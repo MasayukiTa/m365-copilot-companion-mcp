@@ -335,20 +335,33 @@ Check "edge_companion" "Companion Edge running (:9222 fleet/agent)" `
     { Get-Json 'http://127.0.0.1:9222/json/version' | Out-Null; $true } `
     "launch it: powershell -File scripts\start_companion_edge.ps1   (then sign into M365 once)"
 
-Check "m365_signin" "M365 signed in on the companion Edge (no login page)" `
-    {
-        $tabs = Get-Json 'http://127.0.0.1:9222/json'
-        # A login WALL on ANY tab means sign-in is still required -- even if a separate
-        # chat tab is also open. A corporate ADFS/Entra tab can sit on the login page
-        # while another tab shows chat; that must read RED, not green. Broadened pattern:
-        # login.microsoftonline / login.live.com / /adfs/ / adfs. / /oauth2/authorize /
-        # /signin / login_hint= (mirrors relay/edge_recover.looks_like_login's spirit).
-        $loginRe = 'login\.microsoftonline|login\.live\.com|/adfs/|adfs\.|/oauth2/authorize|/signin|login_hint='
-        $onLoginWall = @($tabs | Where-Object { $_.url -match $loginRe }).Count -gt 0
-        $m = $tabs | Where-Object { $_.url -match 'm365|copilot' }
-        ($m) -and -not $onLoginWall
-    } `
-    "sign-in needed: run  powershell -File scripts\start_companion_edge.ps1 -Foreground  (or python -m relay.edge_recover then surface()) to bring the companion Edge window forward, then complete M365 (Entra ID) sign-in -- it persists across restarts"
+# ONE IMPLEMENTATION, NOT TWO. This used to require an m365/copilot TAB to be open, which the
+# websocket-driven fleet never creates -- so a signed-in machine reported RED. The check now
+# calls the same helper setup uses, which PROBES the chat page in the background and looks for a
+# login WALL. "No tab" is not evidence of anything; a wall is.
+#
+# Exit codes: 0 signed in, 1 sign-in needed, 2 cannot tell (Edge not answering). 2 is reported as
+# INFO rather than FAIL: saying "sign in" when the browser is not running sends somebody to do
+# something they cannot do, and the Edge checks above already cover that case.
+$signinPy = Join-Path $repo ".venv\Scripts\python.exe"
+if (-not (Test-Path $signinPy)) { $signinPy = "python" }
+$signinScript = Join-Path $repo "scripts\ensure_m365_signin.py"
+$signinCode = 2
+try {
+    & $signinPy $signinScript --check-only *> $null
+    $signinCode = $LASTEXITCODE
+} catch { $signinCode = 2 }
+
+if ($signinCode -eq 2) {
+    Check "m365_signin" "M365 sign-in state (could not be determined)" `
+        { $false } `
+        "the companion Edge did not answer, so this could not be checked; the Edge checks above say why" `
+        -Info
+} else {
+    Check "m365_signin" "M365 signed in on the companion Edge" `
+        { $signinCode -eq 0 } `
+        "run quickstart.bat again -- it opens the sign-in window for you and waits. You only need to sign in once; it persists across restarts."
+}
 
 # 5. Bridge Edge (:9223) -- optional, only for conversation history/scrape
 Check "edge_bridge" "Bridge Edge running (:9223 history/scrape) [optional]" `

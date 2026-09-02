@@ -473,7 +473,12 @@ def run(cmd, timeout, label):
     tail = ((p.stdout or "") + (p.stderr or "")).strip().splitlines()
     for ln in tail[-6:]:
         log("    | " + ln[:160])
-    return p.returncode == 0, "\n".join(tail[-6:])
+    # RETURN MORE THAN IS PRINTED. Six lines is the right amount to READ; it is the
+    # wrong amount to MATCH against. The fleet gate's refusal is followed by several
+    # library deprecation warnings, which pushed the refusal out of a six-line window,
+    # so the caller's check for it never fired and the cycle carried on capturing empty
+    # patches -- the exact failure that check was added to stop.
+    return p.returncode == 0, chr(10).join(tail[-60:])
 
 
 def worktrees_present():

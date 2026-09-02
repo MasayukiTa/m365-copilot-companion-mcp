@@ -257,3 +257,27 @@ def test_the_refund_is_wired_to_the_gate_branch():
     i = src.index("REFUSING TO START")
     assert "refund_attempts" in src[i:i + 900], (
         "the gate branch stops the cycle but still charges the batch for a run that never began")
+
+
+def test_the_gate_check_sees_the_refusal_even_behind_noise():
+    """IT DID NOT, AND THAT IS WHY THE ABORT NEVER FIRED.
+
+    run() returned only the last SIX lines of output. The gate prints its refusal and the
+    process then emits several library deprecation warnings, which pushed "[gate] REFUSING TO
+    START" out of that window -- so `"REFUSING TO START" in fleet_tail` was False, the cycle
+    carried on, and it captured another empty patch. The guard was present, correct, and looking
+    at a window the evidence had already scrolled out of.
+    """
+    import inspect
+    src = inspect.getsource(C.run)
+    assert "tail[-6:]" not in src.split("return ")[-1], (
+        "run() still matches on six lines; the refusal can scroll out of it again")
+    # A realistic tail: the refusal followed by the warnings that displaced it.
+    noisy = "\n".join(
+        ["[gate] REFUSING TO START -- the stack is not in a state where results would mean anything",
+         "       no browser window headed: copilot-companion-edge",
+         "       Fix it, or pass --force to run anyway."]
+        + ["AuthlibDeprecationWarning: authlib.jose is deprecated"] * 10)
+    assert "REFUSING TO START" in "\n".join(noisy.splitlines()[-60:])
+    assert "REFUSING TO START" not in "\n".join(noisy.splitlines()[-6:]), (
+        "the six-line window would have caught it, so this test proves nothing")
