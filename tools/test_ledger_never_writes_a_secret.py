@@ -95,3 +95,63 @@ def test_an_empty_secret_does_not_blank_the_whole_row(monkeypatch, _held):
     monkeypatch.setenv("MCP_UNLOCK_PASSWORD", "")
     TL.record_call("echo", {"text": "hello world"})
     assert "hello world" in _written(_held)
+
+
+# ------------------------------------------------- the ledger must not break the tool
+
+
+def test_the_caller_s_arguments_are_not_altered(_held):
+    # THE WHOLE QUESTION. Unlock only passes when the REAL password reaches the other side, so
+    # a redaction that reached into the arguments would not be a hardening -- it would turn a
+    # working tool into one that can never authenticate.
+    args = {"name": "unlock", "arguments": {"password": SECRET}}
+    TL.record_call("call_tool", args)
+    assert args["arguments"]["password"] == SECRET, "recording the call mutated the arguments"
+
+
+def test_the_tool_still_receives_the_real_value(_held):
+    # The same property stated end to end: record, then run, and check what the callee got.
+    seen = {}
+
+    def fake_unlock(**kw):
+        seen.update(kw)
+        return "unlocked"
+
+    payload = {"password": SECRET}
+    TL.record_call("unlock", payload)          # ledger first, as the real path does
+    result = fake_unlock(**payload)            # then the tool
+    assert seen["password"] == SECRET, "the tool received a redacted password"
+    assert result == "unlocked"
+    assert SECRET not in _written(_held), "and the ledger still must not hold it"
+
+
+def test_redaction_is_only_ever_applied_on_a_write_path(_held):
+    # secret_store.redact_secrets says in its own docstring that it may be used only at the
+    # moment of writing to a file, never on text being sent. Checked here rather than trusted,
+    # because a future call site added on a send path would break unlock silently -- it would
+    # look like a wrong password, not like a redaction.
+    import pathlib
+    import re
+    root = pathlib.Path(__file__).resolve().parent.parent
+    allowed = {
+        "tools/secret_store.py",            # the definition
+        "tools/tool_ledger.py",             # _append: writes the ledger line
+        "relay/relay_fleet.py",             # _append: writes the fleet transcript
+        "bridge/copilot_bridge.py",         # append_turn: writes the session store
+    }
+    found = set()
+    for path in root.rglob("*.py"):
+        rel = path.relative_to(root).as_posix()
+        if "/worktrees/" in rel or rel.startswith(".") or "test_" in rel:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if re.search(r"\bredact_secrets\s*\(", text):
+            found.add(rel)
+    new = sorted(found - allowed)
+    assert not new, (
+        "redact_secrets is called somewhere new: %s. If that site is a WRITE, add it to the "
+        "list above. If it is a SEND, it will stop unlock working -- the real password has to "
+        "reach the other side." % new)
