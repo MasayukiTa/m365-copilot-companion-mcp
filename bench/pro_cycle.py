@@ -579,9 +579,34 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
         # spend RAM and admission slots on nothing, and every extra concurrent worker makes
         # the shared tool-planner limiter more likely to refuse -- measured, median 35
         # concurrent replies at a refusal against 5 at a recovery.
-        run([PY, "-m", "relay.fleet_runner", "--goals-file", GOALS,
+        fleet_ok, fleet_tail = run(
+            [PY, "-m", "relay.fleet_runner", "--goals-file", GOALS,
              "--effort", effort, "--max-concurrent", str(len(group))],
             BATCH_TIMEOUT_S, "fleet")
+
+        # A GATE REFUSAL ENDS THE CYCLE. The gate exists to stop measurements being taken from
+        # a stack that cannot produce them; ignoring it and starting the next batch reproduces
+        # exactly the numbers it refused to produce, one layer up, as zeroes. Measured on
+        # 2026-09-02: the companion Edge lost its context, and the driver went on to run
+        # THIRTEEN more batches against a refusing gate -- about nineteen instances, each
+        # finishing in under a minute against a normal twenty-five to thirty, each capturing an
+        # empty patch that was then graded "not (empty patch)".
+        #
+        # Not retried and not repaired here. The condition the gate names does not fix itself
+        # between batches, and a driver that restarts the thing it is measuring is how a run
+        # comes to measure something other than what it reports.
+        if not fleet_ok and "REFUSING TO START" in (fleet_tail or ""):
+            log("")
+            log("=" * 72)
+            log("STOPPING: the fleet gate refused, so nothing after this would mean anything.")
+            for ln in (fleet_tail or "").splitlines():
+                log("  " + ln[:160])
+            log("")
+            log("%d instance(s) were not attempted. Their attempt counts are unchanged, so they"
+                % max(0, len(todo) - done))
+            log("are picked up by the next run once the stack is healthy again.")
+            log("=" * 72)
+            return done
 
         # CAPTURE BEFORE ANYTHING ELSE, and unconditionally. A fleet that timed out still has
         # work on disk worth diffing, and the frozen run of 2026-08-31 lost a batch precisely

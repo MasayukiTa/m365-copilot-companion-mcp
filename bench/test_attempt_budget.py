@@ -180,3 +180,47 @@ def test_a_graded_instance_is_untouched_by_the_widening(_files):
     _preds(_files, [{"instance_id": i, "patch": "diff"} for i in ids])
     gate = C.graded_ids() | C.refused_ids() | C.exhausted_ids()
     assert [i for i in ids if i not in gate] == ["u1"]
+
+
+# ------------------------------------------- a refusing gate must end the run, not be ignored
+
+
+def test_a_gate_refusal_ends_the_cycle():
+    """WHAT IT COST WHEN IT DID NOT. The companion Edge lost its context mid-run, and every
+    later fleet_runner printed "[gate] REFUSING TO START ... no browser window headed" and
+    exited. The driver discarded fleet_runner's return value, so it ran THIRTEEN more batches --
+    about nineteen instances -- each finishing in under a minute against a normal twenty-five to
+    thirty, each capturing an empty patch that was then graded "not (empty patch)".
+
+    The gate refused to measure a broken stack. The driver produced the measurements anyway,
+    one layer up, as zeroes.
+    """
+    import inspect
+    src = inspect.getsource(C.cycle)
+    assert "REFUSING TO START" in src, "the driver does not look for a gate refusal at all"
+    assert "fleet_ok" in src, "fleet_runner's result is still discarded"
+
+
+def test_the_refusal_is_not_retried_or_repaired():
+    # A driver that restarts the thing it is measuring is how a run comes to measure something
+    # other than what it reports. The condition the gate names does not fix itself between
+    # batches, so there is nothing to wait for.
+    import inspect
+    src = inspect.getsource(C.cycle)
+    i = src.index("REFUSING TO START")
+    block = src[i:i + 1400]
+    for forbidden in ("start_companion_edge", "edge_recover", "surface(", "restart"):
+        assert forbidden not in block, (
+            "the gate branch tries to repair the browser (%s); measuring must not restart what "
+            "it measures" % forbidden)
+
+
+def test_the_unattempted_instances_stay_retryable():
+    # The point of stopping early is that the remainder is untouched: their attempt counts are
+    # not incremented, so the next run picks them up rather than treating them as spent.
+    import inspect
+    src = inspect.getsource(C.cycle)
+    i = src.index("REFUSING TO START")
+    block = src[i:i + 1400]
+    assert "attempt counts are unchanged" in block or "not attempted" in block, (
+        "the operator is not told whether the remaining instances are lost or retryable")
