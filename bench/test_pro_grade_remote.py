@@ -249,3 +249,35 @@ def test_a_missing_host_is_reported_as_configuration(monkeypatch, tmp_path, caps
     rc = G.main(["--preds", str(tmp_path / "nope.json")])
     assert rc == 2
     assert "no eval host configured" in capsys.readouterr().out
+
+
+def test_a_stray_carriage_return_does_not_silently_drop_instances(tmp_path, capsys, monkeypatch):
+    """How fifteen instances became one.
+
+    The list was written by Python in text mode on Windows, so every line but the last carried a
+    trailing carriage return through the shell. The filter matched exactly one id, graded it,
+    and reported "graded 1 instance(s)" -- a true sentence about a fraction of the job.
+    """
+    monkeypatch.setenv("SWE_EVAL_HOST", "someho.st")
+    preds = tmp_path / "p.json"
+    preds.write_text(json.dumps([
+        {"instance_id": "a", "patch": "diff --git a/x b/x\n"},
+        {"instance_id": "b", "patch": "diff --git a/y b/y\n"},
+    ]), encoding="utf-8")
+    rc = G.main(["--preds", str(preds), "--results", str(tmp_path / "r.json"),
+                 "--dry-run", "--instances", "a\r", "b"])
+    assert rc == 0
+    assert "would stage 2 predictions" in capsys.readouterr().out
+
+
+def test_an_instance_with_no_patch_is_named_not_dropped(tmp_path, capsys, monkeypatch):
+    """Grading a subset of what was asked for must never look like grading all of it."""
+    monkeypatch.setenv("SWE_EVAL_HOST", "someho.st")
+    preds = tmp_path / "p.json"
+    preds.write_text(json.dumps([{"instance_id": "a", "patch": "diff --git a/x b/x\n"}]),
+                     encoding="utf-8")
+    G.main(["--preds", str(preds), "--results", str(tmp_path / "r.json"),
+            "--dry-run", "--instances", "a", "ghost"])
+    out = capsys.readouterr().out
+    assert "have no gradeable patch and were NOT graded" in out
+    assert "ghost" in out
