@@ -169,17 +169,29 @@ if (-not (Get-Command devtunnel -ErrorAction SilentlyContinue)) {
         # is a REAL total cap: IWR's -TimeoutSec is per-read, so a slow-but-alive connection never
         # trips it and the step hangs for ever. curl also follows the aka.ms redirect, uses the
         # system proxy, and prints its own progress.
+        # EVERY ATTEMPT RECORDS WHY IT FAILED. The old branch asserted "your company network
+        # blocked this" whatever happened, so a certificate error, a 407, a DNS failure and a
+        # real block were indistinguishable -- and the operator was sent to ask IT for a file,
+        # which is the wrong remedy for most of them.
+        $dlWhy = New-Object System.Collections.ArrayList
+
         $curl = Join-Path $env:SystemRoot "System32\curl.exe"
-        if (Test-Path $curl) {
+        if (-not (Test-Path $curl)) {
+            [void]$dlWhy.Add("curl.exe is not on this machine (it ships with Windows 10 1803 and later)")
+        } else {
             try {
-                & $curl -L --fail --show-error --connect-timeout 20 --max-time 180 `
-                        --retry 2 --retry-delay 3 -o $payload $dlUri
+                $curlErr = & $curl -L --fail --show-error --connect-timeout 20 --max-time 180 `
+                                   --retry 2 --retry-delay 3 -o $payload $dlUri 2>&1
                 if ($LASTEXITCODE -eq 0 -and (Test-Path $payload) -and (Get-Item $payload).Length -gt 0) {
                     $downloaded = $true
                     Write-Host ("      downloaded {0:N1} MB in {1:N0}s (curl)" -f `
                                 ((Get-Item $payload).Length/1MB), $swDl.Elapsed.TotalSeconds)
+                } else {
+                    [void]$dlWhy.Add("curl exit $LASTEXITCODE : " + (($curlErr | Out-String).Trim()))
                 }
-            } catch { $downloaded = $false }
+            } catch {
+                [void]$dlWhy.Add("curl threw: $($_.Exception.Message)")
+            }
         }
 
         # THE PROGRESS BAR IS THE SLOWDOWN. PowerShell 5.1 renders one per chunk for -OutFile,
@@ -210,7 +222,10 @@ if (-not (Get-Command devtunnel -ErrorAction SilentlyContinue)) {
                     $downloaded = $true
                 } catch {
                     $downloaded = $false
+                    [void]$dlWhy.Add("proxy retry: $($_.Exception.Message)")
                 }
+            } else {
+                [void]$dlWhy.Add("Invoke-WebRequest: $msg")
             }
         }
         }
@@ -219,10 +234,57 @@ if (-not (Get-Command devtunnel -ErrorAction SilentlyContinue)) {
             Write-Host ("      downloaded {0:N1} MB in {1:N0}s" -f `
                         ((Get-Item $payload).Length/1MB), $swDl.Elapsed.TotalSeconds)
         }
+        # ONE MORE TRANSPORT BEFORE GIVING UP. BITS uses the WinHTTP proxy configuration, which
+        # is where a managed machine's proxy actually lives; .NET and curl read different places,
+        # so this succeeds on some networks where both of the others fail.
         if (-not $downloaded) {
-            Write-Host "      ERROR: could not download devtunnel."
-            Write-Host "      Your company network blocked this download. Ask IT (or use another PC) to download"
-            Write-Host "      devtunnel for Windows x64, save it as %LOCALAPPDATA%\devtunnel\devtunnel.exe, then run quickstart.bat again."
+            try {
+                Import-Module BitsTransfer -ErrorAction Stop
+                Write-Host "      trying BITS (uses the machine's WinHTTP proxy settings)..."
+                Start-BitsTransfer -Source $dlUri -Destination $payload -ErrorAction Stop
+                if ((Test-Path $payload) -and (Get-Item $payload).Length -gt 0) {
+                    $downloaded = $true
+                    Write-Host ("      downloaded {0:N1} MB in {1:N0}s (BITS)" -f `
+                                ((Get-Item $payload).Length/1MB), $swDl.Elapsed.TotalSeconds)
+                }
+            } catch {
+                [void]$dlWhy.Add("BITS: $($_.Exception.Message)")
+            }
+        }
+
+        if (-not $downloaded) {
+            $why = ($dlWhy | Out-String)
+            Write-Host ""
+            Write-Host "      ERROR: could not download devtunnel. What each attempt reported:"
+            foreach ($w in $dlWhy) { Write-Host ("        - " + $w) }
+            Write-Host ""
+            # THE DIAGNOSIS IS CHOSEN FROM THE EVIDENCE, not assumed. Each of these needs a
+            # different action, and telling somebody to ask IT for a file when their clock is
+            # wrong wastes a day.
+            if ($why -match 'certificate|SSL|TLS|trust relationship|self.signed') {
+                Write-Host "      This looks like TLS interception, not a block. Run setup.bat first --"
+                Write-Host "      it exports this machine's root certificates to .setup\ca-bundle.pem, which this"
+                Write-Host "      step reuses. If it still fails, check the clock: an out-of-date system time"
+                Write-Host "      fails certificate validation and looks exactly like this."
+            } elseif ($why -match '407|Proxy Authentication') {
+                Write-Host "      The proxy wants credentials (HTTP 407). Sign in to the corporate proxy in a"
+                Write-Host "      browser once, leave that browser open, and run quickstart.bat again."
+            } elseif ($why -match 'could not resolve|name or service not known|No such host') {
+                Write-Host "      DNS did not resolve aka.ms. Check the VPN or network connection --"
+                Write-Host "      this is not a policy block, the name simply did not resolve."
+            } elseif ($why -match 'timed out|Timeout|curl exit 28|curl: \(28\)') {
+                Write-Host "      The connection opened but no data arrived in time. That is usually a proxy"
+                Write-Host "      holding the request. Try once more; if it repeats, it is being filtered."
+            } else {
+                Write-Host "      No transport could fetch it, and the errors above do not name a cause this"
+                Write-Host "      script recognises. Treat the lines above as the evidence, not this sentence."
+            }
+            Write-Host ""
+            Write-Host "      MANUAL WAY OUT, which always works:"
+            Write-Host "        download devtunnel for Windows x64 on any machine that can reach the internet:"
+            Write-Host "          $dlUri"
+            Write-Host "        save it as  %LOCALAPPDATA%\devtunnel\devtunnel.exe  on THIS machine,"
+            Write-Host "        then run quickstart.bat again. It will find it and carry on."
             exit 1
         }
 
