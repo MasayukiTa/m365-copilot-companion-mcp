@@ -273,6 +273,28 @@ def note_attempts(ids):
         pass
 
 
+def refund_attempts(ids):
+    """Give back attempts for instances that never ran.
+
+    The counter is incremented before a batch so that a crash still costs an attempt. A gate
+    refusal is the one outcome where nothing started at all -- no worker, no turn, no quota --
+    and charging for it retires an instance that has never been tried. Measured once: 14
+    instances reached the 2-attempt cap this way without running.
+    """
+    try:
+        d = attempt_counts()
+        for i in ids:
+            if int(d.get(i, 0)) > 0:
+                d[i] = int(d[i]) - 1
+            if not d.get(i):
+                d.pop(i, None)
+        os.makedirs(os.path.dirname(ATTEMPTS), exist_ok=True)
+        with open(ATTEMPTS, "w", encoding="utf-8") as fh:
+            json.dump(d, fh, ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+
+
 def exhausted_ids(cap=None):
     """Instances that have had their attempts."""
     cap = MAX_ATTEMPTS if cap is None else cap
@@ -596,6 +618,9 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
         # between batches, and a driver that restarts the thing it is measuring is how a run
         # comes to measure something other than what it reports.
         if not fleet_ok and "REFUSING TO START" in (fleet_tail or ""):
+            # NOTHING RAN, SO NOTHING IS OWED. The attempt was counted before the batch on the
+            # assumption that it would start; a refusal is the one case where it did not.
+            refund_attempts(group)
             log("")
             log("=" * 72)
             log("STOPPING: the fleet gate refused, so nothing after this would mean anything.")
