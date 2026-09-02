@@ -554,10 +554,20 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
         # exactly the runs that did not need recording.
         _cid = ""
         _t0 = time.time()
+        # OUT OF THE ARGUMENTS, NOT JUST READ FROM THEM. These were read for the ledger and
+        # then handed to the tool by fn(**_args) below, so any caller that set them got
+        # `TypeError: <tool>() got an unexpected keyword argument '_task'` -- the attribution
+        # could not be used without breaking the call it was attributing. That is why worker
+        # and task are empty on every row of the ledger, and why a run's failures could not be
+        # traced back to it.
+        _task = ""
+        _worker = ""
+        if isinstance(_args, dict):
+            _task = str(_args.pop("_task", "") or "")
+            _worker = str(_args.pop("_worker", "") or "")
         try:
             from tools import tool_ledger as _ledger
-            _cid = _ledger.record_call(name, _args, task=_args.get("_task", ""),
-                                       worker=_args.get("_worker", ""))
+            _cid = _ledger.record_call(name, _args, task=_task, worker=_worker)
         except Exception:
             _ledger = None
         try:
