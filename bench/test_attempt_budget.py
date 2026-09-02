@@ -281,3 +281,64 @@ def test_the_gate_check_sees_the_refusal_even_behind_noise():
     assert "REFUSING TO START" in "\n".join(noisy.splitlines()[-60:])
     assert "REFUSING TO START" not in "\n".join(noisy.splitlines()[-6:]), (
         "the six-line window would have caught it, so this test proves nothing")
+
+
+def test_the_gate_check_does_not_depend_on_the_exit_code():
+    """MEASURED: a gate refusal returns 0.
+
+    The guard was written as `if not fleet_ok and "REFUSING TO START" in tail`. Since the
+    refusal exits 0, `not fleet_ok` was always False and the branch was never reached -- the
+    guard was added, tested, committed, and did nothing on three separate runs while the cycle
+    carried on capturing empty patches. A refusal is identified by what it says.
+    """
+    import inspect
+    src = inspect.getsource(C.cycle)
+    i = src.index("REFUSING TO START")
+    line_start = src.rindex(chr(10), 0, i) + 1
+    line = src[line_start:src.index(chr(10), i)]
+    assert "fleet_ok" not in line, (
+        "the gate check is gated on an exit code again; the refusal returns 0, so that "
+        "condition is never true: %s" % line.strip())
+
+
+# ------------------------------------------------- the disk cost model, measured not guessed
+
+
+def test_the_language_costs_are_not_below_what_was_measured():
+    """MEASURED 2026-09-02, free space at batch start against the low point during it:
+
+        openlibrary (python) 4x  8.19 -> 0.62 GiB  ~1900 MB each   the table said 120
+        vuls        (go)     2x  4.08 -> 1.36 GiB  ~1360 MB each   the table said 700
+        element-web (js)     2x  8.20 -> 5.96 GiB  ~1150 MB each   the table said 560
+
+    concurrency_for() divides the headroom by these, so an optimistic entry admits more work
+    than fits. At 120 MB the python entry admits four of anything, and openlibrary alone took a
+    machine from 8 GiB to 620 MB free.
+    """
+    measured = {"python": 1900, "go": 1360, "js": 1150, "ts": 1150}
+    for lang, mb in measured.items():
+        assert C.LANG_DISK_MB.get(lang, 0) >= mb * 0.95, (
+            "%s is costed at %s MB but was measured at ~%d MB; the sizing arithmetic cannot "
+            "hold a floor on an estimate below what the work actually uses"
+            % (lang, C.LANG_DISK_MB.get(lang), mb))
+
+
+def test_a_thin_disk_admits_one_instance_and_not_more():
+    # The floor of the function is one -- a batch of zero makes no progress -- but at 4.5 GiB
+    # nothing should be running two of anything.
+    for lang in ("python", "go", "js"):
+        assert C.concurrency_for([lang], 4.5) == 1, lang
+
+
+def test_an_explicit_batch_size_bypasses_this_entirely():
+    """WHY THAT MATTERS, since it is what actually went wrong.
+
+    batches(ids, size) uses `size if size else concurrency_for(...)`, so passing --batch 2
+    replaces the disk-aware width with a constant. At 4.08 GiB free the sizing would have
+    chosen ONE go instance; --batch 2 ran two, and free space went to 1.36 GiB. The override is
+    a legitimate escape hatch, but it is not a disk safeguard -- it removes the one there is.
+    """
+    import inspect
+    src = inspect.getsource(C.batches)
+    assert "if size else" in src.replace("  ", " "), (
+        "batches() no longer takes an explicit size; update this test's premise")
