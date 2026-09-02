@@ -421,7 +421,8 @@ jobs:
             tools/test_secrets_are_not_readable.py \
             tools/test_setup_tls.py \
             tools/test_shell_timeout_tree.py \
-            tools/test_tool_ledger.py
+            tools/test_tool_ledger.py \
+            bench/test_attempt_budget.py
 
       - name: Run script-style tracer tests
         run: python tools/test_trace.py

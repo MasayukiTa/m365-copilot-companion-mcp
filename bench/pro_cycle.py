@@ -163,10 +163,28 @@ def graded_ids():
             except ValueError:
                 continue
         return ids
+    if isinstance(data, dict) and "instance_id" in data:
+        # ONE JSONL ROW IS ALSO VALID JSON. A results file holding exactly one graded row --
+        # which is every file after the first grading -- parses here as a dict and was then
+        # read as an {instance_id: verdict} MAPPING, so its field names became the instance
+        # ids: graded_ids() returned {"instance_id", "verdict"} and the instance that had
+        # actually been graded was missing from it, and got re-run. The key tells the two
+        # shapes apart: a row HAS an instance_id, a mapping has instance ids AS keys.
+        keep(data)
+        return ids
     if isinstance(data, dict):
         # {instance_id: verdict} or {instance_id: {...}}
         for inst, val in data.items():
             v = val.get("verdict") if isinstance(val, dict) else val
+            # A BOOLEAN IS A GRADE, INCLUDING False. The grader writes {instance_id: bool},
+            # and `v or ""` collapsed False to "" -- which is in _NOT_A_GRADE -- so every
+            # instance that had been graded and did NOT resolve read as never graded and was
+            # re-run. That is the benchmark drifting upward by re-rolling its failures, which
+            # is the exact thing this module's docstring says it exists to prevent, and it
+            # failed in the direction that looks like a better score.
+            if isinstance(v, bool):
+                ids.add(inst)
+                continue
             if str(v or "").upper() not in _NOT_A_GRADE:
                 ids.add(inst)
         return ids
@@ -207,6 +225,58 @@ def captured_ids():
         if patch or row.get("refused"):
             out.add(inst)
     return out
+
+
+def refused_ids():
+    """Instances whose diff was REFUSED for being too large.
+
+    Separated from captured_ids because the two deserve opposite treatment. A refusal is a
+    measured dead end -- 3,054,501 bytes on the first attempt and 74,850,968 on the second --
+    so repeating it spends a batch slot to get a worse answer. A captured patch that has merely
+    never been graded is the opposite: the one thing known about it is that nobody has checked
+    whether it works.
+    """
+    out = set()
+    for row in _load(PREDS, []) or []:
+        if isinstance(row, dict) and row.get("instance_id") and row.get("refused"):
+            out.add(row["instance_id"])
+    return out
+
+
+#: Attempts per instance, kept beside the predictions. A separate file because the predictions
+#: file holds ONE row per instance -- the latest patch overwrites the previous one -- so it
+#: cannot say how many times an instance has been tried.
+ATTEMPTS = os.path.join(SW, "pro_attempts.json")
+
+#: Two, because two is the number that was measured (42.9% at one attempt, 81.0% at two), not
+#: because more is assumed to be better. Settable so the next measurement can move it rather
+#: than argue with it.
+MAX_ATTEMPTS = int(os.environ.get("SWE_MAX_ATTEMPTS", "2"))
+
+
+def attempt_counts():
+    d = _load(ATTEMPTS, {}) or {}
+    return d if isinstance(d, dict) else {}
+
+
+def note_attempts(ids):
+    """Record that these instances are being tried. Best effort: losing the counter must not
+    stop a run, and undercounting only costs an extra attempt, never a lost result."""
+    try:
+        d = attempt_counts()
+        for i in ids:
+            d[i] = int(d.get(i, 0)) + 1
+        os.makedirs(os.path.dirname(ATTEMPTS), exist_ok=True)
+        with open(ATTEMPTS, "w", encoding="utf-8") as fh:
+            json.dump(d, fh, ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+
+
+def exhausted_ids(cap=None):
+    """Instances that have had their attempts."""
+    cap = MAX_ATTEMPTS if cap is None else cap
+    return {i for i, n in attempt_counts().items() if int(n or 0) >= cap}
 
 
 def slice_ids():
@@ -401,23 +471,45 @@ def worktrees_present():
 def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=False,
           redo_captured=False):
     todo = check_slice_is_fresh(slice_ids(), allow_burned)
-    done_already = graded_ids() | (set() if redo_captured else captured_ids())
+    # GRADED, REFUSED, OR OUT OF ATTEMPTS -- not merely "has a file".
+    #
+    # This was `graded_ids() | captured_ids()`, and captured_ids() means a patch file exists.
+    # When the eval host is down, graded_ids() is empty and that union retires every instance
+    # after ONE attempt, holding whatever it produced. Measured across two runs of the same 39
+    # instances: 21 of 40 got a second attempt and scored 81.0%, then 3 of 40 did and the run
+    # scored 59.0%. The second attempt was buying correctness, and this line stopped it.
+    done_already = graded_ids() | refused_ids() | exhausted_ids()
+    if redo_captured:
+        done_already = graded_ids() | refused_ids()
     todo = [i for i in todo if i not in done_already]
     if limit:
         todo = todo[:limit]
     log("=" * 72)
     log("cycle start: %d instance(s) to do, batch=%s, free=%.2f GiB, floor=%.2f GiB"
         % (len(todo), batch_size or "by language", free_gb(), DISK_FLOOR_GB))
-    held = len(captured_ids())
-    if held and not redo_captured:
-        log("%d instance(s) already have a captured patch and are skipped; grade them with "
-            "bench.swe_grade_batch rather than re-running them" % held)
+    counts = attempt_counts()
+    unverified = sorted(captured_ids() - graded_ids() - refused_ids())
+    if unverified:
+        # NAMED, NOT COUNTED AWAY. A held patch that nobody has graded is not a result, and a
+        # run that reports these as finished is reporting a number it has not measured.
+        retryable = [i for i in unverified if int(counts.get(i, 0)) < MAX_ATTEMPTS]
+        log("%d instance(s) hold an UNGRADED patch (%d still within the %d-attempt cap and "
+            "will be tried again); grade them with bench.swe_grade_batch"
+            % (len(unverified), len(retryable), MAX_ATTEMPTS))
+    spent = len(exhausted_ids())
+    if spent:
+        log("%d instance(s) have used all %d attempts and are skipped"
+            % (spent, MAX_ATTEMPTS))
     if not todo:
         log("nothing ungraded in the slice -- done")
         return 0
 
     done = 0
     for n, group in enumerate(batches(todo, batch_size), start=1):
+        # BEFORE the batch runs, so a crash mid-batch still spends the attempt. Counting after
+        # would let an instance that reliably kills the run be retried for ever.
+        if not dry_run:
+            note_attempts(group)
         have = free_gb()
         if have < DISK_FLOOR_GB:
             # FREE SPACE BEFORE GIVING UP, NEVER LOWER THE FLOOR. The idle Edge profiles this

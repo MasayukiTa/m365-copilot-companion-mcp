@@ -269,13 +269,32 @@ def test_a_missing_or_broken_preds_file_means_nothing_is_captured(tmp_path, monk
     assert C.captured_ids() == set()
 
 
-def test_redoing_captured_work_has_to_be_asked_for():
-    """SOURCE-LEVEL, stated as such: cycle() runs a fleet. Skipping is the default and
-    re-running is the deliberate act, not the other way round."""
-    import inspect
-    src = inspect.getsource(C.cycle)
-    assert "redo_captured" in src
-    assert "if redo_captured else captured_ids()" in src.replace("\n", " ").replace("  ", " ")
+def test_redoing_captured_work_has_to_be_asked_for(tmp_path, monkeypatch):
+    """The rule this asserted has been made more precise, so the assertion follows it.
+
+    It used to require the literal source `if redo_captured else captured_ids()`, pinning one
+    line rather than the behaviour -- and that line was wrong: it skipped an instance because a
+    patch FILE existed, graded or not. With the eval host down, graded_ids() was empty and that
+    retired every instance after a single attempt; the run scored 59.0% where the same 39
+    instances scored 70.0% when 21 of them got a second try.
+
+    What must stay true is narrower, and is checked directly rather than through the source:
+    anything already MEASURED is never re-run, and anything merely held is not mistaken for
+    measured.
+    """
+    import json as _j
+    monkeypatch.setattr(C, "RESULTS", str(tmp_path / "r.json"))
+    monkeypatch.setattr(C, "PREDS", str(tmp_path / "p.json"))
+    monkeypatch.setattr(C, "ATTEMPTS", str(tmp_path / "a.json"))
+    open(str(tmp_path / "r.json"), "w", encoding="utf-8").write(
+        _j.dumps({"graded_pass": True, "graded_fail": False}))
+    open(str(tmp_path / "p.json"), "w", encoding="utf-8").write(
+        _j.dumps([{"instance_id": "held", "patch": "diff"}]))
+
+    graded = C.graded_ids()
+    assert graded == {"graded_pass", "graded_fail"}, graded
+    assert "held" not in graded, "an ungraded patch counted as measured"
+    assert "held" not in C.exhausted_ids(), "an ungraded patch was retired unmeasured"
 
 
 # -- the worktree map, which grew without bound --------------------------------------------
