@@ -45,12 +45,42 @@ def test_narrowing_the_test_to_the_relevant_file_still_counts():
 
 # ── the claims the records contradict ─────────────────────────────────────────────────────
 
-def test_a_done_with_no_write_is_contradicted():
-    """The commonest wrong claim: finished, having changed nothing."""
-    events = [call("read_file", 100), call("shell_exec", 200, command="pytest -x")]
+def test_a_done_with_no_write_and_no_way_to_write_is_contradicted():
+    """The commonest wrong claim: finished, having changed nothing.
+
+    The example is deliberately read-only. There is no route here by which the workspace could
+    have changed, so the negative is one the record can actually support.
+    """
+    events = [call("read_file", 100), call("grep", 200)]
     v = EM.assess(True, CONTRACT, events)
     assert v["verdict"] == EM.CONTRADICTED
-    assert "no successful write" in " ".join(v["reasons"])
+    assert "nothing in the workspace changed" in " ".join(v["reasons"])
+
+
+def test_a_write_made_through_an_exec_tool_is_not_reported_as_no_write():
+    """This assertion was changed, and the old one was false.
+
+    It used to require CONTRADICTED for read_file + shell_exec("pytest -x"). But shell_exec can
+    write, and no list of tool NAMES distinguishes `pytest -x` from `sed -i`. Measured: nine
+    instances were judged "nothing in the workspace changed"; every one had exec calls, and four
+    of them produced a patch that graded RESOLVED. The workspace had changed and the ledger
+    could not see how.
+
+    UNVERIFIABLE is not success. It is the verdict for "the record cannot settle it", which is
+    the true state, and it is why step 4 reruns the commands itself instead of reading what the
+    worker chose to report.
+    """
+    events = [call("read_file", 100), call("shell_exec", 200, command="pytest -x")]
+    v = EM.assess(True, CONTRACT, events)
+    assert v["verdict"] == EM.UNVERIFIABLE
+    assert "cannot see a write made that way" in " ".join(v["reasons"])
+
+
+def test_edit_and_verify_counts_as_a_write():
+    """It is a write tool and it was not in the list. Seventeen calls in the ledger, none of
+    them counted, while the instances using it were told nothing had changed. A hand-written
+    allow-list goes stale the moment a tool is added."""
+    assert "edit_and_verify" in EM.WRITE_TOOLS
 
 
 def test_a_test_run_before_the_last_edit_does_not_count():

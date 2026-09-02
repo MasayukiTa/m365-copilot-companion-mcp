@@ -41,9 +41,16 @@ UNVERIFIABLE = "UNVERIFIABLE"
 
 #: Tools whose call means the worktree changed. A DONE with none of these is a claim to have
 #: finished work without doing any.
+#: Tools that change the workspace by name. NOT the whole story, and it cannot be: a write
+#: performed through an exec tool -- open(p,'w') inside run_python, sed -i inside shell_exec --
+#: has no tool name of its own. See the no-writes branch in assess(), which is what keeps that
+#: blind spot from being reported as a fact about the worker.
 WRITE_TOOLS = {
     "write_file", "append_file", "replace_in_file", "multi_edit", "move_path", "copy_path",
     "delete_path", "trash_path", "create_directory", "write_excel", "write_json",
+    # ADDED AFTER IT WAS MISSED: 17 calls in the ledger, none of them counted, while the
+    # instances that used it were being told nothing in their workspace had changed.
+    "edit_and_verify",
 }
 
 #: Tools that run something. The acceptance command arrives through one of these.
@@ -166,7 +173,17 @@ def _assess(claim_done, contract, events):
     ev["last_write_ts"] = last_write_ts
 
     if not writes:
-        reasons.append("claimed DONE with no successful write; nothing in the workspace changed")
+        # A BLIND SPOT IS NOT A FINDING. run_python and shell_exec can write anything, and no
+        # list of tool names will ever see them do it. Nine instances were told "nothing in the
+        # workspace changed" on this branch; all nine had exec calls and four of them produced
+        # a patch that graded RESOLVED. Where the record cannot settle it, say so.
+        if any(e["call"].get("tool") in EXEC_TOOLS for e in events):
+            reasons.append("no write tool was called, but commands were run that can write "
+                           "(run_python, shell_exec); the ledger cannot see a write made that "
+                           "way, so this claim cannot be settled from records")
+            return {"verdict": UNVERIFIABLE, "reasons": reasons, "evidence": ev}
+        reasons.append("claimed DONE with no successful write and nothing was run that could "
+                       "have written; nothing in the workspace changed")
         return {"verdict": CONTRADICTED, "reasons": reasons, "evidence": ev}
 
     checks = (contract or {}).get("checks") or []
