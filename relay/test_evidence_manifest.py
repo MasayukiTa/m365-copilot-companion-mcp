@@ -137,3 +137,51 @@ def test_the_summary_does_not_call_itself_precision():
     s = EM.summarise([{"verdict": EM.SUPPORTED}])
     assert "precision" not in " ".join(s.keys())
     assert "supported_share" in s
+
+
+# -- narrowing the target -------------------------------------------------------------------
+
+def test_a_narrowed_package_selector_is_still_the_acceptance_command():
+    """The defect that made every go instance read as untested.
+
+    _matches_check is documented as loose on the tail: `pytest -x` is satisfied by
+    `pytest -x tests/test_retry.py`, because narrowing pytest APPENDS a token. Narrowing go
+    REPLACES one -- the contract's target IS `./...` -- so requiring that literal token rejected
+    every narrowed run. These two commands were taken from the ledger; both were reported as
+    "the contract's acceptance command was never run".
+    """
+    assert EM._matches_check("go test ./models/... ./scan/... ./report/...", "go test ./...")
+    assert EM._matches_check("go test ./config/... -count=1 -v -run TestLoad", "go test ./...")
+    assert EM._matches_check("go build ./... && go test ./models/...", "go test ./...")
+
+
+def test_narrowing_the_target_is_not_dropping_it():
+    """A selector must be answered by a selector. `go test` with no target is a different act
+    from `go test ./...`, and accepting it would turn the loosening into a hole."""
+    assert not EM._matches_check("go test", "go test ./...")
+
+
+def test_a_different_subcommand_is_not_the_acceptance_command():
+    """What keeps the loosening honest. Only path-shaped tokens are matched by kind; `test` is
+    an ordinary required token, so building is not testing however the paths line up."""
+    assert not EM._matches_check("go build ./...", "go test ./...")
+    assert not EM._matches_check("go vet ./internal/...", "go test ./...")
+
+
+def test_the_pytest_cases_are_unchanged():
+    """The behaviour this loosening must not disturb."""
+    assert EM._matches_check("pytest -x tests/test_retry.py", "pytest -x")
+    assert not EM._matches_check("pytest --collect-only", "pytest -x")
+    assert not EM._matches_check("echo go test ./...", "go test ./...")
+    assert EM._matches_check("npm test", "npm test")
+    assert not EM._matches_check("npm run lint", "npm test")
+
+
+def test_a_flag_is_never_treated_as_a_target():
+    """_is_selector must not accept something that only looks path-ish because it is a flag,
+    or a required flag could be satisfied by an unrelated path."""
+    assert not EM._is_selector("--dir=./x")
+    assert not EM._is_selector("-run")
+    assert EM._is_selector("./...")
+    assert EM._is_selector("./internal/config/...")
+    assert not EM._is_selector("test")
