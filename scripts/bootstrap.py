@@ -184,7 +184,15 @@ def _transcribe(msg: str) -> None:
         pass
 
 
-def log(msg: str) -> None:
+def log(msg: str, transcribe: bool = True) -> None:
+    """Print, and by default also record.
+
+    `transcribe=False` is for the handful of lines that must appear ON SCREEN and must not be
+    kept: the freshly generated Bearer token and unlock password. The operator needs to read
+    them once to paste them into Copilot Studio; .setup/bootstrap.log is the file they are
+    asked to send when setup fails, which makes it the worst place in this project to leave a
+    credential sitting.
+    """
     # The console first: encode-safe, because this console is cp932 and a print() that raises
     # UnicodeEncodeError has ended a long run here before. The transcript is written whatever
     # the console can display, so a character the console cannot show is still recorded.
@@ -196,7 +204,8 @@ def log(msg: str) -> None:
             print(msg.encode(enc, "replace").decode(enc, "replace"), flush=True)
         except Exception:
             pass
-    _transcribe(msg)
+    if transcribe:
+        _transcribe(msg)
 
 
 def _call_step(fn, state: dict, state_file: Path) -> None:
@@ -474,8 +483,14 @@ def step_gen_env() -> None:
     # the user fills them in only if they use the relay/bridge.
     env_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
     log("    OK: wrote .env with fresh random MCP_API_KEY and MCP_UNLOCK_PASSWORD")
-    log("    Your Bearer token (MCP_API_KEY): " + api_key)
-    log("    Your unlock password:           " + unlock_code)
+    # ON SCREEN ONLY. These two are freshly minted and are printed so they can be copied into
+    # Copilot Studio; they must not reach .setup/bootstrap.log, which is the file an operator
+    # is asked to send when setup fails. A note goes to the transcript in their place, because
+    # "the credentials were shown here" is worth recording and the values are not.
+    log("    Your Bearer token (MCP_API_KEY): " + api_key, transcribe=False)
+    log("    Your unlock password:           " + unlock_code, transcribe=False)
+    _transcribe("    (Bearer token and unlock password were shown on screen; "
+                "not recorded here. Re-read them with scripts/copilot_studio_values.ps1)")
     log("    Keep these secret. Optional MCP_*_AGENT_URL vars stay commented in .env.")
 
 

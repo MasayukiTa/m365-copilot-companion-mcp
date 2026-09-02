@@ -422,7 +422,8 @@ jobs:
             tools/test_setup_tls.py \
             tools/test_shell_timeout_tree.py \
             tools/test_tool_ledger.py \
-            bench/test_attempt_budget.py
+            bench/test_attempt_budget.py \
+            scripts/test_bootstrap_transcript.py
 
       - name: Run script-style tracer tests
         run: python tools/test_trace.py
