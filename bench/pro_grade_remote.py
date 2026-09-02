@@ -283,8 +283,22 @@ def main(argv=None):
         # A BATCH, NOT THE LEDGER. The preds file accumulates every capture ever made;
         # grading all of it after each batch would re-score eighty instances to learn
         # about three. The caller names the three.
-        want = set(a.instances)
+        # STRIPPED, AND A MISS IS REPORTED. A list built on Windows and passed through the
+        # shell arrives with a trailing carriage return on every line but the last, and the
+        # filter then matched exactly one of fifteen instances -- and said "graded 1
+        # instance(s)" as though that were the whole job. Silently grading a fraction of what
+        # was asked for is worse than refusing.
+        want = {str(i).strip() for i in a.instances if str(i).strip()}
+        have = {r.get("instance_id") for r in rows}
+        missing = sorted(want - have)
         rows = [r for r in rows if r.get("instance_id") in want]
+        if missing:
+            log("%d of %d requested instance(s) have no gradeable patch and were NOT graded:"
+                % (len(missing), len(want)))
+            for i in missing[:5]:
+                log("    %s" % i)
+            if len(missing) > 5:
+                log("    ... and %d more" % (len(missing) - 5))
     log("%d of %d predictions are gradeable (empty patches dropped)" % (len(rows), len(preds)))
     if not rows:
         return 1
