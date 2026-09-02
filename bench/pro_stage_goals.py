@@ -143,9 +143,15 @@ def goal(inst, wt):
     if req or iface:
         contract = "\n== Required interface / behavioral contract (the patch is judged against THIS) ==\n"
         if req:
-            contract += req[:3000] + "\n"
+        # THE WHOLE CONTRACT, NOT THE FIRST 3000 CHARACTERS. The header above tells the
+        # worker the patch is judged against this, and the steps below tell it to enumerate
+        # EVERY symbol the contract names -- while the tail was being cut mid-sentence with
+        # no marker that anything was missing. Measured on one slice: 4 of 40 contracts were
+        # cut, the longest field ran to 4155 characters, and every graded instance among
+        # them failed. The tail costs about a kilobyte on a prompt already four to seven.
+            contract += req + "\n"
         if iface:
-            contract += "Interface:\n" + iface[:3000] + "\n"
+            contract += "Interface:\n" + iface + "\n"
     text = (
         "You are fixing a real bug in the open-source project **%s** (language: %s).\n"
         "The repository is checked out locally at:\n  %s\n"

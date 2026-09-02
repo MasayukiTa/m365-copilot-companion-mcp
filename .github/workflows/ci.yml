@@ -362,6 +362,7 @@ jobs:
             bench/test_eval_to_ledger.py \
             bench/test_oracle_tasks.py \
             bench/test_panel_shadow_report.py \
+            bench/test_pro_goal_contract.py \
             bench/test_pro_batching.py \
             bench/test_pro_capture.py \
             bench/test_pro_grade_remote.py \
