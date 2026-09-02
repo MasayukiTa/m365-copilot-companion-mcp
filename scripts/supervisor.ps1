@@ -169,9 +169,27 @@ function Start-Server {
     } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Seconds 2
     Push-Location $Root
-    Start-Process -FilePath $Py -ArgumentList "main.py" -WorkingDirectory $Root -WindowStyle Hidden
+    # ITS STARTUP ERROR WAS GOING NOWHERE. Hidden window, no redirection: when main.py dies on
+    # startup -- a missing dependency, a port already bound, an unreadable .env -- the reason is
+    # discarded and the only trace is the line below saying it was "(re)started". The doctor then
+    # says "run start_all.bat", which is what this supervisor is already doing on a loop.
+    $logDir = Join-Path $Root ".setup\logs"
+    try { if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force $logDir | Out-Null } } catch { }
+    $srvOut = Join-Path $logDir "server.log"
+    $srvErr = Join-Path $logDir "server.err.log"
+    try {
+        Start-Process -FilePath $Py -ArgumentList "main.py" -WorkingDirectory $Root `
+                      -WindowStyle Hidden -RedirectStandardOutput $srvOut -RedirectStandardError $srvErr
+    } catch {
+        # Redirection can fail if a previous instance still holds the file. Starting the server
+        # matters more than capturing it, so fall back rather than leave the stack down.
+        Write-Log "server output could not be redirected ($($_.Exception.Message)); starting without it"
+        Start-Process -FilePath $Py -ArgumentList "main.py" -WorkingDirectory $Root -WindowStyle Hidden
+    }
     Pop-Location
-    Write-Log "MCP server (re)started (stale instances cleared)"
+    # SAY WHAT WAS DONE, NOT WHAT WAS ACHIEVED. This used to read as though the server was up.
+    # Whether it stayed up is decided by the health probe on the next pass, not here.
+    Write-Log "MCP server process launched (stale instances cleared); output -> $srvErr"
 }
 
 function Start-TunnelHost {

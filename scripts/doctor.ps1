@@ -135,7 +135,11 @@ Check "agent_url" "Agent URL configured (Copilot Studio agent pasted)" `
 # 2. local MCP server
 Check "server_up" "MCP server up (http://127.0.0.1:8000/health)" `
     { (Invoke-WebRequest -Uri 'http://127.0.0.1:8000/health' -TimeoutSec 4 -UseBasicParsing).StatusCode -eq 200 } `
-    "start the stack: double-click start_all.bat   (or run .\scripts\start.ps1)"
+    ("if the stack has NOT been started: double-click start_all.bat. If it HAS -- the " +
+     "'Running supervisor' check below is green -- then the server is being launched and is " +
+     "dying, and the reason is in .setup\logs\server.err.log (last 20 lines). Read that " +
+     "before restarting anything: the supervisor is already relaunching it on a loop, so " +
+     "running start_all.bat again changes nothing.")
 
 # 3. Dev Tunnel -- LAYERED diagnosis. A single reachability probe cannot tell "CLI not
 #    installed" from "not logged in" from "tunnel deleted/expired" from "exists but not
