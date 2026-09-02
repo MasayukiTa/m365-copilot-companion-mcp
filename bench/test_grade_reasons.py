@@ -99,3 +99,58 @@ def test_the_note_is_bounded():
     # calibration tooling; a megabyte in one field helps neither.
     long_tail = "RUNNER_DONE\n" + ("x" * 5000) + "\nVERDICT=EVALERR\n"
     assert len(G._tail_reason(long_tail)) <= 300
+
+
+# --------------------------------------------------- the grader must be watchable while it runs
+
+
+def test_log_actually_prints(capsys):
+    """IT DID NOT, AND ITS OWN except HID THAT.
+
+    The flush fix was applied by rewriting statement-level print( to log( -- including the two
+    print() calls INSIDE log() itself. That made log() call itself, and the RecursionError was
+    caught by its own `except Exception: pass`, so every message vanished and three separate
+    checks showed an empty log and exit code 0. A handler that swallows its own failure turns a
+    broken function into a silent one.
+    """
+    G.log("hello from the grader")
+    assert "hello from the grader" in capsys.readouterr().out
+
+
+def test_log_does_not_call_itself():
+    # PARSED, NOT GREPPED. Two earlier versions of this test failed on strings rather than code:
+    # first the docstring that explains the recursion, then the literal "log() failed" inside the
+    # last-resort handler. Searching source text for a call is the same mistake in miniature --
+    # ast knows what a call is.
+    import ast
+    import inspect
+    import textwrap
+    tree = ast.parse(textwrap.dedent(inspect.getsource(G.log)))
+    fn = tree.body[0]
+    recursive = [n for n in ast.walk(fn)
+                 if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Name) and n.func.id == "log"]
+    assert not recursive, (
+        "log() calls itself; the RecursionError is then caught by its own handler and every "
+        "message vanishes")
+
+
+def test_log_flushes():
+    # Without flush, stdout is block-buffered when redirected -- which is how this job is always
+    # launched -- so a run of tens of minutes produced an EMPTY file until it exited, and
+    # "working" and "hung" were indistinguishable for the whole run.
+    import inspect
+    assert 'flush=True' in inspect.getsource(G.log)
+
+
+def test_no_handler_in_log_swallows_silently():
+    # rindex('except Exception') finds whichever handler is last in the TEXT, not the outermost
+    # one -- another property-by-substring guess. What matters is that NO handler here is a bare
+    # pass, because that is exactly what turned a RecursionError into silence for three checks.
+    import inspect
+    lines = [ln.strip() for ln in inspect.getsource(G.log).splitlines()]
+    for n, ln in enumerate(lines):
+        if ln.startswith('except'):
+            rest = [x for x in lines[n + 1:n + 4] if x and not x.startswith('#')]
+            assert rest and rest[0] != 'pass', (
+                'a handler in log() swallows silently (line %d)' % (n + 1))
