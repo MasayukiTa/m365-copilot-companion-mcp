@@ -307,6 +307,30 @@ def exhausted_ids(cap=None):
     return {i for i, n in attempt_counts().items() if int(n or 0) >= cap}
 
 
+def report_what_is_left():
+    """Name the work this run is not doing, at EVERY exit.
+
+    CALLED FROM BOTH ENDINGS ON PURPOSE. The first version of this ran only after batches had
+    been executed, and the stall it was written for happens on the other path: a slice with
+    nothing left prints "nothing ungraded in the slice -- done" and returns. That is the quiet
+    ending, and it was the one still saying nothing about the fifteen instances waiting in
+    another file.
+    """
+    for path, left in remaining_elsewhere():
+        log("STILL TO DO: %d instance(s) in %s" % (left, os.path.basename(path)))
+        log("    set SWE_SLICE_FILE=%s && python -m bench.pro_cycle"
+            % os.path.relpath(path, REPO).replace(chr(92), "/"))
+
+    # THE OTHER PLACE FINISHED WORK GOES UNNOTICED. A captured patch that nobody scored is a
+    # completed instance sitting at zero. Twelve had accumulated when this was written.
+    unscored = sorted(captured_ids() - graded_ids() - refused_ids())
+    if unscored:
+        log("UNSCORED: %d captured patch(es) have no grade; score them with"
+            % len(unscored))
+        log("    python -m bench.pro_grade_remote --instances " + " ".join(unscored[:3])
+            + (" ..." if len(unscored) > 3 else ""))
+
+
 def remaining_elsewhere(current=None):
     """Slice files other than this run's that still hold instances nobody has finished.
 
@@ -585,7 +609,7 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
         # run that reports these as finished is reporting a number it has not measured.
         retryable = [i for i in unverified if int(counts.get(i, 0)) < MAX_ATTEMPTS]
         log("%d instance(s) hold an UNGRADED patch (%d still within the %d-attempt cap and "
-            "will be tried again); grade them with bench.swe_grade_batch"
+            "will be tried again); grade them with bench.pro_grade_remote"
             % (len(unverified), len(retryable), MAX_ATTEMPTS))
     spent = len(exhausted_ids())
     if spent:
@@ -593,6 +617,7 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
             % (spent, MAX_ATTEMPTS))
     if not todo:
         log("nothing ungraded in the slice -- done")
+        report_what_is_left()
         return 0
 
     done = 0
@@ -766,23 +791,7 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
     log("cycle end: %d instance(s) attempted, %d graded in total, free %.2f GiB"
         % (done, len(graded_ids()), free_gb()))
 
-    # FINISHING THIS FILE IS NOT FINISHING. The fresh draw was split into a go slice and a
-    # non-go slice, each launched by hand; the non-go one printed the line above and the
-    # pipeline sat idle for ninety minutes with fifteen instances never started. The report
-    # was scoped to one file and the work was not.
-    for path, left in remaining_elsewhere():
-        log("STILL TO DO: %d instance(s) in %s" % (left, os.path.basename(path)))
-        log("    set SWE_SLICE_FILE=%s && python -m bench.pro_cycle"
-            % os.path.relpath(path, REPO).replace(chr(92), "/"))
-
-    # THE OTHER PLACE FINISHED WORK GOES UNNOTICED. A captured patch that nobody scored is a
-    # completed instance sitting at zero. Twelve had accumulated when this was written.
-    unscored = sorted(captured_ids() - graded_ids() - refused_ids())
-    if unscored:
-        log("UNSCORED: %d captured patch(es) have no grade; score them with"
-            % len(unscored))
-        log("    python -m bench.pro_grade_remote --instances " + " ".join(unscored[:3])
-            + (" ..." if len(unscored) > 3 else ""))
+    report_what_is_left()
     return 0
 
 
