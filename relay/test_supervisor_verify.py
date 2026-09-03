@@ -338,3 +338,68 @@ def test_a_slow_honest_failure_is_still_a_failure(monkeypatch):
     monkeypatch.setattr(CE, "_run_with_tree_timeout", fake)
     rec = SV.run_check("pytest -q", cwd=".")
     assert rec["ok"] is False and not rec.get("unavailable")
+
+
+# -- a pass that ran nothing is the dangerous direction ---------------------------------------
+
+def test_go_reporting_no_test_files_is_not_a_pass():
+    """`go test ./...` exits 0 and prints "[no test files]" when the packages it matched hold no
+    tests.
+
+    Every other guard in this module protects a patch from being blamed for the harness. This
+    one protects the harness from a patch, and it is the only one whose failure mode is a
+    PROMOTION: a patch that breaks a package badly enough that its tests stop being discovered
+    produces a green check, which is exactly backwards.
+    """
+    assert SV.nothing_was_exercised("ok  \tgithub.com/x/y\t[no test files]")
+
+
+def test_pytest_collecting_nothing_is_not_a_pass():
+    assert SV.nothing_was_exercised("collected 0 items\n\n= no tests ran in 0.30s =")
+
+
+def test_a_suite_that_actually_ran_is_left_alone():
+    assert not SV.nothing_was_exercised("collected 42 items\n42 passed in 31.2s")
+
+
+def test_a_green_run_that_exercised_nothing_is_not_promoted(monkeypatch):
+    """The whole point: this must reach "do not know", never DONE."""
+    def fake(command, timeout, cwd):
+        import time as _t
+        _t.sleep(SV.IMPOSSIBLY_FAST_S + 0.2)   # slow enough that only the marker can catch it
+        return "ok  \tgithub.com/x/y\t[no test files]"
+
+    import tools.code_exec as CE
+    monkeypatch.setattr(CE, "_run_with_tree_timeout", fake)
+    rec = SV.run_check("go test ./...", cwd=".")
+    assert rec["ok"] is True
+    assert rec.get("unavailable") is True, "an empty run must not stand as a pass"
+    assert "not a pass" in rec.get("why_unavailable", "")
+
+
+def test_a_green_run_too_fast_to_have_run_is_not_promoted(monkeypatch):
+    """The language-independent half, applied on the PASSING path too. A suite cannot start a
+    runner, resolve a module graph and execute tests in under a second and a half, so a green
+    result that fast did not measure the patch."""
+    def fake(command, timeout, cwd):
+        return "everything is fine"
+
+    import tools.code_exec as CE
+    monkeypatch.setattr(CE, "_run_with_tree_timeout", fake)
+    rec = SV.run_check("pytest -q", cwd=".")
+    assert rec["ok"] is True and rec.get("unavailable") is True
+    assert "too fast" in rec.get("why_unavailable", "")
+
+
+def test_a_real_green_suite_is_still_a_pass(monkeypatch):
+    """The guards must not make promotion impossible, or the step measures nothing at all and
+    the cure is worse than the disease."""
+    def fake(command, timeout, cwd):
+        import time as _t
+        _t.sleep(SV.IMPOSSIBLY_FAST_S + 0.2)
+        return "collected 42 items\n42 passed in 31.2s"
+
+    import tools.code_exec as CE
+    monkeypatch.setattr(CE, "_run_with_tree_timeout", fake)
+    rec = SV.run_check("pytest -q", cwd=".")
+    assert rec["ok"] is True and not rec.get("unavailable")
