@@ -245,7 +245,13 @@ def ingest(eval_results: dict, existing_path: str) -> int:
     and a Lite grade are readable side by side. EVALERR is never written from here: this
     function only sees instances the harness actually reported on.
     """
-    have = set()
+    # THE LAST ROW WINS, AS IT DOES IN graded_ids(). This used to treat an instance as already
+    # known if ANY non-EVALERR row mentioned it, without regard to order -- so a verdict that had
+    # been RETRACTED by a later EVALERR still blocked the real one. Sixteen instances graded in
+    # 1186 seconds, every image pulled, no None, produced "0 new rows in the ledger" because each
+    # carried a stale "not" from a run made while the eval filesystem was read-only. The
+    # measurement was discarded at the last step.
+    latest = {}
     if os.path.isfile(existing_path):
         with open(existing_path, encoding="utf-8") as fh:
             for line in fh:
@@ -256,8 +262,10 @@ def ingest(eval_results: dict, existing_path: str) -> int:
                     row = json.loads(line)
                 except ValueError:
                     continue
-                if str(row.get("verdict") or "").upper() != "EVALERR":
-                    have.add(row.get("instance_id"))
+                if isinstance(row, dict) and row.get("instance_id"):
+                    latest[row["instance_id"]] = row
+    have = {i for i, row in latest.items()
+            if str(row.get("verdict") or "").upper() != "EVALERR"}
     added = 0
     with open(existing_path, "a", encoding="utf-8", newline="\n") as fh:
         for inst, resolved in (eval_results or {}).items():
