@@ -140,6 +140,37 @@ def free_gb(path=None):
     return shutil.disk_usage(path or os.path.splitdrive(REPO)[0] + os.sep).free / (1024.0 ** 3)
 
 
+
+def settled_free_gb(samples=3, gap_s=20.0, sleeper=None):
+    """Free space, confirmed. Returns the LARGEST of several readings taken a few seconds apart.
+
+    FREE SPACE HERE IS NOT A LEVEL, IT IS A QUANTITY THAT SWINGS. The fleet's workers hold
+    several gigabytes of deleted-but-still-open temporary files while a batch runs; the space
+    is only returned to the filesystem when those child processes exit. Nothing on disk shows
+    it, no cache-clearing command frees it, and every dip recovers on its own.
+
+    Measured across one night: 6.2 -> 4.9 -> 3.5 -> 3.0 -> 2.2 -> 0.02 -> 4.9 -> 12 GiB. The
+    reading reached 22 MB and was back to 4.9 GiB five seconds later.
+
+    What that cost: at 04:06 on 2026-09-04 the cycle took one sample, saw 0.77 GiB, and stopped
+    the run. Six minutes later, with nothing deleted, there were 12 GiB free. The run killed
+    itself on the bottom of a swing.
+
+    THE LARGEST, NOT THE MEAN OR THE MINIMUM. The question this answers is "is there really not
+    enough room", and a single high reading is sufficient proof that there is. Averaging would
+    let a deep enough trough veto a disk that is genuinely fine.
+
+    Only called when a first cheap reading already looks bad, so the delay is paid on the rare
+    path rather than on every batch.
+    """
+    sleep = sleeper or time.sleep
+    best = free_gb()
+    for _ in range(max(0, samples - 1)):
+        sleep(gap_s)
+        best = max(best, free_gb())
+    return best
+
+
 def _load(path, default):
     try:
         with open(path, encoding="utf-8") as fh:
@@ -744,6 +775,11 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
             # line is the forbidden one, and it is why this reads the floor twice instead of
             # relaxing it once.
             have = _reclaim(have)
+        if have < DISK_FLOOR_GB:
+            # CONFIRM BEFORE STOPPING. One sample is not evidence: see settled_free_gb.
+            log("  %.2f GiB free is under the floor -- re-reading before stopping" % have)
+            have = settled_free_gb()
+            log("  settled reading: %.2f GiB" % have)
         if have < DISK_FLOOR_GB:
             # NOTHING RAN, SO NOTHING IS OWED -- the same rule as a gate refusal, on the one
             # path that did not follow it. note_attempts() is called at the top of this loop,
