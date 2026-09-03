@@ -878,3 +878,40 @@ def test_every_instance_is_yielded_exactly_once(monkeypatch):
     ids = ["i%d" % n for n in range(7)]
     out = [i for g in C.batches(ids, 0) for i in g]
     assert out == ids, out
+
+
+# -- the log must not cut the diagnosis -------------------------------------------------------
+
+def test_an_error_line_keeps_enough_to_be_actionable():
+    """MEASURED TWICE ON 2026-09-03, BOTH TIMES UNNOTICED AT THE TIME.
+
+    Fleet output was logged at ln[:160] whatever it said. The network outage that ended the
+    first run was recorded as
+
+        FETCH_FAIL: fatal: unable to access 'https://github.com/qutebrowser/qutebrowser.git/':
+
+    cut off exactly where git names the cause, leaving DNS, TLS, proxy and auth
+    indistinguishable. A worker's STUCK reason was cut mid-word at "ConnectionClosedError: no
+    close frame r". Both full texts existed only in status.json, which the next batch
+    overwrites.
+    """
+    err = ("FETCH_FAIL: fatal: unable to access 'https://github.com/x/y.git/': "
+           + "schannel: failed to receive handshake, SSL/TLS connection failed " * 3)
+    assert C._log_width(err) == 600
+    # The property that matters is that nothing is cut, not that some length is exceeded --
+    # the first version of this assertion tested the length of its own fixture and failed.
+    assert err[:C._log_width(err)] == err, "the error must survive whole"
+    assert len(err) > 160, "fixture must be long enough that the old 160 cap would have cut it"
+
+
+def test_a_progress_line_stays_short():
+    """The cap exists so a chatty fleet does not drown the log; that still holds."""
+    assert C._log_width("w0   turn=3  running  (waiting on the previous turn)") == 160
+
+
+def test_the_stuck_reason_that_was_cut_mid_word_now_survives():
+    reason = ("reason: not re-sent: the turn may already have been delivered and this goal "
+              "performs an action (delivery=unknown, ConnectionClosedError: no close frame "
+              "received or sent)")
+    kept = reason[:C._log_width(reason)]
+    assert kept.endswith("received or sent)"), kept[-40:]
