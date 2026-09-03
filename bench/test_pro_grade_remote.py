@@ -281,3 +281,39 @@ def test_an_instance_with_no_patch_is_named_not_dropped(tmp_path, capsys, monkey
     out = capsys.readouterr().out
     assert "have no gradeable patch and were NOT graded" in out
     assert "ghost" in out
+
+
+# -- folding results into the ledger ---------------------------------------------------------
+
+def test_a_retracted_verdict_does_not_block_the_real_one(tmp_path):
+    """The last step at which a measurement can be lost, and it lost one.
+
+    ingest() treated an instance as already known if ANY non-EVALERR row mentioned it, without
+    regard to order. Sixteen instances graded in 1186 seconds -- every image pulled, no None,
+    the first trustworthy grade in days -- reported "0 new rows in the ledger", because each
+    carried a stale "not" written while the eval filesystem was read-only and later retracted
+    by appending EVALERR. Order was never consulted, so the retraction was invisible.
+    """
+    led = tmp_path / "results.json"
+    led.write_text(
+        json.dumps({"instance_id": "a", "verdict": "not"}) + "\n"
+        + json.dumps({"instance_id": "a", "verdict": "EVALERR", "note": "host was read-only"})
+        + "\n", encoding="utf-8")
+    assert G.ingest({"a": True}, str(led)) == 1
+    rows = [json.loads(x) for x in led.read_text(encoding="utf-8").splitlines() if x.strip()]
+    assert rows[-1]["instance_id"] == "a" and rows[-1]["verdict"] == "RESOLVED"
+
+
+def test_an_instance_already_graded_for_real_is_not_regraded(tmp_path):
+    """The behaviour worth keeping: a standing verdict is not overwritten by a later run, or a
+    re-grade would silently replace measurements nobody asked to redo."""
+    led = tmp_path / "results.json"
+    led.write_text(json.dumps({"instance_id": "a", "verdict": "RESOLVED"}) + "\n",
+                   encoding="utf-8")
+    assert G.ingest({"a": False}, str(led)) == 0
+
+
+def test_an_instance_the_ledger_has_never_seen_is_written(tmp_path):
+    led = tmp_path / "results.json"
+    led.write_text("", encoding="utf-8")
+    assert G.ingest({"a": True, "b": False}, str(led)) == 2
