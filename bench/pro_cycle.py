@@ -125,7 +125,12 @@ def _load(path, default):
 
 #: Verdicts that mean the evaluation could not be RUN. They say nothing about the patch, so
 #: they must never retire an instance -- see test_evalerr_does_not_count_as_graded.
-_NOT_A_GRADE = {"EVALERR", ""}
+#:
+#: NOPATCH JOINS THEM. An instance that produced no patch had nothing evaluated, and it used to
+#: be written "not" -- a graded failure, which both counted it against the model and retired it
+#: so it was never retried. That is how nineteen instances entered the record as wrong answers
+#: during the run where the fleet gate was refusing and no worker ever started.
+_NOT_A_GRADE = {"EVALERR", "NOPATCH", ""}
 
 
 def graded_ids():

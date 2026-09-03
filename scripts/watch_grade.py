@@ -61,6 +61,15 @@ def assess(text: str):
     if m:
         notes.append("reported RESOLVED %s/%s" % (m.group(1), m.group(2)))
 
+    # THE DENOMINATOR THAT LINE USES IS NOT THE NUMBER OF PATCHES MEASURED. The grade script
+    # counts every instance in eval_results.json, and the harness writes false for instances it
+    # could not evaluate at all -- so "RESOLVED 0/14 = 0.0%" once meant "fourteen images were
+    # missing", not "fourteen patches were wrong". The script now prints UNEVALUATED beside it.
+    u = re.search(r"UNEVALUATED (\d+)", text)
+    if u and int(u.group(1)):
+        notes.append("%s instance(s) were NEVER EVALUATED -- the rate above is over the wrong "
+                     "denominator and those instances are not failures" % u.group(1))
+
     # A DURATION IS EVIDENCE. Pulling an image and running a repository's test suite does not
     # happen in seconds; a whole batch finishing in a minute means nothing was evaluated.
     t0 = re.search(r"\[(\d\d:\d\d:\d\d)\] START pro grade", text)

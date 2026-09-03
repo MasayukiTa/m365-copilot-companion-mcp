@@ -49,6 +49,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -228,23 +229,72 @@ def grade_script(raw_wsl: str, preds_wsl: str, out_wsl: str, out_log: str,
         '( "$PY" -c "import json;[print(\'jefzda/sweap-images:\'+json.loads(l)[\'dockerhub_tag\']) for l in open(\'$RAW\')]"'
         " | xargs -P%d -I{} bash -c 'for t in 1 2 3 4 5; do timeout 800 docker pull \"{}\" >/dev/null 2>&1 && exit 0; sleep 12; done' ) & PUL=$!"
         % pull_parallel,
+        # THE WHOLE HARNESS OUTPUT IS KEPT, not just its last three lines.
+        #
+        # `| tail -3` threw away every per-instance line, and those lines are the ONLY place an
+        # instance the harness could not evaluate is distinguishable from one whose patch was
+        # wrong: swe_bench_pro_eval coerces an unevaluatable instance to false before it writes
+        # eval_results.json, so both arrive here as the same boolean. Measured -- the night2
+        # grade wrote FOURTEEN false verdicts and its log preserved the reason for exactly one
+        # of them, so thirteen infrastructure failures entered the ledger as solver failures
+        # with no surviving trace. tee keeps the evidence; tail still keeps the console short.
         'timeout 30000 "$PY" swe_bench_pro_eval.py --use_local_docker --num_workers %d \\' % workers,
         '  --raw_sample_path "$RAW" --patch_path "$PREDS" --scripts_dir run_scripts \\',
-        '  --dockerhub_username jefzda --output_dir "$OUT" 2>&1 | tail -3',
+        '  --dockerhub_username jefzda --output_dir "$OUT" 2>&1 | tee "$OUT/harness.log" | tail -3',
         'kill "$PUL" 2>/dev/null',
+        # NEXT TO THE SCORE, so "RESOLVED 0/14 = 0.0%" can never again be read as a measurement
+        # of fourteen patches. grep -c prints a count and exits 1 when it is zero, so the count
+        # is taken on its own line rather than through a `|| echo 0` that would print twice.
+        'U=$(grep -c "returned None" "$OUT/harness.log" 2>/dev/null)',
+        'echo "UNEVALUATED ${U:-0}"',
         '"$PY" -c "import json;m=json.load(open(\'$OUT/eval_results.json\'));'
         "r=sum(1 for v in m.values() if v);print('RESOLVED %d/%d = %.1f%%'%(r,len(m),100*r/max(1,len(m))))\"",
         'echo "DONE_PRO_GRADE $(date +%H:%M:%S) free=$(freeG)G"',
     ]) + "\n"
 
 
-def ingest(eval_results: dict, existing_path: str) -> int:
+#: Lines by which the harness names an instance it could NOT evaluate. Both are per-instance and
+#: both were being discarded by `| tail -3` before this file learned to keep the log.
+_UNEVALUATED_PATTERNS = (
+    re.compile(r"Evaluation for (\S+) returned None"),
+    re.compile(r"Failed to pull or find image locally for ([^\s:]+)"),
+)
+
+
+def unevaluated_instances(harness_log: str) -> set:
+    """Instances the harness could not evaluate, read from its own output.
+
+    THE DISTINCTION THIS RECOVERS IS DESTROYED EVERYWHERE ELSE. swe_bench_pro_eval coerces an
+    instance it could not run to false before writing eval_results.json, so "the patch did not
+    fix it" and "no image, no container, nothing ran" are the same byte by the time any of this
+    code sees them. eval_to_ledger states the opposite in its own docstring -- that an instance
+    the grader could not evaluate "is absent from its map" -- and the files on disk disprove it:
+    pro_eval_results_night2.json and _rw1.json each hold fourteen entries, every one false, from
+    runs whose logs say the images could not be pulled at all.
+
+    The harness's stdout is the last surviving place the two differ, which is why the grade
+    script now tees it to a file instead of tailing it away.
+    """
+    out = set()
+    for pattern in _UNEVALUATED_PATTERNS:
+        for inst in pattern.findall(harness_log or ""):
+            out.add(inst)
+    return out
+
+
+def ingest(eval_results: dict, existing_path: str, unevaluated=None) -> int:
     """Fold the harness's {instance_id: bool} into the run's verdict ledger. Returns rows added.
 
     Written as RESOLVED / not, the same vocabulary the rest of the pipeline uses, so a Pro grade
-    and a Lite grade are readable side by side. EVALERR is never written from here: this
-    function only sees instances the harness actually reported on.
+    and a Lite grade are readable side by side.
+
+    AN INSTANCE THE HARNESS NEVER EVALUATED IS WRITTEN EVALERR, NOT "not". It arrives here as
+    false, exactly like a patch that failed its tests, and recording it as a failure puts an
+    infrastructure fault into a number that is supposed to be about the model. `unevaluated` is
+    the set recovered from the harness's own log by unevaluated_instances(); EVALERR does not
+    retire an instance, so it will be graded again rather than counted at zero for ever.
     """
+    unevaluated = set(unevaluated or ())
     # THE LAST ROW WINS, AS IT DOES IN graded_ids(). This used to treat an instance as already
     # known if ANY non-EVALERR row mentioned it, without regard to order -- so a verdict that had
     # been RETRACTED by a later EVALERR still blocked the real one. Sixteen instances graded in
@@ -271,9 +321,17 @@ def ingest(eval_results: dict, existing_path: str) -> int:
         for inst, resolved in (eval_results or {}).items():
             if inst in have:
                 continue
-            fh.write(json.dumps({"instance_id": inst,
-                                 "verdict": "RESOLVED" if resolved else "not",
-                                 "grader": "swe_bench_pro_eval"}, ensure_ascii=False) + "\n")
+            if inst in unevaluated:
+                # NOT A VERDICT ABOUT THE PATCH. Recorded so the instance is visibly outstanding
+                # rather than silently scored zero, and so graded_ids() leaves it to be re-run.
+                row = {"instance_id": inst, "verdict": "EVALERR",
+                       "grader": "swe_bench_pro_eval",
+                       "note": "the harness reported no evaluation for this instance"}
+            else:
+                row = {"instance_id": inst,
+                       "verdict": "RESOLVED" if resolved else "not",
+                       "grader": "swe_bench_pro_eval"}
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
             added += 1
     return added
 
@@ -383,11 +441,39 @@ def main(argv=None):
         return 2
     with open(local_results, encoding="utf-8") as fh:
         results = json.load(fh)
-    added = ingest(results, a.results)
-    resolved = sum(1 for v in results.values() if v)
+
+    # THE HARNESS LOG IS PART OF THE RESULT, not a convenience. Without it every instance the
+    # harness could not evaluate is indistinguishable from one whose patch was wrong, because
+    # both are `false` in eval_results.json. Fetched best-effort: a grade that produced verdicts
+    # is still worth ingesting if the log did not come back, but then nothing can be separated
+    # and the run says so rather than quietly presenting infrastructure failures as a score.
+    local_harness = os.path.join(SW, "pro_harness_%s.log" % a.tag)
+    unevaluated, have_log = set(), False
+    if scp_from(host, "%s/pro_out_%s/harness.log" % (REMOTE_WIN, a.tag), local_harness):
+        have_log = True
+        with open(local_harness, encoding="utf-8", errors="replace") as fh:
+            unevaluated = unevaluated_instances(fh.read()) & set(results)
+    else:
+        log("WARNING: the harness log did not come back. Infrastructure failures cannot be told "
+            "apart from wrong patches in this batch, so the rate below may understate the model.")
+
+    added = ingest(results, a.results, unevaluated)
+    scored = [i for i in results if i not in unevaluated]
+    resolved = sum(1 for i in scored if results[i])
     log("graded %d instance(s): RESOLVED %d/%d = %.1f%%  (%d new rows in the ledger)"
-          % (len(results), resolved, len(results),
-             100.0 * resolved / max(1, len(results)), added))
+        % (len(scored), resolved, len(scored),
+           100.0 * resolved / max(1, len(scored)), added))
+    if unevaluated:
+        # SEPARATE LINE, SEPARATE NUMBER. These are not failures and must never share a
+        # denominator with them.
+        log("%d instance(s) were NOT EVALUATED (no image, nothing ran) and are excluded from "
+            "the rate above; they stay outstanding and will be graded again:" % len(unevaluated))
+        for i in sorted(unevaluated)[:5]:
+            log("    %s" % i)
+        if len(unevaluated) > 5:
+            log("    ... and %d more" % (len(unevaluated) - 5))
+    elif have_log:
+        log("every instance in this batch was actually evaluated")
     return 0
 
 
