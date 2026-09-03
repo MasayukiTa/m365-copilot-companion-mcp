@@ -64,6 +64,10 @@ def main(argv=None):
     ap.add_argument("--ledger", default=os.path.join(SW, "pro_cycle_results.json"))
     ap.add_argument("--arguable", default=os.path.join(SW, "pro_arguable.json"),
                     help="{instance_id: why} for instances whose exclusion is a judgement call")
+    ap.add_argument("--gold", default=os.path.join(SW, "gold_results.json"),
+                    help="verdicts from grading the dataset's OWN gold patch. An instance gold "
+                         "cannot solve is not a question the model was asked; leaving it in the "
+                         "denominator charges the model for a broken instance")
     a = ap.parse_args(argv)
 
     want = PR._slice_ids(a.slice)
@@ -73,9 +77,30 @@ def main(argv=None):
     rows = {i: r for i, r in PR.latest_rows(a.ledger).items() if i in want}
     arguable = load_arguable(a.arguable)
 
+    # GOLD IS THE CALIBRATION. The grade is computed as (f2p | p2p) <= passed_tests, where
+    # passed_tests comes from a parser reading stdout -- so a name the parser cannot normalise
+    # makes a passing test invisible and the instance unresolvable by anyone. The dataset's own
+    # gold patch is the one input that must resolve; where it does not, the instance is broken
+    # and the model was never really asked the question.
+    #
+    # Measured 2026-09-03: gold resolved 39 of 40. The one it could not is excluded here and
+    # named below, never silently dropped.
+    unsolvable = {}
+    gold = PR.latest_rows(a.gold) if a.gold else {}
+    for inst, row in gold.items():
+        if inst in rows and str(row.get("verdict") or "").upper() != "RESOLVED":
+            unsolvable[inst] = "gold パッチでも解決しない"
+    if unsolvable:
+        rows = {i: r for i, r in rows.items() if i not in unsolvable}
+
     t = PR.tally(rows)
     k, n = len(t["resolved"]), t["evaluated"]
     lo, hi = wilson(k, n)
+    if unsolvable:
+        print("EXCLUDED AS BROKEN -- the dataset's gold patch does not resolve these either:")
+        for i in sorted(unsolvable):
+            print("    %s" % i[:74])
+        print()
 
     print("population: %s -- %d of %d instance(s) have a row"
           % (os.path.basename(a.slice), len(rows), len(want)))
