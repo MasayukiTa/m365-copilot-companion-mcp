@@ -620,12 +620,18 @@ def batches(ids, size):
 #: Lines that carry a DIAGNOSIS get more room than lines that carry progress.
 #:
 #: Fleet output was logged at ln[:160] regardless of content, which is fine for a turn counter
-#: and useless for an error. Measured twice on 2026-09-03, both times without noticing at the
-#: time: the network outage that ended the first run was logged as
+#: and useless for an error. Measured on 2026-09-03: a worker's STUCK reason was cut mid-word at
+#:     ConnectionClosedError: no close frame r
+#: and the full text ("...no close frame received or sent") survived only in status.json, which
+#: the next batch overwrites -- so by the time anyone looked it was gone.
+#:
+#: A CORRECTION, BECAUSE THE FIRST VERSION OF THIS COMMENT TAUGHT THE WRONG LESSON. It also
+#: blamed this cap for the run-ending
 #:     FETCH_FAIL: fatal: unable to access 'https://github.com/qutebrowser/qutebrowser.git/':
-#: cut off exactly where git names the cause -- DNS, TLS, proxy, auth, all indistinguishable --
-#: and a worker's STUCK reason was cut mid-word at "ConnectionClosedError: no close frame r".
-#: The full text survived only in status.json, which the next batch overwrites.
+#: ending where git should name the cause. That line is 85 characters; the cap never touched it.
+#: pro_stage_goals builds it from `f.stderr.strip()[-200:]`, and git's own stderr ended there
+#: with no reason -- an empty curl error, which a proxy or TLS failure can produce. Widening
+#: this cap does not recover it and never would have.
 _ERRORISH = ("fail", "error", "fatal", "traceback", "refus", "stuck", "cannot", "could not",
              "denied", "timeout", "timed out", "unable", "no such", "missing", "exceeds")
 

@@ -883,17 +883,14 @@ def test_every_instance_is_yielded_exactly_once(monkeypatch):
 # -- the log must not cut the diagnosis -------------------------------------------------------
 
 def test_an_error_line_keeps_enough_to_be_actionable():
-    """MEASURED TWICE ON 2026-09-03, BOTH TIMES UNNOTICED AT THE TIME.
+    """Measured on 2026-09-03: a worker's STUCK reason was cut mid-word at
+    "ConnectionClosedError: no close frame r", and the full text survived only in status.json,
+    which the next batch overwrites.
 
-    Fleet output was logged at ln[:160] whatever it said. The network outage that ended the
-    first run was recorded as
-
-        FETCH_FAIL: fatal: unable to access 'https://github.com/qutebrowser/qutebrowser.git/':
-
-    cut off exactly where git names the cause, leaving DNS, TLS, proxy and auth
-    indistinguishable. A worker's STUCK reason was cut mid-word at "ConnectionClosedError: no
-    close frame r". Both full texts existed only in status.json, which the next batch
-    overwrites.
+    NOT the FETCH_FAIL line, which an earlier version of this docstring also blamed on the cap.
+    That line is 85 characters and the cap never reached it -- pro_stage_goals builds it from
+    `f.stderr.strip()[-200:]` and git's stderr genuinely ended with no reason. Checking that
+    before writing it down would have taken one grep.
     """
     err = ("FETCH_FAIL: fatal: unable to access 'https://github.com/x/y.git/': "
            + "schannel: failed to receive handshake, SSL/TLS connection failed " * 3)
