@@ -135,6 +135,22 @@ _NOT_RUN_MARKERS = (
     # without deleting go.mod -- something the goal text forbids and no observed patch did.
     "does not contain main module",
     "go.mod file not found",
+
+    # THE DEPENDENCY DOWNLOAD NEVER GOT THROUGH THE NETWORK. Measured on the first go batch of
+    # the baseline run: all three flipt instances recorded VERIFY_FAILED with
+    #   tls: failed to verify certificate: x509: certificate signed by unknown authority
+    #   Get "https://proxy.golang.org/go.uber.org/zap/@v/v1.24.0.zip"
+    # in 4.4 seconds -- a corporate TLS middlebox, not a defect in the patch. The module cache
+    # had been cleared to free disk before the run, so nothing was resolvable offline any more,
+    # and every go verification in the run was about to be recorded as a wrong answer.
+    #
+    # SAFE BY CONSTRUCTION: a patch cannot make a certificate untrusted. These say the toolchain
+    # could not fetch what it needed, which is the definition of "the check did not run".
+    "certificate signed by unknown authority",
+    "tls: failed to verify certificate",
+    "certificate_verify_failed",
+    "sslcertverificationerror",
+    "could not fetch url",
 )
 
 #: DELIBERATELY NOT MARKERS, though the first draft had them. Each is reachable from a bad patch,
