@@ -146,16 +146,56 @@ def format_report(t: dict, by_repo=False, rows=None) -> str:
     return "\n".join(out)
 
 
+def _slice_ids(path):
+    """The instance ids named by a slice file. None if it cannot be read."""
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if isinstance(data, dict):
+        data = data.get("instances") or data.get("rows") or []
+    out = set()
+    for row in data:
+        if isinstance(row, dict) and row.get("instance_id"):
+            out.add(row["instance_id"])
+        elif isinstance(row, str):
+            out.add(row)
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="bench.pro_ledger_report",
                                  description=__doc__.splitlines()[0])
     ap.add_argument("--ledger", default=LEDGER)
     ap.add_argument("--by-repo", action="store_true")
+    ap.add_argument("--slice", default=None,
+                    help="a slice json; report ONLY its instances. A benchmark number is about "
+                         "a stated population, and this ledger holds every instance ever graded "
+                         "under every configuration -- quoting a run's result from the whole "
+                         "file silently mixes it with runs that used a different scaffold")
     a = ap.parse_args(argv)
     rows = latest_rows(a.ledger)
     if not rows:
         print("no ledger at %s" % a.ledger)
         return 1
+
+    if a.slice:
+        want, missing = _slice_ids(a.slice), None
+        if want is None:
+            print("could not read the slice at %s" % a.slice)
+            return 1
+        missing = want - set(rows)
+        rows = {i: r for i, r in rows.items() if i in want}
+        # SAID OUT LOUD. An instance in the slice with no row is not a failure and not a pass;
+        # it is work that has not happened, and leaving it out of both the numerator and the
+        # denominator without saying so is how a partial run gets quoted as a finished one.
+        print("population: %s -- %d of %d instance(s) have a row"
+              % (os.path.basename(a.slice), len(rows), len(want)))
+        if missing:
+            print("            %d not yet graded" % len(missing))
+        print()
+
     t = tally(rows)
     print(format_report(t, a.by_repo, rows))
     return 0
