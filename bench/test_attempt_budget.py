@@ -399,3 +399,45 @@ def test_an_instance_whose_checkout_failed_gets_its_attempt_back(tmp_path, monke
     assert C.attempt_counts() == {"a": 1}
     assert "b" not in C.exhausted_ids(cap=1)
     assert "a" in C.exhausted_ids(cap=1)
+
+
+# -- free space is a swing, not a level -------------------------------------------------------
+
+def test_a_single_low_reading_does_not_stop_a_run_that_has_room(monkeypatch):
+    """THE ONE THAT KILLED A RUN.
+
+    At 04:06 on 2026-09-04 the cycle took one sample, saw 0.77 GiB, and stopped before batch 18.
+    Six minutes later, with nothing deleted, there were 12 GiB free. The space had been held by
+    deleted-but-still-open temporary files belonging to the workers' own child processes, and
+    was returned when they exited.
+
+    Measured across that night: 6.2 -> 4.9 -> 3.5 -> 3.0 -> 2.2 -> 0.02 -> 4.9 -> 12 GiB. The
+    reading reached 22 MB and was back to 4.9 GiB five seconds later. One sample of that is not
+    evidence of anything.
+    """
+    readings = iter([0.77, 12.0, 11.5])
+    monkeypatch.setattr(C, "free_gb", lambda *a, **k: next(readings, 11.5))
+    assert C.settled_free_gb(sleeper=lambda s: None) == 12.0
+
+
+def test_a_genuinely_full_disk_still_reads_full(monkeypatch):
+    """The guard must not talk itself out of a real shortage."""
+    readings = iter([0.5, 0.6, 0.4])
+    monkeypatch.setattr(C, "free_gb", lambda *a, **k: next(readings, 0.4))
+    assert C.settled_free_gb(sleeper=lambda s: None) == 0.6
+
+
+def test_the_largest_reading_wins_not_the_average(monkeypatch):
+    """The question is "is there really not enough room", and one high reading settles it.
+    Averaging would let a deep enough trough veto a disk that is fine."""
+    readings = iter([0.1, 0.1, 9.0])
+    monkeypatch.setattr(C, "free_gb", lambda *a, **k: next(readings, 9.0))
+    assert C.settled_free_gb(sleeper=lambda s: None) == 9.0
+
+
+def test_it_waits_between_samples(monkeypatch):
+    """Sampling three times in the same millisecond measures the same instant three times."""
+    monkeypatch.setattr(C, "free_gb", lambda *a, **k: 1.0)
+    waited = []
+    C.settled_free_gb(samples=3, gap_s=20.0, sleeper=waited.append)
+    assert waited == [20.0, 20.0], waited
