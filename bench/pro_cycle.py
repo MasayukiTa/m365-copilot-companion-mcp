@@ -45,8 +45,25 @@ if not os.path.isfile(PY):
     PY = sys.executable
 
 LOG = os.path.join(SW, "pro_cycle.log")
-PREDS = os.path.join(SW, "pro_cycle_preds.json")
-RESULTS = os.path.join(SW, "pro_cycle_results.json")
+
+
+def _path(env, default):
+    """A run's own file, so a REPEAT does not write into the measurement it is repeating.
+
+    Reading the same instance twice is the only way to see how much of the resolve rate is
+    run-to-run noise, and the cycle skips anything already in its ledger -- so without this a
+    second pass over the same slice does nothing at all, and forcing it by deleting rows would
+    destroy the first measurement. Each repeat gets its own ledger, predictions and attempt
+    counts; the baseline's files are never touched.
+    """
+    v = (os.environ.get(env) or "").strip()
+    if not v:
+        return os.path.join(SW, default)
+    return v if os.path.isabs(v) else os.path.join(SW, v)
+
+
+PREDS = _path("SWE_PREDS_FILE", "pro_cycle_preds.json")
+RESULTS = _path("SWE_RESULTS_FILE", "pro_cycle_results.json")
 GOALS = os.path.join(SW, "pro_cycle_goals.jsonl")
 STATUS = os.path.join(REPO, ".fleet", "status.json")
 
@@ -284,7 +301,7 @@ def refused_ids():
 #: Attempts per instance, kept beside the predictions. A separate file because the predictions
 #: file holds ONE row per instance -- the latest patch overwrites the previous one -- so it
 #: cannot say how many times an instance has been tried.
-ATTEMPTS = os.path.join(SW, "pro_attempts.json")
+ATTEMPTS = _path("SWE_ATTEMPTS_FILE", "pro_attempts.json")
 
 #: Two, because two is the number that was measured (42.9% at one attempt, 81.0% at two), not
 #: because more is assumed to be better. Settable so the next measurement can move it rather
