@@ -25,6 +25,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
 import swe_check_remote as R   # reuse the proven SSH/scp/wsl plumbing
+import verdicts as _V          # the one definition of "this row is not a measurement"
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SWEDIR = os.path.join(REPO, ".fleet", "swe")
@@ -59,7 +60,10 @@ def load_results(path):
                 continue
             try:
                 d = json.loads(line)
-                if str(d.get("verdict") or "").upper() == "EVALERR":
+                # Through the shared predicate: NOPATCH is not a verdict either, and a literal
+                # comparison here would treat "no patch was produced" as a result already held
+                # and skip the instance for ever.
+                if not _V.is_measurement(d.get("verdict")):
                     continue
                 out[d["instance_id"]] = d
             except Exception:
@@ -245,10 +249,12 @@ def _summary(results_path, insts):
     n = len(sub)
     resolved = sum(1 for r in sub.values() if r.get("verdict") == "RESOLVED")
     notr = sum(1 for r in sub.values() if r.get("verdict") == "not")
-    evalerr = sum(1 for r in sub.values() if r.get("verdict") == "EVALERR")
+    # EVERY non-measurement, named. Counting only EVALERR left NOPATCH invisible: the rows
+    # were correctly kept out of `graded`, and a reader had no way to see they existed.
+    unmeasured = sum(1 for r in sub.values() if not _V.is_measurement(r.get("verdict")))
     graded = resolved + notr
-    log("=== GRADE SUMMARY: %d graded -> RESOLVED %d / not %d | EVALERR %d (excluded) ==="
-        % (graded, resolved, notr, evalerr))
+    log("=== GRADE SUMMARY: %d graded -> RESOLVED %d / not %d | %d not measured (excluded) ==="
+        % (graded, resolved, notr, unmeasured))
     if graded:
         log("    pass@1 (graded only) = %d/%d = %.1f%%" % (resolved, graded, 100.0 * resolved / graded))
 

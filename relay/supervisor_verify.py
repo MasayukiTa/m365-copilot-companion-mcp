@@ -131,12 +131,21 @@ _NOT_RUN_MARKERS = (
     # forty go checks recorded VERIFY_FAILED, all of them "[setup failed]" in about 0.15s with
     # "directory prefix . does not contain main module" -- go run outside a module, which
     # exercises nothing at all.
+    # Only the two that mean "this directory is not a Go module", which a patch cannot cause
+    # without deleting go.mod -- something the goal text forbids and no observed patch did.
     "does not contain main module",
     "go.mod file not found",
-    "no go files in",
-    "[setup failed]",
-    "no required module provides package",
 )
+
+#: DELIBERATELY NOT MARKERS, though the first draft had them. Each is reachable from a bad patch,
+#: and this list must never contain a pattern a genuine failure can print:
+#:   "[setup failed]"                     go test prints it for a COMPILE ERROR -- exactly a bad
+#:                                        patch, and the single most likely way one fails.
+#:   "no required module provides package" a bad import added by the patch.
+#:   "no go files in"                     a patch that removed the last file in a package.
+#: Routing these to "unavailable" would launder real defects into "do not know", which is the
+#: opposite of the mistake this list was extended to fix and strictly worse: a false failure is
+#: visible and annoying, a laundered one is invisible and flattering.
 
 #: Below this, a repository's test suite did not run. Nothing in these projects -- go, pytest,
 #: jest -- starts a runner, resolves a module graph and executes a suite in under a second.
@@ -165,13 +174,16 @@ def run_check(command: str, cwd: str, timeout_s: float = None):
     repository: killing only the shell leaves grandchildren running, and 40 of them accumulated
     over 33 hours before anyone noticed.
     """
-    started = time.time()
+    # MONOTONIC, because this duration is now EVIDENCE. A wall clock can step -- NTP
+    # correction, DST -- and a backwards step would make a check look impossibly fast and
+    # silently reclassify a real failure as 'do not know'.
+    started = time.monotonic()
     try:
         from tools.code_exec import _run_with_tree_timeout
         out = _run_with_tree_timeout(command, timeout_s or DEFAULT_TIMEOUT_S, cwd)
         ok = ("[timeout" not in out) and ("[returncode:" not in out)
         record = {"command": command, "ok": ok, "output": out[-4000:],
-                  "duration_s": round(time.time() - started, 2)}
+                  "duration_s": round(time.monotonic() - started, 2)}
         if not ok and not_actually_run(out):
             # THE DISTINCTION THE FAILURE TAXONOMY TURNS ON. "the tests failed" and "the test
             # runner never started" are different facts, and only the first is evidence about
@@ -192,7 +204,7 @@ def run_check(command: str, cwd: str, timeout_s: float = None):
     except Exception as exc:
         return {"command": command, "ok": False,
                 "output": "%s: %s" % (type(exc).__name__, str(exc)[:400]),
-                "duration_s": round(time.time() - started, 2),
+                "duration_s": round(time.monotonic() - started, 2),
                 "unavailable": True}
 
 

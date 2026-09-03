@@ -18,6 +18,10 @@ owner is a deterministic, zero-dependency first cut that is already useful for r
 """
 from __future__ import annotations
 
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', '..', 'bench'))
+import verdicts as _V   # the one definition of "this row is not a measurement"
+
 import json
 import math
 import os
@@ -155,7 +159,10 @@ def calibration_report(grade_results_path: str | None = None, *, dedupe: str = "
     by: dict[str, list] = {}
     for rec in effective:
         verdict = str(rec.get("verdict", "")).strip().upper()
-        if verdict == "EVALERR":
+        # NOPATCH TOO. A literal comparison here excluded only eval-host faults, so an
+        # instance that produced no patch -- nothing evaluated at all -- entered this
+        # denominator as a competence failure.
+        if not _V.is_measurement(verdict):
             n_evalerr_excluded += 1
             continue  # infra fault: out of the denominator entirely
         cls = classify_instance(rec["instance_id"])

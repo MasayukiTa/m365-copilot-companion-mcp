@@ -18,6 +18,11 @@ and degrade to empty/None on any malformed line or missing file. stdlib only; de
 """
 from __future__ import annotations
 
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                                  '..', '..', 'bench'))
+import verdicts as _V   # the one definition of "this row is not a measurement"
+
 from relay.selfimprove import calibration as C
 
 
@@ -138,8 +143,9 @@ def assemble_misses(task_class: str, grade_results_path: str | None = None,
             if C.classify_instance(iid) != task_class:
                 continue
             verdict = str(rec.get("verdict", "")).strip().upper()
-            if verdict == "RESOLVED" or verdict == "EVALERR":
-                continue  # resolved = not a miss; EVALERR = infra, never a diagnosis target
+            # NOPATCH is not a miss to diagnose either -- there is no patch to look at.
+            if verdict == "RESOLVED" or not _V.is_measurement(verdict):
+                continue  # resolved = not a miss; a non-measurement = nothing to diagnose
             misses.add(iid)
         return sorted(misses)
     except Exception:

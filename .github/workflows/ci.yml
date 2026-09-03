@@ -368,6 +368,7 @@ jobs:
             bench/test_pro_capture.py \
             bench/test_pro_grade_remote.py \
             bench/test_pro_ledger_report.py \
+            bench/test_verdicts.py \
             bench/test_pro_record_arm.py \
             bench/test_pro_record_denominator.py \
             bench/test_retry_floor.py \

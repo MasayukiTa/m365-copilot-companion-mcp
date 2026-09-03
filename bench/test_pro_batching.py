@@ -807,7 +807,7 @@ def _cycle_statement_order():
                 if (isinstance(sub, ast.Constant) and sub.value == "pro_grade_remote.py"
                         and "grade" not in marks):
                     marks["grade"] = node.lineno
-                if (isinstance(sub, ast.Constant) and sub.value == "--keep"
+                if (isinstance(sub, ast.Constant) and sub.value == "--keep-worktrees"
                         and "keep" not in marks):
                     marks["keep"] = node.lineno
     return marks
@@ -826,8 +826,10 @@ def test_the_worktrees_survive_until_verification_has_run():
     """
     marks = _cycle_statement_order()
     assert "keep" in marks, (
-        "pro_capture must be called with --keep, or it deletes the worktree that the "
-        "verification step is about to run in")
+        "pro_capture must be called with --keep-worktrees, or it deletes the worktree that "
+        "the verification step is about to run in. NOT plain --keep: that also holds the "
+        "routed CONTAINER, and forty of those fill a volume with 25 GB free -- two different "
+        "resources behind one flag, which is how a correctness fix bought a disk regression.")
 
 
 def test_the_trees_are_discarded_before_the_grade_not_after_it():
