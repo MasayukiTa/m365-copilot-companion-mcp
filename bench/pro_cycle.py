@@ -598,10 +598,22 @@ def batches(ids, size):
         by_lang.setdefault(lang_of(i), []).append(i)
     order = sorted(by_lang, key=lambda l: LANG_DISK_MB.get(l, DEFAULT_DISK_MB))
     for lang in order:
-        group = by_lang[lang]
-        width = size if size else concurrency_for([lang], free_gb())
-        for i in range(0, len(group), width):
-            yield group[i:i + width]
+        # RE-READ THE DISK FOR EVERY BATCH, not once per language.
+        #
+        # This computed `width` a single time, when the generator first reached a language, and
+        # every later batch of that language reused it. Measured on the re-run of 2026-09-03:
+        # the python group was entered at 17:44 with 4.55 GiB free, fixing width=1; 3.2 GB were
+        # then reclaimed and the free space reached 7.53 GiB -- enough for two -- and the cycle
+        # went on staging one at a time, because the number had already been decided. The log
+        # even printed the new free figure on each batch line while ignoring it.
+        #
+        # Free space moves by about 3 GB inside a batch as worktrees are created and discarded,
+        # so a width taken from one instant is a guess about every instant after it.
+        remaining = by_lang[lang]
+        while remaining:
+            width = size if size else concurrency_for([lang], free_gb())
+            yield remaining[:width]
+            remaining = remaining[width:]
 
 
 def run(cmd, timeout, label):
