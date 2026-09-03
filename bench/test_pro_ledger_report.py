@@ -105,3 +105,61 @@ def test_a_repository_is_read_past_hyphens_in_the_owner(tmp_path):
 
 def test_an_id_that_carries_no_repository_says_so():
     assert R.repo_of("nonsense") == "?"
+
+
+# -- reporting over ONE population ------------------------------------------------------------
+
+def test_a_slice_reports_only_its_own_population(tmp_path, capsys):
+    """A benchmark number is about a stated population.
+
+    This ledger holds every instance ever graded, under every scaffold configuration and several
+    overlapping slices. Quoting one run's result from the whole file mixes it with runs that used
+    different code -- which is exactly how 70.0% and 59.0% came to be compared as though they had
+    measured the same thing.
+    """
+    led = tmp_path / "led.jsonl"
+    led.write_text("\n".join(json.dumps(r) for r in [
+        {"instance_id": "mine_a", "verdict": "RESOLVED"},
+        {"instance_id": "mine_b", "verdict": "not"},
+        {"instance_id": "old_c", "verdict": "not"},
+        {"instance_id": "old_d", "verdict": "not"},
+    ]) + "\n", encoding="utf-8")
+    sl = tmp_path / "slice.json"
+    sl.write_text(json.dumps([{"instance_id": "mine_a"}, {"instance_id": "mine_b"}]),
+                  encoding="utf-8")
+
+    assert R.main(["--ledger", str(led), "--slice", str(sl)]) == 0
+    out = capsys.readouterr().out
+    assert "RESOLVED 1 / 2 evaluated = 50.0%" in out, out
+    assert "2 of 2 instance(s) have a row" in out
+
+
+def test_an_ungraded_slice_member_is_named_not_silently_dropped(tmp_path, capsys):
+    """Work that has not happened is neither a pass nor a failure, and dropping it from both the
+    numerator and the denominator without saying so is how a partial run is quoted as a finished
+    one."""
+    led = tmp_path / "led.jsonl"
+    led.write_text(json.dumps({"instance_id": "a", "verdict": "RESOLVED"}) + "\n",
+                   encoding="utf-8")
+    sl = tmp_path / "slice.json"
+    sl.write_text(json.dumps([{"instance_id": "a"}, {"instance_id": "b"}, {"instance_id": "c"}]),
+                  encoding="utf-8")
+
+    assert R.main(["--ledger", str(led), "--slice", str(sl)]) == 0
+    out = capsys.readouterr().out
+    assert "1 of 3 instance(s) have a row" in out
+    assert "2 not yet graded" in out
+
+
+def test_a_slice_of_bare_ids_is_understood(tmp_path):
+    sl = tmp_path / "slice.json"
+    sl.write_text(json.dumps(["x", "y"]), encoding="utf-8")
+    assert R._slice_ids(str(sl)) == {"x", "y"}
+
+
+def test_an_unreadable_slice_is_refused_rather_than_treated_as_empty(tmp_path):
+    """An empty population reports "nothing was evaluated", which reads like a result."""
+    led = tmp_path / "led.jsonl"
+    led.write_text(json.dumps({"instance_id": "a", "verdict": "RESOLVED"}) + "\n",
+                   encoding="utf-8")
+    assert R.main(["--ledger", str(led), "--slice", str(tmp_path / "nope.json")]) == 1
