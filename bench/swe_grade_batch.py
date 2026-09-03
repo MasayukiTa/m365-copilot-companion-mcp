@@ -181,9 +181,26 @@ def main():
             inst = queue.pop(0)
             runid = make_runid(inst, preds[inst], nonce)
             if not preds[inst].strip():
-                append_result(a.results, {"instance_id": inst, "verdict": "not",
-                                          "note": "empty patch", "ts": int(time.time())})
-                log("  %s -> not (empty patch, skipped eval)" % inst)
+                # NOPATCH IS NOT "not". This wrote a graded-failure verdict for an instance it
+                # says in the very next line it SKIPPED -- so nothing was evaluated, and the row
+                # both entered the resolve rate as a solver failure and retired the instance so
+                # it was never tried again. Four lines below, a launch failure is correctly
+                # written EVALERR; the two cases were being treated as opposites inside one
+                # function.
+                #
+                # It matters because of how empty patches actually arise here. Measured
+                # 2026-09-02: the companion Edge lost its context, the fleet gate refused, and
+                # the driver ran THIRTEEN further batches -- about nineteen instances, each
+                # finishing in under a minute against a normal twenty-five to thirty, each
+                # capturing an empty patch. Every one of those was recorded as a wrong answer.
+                #
+                # Kept as its own verdict rather than dropped: "the worker produced nothing" is
+                # a real observation and belongs in the record, it simply is not a measurement
+                # of a patch. It is excluded from the rate and left outstanding for a retry.
+                append_result(a.results, {"instance_id": inst, "verdict": "NOPATCH",
+                                          "note": "no patch was produced; nothing was evaluated",
+                                          "ts": int(time.time())})
+                log("  %s -> NOPATCH (nothing to evaluate; not counted as a failure)" % inst)
                 continue
             if launch_grade(inst, preds[inst], runid):
                 inflight[runid] = (inst, time.time() + a.max_wait_min * 60)

@@ -317,3 +317,79 @@ def test_an_instance_the_ledger_has_never_seen_is_written(tmp_path):
     led = tmp_path / "results.json"
     led.write_text("", encoding="utf-8")
     assert G.ingest({"a": True, "b": False}, str(led)) == 2
+
+
+# -- infrastructure failure is not solver failure --------------------------------------------
+
+#: VERBATIM from C:/swe-grade/pro_grade_night2.out on the eval host. That run wrote FOURTEEN
+#: false verdicts into eval_results.json; because the grade script piped the harness through
+#: `tail -3`, this is all that survived of the reason, and it names exactly one instance.
+REAL_NIGHT2_LOG = (
+    "[07:49:18] START pro grade free=225G\n"
+    "Failed to pull or find image locally for "
+    "instance_navidrome__navidrome-6bd4c0f6bfa653e9b8b27cfdc2955762d371d6e9: 404 Client Error "
+    "for http+docker://localhost/v1.52/images/jefzda/sweap-images:navidrome.navidrome-"
+    "navidrome__navidrome-6bd4c0f6bfa653e9b8b27cfdc2955762d371d6e9/json: Not Found\n"
+    "Evaluation for instance_navidrome__navidrome-"
+    "6bd4c0f6bfa653e9b8b27cfdc2955762d371d6e9 returned None\n"
+    "Overall accuracy:  0.0\n"
+    "RESOLVED 0/14 = 0.0%\n"
+)
+
+NAVIDROME = "instance_navidrome__navidrome-6bd4c0f6bfa653e9b8b27cfdc2955762d371d6e9"
+
+
+def test_the_harness_output_is_kept_not_tailed_away():
+    """The evidence had to exist before anything could read it.
+
+    `| tail -3` discarded every per-instance line the harness printed, and those lines are the
+    only place an instance that could not be evaluated differs from one whose patch was wrong --
+    swe_bench_pro_eval coerces the first to false before writing eval_results.json. Fourteen
+    infrastructure failures were recorded as fourteen failed patches, and the log kept the reason
+    for one of them.
+    """
+    script = G.grade_script("/raw", "/preds", "/out", "/log")
+    assert 'tee "$OUT/harness.log"' in script, (
+        "the harness's full output must be kept; without it an instance that never ran is "
+        "indistinguishable from a patch that failed"
+    )
+
+
+def test_an_instance_the_harness_never_evaluated_is_read_out_of_the_real_log():
+    """Parsed from the eval host's own text, not from a sample written to suit the regex."""
+    assert G.unevaluated_instances(REAL_NIGHT2_LOG) == {NAVIDROME}
+
+
+def test_a_log_where_everything_ran_names_nobody():
+    """The guard must not manufacture excuses for patches that genuinely failed."""
+    clean = ("Running local-docker evaluation for %s\n"
+             "Using Docker Hub image: jefzda/sweap-images:navidrome.x\n"
+             "Overall accuracy:  0.4375\n" % NAVIDROME)
+    assert G.unevaluated_instances(clean) == set()
+
+
+def test_an_unevaluated_instance_is_written_evalerr_rather_than_failed(tmp_path):
+    """THE DEFECT ITSELF. The harness hands both outcomes over as false; only the log separates
+    them, and a false recorded as "not" is an infrastructure fault inside a competence number."""
+    led = tmp_path / "results.json"
+    led.write_text("", encoding="utf-8")
+    added = G.ingest({NAVIDROME: False, "instance_real_failure": False},
+                     str(led), unevaluated={NAVIDROME})
+    assert added == 2
+    by_id = {r["instance_id"]: r for r in
+             (json.loads(x) for x in led.read_text(encoding="utf-8").splitlines() if x.strip())}
+    assert by_id[NAVIDROME]["verdict"] == "EVALERR"
+    assert by_id["instance_real_failure"]["verdict"] == "not"
+
+
+def test_an_evalerr_written_here_leaves_the_instance_outstanding():
+    """Across the module boundary, because that is where this has to hold.
+
+    Recording EVALERR is only an improvement if the cycle then re-runs the instance. If
+    graded_ids() counted it, the instance would be retired at zero -- the same outcome as before,
+    reached by a longer route.
+    """
+    from bench import pro_cycle
+    assert "EVALERR" in pro_cycle._NOT_A_GRADE, (
+        "an instance the grader could not evaluate must not count as graded"
+    )
