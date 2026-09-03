@@ -295,3 +295,46 @@ def test_the_cycle_passes_the_evidence_in():
     repo = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
     src = io.open(_os.path.join(repo, "bench", "pro_cycle.py"), encoding="utf-8").read()
     assert "SV.promote(inst in claimed, v, _EVIDENCE_BY_INSTANCE.get(inst))" in src
+
+
+# -- a duration is evidence in any language ---------------------------------------------------
+
+def test_go_saying_it_never_entered_a_module_is_not_a_test_failure():
+    """The marker list was python and npm only, so the same failure class was fixed twice and
+    never swept for the third language. Forty go checks were condemned by the omission."""
+    assert SV.not_actually_run(
+        "FAIL\t./... [setup failed]\npattern ./...: directory prefix . does not "
+        "contain main module or its selected dependencies")
+
+
+def test_a_failure_too_fast_to_be_a_test_run_is_not_known_to_be_a_failure(monkeypatch):
+    """THE GUARD THAT NEEDS NO LANGUAGE. A hand-written marker list fails OPEN: a message nobody
+    added becomes a verdict about the patch. No suite in these repositories starts a runner,
+    resolves a module graph and executes tests in under a second and a half.
+    """
+    monkeypatch.setattr(SV, "_run_check_impl", None, raising=False)
+
+    def fake(command, timeout, cwd):
+        return "some toolchain complaint nobody has ever added to the list\n[returncode: 1]"
+
+    import tools.code_exec as CE
+    monkeypatch.setattr(CE, "_run_with_tree_timeout", fake)
+    rec = SV.run_check("pytest -q", cwd=".")
+    assert rec["ok"] is False
+    assert rec.get("unavailable") is True, (
+        "an unrecognised failure returned in milliseconds must be 'do not know', not 'the "
+        "patch is wrong'")
+    assert "too fast" in rec.get("why_unavailable", "")
+
+
+def test_a_slow_honest_failure_is_still_a_failure(monkeypatch):
+    """The guard must not launder real defects into 'unavailable'."""
+    def fake(command, timeout, cwd):
+        import time as _t
+        _t.sleep(SV.IMPOSSIBLY_FAST_S + 0.2)
+        return "2 failed, 10 passed\n[returncode: 1]"
+
+    import tools.code_exec as CE
+    monkeypatch.setattr(CE, "_run_with_tree_timeout", fake)
+    rec = SV.run_check("pytest -q", cwd=".")
+    assert rec["ok"] is False and not rec.get("unavailable")

@@ -755,7 +755,20 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
         # CAPTURE BEFORE ANYTHING ELSE, and unconditionally. A fleet that timed out still has
         # work on disk worth diffing, and the frozen run of 2026-08-31 lost a batch precisely
         # because capture was downstream of a clean finish.
-        run([PY, os.path.join("bench", "pro_capture.py"), "--preds", PREDS], 900, "capture")
+        # --keep, BECAUSE THE NEXT TWO STEPS NEED THE TREE THIS ONE WAS DELETING.
+        #
+        # pro_capture deletes each worktree as soon as it has the diff, and _shadow_verify then
+        # ran the acceptance commands with cwd set to a directory that no longer existed. It has
+        # never once done anything else: 81 of 81 verification records carry an EMPTY tree hash,
+        # because there was no tree to hash. The commands fell back to the repository root, so
+        # `go test ./...` reported "directory prefix . does not contain main module" in 0.1s and
+        # was recorded VERIFY_FAILED -- forty verdicts about code that was never executed, from
+        # the step this module's own comment calls the only place DONE is produced.
+        #
+        # The trees are discarded below, before the grade rather than after it, so the disk
+        # profile is unchanged: nothing is held across the long step.
+        run([PY, os.path.join("bench", "pro_capture.py"), "--preds", PREDS, "--keep"],
+            900, "capture")
 
         # SHADOW. The records are compared against what each worker claimed, and the verdict is
         # written down beside the reported outcome. Nothing is gated on it: switching a gate
@@ -769,6 +782,12 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
         # before and after. It is the only place DONE is produced -- and while it is in shadow
         # it produces it into a file, not into the run's outcome.
         _shadow_verify(group)
+
+        # NOW the trees go, before the grade and not after it. Grading reads the captured patch
+        # file and talks to the eval host; it has no use for a worktree, and the grade is the
+        # long step -- up to three hours -- so holding them across it would be the one change
+        # here that actually cost disk.
+        _discard()
 
         graded_before = len(graded_ids())
 
@@ -793,6 +812,8 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
         gained = len([i for i in group if i in after])
         log("  graded this batch: %d of %d" % (gained, len(group)))
 
+        # The trees were discarded before the grade; this is the sweep for anything the grade
+        # step or a crash left behind, and it is a no-op in the normal case.
         _discard()
         done += len(group)
         # "0 worktree dir(s) left" IS NOT "the space came back". Measured across three go

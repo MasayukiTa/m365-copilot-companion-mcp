@@ -785,3 +785,55 @@ def test_a_later_real_verdict_replaces_an_earlier_error(tmp_path, monkeypatch):
         encoding="utf-8")
     monkeypatch.setattr(C, "RESULTS", str(results))
     assert C.graded_ids() == {"a"}
+
+
+# -- the tree the verification needs ---------------------------------------------------------
+
+def _cycle_statement_order():
+    """Line numbers of the steps whose ORDER is the thing under test, inside cycle()."""
+    import ast
+    src = io.open(os.path.join(os.path.dirname(__file__), "pro_cycle.py"),
+                  encoding="utf-8").read()
+    tree = ast.parse(src)
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "cycle")
+    marks = {}
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Call):
+            name = getattr(node.func, "id", "") or getattr(node.func, "attr", "")
+            if name in ("_shadow_verify", "_discard") and name not in marks:
+                marks[name] = node.lineno
+            for sub in ast.walk(node):
+                if (isinstance(sub, ast.Constant) and sub.value == "pro_grade_remote.py"
+                        and "grade" not in marks):
+                    marks["grade"] = node.lineno
+                if (isinstance(sub, ast.Constant) and sub.value == "--keep"
+                        and "keep" not in marks):
+                    marks["keep"] = node.lineno
+    return marks
+
+
+def test_the_worktrees_survive_until_verification_has_run():
+    """THE STEP HAD NEVER ONCE SEEN A WORKTREE.
+
+    pro_capture deletes each tree as soon as it has the diff, and _shadow_verify then ran the
+    acceptance commands with cwd pointing at that deleted directory. Measured across the whole
+    history of the feature: 81 of 81 verification records carry an EMPTY tree hash, because
+    there was nothing to hash. The commands fell back to the repository root, where
+    `go test ./...` reports "directory prefix . does not contain main module" in about 0.15s --
+    forty VERIFY_FAILED verdicts about code that was never executed, from the step this module
+    calls the only place DONE is produced.
+    """
+    marks = _cycle_statement_order()
+    assert "keep" in marks, (
+        "pro_capture must be called with --keep, or it deletes the worktree that the "
+        "verification step is about to run in")
+
+
+def test_the_trees_are_discarded_before_the_grade_not_after_it():
+    """--keep must not turn into holding worktrees across the long step. The grade reads the
+    captured patch file and talks to the eval host; it has no use for a tree, and it can run for
+    three hours. Discarding after it would trade a correctness fix for a disk regression."""
+    marks = _cycle_statement_order()
+    assert marks["_shadow_verify"] < marks["_discard"] < marks["grade"], (
+        "order must be: verify (needs the tree), discard, then grade -- got %s" % marks)
