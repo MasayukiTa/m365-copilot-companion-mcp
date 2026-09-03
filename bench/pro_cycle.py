@@ -972,6 +972,16 @@ def _shadow_verify(group):
                     "reasons": v.get("reasons"),
                     "tree_stable": bool(v.get("tree_before")) and
                                    v.get("tree_before") == v.get("tree_after"),
+                    # THE HASHES THEMSELVES, not only the boolean derived from them. The record
+                    # kept tree_stable alone, and that boolean cannot answer the question it
+                    # looks like it answers: tree_hash over a MISSING directory returns the
+                    # digest of no input at all, which is non-empty and equal to itself, so an
+                    # absent worktree reads as "stable". Asked afterwards whether verification
+                    # had a tree to run in, this record could not say -- and reading the absence
+                    # of the field as the absence of a tree is a mistake already made once here.
+                    # An empty-input digest is recognisable; a missing field is not.
+                    "tree_before": v.get("tree_before", ""),
+                    "tree_after": v.get("tree_after", ""),
                     # THE EVIDENCE, NOT JUST THE VERDICT. This record used to carry id, ok and
                     # duration and nothing else, so "project_tests failed in 3.4s" was the
                     # entire account -- and the reason it failed (the project's dependencies
