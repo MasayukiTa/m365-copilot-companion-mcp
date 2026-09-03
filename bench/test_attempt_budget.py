@@ -342,3 +342,46 @@ def test_an_explicit_batch_size_bypasses_this_entirely():
     src = inspect.getsource(C.batches)
     assert "if size else" in src.replace("  ", " "), (
         "batches() no longer takes an explicit size; update this test's premise")
+
+
+# -- a checkout that never happened -----------------------------------------------------------
+
+def test_staged_ids_reads_what_was_actually_written(tmp_path):
+    """pro_stage_goals reports a per-instance FETCH_FAIL and still exits 0, so the exit code
+    says nothing about whether any instance is ready to run. The goals file does."""
+    g = tmp_path / "goals.jsonl"
+    g.write_text(json.dumps({"instance_id": "a", "goal": "x"}) + "\n", encoding="utf-8")
+    assert C.staged_ids(str(g)) == {"a"}
+
+
+def test_an_empty_goals_file_stages_nothing(tmp_path):
+    g = tmp_path / "goals.jsonl"
+    g.write_text("", encoding="utf-8")
+    assert C.staged_ids(str(g)) == set()
+
+
+def test_a_missing_goals_file_stages_nothing(tmp_path):
+    assert C.staged_ids(str(tmp_path / "nope.jsonl")) == set()
+
+
+def test_an_instance_whose_checkout_failed_gets_its_attempt_back(tmp_path, monkeypatch):
+    """THE ONE THAT ENDED THE BASELINE RUN.
+
+    GitHub became unreachable at 16:22 on 2026-09-03. pro_stage_goals wrote "0 goals" for every
+    remaining batch and exited 0, so the "staging failed" branch was never reached; fleet_runner
+    exited with "no goals", capture found nothing, and the batch was written off having already
+    charged the attempt. Eleven python instances burned through batches 10-20 in four minutes,
+    none of them ever run, and under SWE_MAX_ATTEMPTS=1 that retired them for good.
+
+    An unreachable git host is the same class of fact as a refusing gate: no worker, no turn, no
+    quota. It must not be charged.
+    """
+    monkeypatch.setattr(C, "ATTEMPTS", str(tmp_path / "attempts.json"))
+    C.note_attempts(["a", "b"])
+    assert C.attempt_counts() == {"a": 1, "b": 1}
+
+    # "a" was staged; "b"'s checkout failed
+    C.refund_attempts(["b"])
+    assert C.attempt_counts() == {"a": 1}
+    assert "b" not in C.exhausted_ids(cap=1)
+    assert "a" in C.exhausted_ids(cap=1)

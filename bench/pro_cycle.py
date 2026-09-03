@@ -297,6 +297,35 @@ def attempt_counts():
     return d if isinstance(d, dict) else {}
 
 
+
+def staged_ids(path):
+    """The instance ids a staging run actually wrote goals for.
+
+    Read from the goals file rather than assumed from the request, because pro_stage_goals
+    reports a per-instance FETCH_FAIL and still exits 0 -- so "the command succeeded" says
+    nothing about whether any instance is ready to run.
+    """
+    out = set()
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict):
+                    for key in ("instance_id", "instance", "id"):
+                        if row.get(key):
+                            out.add(row[key])
+                            break
+    except OSError:
+        return out
+    return out
+
+
 def note_attempts(ids):
     """Record that these instances are being tried. Best effort: losing the counter must not
     stop a run, and undercounting only costs an extra attempt, never a lost result."""
@@ -684,6 +713,33 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
                      "--ids", ",".join(group), "--out", GOALS], 1800, "stage")
         if not ok:
             log("  staging failed -- skipping this batch, nothing left behind")
+            refund_attempts(group)
+            _discard()
+            continue
+
+        # STAGING CAN "SUCCEED" WITH NOTHING STAGED, AND THAT IS HOW THIS RUN DIED.
+        #
+        # pro_stage_goals reports a per-instance FETCH_FAIL and still exits 0, so `ok` above was
+        # True while the goals file held zero goals. fleet_runner then exited with "no goals",
+        # capture found nothing, and the batch was written off -- having already charged the
+        # instance its attempt. Measured on the baseline run of 2026-09-03: GitHub became
+        # unreachable at 16:22 and eleven python instances (ansible, openlibrary, qutebrowser)
+        # burned through batches 10-20 in four minutes, each in about twenty seconds, none of
+        # them ever run. Under SWE_MAX_ATTEMPTS=1 that retired them permanently.
+        #
+        # An unreachable git host is the same class of fact as a refusing gate: nothing started,
+        # no worker, no turn, no quota. It must not be charged, and the instances it hit must
+        # stay outstanding.
+        staged = staged_ids(GOALS)
+        unstaged = [i for i in group if i not in staged]
+        if unstaged:
+            refund_attempts(unstaged)
+            log("  %d of %d instance(s) could not be staged (checkout failed); their attempts "
+                "are refunded and they stay outstanding" % (len(unstaged), len(group)))
+            for i in unstaged[:4]:
+                log("      %s" % i[:70])
+        if not staged:
+            log("  nothing staged -- skipping this batch")
             _discard()
             continue
 
