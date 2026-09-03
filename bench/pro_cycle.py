@@ -78,6 +78,14 @@ BATCH_TIMEOUT_S = float(os.environ.get("SWE_CYCLE_BATCH_TIMEOUT_S", "3600"))
 #: fine was killed for taking longer than the work that produced it.
 GRADE_TIMEOUT_S = float(os.environ.get("SWE_CYCLE_GRADE_TIMEOUT_S", "10800"))
 
+#: Names this run's artefacts on the eval host. Defaults to the date, so two runs on different
+#: days never collide even when nobody sets it; set SWE_RUN_TAG for two runs on the same day.
+#: ASCII and no separators of its own -- it becomes part of a filename that crosses PowerShell,
+#: WSL and bash.
+RUN_TAG = "".join(c for c in (os.environ.get("SWE_RUN_TAG")
+                              or "cycle" + time.strftime("%Y%m%d"))
+                  if c.isalnum() or c == "_") or "cycle"
+
 
 def log(msg):
     """Never raises. A LOGGING CALL TOOK THE WHOLE CYCLE DOWN once already: this console is
@@ -804,9 +812,14 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
         # and takes dockerd and /tmp with it. It reads the preds file directly, so the
         # per-instance directory conversion _explode_preds did is no longer needed here.
         if captured_ids() & set(group):
+            # THE RUN'S OWN TAG. This was "cycle_b%d" alone, which is a batch number and nothing
+            # else, so every run wrote over the previous run's remote artefacts -- predictions,
+            # output directory, harness log -- and afterwards there was no way to say which run
+            # produced the log you were reading. The grade is self-contained (the script clears
+            # its output dir first), so this is about the record, not correctness.
             run([PY, os.path.join("bench", "pro_grade_remote.py"),
                  "--preds", PREDS, "--results", RESULTS,
-                 "--tag", "cycle_b%d" % n,
+                 "--tag", "%s_b%d" % (RUN_TAG, n),
                  "--instances"] + group, GRADE_TIMEOUT_S, "grade")
         else:
             log("  no patch captured for this batch -- nothing to grade")
