@@ -125,7 +125,31 @@ _NOT_RUN_MARKERS = (
 
     # The command ran and exercised nothing. Not a pass, and not evidence of a defect either.
     "no tests ran",
+
+    # GO, WHICH THIS LIST HAD NEVER HEARD OF. Every marker above is python or npm, so the whole
+    # failure class was fixed twice for two languages and never swept for the third. Measured:
+    # forty go checks recorded VERIFY_FAILED, all of them "[setup failed]" in about 0.15s with
+    # "directory prefix . does not contain main module" -- go run outside a module, which
+    # exercises nothing at all.
+    "does not contain main module",
+    "go.mod file not found",
+    "no go files in",
+    "[setup failed]",
+    "no required module provides package",
 )
+
+#: Below this, a repository's test suite did not run. Nothing in these projects -- go, pytest,
+#: jest -- starts a runner, resolves a module graph and executes a suite in under a second.
+#:
+#: THIS IS THE GUARD THAT DOES NOT NEED A LANGUAGE. The list above is hand-written, so it fails
+#: OPEN by construction: an unrecognised message becomes a verdict about the patch, which is how
+#: forty go instances were condemned for a defect in the harness. A duration is evidence no
+#: matter which toolchain produced it, and the same reasoning already guards the grade watcher,
+#: where 87 seconds for fourteen instances was the tell.
+#:
+#: It only ever routes a FAILURE to "do not know". A passing check is never reclassified, and a
+#: genuine compile error that fails this fast is still not something the run established.
+IMPOSSIBLY_FAST_S = 1.5
 
 
 def not_actually_run(output: str) -> bool:
@@ -155,6 +179,15 @@ def run_check(command: str, cwd: str, timeout_s: float = None):
             # non-zero, which read as VERIFY_FAILED -- a verdict about code that was never run.
             record["unavailable"] = True
             record["why_unavailable"] = "the command did not get as far as running the tests"
+        elif not ok and record["duration_s"] < IMPOSSIBLY_FAST_S:
+            # The marker list did not recognise this, and it does not need to: no suite in these
+            # repositories runs in under a second and a half. Saying "do not know" is the honest
+            # verdict, and it is the one this list fails to reach whenever the toolchain phrases
+            # its complaint in words nobody added yet.
+            record["unavailable"] = True
+            record["why_unavailable"] = (
+                "failed in %.2fs, which is too fast for the suite to have run"
+                % record["duration_s"])
         return record
     except Exception as exc:
         return {"command": command, "ok": False,
