@@ -616,6 +616,26 @@ def batches(ids, size):
             remaining = remaining[width:]
 
 
+
+#: Lines that carry a DIAGNOSIS get more room than lines that carry progress.
+#:
+#: Fleet output was logged at ln[:160] regardless of content, which is fine for a turn counter
+#: and useless for an error. Measured twice on 2026-09-03, both times without noticing at the
+#: time: the network outage that ended the first run was logged as
+#:     FETCH_FAIL: fatal: unable to access 'https://github.com/qutebrowser/qutebrowser.git/':
+#: cut off exactly where git names the cause -- DNS, TLS, proxy, auth, all indistinguishable --
+#: and a worker's STUCK reason was cut mid-word at "ConnectionClosedError: no close frame r".
+#: The full text survived only in status.json, which the next batch overwrites.
+_ERRORISH = ("fail", "error", "fatal", "traceback", "refus", "stuck", "cannot", "could not",
+             "denied", "timeout", "timed out", "unable", "no such", "missing", "exceeds")
+
+
+def _log_width(line):
+    """How much of a fleet output line to keep. Errors keep enough to be actionable."""
+    low = (line or "").lower()
+    return 600 if any(m in low for m in _ERRORISH) else 160
+
+
 def run(cmd, timeout, label):
     """Run one step. Returns (ok, tail-of-output). Never raises."""
     log("  $ %s" % " ".join(cmd[1:] if cmd and cmd[0] == PY else cmd))
@@ -627,7 +647,7 @@ def run(cmd, timeout, label):
         return False, "timeout"
     tail = ((p.stdout or "") + (p.stderr or "")).strip().splitlines()
     for ln in tail[-6:]:
-        log("    | " + ln[:160])
+        log("    | " + ln[:_log_width(ln)])
     # RETURN MORE THAN IS PRINTED. Six lines is the right amount to READ; it is the
     # wrong amount to MATCH against. The fleet gate's refusal is followed by several
     # library deprecation warnings, which pushed the refusal out of a six-line window,
@@ -818,7 +838,7 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
             log("=" * 72)
             log("STOPPING: the fleet gate refused, so nothing after this would mean anything.")
             for ln in (fleet_tail or "").splitlines():
-                log("  " + ln[:160])
+                log("  " + ln[:_log_width(ln)])
             log("")
             log("%d instance(s) were not attempted. Their attempt counts are unchanged, so they"
                 % max(0, len(todo) - done))
