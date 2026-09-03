@@ -298,32 +298,26 @@ def attempt_counts():
 
 
 
-def staged_ids(path):
-    """The instance ids a staging run actually wrote goals for.
+def staged_ids(_goals_path=None):
+    """The instance ids a staging run actually produced a checkout for.
 
-    Read from the goals file rather than assumed from the request, because pro_stage_goals
-    reports a per-instance FETCH_FAIL and still exits 0 -- so "the command succeeded" says
-    nothing about whether any instance is ready to run.
+    READ FROM THE WORKTREE MAP, NOT THE GOALS FILE. The first version of this parsed
+    pro_cycle_goals.jsonl looking for an "instance_id" -- a field that file has never had; its
+    rows are {checks, cwd, text}. Every batch therefore looked like a failed checkout, and the
+    re-run refunded and skipped four batches that had staged perfectly well ("go 16MB ok",
+    "wrote ... with 1 goals") before it was stopped. A guard that reads a field its input does
+    not contain fails in whichever direction its default happens to point, and this one pointed
+    at "nothing was staged".
+
+    pro_stage_goals writes pro_wt_map.json alongside the goals: instance_id -> worktree path,
+    for exactly the instances it checked out.
     """
-    out = set()
     try:
-        with open(path, encoding="utf-8-sig") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(row, dict):
-                    for key in ("instance_id", "instance", "id"):
-                        if row.get(key):
-                            out.add(row[key])
-                            break
-    except OSError:
-        return out
-    return out
+        with open(os.path.join(SW, "pro_wt_map.json"), encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return set()
+    return {k for k in data} if isinstance(data, dict) else set()
 
 
 def note_attempts(ids):
