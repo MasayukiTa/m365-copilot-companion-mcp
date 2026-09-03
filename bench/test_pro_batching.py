@@ -839,3 +839,42 @@ def test_the_trees_are_discarded_before_the_grade_not_after_it():
     marks = _cycle_statement_order()
     assert marks["_shadow_verify"] < marks["_discard"] < marks["grade"], (
         "order must be: verify (needs the tree), discard, then grade -- got %s" % marks)
+
+
+# -- the width is a reading, not a decision ---------------------------------------------------
+
+def test_batch_width_follows_the_disk_as_it_changes(monkeypatch):
+    """WIDTH WAS DECIDED ONCE PER LANGUAGE AND NEVER REVISITED.
+
+    Measured on the re-run of 2026-09-03: the python group was entered at 17:44 with 4.55 GiB
+    free, which fixed width=1. Three gigabytes were then reclaimed, free reached 7.53 GiB --
+    comfortably enough for two -- and the cycle went on staging one instance at a time for the
+    rest of the run. The batch lines even printed the new free figure while ignoring it.
+
+    Free space moves by about 3 GB inside a batch as worktrees are created and discarded, so a
+    width taken from one instant is a guess about every instant after it.
+    """
+    readings = iter([4.55, 7.53, 7.53, 7.53])
+    monkeypatch.setattr(C, "free_gb", lambda *a, **k: next(readings, 7.53))
+    monkeypatch.setattr(C, "lang_of", lambda i: "python")
+    ids = ["i%d" % n for n in range(5)]
+    sizes = [len(g) for g in C.batches(ids, 0)]
+    assert sizes[0] == 1, "the first batch is sized by the disk at the time: %r" % sizes
+    assert 2 in sizes[1:], (
+        "later batches must re-read the disk; got %r, which is the defect this pins" % sizes)
+
+
+def test_an_explicit_batch_size_still_wins(monkeypatch):
+    """--batch N is an instruction, not a hint; the disk must not override it."""
+    monkeypatch.setattr(C, "free_gb", lambda *a, **k: 3.2)
+    monkeypatch.setattr(C, "lang_of", lambda i: "python")
+    assert [len(g) for g in C.batches(["a", "b", "c"], 2)] == [2, 1]
+
+
+def test_every_instance_is_yielded_exactly_once(monkeypatch):
+    """The rewrite slices a list while iterating it -- the obvious way to drop or repeat work."""
+    monkeypatch.setattr(C, "free_gb", lambda *a, **k: 7.53)
+    monkeypatch.setattr(C, "lang_of", lambda i: "python")
+    ids = ["i%d" % n for n in range(7)]
+    out = [i for g in C.batches(ids, 0) for i in g]
+    assert out == ids, out
