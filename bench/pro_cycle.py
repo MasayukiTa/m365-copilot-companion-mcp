@@ -745,9 +745,17 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
             # relaxing it once.
             have = _reclaim(have)
         if have < DISK_FLOOR_GB:
+            # NOTHING RAN, SO NOTHING IS OWED -- the same rule as a gate refusal, on the one
+            # path that did not follow it. note_attempts() is called at the top of this loop,
+            # before the disk is read, so by the time we stop the batch has already been
+            # charged. Measured on the repeat run of 2026-09-04: the cycle stopped before batch
+            # 18, and the instance in it came back on the next run as "used all 1 attempts and
+            # are skipped" having never been staged, let alone run.
+            refund_attempts(group)
             log("STOP before batch %d: %.2f GiB free is under the %.2f GiB floor. "
-                "Everything graded so far is recorded; re-run to continue."
-                % (n, have, DISK_FLOOR_GB))
+                "Everything graded so far is recorded; the %d instance(s) in this batch never "
+                "started and keep their attempt. Re-run to continue."
+                % (n, have, DISK_FLOOR_GB, len(group)))
             break
         _before_free = have
         log("-" * 72)
