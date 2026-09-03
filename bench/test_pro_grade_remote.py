@@ -393,3 +393,46 @@ def test_an_evalerr_written_here_leaves_the_instance_outstanding():
     assert "EVALERR" in pro_cycle._NOT_A_GRADE, (
         "an instance the grader could not evaluate must not count as graded"
     )
+
+
+# -- recovering a grade that already ran ------------------------------------------------------
+
+def test_ingest_only_stages_nothing_and_starts_no_grade(tmp_path, monkeypatch):
+    """WHY THIS EXISTS. Ingestion fails closed without the harness log, which is right -- an
+    instance that was never evaluated is otherwise indistinguishable from a patch that failed.
+    But that makes one flaky scp throw away a grade that took twenty minutes and succeeded.
+
+    The recovery must not re-send the predictions or the script: those are the very artefacts it
+    is trying to read back, and rebuilding the dataset rows costs a WSL session on a host where
+    an extra session can kill a running grade.
+    """
+    results = tmp_path / "eval_results.json"
+    ledger = tmp_path / "ledger.jsonl"
+    preds = tmp_path / "preds.json"
+    preds.write_text(json.dumps([{"instance_id": "a", "patch": "diff"}]), encoding="utf-8")
+
+    def no_staging(*args, **kwargs):
+        raise AssertionError("--ingest-only must not stage anything on the host")
+
+    def fake_ssh(*args, **kwargs):
+        raise AssertionError("--ingest-only must not start a session on the host")
+
+    def fake_scp_from(host, remote, local, timeout=600):
+        if remote.endswith("eval_results.json"):
+            io.open(local, "w", encoding="utf-8").write(json.dumps({"a": True}))
+        else:
+            io.open(local, "w", encoding="utf-8").write("Running local-docker evaluation for a")
+        return True
+
+    monkeypatch.setattr(G, "ssh_host", lambda: "host")
+    monkeypatch.setattr(G, "scp_to", no_staging)
+    monkeypatch.setattr(G, "ssh", fake_ssh)
+    monkeypatch.setattr(G, "scp_from", fake_scp_from)
+    monkeypatch.setattr(G, "SW", str(tmp_path))
+
+    code = G.main(["--preds", str(preds), "--results", str(ledger),
+                   "--tag", "recover1", "--ingest-only"])
+    assert code == 0
+    rows = [json.loads(x) for x in ledger.read_text(encoding="utf-8").splitlines() if x.strip()]
+    assert rows and rows[-1]["verdict"] == "RESOLVED"
+    assert results is not None      # keeps the linter honest about the unused fixture path

@@ -344,6 +344,74 @@ def ingest(eval_results: dict, existing_path: str, unevaluated=None) -> int:
     return added
 
 
+def _collect(host, a):
+    """Bring back a finished grade and fold it into the ledger. Returns an exit code.
+
+    SEPARATE FROM RUNNING THE GRADE, because the two fail independently. Ingestion now
+    refuses without the harness log -- correctly, since without it an instance that was
+    never evaluated is indistinguishable from a patch that failed -- but that makes one
+    flaky scp cost a grade that took twenty minutes and actually succeeded. The verdicts
+    are on the host either way, so --ingest-only calls this and nothing else.
+    """
+    local_results = os.path.join(SW, "pro_eval_results_%s.json" % a.tag)
+    if not scp_from(host, "%s/pro_out_%s/eval_results.json" % (REMOTE_WIN, a.tag), local_results):
+        log("the grade produced no eval_results.json to collect")
+        return 2
+    with open(local_results, encoding="utf-8") as fh:
+        results = json.load(fh)
+
+    # THE HARNESS LOG IS PART OF THE RESULT, not a convenience. Without it every instance the
+    # harness could not evaluate is indistinguishable from one whose patch was wrong, because
+    # both are `false` in eval_results.json.
+    #
+    # RETRIED, BECAUSE REFUSING IS EXPENSIVE. Ingestion now fails closed without this file, which
+    # is right -- but it means one flaky scp throws away a grade that took twenty minutes and
+    # actually succeeded. Three attempts, and --ingest-only recovers the batch afterwards without
+    # re-grading anything.
+    local_harness = os.path.join(SW, "pro_harness_%s.log" % a.tag)
+    unevaluated, have_log = set(), False
+    for attempt in (1, 2, 3):
+        if scp_from(host, "%s/pro_out_%s/harness.log" % (REMOTE_WIN, a.tag), local_harness):
+            have_log = True
+            with open(local_harness, encoding="utf-8", errors="replace") as fh:
+                unevaluated = unevaluated_instances(fh.read()) & set(results)
+            break
+        log("could not collect the harness log (attempt %d of 3)" % attempt)
+    else:
+        # FAIL CLOSED. Warning and then ingesting anyway is the original defect with a log line
+        # in front of it: without the log, every instance the harness could not evaluate is an
+        # indistinguishable `false` and lands in the ledger as a wrong answer -- which is how
+        # fourteen missing images became a score of 0.0%. The verdicts are kept on disk and the
+        # grade can be re-ingested once the log is recovered; what must not happen is writing
+        # failures nobody measured.
+        log("REFUSING TO INGEST: the harness log did not come back, so an instance that was "
+            "never evaluated cannot be told apart from a patch that failed. The verdicts are "
+            "saved at %s and the harness log is at %s/pro_out_%s/harness.log on the host. "
+            "Recover the batch WITHOUT re-grading it:\n"
+            "    python -m bench.pro_grade_remote --tag %s --ingest-only"
+            % (local_results, REMOTE_WIN, a.tag, a.tag))
+        return 3
+
+    added = ingest(results, a.results, unevaluated)
+    scored = [i for i in results if i not in unevaluated]
+    resolved = sum(1 for i in scored if results[i])
+    log("graded %d instance(s): RESOLVED %d/%d = %.1f%%  (%d new rows in the ledger)"
+        % (len(scored), resolved, len(scored),
+           100.0 * resolved / max(1, len(scored)), added))
+    if unevaluated:
+        # SEPARATE LINE, SEPARATE NUMBER. These are not failures and must never share a
+        # denominator with them.
+        log("%d instance(s) were NOT EVALUATED (no image, nothing ran) and are excluded from "
+            "the rate above; they stay outstanding and will be graded again:" % len(unevaluated))
+        for i in sorted(unevaluated)[:5]:
+            log("    %s" % i)
+        if len(unevaluated) > 5:
+            log("    ... and %d more" % (len(unevaluated) - 5))
+    elif have_log:
+        log("every instance in this batch was actually evaluated")
+    return 0
+
+
 # ── the run ───────────────────────────────────────────────────────────────────────────────
 
 def main(argv=None):
@@ -356,6 +424,11 @@ def main(argv=None):
                     help="grade only these instance ids from --preds; the cycle passes "
                          "one batch at a time so a batch is scored while the next runs")
     ap.add_argument("--dry-run", action="store_true", help="stage nothing; print what would run")
+    ap.add_argument("--ingest-only", action="store_true",
+                    help="collect and ingest a grade that ALREADY ran on the host, without "
+                         "starting another one. For recovering a batch whose results could not "
+                         "be ingested because the harness log did not come back -- the verdicts "
+                         "are already on the host and re-grading would cost the whole run again")
     a = ap.parse_args(argv)
 
     host = ssh_host()
@@ -416,6 +489,13 @@ def main(argv=None):
     if locks:
         log("cleared %d stale cloudflared lock(s) before connecting" % locks)
 
+    # NOTHING IS STAGED FOR AN INGEST. The predictions, the script and the dataset rows are all
+    # already on the host from the grade being recovered; re-sending them would overwrite the
+    # very artefacts this is trying to read, and rebuilding the dataset rows costs a WSL session
+    # for no reason.
+    if a.ingest_only:
+        return _collect(host, a)
+
     log("staging predictions and script...")
     if not scp_to(host, local_preds, preds_win):
         log("could not send the predictions")
@@ -438,60 +518,15 @@ def main(argv=None):
         log("the dataset rows could not be built; not starting a grade that cannot score")
         return 2
 
-    log("running the grade in ONE held session (the WSL VM tears down between commands)...")
-    run = 'wsl.exe -d Ubuntu -u root -- bash %s' % sh_wsl
-    code, out = ssh(host, run, timeout=30000)
-    log(out.strip()[-600:])
-
-    local_results = os.path.join(SW, "pro_eval_results_%s.json" % a.tag)
-    if not scp_from(host, "%s/pro_out_%s/eval_results.json" % (REMOTE_WIN, a.tag), local_results):
-        log("the grade produced no eval_results.json to collect")
-        return 2
-    with open(local_results, encoding="utf-8") as fh:
-        results = json.load(fh)
-
-    # THE HARNESS LOG IS PART OF THE RESULT, not a convenience. Without it every instance the
-    # harness could not evaluate is indistinguishable from one whose patch was wrong, because
-    # both are `false` in eval_results.json. Fetched best-effort: a grade that produced verdicts
-    # is still worth ingesting if the log did not come back, but then nothing can be separated
-    # and the run says so rather than quietly presenting infrastructure failures as a score.
-    local_harness = os.path.join(SW, "pro_harness_%s.log" % a.tag)
-    unevaluated, have_log = set(), False
-    if scp_from(host, "%s/pro_out_%s/harness.log" % (REMOTE_WIN, a.tag), local_harness):
-        have_log = True
-        with open(local_harness, encoding="utf-8", errors="replace") as fh:
-            unevaluated = unevaluated_instances(fh.read()) & set(results)
+    if not a.ingest_only:
+        log("running the grade in ONE held session (the WSL VM tears down between commands)...")
+        run = 'wsl.exe -d Ubuntu -u root -- bash %s' % sh_wsl
+        code, out = ssh(host, run, timeout=30000)
+        log(out.strip()[-600:])
     else:
-        # FAIL CLOSED. Warning and then ingesting anyway is the original defect with a log line
-        # in front of it: without the log, every instance the harness could not evaluate is an
-        # indistinguishable `false` and lands in the ledger as a wrong answer -- which is how
-        # fourteen missing images became a score of 0.0%. The verdicts are kept on disk and the
-        # grade can be re-ingested once the log is recovered; what must not happen is writing
-        # failures nobody measured.
-        log("REFUSING TO INGEST: the harness log did not come back, so an instance that was "
-            "never evaluated cannot be told apart from a patch that failed. The verdicts are "
-            "saved at %s and the harness log is at %s/pro_out_%s/harness.log on the host; "
-            "re-run once it can be collected." % (local_results, REMOTE_WIN, a.tag))
-        return 3
+        log("--ingest-only: collecting a grade that already ran, not starting a new one")
 
-    added = ingest(results, a.results, unevaluated)
-    scored = [i for i in results if i not in unevaluated]
-    resolved = sum(1 for i in scored if results[i])
-    log("graded %d instance(s): RESOLVED %d/%d = %.1f%%  (%d new rows in the ledger)"
-        % (len(scored), resolved, len(scored),
-           100.0 * resolved / max(1, len(scored)), added))
-    if unevaluated:
-        # SEPARATE LINE, SEPARATE NUMBER. These are not failures and must never share a
-        # denominator with them.
-        log("%d instance(s) were NOT EVALUATED (no image, nothing ran) and are excluded from "
-            "the rate above; they stay outstanding and will be graded again:" % len(unevaluated))
-        for i in sorted(unevaluated)[:5]:
-            log("    %s" % i)
-        if len(unevaluated) > 5:
-            log("    ... and %d more" % (len(unevaluated) - 5))
-    elif have_log:
-        log("every instance in this batch was actually evaluated")
-    return 0
+    return _collect(host, a)
 
 
 if __name__ == "__main__":
