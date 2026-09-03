@@ -96,7 +96,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--preds", default=os.path.join(SW, "pro_preds_50.json"))
     ap.add_argument("--prefix", default="companion")
-    ap.add_argument("--keep", action="store_true", help="capture but do NOT delete the worktrees")
+    ap.add_argument("--keep", action="store_true",
+                    help="keep BOTH the worktrees and the routed containers; for "
+                         "inspecting a run that went wrong")
+    # TWO DIFFERENT THINGS, WHICH --keep CONFLATED. The verification step needs the
+    # local worktree to still exist; it has no use for a routed container, and holding
+    # forty of those fills a volume with 25 GB free. Passing --keep to get the first
+    # silently bought the second, so the cycle asks for exactly the one it needs.
+    ap.add_argument("--keep-worktrees", action="store_true",
+                    help="keep the worktrees (the verification step runs in them) but "
+                         "still release the routed containers")
     a = ap.parse_args()
 
     wt = json.load(open(WTMAP, encoding="utf-8"))
@@ -164,6 +173,7 @@ def main():
             # five batches leave forty containers and forty work directories on a volume with
             # 25 GB free, and the images they are built from are the 183 GB that must not be
             # re-pulled. --keep holds them, for looking at a run that went wrong.
+            # Released even under --keep-worktrees: a container is not a worktree.
             if not a.keep:
                 try:
                     from bench.routing_switch import broker as _b
@@ -216,7 +226,7 @@ def main():
         # "captured 1, skipped 1" for a batch containing exactly one instance.
         if not over:
             captured += 1
-        if not a.keep:
+        if not (a.keep or a.keep_worktrees):
             # `git worktree remove` FIRST, rmtree only as a fallback.
             #
             # rmtree(ignore_errors=True) cannot delete the locked `.git` entry on Windows, so
@@ -246,7 +256,7 @@ def main():
         print("SKIPPED %-58s %s" % (inst[:58], why))
     print("captured %d, skipped %d (total preds now %d) -> %s%s"
           % (captured, len(skipped), len(preds), a.preds,
-             "" if a.keep else "  [worktrees deleted]"))
+             "" if (a.keep or a.keep_worktrees) else "  [worktrees deleted]"))
 
 
 if __name__ == "__main__":

@@ -130,7 +130,11 @@ def _load(path, default):
 #: be written "not" -- a graded failure, which both counted it against the model and retired it
 #: so it was never retried. That is how nineteen instances entered the record as wrong answers
 #: during the run where the fleet gate was refusing and no worker ever started.
-_NOT_A_GRADE = {"EVALERR", "NOPATCH", ""}
+#:
+#: IMPORTED, NOT RESTATED. This rule had five copies and they disagreed the moment NOPATCH was
+#: added -- this file left such an instance outstanding while the grader treated it as already
+#: settled and threw the real verdict away.
+from bench.verdicts import NOT_A_MEASUREMENT as _NOT_A_GRADE  # noqa: E402
 
 
 def graded_ids():
@@ -767,7 +771,7 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
         #
         # The trees are discarded below, before the grade rather than after it, so the disk
         # profile is unchanged: nothing is held across the long step.
-        run([PY, os.path.join("bench", "pro_capture.py"), "--preds", PREDS, "--keep"],
+        run([PY, os.path.join("bench", "pro_capture.py"), "--preds", PREDS, "--keep-worktrees"],
             900, "capture")
 
         # SHADOW. The records are compared against what each worker claimed, and the verdict is

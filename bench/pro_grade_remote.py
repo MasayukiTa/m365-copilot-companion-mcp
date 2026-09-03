@@ -53,6 +53,9 @@ import re
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import verdicts as V   # noqa: E402  (runnable as a script and as bench.pro_grade_remote)
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SW = os.path.join(REPO, ".fleet", "swe")
 
@@ -314,8 +317,13 @@ def ingest(eval_results: dict, existing_path: str, unevaluated=None) -> int:
                     continue
                 if isinstance(row, dict) and row.get("instance_id"):
                     latest[row["instance_id"]] = row
-    have = {i for i, row in latest.items()
-            if str(row.get("verdict") or "").upper() != "EVALERR"}
+    # THROUGH THE SHARED PREDICATE, NOT A LITERAL. This read `!= "EVALERR"`, so the moment
+    # NOPATCH existed a row saying "nothing was evaluated" counted as a verdict already held --
+    # and the real verdict, when it finally arrived, was discarded here as already known. Since
+    # graded_ids() correctly leaves NOPATCH outstanding, the instance would have been re-run for
+    # ever and never once recorded. Same defect as the retracted-EVALERR one, reintroduced by
+    # adding a value to a rule that lived in five copies.
+    have = {i for i, row in latest.items() if V.is_measurement(row.get("verdict"))}
     added = 0
     with open(existing_path, "a", encoding="utf-8", newline="\n") as fh:
         for inst, resolved in (eval_results or {}).items():
@@ -454,8 +462,17 @@ def main(argv=None):
         with open(local_harness, encoding="utf-8", errors="replace") as fh:
             unevaluated = unevaluated_instances(fh.read()) & set(results)
     else:
-        log("WARNING: the harness log did not come back. Infrastructure failures cannot be told "
-            "apart from wrong patches in this batch, so the rate below may understate the model.")
+        # FAIL CLOSED. Warning and then ingesting anyway is the original defect with a log line
+        # in front of it: without the log, every instance the harness could not evaluate is an
+        # indistinguishable `false` and lands in the ledger as a wrong answer -- which is how
+        # fourteen missing images became a score of 0.0%. The verdicts are kept on disk and the
+        # grade can be re-ingested once the log is recovered; what must not happen is writing
+        # failures nobody measured.
+        log("REFUSING TO INGEST: the harness log did not come back, so an instance that was "
+            "never evaluated cannot be told apart from a patch that failed. The verdicts are "
+            "saved at %s and the harness log is at %s/pro_out_%s/harness.log on the host; "
+            "re-run once it can be collected." % (local_results, REMOTE_WIN, a.tag))
+        return 3
 
     added = ingest(results, a.results, unevaluated)
     scored = [i for i in results if i not in unevaluated]

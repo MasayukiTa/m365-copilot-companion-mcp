@@ -40,9 +40,10 @@ import re
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LEDGER = os.path.join(REPO, ".fleet", "swe", "pro_cycle_results.json")
 
-#: Verdicts that mean no evaluation happened. Kept in step with pro_cycle._NOT_A_GRADE by a
-#: test rather than by memory -- two copies of a rule about the same file is how they drift.
-NOT_A_MEASUREMENT = {"EVALERR", "NOPATCH", ""}
+#: Verdicts that mean no evaluation happened. IMPORTED, not restated: "kept in step by a test"
+#: was the previous plan and it was already false when written -- the same rule had five copies
+#: and adding NOPATCH broke four of them, one of which silently discarded real verdicts.
+from bench.verdicts import NOT_A_MEASUREMENT  # noqa: E402,F401
 
 _INSTANCE = re.compile(r"^instance_(?P<owner>.+?)__(?P<repo>.+?)-[0-9a-f]{40}")
 

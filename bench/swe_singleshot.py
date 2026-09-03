@@ -17,6 +17,9 @@ PASS_TO_PASS/FAIL_TO_PASS regression feedback (bench meta-info). Sequential = di
 import argparse
 import json
 import os
+import sys as _sys
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import verdicts as _V
 import subprocess
 import sys
 
@@ -84,8 +87,11 @@ def main():
         ln = ln.strip()
         if " " in ln:
             v, i = ln.split(" ", 1)
-            if v == "EVALERR":
-                continue   # eval-host failure, not a final verdict -> re-attempt this instance
+            # ANY non-measurement, not just EVALERR. A NOPATCH row means no patch was
+            # produced and nothing was evaluated; treating it as final records a failure
+            # nobody measured and stops the instance being attempted again.
+            if not _V.is_measurement(v):
+                continue   # not a final verdict -> re-attempt this instance
             done[i] = (v == "RESOLVED")
 
     res = dict(done)
