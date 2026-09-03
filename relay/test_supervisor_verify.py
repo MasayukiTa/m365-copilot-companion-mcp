@@ -403,3 +403,31 @@ def test_a_real_green_suite_is_still_a_pass(monkeypatch):
     monkeypatch.setattr(CE, "_run_with_tree_timeout", fake)
     rec = SV.run_check("pytest -q", cwd=".")
     assert rec["ok"] is True and not rec.get("unavailable")
+
+
+# -- the network never let the toolchain start ------------------------------------------------
+
+def test_a_blocked_module_download_is_not_the_patch_s_fault():
+    """Measured on the first go batch of the baseline run.
+
+    All three flipt instances recorded VERIFY_FAILED in 4.4 seconds with a corporate TLS
+    middlebox rejecting proxy.golang.org. The module cache had been cleared to free disk before
+    the run, so nothing resolved offline any more, and every go verification in the run was
+    about to enter the record as a wrong answer. A patch cannot make a certificate untrusted.
+    """
+    out = ('go.uber.org/zap@v1.24.0: Get "https://proxy.golang.org/go.uber.org/zap/@v/'
+           'v1.24.0.zip": tls: failed to verify certificate: x509: certificate signed by '
+           'unknown authority')
+    assert SV.not_actually_run(out)
+
+
+def test_a_blocked_pip_download_is_not_the_patch_s_fault():
+    assert SV.not_actually_run(
+        "SSLError(SSLCertVerificationError(1, 'certificate verify failed'))")
+
+
+def test_a_genuine_test_failure_still_counts_as_a_failure():
+    """The guard rail on the guard rail: this list must never contain a pattern a real failure
+    can print, or a defect becomes 'could not check'."""
+    assert not SV.not_actually_run("--- FAIL: TestParseFlag (0.01s)  expected 3, got 4")
+    assert not SV.not_actually_run("2 failed, 10 passed in 31.2s")
