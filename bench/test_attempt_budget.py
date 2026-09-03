@@ -346,22 +346,36 @@ def test_an_explicit_batch_size_bypasses_this_entirely():
 
 # -- a checkout that never happened -----------------------------------------------------------
 
-def test_staged_ids_reads_what_was_actually_written(tmp_path):
-    """pro_stage_goals reports a per-instance FETCH_FAIL and still exits 0, so the exit code
-    says nothing about whether any instance is ready to run. The goals file does."""
-    g = tmp_path / "goals.jsonl"
-    g.write_text(json.dumps({"instance_id": "a", "goal": "x"}) + "\n", encoding="utf-8")
-    assert C.staged_ids(str(g)) == {"a"}
+def test_staged_ids_reads_the_worktree_map(tmp_path, monkeypatch):
+    """WHICH FILE IS AUTHORITATIVE, AND THE COST OF GETTING IT WRONG.
+
+    The first version parsed pro_cycle_goals.jsonl for an "instance_id" -- a field that file has
+    never had; its rows are {checks, cwd, text}. So every batch read as a failed checkout, and a
+    re-run refunded and skipped four batches whose staging had plainly succeeded ("go 16MB ok",
+    "wrote ... with 1 goals"). A guard that reads a field its input does not contain fails in
+    whichever direction its default points, and this one pointed at "nothing was staged".
+    """
+    monkeypatch.setattr(C, "SW", str(tmp_path))
+    (tmp_path / "pro_wt_map.json").write_text(
+        json.dumps({"a": "C:/work/p01", "b": "C:/work/p02"}), encoding="utf-8")
+    assert C.staged_ids() == {"a", "b"}
 
 
-def test_an_empty_goals_file_stages_nothing(tmp_path):
-    g = tmp_path / "goals.jsonl"
-    g.write_text("", encoding="utf-8")
-    assert C.staged_ids(str(g)) == set()
+def test_a_goals_row_without_an_instance_id_is_not_mistaken_for_a_failure(tmp_path,
+                                                                         monkeypatch):
+    """The real shape of a goals row -- no id anywhere in it."""
+    monkeypatch.setattr(C, "SW", str(tmp_path))
+    (tmp_path / "pro_cycle_goals.jsonl").write_text(
+        json.dumps({"checks": [], "cwd": "C:/work/p01", "text": "fix it"}) + "\n",
+        encoding="utf-8")
+    (tmp_path / "pro_wt_map.json").write_text(json.dumps({"a": "C:/work/p01"}),
+                                              encoding="utf-8")
+    assert C.staged_ids() == {"a"}
 
 
-def test_a_missing_goals_file_stages_nothing(tmp_path):
-    assert C.staged_ids(str(tmp_path / "nope.jsonl")) == set()
+def test_a_missing_worktree_map_stages_nothing(tmp_path, monkeypatch):
+    monkeypatch.setattr(C, "SW", str(tmp_path))
+    assert C.staged_ids() == set()
 
 
 def test_an_instance_whose_checkout_failed_gets_its_attempt_back(tmp_path, monkeypatch):
