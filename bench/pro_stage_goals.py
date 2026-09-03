@@ -131,7 +131,16 @@ def stage(inst):
 def goal(inst, wt):
     r = BY_ID[inst]
     lang = r["repo_language"]
-    ps = (r["problem_statement"] or "")[:6000]
+    # IF THIS EVER CUTS, IT SAYS SO. The behavioural contract one block below was being cut at
+    # 3000 characters with no marker, mid-sentence, while the goal text told the worker the patch
+    # was judged against it -- 4 of 40 on one slice, the longest field 5214 characters. This cap
+    # is not currently reached (the longest problem statement measured is 3251), so it is left
+    # alone rather than tuned; what is added is the marker, so the same defect cannot recur here
+    # silently the way it did there.
+    ps = (r["problem_statement"] or "")
+    if len(ps) > 6000:
+        ps = ps[:6000] + ("\n\n[... the issue text was truncated at 6000 characters; %d were "
+                          "omitted. Say so if what you need is missing.]" % (len(ps) - 6000))
     th = TESTHINT.get(lang, "the project's own test command")
     # PUBLIC contract (requirements + interface): provided by the dataset as task input (NOT the
     # hidden tests). The hidden tests bind to THESE named symbols/behaviors -- a smoke miss (ansible)
