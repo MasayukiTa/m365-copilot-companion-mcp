@@ -161,6 +161,28 @@ _NOT_RUN_MARKERS = (
 IMPOSSIBLY_FAST_S = 1.5
 
 
+#: Output from a command that SUCCEEDED while exercising nothing. These are checked on the
+#: passing path, which every other guard here leaves alone -- and it is the direction that
+#: matters most, because the failure mode is a promotion rather than a false accusation.
+#:
+#: `go test ./...` exits 0 with "[no test files]" whenever the packages it matched contain no
+#: tests; pytest exits 0 having collected zero items; jest exits 0 on "No tests found". A patch
+#: that breaks a package badly enough for its tests to stop being discovered therefore produces
+#: a green check, which is exactly backwards.
+_NOTHING_EXERCISED_MARKERS = (
+    "no test files",
+    "collected 0 items",
+    "no tests ran",
+    "no tests found",
+    "there are no tests to run",
+)
+
+
+def nothing_was_exercised(output: str) -> bool:
+    """Whether a SUCCESSFUL command actually ran any test. Empty is not green."""
+    return any(m in (output or "").lower() for m in _NOTHING_EXERCISED_MARKERS)
+
+
 def not_actually_run(output: str) -> bool:
     """Whether the command failed to START, as opposed to running and reporting failure."""
     low = (output or "").lower()
@@ -184,7 +206,23 @@ def run_check(command: str, cwd: str, timeout_s: float = None):
         ok = ("[timeout" not in out) and ("[returncode:" not in out)
         record = {"command": command, "ok": ok, "output": out[-4000:],
                   "duration_s": round(time.monotonic() - started, 2)}
-        if not ok and not_actually_run(out):
+        if ok and nothing_was_exercised(out):
+            # A PASS THAT RAN NOTHING IS NOT A PASS, AND IT IS THE DANGEROUS DIRECTION.
+            #
+            # Every other guard here protects a patch from being blamed for the harness. This one
+            # protects the harness from a patch: `go test ./...` exits 0 and prints
+            # "[no test files]" when the packages it matched contain no tests, and pytest exits 0
+            # having collected nothing. Both look identical to a green suite, and both would
+            # promote a candidate to DONE on the strength of nothing at all.
+            record["unavailable"] = True
+            record["why_unavailable"] = ("the command succeeded without exercising any test; "
+                                         "an empty run is not a pass")
+        elif ok and record["duration_s"] < IMPOSSIBLY_FAST_S:
+            record["unavailable"] = True
+            record["why_unavailable"] = (
+                "succeeded in %.2fs, which is too fast for the suite to have run"
+                % record["duration_s"])
+        elif not ok and not_actually_run(out):
             # THE DISTINCTION THE FAILURE TAXONOMY TURNS ON. "the tests failed" and "the test
             # runner never started" are different facts, and only the first is evidence about
             # the work. Measured while wiring this: an absent worktree made `npm test` exit
