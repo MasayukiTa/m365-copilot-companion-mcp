@@ -1321,6 +1321,52 @@ def _print_table(workers, total=None):
 _ACTIVE_STATE_DIR = None
 
 
+
+def report_duplicate_completions(state_dir, out=print, transcripts=None):
+    """Say, at the end of a run, where duplicate completions of one goal disagree.
+
+    A STUCK worker is retried and the retry duplicates the goal, so a run can finish holding
+    several independent answers to the same question -- and the ledger keeps whichever landed
+    last. Measured on the 290-cinema survey of 2026-09-04: one goal was completed four times,
+    five of its subjects came back with conflicting verdicts, one of them three ways, and
+    finding that out took a person reading four transcripts.
+
+    It picks no winner. Choosing is the judgement that needs a person or a supervising agent;
+    this only makes the choice visible.
+
+    A FUNCTION SO IT CAN BE RUN BY A TEST. Inline at the call site it could only ever be
+    asserted against its own source, and source assertions do not execute -- which is how the
+    detectors this repository already had came to be correct and unreachable at the same time.
+    Best-effort: a reconciler that raised would turn a finished run into a crashed one.
+    """
+    try:
+        import os as _os
+        from relay.fleet_reconcile import load_completions, reconcile, disagreements
+        where = transcripts or _os.path.join(state_dir, "transcripts")
+        repeated = {k: v for k, v in load_completions(run=None, transcripts=where).items()
+                    if len(v) > 1}
+        reported = 0
+        for _key, comps in repeated.items():
+            conflicts = disagreements(reconcile(comps))
+            if not conflicts:
+                continue
+            reported += 1
+            out("")
+            out("  ⚠ この走行で同じゴールが %d 回完了し、%d 件で結論が食い違っています:"
+                % (len(comps), len(conflicts)))
+            for subject, verdicts in conflicts[:8]:
+                out("      %s" % subject[:60])
+                for verdict, who in verdicts.items():
+                    out("          %-12s <- %s" % (verdict[:12], ", ".join(who)))
+            if len(conflicts) > 8:
+                out("      ... 他 %d 件" % (len(conflicts) - 8))
+            out("    どれを採るかは自動では決めません。"
+                "python -m relay.fleet_reconcile で全文を確認してください。")
+        return reported
+    except Exception:
+        return 0
+
+
 def main():
     # cp932 console: goal/reason text can contain chars the legacy codepage cannot
     # encode (a worker once died printing U+26A0); degrade to '?' instead of crashing.
@@ -2252,6 +2298,10 @@ def main():
                                             (r["goal"][:60] + "...") if len(r["goal"]) > 60 else r["goal"]))
         if r["reason"]:
             print("       reason: %s" % r["reason"])
+
+    # Printed at the end of the run, because a detector whose output nobody reads is
+    # the defect this repository keeps rediscovering.
+    report_duplicate_completions(args.state_dir)
 
     # CLEAN COMPLETION: this point is reached whenever the run ends on its own -- goals
     # ran to a terminal outcome, OR a graceful `stop` command (bench/fleet_ctl.py stop /

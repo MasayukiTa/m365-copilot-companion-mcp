@@ -144,3 +144,67 @@ def test_a_single_completion_produces_no_lone_report():
 def test_nothing_to_reconcile_is_said_plainly(tmp_path):
     out = R.report(transcripts=str(tmp_path))
     assert "no goal was finished twice" in out
+
+
+# -- reaching someone, which is the part that kept being missing -------------------------------
+
+def _transcript(tmp, name, goal, final):
+    import io as _io, json as _json, os as _os
+    p = _os.path.join(str(tmp), name + ".jsonl")
+    with _io.open(p, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(_json.dumps({"goal": goal, "key": "k"}, ensure_ascii=False) + "\n")
+        fh.write(_json.dumps({"role": "assistant", "turn": 1, "text": final},
+                             ensure_ascii=False) + "\n")
+    return p
+
+
+def test_a_finished_run_says_where_its_duplicates_disagree(tmp_path):
+    """THE WHOLE POINT OF THE MODULE. A detector nobody reads is the defect this repository
+    keeps rediscovering, so the run itself has to say it."""
+    from relay import fleet_runner as FR
+    _transcript(tmp_path, "w1", "調べて", "- **A: 配布終了** — 根拠1\n")
+    _transcript(tmp_path, "w2", "調べて", "- **A: 情報なし** — 到達できず\n")
+    said = []
+    n = FR.report_duplicate_completions(None, out=said.append, transcripts=str(tmp_path))
+    assert n == 1
+    blob = "\n".join(said)
+    assert "配布終了" in blob and "情報なし" in blob
+    assert "w1" in blob and "w2" in blob
+
+
+def test_it_says_nothing_when_the_duplicates_agree(tmp_path):
+    """A report that fires on every run is one nobody reads either."""
+    from relay import fleet_runner as FR
+    _transcript(tmp_path, "w1", "調べて", "- **A: 配布終了** — 根拠1\n")
+    _transcript(tmp_path, "w2", "調べて", "- **A: 配布終了** — 根拠2（別ページ）\n")
+    said = []
+    assert FR.report_duplicate_completions(None, out=said.append,
+                                           transcripts=str(tmp_path)) == 0
+    assert said == []
+
+
+def test_a_run_with_no_duplicates_says_nothing(tmp_path):
+    from relay import fleet_runner as FR
+    _transcript(tmp_path, "w1", "ゴールA", "- **A: 配布終了** — 根拠\n")
+    _transcript(tmp_path, "w2", "ゴールB", "- **B: 情報なし** — 根拠\n")
+    said = []
+    assert FR.report_duplicate_completions(None, out=said.append,
+                                           transcripts=str(tmp_path)) == 0
+    assert said == []
+
+
+def test_it_never_turns_a_finished_run_into_a_crashed_one(tmp_path):
+    """Best-effort by contract: this runs after the results are already printed."""
+    from relay import fleet_runner as FR
+    assert FR.report_duplicate_completions(None, out=None,
+                                           transcripts=str(tmp_path / "nope")) == 0
+
+
+def test_it_does_not_choose_a_winner(tmp_path):
+    """Picking one is the judgement that needs a person; saying so is the deliverable."""
+    from relay import fleet_runner as FR
+    _transcript(tmp_path, "w1", "調べて", "- **A: 配布終了** — 根拠1\n")
+    _transcript(tmp_path, "w2", "調べて", "- **A: 情報なし** — 到達できず\n")
+    said = []
+    FR.report_duplicate_completions(None, out=said.append, transcripts=str(tmp_path))
+    assert "自動では決めません" in "\n".join(said)

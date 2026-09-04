@@ -137,10 +137,55 @@ MARKER_WAITS = 2
 PANEL_LENSES = ("correctness", "edge", "security")
 
 
-def build_refuter_prompt(goal: str, final_response: str, lens: str = "") -> str:
+#: Framing for a goal that carries NO acceptance check -- gathering information rather than
+#: changing code.
+#:
+#: WHY IT IS NEEDED. REFUTER_INSTRUCTION is written for code: it names 境界値・エラー処理・例外
+#: ケース・セキュリティ and tells the reviewer to open 実物のファイルやテスト. A survey has no
+#: files and no tests. Worse, the three verdicts leave nowhere to put a well-supported negative
+#: finding, so a reviewer told to hunt for a defect 全力で always finds "you did not try X".
+#:
+#: MEASURED on the 290-cinema survey of 2026-09-04: one worker was sent back three times in a
+#: row, answered "調べ尽くした" each time, and was told to try PDF parsing and proxied fetches.
+#: Its final conclusion was materially the same as its first. Three turns of quota were spent on
+#: pressure alone, because the harness assumes a verifiable correct answer always exists -- the
+#: same assumption that, measured the same day on the benchmark side, produced an acceptance
+#: check with zero sensitivity.
+#:
+#: WHAT IT MUST NOT DO IS EXCUSE LAZINESS. The same write-up credits this reviewer with catching
+#: real sloppiness: one worker checked 1 of 9 cinemas and called the rest unknown; another reused
+#: a different campaign's stock figure; another processed the wrong cinema entirely. Those are
+#: defects in the SEARCH and they stay REFUTED. The change is only that a search which was
+#: actually carried out, and found nothing, is allowed to be finished.
+UNVERIFIABLE_PREAMBLE = (
+    "【このゴールには機械的な検証条件がありません】調査・情報収集の課題です。コードの変更では"
+    "ないので、ファイルやテストを開いて確かめる観点(境界値・例外処理・セキュリティ)は当てはまり"
+    "ません。判定の基準を次に置き換えてください。\n"
+    "**問うべきは『答えが出たか』ではなく『調べ方が十分だったか』です。**\n"
+    "・**「情報が存在しない」「一次情報に到達できない」は正当な結論です。**十分に調べた上での"
+    "その報告は UPHELD にしてください。追加の手段を思いつくというだけでは REFUTED の理由に"
+    "なりません。\n"
+    "・REFUTED にすべきなのは調査そのものの欠陥です。例:\n"
+    "  - ゴールが挙げた対象の一部しか実際には調べていない\n"
+    "  - 参照したと書いてある情報源を実際には開いていない\n"
+    "  - 別の対象・別の項目の情報を流用して判定している\n"
+    "  - 報告された対象名と根拠が食い違っている\n"
+    "  - 到達できなかった理由が書かれておらず、調べたのか調べていないのか区別できない\n"
+    "・同じ指摘を繰り返さないでください。前回と同じ理由で差し戻すくらいなら UPHELD です。"
+)
+
+
+def build_refuter_prompt(goal: str, final_response: str, lens: str = "",
+                         unverifiable: bool = False) -> str:
     """Compose the adversarial reviewer prompt from the goal and the implementer's
-    claimed-done summary. `lens` (one of LENS_PROMPTS) focuses a panel reviewer."""
+    claimed-done summary. `lens` (one of LENS_PROMPTS) focuses a panel reviewer.
+
+    `unverifiable` reframes the review for a goal with no acceptance check; the default keeps
+    the prompt byte-for-byte as it was for everything else.
+    """
     base = REFUTER_INSTRUCTION
+    if unverifiable:
+        base = UNVERIFIABLE_PREAMBLE + "\n\n" + base
     if lens and lens in LENS_PROMPTS:
         base = LENS_PROMPTS[lens] + "\n" + base
     return (
@@ -287,7 +332,8 @@ def agent_base_url(conversation_url: str) -> str:
 
 def run_refuter(context, conversation_url: str, goal: str, final_response: str,
                 notify=None, runlog=None, run_id: str = "relay", turn: int = 0,
-                timeout_s: int = 600, max_nudges: int = 2, lens: str = ""):
+                timeout_s: int = 600, max_nudges: int = 2, lens: str = "",
+                unverifiable: bool = False):
     """Open an independent side-page Copilot chat and ask it to refute the claimed DONE.
     Returns (kind, reason). Never raises into the control loop -- any failure yields
     ("UNCLEAR", "") so the loop falls back to accepting the DONE. Mirrors the research/
@@ -310,7 +356,8 @@ def run_refuter(context, conversation_url: str, goal: str, final_response: str,
             return ("UNCLEAR",
                     "harness: the composer never rendered within 40s of loading the page")
         drv = CopilotWebDriver(page)
-        drv.send(build_refuter_prompt(goal, final_response, lens=lens))
+        drv.send(build_refuter_prompt(goal, final_response, lens=lens,
+                                      unverifiable=unverifiable))
         ok = drv.wait_for_idle(timeout_s=timeout_s)
         verdict = (parse_verdict(drv.read_last_response()) if ok else
                    ("UNCLEAR", "harness: the reviewer did not settle within %ds" % timeout_s))
@@ -374,8 +421,9 @@ class RefuterSession:
 
     def __init__(self, context, base_url, goal, final_response,
                  dwell_s=4.0, timeout_s=600, max_nudges=2, lens="",
-                 max_network_reopens=2):
+                 max_network_reopens=2, unverifiable=False):
         self.context = context
+        self.unverifiable = unverifiable
         self.base_url = base_url
         self.goal = goal
         self.final = final_response
@@ -435,7 +483,8 @@ class RefuterSession:
             self.drv = CopilotWebDriver(self.page)
             self._count_before = self.drv._answers().count()
             self.drv._count_before = self._count_before
-            self.drv.send(build_refuter_prompt(self.goal, self.final, lens=self.lens))
+            self.drv.send(build_refuter_prompt(self.goal, self.final, lens=self.lens,
+                                              unverifiable=self.unverifiable))
             self._pending_open = False
             self._t_send = time.time()
         except Exception as exc:
@@ -511,7 +560,8 @@ class RefuterSession:
             self.page, self.drv, self.socket = None, drv, True
             self._count_before = 0
             self.drv._count_before = 0
-            self.drv.send(build_refuter_prompt(self.goal, self.final, lens=self.lens))
+            self.drv.send(build_refuter_prompt(self.goal, self.final, lens=self.lens,
+                                              unverifiable=self.unverifiable))
             self._pending_open = False
             self._t_send = time.time()
             return True
