@@ -92,6 +92,7 @@ jobs:
             scripts/test_ensure_m365_signin.py \
             scripts/test_check_no_identifying_names.py \
             scripts/test_check_integration_evidence.py \
+            scripts/test_run_script_style_tests.py \
             tests/test_scroll_transcript.py \
             tests/test_golden.py \
             tests/test_listing_counts.py \
