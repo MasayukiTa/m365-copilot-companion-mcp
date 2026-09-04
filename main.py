@@ -158,7 +158,7 @@ from tools.registry import list_my_tools, register
 from tools.search_ops import find_files, glob
 from tools.security import list_unlocked, unlock
 from tools.task_ops import todo_clear, todo_list, todo_write
-from tools.web_ops import github_file, web_fetch
+from tools.web_ops import github_file, render_page, web_fetch
 
 load_dotenv()
 
@@ -312,7 +312,7 @@ TOOLS = (
     # git (write)
     git_add, git_commit, git_checkout,
     # web
-    web_fetch, github_file,
+    web_fetch, render_page, github_file,
     web_search, web_search_news,
     # images / pdf (self-verification)
     read_image, image_info,
