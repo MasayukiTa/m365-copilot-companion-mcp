@@ -471,18 +471,23 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
                 pass
 
         if not name or name in ("?", "list", "*"):
-            # COMPACT catalog: name -- one-line summary only (no signatures), so an agent
-            # with a small context window can scan every tool without overflowing. Get one
-            # tool's full signature/usage with call_tool(name="<tool>") (no arguments).
-            rows = []
-            for n in sorted(_ALL_TOOLS):
-                doc = (getattr(_ALL_TOOLS[n], "__doc__", "") or "").strip().splitlines()
-                rows.append("%s -- %s" % (n, doc[0] if doc else ""))
-            _catalogue = ("%d tools available. Pick what THIS task needs, then: "
-                    "call_tool(name='X') shows X's signature; "
-                    "call_tool(name='X', arguments={...}) runs X.\n%s" % (
-                        len(rows), "\n".join(rows)))
-            _log_discovery("call_tool.catalogue", {"tools": len(rows)}, _catalogue)
+            # THE CATALOGUE WITHHELD THE ONE FACT ITS READERS NEEDED. It listed 173 names
+            # and summaries alphabetically, with no parameter names anywhere, so the caller
+            # invented them: 1,063 calls died on a guessed argument name, and the 18
+            # most-used tools hold 92.9% of those. On several -- git_log 62.8%, git_status
+            # 57.5%, github_file 52.5% -- the caller is wrong more often than right, which
+            # is a property of the catalogue rather than of the caller.
+            #
+            # So the twenty tools that account for 96.4% of real calls now carry their
+            # parameter names, for about 470 tokens against a catalogue already spending
+            # 4,100. Nothing is removed: 115 tools have never been called, but the ledger is
+            # almost all coding runs, so they were never NEEDED rather than found wanting.
+            # See tools/tool_catalogue.py.
+            from tools import tool_catalogue as _tc
+            _catalogue = _tc.render(_ALL_TOOLS)
+            _log_discovery("call_tool.catalogue",
+                           {"tools": len(_ALL_TOOLS), "with_signatures": len(_tc.HOT)},
+                           _catalogue)
             return _catalogue
         fn = _ALL_TOOLS.get(name)
         if fn is None:
