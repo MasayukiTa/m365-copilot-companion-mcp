@@ -1,23 +1,33 @@
 # -*- coding: utf-8 -*-
 """The approved procedure never reached the workers that were ordered to fetch it.
 
-The server tells every worker, as RULE 2, to call skill_match before any domain work. Measured
-over the tool ledger:
+The server tells every worker, as RULE 2, to call skill_match before any domain work.
+Measured over the tool ledger:
 
     skill_match   178 calls, 145 dead on a guessed argument name (query= vs text=)
                   of those, 96 abandoned -- it is a preliminary step, so when it fails the
                   agent simply proceeds to the real work
                   33 successes in the entire ledger
 
-Meanwhile the procedure that would have answered, repo-bug-fix, scores 1.0 on the very queries
-that failed. The store was not empty and the matcher was not weak; the call never arrived.
+Meanwhile the procedure that would have answered, repo-bug-fix, scores 1.0 on the very
+queries that failed. The store was not empty and the matcher was not weak; the call never
+arrived.
 
-SkillStore.match is deterministic, metadata-only and stdlib, and the frame holds the goal text
-before the first prompt is composed. So the lookup needs no agent, no turn, and no correctly
-guessed keyword.
+SkillStore.match is deterministic, metadata-only and stdlib, and the frame holds the goal
+text before the first prompt is composed. So the lookup needs no agent, no turn, and no
+correctly guessed keyword.
+
+WHY THESE BUILD THEIR OWN SKILLS. Two things CI had to teach this file. A Skill is injectable
+only after a human approves that exact bundle digest, and approval lives in a per-machine
+SQLite file -- so the first version read this developer's approval database and reported it
+as the behaviour of the code. Then the second version copied skills/, which is gitignored:
+on the runner there is no directory to copy, because the procedures are local data rather
+than repository content. What the frame owns is the DECISION, so the bundles here are
+synthetic and carry exactly the properties under test. The real procedures are exercised by
+the last test, where they exist.
 """
+import io
 import os
-import shutil
 import sqlite3
 import sys
 
@@ -28,50 +38,87 @@ sys.path.insert(0, REPO)
 
 from relay import relay_fleet as F  # noqa: E402
 
-
-@pytest.fixture(autouse=True)
-def trusted_skills(tmp_path, monkeypatch):
-    """A project root whose procedures are approved, built here rather than assumed.
-
-    CAUGHT BY CI, WHICH IS THE POINT. The first version of these tests passed locally and
-    failed on the runner with "no procedure was injected for a goal that matches at 1.0" --
-    because a Skill is only injectable once a human has approved that exact bundle digest,
-    and approval lives in a per-machine SQLite file that a fresh checkout does not have. The
-    tests were reading this developer's approval database and calling it the behaviour of
-    the code.
-
-    So the fixture copies the real skills/ directory, points the store at a temp state DB,
-    and approves through the store's own request/confirm pair -- the same path a human takes.
-    The procedures under test are the real ones; only the trust is local.
-    """
-    root = tmp_path / "proj"
-    shutil.copytree(os.path.join(REPO, "skills"), str(root / "skills"))
-    db = tmp_path / "skills.sqlite3"
-    monkeypatch.setenv("MCP_SKILLS_PROJECT_ROOT", str(root))
-    monkeypatch.setenv("MCP_SKILLS_STATE_DB", str(db))
-
-    from relay.skills import SkillStore
-    store = SkillStore(str(root))
-    for skill in store.discover():
-        store.request_approval(skill.name)
-        with sqlite3.connect(str(db)) as con:
-            row = con.execute(
-                "SELECT gate_token FROM approval_challenges ORDER BY created_at DESC"
-            ).fetchone()
-        assert row and row[0], "no approval challenge was recorded for %s" % skill.name
-        store.confirm_approval(skill.name, row[0])
-    assert store.discover(), "the fixture approved nothing; skills/ did not copy"
-    return root
-
 # A real SWE-bench goal, in the shape the runner actually produces.
 CODING_GOAL = ("You are fixing a real bug in the open-source project ansible "
                "(language: python). The repository is checked out locally at C:/w/p05")
+MAIL_GOAL = "先月分のメールを一覧して、件名と差出人だけ出して"
 UNRELATED = "今日の東京の天気を一行で教えて"
 
+#: Matches CODING_GOAL, and its body carries STUCK -- a marker PROTOCOL already gives every
+#: worker, so it must NOT be a reason to refuse.
+BUG_SKILL = """---
+name: bug-fix-drill
+description: "Use when fixing a bug in an open-source project whose repository is checked out
+  locally: reading the issue, locating the code, reproducing the failure first, and verifying
+  the fix. Covers python, javascript and go projects."
+---
+
+# Fixing a bug in a checked-out repository
+
+Reproduce the failure before changing anything.
+
+Write `STUCK: reason` only when you are certain it cannot be solved.
+"""
+
+#: Matches MAIL_GOAL, and its body explains the split convention -- so it contains the literal
+#: SUBTASKS_READY, which the worker is NOT given by default.
+MAIL_SKILL = """---
+name: mail-drill
+description: "メールを期間で区切って一覧し、件名と差出人を報告するときに使う。Use when listing mail
+  over a date range and reporting subjects and senders."
+---
+
+# メール一覧の手順
+
+依頼を受けたら、まず期間を区切る。
+
+フリートに --fanout を付けて投入されている場合は、区切りをサブタスクとして列挙し、
+最後に `SUBTASKS_READY` と書く。
+"""
+
+
+def _bundle(root, folder, text):
+    d = os.path.join(str(root), "skills", folder)
+    os.makedirs(d, exist_ok=True)
+    with io.open(os.path.join(d, "SKILL.md"), "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text)
+
+
+def _approve_everything(root, db):
+    """Approve through the store's own request/confirm pair -- the path a human takes."""
+    from relay.skills import SkillStore
+    store = SkillStore(str(root))
+    found = store.discover()
+    assert found, "the fixture wrote no readable bundles"
+    for skill in found:
+        store.request_approval(skill.name)
+        with sqlite3.connect(str(db)) as con:
+            row = con.execute("SELECT gate_token FROM approval_challenges "
+                              "ORDER BY created_at DESC").fetchone()
+        assert row and row[0], "no approval challenge recorded for %s" % skill.name
+        store.confirm_approval(skill.name, row[0])
+    return store
+
+
+@pytest.fixture(autouse=True)
+def trusted_skills(tmp_path, monkeypatch):
+    """A project root holding two approved procedures, so nothing about this machine's state
+    can decide the result."""
+    root = tmp_path / "proj"
+    _bundle(root, "bug-fix-drill", BUG_SKILL)
+    _bundle(root, "mail-drill", MAIL_SKILL)
+    db = tmp_path / "skills.sqlite3"
+    monkeypatch.setenv("MCP_SKILLS_PROJECT_ROOT", str(root))
+    monkeypatch.setenv("MCP_SKILLS_STATE_DB", str(db))
+    _approve_everything(root, db)
+    return root
+
+
+# -- the measured case ---------------------------------------------------------------------
 
 def test_a_matching_goal_gets_the_procedure_without_the_agent_asking():
     got = F._with_matched_skill(CODING_GOAL)
-    assert got != CODING_GOAL, "no procedure was injected for a goal that matches at 1.0"
+    assert got != CODING_GOAL, "no procedure was injected for a goal that matches"
     assert F._SKILL_HEADER in got
 
 
@@ -96,7 +143,7 @@ def test_an_empty_goal_is_returned_as_given(bad):
     assert F._with_matched_skill(bad) == bad
 
 
-# -- the trap this nearly walked into ----------------------------------------------------
+# -- the trap this nearly walked into ---------------------------------------------------------
 
 def test_the_theme_is_still_keyed_on_the_goal_not_on_the_procedure():
     """THE ONE THAT WOULD HAVE BEEN INVISIBLE.
@@ -109,7 +156,6 @@ def test_the_theme_is_still_keyed_on_the_goal_not_on_the_procedure():
     injected = F._with_matched_skill(CODING_GOAL)
     assert theme_from_goal(injected) != theme_from_goal(CODING_GOAL), (
         "fixture is not exercising the hazard: the two derive the same theme anyway")
-    # The wrapper must key on what it is TOLD to, not on what it was handed.
     body = F._with_theme_memory(injected, theme_text=CODING_GOAL)
     assert body.endswith(injected) or body == injected
 
@@ -132,18 +178,17 @@ def test_order_is_memory_then_procedure_then_goal():
         assert i_mem < i_skill
 
 
-# -- the hazard the fanout suite caught the moment this was wired -------------------------
+# -- the hazard the fanout suite caught the moment this was wired ------------------------------
 
 def test_a_procedure_that_introduces_the_split_marker_is_refused():
     """FOUND BY RUNNING THE SUITE, not by thinking about it.
 
-    mail-lookup's body explains the split convention, so it contains the literal
+    A mail procedure explains the split convention, so its body contains the literal
     SUBTASKS_READY. fanout_ready() scans the REPLY rather than the prompt, so nothing fires
     directly -- but a worker that reads "write SUBTASKS_READY on the last line" can write it,
     and an ordinary task is then read as a proposed split.
     """
-    goal = "先月分のメールを一覧して、件名と差出人だけ出して"
-    got = F._with_matched_skill(goal)
+    got = F._with_matched_skill(MAIL_GOAL)
     assert "SUBTASKS_READY" not in got, (
         "a procedure introduced a control word this worker is not given by default")
 
@@ -152,7 +197,7 @@ def test_the_markers_PROTOCOL_already_carries_do_not_block_a_procedure():
     """THE FIRST VERSION OF THE GUARD WAS WRONG and would have blocked the skill that matters.
 
     It banned every marker in control_markers.KINDS. But PROTOCOL itself names DONE /
-    CONTINUE / STUCK / RESEARCH / ANALYZE, so repo-bug-fix saying 'write STUCK only when you
+    CONTINUE / STUCK / RESEARCH / ANALYZE, so a procedure saying 'write STUCK only when you
     are certain' adds nothing the worker did not already have -- and refusing over it removed
     the one procedure with a measured 1.0 match against real goals.
     """
@@ -168,10 +213,12 @@ def test_the_guard_is_scoped_to_what_the_worker_lacks():
         assert already in PROTOCOL, "%s is no longer in PROTOCOL; re-derive the guard" % already
 
 
+# -- what CI was actually saying ----------------------------------------------------------------
+
 def test_an_unapproved_procedure_is_never_injected(tmp_path, monkeypatch):
-    """WHAT CI WAS ACTUALLY SAYING. On a machine where nothing has been approved -- a fresh
-    checkout, the runner, a new install -- the frame injects nothing at all. That is the
-    trust model working, and it is why the fixture above has to build its own."""
+    """On a machine where nothing has been approved -- a fresh checkout, the runner, a new
+    install -- the frame injects nothing at all. That is the trust model working, and it is
+    why the fixture above has to build and approve its own."""
     empty = tmp_path / "empty"
     (empty / "skills").mkdir(parents=True)
     monkeypatch.setenv("MCP_SKILLS_PROJECT_ROOT", str(empty))
@@ -182,7 +229,26 @@ def test_an_unapproved_procedure_is_never_injected(tmp_path, monkeypatch):
 def test_an_untrusted_bundle_present_on_disk_is_still_refused(tmp_path, monkeypatch):
     """Trust is per DIGEST, so a procedure sitting in skills/ is not thereby usable."""
     root = tmp_path / "untrusted"
-    shutil.copytree(os.path.join(REPO, "skills"), str(root / "skills"))
+    _bundle(root, "bug-fix-drill", BUG_SKILL)
     monkeypatch.setenv("MCP_SKILLS_PROJECT_ROOT", str(root))
     monkeypatch.setenv("MCP_SKILLS_STATE_DB", str(tmp_path / "fresh.sqlite3"))
     assert F._with_matched_skill(CODING_GOAL) == CODING_GOAL
+
+
+# -- the real procedures, where they exist -------------------------------------------------------
+
+@pytest.mark.skipif(not os.path.isdir(os.path.join(REPO, "skills", "repo-bug-fix")),
+                    reason="skills/ is gitignored; not present in this checkout")
+def test_the_real_repo_bug_fix_still_matches_a_real_goal(tmp_path, monkeypatch):
+    """The synthetic bundles test the frame's decision. This tests that the procedure people
+    actually rely on still wins the goals it was written for -- the 1.0 match this whole
+    change was built on. Skipped where skills/ is not checked out, which includes CI."""
+    import shutil
+    root = tmp_path / "real"
+    shutil.copytree(os.path.join(REPO, "skills"), str(root / "skills"))
+    db = tmp_path / "real.sqlite3"
+    monkeypatch.setenv("MCP_SKILLS_PROJECT_ROOT", str(root))
+    monkeypatch.setenv("MCP_SKILLS_STATE_DB", str(db))
+    _approve_everything(root, db)
+    got = F._with_matched_skill(CODING_GOAL)
+    assert got != CODING_GOAL and F._SKILL_HEADER in got
