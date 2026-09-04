@@ -83,6 +83,7 @@ jobs:
             tests/test_unlock_oracle.py \
             tools/test_child_env_credentials.py \
             tools/test_web_fetch_encoding.py \
+            tools/test_arg_repair.py \
             tests/test_security_state_is_not_readable.py \
             tests/test_unlock_token.py \
             tests/test_exec_via_gateway.py \

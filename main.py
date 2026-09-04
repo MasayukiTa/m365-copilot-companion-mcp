@@ -446,6 +446,30 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
             unlock_token: the value from unlock()'s reply. Required for mutating and executing
                 tools once MCP_REQUIRE_UNLOCK_TOKEN is on; harmless to pass at any time.
         """
+        def _log_discovery(kind, detail, result):
+            """Record a catalogue or signature lookup, which the ledger did not see.
+
+            DISCOVERY WAS INVISIBLE. record_call sits below every branch here, so the three
+            that return early -- the catalogue, an unknown name, and the signature help --
+            left no trace at all. The consequence is not a gap in a report: it means the
+            first two steps this server ORDERS every agent to take (RULE 1 catalogue, then a
+            per-tool signature) cannot be counted, so no change to discovery can be shown to
+            have worked. Measured 1,037 calls dying on guessed argument names, and no way to
+            tell whether the agents had looked the signature up first.
+
+            Named apart from the tools themselves (`call_tool.catalogue`, not `call_tool`) so
+            existing per-tool statistics are unchanged, and PAIRED -- one call row, one
+            outcome row -- because the ledger's rows are exactly paired today (11,385 each)
+            and analyses divide by that.
+            """
+            try:
+                from tools import tool_ledger as _l
+                cid = _l.record_call(kind, detail)
+                if cid:
+                    _l.record_outcome(cid, ok=True, result=result)
+            except Exception:
+                pass
+
         if not name or name in ("?", "list", "*"):
             # COMPACT catalog: name -- one-line summary only (no signatures), so an agent
             # with a small context window can scan every tool without overflowing. Get one
@@ -454,20 +478,26 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
             for n in sorted(_ALL_TOOLS):
                 doc = (getattr(_ALL_TOOLS[n], "__doc__", "") or "").strip().splitlines()
                 rows.append("%s -- %s" % (n, doc[0] if doc else ""))
-            return ("%d tools available. Pick what THIS task needs, then: "
+            _catalogue = ("%d tools available. Pick what THIS task needs, then: "
                     "call_tool(name='X') shows X's signature; "
                     "call_tool(name='X', arguments={...}) runs X.\n%s" % (
                         len(rows), "\n".join(rows)))
+            _log_discovery("call_tool.catalogue", {"tools": len(rows)}, _catalogue)
+            return _catalogue
         fn = _ALL_TOOLS.get(name)
         if fn is None:
-            return "[call_tool: unknown tool '%s'. Use call_tool(name='') to list all.]" % name
+            _unknown = "[call_tool: unknown tool '%s'. Use call_tool(name='') to list all.]" % name
+            _log_discovery("call_tool.unknown", {"name": name}, _unknown)
+            return _unknown
         if arguments is None:
             # HELP for ONE tool: signature + doc. To actually run a no-arg tool, pass arguments={}.
             try:
                 sig = str(_inspect.signature(fn))
             except Exception:
                 sig = "(...)"
-            return "%s%s\n%s" % (name, sig, (getattr(fn, "__doc__", "") or "").strip())
+            _help = "%s%s\n%s" % (name, sig, (getattr(fn, "__doc__", "") or "").strip())
+            _log_discovery("call_tool.signature", {"name": name}, _help)
+            return _help
         # REMOVED: the benchmark's tool-population policy, consulted here.
         #
         # Which sixteen tools a benchmark worker may reach is a fact about that benchmark,
@@ -571,6 +601,25 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
         except Exception:
             _ledger = None
         try:
+            # REPAIR A GUESSED ARGUMENT NAME BEFORE REJECTING THE CALL.
+            #
+            # The catalogue names tools without saying how to call them, so the caller
+            # guesses. 1,037 calls died on that guess. Where the mapping is forced --
+            # one unknown name, one unfilled required parameter -- and the tool only
+            # reads, correct it and run. Anything less certain is explained back and
+            # NOT run: silently redirecting an argument on a tool that writes could act
+            # on the wrong target while looking like a success. See tools/arg_repair.py.
+            _note = ''
+            try:
+                from tools import arg_repair as _ar
+                _ro = bool((_TOOL_ANNOTATIONS or {}).get(name, {}).get('readOnlyHint'))
+                _plan = _ar.repair(fn, _args, name=name, read_only=_ro)
+                if _plan['action'] == _ar.EXPLAIN:
+                    return _plan['message']
+                _args = _plan['arguments']
+                _note = _plan['message']
+            except Exception:
+                pass
             _out = fn(**_args)
             if _trace is not None:
                 _trace.record(name, _args, True, _out, fn)
@@ -580,6 +629,13 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
                                            duration_s=time.time() - _t0)
                 except Exception:
                     pass
+            if _note:
+                # The caller guessed a name and we ran it anyway; say so, or it
+                # learns nothing and guesses the same way next time.
+                try:
+                    return _note + chr(10) + str(_out)
+                except Exception:
+                    return _out
             return _out
         except Exception as _e:
             if _trace is not None:
