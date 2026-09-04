@@ -235,6 +235,81 @@ def test_an_untrusted_bundle_present_on_disk_is_still_refused(tmp_path, monkeypa
     assert F._with_matched_skill(CODING_GOAL) == CODING_GOAL
 
 
+# -- the near miss becomes a question rather than nothing ---------------------------------------
+
+def _unapproved(tmp_path, monkeypatch):
+    root = tmp_path / "pending"
+    _bundle(root, "bug-fix-drill", BUG_SKILL)
+    db = tmp_path / "pending.sqlite3"
+    monkeypatch.setenv("MCP_SKILLS_PROJECT_ROOT", str(root))
+    monkeypatch.setenv("MCP_SKILLS_STATE_DB", str(db))
+    F._APPROVAL_ASKED.clear()
+    return root, db
+
+
+def test_a_procedure_that_would_have_matched_is_raised_for_approval(tmp_path, monkeypatch):
+    """THE REQUEST PATH EXISTED AND NOTHING REACHED IT. tools/skill_ops.skill_match already
+    asks -- but that is inside the tool agents fail to call 145 times out of 178, so the
+    Approval Centre stayed empty and procedures sat unreadable. The frame holds the goal, so
+    the frame can ask."""
+    _root, db = _unapproved(tmp_path, monkeypatch)
+    F._with_matched_skill(CODING_GOAL)
+    with sqlite3.connect(str(db)) as con:
+        rows = con.execute("SELECT source_path FROM approval_challenges").fetchall()
+    assert rows, "no approval was requested for a procedure that would have matched"
+
+
+def test_asking_never_injects_the_unapproved_procedure(tmp_path, monkeypatch):
+    """The question is the whole action. Nothing about raising it may make the bundle usable."""
+    _unapproved(tmp_path, monkeypatch)
+    assert F._with_matched_skill(CODING_GOAL) == CODING_GOAL
+
+
+def test_a_goal_nothing_resembles_asks_for_nothing(tmp_path, monkeypatch):
+    """Requesting approval for whatever happens to be lying around would make the Approval
+    Centre a list of unrelated procedures, which is how a queue stops being read."""
+    _root, db = _unapproved(tmp_path, monkeypatch)
+    F._with_matched_skill(UNRELATED)
+    with sqlite3.connect(str(db)) as con:
+        rows = con.execute("SELECT source_path FROM approval_challenges").fetchall()
+    assert not rows
+
+
+def test_twenty_workers_raise_one_question(tmp_path, monkeypatch, capsys):
+    """A run builds many workers against one goal shape. The store would de-duplicate the
+    challenge anyway, but each call still writes the gate file and touches SQLite, and each
+    would print the same line."""
+    _root, db = _unapproved(tmp_path, monkeypatch)
+    calls = []
+    for _ in range(20):
+        F._with_matched_skill(CODING_GOAL)
+    said = [l for l in capsys.readouterr().out.splitlines() if "raised for approval" in l]
+    assert len(said) == 1, said
+    with sqlite3.connect(str(db)) as con:
+        rows = con.execute("SELECT COUNT(*) FROM approval_challenges").fetchone()
+    assert rows[0] == 1, "%d challenges written for one procedure" % rows[0]
+    assert not calls
+
+
+def test_an_edited_procedure_is_asked_about_again(tmp_path, monkeypatch, capsys):
+    """The digest is in the key, so a Skill changed mid-run raises a fresh question -- that
+    is the one repeat worth having, because approval is of a hash."""
+    root, _db = _unapproved(tmp_path, monkeypatch)
+    F._with_matched_skill(CODING_GOAL)
+    _bundle(root, "bug-fix-drill", BUG_SKILL + "\nOne more line, so the digest moves.\n")
+    F._with_matched_skill(CODING_GOAL)
+    said = [l for l in capsys.readouterr().out.splitlines() if "raised for approval" in l]
+    assert len(said) == 2, said
+
+
+def test_a_broken_store_does_not_take_the_run_with_it(tmp_path, monkeypatch):
+    """Asking is an enhancement. A failure here must return the goal, not raise."""
+    class Broken:
+        def match_unapproved(self, _text):
+            raise RuntimeError("boom")
+    F._ask_to_approve_the_near_miss(Broken(), "anything")     # must not raise
+
+
 # -- the real procedures, where they exist -------------------------------------------------------
 
 @pytest.mark.skipif(not os.path.isdir(os.path.join(REPO, "skills", "repo-bug-fix")),

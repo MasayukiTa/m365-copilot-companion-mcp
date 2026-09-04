@@ -838,7 +838,14 @@ class SkillStore:
         # user was asking to see.
         if best is None or best_score < 0.25:
             return None
-        return {"score": round(best_score, 3), "name": best.name, "trust": best.trust}
+        # THE DIGEST BELONGS IN HERE, because `trust` is a fact about a digest and not about a
+        # name: "changed" means precisely that this bundle's hash is not the one approved. A
+        # caller that wants to ask about the version it actually saw had no way to say which
+        # version that was, and a de-duplication key built from the name alone silently never
+        # changes when the Skill is edited -- which is the one case where asking again is
+        # right. Adding a key; every existing reader takes name and trust.
+        return {"score": round(best_score, 3), "name": best.name, "trust": best.trust,
+                "digest": best.digest}
 
     def unapproved(self) -> list[dict[str, Any]]:
         """Every Skill a person has not (or no longer has) approved, newest question first."""
