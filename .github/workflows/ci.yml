@@ -82,6 +82,7 @@ jobs:
             tests/test_security_xff.py \
             tests/test_unlock_oracle.py \
             tools/test_child_env_credentials.py \
+            tools/test_web_fetch_encoding.py \
             tests/test_security_state_is_not_readable.py \
             tests/test_unlock_token.py \
             tests/test_exec_via_gateway.py \
@@ -379,6 +380,7 @@ jobs:
             bench/test_ui_goal_lines.py \
             bridge/test_conversation_selection.py \
             bridge/test_tool_probe_borrows_a_page.py \
+            bridge/test_connection_recovery.py \
             relay/selfimprove/test_frozen_surfaces.py \
             relay/selfimprove/test_reliability.py \
             relay/test_claim_verdict.py \
@@ -394,6 +396,7 @@ jobs:
             relay/test_live_record_isolation.py \
             relay/test_mechanism_telemetry.py \
             relay/test_memory_dedupe.py \
+            relay/test_fleet_reconcile.py \
             relay/test_merge_failure_visible.py \
             relay/test_orphan_reaper.py \
             relay/test_panel_shadow.py \
@@ -401,7 +404,10 @@ jobs:
             relay/test_quota_meter.py \
             relay/test_rate_ceiling.py \
             relay/test_refuter_placement.py \
+            relay/test_refuter_unverifiable.py \
             relay/test_retry_trigger.py \
+            relay/test_unlock_keeps_the_planner.py \
+            relay/test_unverifiable_turn_cap.py \
             relay/test_settings_round_trip.py \
             relay/test_supervisor_verify.py \
             relay/test_turn_outcome.py \
