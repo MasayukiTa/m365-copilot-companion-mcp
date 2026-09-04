@@ -33,7 +33,7 @@ from relay import project_memory as M  # noqa: E402
 
 THEME = "You are fixing a real bug in the open-source project **tutao"
 GOAL = (THEME + "/tutanota** (language: ts). The repository is checked out locally at: "
-                "C:/Users/x/resonac-mcp")
+                "C:/Users/x/checkout")
 
 
 # -- what must never be stored as a note ---------------------------------------------------
