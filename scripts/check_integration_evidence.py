@@ -86,6 +86,26 @@ def _git(*args, base=None, required=False):
     return r.stdout or ""
 
 
+#: Decorators that ARE the registration. This checker's own rule is that a registration point
+#: counts as evidence -- a table, a CLI flag, a manifest entry -- and a decorator that hands
+#: the function to a framework is the same thing said in one line. A pytest fixture is the
+#: case that found this: an autouse fixture is referenced by nobody ANYWHERE by design, so
+#: every fixture ever added would be reported as dead code.
+REGISTERING_DECORATORS = ("fixture", "hookimpl", "tool", "app", "route", "command",
+                          "register", "task", "step")
+
+
+def _is_registered_by_decorator(node) -> bool:
+    """Whether a decorator on this definition is itself the wiring."""
+    for dec in getattr(node, "decorator_list", []) or []:
+        target = dec.func if isinstance(dec, ast.Call) else dec
+        name = (target.attr if isinstance(target, ast.Attribute)
+                else getattr(target, "id", ""))
+        if name in REGISTERING_DECORATORS:
+            return True
+    return False
+
+
 def added_definitions(base: str):
     """Public module-level defs and classes this change adds, as {name: path}.
 
@@ -125,6 +145,8 @@ def added_definitions(base: str):
             if node.lineno not in lines:
                 continue
             if CONVENTIONAL.match(node.name):
+                continue
+            if _is_registered_by_decorator(node):
                 continue
             out[node.name] = path
     return out
