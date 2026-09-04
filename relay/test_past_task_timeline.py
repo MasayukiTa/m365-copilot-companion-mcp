@@ -183,6 +183,7 @@ def test_a_wait_under_a_minute_can_still_change_the_displayed_time():
     assert _hm(late) != _hm(late + 58.0)
 
 
+@needs_records
 def test_queued_and_started_gap_is_recorded_for_the_next_person():
     """The measurement itself, kept visible rather than only in a commit message."""
     history, _root = _load()
