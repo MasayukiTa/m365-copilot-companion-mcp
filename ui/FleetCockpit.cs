@@ -3961,14 +3961,24 @@ class CockpitWindow : Window
         // Marker 2: Started (first turn in transcript)
         //
         // ONLY WHEN IT SAYS SOMETHING THE PREVIOUS MARKER DID NOT. The meta line and the first
-        // user turn are written within the same second, so at HH:mm resolution 投入 and 開始
-        // carried the identical clock time on every task measured -- two rows, one fact. A
-        // timeline whose steps repeat each other reads as a template rather than as this
-        // task's history, which is how the wrong 終了 above stayed invisible.
-        if (firstTurnTs > 0 && (metaTs <= 0 || (firstTurnTs - metaTs) >= 60.0))
+        // user turn are usually written within the same second, so at HH:mm resolution 投入 and
+        // 開始 carried the identical clock time on every task first measured -- two rows, one
+        // fact. A timeline whose steps repeat each other reads as a template rather than as
+        // this task's history, which is how the wrong 終了 above stayed invisible.
+        //
+        // THE TEST IS WHETHER THE DISPLAYED TIMES DIFFER, not whether the gap clears some
+        // number of seconds. The first version used >= 60s as a stand-in for "the minute will
+        // have changed", which is sound in one direction only: 60s guarantees a different
+        // minute, but a shorter wait can straddle a boundary and be equally informative. On
+        // the real records the waits run median 6.5s with 13% over thirty seconds -- the queue
+        // does wait, in steps, as admission control staggers the workers -- so a threshold
+        // picked in seconds hides real history at 10:59:50 -> 11:00:48 while claiming to show
+        // it. Comparing the strings that will actually be rendered is the exact question, and
+        // it needs no threshold at all.
+        string sTime = fmtHM(firstTurnTs);
+        if (firstTurnTs > 0 && sTime != "" && sTime != qTime)
         {
             string sLabel = ja ? "開始" : "Started";
-            string sTime = fmtHM(firstTurnTs);
             events.Add(new Tuple<string, string, string>(sLabel, sTime, live));
         }
 
