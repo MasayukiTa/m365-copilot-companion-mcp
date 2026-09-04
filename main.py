@@ -592,7 +592,34 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
                                            duration_s=time.time() - _t0)
                 except Exception:
                     pass
-            return "[call_tool %s error: %s: %s]" % (name, type(_e).__name__, _e)
+            # A WRONG ARGUMENT NAME IS A DEAD END, AND IT DOES NOT HAVE TO BE.
+            #
+            # Under MCP_TOOL_MAP most tools are reachable only through this gateway, so the
+            # agent never sees their schema and has to GUESS the parameter names. A wrong
+            # guess raised a bare TypeError naming the rejected key and nothing else -- not
+            # the accepted names, not the fact that call_tool(name='X') would have shown
+            # them. So the agent guessed again, or stopped.
+            #
+            # MEASURED over .fleet/tool_events.jsonl: 1,037 calls died this way. skill_match
+            # failed 145 of 178 times (81%) because the agent wrote query= and the parameter
+            # is text=; git_log 63%, git_status 57%, github_file 52%, find_files 38%, and
+            # even read_file 271 times. The guesses were all reasonable -- query, limit,
+            # repo, name, substring -- which is the point: nothing had told them otherwise.
+            #
+            # The signature is already produced six lines above for the help path. Handing it
+            # back here turns a dead end into a correction the caller can act on immediately.
+            _msg = "%s: %s" % (type(_e).__name__, _e)
+            if isinstance(_e, TypeError) and (
+                    "unexpected keyword argument" in str(_e)
+                    or "required positional argument" in str(_e)
+                    or "required keyword-only argument" in str(_e)):
+                try:
+                    _sig = str(_inspect.signature(fn))
+                except Exception:
+                    _sig = ""
+                if _sig:
+                    _msg += ". The accepted form is %s%s -- retry with those names." % (name, _sig)
+            return "[call_tool %s error: %s]" % (name, _msg)
         finally:
             # SCOPED TO THIS CALL. A token left behind would authorise the next one, which is
             # the same class of defect as the identity it replaces.
