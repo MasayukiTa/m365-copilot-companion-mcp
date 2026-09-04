@@ -80,12 +80,33 @@ SUITES = {
     "relay/test_watchdog.py": None,
 }
 
+#: Per-suite budget. relay/test_fleet_refute.py is the slowest at a few seconds; the
+#: headroom is for a loaded machine, not for a suite that hangs.
+TIMEOUT_S = 600
+
 _COUNT = re.compile(r"===\s*(\d+)\s*/\s*(\d+)[^=]*passed\s*===")
 
 
-def run_one(rel: str, expected):
-    proc = subprocess.run([sys.executable, str(ROOT / rel)], cwd=str(ROOT),
-                          capture_output=True, text=True, timeout=600)
+def run_one(rel: str, expected, timeout: int = None):
+    # A TIMEOUT IS A RESULT, NOT A CRASH. subprocess.run raises TimeoutExpired, and with
+    # nothing catching it the whole gate died on a traceback -- so every suite after the slow
+    # one never ran at all, and the output said nothing about which suite was slow or that
+    # the rest had been skipped. Observed on relay/test_fleet_refute.py, which passes 12/12
+    # when given more than 600s: the gate reported a stack trace from subprocess and the
+    # suites below it were quietly not tested.
+    #
+    # The encoding is explicit for the reason set out in scripts/check_integration_evidence
+    # ._git: text=True alone decodes the child with the locale codec, and these suites print
+    # Japanese.
+    try:
+        proc = subprocess.run([sys.executable, str(ROOT / rel)], cwd=str(ROOT),
+                              capture_output=True, text=True,
+                              encoding="utf-8", errors="replace",
+                              timeout=TIMEOUT_S if timeout is None else timeout)
+    except subprocess.TimeoutExpired:
+        return False, ("%s TIMED OUT after %ds. It was not run to completion, so nothing it "
+                       "covers has been checked."
+                       % (rel, TIMEOUT_S if timeout is None else timeout))
     out = (proc.stdout or "") + (proc.stderr or "")
     hit = _COUNT.search(out)
     passed, total = (int(hit.group(1)), int(hit.group(2))) if hit else (None, None)
