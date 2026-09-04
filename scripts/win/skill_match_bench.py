@@ -19,9 +19,12 @@ sys.path.insert(0, REPO)
 from relay.skills import SkillStore, _match_tokens   # noqa: E402
 
 #: (query, expected skill name or None). The positives are the phrasings a person actually
-#: types; the two that carry a date are the ones the current matcher misses. The negatives
-#: are the ones that must keep returning nothing however the scoring changes -- including
-#: near-misses that share vocabulary with a skill without asking for what it does.
+#: types. The negatives are the ones that must keep returning nothing however the scoring
+#: changes -- including near-misses that share vocabulary with a skill without asking for
+#: what it does.
+#:
+#: The dated queries used to be the ones that missed; they pass now. What misses today is the
+#: calendar half, and KNOWN below records it with the measurements behind it.
 CASES = [
     # --- must match /mail-lookup ---
     ("メールを検索したい", "mail-lookup"),
@@ -31,6 +34,29 @@ CASES = [
     ("2026年1月のメールを検索して一覧にしたい", "mail-lookup"),
     ("先月のメールを一覧にして", "mail-lookup"),
     ("4月の送信済みメールを宛先付きで一覧にしてください", "mail-lookup"),
+
+    # --- must match /mail-lookup: the CALENDAR half of its declared scope ---
+    #
+    # when_to_use names 予定表 / 打合せ / 会議 / 会議, and this fixture asked about none
+    # of them -- its only calendar case was a negative. So a perfect score meant the
+    # half that was never asked about could be failing without moving the number, and
+    # it was: a worker sent to look up next week's meetings ran with no 手順 at all.
+    ("今日の予定を教えて", "mail-lookup"),
+    ("来週の打合せの予定を教えて", "mail-lookup"),
+    ("自分の予定表を確認して", "mail-lookup"),
+    ("今週の会議を一覧にして", "mail-lookup"),
+    ("8月22日の予定表に何が入っているか調べて", "mail-lookup"),
+    ("来月の打ち合わせを日付順に一覧化して", "mail-lookup"),
+
+    # --- must keep returning nothing: calendar vocabulary, different job ---
+    #
+    # Half the fixture is negatives on purpose, and adding positives without these
+    # would remove the only thing standing between a looser matcher and a wrong match.
+    # Each of these shares words with the skill while asking for something it does not
+    # do: mail-lookup INVESTIGATES 予定 and メール, it does not create or write them.
+    ("会議の議事録を書いて", None),
+    ("来週の打合せの資料を作って", None),
+    ("予定表に新しい会議を登録して", None),
     # --- must match another skill ---
     ("銅箔の保証期限超過ロットを調べたい", "copper-foil-survey"),
     ("MT18EX5 RM の期限切れロットを調査して散布図を出して", "copper-foil-survey"),
@@ -43,6 +69,55 @@ CASES = [
     ("銅箔の価格推移をグラフにして", None),          # shares 銅箔, asks something else
     ("会議室を予約して", None),
 ]
+
+
+#: WHAT IS KNOWN TO FAIL, AND WHY IT IS RECORDED RATHER THAN FIXED.
+#:
+#: mail-lookup's when_to_use names 予定表 / 打合せ / 会議, and until 2026-09-05 this fixture
+#: asked about none of them -- its only calendar case was a negative. It scored 16/16, which
+#: meant "that half was never asked about", not "everything is right". Asked about, five of
+#: six calendar lookups miss and the one thing that matches confidently is the task that
+#: should NOT: 予定表に新しい会議を登録して, which is creation, gets the investigation 手順.
+#:
+#: This matters beyond tidiness. outlook_calendar is one of the two COM tools the procedure
+#: exists to steer people away from -- it starts the desktop Outlook on the user's machine
+#: and reads only that profile's cache -- so the guardrail is absent exactly where one of
+#: its two named hazards lives.
+#:
+#: TWO FIXES WERE MEASURED AND NEITHER IS TAKEN:
+#:
+#:   MIN_MATCH_TOKENS 3 -> 2   19/25 -> 20/25, but WRONG MATCHES 1 -> 3.
+#:                             来月の打ち合わせを日付順に一覧化して lands on
+#:                             desktop-md-inventory, and メールサーバーの障害原因を調べて
+#:                             -- a deliberate negative -- lands on mail-lookup. Exactly the
+#:                             failure this fixture's negatives exist to catch.
+#:
+#:   a richer when_to_use      19/25 -> 20/25, no new wrong matches, but it fixes only one.
+#:                             The gate is `len(query & vocabulary) < MIN_MATCH_TOKENS`, so
+#:                             enlarging the SKILL's vocabulary cannot help a query that has
+#:                             too few tokens of its own: 今日の予定を教えて shares exactly
+#:                             one. And editing an approved bundle changes its digest, which
+#:                             switches the procedure off until a human re-approves.
+#:
+#: So the limit is structural -- metadata-only bigram matching against short Japanese
+#: phrases -- and not a threshold anyone forgot to tune. Recorded here so the next person
+#: starts from the measurement instead of repeating it.
+#: query -> HOW it fails. The kind is recorded and not just the name, because a case moving
+#: from "miss" to "wrong" is a real worsening that a set of names cannot see -- and a wrong
+#: match is the expensive one. Measured: lowering MIN_MATCH_TOKENS turns
+#: 来月の打ち合わせを日付順に一覧化して from a miss into a match on desktop-md-inventory,
+#: and a set-only baseline reported that as unchanged.
+KNOWN = {
+    "今日の予定を教えて": "miss",
+    "来週の打合せの予定を教えて": "miss",
+    "今週の会議を一覧にして": "miss",
+    "8月22日の予定表に何が入っているか調べて": "miss",
+    "来月の打ち合わせを日付順に一覧化して": "miss",
+    "予定表に新しい会議を登録して": "wrong",
+}
+
+BASELINE_NOTE = ("the calendar half of mail-lookup: 5 lookups missed, 1 creation wrongly "
+                 "matched. See KNOWN above for the two fixes already measured.")
 
 
 def evaluate(store, scorer):
@@ -90,7 +165,28 @@ def main():
           % (hits, total, misses, false_hits))
     print("a wrong match is the expensive one: the agent follows a procedure meant for "
           "something else and presents it as the user's own.")
-    return 0
+
+    # A NUMBER IS A DEBT, NEVER A DECISION -- the same convention run_script_style_tests.py
+    # uses. These six are the calendar half, measured and not yet solved, and recording them
+    # is how the fixture keeps asking rather than quietly reporting a perfect score.
+    got_bad = {q: ("miss" if n is None else "wrong")
+               for ok, q, _e, n, _s, _x in rows if not ok}
+    if got_bad == KNOWN:
+        print("\nat the recorded baseline: %d known, all accounted for. %s"
+              % (len(KNOWN), BASELINE_NOTE))
+        return 0
+    for q in sorted(set(got_bad) - set(KNOWN)):
+        print("  REGRESSED (not on the recorded list): %s [%s]" % (q, got_bad[q]))
+    for q in sorted(set(KNOWN) - set(got_bad)):
+        print("  IMPROVED (recorded as failing, now passes): %s" % q)
+    for q in sorted(set(KNOWN) & set(got_bad)):
+        if KNOWN[q] != got_bad[q]:
+            print("  CHANGED KIND: %s  %s -> %s%s"
+                  % (q, KNOWN[q], got_bad[q],
+                     "   (a wrong match is the expensive one)"
+                     if got_bad[q] == "wrong" else ""))
+    print("\nUpdate KNOWN in this file so it keeps being a record of what is actually broken.")
+    return 1
 
 
 
