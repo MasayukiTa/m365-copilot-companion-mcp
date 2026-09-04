@@ -151,3 +151,49 @@ def test_a_missing_base_is_still_a_skip_not_a_failure(tmp_path):
         assert G.main(["--base", "HEAD~50"]) == 0
     finally:
         G.ROOT = old
+
+
+# -- a decorator can BE the wiring ---------------------------------------------------------
+
+FIXTURE_SRC = (
+    "import pytest\n"
+    "\n"
+    "\n"
+    "@pytest.fixture(autouse=True)\n"
+    "def trusted_skills():\n"
+    "    return 1\n"
+)
+
+CACHED_SRC = (
+    "import functools\n"
+    "\n"
+    "\n"
+    "@functools.lru_cache()\n"
+    "def brand_new_capability():\n"
+    "    return 1\n"
+)
+
+
+def _commit_appending(tmp_path, source):
+    tmp_path, git, path = _repo(tmp_path)
+    with open(path, "a", encoding="utf-8", newline="\n") as fh:
+        fh.write(source)
+    git("add", "-A")
+    git("commit", "-qm", "add")
+    return tmp_path
+
+
+def test_a_pytest_fixture_is_not_reported_as_dead_code(tmp_path):
+    """FOUND BY THE GATE FAILING ON A REAL COMMIT. An autouse fixture is referenced by
+    nobody anywhere -- that is what autouse means -- so without this, every fixture ever
+    added is reported as a new definition nothing calls. The checker's own rule already
+    counts a registration point as evidence; a decorator that hands the function to a
+    framework is that, said in one line."""
+    assert _added_in(_commit_appending(tmp_path, FIXTURE_SRC), "HEAD~1") == {}
+
+
+def test_an_ordinary_decorated_function_is_still_checked(tmp_path):
+    """The exemption is for decorators that register, not for any decorator at all --
+    otherwise @lru_cache would hide a capability nothing calls."""
+    assert _added_in(_commit_appending(tmp_path, CACHED_SRC), "HEAD~1") == {
+        "brand_new_capability": "tools/m.py"}
