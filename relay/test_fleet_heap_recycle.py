@@ -68,15 +68,31 @@ def test_the_worker_does_not_reset_its_global_turn_budget_on_recycle():
 # ---- 既存の経路をそのまま使っていること ------------------------------------------------------------
 
 def test_it_reuses_the_existing_recycle_road():
-    """別経路を作ると、再アンカーも max_recycles 上限も二重管理になる。"""
+    """別経路を作ると、再アンカーも max_recycles 上限も二重管理になる。
+
+    以前はこの区間のソースに RECYCLE_PREFIX という文字列があることで再アンカーを確認して
+    いた。組み立てが _recycle_job() に切り出された時点で、**性質は保たれたまま文面だけが
+    消えて**落ちた。ソース断言はその形で壊れるので、片方は実行して確かめる。
+    """
     src = _src(RF.RelayWorker._decide)
     i = src.index("heavy = ")
     # ブロックの終わりまで見る。最初の `return` で切ると、再アンカーの手前にある
     # stuck 経路の return を境界にしてしまい、通っているものを見落とす。
     j = src.index("DEAD-AGENT", i)
     seg = src[i:j]
-    assert "RECYCLE_PREFIX" in seg, "ゴールの再アンカーを通っていない"
+    assert "_recycle_job()" in seg, "既存の再アンカー経路を通っていない（別経路を作った）"
     assert "_max_recycles" in seg, "リサイクル回数の上限を共有していない"
+
+
+def test_the_recycle_road_actually_re_anchors_the_goal():
+    """上の片割れ。経路を通っているかではなく、通った先が何を作るかを実行して見る。"""
+    from relay.copilot_autopilot_relay import RECYCLE_PREFIX
+    goal = "1〜3月のメールを一覧化する"
+    w = RF.RelayWorker(goal, "w0")
+    w._recycles = 1
+    job = w._recycle_job()
+    assert RECYCLE_PREFIX in job, "ゴールの再アンカーを通っていない"
+    assert job.endswith(goal), "再アンカーの見出しの後ろがゴールになっていない"
 
 
 def test_exhaustion_still_wins_and_is_not_relabelled():

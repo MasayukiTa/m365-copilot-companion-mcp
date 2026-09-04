@@ -2096,12 +2096,27 @@ class RelayWorker:
         # the replay envelope, and what record_task derives the theme from. An earlier
         # version prepended the memory to the goal text itself and broke all three at once
         # (and hung a fleet sweep whose workers are keyed by goal text).
-        initial_body, preflight_unlock = _initial_job_with_unlock(
-            # Memory first, then the matched procedure, then the goal: the procedure is HOW
-            # to do the thing, so it is the last thing read before the thing. Both derive from
-            # self.goal -- the worker's identity -- and neither is written back into it.
-            _with_theme_memory(_with_matched_skill(self.goal), theme_text=self.goal),
-            plan_mode)
+        # Memory first, then the matched procedure, then the goal: the procedure is HOW to do
+        # the thing, so it is the last thing read before the thing. Both derive from self.goal
+        # -- the worker's identity -- and neither is written back into it. Held in a local
+        # because the fan-out branch below needs the same text and matching twice would cost a
+        # second filesystem-and-SQLite pass per worker.
+        composed_goal = _with_theme_memory(_with_matched_skill(self.goal), theme_text=self.goal)
+        initial_body, preflight_unlock = _initial_job_with_unlock(composed_goal, plan_mode)
+        # Kept for the branches that REBUILD the job for a fresh conversation -- a replay and
+        # a token-limit recycle. Both hand the agent a chat with no history at all, so they
+        # need the procedure more than turn 1 did, and both were sending PROTOCOL + the bare
+        # goal. The replay's own comment claimed it was "the same initial payload as the
+        # original", which stopped being true the moment the original grew memory and a
+        # procedure; that is the shape of comment that goes stale without anyone noticing.
+        #
+        # The prefix is the context WITHOUT the goal, because RECYCLE_PREFIX ends with a
+        # "--- 元のゴール ---" heading and what follows it should be the goal. Safe to take
+        # by suffix: the composition ends with the goal by construction, and
+        # test_the_goal_survives_intact_and_last exists to keep it that way.
+        self._composed_goal = composed_goal
+        self._composed_prefix = (composed_goal[:-len(self.goal)]
+                                 if self.goal and composed_goal.endswith(self.goal) else "")
         if preflight_unlock:
             # Count the proactive attempt against the same bounded budget used by reactive
             # re-unlocks when the M365 backend later rotates to a different source IP.
@@ -2118,7 +2133,18 @@ class RelayWorker:
             # Turn 1 asks for the split instead of the work. The goal still travels in full,
             # because the split has to be made against the real instructions -- an agent
             # asked to divide a goal it cannot see divides something else.
-            self.job = (conversation_start_label(self.name) + PROTOCOL + self.goal
+            #
+            # AND SO DOES THE PROCEDURE, which this branch used to discard along with the
+            # memory. For at least one approved Skill the split is what it is ABOUT:
+            # mail-lookup's 大原則2 is a table of how to slice a mail request by date range
+            # (a month becomes 上旬/中旬/下旬, a quarter becomes months), written because
+            # asking for a whole period at once is always truncated. A splitter denied that
+            # invents its own slicing and hits the wall the procedure exists to describe.
+            #
+            # The memory travels for the same reason rather than by symmetry: the same Skill
+            # forbids re-fetching a range already collected, and what was already collected is
+            # exactly what the theme notes hold.
+            self.job = (conversation_start_label(self.name) + PROTOCOL + composed_goal
                         + "\n\n" + fanout_mod.SPLIT_JOB)
         self.turn = 0
         self._turn_sent_at = 0.0
@@ -2222,7 +2248,7 @@ class RelayWorker:
             return False
 
         # This is the same initial payload as the original non-plan review task.
-        self.job = conversation_start_label(self.name + "-replay%d" % self.fresh_replay_count) + PROTOCOL + self.goal
+        self.job = self._replay_job()
         self.status = "ready"
         return True
 
@@ -2434,6 +2460,27 @@ class RelayWorker:
         style mid-task redirection). Takes priority over CONTINUE/FIX."""
         if text:
             self.steer_msgs.append(text)
+
+    def _replay_job(self):
+        """The opening turn for a replay in a fresh conversation.
+
+        A METHOD RATHER THAN AN EXPRESSION so it can be called by a test. The branch it came
+        from needs a live page to reach, so what it built was only ever checkable by reading
+        it -- and its comment, "the same initial payload as the original", had quietly stopped
+        being true when the original grew memory and a procedure.
+        """
+        return (conversation_start_label(self.name + "-replay%d" % self.fresh_replay_count)
+                + PROTOCOL + self._composed_goal)
+
+    def _recycle_job(self):
+        """The opening turn after a token-limit recycle, which is a BRAND NEW chat.
+
+        The agent has no memory of anything, including the procedure it was given at turn 1,
+        so it travels again. It goes ABOVE the reset notice because RECYCLE_PREFIX ends with a
+        "--- 元のゴール ---" heading, and what follows that heading should be the goal.
+        """
+        return (conversation_start_label(self.name + "-recycle%d" % self._recycles)
+                + PROTOCOL + self._composed_prefix + RECYCLE_PREFIX + self.goal)
 
     def _task_anchor(self, nudge):
         """Prepend the worker's task identity to a GENERIC retry/continue/fix nudge so a
@@ -3192,8 +3239,7 @@ class RelayWorker:
                                "conversation" if getattr(self, "socket", False) else
                                "token-limit recycle: fresh conversation did not render")
                 return
-            self.job = (conversation_start_label(self.name + "-recycle%d" % self._recycles)
-                        + PROTOCOL + RECYCLE_PREFIX + self.goal)  # re-anchor in the fresh chat
+            self.job = self._recycle_job()   # re-anchor in the fresh chat
             self.reason = (
                 f"ヒープ {getattr(self, '_last_heap_mb', 0):.0f}MB → 新会話で続行 "
                 f"({self._recycles}/{self._max_recycles})" if heavy else
