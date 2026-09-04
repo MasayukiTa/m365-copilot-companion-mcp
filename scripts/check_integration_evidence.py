@@ -46,15 +46,44 @@ WATCHED = ("relay/", "tools/", "scripts/win/")
 CONVENTIONAL = re.compile(r"^(main|test_|_|handle_|cmd_|on_)")
 
 
-def _git(*args, base=None):
+class GitUnreadable(RuntimeError):
+    """The checker could not read what it is meant to check.
+
+    Its own name, because "" was doing this job and "" is indistinguishable from "nothing
+    changed" -- which is how the encoding bug below became a passing gate rather than a
+    failing one. An unreadable input is not a clean input.
+    """
+
+
+def _git(*args, base=None, required=False):
     """git output as a string, ALWAYS a string. `.stdout` can come back None -- it did, under
-    pytest -- and a checker that crashes is a checker that gets disabled."""
+    pytest -- and a checker that crashes is a checker that gets disabled.
+
+    THE ENCODING IS NOT OPTIONAL, and leaving it out made this checker blind rather than
+    loud. `text=True` alone decodes the child with the locale codec, which on a Japanese
+    Windows install is cp932; this repository's diffs are full of UTF-8 Japanese, so the
+    decode raised inside subprocess's reader THREAD. The exception printed a traceback that
+    belonged to no caller, `r.stdout` came back empty, and `or ""` handed that to callers who
+    read an empty diff as "nothing changed". Measured on the commit before this one: the file
+    list arrived intact (19 ASCII paths) while the unified diff came back 0 characters
+    against a true 14,482 -- so no line was ever new, no definition was ever added, and the
+    gate said OK because it had read nothing.
+
+    Note the docstring above: this function had already been hardened once against a crash.
+    That hardening is what turned a visible failure into a silent pass, which is the whole
+    lesson -- a checker that cannot read its input must say so, not return clean.
+    """
     try:
         r = subprocess.run(["git"] + list(args), cwd=ROOT, capture_output=True,
-                           text=True, timeout=120)
-        return r.stdout or ""
-    except Exception:
+                           text=True, encoding="utf-8", errors="replace", timeout=120)
+    except Exception as exc:
+        if required:
+            raise GitUnreadable("git %s could not run: %s" % (" ".join(args), exc))
         return ""
+    if required and r.returncode != 0:
+        raise GitUnreadable("git %s exited %d: %s"
+                            % (" ".join(args), r.returncode, (r.stderr or "").strip()[:200]))
+    return r.stdout or ""
 
 
 def added_definitions(base: str):
@@ -65,7 +94,8 @@ def added_definitions(base: str):
     lines are new.
     """
     out = {}
-    diff = _git("diff", "--unified=0", base, "--", *WATCHED)
+    # required=True: an empty diff must mean "nothing changed", never "could not read".
+    diff = _git("diff", "--unified=0", base, "--", *WATCHED, required=True)
     if not diff.strip():
         return out
     current, added_lines = None, {}
@@ -133,7 +163,8 @@ def references(name: str, defining_path: str):
     """
     try:
         raw = subprocess.run(["git", "grep", "-l", "-w", "--", name],
-                             cwd=ROOT, capture_output=True, text=True, timeout=60).stdout
+                             cwd=ROOT, capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=60).stdout
     except Exception:
         return []
     found = []
@@ -208,7 +239,16 @@ def main(argv=None):
         return 0
 
     exceptions = load_exceptions()
-    added = added_definitions(args.base)
+    try:
+        added = added_definitions(args.base)
+    except GitUnreadable as exc:
+        # NOT a clean result. The previous version of this checker returned "" here and
+        # printed "no new public definitions", which is the same sentence it prints when a
+        # change really adds none -- so the one case that needs attention looked exactly
+        # like the common case that does not.
+        print("integration evidence: FAILED -- could not read the change.")
+        print("  %s" % exc)
+        return 2
     if not added:
         print("integration evidence: no new public definitions in %s..HEAD" % args.base)
         return 0
