@@ -17,13 +17,51 @@ before the first prompt is composed. So the lookup needs no agent, no turn, and 
 guessed keyword.
 """
 import os
+import shutil
+import sqlite3
 import sys
 
 import pytest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
 
 from relay import relay_fleet as F  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def trusted_skills(tmp_path, monkeypatch):
+    """A project root whose procedures are approved, built here rather than assumed.
+
+    CAUGHT BY CI, WHICH IS THE POINT. The first version of these tests passed locally and
+    failed on the runner with "no procedure was injected for a goal that matches at 1.0" --
+    because a Skill is only injectable once a human has approved that exact bundle digest,
+    and approval lives in a per-machine SQLite file that a fresh checkout does not have. The
+    tests were reading this developer's approval database and calling it the behaviour of
+    the code.
+
+    So the fixture copies the real skills/ directory, points the store at a temp state DB,
+    and approves through the store's own request/confirm pair -- the same path a human takes.
+    The procedures under test are the real ones; only the trust is local.
+    """
+    root = tmp_path / "proj"
+    shutil.copytree(os.path.join(REPO, "skills"), str(root / "skills"))
+    db = tmp_path / "skills.sqlite3"
+    monkeypatch.setenv("MCP_SKILLS_PROJECT_ROOT", str(root))
+    monkeypatch.setenv("MCP_SKILLS_STATE_DB", str(db))
+
+    from relay.skills import SkillStore
+    store = SkillStore(str(root))
+    for skill in store.discover():
+        store.request_approval(skill.name)
+        with sqlite3.connect(str(db)) as con:
+            row = con.execute(
+                "SELECT gate_token FROM approval_challenges ORDER BY created_at DESC"
+            ).fetchone()
+        assert row and row[0], "no approval challenge was recorded for %s" % skill.name
+        store.confirm_approval(skill.name, row[0])
+    assert store.discover(), "the fixture approved nothing; skills/ did not copy"
+    return root
 
 # A real SWE-bench goal, in the shape the runner actually produces.
 CODING_GOAL = ("You are fixing a real bug in the open-source project ansible "
@@ -128,3 +166,23 @@ def test_the_guard_is_scoped_to_what_the_worker_lacks():
     assert "SUBTASKS_READY" not in PROTOCOL and "PLAN_READY" not in PROTOCOL
     for already in ("DONE", "CONTINUE", "STUCK"):
         assert already in PROTOCOL, "%s is no longer in PROTOCOL; re-derive the guard" % already
+
+
+def test_an_unapproved_procedure_is_never_injected(tmp_path, monkeypatch):
+    """WHAT CI WAS ACTUALLY SAYING. On a machine where nothing has been approved -- a fresh
+    checkout, the runner, a new install -- the frame injects nothing at all. That is the
+    trust model working, and it is why the fixture above has to build its own."""
+    empty = tmp_path / "empty"
+    (empty / "skills").mkdir(parents=True)
+    monkeypatch.setenv("MCP_SKILLS_PROJECT_ROOT", str(empty))
+    monkeypatch.setenv("MCP_SKILLS_STATE_DB", str(tmp_path / "none.sqlite3"))
+    assert F._with_matched_skill(CODING_GOAL) == CODING_GOAL
+
+
+def test_an_untrusted_bundle_present_on_disk_is_still_refused(tmp_path, monkeypatch):
+    """Trust is per DIGEST, so a procedure sitting in skills/ is not thereby usable."""
+    root = tmp_path / "untrusted"
+    shutil.copytree(os.path.join(REPO, "skills"), str(root / "skills"))
+    monkeypatch.setenv("MCP_SKILLS_PROJECT_ROOT", str(root))
+    monkeypatch.setenv("MCP_SKILLS_STATE_DB", str(tmp_path / "fresh.sqlite3"))
+    assert F._with_matched_skill(CODING_GOAL) == CODING_GOAL
