@@ -154,19 +154,28 @@ def test_a_missing_tab_is_not_evidence_of_being_signed_out():
     # THE BUG THIS CAUSED. The first version read "no m365 tab" as "not signed in" and surfaced
     # the browser. The fleet is websocket-driven and opens NO tabs, so on a signed-in machine
     # that fired every time -- it yanked the window to the front during a benchmark run.
+    #
+    # THESE TESTS ONCE DEMANDED A `probe()`, and that demand outlived the design. The first
+    # repair was to open a background tab and look; then "Take the tab-opening out of the
+    # sign-in check" removed it, because a health check that opens a tab is itself a change to
+    # the thing it is measuring. The tests were not updated with it, so they went on pinning an
+    # abandoned approach and failed on every CI run -- asserting for a function whose deletion
+    # was the fix. What the check owes now is weaker and better: decline to judge.
     src = _signin_src()
     assert "opens no tabs" in src, "the stale tab-based assumption is not documented as wrong"
-    assert "def probe(" in src, "nothing probes; the decision is still made from the tab list"
+    assert "nothing to judge from" in src, (
+        "a missing tab must produce 'cannot tell', not a verdict")
 
 
-def test_the_probe_does_not_focus_the_window():
-    # /json/new opens a tab without raising the window; surface() raises it. Probing must use
-    # the first and never the second.
+def test_reading_the_state_does_not_touch_the_browser():
+    # Stronger than the old "the probe must not focus the window": there is no probe. state()
+    # reads the tab list and nothing else, so the check cannot change what it is checking.
     src = _signin_src()
-    i = src.index("def probe(")
-    body = src[i:i + 1200]
-    assert "open_background" in body
-    assert "surface(" not in body, "the probe surfaces the window; probing must be invisible"
+    i = src.index("def state(")
+    body = src[i:src.index("def main(", i)]
+    assert "surface(" not in body, "state() surfaces the window while merely reading"
+    for opener in ("/json/new", "open_background", "new_page"):
+        assert opener not in body, "state() opens %s; reading must leave no trace" % opener
 
 
 def test_surfacing_requires_a_real_login_wall():
@@ -179,10 +188,13 @@ def test_surfacing_requires_a_real_login_wall():
         "surface() is reachable without first ruling out 'signed in' and 'cannot tell'")
 
 
-def test_the_probe_cleans_up_after_itself():
+def test_nothing_is_opened_so_there_is_nothing_to_clean_up():
+    # This asked that the probe tab be closed in a finally. The better answer, and the one the
+    # script now implements, is not to open one: a tab that is never created cannot leak.
     src = _signin_src()
-    assert "close_tab" in src and "finally:" in src, (
-        "the probe tab is not closed; a health check must leave no trace in the browser")
+    assert "def probe(" not in src, (
+        "a probe is back; if that is deliberate it must close its tab in a finally, and this "
+        "test needs to say so again")
 
 
 def test_cannot_tell_is_a_third_answer():

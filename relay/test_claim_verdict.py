@@ -74,9 +74,35 @@ def test_a_worker_that_wrote_and_then_ran_its_check_stays_done(monkeypatch):
     assert W(CHECKS)._claim_verdict() == "DONE"
 
 
-def test_running_the_check_without_changing_anything_is_still_contradicted(monkeypatch):
+def test_an_exec_only_record_is_not_treated_as_a_contradiction(monkeypatch):
+    """THIS TEST ASSERTED THE OPPOSITE, and the behaviour it pinned was measured wrong.
+
+    It demanded EVIDENCE_CONTRADICTED for a worker that ran its acceptance command without
+    calling any write tool -- "it claimed DONE without doing anything". Then
+    evidence_manifest was corrected against real data: nine instances were told nothing in the
+    workspace had changed, all nine had exec calls, and FOUR of them had produced a patch that
+    graded RESOLVED. run_python and shell_exec can write anything, and no list of tool names
+    will ever see them do it.
+
+    So the record cannot settle this case, and the honest verdict is UNVERIFIABLE, which
+    _claim_verdict deliberately leaves as DONE -- an absence of evidence is not evidence, and a
+    worker must not be demoted because the ledger has a blind spot. The test survived the
+    correction unchanged and failed on every CI run afterwards, still asking for a demotion the
+    data had already refuted."""
     ledger(monkeypatch, [call("shell_exec", {"command": "pytest -x", "working_dir": "C:/w/task1"})])
-    assert W(CHECKS)._claim_verdict() == "EVIDENCE_CONTRADICTED"
+    assert W(CHECKS)._claim_verdict() == "DONE"
+
+
+def test_the_blind_spot_is_reported_rather_than_hidden(monkeypatch):
+    """Not demoting is not the same as saying nothing. The assessor has to name why it cannot
+    tell, or the next reader re-derives it from scratch."""
+    from relay import evidence_manifest as EM
+    events = [{"call": {"tool": "shell_exec", "ts": 1.0,
+                        "args": {"command": "pytest -x", "working_dir": "C:/w/task1"}},
+               "outcome": {"ok": True}}]
+    got = EM.assess(True, {"checks": [{"id": "tests", "command": "pytest -x"}]}, events)
+    assert got["verdict"] == EM.UNVERIFIABLE
+    assert any("cannot see" in r for r in got["reasons"]), got["reasons"]
 
 
 def test_no_recorded_calls_leaves_done_untouched(monkeypatch):

@@ -60,7 +60,21 @@ def iter_files(base: Path, skipped=None):
                 else:
                     keep.append(d)
             dirs[:] = keep
-        for name in files:
+        # SORTED, SO THE SAME QUESTION GETS THE SAME ANSWER TWICE.
+        #
+        # os.walk yields whatever the filesystem hands it: NTFS enumerates a directory in name
+        # order, ext4 in hash order. Every caller that stops early or breaks a tie by
+        # first-seen therefore returned a DIFFERENT result on the two platforms for identical
+        # input -- find_files' equal-mtime tie-break, and grep's "which files did I reach
+        # before max_matches", which decides whether the note about skipped files is ever
+        # recorded at all. Both were caught the same way: green on Windows, red on a Linux
+        # runner, with the tests asserting sorted order because that is what the author saw.
+        #
+        # A tool an agent uses to decide what to do next must not answer differently on two
+        # machines for reasons that have nothing to do with the question. Sorting names within
+        # each directory costs one sort per directory against a stat() per candidate.
+        dirs.sort()
+        for name in sorted(files):
             yield Path(root) / name
 
 
