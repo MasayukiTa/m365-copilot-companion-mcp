@@ -722,7 +722,22 @@ def _initial_job_with_unlock(goal: str, plan_mode: bool = False):
     pw = _unlock_password()
     if not pw:
         return opening, False
-    return PROTOCOL + (UNLOCK_PREFIX % pw) + original, True
+    if plan_mode:
+        # Operator-set plan-then-wait: not a component, and not this function's to reinterpret.
+        return PROTOCOL + (UNLOCK_PREFIX % pw) + original, True
+    # THROUGH THE PLANNER, NOT AROUND IT.
+    #
+    # This composed the turn by hand whenever a password existed, which is the normal
+    # configuration -- so opening_turn, and with it the whole `planner` component, was reached
+    # only when unlock was NOT being injected. The effect was that planner/v1 and planner/v2
+    # produced byte-identical first turns in every ordinary run: an A/B whose two arms are the
+    # same program, which is precisely what PLANNER_VERSIONS was created to end. The comment
+    # above that table says so about its predecessor; the same hole was open one file over.
+    #
+    # The unlock text belongs where the protocol goes, before the goal, so passing it as part
+    # of the protocol reproduces the previous byte layout exactly under planner/v1 and lets
+    # planner/v2 differ where it is supposed to.
+    return opening_turn(original, PROTOCOL + (UNLOCK_PREFIX % pw)), True
 
 
 def _redact_unlock_password(text: str) -> str:
@@ -1748,6 +1763,23 @@ def _open_fresh(context, url):
         except Exception:
             pass
     return pg
+
+
+#: Turn cap for a goal that carries NO acceptance check.
+#:
+#: WHY A GOAL WITHOUT CHECKS IS DIFFERENT. With checks there is a thing that can go from red to
+#: green, so another turn can convert into a result. Without them nothing can change state; more
+#: turns only produce more prose about the same evidence. The 290-cinema survey of 2026-09-04 is
+#: the case: workers with no checks were pushed for further attempts on subjects where the
+#: information does not exist publicly, and spent turns restating the same conclusion.
+#:
+#: HONEST ABOUT WHAT THIS DOES NOT DO. The cap has never bound. Measured across the stored
+#: transcripts the highest turn any worker ever reached is ELEVEN, against a default of 1000, so
+#: this changes nothing in normal operation and no run gets shorter today. What it changes is the
+#: cost when something else has already failed: a stall detector that stops firing costs forty
+#: turns on an unverifiable task instead of a thousand. Goals WITH checks keep the full cap,
+#: because there a long run can still be converging on something real.
+UNVERIFIABLE_MAX_TURNS = 40
 
 
 def goal_fields(goal):
@@ -4988,7 +5020,12 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                                    log=lambda m: print(m, flush=True))
         if knobs != _run_effort:
             print("[effort] w%d: %s" % (index, effort_mod.describe(knobs)), flush=True)
-        return RelayWorker(goal_item, "w%d" % index, max_turns=effective_max_turns,
+        # Per goal, not per run: a batch mixes verifiable and unverifiable work.
+        _text, _checks, _cwd = goal_fields(goal_item)
+        _cap = (effective_max_turns if _checks
+                else (min(effective_max_turns, UNVERIFIABLE_MAX_TURNS)
+                      if effective_max_turns else UNVERIFIABLE_MAX_TURNS))
+        return RelayWorker(goal_item, "w%d" % index, max_turns=_cap,
                            refuter=knobs["refuter"], max_refute=knobs["max_refute"],
                            plan_mode=plan_mode,
                            review_lenses=knobs["review_lenses"],
