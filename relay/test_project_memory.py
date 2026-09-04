@@ -46,8 +46,20 @@ def main():
     other_notes = load_notes(other, state_dir=sd)
     check("other_folder_has_no_entries_of_its_own",
           "このテーマ" not in other_notes)
-    check("other_folder_still_sees_the_index",
-          "記憶している他のテーマ" in other_notes)
+    # THIS ONCE ASSERTED THE OPPOSITE, on an argument that was never measured: without the
+    # index every theme is an island and the store never compounds. Sound in principle, and it
+    # never happened -- .fleet/tool_events.jsonl holds 22,444 recorded tool calls in which
+    # `.fleet/memory` appears ZERO times. No worker has ever opened a theme the index offered
+    # it. What the block did do was carry noise: a cinema survey was primed with a furigana
+    # task and two arithmetic one-shots, eight mentions of an unrelated subject in a
+    # 3,646-character prompt.
+    #
+    # RELATED themes are still offered in full; only the unrelated filler is gone, which is
+    # what an unrelated folder now correctly receives none of. See relay/test_memory_dedupe.py
+    # for the positive case, and _INDEX_RECENT_TAIL for how to turn this back on if the recall
+    # path is ever wired to something that reads it.
+    check("an_unrelated_folder_is_not_primed_with_other_themes",
+          "記憶している他のテーマ" not in other_notes)
     check("index_only_when_something_is_remembered",
           load_notes(tempfile.mkdtemp(prefix="pm_empty_"),
                      state_dir=tempfile.mkdtemp(prefix="pm_nostate_")) == "")
