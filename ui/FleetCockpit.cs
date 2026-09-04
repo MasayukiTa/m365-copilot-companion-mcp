@@ -1504,9 +1504,20 @@ class CockpitWindow : Window
         // capped to the viewport (MaxHeight) and scrolls. Item-virtualization is traded away here;
         // the fleet ledger row count is modest and rows are light.
         ScrollViewer.SetCanContentScroll(_list, false);
-        VirtualizingPanel.SetIsVirtualizing(_list, true);
-        VirtualizingPanel.SetVirtualizationMode(_list, VirtualizationMode.Recycling);
-        VirtualizingPanel.SetScrollUnit(_list, ScrollUnit.Pixel);
+        // VIRTUALIZATION OFF, WHICH IS WHAT THE LINE ABOVE ALREADY ASSUMED.
+        //
+        // The comment above says item-virtualization is traded away, and then the next line
+        // turned it on. The two together are the bug the history list had: pixel scrolling over
+        // a VIRTUALIZING panel means WPF has to ESTIMATE the extent, because the rows it has not
+        // realized have no measured height. These rows are cards of very different heights, so
+        // the estimate is short -- and a short extent is a scrollbar that stops before the end.
+        // The last entries could not be reached at all; reported from the running cockpit as
+        // "the history will not scroll all the way down".
+        //
+        // With it off every row is measured, so the extent is exact and the end is reachable.
+        // That is the trade the comment above describes and the row count justifies: the ledger
+        // is tens of rows, not thousands, and each is a light template.
+        VirtualizingPanel.SetIsVirtualizing(_list, false);
         _list.Focusable = false;
         _list.IsTabStop = false;
         KeyboardNavigation.SetDirectionalNavigation(_list, KeyboardNavigationMode.None);
@@ -3512,7 +3523,8 @@ class CockpitWindow : Window
                 titleTag.Margin = new Thickness(0, 0, 0, 2);
                 wrap.Children.Add(titleTag);
                 wrap.Children.Add(BuildSpineContent(root, "ended", true, pastList));
-                _spinePanel.Child = wrap;
+                // A past task is finished, so it opens at the top: nothing new will arrive.
+                _spinePanel.Child = SpineScroll(wrap, false);
                 return;
             }
         }
@@ -3601,7 +3613,8 @@ class CockpitWindow : Window
         _spineCol.Width = new GridLength(220);
         _spinePanel.BorderBrush = Theme.Br(Theme.Border(_dark));
         _spinePanel.Background = Theme.Br(Theme.Bg(_dark));
-        _spinePanel.Child = BuildSpineContent(root, overallPhase, runEnded, spineWorkers);
+        _spinePanel.Child = SpineScroll(
+            BuildSpineContent(root, overallPhase, runEnded, spineWorkers), !runEnded);
     }
 
     // THE TIMELINE FOLLOWED workers[0] AND NOTHING ELSE. Open a running worker while the first
@@ -3627,6 +3640,37 @@ class CockpitWindow : Window
     }
 
     // Build the spine panel content: section header + vertical [COMPUTED] execution timeline.
+    // GIVE THE SPINE A VIEWPORT. The column is a fixed 220px lane whose content has NO upper
+    // bound: the timeline is one entry per phase transition, and the Border it sat in simply
+    // CLIPPED everything past the fold. The entries were rendered and unreachable, with no
+    // scrollbar to say so -- the failure looked like "the timeline stops at 12:17" rather than
+    // like a missing viewport.
+    //
+    // WHY IT SURVIVED THIS LONG: benchmark runs are short and uniform, so the timeline never
+    // outgrew the lane. General use does, and it is general use that this is for. A fixed-size
+    // container sized against the shortest input is a bug waiting for a real workload.
+    //
+    // LIVE RUNS RIDE THE BOTTOM. While a run is going the newest entry is the one worth seeing,
+    // and this panel is rebuilt whenever the phase signature changes -- so a top-anchored
+    // rebuild would hide the very event that triggered it. Keyed off ExtentHeightChange, which
+    // is non-zero only when CONTENT grows, so it never fights a user who has scrolled up.
+    // A finished run opens at the top, where its story starts.
+    ScrollViewer SpineScroll(UIElement content, bool follow)
+    {
+        var sv = new ScrollViewer();
+        sv.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+        sv.HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled;
+        sv.Focusable = false;
+        sv.IsTabStop = false;
+        sv.Content = content;
+        if (follow)
+            sv.ScrollChanged += delegate(object s, ScrollChangedEventArgs e)
+            {
+                if (e.ExtentHeightChange != 0) sv.ScrollToEnd();
+            };
+        return sv;
+    }
+
     // Derives events honestly from available data: run started ts, transcript first-turn ts,
     // current overall phase (polled), run ended state. No fabricated phase_events.
     UIElement BuildSpineContent(Dictionary<string, object> root, string overallPhase, bool runEnded,
