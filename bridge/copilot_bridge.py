@@ -41,6 +41,48 @@ from socketserver import ThreadingMixIn
 
 logger = logging.getLogger(__name__)
 
+
+def _configure_logging():
+    """Give this module's 93 log calls somewhere to land. Idempotent.
+
+    WHAT THIS COST, MEASURED. On 2026-09-03 the Playwright driver connection died. The failure
+    site logged exactly the right thing -- the reason, with a full traceback:
+
+        agent page had closed and could not be reopened
+        Exception: BrowserContext.new_page: Connection closed while reading from the driver
+
+    and it went into `.setup/logs/bridge.log.err`, a file split off from the operational log and
+    read by nobody. The bridge then sat unusable for 22.5 hours. The cockpit's Tool dot was red
+    the whole time and was noticed by a human looking at a screenshot.
+
+    THE INSTRUMENTATION WAS ALREADY CORRECT. Nothing had to be added at the failure sites; the
+    calls were there, at the right places, with exc_info. They had no destination. Earlier work
+    in this file converted the STEADY-STATE lines to print() -- see ensure_driver's comment
+    about the root logger having no handler -- and that is exactly backwards: it rescued the
+    lines that say things are fine and left the ones that say what broke going nowhere.
+    logger.info/debug were dropped outright (33 calls), and logger.warning/error (59 calls)
+    fell through to logging.lastResort, which writes to stderr -- the OTHER file.
+
+    STDOUT, NOT A NEW FILE. The prints are already redirected to .setup/logs/bridge.log by
+    start_all.ps1, so writing here puts every operational line in one file, in order, with one
+    writer. A second FileHandler on that same path would mean two writers on one Windows file
+    handle, and a separate file would recreate the split that caused this.
+
+    propagate=False because otherwise every WARNING is emitted TWICE: once by this handler and
+    once by logging.lastResort into stderr, which is the split all over again.
+    """
+    if getattr(logger, "_bridge_log_configured", False):
+        return
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S"))
+    logger.addHandler(handler)
+    level = (os.environ.get("MCP_BRIDGE_LOG_LEVEL") or "INFO").strip().upper()
+    logger.setLevel(getattr(logging, level, logging.INFO))
+    logger.propagate = False
+    logger._bridge_log_configured = True
+
+
 #: When this process started, so a caller can tell a fresh bridge from a stale one without
 #: guessing from a log line or a process table.
 _PROCESS_STARTED = time.time()
@@ -516,6 +558,10 @@ PAGE = None      # set at startup
 #: no way back and stayed broken until someone restarted it. The delete log records it plainly:
 #: 12 of 14 delete attempts failed, and the largest group, 5 of them, is TargetClosedError.
 CTX = None
+#: The sync_playwright object that owns CTX, kept so the connection can be REBUILT rather than
+#: only built. Holding the context but not the thing that can reopen it is what turned a dead
+#: connection into a dead process: see reconnect_browser.
+PW = None
 DRIVER = None
 AGENT_URL = ""   # bare agent URL (a fresh chat); set at startup
 
@@ -1512,6 +1558,83 @@ def ensure_driver():
     return DRIVER if run_on_page_thread(ensure_page_alive) else None
 
 
+#: (ts, message) when a page operation last failed because OUR CONNECTION to the browser is
+#: gone -- as distinct from a page that closed, a navigation that failed, or a site that misbehaved.
+#: Cleared by a successful reconnect. Read by the watchdog and by the tool probe.
+_CONNECTION_DEAD = None
+
+#: Playwright's wording for "the pipe to the browser or its driver is gone". Every marker here is
+#: about the CONNECTION and never about one page, so acting on them cannot mistake a content
+#: failure for an infrastructure one -- no site, navigation or patch can produce these.
+#
+# MEASURED 2026-09-03, and this is the case that had no branch:
+#   BrowserContext.new_page: Connection closed while reading from the driver
+# The node driver process behind sync_playwright had gone. CTX was therefore not None -- it was
+# a STALE HANDLE -- so ensure_page_alive sailed past its `CTX is None` guard and raised the same
+# exception on every call afterwards, for 22.5 hours. Edge itself stayed up and kept answering
+# /json/version, so _cdp_healthy saw a healthy browser and the CDP watchdog never fired. The
+# watchdog was watching the wrong end of the pipe.
+_CONNECTION_DEAD_MARKERS = (
+    "connection closed while reading from the driver",
+    "browser has been closed",
+    "target page, context or browser has been closed",
+    "browser closed",
+    "driver process exited",
+)
+
+
+def connection_is_dead(exc) -> bool:
+    """Whether this exception says the browser CONNECTION is gone, not merely a page."""
+    return any(m in ("%s" % (exc,)).lower() for m in _CONNECTION_DEAD_MARKERS)
+
+
+def note_connection_dead(exc) -> None:
+    """Record that the connection died, so something other than the raising call can see it."""
+    global _CONNECTION_DEAD
+    _CONNECTION_DEAD = (time.time(), str(exc)[:300])
+    logger.error("the browser connection is gone (%s); every page operation will fail until "
+                 "it is rebuilt", str(exc)[:200])
+
+
+def connection_dead_for_s():
+    """Seconds since the connection was last seen dead, or None if it is not known to be dead."""
+    rec = _CONNECTION_DEAD
+    return None if not rec else max(0.0, time.time() - rec[0])
+
+
+def reconnect_browser(cdp=None) -> bool:
+    """Rebuild CTX after the connection to the browser died. PAGE-OWNER THREAD ONLY.
+
+    THE BRANCH THAT DID NOT EXIST. `connect_over_cdp` ran exactly once, in _page_main, so once
+    that connection died there was no way back and the process stayed up serving a dead handle.
+    This is the same shape as the socket route's "reconnection is impossible" claim, which
+    survived only because the code had no reconnect branch and therefore never tested it.
+
+    Returns False when PW itself is gone -- if the driver process died, the playwright object
+    that owned it cannot open anything either, and the honest move is to let the caller hand
+    the process back to the keepalive supervisor.
+    """
+    global CTX, PAGE, DRIVER, _CONNECTION_DEAD
+    if PW is None:
+        logger.error("cannot reconnect: playwright was never started on this process")
+        return False
+    cdp = cdp or os.environ.get("MCP_CDP_URL", "http://localhost:9222")
+    try:
+        br = PW.chromium.connect_over_cdp(cdp)
+        CTX = br.contexts[0] if br.contexts else br.new_context()
+        # DROPPED DELIBERATELY: both belong to the connection that just died. Leaving either
+        # would hand the next caller a handle onto a browser this process can no longer reach,
+        # which is the state this whole function exists to leave behind.
+        PAGE, DRIVER = None, None
+        _CONNECTION_DEAD = None
+        logger.warning("reconnected to the browser over CDP; page and driver dropped with the "
+                       "old connection and will be rebuilt on demand")
+        return True
+    except Exception:
+        logger.error("could not reconnect to the browser over CDP", exc_info=True)
+        return False
+
+
 def ensure_page_alive():
     """Reopen the agent page if it has closed. Returns True if a page is usable afterwards.
 
@@ -1550,7 +1673,15 @@ def ensure_page_alive():
             DRIVER = CopilotWebDriver(PAGE)
         logger.info("agent page had closed -- reopened it")
         return True
-    except Exception:
+    except Exception as exc:
+        # TELL SOMEBODY ELSE. Returning False says "no page", which is true and useless: a page
+        # that cannot be opened because the browser connection is gone needs the connection
+        # rebuilt, and a page that cannot be opened for any other reason does not. Both used to
+        # arrive at the caller as the same bare False, and the probe then reported the state as
+        # "no page available to probe with" -- a message that describes a symptom of the thing
+        # that is wrong and names nothing that could be repaired.
+        if connection_is_dead(exc):
+            note_connection_dead(exc)
         logger.warning("agent page had closed and could not be reopened", exc_info=True)
         return False
 
@@ -5613,8 +5744,19 @@ def _run_tool_probe():
                 except Exception:
                     _ok_borrow, _probe_borrowed = False, None
                 if not _ok_borrow or PAGE is None:
-                    tool_probe.record_probe(False, "starting",
-                                            detail="no page available to probe with; retrying")
+                    # SAY WHICH THING IS BROKEN. "no page available to probe with" was written
+                    # for the ordinary case -- the bridge is idle, the resident page is released,
+                    # and a borrow will succeed on the next cycle -- so it reads as routine. It
+                    # was also what the dot said for 22.5 hours while the browser connection was
+                    # dead, and reading it cost a full investigation to discover that the page
+                    # was never the problem.
+                    _dead_for = connection_dead_for_s()
+                    if _dead_for is not None:
+                        _why = ("the browser connection is dead (%.0f min); the watchdog is "
+                                "rebuilding it" % (_dead_for / 60.0))
+                    else:
+                        _why = "no page available to probe with; retrying"
+                    tool_probe.record_probe(False, "starting", detail=_why)
                     logger.info("tool probe: could not borrow a page; short retry armed")
                     return 15.0
             # Persist an explicit transitional state BEFORE the potentially long M365 turn.
@@ -5860,6 +6002,16 @@ def _port_already_served(port, timeout=2.0):
 CDP_WATCHDOG_SEC = max(2.0, float(os.environ.get("MCP_CDP_WATCHDOG_SEC", "10")))
 CDP_WATCHDOG_FAILURES = max(2, int(os.environ.get("MCP_CDP_WATCHDOG_FAILURES", "3")))
 
+#: How long the connection may be known-dead before the watchdog acts. A grace period at all,
+#: because a turn that is mid-flight when the driver dies will report it and then recover on its
+#: own retry; acting instantly would rebuild the connection underneath a request that was about
+#: to succeed.
+CONNECTION_DEAD_GRACE_S = max(5.0, float(os.environ.get("MCP_CONN_DEAD_GRACE_SEC", "20")))
+#: Reconnect attempts before handing the process back to the supervisor. Bounded, but this bound
+#: is NOT a quiet stop: exhausting it exits 70 so start_bridge.ps1 rebuilds the whole stack.
+#: A retry budget that ends in "give up and keep running" is how a dead bridge stays up.
+CONNECTION_RECONNECT_TRIES = max(1, int(os.environ.get("MCP_CONN_RECONNECT_TRIES", "3")))
+
 
 def _cdp_healthy(cdp, timeout=2.0):
     try:
@@ -5876,15 +6028,188 @@ def _cdp_healthy(cdp, timeout=2.0):
         return False
 
 
+#: When the page-owner thread first stopped completing a liveness probe, in the current run of
+#: failures. Cleared by any probe that completes. A wedged owner thread is a DIFFERENT fault from
+#: a dead connection -- rebuilding the browser would not repair it -- and it needs its own clock.
+_PAGE_THREAD_WEDGED = None
+
+#: How long the owner thread may fail its liveness probe before the process is handed back to the
+#: supervisor. Generous, because a slow real turn holds the queue legitimately; a turn budget is
+#: 600s but the probe is submitted with its own short timeout and only its REPEATED failure counts.
+PAGE_THREAD_WEDGE_LIMIT_S = max(30.0, float(os.environ.get("MCP_PAGE_WEDGE_LIMIT_SEC", "120")))
+
+
+def page_thread_wedged_for_s():
+    """Seconds the owner thread has been failing its liveness probe, or None if it is not."""
+    return None if _PAGE_THREAD_WEDGED is None else max(0.0, time.time() - _PAGE_THREAD_WEDGED)
+
+
+def wedge_escalation_step(exiter=None, wedged_for=None) -> bool:
+    """Hand the process back to the supervisor when the owner thread has stopped answering.
+
+    Returns whether it escalated. Separate from the connection path because the two faults are
+    not the same: a dead connection can be rebuilt in-process, a wedged thread cannot be, since
+    a timed-out Playwright call cannot be cancelled safely.
+    """
+    if wedged_for is None:
+        wedged_for = page_thread_wedged_for_s()
+    if wedged_for is None or wedged_for < PAGE_THREAD_WEDGE_LIMIT_S:
+        return False
+    try:
+        tool_probe.record_probe(False, "starting",
+                                detail="the bridge's page thread stopped responding; "
+                                       "supervisor restarting")
+    except Exception:
+        pass
+    logger.error("the page-owner thread has not answered for %.0fs; exiting for keepalive "
+                 "recovery", wedged_for)
+    (exiter or os._exit)(70)
+    return True
+
+
+def probe_connection(timeout_s=10.0, touch=None):
+    """Ask THIS PROCESS'S connection to the browser whether it still works.
+
+    True = it answered, False = it is gone (and that is now recorded), None = do not know.
+
+    WHY AN ACTIVE CHECK. note_connection_dead only fires from a call that needed a page, so a
+    connection that dies while the bridge is idle is not discovered until something happens to
+    try -- and the thing most likely to try is the tool probe, which then reports the failure as
+    its own. Measured while building this: the driver was killed and the bridge sat for 145
+    seconds with transport=none and nothing noticed, because nothing asked. _cdp_healthy has
+    asked the BROWSER this question every ten seconds for months; this asks our end of the pipe.
+
+    cookies() rather than `CTX.pages`, because pages is answered from playwright's local cache
+    and never crosses the driver -- it returns happily while the pipe is dead, which would make
+    this check confidently wrong in exactly the situation it exists for. cookies() sends a
+    protocol message and therefore fails when there is nothing to send it to. The value is
+    dropped without being read.
+
+    A timeout is NOT reported as death: the page-owner thread being wedged is a different fault
+    from the connection being gone, and rebuilding the connection would not fix it.
+    """
+    ctx = CTX
+    if ctx is None:
+        return None
+    if touch is None:
+        def touch():
+            ctx.cookies()
+            return True
+    global _PAGE_THREAD_WEDGED
+    try:
+        PAGE_EXECUTOR.submit_bounded(timeout_s, touch)
+        _PAGE_THREAD_WEDGED = None
+        return True
+    except TimeoutError as exc:
+        # THE CASE THAT ACTUALLY HAPPENS, and the one this first got wrong.
+        #
+        # When the driver dies, the page-owner thread is usually already blocked inside a
+        # playwright call waiting on a pipe that will never answer. So the probe never gets to
+        # RUN, and the failure arrives as a timeout rather than as a connection error. Measured:
+        # the driver was killed and the bridge logged this same line every 20 seconds for four
+        # and a half minutes while nothing recovered, because a timeout was being treated as
+        # "do not know" and "do not know" did nothing.
+        #
+        # submit_bounded's own docstring says what to do here -- "callers must terminate the
+        # bridge process and let the keepalive supervisor rebuild the page rather than
+        # continuing with a possibly wedged owner thread" -- and this is that caller.
+        if _PAGE_THREAD_WEDGED is None:
+            _PAGE_THREAD_WEDGED = time.time()
+            logger.error("the page-owner thread is not servicing its queue (%s)", str(exc)[:160])
+        else:
+            logger.warning("the page-owner thread is still wedged (%.0fs)",
+                           page_thread_wedged_for_s() or 0.0)
+        return None
+    except Exception as exc:
+        if connection_is_dead(exc):
+            note_connection_dead(exc)
+            _PAGE_THREAD_WEDGED = None
+            return False
+        logger.warning("connection probe could not complete (%s: %s)",
+                       type(exc).__name__, str(exc)[:160])
+        return None
+
+
+def connection_recovery_step(cdp, attempts, reconnect=None, exiter=None, dead_for=None):
+    """One watchdog pass over THIS PROCESS'S connection to the browser. Returns the attempt
+    count to carry into the next pass -- 0 whenever the connection is not known to be dead.
+
+    LIFTED OUT OF THE LOOP ON PURPOSE. Its home is a `while True` that ends in os._exit, so as
+    written inside it this escalation could not be run by a test even once. That is the exact
+    shape of the defect being repaired here: reconnect_browser's predecessor did not exist, and
+    nobody noticed for as long as the code had no way to ask whether it worked. `reconnect` and
+    `exiter` are injection points for that reason and no other.
+    """
+    if dead_for is None:
+        dead_for = connection_dead_for_s()
+    if dead_for is None or dead_for < CONNECTION_DEAD_GRACE_S:
+        return 0
+    if reconnect is None:
+        # BOUNDED: if the page-owner thread has itself wedged, this raises rather than parking
+        # the watchdog behind the very thread it exists to rescue.
+        def reconnect():
+            return PAGE_EXECUTOR.submit_bounded(30.0, reconnect_browser, cdp)
+    if exiter is None:
+        exiter = os._exit
+
+    attempts += 1
+    try:
+        tool_probe.record_probe(False, "starting",
+                                detail="the browser connection is dead; rebuilding it "
+                                       "(attempt %d)" % attempts)
+    except Exception:
+        pass
+    rebuilt = False
+    try:
+        rebuilt = bool(reconnect())
+    except Exception:
+        logger.error("CDP watchdog: reconnect attempt %d could not run", attempts, exc_info=True)
+    if rebuilt:
+        logger.warning("CDP watchdog: browser connection rebuilt after %.0fs dead (attempt %d)",
+                       dead_for, attempts)
+        return 0
+    if attempts >= CONNECTION_RECONNECT_TRIES:
+        try:
+            tool_probe.record_probe(False, "starting",
+                                    detail="browser connection dead and unrecoverable in this "
+                                           "process; supervisor restarting")
+        except Exception:
+            pass
+        # NOT A QUIET GIVE-UP. Exhausting the budget hands the process to start_bridge.ps1,
+        # which rebuilds Edge and the bridge together. A retry budget whose end is "stop trying
+        # and keep serving" is how a dead bridge stays up looking alive.
+        logger.error("CDP watchdog: the browser connection could not be rebuilt in %d attempts; "
+                     "exiting for keepalive recovery", attempts)
+        exiter(70)
+    return attempts
+
+
 def _start_cdp_watchdog(cdp):
     def _watch():
         failures = 0
+        reconnects = 0
         while True:
             time.sleep(CDP_WATCHDOG_SEC)
             if _cdp_healthy(cdp):
                 if failures:
                     logger.info("CDP watchdog: recovered after %d failed check(s)", failures)
                 failures = 0
+                # EDGE ANSWERING IS NOT THIS PROCESS BEING ABLE TO DRIVE IT.
+                #
+                # _cdp_healthy opens its own HTTP connection to /json/version, so it reports on
+                # the BROWSER. The 2026-09-03 outage killed the other end -- the playwright
+                # driver this process talks through -- and Edge stayed up and healthy for the
+                # whole 22.5 hours. Every check passed, `failures` never left 0, and the
+                # watchdog whose entire purpose is to repair a half-dead stack watched the half
+                # that was fine.
+                # ASK OUR OWN END TOO, rather than waiting for some request to discover it.
+                probe_connection()
+                # A thread that cannot answer at all outranks a connection that can be rebuilt:
+                # when the driver dies the owner thread is usually already blocked inside it, so
+                # this is the path the real failure takes.
+                if wedge_escalation_step():
+                    continue
+                reconnects = connection_recovery_step(cdp, reconnects)
                 continue
             failures += 1
             logger.warning("CDP watchdog: %s failed (%d/%d)", cdp, failures,
@@ -5910,9 +6235,12 @@ def _page_main(cdp, fresh):
     Every later PAGE/DRIVER call (from any HTTP request thread) is routed here via
     run_on_page_thread -- see PageExecutor's docstring for why page creation and every later
     page call must share this one thread (Playwright sync-API thread affinity)."""
-    global PAGE, DRIVER, CTX, AGENT_URL, ACTIVE_SID, _CONVERSATION_TURNS
+    global PAGE, DRIVER, CTX, PW, AGENT_URL, ACTIVE_SID, _CONVERSATION_TURNS
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
+        # PUBLISHED, so a later reconnect has something to reconnect WITH. `p` was a local, which
+        # meant connect_over_cdp could happen exactly once in the life of the process.
+        PW = p
         br = p.chromium.connect_over_cdp(cdp)
         ctx = br.contexts[0] if br.contexts else br.new_context()
         CTX = ctx
@@ -6055,6 +6383,9 @@ def _page_main(cdp, fresh):
 
 
 def main():
+    # BEFORE ANYTHING ELSE CAN FAIL. Everything this process learns about its own health is
+    # reported through `logger`, and until this call that reporting has no destination.
+    _configure_logging()
     fresh = "--fresh" in sys.argv[1:]
     cdp = os.environ.get("MCP_CDP_URL", "http://localhost:9222")
     port = int(os.environ.get("MCP_BRIDGE_PORT", "8765"))
