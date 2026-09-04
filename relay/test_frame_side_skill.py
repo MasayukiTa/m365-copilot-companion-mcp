@@ -26,6 +26,7 @@ than repository content. What the frame owns is the DECISION, so the bundles her
 synthetic and carry exactly the properties under test. The real procedures are exercised by
 the last test, where they exist.
 """
+import inspect
 import io
 import os
 import sqlite3
@@ -180,37 +181,65 @@ def test_order_is_memory_then_procedure_then_goal():
 
 # -- the hazard the fanout suite caught the moment this was wired ------------------------------
 
-def test_a_procedure_that_introduces_the_split_marker_is_refused():
-    """FOUND BY RUNNING THE SUITE, not by thinking about it.
+def test_a_procedure_that_mentions_the_split_marker_is_still_delivered():
+    """THE GUARD THAT WAS HERE PROTECTED AGAINST A HAZARD THAT DOES NOT EXIST.
 
-    A mail procedure explains the split convention, so its body contains the literal
-    SUBTASKS_READY. fanout_ready() scans the REPLY rather than the prompt, so nothing fires
-    directly -- but a worker that reads "write SUBTASKS_READY on the last line" can write it,
-    and an ordinary task is then read as a proposed split.
+    The reasoning was that a body containing SUBTASKS_READY could teach an ordinary worker
+    to write it, and that the reply would then be read as a proposed split. It refused the
+    whole procedure on that basis, so every mail task ran without its approved 手順.
+
+    The consumer says otherwise -- see the two tests below -- and the cost was real, so the
+    guard is gone and this pins that it stays gone.
     """
     got = F._with_matched_skill(MAIL_GOAL)
-    assert "SUBTASKS_READY" not in got, (
-        "a procedure introduced a control word this worker is not given by default")
+    assert got != MAIL_GOAL, "the mail procedure is being refused again"
+    assert "SUBTASKS_READY" in got, "fixture no longer exercises the case"
 
 
-def test_the_markers_PROTOCOL_already_carries_do_not_block_a_procedure():
-    """THE FIRST VERSION OF THE GUARD WAS WRONG and would have blocked the skill that matters.
+def test_the_split_marker_is_inert_outside_fanout_mode():
+    """WHY THE GUARD WAS UNNECESSARY, checked against the code that reads the marker rather
+    than against the reasoning that assumed it. _decide gates the split branch on the mode:
 
-    It banned every marker in control_markers.KINDS. But PROTOCOL itself names DONE /
-    CONTINUE / STUCK / RESEARCH / ANALYZE, so a procedure saying 'write STUCK only when you
-    are certain' adds nothing the worker did not already have -- and refusing over it removed
-    the one procedure with a measured 1.0 match against real goals.
+        if self.fanout and not self._fanout_done:  ->  fanout_ready(resp)
+
+    so an ordinary worker writing SUBTASKS_READY reaches no branch at all. If that gate is
+    ever removed, this fails and the guard question comes back.
     """
+    w = F.RelayWorker(MAIL_GOAL, "w0")
+    assert w.fanout is False, "an ordinary worker is not in fanout mode"
+    src = inspect.getsource(F.RelayWorker._decide)
+    i = src.find("fanout_ready")
+    assert i != -1, "fanout_ready is no longer consulted here; re-derive this"
+    assert "self.fanout" in src[max(0, i - 400):i], (
+        "the split branch is no longer gated on fanout mode; the marker is live for every "
+        "worker again and a procedure that names it must be refused")
+
+
+def test_a_worker_that_is_in_fanout_mode_was_given_the_marker_anyway():
+    """The other half. Inside the mode that reads it, SPLIT_JOB instructs the worker to write
+    it -- so a procedure mentioning it adds nothing there either."""
+    from relay import fanout as fanout_mod
+    assert "SUBTASKS_READY" in fanout_mod.SPLIT_JOB
+
+
+def test_the_plan_marker_has_the_same_two_properties():
+    from relay import planner
+    src = inspect.getsource(F.RelayWorker._decide)
+    i = src.find("plan_ready")
+    assert i != -1
+    assert "self.plan_mode" in src[max(0, i - 400):i]
+    # PLAN_PROMPT is the plan-mode opening turn, and it tells the worker to write the marker.
+    assert "PLAN_READY" in planner.PLAN_PROMPT
+
+
+def test_the_markers_PROTOCOL_already_carries_reach_the_worker():
+    """PROTOCOL names DONE / CONTINUE / STUCK / RESEARCH / ANALYZE, so a procedure saying
+    'write STUCK only when you are certain' adds nothing -- and the first version of the
+    guard, which banned every marker in control_markers.KINDS, would have blocked
+    repo-bug-fix, the one procedure with a measured 1.0 match against real goals."""
     got = F._with_matched_skill(CODING_GOAL)
-    assert got != CODING_GOAL, "a procedure was refused over a marker PROTOCOL already carries"
+    assert got != CODING_GOAL
     assert "STUCK" in got, "fixture no longer exercises the case"
-
-
-def test_the_guard_is_scoped_to_what_the_worker_lacks():
-    from relay.relay_fleet import PROTOCOL
-    assert "SUBTASKS_READY" not in PROTOCOL and "PLAN_READY" not in PROTOCOL
-    for already in ("DONE", "CONTINUE", "STUCK"):
-        assert already in PROTOCOL, "%s is no longer in PROTOCOL; re-derive the guard" % already
 
 
 # -- what CI was actually saying ----------------------------------------------------------------
