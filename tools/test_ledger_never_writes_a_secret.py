@@ -12,6 +12,7 @@ against the VALUES the process holds, at the point where bytes leave it.
 import io
 import json
 import os
+import pathlib
 
 import pytest
 
@@ -31,6 +32,33 @@ def _held(monkeypatch, tmp_path):
 
 def _written(path):
     return io.open(str(path), encoding="utf-8").read() if os.path.exists(str(path)) else ""
+
+
+def _python_files(root):
+    """Every .py under root, without dying on a directory entry that cannot be read.
+
+    pathlib.rglob raises FileNotFoundError the moment it meets a DANGLING JUNCTION, and the
+    exception is not about the file being scanned -- it aborts the whole walk. Measured
+    2026-09-04: one orphan `fleetlink_p08` left behind by an earlier fleet run pointed at a
+    worktree that had been cleaned up, and it took both of these tests red. A guarantee about
+    secrets that stops holding because an unrelated run left a stale link behind is not a
+    guarantee, and a red suite hides whatever fails next.
+
+    Skips are limited to entries that do not resolve, so nothing readable is quietly dropped:
+    a real directory that merely fails to open still raises.
+    """
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root, onerror=None):
+        keep = []
+        for d in dirnames:
+            full = os.path.join(dirpath, d)
+            if os.path.exists(full):
+                keep.append(d)
+        dirnames[:] = keep
+        for fn in filenames:
+            if fn.endswith(".py"):
+                out.append(pathlib.Path(dirpath) / fn)
+    return out
 
 
 def test_a_gateway_wrapped_password_does_not_reach_the_ledger(_held):
@@ -140,7 +168,7 @@ def test_redaction_is_only_ever_applied_on_a_write_path(_held):
         "bridge/copilot_bridge.py",         # append_turn: writes the session store
     }
     found = set()
-    for path in root.rglob("*.py"):
+    for path in _python_files(root):
         rel = path.relative_to(root).as_posix()
         if "/worktrees/" in rel or rel.startswith(".") or "test_" in rel:
             continue
@@ -190,7 +218,7 @@ def test_the_ledger_has_exactly_one_writer(_held):
     root = pathlib.Path(__file__).resolve().parent.parent
     allowed = {"main.py", "tools/tool_ledger.py"}
     writers = set()
-    for path in root.rglob("*.py"):
+    for path in _python_files(root):
         rel = path.relative_to(root).as_posix()
         if "/worktrees/" in rel or rel.startswith(".") or "test_" in rel:
             continue
