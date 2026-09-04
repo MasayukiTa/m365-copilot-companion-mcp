@@ -50,6 +50,27 @@ def _assigned_outcomes():
                     continue
                 if isinstance(val, ast.Constant) and isinstance(val.value, str):
                     found.setdefault(val.value, []).append("%s:%d" % (name, node.lineno))
+                elif isinstance(val, ast.Call):
+                    # ASSIGNED FROM A METHOD, WHICH THIS USED TO BE BLIND TO.
+                    #
+                    # `_settle_done` consolidated four separate ("done", "DONE") assignments
+                    # into ONE site -- exactly the right move, and it is why a gate now cannot
+                    # be walked around. But the literal moved from an assignment into a
+                    # `return`, so a walker that only reads Assign nodes stopped seeing DONE at
+                    # all and declared the most common outcome in the system unproduced.
+                    #
+                    # The guard has to follow the refactor: when outcome is assigned from
+                    # self.<method>(), harvest the strings that method returns.
+                    fn = val.func
+                    called = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
+                    for other in ast.walk(tree):
+                        if not (isinstance(other, ast.FunctionDef) and other.name == called):
+                            continue
+                        for r in ast.walk(other):
+                            if (isinstance(r, ast.Return) and isinstance(r.value, ast.Constant)
+                                    and isinstance(r.value.value, str)):
+                                found.setdefault(r.value.value, []).append(
+                                    "%s:%d (returned by %s)" % (name, r.lineno, called))
     return found
 
 
