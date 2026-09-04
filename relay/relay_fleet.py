@@ -4710,6 +4710,53 @@ _MEMORY_HEADER = "--- このテーマでの過去の作業メモ ---"
 _SKILL_HEADER = "--- この作業の承認済み手順（このとおり進める） ---"
 
 
+#: (name, digest) pairs this process has already asked about, so a run with twenty workers
+#: raises one question rather than twenty identical log lines. The store de-duplicates the
+#: request itself, by digest; this is only about the noise.
+_APPROVAL_ASKED = set()
+
+
+def _ask_to_approve_the_near_miss(store, text):
+    """When no TRUSTED procedure matches, ask about the one that would have. Never raises.
+
+    THE REQUEST PATH ALREADY EXISTED AND NOTHING REACHED IT. tools/skill_ops.skill_match does
+    exactly this -- finds the near miss, calls request_approval, and tells the caller to ask
+    the user -- and its own comment records why it had to: request_approval is invoked from
+    one place in the codebase, a command inside the chat CLI's REPL, so the Approval Centre
+    correctly showed nothing and six Skills sat unreadable for weeks.
+
+    But that lives inside the tool the agent is ORDERED to call and does not: 178 attempts,
+    145 dead on a guessed argument name, 33 successes in the entire ledger. So the fix for
+    the matching was the fix for this too -- the frame holds the goal, so it can ask.
+
+    This trusts nothing and injects nothing. It writes a question, with the bundle's digest,
+    for a person to answer, at the moment a procedure they wrote would have been used and
+    could not be.
+    """
+    try:
+        near = store.match_unapproved(text)
+        if not near:
+            return
+        # ONCE PER PROCESS PER DIGEST. A run builds twenty workers against one goal shape, and
+        # the store would happily be asked twenty times -- it de-duplicates the challenge, but
+        # each call still writes the gate file and touches SQLite. The digest is in the key, so
+        # a Skill edited mid-run is asked about again, which is the one case worth repeating.
+        key = (near.get("name"), near.get("digest"))
+        if key in _APPROVAL_ASKED:
+            return
+        _APPROVAL_ASKED.add(key)
+        store.request_approval(near["name"])
+        # "changed" means a human DID approve this and then its text moved, so the approval --
+        # which is of a hash -- lapsed. That is a different question from one never asked, and
+        # it is the part a person needs in order to answer quickly.
+        why = ("changed since it was approved" if near.get("trust") == "changed"
+               else "has never been approved")
+        print("[skill] %r would have matched this goal but %s -- raised for approval; "
+              "running without it" % (near.get("name"), why), flush=True)
+    except Exception:
+        pass
+
+
 def _with_matched_skill(goal_text):
     """Prepend the approved procedure for this goal, when one matches. Never raises.
 
@@ -4744,6 +4791,7 @@ def _with_matched_skill(goal_text):
         store = SkillStore(root)
         hit = store.match(text)
         if not hit:
+            _ask_to_approve_the_near_miss(store, text)
             return goal_text
         body = store.render(hit["name"], "")
         if not body:
