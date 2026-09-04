@@ -2097,7 +2097,11 @@ class RelayWorker:
         # version prepended the memory to the goal text itself and broke all three at once
         # (and hung a fleet sweep whose workers are keyed by goal text).
         initial_body, preflight_unlock = _initial_job_with_unlock(
-            _with_theme_memory(self.goal), plan_mode)
+            # Memory first, then the matched procedure, then the goal: the procedure is HOW
+            # to do the thing, so it is the last thing read before the thing. Both derive from
+            # self.goal -- the worker's identity -- and neither is written back into it.
+            _with_theme_memory(_with_matched_skill(self.goal), theme_text=self.goal),
+            plan_mode)
         if preflight_unlock:
             # Count the proactive attempt against the same bounded budget used by reactive
             # re-unlocks when the M365 backend later rotates to a different source IP.
@@ -4701,7 +4705,89 @@ def _refresh_selfimprove_dashboard():
 _MEMORY_HEADER = "--- このテーマでの過去の作業メモ ---"
 
 
-def _with_theme_memory(goal_text):
+
+#: Header for a procedure the FRAME matched and put in front of the worker.
+_SKILL_HEADER = "--- この作業の承認済み手順（このとおり進める） ---"
+
+
+def _with_matched_skill(goal_text):
+    """Prepend the approved procedure for this goal, when one matches. Never raises.
+
+    WHY THE FRAME DOES THIS. The server orders every worker, as RULE 2, to call skill_match
+    before any domain work. Measured over the tool ledger: 178 attempts, 145 of them dead on a
+    guessed argument name -- and because it is a preliminary step rather than the work itself,
+    96 of those were simply abandoned. skill_match has succeeded 33 times in the entire ledger,
+    while the procedure that would have answered scores 1.0 on the very queries that failed.
+    The store was not empty and the matcher was not weak; the call never arrived.
+
+    SkillStore.match is deterministic, metadata-only, stdlib, and the frame holds the goal text
+    before the first prompt is composed. So the lookup does not need an agent, a turn, or a
+    correctly-guessed keyword. Two round trips (match, then load) become none.
+
+    CONDITIONAL, WHICH IS WHAT THE SKILL ITSELF ASKS FOR. repo-bug-fix's own preamble argues
+    against embedding procedures in every goal -- it grew one goal from 0 to 2,295 bytes -- and
+    for pulling them when needed. This is that, performed by the party that reliably performs
+    things. Bodies run 1.4 to 7.8 KB and are added only on a confident, trusted match.
+
+    Placed AFTER the theme notes and immediately BEFORE the goal: the procedure is how to do
+    the thing, so it should be the last thing read before the thing. That position is a
+    judgement, not a measurement, and is worth an A/B once anything is being measured.
+    """
+    try:
+        text = str(goal_text or "")
+        if not text or _SKILL_HEADER in text:
+            return goal_text
+        from relay.skills import SkillStore
+        # Same root skill_ops uses, derived here so the frame does not depend on it.
+        root = (os.environ.get("MCP_SKILLS_PROJECT_ROOT")
+                or os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        store = SkillStore(root)
+        hit = store.match(text)
+        if not hit:
+            return goal_text
+        body = store.render(hit["name"], "")
+        if not body:
+            return goal_text
+        # A PROCEDURE MUST NOT INTRODUCE A CONTROL WORD THE WORKER WAS NOT ALREADY GIVEN.
+        #
+        # Found by the fanout suite the moment this was wired: a mail goal matched
+        # mail-lookup, whose body explains the split convention and so contains the literal
+        # SUBTASKS_READY. fanout_ready() scans the REPLY rather than the prompt, so nothing
+        # fires directly -- but a worker that reads "write SUBTASKS_READY on the last line"
+        # can write it, and an ordinary task is then read as a proposed split.
+        #
+        # ONLY THE WORDS PROTOCOL DOES NOT ALREADY CARRY. The first version banned every
+        # marker and was plainly wrong: PROTOCOL itself names DONE / CONTINUE / STUCK /
+        # RESEARCH / ANALYZE, so a procedure saying "write STUCK only when you are certain"
+        # adds nothing the worker did not have -- and refusing over it would have blocked
+        # repo-bug-fix, the one skill that matters most. What is left is the pair the worker
+        # is NOT given by default: SUBTASKS_READY and PLAN_READY, each of which turns an
+        # ordinary reply into a different kind of event.
+        #
+        # Refused rather than edited: rewriting somebody's approved procedure to make it safe
+        # to inject would change what a human signed off on. Said out loud instead, so the
+        # skill can quote its markers differently and become injectable.
+        _banned = ("SUBTASKS_READY", "PLAN_READY")
+        _hits = [m for m in _banned if m in body and m not in PROTOCOL]
+        if _hits:
+            print("[skill] %r not injected: its body introduces %s, which this worker is not "
+                  "given by default and which would be read as a different kind of reply"
+                  % (hit["name"], ", ".join(sorted(set(_hits)))), flush=True)
+            return goal_text
+        try:
+            from tools.skill_ops import _record_skill_use
+            _record_skill_use("inject", text, hit["name"])
+        except Exception:
+            pass
+        print("[skill] frame matched %r (score %s) and put it in front of the goal"
+              % (hit["name"], hit.get("score")), flush=True)
+        nl = chr(10)
+        return (_SKILL_HEADER + nl + body + nl + "--- 手順ここまで ---" + nl + nl + text)
+    except Exception:
+        return goal_text
+
+
+def _with_theme_memory(goal_text, theme_text=None):
     """Return the goal body with this theme's history prepended, or unchanged on any doubt.
 
     Applied to the BODY that is sent, never to the worker's goal. Recording without recall
@@ -4717,7 +4803,14 @@ def _with_theme_memory(goal_text):
         text = str(goal_text or "")
         if not text or _MEMORY_HEADER in text:
             return goal_text
-        notes = load_notes(theme_from_goal(text), goal=text)
+        # THE THEME COMES FROM THE GOAL, NOT FROM WHATEVER IS WRAPPED AROUND IT.
+        #
+        # theme_from_goal reads the first clause, so once a matched procedure is prepended the
+        # theme becomes the procedure's own heading and every task that loads a skill lands in
+        # one bucket named after that skill. `theme_text` lets the caller keep deriving from
+        # the bare goal while priming a body that already carries other material.
+        keyed_on = str(theme_text if theme_text is not None else goal_text or "")
+        notes = load_notes(theme_from_goal(keyed_on), goal=keyed_on)
         if not notes:
             return goal_text
         return "%s\n%s\n--- メモここまで ---\n\n%s" % (_MEMORY_HEADER, notes, text)
