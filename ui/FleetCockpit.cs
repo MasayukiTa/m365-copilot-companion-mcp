@@ -2183,6 +2183,24 @@ class CockpitWindow : Window
             bool onAgent = tabs != null && tabs.IndexOf("m365.cloud.microsoft", StringComparison.OrdinalIgnoreCase) >= 0;
             if (onAgent)
                 SetDot(2, HealthState.Green, T("hs_edge_detail_ok"), now);
+            else if (!FleetRunIsLive() || !RunDrivesTabs())
+                // A MISSING TAB IS ONLY A FAULT WHERE TABS ARE THE TRANSPORT.
+                //
+                // This asked for a tab unconditionally, and both ways round it was wrong.
+                // Measured 2026-09-04: amber for the whole of a healthy socket-route run, whose
+                // workers correctly hold no page -- then GREEN the moment that run ended STUCK,
+                // because the failure left a Copilot page behind. The dot was inverted with
+                // respect to the thing it is read for, which is worse than absent: a signal that
+                // is wrong during the incident it exists to surface teaches people to ignore it.
+                //
+                // The original case is kept exactly. When a run IS driving tabs and none of them
+                // is on the agent, that is still the 2026-08-31 failure -- every worker falling
+                // back to the assistant with no tools -- and it still goes amber below.
+                //
+                // Whether workers can actually reach the agent is the AGENT dot's question, and
+                // that one was already moved off the tab list when the socket route landed. This
+                // dot answers for the browser.
+                SetDot(2, HealthState.Green, T("hs_edge_detail_ok"), now);
             else
                 // Amber, not red: the browser is up and one navigation away from usable, which
                 // is exactly what the automatic repair is for.
@@ -2290,6 +2308,26 @@ class CockpitWindow : Window
         // guard would outlive the run it was guarding. When the runner's own pid marker says
         // no process exists, there is no run to protect, whatever the snapshot says.
         catch (Exception) { return !MarkerPidIsDead(); }
+    }
+
+    // Whether the live run drives TABS at all. Under the socket route it does not: workers hold
+    // no page, and one is opened only to read a token -- about four seconds per token lifetime,
+    // which the runner logs as 46 minutes. So "no tab is on the agent" is the normal state for
+    // roughly 99.8% of a healthy run, and asking for one is asking about a transport this run
+    // is not using. Returns true when the answer is not knowable, which keeps the original tab
+    // check in force rather than assuming the socket route.
+    bool RunDrivesTabs()
+    {
+        try
+        {
+            string p = ResolvePath(null);
+            if (!File.Exists(p)) return false;
+            var root = _js.DeserializeObject(File.ReadAllText(p, Encoding.UTF8))
+                       as Dictionary<string, object>;
+            if (root == null || !root.ContainsKey("open_tabs")) return true;   // unknown -> ask
+            return I(root, "open_tabs") > 0;
+        }
+        catch (Exception) { return true; }
     }
 
     //: How old a capture may be and still describe the present. Beyond this a sign-in
