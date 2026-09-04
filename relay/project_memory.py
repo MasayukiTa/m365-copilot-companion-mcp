@@ -242,6 +242,39 @@ def _tokens(text):
     return out
 
 
+#: Below this many entries there is no distribution to read, so nothing is discounted.
+_IDF_MIN_LINES = 8
+#: A token in this fraction of the index or more tells you nothing about which entry to open.
+_IDF_COMMON_FRACTION = 0.25
+#: How many two-character CJK fragments must be shared, when no whole word is. See
+#: shares_a_topic for why a count alone cannot decide this.
+_MIN_SHARED_FRAGMENTS = 2
+
+
+def uninformative_tokens(lines):
+    """Tokens so common across the index that sharing one means nothing.
+
+    MEASURED 2026-09-04. A worker's goal was matched against 40 stored themes and four of them
+    came back "related" on a single shared token each -- and the token was する, or この. Those
+    are Japanese function words: they appear in almost any sentence, so under a "share at least
+    one token" rule almost anything is related to almost anything. That is how a furigana task
+    and two unrelated repository themes were primed into a cinema survey.
+
+    Derived from the index itself rather than from a hand-written stoplist: a list of stop words
+    is a thing someone has to remember to maintain, and the one word it is missing is the one
+    doing the damage. Frequency needs no maintenance and adapts to whatever the store holds.
+    """
+    if len(lines) < _IDF_MIN_LINES:
+        return set()
+    seen = {}
+    for ln in lines:
+        title = ln.split("](", 1)[0][3:] if "](" in ln else ln
+        for tok in _tokens(title):
+            seen[tok] = seen.get(tok, 0) + 1
+    cutoff = max(2, int(len(lines) * _IDF_COMMON_FRACTION))
+    return {tok for tok, n in seen.items() if n >= cutoff}
+
+
 def rank_index_lines(lines, theme="", goal=""):
     """Order the index by how likely each theme is to be worth opening for THIS work.
 
@@ -261,7 +294,7 @@ def rank_index_lines(lines, theme="", goal=""):
     applied by the caller, unchanged.
     """
     try:
-        want = _tokens(theme) | _tokens(goal)
+        want = (_tokens(theme) | _tokens(goal)) - uninformative_tokens(lines)
         if not want:
             return list(lines)
         scored = []
@@ -275,11 +308,47 @@ def rank_index_lines(lines, theme="", goal=""):
         return list(lines)
 
 
-#: How many UNRELATED themes to keep, always. The index's stated job is DISCOVERY, and a
-#: filter that shows only what already looks related can never surface anything new -- so a
-#: short recency tail stays whatever happens. Five lines is about 340 characters; forty was
-#: 2,718.
-_INDEX_RECENT_TAIL = 5
+#: How many UNRELATED themes to keep, always. The argument for keeping any was DISCOVERY: a
+#: filter that shows only what already looks related can never surface anything new.
+#:
+#: MEASURED 2026-09-04, AND DISCOVERY NEVER HAPPENED. The index is primed into every worker's
+#: first prompt, and .fleet/tool_events.jsonl holds 22,444 recorded tool calls in which
+#: `.fleet/memory` appears ZERO times. Not rarely -- never. No worker has ever opened a theme
+#: this list offered it, related or not, so the tail has only ever been cost.
+#:
+#: What that cost looked like: a worker surveying cinemas was handed "50を2で割っていくつか",
+#: "1024を4で割っていくつか" and a furigana task -- one-shot questions the theme key had turned
+#: into permanent themes -- eight mentions of an unrelated subject in a 3,646-character prompt.
+#:
+#: Zero, not deleted: RELATED themes are still kept in full by prune_index_lines, so the day a
+#: neighbouring theme genuinely matches it is still offered. Only the unrelated filler is gone.
+#: Raise this if the recall path is ever wired to something that reads it.
+_INDEX_RECENT_TAIL = 0
+
+
+
+def shares_a_topic(want, have):
+    """Whether two token sets overlap enough to mean anything.
+
+    NOT A COUNT, because _tokens does not produce comparable units. A Latin run is a whole word
+    ("ansible", "bench"); a CJK run is exploded into two-character bigrams, so one Japanese
+    phrase yields a dozen tokens and one English phrase yields two. Counting both the same way
+    breaks in opposite directions, and this had it both ways round within one afternoon:
+
+      * one shared bigram was enough, so する and この -- function words present in almost any
+        Japanese sentence -- made a furigana task "related" to a cinema survey. Measured against
+        the live store: overlaps of 21, 5, then 1,1,1,1, then zero for the other 34, with the
+        four ones riding entirely on those two tokens.
+      * requiring two then dropped an obvious match: "fixing ansible" shares exactly one token
+        with an ansible theme, because that token is the whole word.
+
+    So judge by what the shared token IS. A word of three or more characters names something;
+    a two-character CJK bigram is a fragment, and fragments only mean something in numbers.
+    """
+    shared = want & have
+    if any(len(tok) >= 3 for tok in shared):
+        return True
+    return len(shared) >= _MIN_SHARED_FRAGMENTS
 
 
 def prune_index_lines(lines, theme="", goal=""):
@@ -312,7 +381,7 @@ def prune_index_lines(lines, theme="", goal=""):
         related, rest = [], []
         for ln in lines:
             title = ln.split("](", 1)[0][3:] if "](" in ln else ln
-            (related if (want & _tokens(title)) else rest).append(ln)
+            (related if shares_a_topic(want, _tokens(title)) else rest).append(ln)
         return related + rest[:_INDEX_RECENT_TAIL]
     except Exception:
         return list(lines)

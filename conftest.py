@@ -84,6 +84,10 @@ LIVE_RECORD_REDIRECTS = {
 #: this list is a claim that a test writing there is harmless -- so it is short, and each line
 #: has to be defensible.
 DELIBERATELY_NOT_REDIRECTED = {
+    ("relay.fleet_reconcile", "TRANSCRIPTS"):
+        "read-only: the reconciler only ever reads finished transcripts to compare them, and "
+        "writes nothing at all. Its own tests pass an explicit directory, so nothing here "
+        "reaches the operator's store either way",
     ("tools.contract_gate", "_FLEET_DIR"):
         "a directory, not a record; the gate's own files are redirected by the tests that "
         "write them and the contract file is already per-test",
