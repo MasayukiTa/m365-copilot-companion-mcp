@@ -167,7 +167,11 @@ def test_a_socket_resume_still_goes_through_the_unlock_generation_point():
     import relay.relay_fleet as RF
     src = inspect.getsource(RF)
     i = src.index("initial_body, preflight_unlock = _initial_job_with_unlock(")
-    tail = src[i:i + 700]
+    # A FIXED WINDOW IS NOT A NEIGHBOURHOOD. This read src[i:i+700]; adding a few comment
+    # lines between the two statements pushed the one being checked out of the window and
+    # failed a property that still held. Search from the anchor to the end instead -- what
+    # matters is that the resume path is built from THIS call, not how far apart they sit.
+    tail = src[i:]
     assert "self.job = (initial_body if self.resume_conv" in tail, \
         "the resume path must be built by the same call"
 

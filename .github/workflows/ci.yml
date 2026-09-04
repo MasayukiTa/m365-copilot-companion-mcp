@@ -397,6 +397,7 @@ jobs:
             relay/test_mechanism_telemetry.py \
             relay/test_memory_dedupe.py \
             relay/test_fleet_reconcile.py \
+            relay/test_frame_side_skill.py \
             relay/test_merge_failure_visible.py \
             relay/test_orphan_reaper.py \
             relay/test_panel_shadow.py \

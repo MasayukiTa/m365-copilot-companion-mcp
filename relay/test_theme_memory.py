@@ -125,15 +125,21 @@ def test_the_fleet_also_reads_memory_back():
     """記録するだけで参照しないなら意味がない。"""
     fn = FLEET_SRC[FLEET_SRC.index("def _with_theme_memory"):]
     assert "load_notes(" in fn
-    assert "_with_theme_memory(self.goal)" in FLEET_SRC
+    # 呼び出しの「文面」ではなく「使われていること」を見る。以前は
+    # "_with_theme_memory(self.goal)" という一文をそのまま探しており、手順注入を
+    # 挟んで合成した時点で、挙動は正しいのに落ちた。
+    assert "_with_theme_memory(" in FLEET_SRC
+    assert "theme_text=self.goal" in FLEET_SRC,         "テーマは goal から導出し続けること（包んだ本文からではなく）"
 
 
 def test_priming_touches_the_sent_body_not_the_worker_identity():
     """ワーカーは goal 文字列で同定される。書き換えると転写キー・再実行エンベロープ・
     record_task のテーマが同時に壊れ、実際にフリート走行がハングした。"""
-    i = FLEET_SRC.index("_with_theme_memory(self.goal)")
-    # 差し込みは初回ジョブ本文の組み立て地点でのみ行う
-    assert "_initial_job_with_unlock(" in FLEET_SRC[i - 200:i + 60]
+    # 差し込みは初回ジョブ本文の組み立て地点でのみ行う。文字数窓で近傍を判定していたが、
+    # 間にコメントが数行入っただけで窓から外れた。窓ではなく「同じ文の中か」で見る。
+    i = FLEET_SRC.index("_initial_job_with_unlock(")
+    stmt = FLEET_SRC[i:FLEET_SRC.index("preflight_unlock:", i)]
+    assert "_with_theme_memory(" in stmt, "初回ジョブ本文の組み立て地点で差し込んでいない"
     # goals そのものを差し替える経路を作らない
     assert "goals = _with_theme_memory" not in FLEET_SRC
     assert "_prime_goals_with_memory" not in FLEET_SRC
