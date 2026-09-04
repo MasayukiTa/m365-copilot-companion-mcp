@@ -105,6 +105,7 @@ jobs:
             relay/test_fleet_heap_recycle.py \
             relay/test_chathub.py \
             relay/test_socket_tools.py \
+            relay/test_memory_is_about_the_work.py \
             tests/test_sensitive_paths_untracked.py \
             tests/test_unlock_redaction.py \
             tests/test_edge_keeper_coverage.py \
