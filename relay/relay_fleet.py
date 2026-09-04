@@ -4796,32 +4796,34 @@ def _with_matched_skill(goal_text):
         body = store.render(hit["name"], "")
         if not body:
             return goal_text
-        # A PROCEDURE MUST NOT INTRODUCE A CONTROL WORD THE WORKER WAS NOT ALREADY GIVEN.
+        # THERE WAS A GUARD HERE AGAINST CONTROL WORDS IN A PROCEDURE'S BODY, AND IT WAS
+        # PROTECTING AGAINST A HAZARD THAT DOES NOT EXIST.
         #
-        # Found by the fanout suite the moment this was wired: a mail goal matched
-        # mail-lookup, whose body explains the split convention and so contains the literal
-        # SUBTASKS_READY. fanout_ready() scans the REPLY rather than the prompt, so nothing
-        # fires directly -- but a worker that reads "write SUBTASKS_READY on the last line"
-        # can write it, and an ordinary task is then read as a proposed split.
+        # The reasoning was: mail-lookup's body explains the split convention, so it contains
+        # the literal SUBTASKS_READY; a worker that reads "write SUBTASKS_READY on the last
+        # line" can write it; and an ordinary task would then be read as a proposed split. It
+        # refused the whole procedure on that basis, which cost the mail procedure entirely --
+        # every mail task ran without the approved手順 while the log line said why.
         #
-        # ONLY THE WORDS PROTOCOL DOES NOT ALREADY CARRY. The first version banned every
-        # marker and was plainly wrong: PROTOCOL itself names DONE / CONTINUE / STUCK /
-        # RESEARCH / ANALYZE, so a procedure saying "write STUCK only when you are certain"
-        # adds nothing the worker did not have -- and refusing over it would have blocked
-        # repo-bug-fix, the one skill that matters most. What is left is the pair the worker
-        # is NOT given by default: SUBTASKS_READY and PLAN_READY, each of which turns an
-        # ordinary reply into a different kind of event.
+        # Reading the code that consumes the markers settles it. _decide() gates each one on
+        # the mode that asks for it:
         #
-        # Refused rather than edited: rewriting somebody's approved procedure to make it safe
-        # to inject would change what a human signed off on. Said out loud instead, so the
-        # skill can quote its markers differently and become injectable.
-        _banned = ("SUBTASKS_READY", "PLAN_READY")
-        _hits = [m for m in _banned if m in body and m not in PROTOCOL]
-        if _hits:
-            print("[skill] %r not injected: its body introduces %s, which this worker is not "
-                  "given by default and which would be read as a different kind of reply"
-                  % (hit["name"], ", ".join(sorted(set(_hits)))), flush=True)
-            return goal_text
+        #     if self.fanout and not self._fanout_done:   ->  fanout_ready(resp)
+        #     if self.plan_mode and not self._plan_approved:  ->  plan_ready(resp)
+        #
+        # So an ordinary worker writing SUBTASKS_READY reaches no branch at all -- the marker
+        # is inert outside its mode. And INSIDE its mode the worker is already told to write
+        # it: fanout.SPLIT_JOB and planner's opening turn each name their own marker. Both
+        # markers are therefore either given or inert, in every mode, which leaves nothing for
+        # a guard to prevent.
+        #
+        # The same is true of the markers PROTOCOL carries (DONE / CONTINUE / STUCK / RESEARCH
+        # / ANALYZE), which is why the first version -- banning every marker in
+        # control_markers.KINDS -- would have blocked repo-bug-fix as well.
+        #
+        # Worth stating plainly: this refused an approved procedure for two commits on
+        # reasoning that was never checked against the consumer. A guard needs the same
+        # evidence as a feature.
         try:
             from tools.skill_ops import _record_skill_use
             _record_skill_use("inject", text, hit["name"])
