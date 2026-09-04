@@ -35,6 +35,9 @@ from relay import provenance as P
 _MAX_PER_THEME = 20           # keep the most recent N entries per theme
 _NOTE_CAP = 280               # chars per note snippet
 _GOAL_CAP = 160
+#: How much of a goal survives NEXT TO its own theme heading. The heading already
+#: names the work; the remainder only has to distinguish two goals filed under it.
+_TAIL_CAP = 60
 _INDEX_NAME = "INDEX.md"
 # The index is the part that gets read on EVERY task, so it is capped the way Claude Code
 # caps MEMORY.md: enough to see what exists, never enough to crowd out the actual work.
@@ -417,6 +420,67 @@ def _fmt_ts(ts):
         return ""
 
 
+#: What the HARNESS said about its own retrying, not what the work discovered. Measured over
+#: the live store at 974 entries: 618 of them -- 63.4% -- were the single string
+#: "refuter#1: UPHELD", and another 26 were retry bookkeeping. A run primed with twenty lines
+#: of "transient retry 1/10" is not better informed than one primed with nothing; it is worse
+#: off, because it paid for them.
+#:
+#: The cause is the write site, which passes `w.reason or w.last_response`. `reason` is the
+#: frame's own status field, so it is plumbing BY CONSTRUCTION and it wins whenever it is set.
+#:
+#: Matched against the note only, never the goal: a task genuinely ABOUT retry logic must
+#: still be able to say so.
+_PLUMBING = re.compile(
+    r"refuter#\d+"
+    r"|transient retry"
+    r"|\bre-?sent\b|\bresend\b"
+    r"|retry \d+\s*/\s*\d+"
+    r"|after \d+ retries"
+    r"|ConnectionClosed|websocket|delivery=unknown"
+    r"|previous turn still generating"
+    r"|goal not received"
+    r"|個のサブタスクに分割"
+    r"|no budget",
+    re.IGNORECASE)
+
+
+def is_frame_plumbing(note):
+    """Whether this note is the harness talking about itself.
+
+    Such a note is dropped rather than the whole entry: that the theme was attempted and how
+    it ended is worth keeping, and with the note gone the write path's dedupe collapses the
+    618 identical refuter lines into one line per outcome per theme instead of filling the
+    twenty-entry cap with them -- which is what had been evicting the entries that said
+    something.
+    """
+    text = " ".join(str(note or "").split())
+    return bool(text) and bool(_PLUMBING.search(text))
+
+
+def _note_body(goal, theme):
+    """The part of the goal worth storing next to a note, given the theme heading above it.
+
+    Entries read back as "- [DONE] <goal> — <note>" under a heading that already names the
+    theme, and theme_from_goal takes the goal's first clause -- so the goal is a PREFIX of
+    the heading's own text. Measured: 59% of every stored character was that restatement,
+    primed into every future task on the theme.
+
+    What survives is the part the heading does not already say, which is what distinguishes
+    two goals filed under one theme. When there is nothing left, nothing is stored.
+    """
+    text = " ".join(str(goal or "").split())[:_GOAL_CAP]
+    head = " ".join(str(theme or "").split())
+    if head and text.startswith(head):
+        # Only what distinguishes this goal from its neighbours under the same heading, and
+        # a shorter cap than a whole goal because that is all the remainder has to do. The
+        # SWE-bench goals show why: what follows the heading is
+        # "/tutanota** (language: ts). The repository is checked out locally at: C:\\..." --
+        # the repository identifies the entry, the checkout path is this machine's noise.
+        text = text[len(head):].strip(" .、。:：—-")[:_TAIL_CAP]
+    return text
+
+
 def record_task(theme, goal, outcome, note="", state_dir=None, ts=None, folder="",
                 authority=None):
     """Record one finished piece of work under `theme`. Never raises; returns bool.
@@ -440,10 +504,14 @@ def record_task(theme, goal, outcome, note="", state_dir=None, ts=None, folder="
         theme, slug = _resolve(theme, goal, folder)
         when = time.time() if ts is None else ts
         auth = P.normalise(authority)
+        # The outcome is always worth keeping. The note is kept only when it is about the
+        # work rather than about the harness, and the goal only insofar as the theme heading
+        # does not already say it.
+        _note = "" if is_frame_plumbing(note) else " ".join(str(note or "").split())
         line = "- [%s] %s — %s%s%s" % (
             (outcome or "?").strip() or "?",
-            " ".join(str(goal or "").split())[:_GOAL_CAP],
-            " ".join(str(note or "").split())[:_NOTE_CAP] or "(記録なし)",
+            _note_body(goal, theme),
+            _note[:_NOTE_CAP] or "(記録なし)",
             "  <!-- authority=%s -->" % auth,
             "  <!-- %s -->" % _fmt_ts(when),
         )
