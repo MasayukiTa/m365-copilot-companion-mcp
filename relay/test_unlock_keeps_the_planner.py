@@ -17,6 +17,13 @@ PROOF OF KNOWLEDGE, not a lookup -- a version that read the environment and self
 let anyone holding the API key unlock, which is the two-factors-collapsed-into-one failure that
 tools/security.py documents at its own unlock(). The credential has to reach the agent. What is
 fixed here is the capability that was being dropped alongside it.
+
+NOTHING HERE TOUCHES THE ENVIRONMENT. The first version of this file set MCP_UNLOCK_PASSWORD at
+import time, which is precisely the hazard test_unlock_inject.py documents: pytest imports every
+module before it runs anything, so an import-time env write is live for every other test until
+the writing module's teardown, and two unrelated tests once failed in CI and passed locally on
+import order alone. `_unlock_password()` reads its value on each call, so a per-test patch is
+both sufficient and contained.
 """
 import os
 import sys
@@ -25,36 +32,29 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from relay import planner as P        # noqa: E402
+from relay import relay_fleet as F    # noqa: E402
+
 PW = "planner_test_pw_zz9"
-_PREV = os.environ.get("MCP_UNLOCK_PASSWORD")
-os.environ["MCP_UNLOCK_PASSWORD"] = PW    # before the import, or .env is read instead
-
-from relay import relay_fleet as F        # noqa: E402
-from relay import planner as P            # noqa: E402
-
-
-def teardown_module(_m):
-    if _PREV is None:
-        os.environ.pop("MCP_UNLOCK_PASSWORD", None)
-    else:
-        os.environ["MCP_UNLOCK_PASSWORD"] = _PREV
-
-
 GOAL = "全国の劇場ごとに配布状況を調べて"
 
 
 @pytest.fixture
+def held(monkeypatch):
+    """A password exists, without writing one into the process environment."""
+    monkeypatch.setattr(F, "_unlock_password", lambda: PW)
+
+
+@pytest.fixture
 def planner(monkeypatch):
-    """Pin the planner version the way the harness does."""
+    """Pin the planner version the way the harness's component table does."""
     def use(version):
-        monkeypatch.setattr(P, "opening_turn",
-                            lambda goal, protocol: P.PLANNER_VERSIONS[version](goal, protocol))
         monkeypatch.setattr(F, "opening_turn",
                             lambda goal, protocol: P.PLANNER_VERSIONS[version](goal, protocol))
     return use
 
 
-def test_v1_is_byte_identical_to_what_it_produced_before(planner):
+def test_v1_is_byte_identical_to_what_it_produced_before(held, planner):
     """The fix must not move a single character under the version that was already running,
     or it is a behaviour change hiding inside a bug fix."""
     planner("planner/v1")
@@ -63,7 +63,7 @@ def test_v1_is_byte_identical_to_what_it_produced_before(planner):
     assert got == F.PROTOCOL + (F.UNLOCK_PREFIX % PW) + GOAL
 
 
-def test_v2_now_actually_differs(planner):
+def test_v2_now_actually_differs(held, planner):
     """THE POINT. Before this, the two arms returned the same string."""
     planner("planner/v1")
     v1, _ = F._initial_job_with_unlock(GOAL)
@@ -73,22 +73,22 @@ def test_v2_now_actually_differs(planner):
     assert P.PLAN_PROMPT in v2 and P.PLAN_PROMPT not in v1
 
 
-def test_the_credential_still_reaches_the_agent(planner):
+def test_the_credential_still_reaches_the_agent(held, planner):
     """It has to: unlock() proves knowledge rather than looking the value up."""
     planner("planner/v2")
     got, injected = F._initial_job_with_unlock(GOAL)
     assert injected and PW in got
 
 
-def test_the_goal_still_survives_intact(planner):
+def test_the_goal_still_survives_intact(held, planner):
     planner("planner/v2")
     got, _ = F._initial_job_with_unlock(GOAL)
     assert GOAL in got
 
 
-def test_operator_plan_mode_is_not_reinterpreted(planner):
+def test_operator_plan_mode_is_not_reinterpreted(held, planner):
     """plan_mode is plan-then-WAIT, set by a person. A component version does not get to
-    quietly redefine a flag the operator sets by hand, so this path is left alone."""
+    quietly redefine a flag the operator sets by hand, so that path is left alone."""
     planner("planner/v2")
     got, injected = F._initial_job_with_unlock(GOAL, plan_mode=True)
     assert injected
@@ -97,8 +97,7 @@ def test_operator_plan_mode_is_not_reinterpreted(planner):
 
 def test_without_a_password_the_planner_was_always_honoured(monkeypatch, planner):
     """The branch that already worked, kept working -- this is the one the A/B was measuring
-    when it thought it was measuring both."""
-    monkeypatch.delenv("MCP_UNLOCK_PASSWORD", raising=False)
+    when it believed it was measuring both."""
     monkeypatch.setattr(F, "_unlock_password", lambda: "")
     planner("planner/v2")
     got, injected = F._initial_job_with_unlock(GOAL)
