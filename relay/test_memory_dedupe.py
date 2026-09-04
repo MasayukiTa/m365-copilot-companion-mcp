@@ -213,12 +213,26 @@ def test_unrelated_themes_are_dropped_when_something_related_exists():
     assert len(got) <= 1 + M._INDEX_RECENT_TAIL
 
 
-def test_a_recency_tail_survives_so_discovery_is_still_possible():
-    """The index exists so a worker DISCOVERS a neighbouring theme. A filter that shows only
-    what already looks related can never surface anything new."""
+def test_the_discovery_tail_is_gone_because_discovery_never_happened():
+    """THIS TEST USED TO ASSERT THE OPPOSITE, and the reason it did was never measured.
+
+    The tail existed on the argument that a worker might DISCOVER a neighbouring theme, and a
+    filter showing only what already looks related can never surface anything new. Sound in
+    principle. Measured 2026-09-04 against .fleet/tool_events.jsonl: 22,444 recorded tool calls,
+    and `.fleet/memory` appears in ZERO of them. Not rarely -- never. No worker has ever opened
+    a theme this index offered it.
+
+    So the tail was only ever cost, and the cost was real: a worker surveying cinemas was handed
+    arithmetic one-shots and a furigana task, eight mentions of an unrelated subject in a
+    3,646-character prompt.
+
+    RELATED themes are still kept in full. Only the unrelated filler is gone, so the day the
+    recall path is wired to something that reads it, raising _INDEX_RECENT_TAIL restores this
+    behaviour and this test is the place that says why it was turned off."""
     lines = idx("ansible の executor", "まったく別の作業A", "まったく別の作業B")
     got = M.prune_index_lines(lines, "ansible", "fixing ansible")
-    assert len(got) > 1, "nothing but the obvious match survived"
+    assert len(got) == 1, "an unrelated theme was primed into the goal again"
+    assert "ansible" in got[0], "the related theme must still survive"
 
 
 def test_the_tail_applies_even_when_nothing_matches():
@@ -232,6 +246,9 @@ def test_the_tail_applies_even_when_nothing_matches():
     got = M.prune_index_lines(lines, "ansible", "fixing a bug in ansible")
     assert len(got) == M._INDEX_RECENT_TAIL
     assert got == lines[:M._INDEX_RECENT_TAIL], "the tail must be the most recent"
+    # With the tail at zero this now says: twenty unrelated one-shot questions reach the
+    # worker's prompt as nothing at all, which is the whole point.
+    assert got == [], "unrelated one-shot themes are still being primed"
 
 
 def test_an_empty_goal_changes_nothing():
@@ -261,3 +278,59 @@ def test_a_theme_with_genuinely_different_entries_keeps_all_of_them(tmp_path):
         M.record_task("t", "goal %d" % i, "DONE", note="note %d" % i, state_dir=d, ts=1000 + i)
     entries = M._entry_lines(open(M._theme_path(M._resolve("t")[1], d), encoding="utf-8").read())
     assert len(entries) == 5
+
+
+# ── what counts as "related" ───────────────────────────────────────────────────────────────
+#
+# Measured 2026-09-04 against the live store: a goal was matched against 40 themes and the
+# overlap counts were 21, 5, then 1,1,1,1, then zero for the other 34. The four entries sitting
+# on a single shared token were riding on する and この -- function words in almost any Japanese
+# sentence -- and that is how a furigana task and two repository themes were primed into a
+# cinema survey.
+#
+# Fixing it by requiring two tokens then broke the opposite case: "fixing ansible" shares
+# exactly ONE token with an ansible theme, because that token is a whole word. _tokens does not
+# produce comparable units -- Latin runs are words, CJK runs are exploded into bigrams -- so a
+# count alone cannot decide this. Both failures happened within one afternoon.
+
+def test_a_single_japanese_function_word_is_not_a_shared_topic():
+    """THE MEASURED FALSE POSITIVE. する is what made furigana 'related' to cinemas."""
+    lines = idx("社員名簿のフリガナを確定する作業")
+    got = M.prune_index_lines(lines, "", "劇場ごとの配布状況を調査する")
+    assert got == [], "a function-word bigram still counts as a shared topic"
+
+
+def test_a_single_whole_word_IS_a_shared_topic():
+    """THE REGRESSION THE COUNT INTRODUCED. One token, but the token names the subject."""
+    lines = idx("ansible の executor")
+    got = M.prune_index_lines(lines, "ansible", "fixing ansible")
+    assert len(got) == 1, "an obvious match was dropped for having only one shared token"
+
+
+def test_two_japanese_fragments_are_enough():
+    """Fragments mean something in numbers; this is the same cinema theme spelled loosely."""
+    lines = idx("劇場版まどか☆マギカの配布状況")
+    got = M.prune_index_lines(lines, "", "劇場版まどか☆マギカ 配布状況を調べて")
+    assert len(got) == 1
+
+
+def test_shares_a_topic_reads_the_token_not_the_count():
+    assert M.shares_a_topic({"ansible"}, {"ansible", "x"})            # one word: enough
+    assert not M.shares_a_topic({"する"}, {"する", "作業"})            # one fragment: not
+    assert M.shares_a_topic({"劇場", "配布"}, {"劇場", "配布"})        # two fragments: enough
+
+
+def test_boilerplate_shared_by_most_of_the_store_is_discounted_when_ranking():
+    """Every SWE-bench theme opens with the same sentence, so 'fixing' and 'project' say
+    nothing about which one to open. Discounting is for RANKING only -- it must not decide
+    relatedness, because in a store dominated by one topic the topic word is common too, and
+    discounting it there dropped the obvious match entirely."""
+    lines = idx(*["You are fixing a real bug in the open-source project **r%d**" % i
+                  for i in range(12)])
+    dull = M.uninformative_tokens(lines)
+    assert "fixing" in dull and "project" in dull
+
+
+def test_a_small_store_discounts_nothing():
+    """With a handful of entries there is no distribution to read."""
+    assert M.uninformative_tokens(idx("a", "b")) == set()
