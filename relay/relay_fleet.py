@@ -4017,7 +4017,8 @@ class RelayWorker:
                 from .refuter import RefuterSession
                 self._refuter_session = RefuterSession(
                     self._context, self._agent_url or "", self.goal,
-                    self.last_response).start()
+                    self.last_response,
+                    unverifiable=not self.checks).start()
             self.status = "refuting"
             return
         if self.fresh_replay_count:
@@ -4087,9 +4088,13 @@ class RelayWorker:
     def _start_next_lens(self):
         from .refuter import RefuterSession
         lens = self._panel_queue.pop(0)
+        # A PANEL REVIEWS THE SAME WORK, so every lens needs the same framing: one reviewer
+        # still holding the coding criteria would refute on grounds the others were told do
+        # not apply, and a single REFUTED is enough to send the worker back.
         self._refuter_session = RefuterSession(
             self._context, self._agent_url or "", self.goal,
-            self.last_response, lens=lens).start()
+            self.last_response, lens=lens,
+            unverifiable=not self.checks).start()
 
     def _append_panel_ledger(self, record):
         """One line per completed panel, beside the run state.
