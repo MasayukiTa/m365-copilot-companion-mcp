@@ -38,17 +38,29 @@ def test_the_split_request_still_carries_the_whole_goal():
     assert "社内一斉配信は除外" in w.job
 
 
+# THESE TWO ASSERT THE INSTRUCTION, NOT THE WORD, and they used to assert the word.
+#
+# "SUBTASKS_READY is nowhere in the job" was a fair proxy while nothing but the fan-out branch
+# could put it there. Then the frame began composing an approved 手順 into every goal, and
+# mail-lookup's body EXPLAINS the split convention -- so the literal appears in a worker that
+# is not being asked to split, and the proxy failed while the property it stood for held.
+#
+# The property is that a worker which must not split is not TOLD to split, so that is what is
+# checked. The marker alone is inert here anyway: _decide consults fanout_ready only under
+# `if self.fanout and not self._fanout_done`, which these same tests pin by asserting
+# w.fanout is False.
+
 def test_fanout_is_off_for_a_child_however_it_is_constructed():
     """Structural, not a promise: recursive splitting is how one goal becomes unbounded."""
     w = _worker(fanout=True, depth=1)
     assert w.fanout is False
-    assert fo.SUBTASKS_READY not in w.job
+    assert fo.SPLIT_JOB not in w.job
 
 
 def test_an_ordinary_worker_is_untouched():
     w = _worker(fanout=False)
     assert w.fanout is False
-    assert fo.SUBTASKS_READY not in w.job
+    assert fo.SPLIT_JOB not in w.job
 
 
 # ---- the split reply ----------------------------------------------------------------------
