@@ -48,6 +48,20 @@ STATUS_OF = {
     #: across 28 in six runs, moving to a different goal each run.
     "REFUSED": "stuck",
     "VERIFY_FAILED": "stuck",
+    #: The worker claimed DONE and the RECORD of what it did contradicts the claim -- it is the
+    #: fleet-side counterpart of the benchmark's evidence check, assigned by _settle_done.
+    #:
+    #: MISSING UNTIL 2026-09-04, and missing for a reason worth keeping: _settle_done
+    #: consolidated four separate ("done", "DONE") assignments into one site, which is exactly
+    #: the right move -- but it turned the literal into a RETURN value, and the exhaustiveness
+    #: walker only read assignments. So the guard that exists to keep this set closed went
+    #: blind to a whole outcome, and reported the most common one, DONE, as never produced.
+    #: Widening the walker to follow the method it assigns from surfaced this one immediately.
+    #:
+    #: "done", not "stuck": the work FINISHED. What is in doubt is whether it did what it
+    #: claimed, and reporting that as stuck would tell an operator to re-run something that
+    #: already ran to completion.
+    "EVIDENCE_CONTRADICTED": "done",
     "ERROR": "error",
 }
 
@@ -82,6 +96,8 @@ NON_RETRYABLE = frozenset(OUTCOMES - RETRYABLE)
 FINISHED = frozenset({
     "DONE", "FANOUT", "MAXTURNS", "CANCELLED", "CONTENT_REFUSED",
     "STUCK",
+    # The worker ran to the end; only the truth of its claim is in question.
+    "EVIDENCE_CONTRADICTED",
 })
 
 
@@ -148,6 +164,8 @@ SCORING = {
     "INFRA_STUCK": "fail",
     "REFUSED": "fail",
     "VERIFY_FAILED": "fail",
+    # A claim the record does not support does not count as a pass.
+    "EVIDENCE_CONTRADICTED": "fail",
     "ERROR": "fail",
 }
 
