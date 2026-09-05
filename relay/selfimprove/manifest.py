@@ -42,6 +42,21 @@ SCHEMA_VERSION = 1
 # where they document intent without licensing an experiment.
 EVOLVABLE_COMPONENTS = frozenset({
     "memory",
+    # PROMOTED 2026-09-05, in the two steps this comment block prescribes. The version table
+    # (relay.relay_fleet.SKILL_VERSIONS) was written first and shown to dispatch differently
+    # -- skill/v1 composes the matched procedure ahead of the goal, skill/off leaves the goal
+    # exactly as it was -- and only then was the name moved here.
+    #
+    # It earns a place because the claim behind it is untested. Frame-side matching was built
+    # on a measurement of the FAILURE it replaces: skill_match, 178 calls, 145 dead on a
+    # guessed argument name, 33 successes in the whole ledger. That the procedure now ARRIVES
+    # is measured. That arriving HELPS is not -- it costs 1.4-7.8 KB of a worker's first turn,
+    # and only an arm that turns it off can price that.
+    #
+    # The arms differ in the injection and in nothing else: matching, the marker handling and
+    # the approval request to a human are identical on both sides, so a comparison does not
+    # also compare how much got approved along the way.
+    "skill",
     # PROMOTED 2026-08-20, in the two steps this comment block prescribes: the version table
     # (relay.quality_cards.QUALITY_CARDS_VERSIONS) was written and shown to dispatch
     # differently -- v2 suppresses, replaces and appends cards from the applied genome -- and
@@ -125,6 +140,7 @@ FORBIDDEN_COMPONENTS = frozenset({
 #: while six of them dispatched to nothing.
 DEFAULT_COMPONENTS = {
     "memory": "memory/v1",
+    "skill": "skill/v1",          # the behaviour in place; skill/off is the comparison
     "quality_cards": "quality_cards/v1",
     "planner": "planner/v1",
     "transport": "transport/v1",
@@ -218,6 +234,12 @@ def known_versions(component: str) -> frozenset:
         try:
             from relay.project_memory import MEMORY_VERSIONS
             return frozenset(MEMORY_VERSIONS)
+        except Exception:
+            return frozenset()
+    if component == "skill":
+        try:
+            from relay.relay_fleet import SKILL_VERSIONS
+            return frozenset(SKILL_VERSIONS)
         except Exception:
             return frozenset()
     if component == "quality_cards":
