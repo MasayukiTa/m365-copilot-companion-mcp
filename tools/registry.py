@@ -110,15 +110,23 @@ def _wrap_for_evidence(wrapped: Callable, original: Callable) -> Callable:
         # this machine work through, and an inbound goal with no ledger row cannot be audited.
         #
         # Best-effort throughout: a tool call must never fail because a record did.
+        # POSITIONALS COUNT AS ARGUMENTS. FastMCP binds from the schema and so calls with
+        # keywords, and every observed call does -- but note_inbound recognises the probe by
+        # a path in the arguments, and record_call is the audit row, so neither may depend on
+        # the host's calling convention staying what it is today. The trace below already
+        # carries positionals for the same reason.
+        _recorded_args = dict(kwargs)
+        if args:
+            _recorded_args["_positional"] = list(args)
         _cid = None
         try:
             from tools import tool_probe as _probe
-            _probe.note_inbound(original.__name__, kwargs)
+            _probe.note_inbound(original.__name__, _recorded_args)
         except Exception:
             pass
         try:
             from tools import tool_ledger as _ledger
-            _cid = _ledger.record_call(original.__name__, kwargs)
+            _cid = _ledger.record_call(original.__name__, _recorded_args)
         except Exception:
             _cid = None
 
@@ -155,9 +163,7 @@ def _wrap_for_evidence(wrapped: Callable, original: Callable) -> Callable:
                 raise
             _finish(True, _out)
             return _out
-        payload = dict(kwargs)
-        if args:
-            payload["_positional"] = list(args)
+        payload = _recorded_args
         try:
             out = wrapped(*args, **kwargs)
         except Exception as exc:

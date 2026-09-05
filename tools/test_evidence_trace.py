@@ -412,3 +412,23 @@ def test_a_broken_ledger_does_not_break_the_tool(own_ledger, monkeypatch):
         return "still fine"
 
     assert _run(register(quiet)) == "still fine"
+
+
+def test_a_positional_call_is_recorded_too(own_ledger, monkeypatch):
+    """FastMCP binds from the schema, so calls arrive with keywords -- but the probe is
+    recognised by a path in the arguments and the row is the audit trail, so neither may
+    depend on that staying true."""
+    seen = []
+    from tools import tool_probe as P
+    monkeypatch.setattr(P, "note_inbound", lambda name, args=None, **k: seen.append(args))
+    from tools.registry import register
+
+    def list_directory(path="."):
+        """One line."""
+        return "ok"
+
+    import asyncio
+    asyncio.run(register(list_directory)("C:/x/.fleet/probe_challenge"))
+    assert seen and "C:/x/.fleet/probe_challenge" in str(seen[0])
+    rows = [r for r in _ledger_rows(own_ledger) if r.get("event") == "call"]
+    assert rows and "probe_challenge" in json.dumps(rows[0].get("args"))
