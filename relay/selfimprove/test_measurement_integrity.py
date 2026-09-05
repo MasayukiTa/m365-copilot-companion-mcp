@@ -163,6 +163,22 @@ def test_experiment_ids_are_unique_and_time_ordered():
     assert a < b, "時系列に並ばない id は grep しづらい"
 
 
+def test_two_ids_from_one_clock_reading_still_differ(monkeypatch):
+    """WINDOWS の time.time() は約 15.6ms 刻みで進む。
+
+    tail は sha256(time.time() | pid) だったので、同じ tick 内の2回は**同一の id** になった。
+    台帳は append-only で仮説を書き換えないから、2回目は
+    "experiment ... already has a proposal" で落ちる。13分のスイートで3回に1回ほど失敗し、
+    flaky と呼ばれる形をしていた。docstring は最初から
+    「同じ秒に始まった2つを区別できればよい」と要求していて、その要求が満たされていなかった。
+
+    ts を渡さない経路を突く。渡す経路は上のテストが押さえている。
+    """
+    monkeypatch.setattr(EX.time, "time", lambda: 1788600000.0)
+    ids = {EX.new_experiment_id() for _ in range(50)}
+    assert len(ids) == 50, "同一 tick 内で id が衝突した: %d/50" % len(ids)
+
+
 def test_the_candidate_id_depends_on_the_parent_not_only_the_genome():
     """試しているのは節点ではなく辺。親が違えば別の候補。"""
     g = {"knobs": {"T": "1"}}
