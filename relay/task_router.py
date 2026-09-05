@@ -553,6 +553,14 @@ def run_job(job, now_ts=None):
     dest = destination_for(job)
     rec = {"id": jid, "type": job.get("type"), "destination": dest,
            "ts_done": now_ts, "status": None, "result": None, "error": None}
+    # PROVENANCE SURVIVES INTO THE ARCHIVE. fleet_intake records where an instruction came
+    # from -- {"via": "mcp", "source": ...} -- so that a goal handed in over the tunnel can be
+    # told apart from one an operator typed. It was being dropped here, at the moment the job
+    # became a record: the done/ file read origin=None for the first real submission, and the
+    # only place the difference could still be seen was the pending file that had just been
+    # deleted. A distinction that does not reach the audit trail is not a distinction.
+    if job.get("origin"):
+        rec["origin"] = job["origin"]
     try:
         if dest == "local":
             job_type = job.get("type")
