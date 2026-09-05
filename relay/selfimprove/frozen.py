@@ -213,14 +213,27 @@ _BASELINE_LOCK = os.path.join(os.path.dirname(DEFAULT_BASELINE), ".baseline.lock
 def _baseline_lock(timeout_s: float = 20.0):
     """Cross-process exclusive lock. O_CREAT|O_EXCL because this must behave the same on
     Windows, and the critical section is three file writes long. Mirrors the same pattern in
-    ledger.py rather than introducing a second locking idiom."""
+    ledger.py rather than introducing a second locking idiom.
+
+    PERMISSIONERROR COUNTS AS CONTENTION, AND ONLY WINDOWS SAYS SO. A lock file whose last
+    handle has just closed with an unlink outstanding sits in delete-pending, and creating it
+    then returns ERROR_ACCESS_DENIED rather than "it exists". Catching FileExistsError alone
+    let the exception out of the lock every time one holder released while another was taking
+    it -- measured in the identical loop in relay/task_router.py at 2 failures in 8 runs with
+    24 concurrent writers. The clause said it chose this idiom BECAUSE it behaves the same on
+    Windows, and the one way Windows differs was the case it did not handle.
+
+    It matters more here than anywhere else the same loop appears: what escapes is a raw
+    PermissionError from inside a baseline write, and the caller cannot tell it apart from a
+    refusal. BaselineRefused is what this function raises when it truly cannot get the lock.
+    """
     import time as _time
     deadline = _time.time() + timeout_s
     fd = None
     while fd is None:
         try:
             fd = os.open(_BASELINE_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
+        except (FileExistsError, PermissionError):
             if _time.time() > deadline:
                 raise BaselineRefused(
                     "another process is writing the baseline (%s). Re-signing and revoking "
