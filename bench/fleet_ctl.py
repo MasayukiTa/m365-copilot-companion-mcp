@@ -33,16 +33,21 @@ def _read(path):
 
 
 def _merge_command(patch):
-    cmd = _read(CMDS)
-    if not isinstance(cmd, dict):
-        cmd = {}
-    cmd.update(patch)
+    # UNDER THE SAME LOCK AS EVERY OTHER PYTHON WRITER. The docstring above says this merges
+    # "so a queued add_goal isn't clobbered" -- which the read-modify-write here could not
+    # deliver on its own: another writer replacing the file between the read and the write
+    # took the merge with it, and `CMDS + ".tmp"` is a temp name shared with every other
+    # writer of this file. relay/task_router.write_commands holds that lock.
     os.makedirs(STATE, exist_ok=True)
-    tmp = CMDS + ".tmp"
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(cmd, f, ensure_ascii=False)
-    os.replace(tmp, CMDS)
-    return cmd
+    if REPO not in sys.path:
+        sys.path.insert(0, REPO)
+    from relay import task_router as _tr
+
+    def _apply(cur):
+        cur.update(patch)
+
+    _tr.write_commands(CMDS, _apply)
+    return _read(CMDS)
 
 
 def _status():

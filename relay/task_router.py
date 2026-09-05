@@ -47,6 +47,7 @@ Design notes:
     below) before they execute -- a CONFIRM decision moves the job to awaiting/ and raises a
     desktop-notification HITL gate instead of running it or blocking the dispatch loop.
 """
+import contextlib
 import hashlib
 import json
 import os
@@ -511,23 +512,27 @@ def fleet_is_live(state_dir=None) -> bool:
         return False
 
 
-def add_goal_to_live_fleet(goal: str, state_dir=None, priority: bool = False) -> None:
-    """Append a goal to the running fleet's command file. Written whole, then renamed.
+@contextlib.contextmanager
+def commands_lock(path):
+    """Hold the exclusive lock on a fleet commands.json for one read-modify-write.
 
-    utf-8 with no BOM on the way out and utf-8-sig on the way in, matching code_task.py: the
-    fleet reads both, and writing what the other writer writes is how the two stay compatible.
+    PUBLIC, BECAUSE A LOCK ONE WRITER TAKES IS NOT A LOCK. This was added inside
+    add_goal_to_live_fleet with a comment naming relay/code_task.py as the other writer -- and
+    code_task went on doing its own unlocked read-append-write, as did bench/fleet_ctl.py,
+    whose docstring claims it "merges, so a queued add_goal isn't clobbered". Three Python
+    writers, one lock, and the two unlocked ones lose exactly the goals the lock was added to
+    protect. The guard went where the work was, not on the path every writer takes.
+
+    STILL UNPROTECTED: ui/CopilotChat.cs writes this file too, and takes no such lock. A
+    CreateNew open interoperates with O_CREAT|O_EXCL at the filesystem level, so the same
+    protocol is implementable there; it is not implemented, and this docstring is the record
+    of that rather than a claim of safety.
+
+    O_CREAT|O_EXCL, matching relay/selfimprove/ledger.py rather than introducing a second
+    locking idiom. PermissionError counts as contention: on Windows a lock file whose last
+    handle has just closed with an unlink outstanding is in delete-pending, and creating it
+    then returns ERROR_ACCESS_DENIED rather than "it exists".
     """
-    sd = state_dir or FLEET_STATE_DIR
-    path = os.path.join(sd, "commands.json")
-    # UNDER A LOCK, BECAUSE THE INSTRUCTIONS DO NOT ALL COME FROM ONE PLACE. Two phones can
-    # submit at the same moment, and this router is not the only writer of commands.json --
-    # relay/code_task.py writes it too. The write itself was already atomic, but the
-    # read-append-write around it was not: two callers read the same list, each appended its
-    # own goal, and whichever replaced second silently deleted the other one's work. A lost
-    # goal looks exactly like a goal that was never sent, which is the worst way to fail.
-    #
-    # O_CREAT|O_EXCL, matching relay/selfimprove/frozen.py and ledger.py rather than
-    # introducing a third locking idiom. The critical section is one read and one write.
     lock = path + ".lock"
     deadline = time.time() + 10.0
     fd = None
@@ -535,14 +540,6 @@ def add_goal_to_live_fleet(goal: str, state_dir=None, priority: bool = False) ->
         try:
             fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except (FileExistsError, PermissionError):
-            # PERMISSIONERROR IS ALSO "SOMEONE ELSE HAS IT", ON WINDOWS. A file whose last
-            # handle has just been closed with an unlink outstanding sits in delete-pending,
-            # and opening it there fails with ERROR_ACCESS_DENIED -> PermissionError, not
-            # FileExistsError. Catching only FileExistsError therefore let the exception out
-            # of this function whenever one caller released the lock while another was taking
-            # it -- measured at 2 runs in 8 with 24 concurrent submitters, each raising for
-            # most of its threads. Two phones submitting at the same moment is the premise
-            # this lock exists for, so the window is not hypothetical.
             if time.time() > deadline:
                 # STALE RATHER THAN CONTENDED: ten seconds is far longer than a read and a
                 # write, so a lock still held is a crashed holder, not a busy one. Taking it
@@ -555,6 +552,23 @@ def add_goal_to_live_fleet(goal: str, state_dir=None, priority: bool = False) ->
             else:
                 time.sleep(0.02)
     try:
+        yield
+    finally:
+        os.close(fd)
+        try:
+            os.unlink(lock)
+        except OSError:
+            pass
+
+
+def write_commands(path, mutate):
+    """Read commands.json, hand the dict to `mutate`, and write it back -- all under the lock.
+
+    `mutate(cur)` edits in place or returns the new dict. Every Python writer of this file
+    goes through here, so "the merge is safe" is a property of one function rather than a
+    claim repeated in three docstrings.
+    """
+    with commands_lock(path):
         cur = {}
         if os.path.isfile(path):
             try:
@@ -562,16 +576,15 @@ def add_goal_to_live_fleet(goal: str, state_dir=None, priority: bool = False) ->
                     cur = json.load(fh) or {}
             except Exception:
                 cur = {}
-        adds = cur.get("add_goal") or []
-        if not isinstance(adds, list):
-            adds = [adds]
-        adds.append({"text": goal, "priority": bool(priority)})
-        cur["add_goal"] = adds
-        # A TEMP NAME OF ITS OWN. `path + ".tmp"` is one name shared by every writer, so two
-        # of them clobber each other's half-written file before either replace() runs.
-        # PER THREAD AS WELL AS PER PROCESS. The lock serialises writers, but its stale-break
-        # path can admit a second one, and threads of one process share a pid -- so a name
-        # keyed only on the pid is the shared name this comment warns about.
+        if not isinstance(cur, dict):
+            cur = {}
+        out = mutate(cur)
+        if out is not None:
+            cur = out
+        # A TEMP NAME OF ITS OWN, per process AND per thread. `path + ".tmp"` is one name
+        # shared by every writer, so two of them clobber each other's half-written file
+        # before either replace() runs -- and threads of one process share a pid, so a name
+        # keyed only on the pid is that same shared name.
         tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
         with open(tmp, "w", encoding="utf-8", newline="") as fh:
             json.dump(cur, fh, ensure_ascii=False)
@@ -579,21 +592,39 @@ def add_goal_to_live_fleet(goal: str, state_dir=None, priority: bool = False) ->
         # fails with PermissionError, and the fleet reads commands.json on its own schedule.
         # Bounded, because failing loudly after two seconds is better than a goal that never
         # lands and never says so.
-        _until = time.time() + 2.0
+        until = time.time() + 2.0
         while True:
             try:
                 os.replace(tmp, path)
-                break
+                return
             except PermissionError:
-                if time.time() > _until:
+                if time.time() > until:
                     raise
                 time.sleep(0.02)
-    finally:
-        os.close(fd)
-        try:
-            os.unlink(lock)
-        except OSError:
-            pass
+
+
+def add_goal_to_live_fleet(goal: str, state_dir=None, priority: bool = False,
+                           entry: dict = None) -> None:
+    """Append a goal to the running fleet's command file. Written whole, then renamed.
+
+    utf-8 with no BOM on the way out and utf-8-sig on the way in, matching code_task.py: the
+    fleet reads both, and writing what the other writer writes is how the two stay compatible.
+
+    `entry` lets a caller supply the whole command dict -- code_task adds `cwd` and `checks` --
+    so it can share this locked path instead of keeping its own unlocked copy of it.
+    """
+    sd = state_dir or FLEET_STATE_DIR
+    path = os.path.join(sd, "commands.json")
+    item = dict(entry) if entry else {"text": goal, "priority": bool(priority)}
+
+    def _append(cur):
+        adds = cur.get("add_goal") or []
+        if not isinstance(adds, list):
+            adds = [adds]
+        adds.append(item)
+        cur["add_goal"] = adds
+
+    write_commands(path, _append)
 
 
 def fleet_handoff(goal: str, jid: str, state_dir=None):

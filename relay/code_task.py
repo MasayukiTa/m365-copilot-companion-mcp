@@ -201,19 +201,17 @@ def main():
                 cur = json.load(open(cmds_path, encoding="utf-8-sig"))
             except Exception:
                 cur = {}
-        adds = cur.get("add_goal") or []
-        if not isinstance(adds, list):
-            adds = [adds]
         entry = {"text": goal["text"], "cwd": goal.get("cwd") or os.path.abspath(args.folder),
                  "priority": bool(args.priority)}
         if goal.get("checks"):
             entry["checks"] = goal["checks"]
-        adds.append(entry)
-        cur["add_goal"] = adds
-        tmp = cmds_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8", newline="") as f:   # BOM-less (the fleet reads utf-8-sig too)
-            json.dump(cur, f, ensure_ascii=False)
-        os.replace(tmp, cmds_path)
+        # THROUGH THE SHARED LOCKED WRITER. This used to do its own read-append-write with
+        # `cmds_path + ".tmp"` -- one temp name shared by every writer -- while task_router
+        # held a lock this side never took. The router's comment named THIS file as the other
+        # writer and still guarded only itself, so the two clobbered each other's goals in
+        # exactly the case the lock was added for. A lock one writer takes is not a lock.
+        from relay import task_router as _tr
+        _tr.add_goal_to_live_fleet(entry["text"], state_dir, entry=entry)
         print("  a fleet is already RUNNING -> queued this task into it (priority=%s); it will run "
               "%s the current work. NOT spawning a competing fleet." %
               (bool(args.priority), "before" if args.priority else "after"))
