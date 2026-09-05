@@ -152,9 +152,19 @@ def test_a_fleet_goal_job_reaches_the_running_fleet(state):
     assert [a["text"] for a in _commands(state)["add_goal"]] == ["do the thing"]
 
 
-def test_the_record_of_what_was_asked_for_is_still_written(state):
-    """for_fleet/<id>.txt stays: it is the record of the goal, even now that delivery is real."""
-    _status(state, True)
+def test_a_goal_that_could_not_be_delivered_is_kept_where_it_can_be_retried(state):
+    """for_fleet/ MEANS ONE THING NOW, and this test used to assert the other one.
+
+    It read "the record of the goal, even now that delivery is real" -- so the file was
+    written whether or not delivery happened, and the directory held both kinds at once. That
+    was fine as a record and useless as a queue, which is why a goal arriving with no fleet
+    running was filed as awaiting_fleet and then never delivered: nothing could tell which
+    files were still owed.
+
+    The record of a delivered goal is its done/ entry, which says dispatched and how. What
+    stays here is what is still owed.
+    """
+    _status(state, False)
     TR.run_job({"id": "j9", "type": "fleet_goal", "payload": {"goal": "do the thing"}})
     with open(os.path.join(TR.TASKS, "for_fleet", "j9.txt"), encoding="utf-8") as fh:
         assert fh.read() == "do the thing"
@@ -255,3 +265,87 @@ def _clock_running_fast():
     import itertools
     counter = itertools.count(0, 60.0)
     return lambda: next(counter)
+
+
+# -- a goal that arrived before the fleet did ---------------------------------------------------
+
+def _tasks(tmp_path, monkeypatch):
+    monkeypatch.setattr(TR, "TASKS", str(tmp_path / "tasks"))
+    monkeypatch.setattr(TR, "FLEET_STATE_DIR", str(tmp_path / "state"))
+    (tmp_path / "state").mkdir(exist_ok=True)
+    TR.ensure_dirs()
+    return tmp_path
+
+
+def _live(tmp_path, running=True):
+    """Write the status file fleet_is_live reads, with a pid that is really alive."""
+    import json as _json
+    import os as _os
+    with io.open(str(tmp_path / "state" / "status.json"), "w", encoding="utf-8") as fh:
+        _json.dump({"running": running, "pid": _os.getpid(), "ts": 9e9}, fh)
+
+
+def test_a_goal_that_arrived_with_no_fleet_is_delivered_when_one_starts(tmp_path, monkeypatch):
+    """THE GAP. It was filed in done/ as awaiting_fleet and never looked at again -- the
+    status was the only thing waiting. Six such records had built up."""
+    _tasks(tmp_path, monkeypatch)
+    rec = TR.run_job({"id": "j1", "type": "fleet_goal",
+                      "payload": {"goal": "do the thing"}}, now_ts=1.0)
+    assert rec["status"] == "awaiting_fleet"
+    assert os.path.isfile(os.path.join(TR.TASKS, "for_fleet", "j1.txt"))
+
+    _live(tmp_path)
+    out = TR._deliver_waiting_goals(now_ts=2.0)
+    assert [r["status"] for r in out] == ["dispatched"]
+    assert out[0]["result"]["delivered_late"] is True
+
+    import json as _json
+    with io.open(str(tmp_path / "state" / "commands.json"), encoding="utf-8-sig") as fh:
+        cmds = _json.load(fh)
+    assert [g["text"] for g in cmds["add_goal"]] == ["do the thing"]
+
+
+def test_a_delivered_goal_leaves_nothing_waiting(tmp_path, monkeypatch):
+    """for_fleet/ means one thing now: goals still waiting. A delivered goal's record is its
+    done/ entry, which says dispatched and how."""
+    _tasks(tmp_path, monkeypatch)
+    _live(tmp_path)
+    rec = TR.run_job({"id": "j2", "type": "fleet_goal", "payload": {"goal": "x"}}, now_ts=1.0)
+    assert rec["status"] == "dispatched"
+    assert os.listdir(os.path.join(TR.TASKS, "for_fleet")) == []
+
+
+def test_it_keeps_waiting_while_no_fleet_runs(tmp_path, monkeypatch):
+    """A pass with nothing in flight must not consume the goal."""
+    _tasks(tmp_path, monkeypatch)
+    TR.run_job({"id": "j3", "type": "fleet_goal", "payload": {"goal": "y"}}, now_ts=1.0)
+    assert TR._deliver_waiting_goals(now_ts=2.0) == []
+    assert os.path.isfile(os.path.join(TR.TASKS, "for_fleet", "j3.txt"))
+
+
+def test_the_waiting_file_survives_a_failed_delivery(tmp_path, monkeypatch):
+    """Removing it first would lose the goal if the write failed, and a lost goal looks
+    exactly like one that was never sent."""
+    _tasks(tmp_path, monkeypatch)
+    TR.run_job({"id": "j4", "type": "fleet_goal", "payload": {"goal": "z"}}, now_ts=1.0)
+    _live(tmp_path)
+
+    def boom(*a, **k):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(TR, "add_goal_to_live_fleet", boom)
+    try:
+        TR._deliver_waiting_goals(now_ts=2.0)
+    except OSError:
+        pass
+    assert os.path.isfile(os.path.join(TR.TASKS, "for_fleet", "j4.txt"))
+
+
+def test_an_empty_waiting_file_is_not_retried_forever(tmp_path, monkeypatch):
+    _tasks(tmp_path, monkeypatch)
+    TR.ensure_dirs()
+    with io.open(os.path.join(TR.TASKS, "for_fleet", "j5.txt"), "w", encoding="utf-8") as fh:
+        fh.write("   ")
+    _live(tmp_path)
+    assert TR._deliver_waiting_goals(now_ts=2.0) == []
+    assert not os.path.isfile(os.path.join(TR.TASKS, "for_fleet", "j5.txt"))
