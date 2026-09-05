@@ -144,3 +144,49 @@ def test_the_queue_view_counts_every_stage():
 
 def test_the_queue_view_works_on_an_empty_queue():
     assert "pending   0" in FI.fleet_queue()
+
+
+# -- more than one device at a time ------------------------------------------------------------
+
+def test_the_count_it_reports_includes_the_goals_that_landed_beside_it():
+    """Four devices at the same instant were each told "1 job(s) waiting" when there were four.
+
+    The number was read BEFORE the write, so every racer saw the queue as it stood before any
+    of them had written and then reported its own reading plus one. Submitting from more than
+    one device at a time is the premise this door was built for, so a number that is only
+    right when submissions are serialised is the wrong number.
+    """
+    import threading
+
+    n = 4
+    barrier = threading.Barrier(n)
+    out = [None] * n
+
+    def submit(i):
+        barrier.wait()
+        out[i] = FI.fleet_submit("device %d goal" % i, source="device-%d" % i)
+
+    threads = [threading.Thread(target=submit, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(_jobs()) == n, "a goal was lost: %d of %d survived" % (len(_jobs()), n)
+    assert len({o.split()[1] for o in out}) == n, "two devices got the same job id"
+    counts = sorted(int(o.split("It has NOT started yet, and nothing has run because of "
+                                "this call. ")[1].split()[0]) for o in out)
+    assert counts[-1] == n, (
+        "the last submitter should see every goal that landed before it; got %s" % counts)
+
+
+def test_a_goal_already_handed_to_the_fleet_still_counts_as_waiting():
+    """The router empties pending within a drain cycle and moves the goal to for_fleet. Counting
+    only pending tells the next sender "1 waiting" while five sit ahead of theirs."""
+    import io as _io
+    handed = os.path.join(TR.TASKS, "for_fleet")
+    os.makedirs(handed, exist_ok=True)
+    for i in range(3):
+        _io.open(os.path.join(handed, "earlier%d.txt" % i), "w", encoding="utf-8").write("x")
+    out = FI.fleet_submit("the fourth goal")
+    assert "4 job(s) waiting" in out, out
