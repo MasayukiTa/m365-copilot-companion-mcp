@@ -78,7 +78,15 @@ def _exclusive(lock_path):
     while fd is None:
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
+        except (FileExistsError, PermissionError):
+            # PERMISSIONERROR IS THE WINDOWS HALF OF "SOMEONE ELSE HAS IT". This idiom was
+            # chosen because it "has to work identically on Windows", and the one way Windows
+            # differs was the case not handled: a lock file whose last handle has just closed
+            # with an unlink outstanding sits in delete-pending, and O_CREAT|O_EXCL on it
+            # returns ERROR_ACCESS_DENIED -> PermissionError. Catching FileExistsError alone
+            # let that out of the lock every time one holder released while another was
+            # taking it. Measured in the identical copy of this loop in relay/task_router.py:
+            # 24 concurrent writers, 2 failures in 8 runs, most threads raising at once.
             if time.time() > deadline:
                 try:
                     os.unlink(lock_path)          # presumed stale; the re-read still guards
