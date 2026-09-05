@@ -509,22 +509,58 @@ def add_goal_to_live_fleet(goal: str, state_dir=None, priority: bool = False) ->
     """
     sd = state_dir or FLEET_STATE_DIR
     path = os.path.join(sd, "commands.json")
-    cur = {}
-    if os.path.isfile(path):
+    # UNDER A LOCK, BECAUSE THE INSTRUCTIONS DO NOT ALL COME FROM ONE PLACE. Two phones can
+    # submit at the same moment, and this router is not the only writer of commands.json --
+    # relay/code_task.py writes it too. The write itself was already atomic, but the
+    # read-append-write around it was not: two callers read the same list, each appended its
+    # own goal, and whichever replaced second silently deleted the other one's work. A lost
+    # goal looks exactly like a goal that was never sent, which is the worst way to fail.
+    #
+    # O_CREAT|O_EXCL, matching relay/selfimprove/frozen.py and ledger.py rather than
+    # introducing a third locking idiom. The critical section is one read and one write.
+    lock = path + ".lock"
+    deadline = time.time() + 10.0
+    fd = None
+    while fd is None:
         try:
-            with open(path, encoding="utf-8-sig") as fh:
-                cur = json.load(fh) or {}
-        except Exception:
-            cur = {}
-    adds = cur.get("add_goal") or []
-    if not isinstance(adds, list):
-        adds = [adds]
-    adds.append({"text": goal, "priority": bool(priority)})
-    cur["add_goal"] = adds
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8", newline="") as fh:
-        json.dump(cur, fh, ensure_ascii=False)
-    os.replace(tmp, path)
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            if time.time() > deadline:
+                # STALE RATHER THAN CONTENDED: ten seconds is far longer than a read and a
+                # write, so a lock still held is a crashed holder, not a busy one. Taking it
+                # is better than dropping the goal, and saying so is better than either.
+                try:
+                    os.unlink(lock)
+                except OSError:
+                    pass
+                deadline = time.time() + 10.0
+            else:
+                time.sleep(0.02)
+    try:
+        cur = {}
+        if os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8-sig") as fh:
+                    cur = json.load(fh) or {}
+            except Exception:
+                cur = {}
+        adds = cur.get("add_goal") or []
+        if not isinstance(adds, list):
+            adds = [adds]
+        adds.append({"text": goal, "priority": bool(priority)})
+        cur["add_goal"] = adds
+        # A TEMP NAME OF ITS OWN. `path + ".tmp"` is one name shared by every writer, so two
+        # of them clobber each other's half-written file before either replace() runs.
+        tmp = "%s.%d.tmp" % (path, os.getpid())
+        with open(tmp, "w", encoding="utf-8", newline="") as fh:
+            json.dump(cur, fh, ensure_ascii=False)
+        os.replace(tmp, path)
+    finally:
+        os.close(fd)
+        try:
+            os.unlink(lock)
+        except OSError:
+            pass
 
 
 def fleet_handoff(goal: str, jid: str, state_dir=None):
