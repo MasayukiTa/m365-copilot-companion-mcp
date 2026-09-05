@@ -19,7 +19,7 @@
 | `MCP_UNLOCK_TTL_DAYS` | unlock した IP を信頼し続ける日数 | `30` |
 | `MCP_ALLOWED_BASE` | エージェントがアクセスできるフォルダの上限。`~` = ホーム全体。`~/work` 等に絞ると隔離が固くなる | `~` |
 | `MCP_TOOL_MAP` | map mode の有効化。Copilot Studio では **必ず `1`** | `1` |
-| `MCP_TOOL_MAP_MAX` | map mode で先頭に登録する高価値ツールの数 | `8` |
+| `MCP_TOOL_MAP_MAX` | map mode で先頭に登録する高価値ツールの数。**公開ツール総数ではない**（下記） | `8` |
 | `MCP_TOOL_MAP_INCLUDE` | map mode で追加で第一級ツールとして載せたいツール名（カンマ区切り） | 空 |
 | `MCP_IMPL_AGENT_URL` | bridge / fleet が駆動する主 Copilot エージェントの URL（テナント固有 `T_…`） | 手動で貼る（**必須**） |
 | `MCP_FLEET_AGENT_URL` | fleet 専用エージェント URL | 未指定なら `MCP_IMPL_AGENT_URL` |
@@ -75,6 +75,15 @@ call_tool(name="X", arguments={...}) → X を実行
 ```
 
 実証済みの良い構成は `MCP_TOOL_MAP=1` かつ `MCP_TOOL_MAP_MAX=8` です。`MCP_TOOL_MAP` を未設定にすると全ツールを登録します（Claude Code のようなフル対応クライアント向け。Copilot Studio では不可）。
+
+**`MCP_TOOL_MAP_MAX` は「先頭に登録する数」であって公開ツール総数ではありません。** `tools/auto/` の
+forged ツールはこの数の**後から上乗せ**で登録されます。`MCP_TOOL_MAP_MAX=10` のサーバが 72 ツールを
+公開し、クライアント上限の 70 を無言で越えていた実例があります。確認すべき数は `tools/list` が実際に
+返す数です。
+
+**`MCP_TOOL_MAP_INCLUDE` で pin したら、その数だけ `MCP_TOOL_MAP_MAX` を上げてください。** 優先セット
+だけで 8 が埋まるため、上げずに pin したツールは黙って落ちます。落とした場合はサーバが起動時に
+stderr へ `[tool_map] ... cut N tool(s) that were asked for: ...` と出し、落とさなければ何も出しません。
 
 ---
 
