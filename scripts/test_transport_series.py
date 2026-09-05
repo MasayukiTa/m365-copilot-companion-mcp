@@ -333,3 +333,43 @@ def test_an_arm_that_never_settled_is_quarantined():
         why = ts.classify(bad)
         assert why, "%s が整定しなかった走行を通している" % arm
         assert arm in why and "settle" in why, why
+
+
+def test_a_reply_without_a_tool_call_blocks_the_run():
+    """THE COMBINATION THAT PASSED. The guard read `tool_ok is False AND tool_inbound is
+    False`, so a probe that answered while no tool call reached this server was treated as a
+    working connector.
+
+    It is not hypothetical: ok=True with inbound=False held for thirty-three minutes on
+    2026-09-06 while the bridge's page-owner thread was wedged. bench/tool_path_ready.py names
+    the rule this contradicted and what it costs -- a 40-instance run where ten of eighteen
+    workers had no tool map, reported STUCK, and produced patches written from memory.
+    """
+    why = S.preflight(summary={"tool_ok": True, "tool_inbound": False, "tool_age_s": 30.0},
+                        inbound_age=S.PROBE_STALE_S + 1)
+    assert why, "a run would have started with the tool path down for tools"
+    assert "down for tools" in why
+
+
+def test_a_fresh_inbound_stamp_still_lets_the_run_proceed():
+    """The early return is the primary check and must keep primacy: a call that actually
+    arrived recently is proof, whatever the summary says."""
+    assert S.preflight(summary={"tool_ok": False, "tool_inbound": False, "tool_age_s": 30.0},
+                         inbound_age=1.0) == ""
+
+
+def test_a_failed_probe_whose_call_arrived_is_still_not_blocked():
+    """THE HALF I ALMOST BROKE. My first version of this fix also blocked on tool_ok being
+    False by itself. That undoes a decision recorded a few tests above: the reply was unusable
+    but the CALL ARRIVED, so the transport measurement may continue -- blocking there stops a
+    whole night on a model's whim. That test caught it. Only inbound is decisive here."""
+    assert S.preflight({"tool_age_s": 60, "tool_ok": False, "tool_inbound": True},
+                       inbound_age=S.PROBE_STALE_S + 1) == ""
+
+
+def test_no_evidence_either_way_is_not_treated_as_proof():
+    """A record written before tool_inbound existed reads as None. None is not False, and it
+    is not permission either -- the stale stamp above already blocks."""
+    why = S.preflight(summary={"tool_ok": True, "tool_inbound": None, "tool_age_s": 30.0},
+                        inbound_age=None)
+    assert why == "" or "down for tools" not in why
