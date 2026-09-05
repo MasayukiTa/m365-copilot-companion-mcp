@@ -27,6 +27,7 @@ import json
 import os
 import subprocess
 import time
+import uuid
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -160,10 +161,19 @@ def new_experiment_id(prefix="exp", ts=None) -> str:
     Time-ordered on purpose: experiment ids end up in filenames and log greps, and an id
     that sorts chronologically is worth more day to day than one with more entropy. The
     random tail only has to separate two attempts started in the same second.
+
+    THE TAIL WAS NOT RANDOM, AND ON WINDOWS THAT MADE IT NOT SEPARATE THEM. It was
+    sha256(time.time() | pid), which is a pure function of the clock reading -- and
+    time.time() on Windows advances in ~15.6 ms ticks, so two attempts inside one tick read
+    the identical float, hash it to the identical tail, and get the identical id. The ledger
+    is append-only and refuses to rewrite a hypothesis, so the second attempt died with
+    "experiment ... already has a proposal". It surfaced as a test failing about one run in
+    three of a thirteen-minute suite, which is the shape of a bug that gets called flaky.
+    The requirement was already written above; it just was not met.
     """
     when = time.time() if ts is None else ts
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(when))
-    tail = hashlib.sha256(("%s|%s" % (when, os.getpid())).encode("utf-8")).hexdigest()[:6]
+    tail = uuid.uuid4().hex[:6]
     return "%s-%s-%s" % (prefix, stamp, tail)
 
 
