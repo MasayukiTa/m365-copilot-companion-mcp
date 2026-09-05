@@ -25,8 +25,15 @@ Design notes:
     double-run a job.
   * LOCAL executors are bounded (timeout) and never raise out of run_job -- a failure becomes a
     {status:"error"} result, so one bad job can't wedge the loop.
-  * FLEET/CLAUDE jobs are not executed here; they're written as a handoff artifact and marked
-    {status:"dispatched"} -- the fleet runner / Claude agent completes them and writes done/.
+  * CLAUDE jobs are not executed here; they're written as a handoff artifact and marked
+    {status:"escalated"} -- the Claude agent completes them and writes done/.
+  * FLEET jobs ARE delivered here, and until 2026-09-05 they were not: this branch wrote
+    for_fleet/<id>.txt, said "dispatched" and stopped, and nothing anywhere read that
+    directory. A goal now joins the run that is in flight, by appending add_goal to
+    commands.json exactly as relay/code_task.py does -- because two fleets share the one
+    dedicated Edge and clobber each other's status.json. With no run in flight the job says
+    "awaiting_fleet" and waits; starting a fleet is opt-in (FLEET_INTAKE_AUTOSTART), since
+    spawning one opens a browser and spends the tenant's Copilot budget.
   * LOCAL jobs pass through a 3-mode approval gate (TASK_JOB_APPROVAL_MODE, see job_gate()
     below) before they execute -- a CONFIRM decision moves the job to awaiting/ and raises a
     desktop-notification HITL gate instead of running it or blocking the dispatch loop.
@@ -453,6 +460,85 @@ def _read_job_gate(token):
         return None
 
 
+#: Where the fleet keeps its live state. The same directory code_task.py reads, deliberately:
+#: two answers to "is a fleet running" that can disagree is worse than either alone.
+FLEET_STATE_DIR = os.path.join(REPO, ".fleet")
+
+#: A status.json older than this is not a live run, whatever it says inside. A fleet that died
+#: leaves its last snapshot behind, and a stale file claiming running=True would have every
+#: later goal queued into a run that ended hours ago.
+FLEET_LIVE_MAX_AGE_S = 30
+
+#: Spawning a fleet starts a browser, a set of workers and spends the tenant's Copilot budget.
+#: Doing that because a sentence arrived over a tunnel is a bigger act than queueing one, so it
+#: is opt-in. Off, a goal that arrives with no run in flight waits and says it is waiting.
+AUTOSTART = os.environ.get("FLEET_INTAKE_AUTOSTART", "0") == "1"
+
+
+def fleet_is_live(state_dir=None) -> bool:
+    """Whether a fleet run is in flight right now.
+
+    Read the same way code_task.py reads it -- file age AND the running flag -- because this
+    decides whether a goal joins the current run or waits, and the failure it prevents is
+    already on the record: two fleets share the one dedicated Edge and clobber each other's
+    status.json, and the second run's work showed up as a phantom worker behind the first.
+    """
+    sd = state_dir or FLEET_STATE_DIR
+    try:
+        sp = os.path.join(sd, "status.json")
+        if not os.path.isfile(sp) or (time.time() - os.path.getmtime(sp)) > FLEET_LIVE_MAX_AGE_S:
+            return False
+        with open(sp, encoding="utf-8-sig") as fh:
+            return bool(json.load(fh).get("running"))
+    except Exception:
+        return False
+
+
+def add_goal_to_live_fleet(goal: str, state_dir=None, priority: bool = False) -> None:
+    """Append a goal to the running fleet's command file. Written whole, then renamed.
+
+    utf-8 with no BOM on the way out and utf-8-sig on the way in, matching code_task.py: the
+    fleet reads both, and writing what the other writer writes is how the two stay compatible.
+    """
+    sd = state_dir or FLEET_STATE_DIR
+    path = os.path.join(sd, "commands.json")
+    cur = {}
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8-sig") as fh:
+                cur = json.load(fh) or {}
+        except Exception:
+            cur = {}
+    adds = cur.get("add_goal") or []
+    if not isinstance(adds, list):
+        adds = [adds]
+    adds.append({"text": goal, "priority": bool(priority)})
+    cur["add_goal"] = adds
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="") as fh:
+        json.dump(cur, fh, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def fleet_handoff(goal: str, jid: str, state_dir=None):
+    """Deliver a fleet-bound goal. Returns the (status, result) the job record should carry."""
+    if not (goal or "").strip():
+        return "error", {"handoff": "for_fleet/%s.txt" % jid, "detail": "empty goal"}
+    if fleet_is_live(state_dir):
+        add_goal_to_live_fleet(goal, state_dir)
+        return "dispatched", {"handoff": "for_fleet/%s.txt" % jid,
+                              "delivered": "add_goal", "note": "queued into the running fleet"}
+    if AUTOSTART:
+        return "awaiting_fleet", {"handoff": "for_fleet/%s.txt" % jid,
+                                  "note": "autostart is on but is not implemented here; the "
+                                          "goal is recorded and waiting"}
+    # SAYS IT IS WAITING, rather than "dispatched". The old wording claimed delivery for a
+    # file nobody read, and a status that overstates what happened is how a queue goes
+    # unnoticed for months.
+    return "awaiting_fleet", {"handoff": "for_fleet/%s.txt" % jid,
+                              "note": "no fleet run is in flight; the goal waits for one"}
+
+
 def run_job(job, now_ts=None):
     """Execute (LOCAL) or hand off (FLEET/CLAUDE) a single job. Returns the done-record dict.
     Never raises -- any failure is captured as status 'error'."""
@@ -492,11 +578,15 @@ def run_job(job, now_ts=None):
                     rec["result"] = {"gate_token": token, "class_key": key}
                     rec["error"] = reason
         elif dest == "fleet":
-            # write a goal the relay fleet consumes (one goal per line / file)
+            # A HANDOFF NOBODY COLLECTED. This branch wrote for_fleet/<id>.txt, marked the job
+            # "dispatched" and stopped -- and no file in relay/, bridge/, tools/, ui/ or
+            # scripts/ ever read that directory. Every fleet-bound job this router has ever
+            # seen was filed as delivered and went nowhere. The file is still written, because
+            # it is the record of what was asked for, but the delivery now actually happens.
             goal = (job.get("payload") or {}).get("goal") or (job.get("payload") or {}).get("text", "")
             with open(_p("for_fleet", "%s.txt" % jid), "w", encoding="utf-8") as f:
                 f.write(goal)
-            rec["status"], rec["result"] = "dispatched", {"handoff": "for_fleet/%s.txt" % jid}
+            rec["status"], rec["result"] = fleet_handoff(goal, jid)
         else:  # claude
             with open(_p("for_claude", "%s.json" % jid), "w", encoding="utf-8") as f:
                 json.dump(job, f, ensure_ascii=False, indent=2)

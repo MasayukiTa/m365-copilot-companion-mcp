@@ -52,8 +52,13 @@ LIVE_RECORD_REDIRECTS = {
                                   "RESULTS_PATH": "compare_results.jsonl"},
     "relay.selfimprove.runtime_config": {"ACTIVE_PATH": "active_manifest.json"},
     "relay.settle_replay": {"DEFAULT_TRACE": "settle_trace.jsonl"},
+    # FLEET_STATE_DIR is not a log. task_router now DELIVERS fleet-bound goals by appending
+    # add_goal to <state_dir>/commands.json, which a running fleet reads and acts on -- so a
+    # test that reaches fleet_handoff() without this redirect does not dirty a record, it
+    # hands the operator's live run a goal that nobody asked for.
     "relay.task_router": {"APPROVED_JOBS_FILE": "approved_jobs.json",
-                          "TASKS": "tasks.jsonl"},
+                          "TASKS": "tasks.jsonl",
+                          "FLEET_STATE_DIR": "fleet_state"},
     "tools.auth_stats": {"_STATS_FILE": "auth_stats.json"},
     "tools.skill_ops": {"_SKILL_USE_LOG": "skill_use.jsonl"},
     "relay.mechanism_telemetry": {"LOG": "mechanisms.jsonl"},

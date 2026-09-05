@@ -89,9 +89,14 @@ def test_file_roundtrip():
 
 def test_fleet_and_claude_handoff():
     d = _use_tmp_tasks()
+    # "dispatched" USED TO BE UNCONDITIONAL, and it was the wrong word: the branch wrote
+    # for_fleet/<id>.txt and nothing anywhere read that directory, so every fleet job was
+    # filed as delivered and delivered none. The status now says which of the two things
+    # happened, and with no run in flight in this test's environment it is the honest one.
     rec = tr.run_job({"id": "c1", "type": "coding", "payload": {"goal": "fix the bug"}})
-    check("coding dispatched", rec["status"] == "dispatched")
+    check("coding awaits a fleet when none is running", rec["status"] == "awaiting_fleet")
     check("fleet handoff written", os.path.isfile(os.path.join(d, "for_fleet", "c1.txt")))
+    check("and it says why it is waiting", "waits" in (rec["result"] or {}).get("note", ""))
     rec = tr.run_job({"id": "d1", "type": "deep-research", "payload": {"q": "x"}})
     check("deepresearch escalated", rec["status"] == "escalated")
     check("claude handoff written", os.path.isfile(os.path.join(d, "for_claude", "d1.json")))
