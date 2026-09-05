@@ -4762,6 +4762,38 @@ _SKILL_HEADER = "--- この作業の承認済み手順（このとおり進め�
 _APPROVAL_ASKED = set()
 
 
+def _skill_off(goal_text, body):
+    """The arm that does NOT put the procedure in front of the goal.
+
+    This is what every worker got until frame-side matching landed: the server orders a
+    skill_match as RULE 2 and the agent either makes the call or does not. Measured, it did
+    not -- 178 attempts, 33 successes in the entire ledger.
+    """
+    return goal_text
+
+
+def _skill_v1(goal_text, body):
+    """The arm that composes the matched procedure in ahead of the goal."""
+    nl = chr(10)
+    return _SKILL_HEADER + nl + body + nl + "--- 手順ここまで ---" + nl + nl + goal_text
+
+
+#: The two arms, mapped for the self-improvement loop the way memory, planner, quality_cards
+#: and transport already are.
+#:
+#: REGISTERED BECAUSE IT DISPATCHES, NOT BECAUSE IT SOUNDS EVOLVABLE. manifest.py is explicit
+#: that an aspirational component is worse than an absent one -- seven knobs were once
+#: advertised and six dispatched to nothing, so every A/B over them ran the same program
+#: twice and reported a p-value about noise. These two return different text for the same
+#: input, and relay/test_frame_side_skill.py asserts that they do.
+#:
+#: It is registered because the claim needs testing rather than believing. Putting the
+#: procedure in front of the goal is a judgement: it costs 1.4-7.8 KB of a worker's first
+#: turn, and whether that buys more than it costs is a measurement nobody has taken. An arm
+#: that turns it off is what makes taking it possible.
+SKILL_VERSIONS = {"skill/off": _skill_off, "skill/v1": _skill_v1}
+
+
 def _ask_to_approve_the_near_miss(store, text):
     """When no TRUSTED procedure matches, ask about the one that would have. Never raises.
 
@@ -4870,15 +4902,23 @@ def _with_matched_skill(goal_text):
         # Worth stating plainly: this refused an approved procedure for two commits on
         # reasoning that was never checked against the consumer. A guard needs the same
         # evidence as a feature.
+        # WHICH ARM THE ACTIVE HARNESS NAMES. The matching, the guard and the approval
+        # request are the same on both sides; only whether the body is composed in differs,
+        # so the comparison is of the injection and of nothing else.
+        try:
+            from relay.selfimprove import runtime_config as _rc
+            arm = _rc.component("skill") or "skill/v1"
+        except Exception:
+            arm = "skill/v1"
+        impl = SKILL_VERSIONS.get(arm, _skill_v1)
         try:
             from tools.skill_ops import _record_skill_use
             _record_skill_use("inject", text, hit["name"])
         except Exception:
             pass
-        print("[skill] frame matched %r (score %s) and put it in front of the goal"
-              % (hit["name"], hit.get("score")), flush=True)
-        nl = chr(10)
-        return (_SKILL_HEADER + nl + body + nl + "--- 手順ここまで ---" + nl + nl + text)
+        print("[skill] frame matched %r (score %s); arm %s"
+              % (hit["name"], hit.get("score"), arm), flush=True)
+        return impl(text, body)
     except Exception:
         return goal_text
 
