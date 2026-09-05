@@ -786,13 +786,6 @@ class PageExecutor:
     def __init__(self):
         self._q: "queue.Queue" = queue.Queue()
         self._thread = None
-        #: When the owner thread last FINISHED a job. Without it, a liveness probe cannot tell
-        #: a thread that is not servicing its queue from one that is servicing something
-        #: longer than the probe's timeout -- and those are opposite facts. Measured: the
-        #: bridge logged "the page-owner thread is not servicing its queue" once per probe
-        #: cycle, roughly every ten minutes, every time it opened a page and ran a real turn.
-        #: None until the first job completes, which is honestly "no evidence yet".
-        self._last_completed = None
 
     def start(self, target):
         """Start the owner thread running `target()` (main()'s page-setup-then-serve
@@ -853,15 +846,6 @@ class PageExecutor:
         while True:
             job = self._q.get()
             job()
-            # STAMPED AFTER, NOT BEFORE. The question a probe asks is "did this thread finish
-            # anything recently", and a stamp taken on pickup would answer "did it start
-            # anything" -- which a thread wedged inside a job answers yes to forever.
-            self._last_completed = time.time()
-
-    def idle_for_s(self):
-        """Seconds since the owner thread last finished a job, or None if it never has."""
-        return None if self._last_completed is None else max(
-            0.0, time.time() - self._last_completed)
 
 
 PAGE_EXECUTOR = PageExecutor()
@@ -6129,22 +6113,6 @@ def probe_connection(timeout_s=10.0, touch=None):
         # submit_bounded's own docstring says what to do here -- "callers must terminate the
         # bridge process and let the keepalive supervisor rebuild the page rather than
         # continuing with a possibly wedged owner thread" -- and this is that caller.
-        # BUSY IS NOT WEDGED, and this could not tell them apart. submit_bounded queues the
-        # probe and waits; a thread part-way through a real turn will not reach it inside the
-        # timeout, so "did not answer in 10s" was being reported as "is not servicing its
-        # queue". Measured: that ERROR appeared once per probe cycle, about every ten minutes,
-        # on cycles that then completed normally -- and a line that cries wedge every cycle is
-        # how a real wedge goes unread.
-        #
-        # A job FINISHED while we were waiting is proof the thread is draining its queue: it
-        # got to something, just not to us. Only a thread that finished nothing across the
-        # whole wait is wedged, which is the property the escalation actually needs.
-        idle = PAGE_EXECUTOR.idle_for_s()
-        if idle is not None and idle < timeout_s:
-            _PAGE_THREAD_WEDGED = None
-            logger.info("the page-owner thread is busy, not wedged (last job finished %.0fs "
-                        "ago, probe waited %.0fs)", idle, timeout_s)
-            return None
         if _PAGE_THREAD_WEDGED is None:
             _PAGE_THREAD_WEDGED = time.time()
             logger.error("the page-owner thread is not servicing its queue (%s)", str(exc)[:160])
