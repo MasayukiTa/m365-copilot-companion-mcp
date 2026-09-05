@@ -184,8 +184,22 @@ def preflight(summary=None, inbound_age=None) -> str:
         return "no probe has ever been recorded and nothing has reached this server"
     if float(age) > PROBE_STALE_S:
         return "the last probe is %.0f minutes old" % (float(age) / 60.0)
-    if summary.get("tool_ok") is False and summary.get("tool_inbound") is False:
-        return "the last probe never reached this server"
+    # OR, NOT AND -- and the difference is the whole failure this guard names.
+    #
+    # It read `tool_ok is False and tool_inbound is False`, so a probe that ANSWERED while no
+    # tool call reached this server passed the check. That combination is not hypothetical: it
+    # held for thirty-three minutes on 2026-09-06, ok=True with inbound=False throughout,
+    # while the bridge's page-owner thread was wedged. bench/tool_path_ready.py states the
+    # rule this file was contradicting -- "tool_inbound is the one that matters; tool_ok can
+    # be true on a reply that came back without the call ever arriving here" -- and cites what
+    # it costs: a 40-instance run where ten of eighteen workers had no tool map, reported
+    # STUCK, and produced patches written from memory.
+    #
+    # Reaching this line already means the inbound stamp was stale or absent, since a fresh
+    # one returns above. So an inbound of False is decisive on its own, whatever tool_ok says.
+    if summary.get("tool_inbound") is False:
+        return ("a reply came back but no tool call has reached this server; the connector "
+                "path is up for text and down for tools")
     return ""
 
 
