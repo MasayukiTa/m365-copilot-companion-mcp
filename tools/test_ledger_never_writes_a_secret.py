@@ -216,7 +216,13 @@ def test_the_ledger_has_exactly_one_writer(_held):
     import pathlib
     import re
     root = pathlib.Path(__file__).resolve().parent.parent
-    allowed = {"main.py", "tools/tool_ledger.py"}
+    # tools/registry.py joined this list when the ledger was extended past the call_tool
+    # gateway to the DIRECTLY registered tools -- the ten the host invokes without touching
+    # the gateway, which until then left no row at all. It satisfies the property this test
+    # is really about: the write happens inside register()'s wrapper, and register is
+    # imported by main.py alone, so it only ever runs in the server process, which does
+    # hold the values redact_args matches. The test below pins that importer set.
+    allowed = {"main.py", "tools/tool_ledger.py", "tools/registry.py"}
     writers = set()
     for path in _python_files(root):
         rel = path.relative_to(root).as_posix()
@@ -233,3 +239,31 @@ def test_the_ledger_has_exactly_one_writer(_held):
         "a new ledger writer appeared: %s. If it runs in a CHILD process it cannot redact -- "
         "sanitized_child_env strips the credentials, so the child does not hold the value to "
         "match and the write would be in clear text." % new)
+
+
+def test_the_registration_wrapper_only_ever_runs_in_the_server_process():
+    """The allowance above rests on WHERE register() runs, so pin that rather than the name.
+
+    A ledger writer in a child cannot redact: sanitized_child_env strips the credentials, so the
+    child does not hold the value to match and would write it in clear text. register() is safe
+    because main.py is its only importer. If a child-side module starts importing it, the
+    allowance stops being true and this fails first.
+    """
+    import pathlib
+    import re
+    root = pathlib.Path(__file__).resolve().parent.parent
+    importers = set()
+    for path in _python_files(root):
+        rel = path.relative_to(root).as_posix()
+        if "/worktrees/" in rel or rel.startswith(".") or "test_" in rel:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if re.search(r"from\s+(?:tools\.registry|\.registry)\s+import\s+[^\n]*\bregister\b", text):
+            importers.add(rel)
+    assert importers == {"main.py"}, (
+        "register() is imported outside the server process by %s; the ledger write inside its "
+        "wrapper can no longer be assumed to hold the credentials it must redact."
+        % sorted(importers - {"main.py"}))
