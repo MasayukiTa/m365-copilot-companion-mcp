@@ -332,3 +332,45 @@ def test_a_thread_that_stops_answering_hands_the_process_back():
 def test_no_wedge_means_no_escalation():
     assert B.wedge_escalation_step(exiter=lambda c: pytest.fail("exited for nothing"),
                                    wedged_for=None) is False
+
+
+def _spy_logger(monkeypatch):
+    """A spy, not caplog. caplog attaches to the root logger, and this module's logger is
+    configured with its own handlers, so what caplog sees depends on which test ran first --
+    these two passed alone and failed inside the file. The spy records the call that was made.
+    """
+    seen = []
+    for level in ("debug", "info", "warning", "error", "critical"):
+        monkeypatch.setattr(B.logger, level,
+                            (lambda lv: lambda msg, *a, **k: seen.append((lv, str(msg) % a if a else str(msg))))(level))
+    return seen
+
+
+def test_the_first_missed_probe_is_not_logged_as_an_established_wedge(monkeypatch):
+    """An ERROR that fires on every healthy cycle is how a real wedge goes unnoticed.
+
+    submit_bounded puts the probe on the owner thread's QUEUE, so a thread part-way through
+    opening a page and running a real turn does not reach that entry inside the timeout. The
+    line said "is not servicing its queue" at ERROR, which is a stronger claim than one missed
+    ten-second probe supports, and it fired on roughly every probe cycle all night on cycles
+    that then completed. It also drew a 33-minute run of missing tool arrivals onto itself; the
+    cause was elsewhere -- directly registered tools were not being recorded at all.
+
+    What decides is unchanged: the clock starts here, and the escalation is still an ERROR.
+    """
+    seen = _spy_logger(monkeypatch)
+    _timeout_probe(monkeypatch)
+    assert B.probe_connection(touch=lambda: True) is None
+    assert seen, "the missed probe was not logged at all"
+    assert not [lv for lv, _ in seen if lv in ("error", "critical")], (
+        "one missed probe is logged as an error: %s" % seen)
+    assert B.page_thread_wedged_for_s() is not None, "the clock must still start"
+
+
+def test_the_escalation_is_still_an_error(monkeypatch):
+    """The level moved down for the observation, not for the fault."""
+    seen = _spy_logger(monkeypatch)
+    assert B.wedge_escalation_step(exiter=lambda c: None,
+                                   wedged_for=B.PAGE_THREAD_WEDGE_LIMIT_S + 1) is True
+    assert [lv for lv, _ in seen if lv == "error"], (
+        "handing the process back to the supervisor is not a warning: %s" % seen)
