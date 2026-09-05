@@ -61,6 +61,24 @@ def _pending_count() -> int:
         return 0
 
 
+def _waiting_count() -> int:
+    """Goals that have arrived and not yet been picked up by a runner.
+
+    Two directories, because the router empties `pending` within a drain cycle and moves the
+    goal to `for_fleet` when no run is in flight. Counting only `pending` therefore tells a
+    sender "1 waiting" while five goals sit ahead of theirs, which is the opposite of what
+    the sentence claims.
+    """
+    n = 0
+    for sub in ("pending", "for_fleet"):
+        try:
+            n += len([f for f in os.listdir(os.path.join(TR.TASKS, sub))
+                      if f.endswith(".json") or f.endswith(".txt")])
+        except Exception:
+            pass
+    return n
+
+
 def fleet_submit(goal: str, note: str = "", source: str = "") -> str:
     """Queue a goal for this machine's worker fleet. Returns the job id.
 
@@ -103,9 +121,19 @@ def fleet_submit(goal: str, note: str = "", source: str = "") -> str:
     except Exception as exc:
         return "[fleet_submit: could not queue the goal: %s: %s]" % (type(exc).__name__, exc)
 
+    # COUNTED AFTER THE WRITE, NOT BEFORE. Four devices submitting at the same instant each
+    # read the queue before any of them had written, so all four were told "1 job waiting"
+    # when there were four -- and submitting from more than one device at a time is the
+    # premise this door was built for. Reading after os.replace means the number includes
+    # this goal and everything that landed ahead of it.
+    #
+    # The admission check above keeps its earlier reading on purpose: it is a cheap refusal
+    # for a queue nobody is draining, and it can still let a simultaneous burst past
+    # MAX_PENDING. Nothing breaks at 51 -- the number is advisory -- so this is stated
+    # rather than locked against.
     return ("queued %s -- the goal is in this machine's queue and will be picked up by its "
             "runner. It has NOT started yet, and nothing has run because of this call. "
-            "%d job(s) waiting." % (jid, n + 1))
+            "%d job(s) waiting." % (jid, _waiting_count()))
 
 
 def fleet_queue() -> str:
