@@ -443,12 +443,30 @@ while ($true) {
     # approval gate (default mode confirms every first-seen class into awaiting/), a CLAUDE job
     # is only written out, and a FLEET goal joins a run that is ALREADY in flight -- nothing
     # here starts one, so no browser opens and no Copilot budget is spent by a queue drain.
+    # NO 2>$null ON A NATIVE COMMAND. Windows PowerShell wraps a native process's stderr lines
+    # in ErrorRecords, so redirecting them turns a harmless import-time DeprecationWarning
+    # into a terminating error. -W ignore keeps the warning down; stderr is left alone.
+    #
+    # THE PATH IS BUILT IN TWO SEGMENTS, and that is not style. Written as one string it was
+    # "relay\task_router.py", and the \t in it became a TAB before it ever reached this file
+    # -- so the supervisor spent every 15-second pass launching python against
+    # "relay<TAB>ask_router.py", getting exit code 2 and an empty stdout, and saying nothing.
+    # The queue never moved and nothing anywhere reported a failure. Two segments cannot carry
+    # an escape, so the bug cannot come back the same way.
+    #
+    # $LASTEXITCODE IS CHECKED. The router failing is not a PowerShell exception, so the catch
+    # below never saw it; a drain that fails quietly is exactly how this went unnoticed.
     try {
-        $routed = & $Py (Join-Path $Root "relay	ask_router.py") --once 2>$null
-        if ($routed -and $routed.Trim() -and $routed.Trim() -ne "[]") {
+        $rtPath = Join-Path (Join-Path $Root "relay") "task_router.py"
+        $routed = (& $Py -W ignore $rtPath --once) -join ""
+        if ($LASTEXITCODE -ne 0) {
+            Write-Log "task_router: exit $LASTEXITCODE from $rtPath (queue not drained)"
+        } elseif ($routed -and $routed.Trim() -and $routed.Trim() -ne "[]") {
             Write-Log "task_router: $($routed.Trim())"
         }
-    } catch { }
+    } catch {
+        Write-Log "task_router pass failed: $($_.Exception.Message)"
+    }
 
     Invoke-ReviewAutoResume | Out-Null
 

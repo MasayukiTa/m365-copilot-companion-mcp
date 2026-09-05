@@ -12,6 +12,7 @@ recorded there: two fleets share the one dedicated Edge and clobber each other's
 and the second run's work appeared as a phantom worker behind the first. So a goal joins the
 run that is in flight rather than starting a competing one.
 """
+import io
 import json
 import os
 import sys
@@ -178,3 +179,79 @@ def test_a_job_with_no_origin_does_not_grow_an_empty_one(tmp_path, monkeypatch):
     TR.ensure_dirs()
     rec = TR.run_job({"id": "j2", "type": "fleet_goal", "payload": {"goal": "x"}}, now_ts=1.0)
     assert "origin" not in rec
+
+
+# -- more than one device, at the same moment -------------------------------------------------
+
+def test_goals_arriving_together_do_not_delete_each_other(tmp_path, monkeypatch):
+    """THE ONE THAT WOULD HAVE LOST WORK. The instructions do not all come from one place --
+    two phones can submit at the same moment, and code_task.py writes commands.json too.
+
+    The write was atomic; the read-append-write around it was not. Both callers read the same
+    list, each appended its own goal, and whichever replaced second silently deleted the
+    other. A lost goal is indistinguishable from a goal that was never sent.
+    """
+    import threading
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setattr(TR, "FLEET_STATE_DIR", str(state))
+
+    n = 24
+    errors = []
+
+    def submit(i):
+        try:
+            TR.add_goal_to_live_fleet("goal %02d" % i, str(state))
+        except Exception as exc:  # pragma: no cover - a failure here is the finding
+            errors.append(exc)
+
+    threads = [threading.Thread(target=submit, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert not errors, errors
+    import json as _json
+    with io.open(str(state / "commands.json"), encoding="utf-8-sig") as fh:
+        got = _json.load(fh)
+    texts = sorted(g["text"] for g in got["add_goal"])
+    assert len(texts) == n, "%d of %d goals survived" % (len(texts), n)
+    assert texts == sorted("goal %02d" % i for i in range(n))
+
+
+def test_the_command_file_is_never_left_half_written(tmp_path, monkeypatch):
+    """Every writer used the same `commands.json.tmp`, so two of them clobbered each other's
+    partial file before either replace() ran. Each takes a name of its own now."""
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setattr(TR, "FLEET_STATE_DIR", str(state))
+    TR.add_goal_to_live_fleet("a", str(state))
+    TR.add_goal_to_live_fleet("b", str(state))
+    leftovers = [p.name for p in state.iterdir() if p.name.endswith(".tmp")
+                 or p.name.endswith(".lock")]
+    assert not leftovers, "left behind: %s" % leftovers
+
+
+def test_a_lock_left_by_a_crashed_writer_does_not_wedge_delivery(tmp_path, monkeypatch):
+    """A goal dropped because a previous process died holding a lock would be indistinguishable
+    from one never sent. Ten seconds is far longer than a read and a write."""
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setattr(TR, "FLEET_STATE_DIR", str(state))
+    stale = state / "commands.json.lock"
+    stale.write_text("", encoding="utf-8")
+    monkeypatch.setattr(TR.time, "time", _clock_running_fast())
+    TR.add_goal_to_live_fleet("after a crash", str(state))
+    import json as _json
+    with io.open(str(state / "commands.json"), encoding="utf-8-sig") as fh:
+        got = _json.load(fh)
+    assert [g["text"] for g in got["add_goal"]] == ["after a crash"]
+
+
+def _clock_running_fast():
+    """A clock that jumps a minute per call, so the stale-lock deadline is reached at once
+    instead of the test sleeping through it."""
+    import itertools
+    counter = itertools.count(0, 60.0)
+    return lambda: next(counter)
