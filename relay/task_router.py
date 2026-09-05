@@ -16,9 +16,18 @@ Queue layout (all under .fleet/tasks/):
   pending/<id>.json   incoming jobs           {id, type, payload, created}
   running/<id>.json   claimed (in progress)
   awaiting/<id>.json  LOCAL job held for human approval (see approval gate below)
-  done/<id>.json      finished                {..., status, result, error, ts_done}
+  done/<id>.json      the ROUTER is finished with it {..., status, result, error, ts_done}
   for_fleet/<id>.txt  FLEET handoff (a goal the relay fleet consumes)
   for_claude/<id>.json CLAUDE handoff (escalation the agent picks up)
+
+  `done/` DOES NOT MEAN THE WORK IS DONE. It means this router will not look at the job
+  again; the job's own `status` says what actually happened. A fleet_goal that arrived with
+  no run in flight is written here with status="awaiting_fleet" and ts_done=null while the
+  thing that still has to happen sits in for_fleet/<id>.txt under a different extension. This
+  line used to read "finished", and a careful reader auditing the queue read the record in
+  done/, saw no matching *.delivered.json, and reported a job that had moved out of for_fleet/
+  by some route they could not determine. Nothing had moved: the record and the handoff are
+  two artifacts written in the same pass, and only the handoff is the outstanding work.
 
 Design notes:
   * One writer claims a job by moving pending/ -> running/ (atomic rename) so two routers never
@@ -43,6 +52,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -524,7 +534,15 @@ def add_goal_to_live_fleet(goal: str, state_dir=None, priority: bool = False) ->
     while fd is None:
         try:
             fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
+        except (FileExistsError, PermissionError):
+            # PERMISSIONERROR IS ALSO "SOMEONE ELSE HAS IT", ON WINDOWS. A file whose last
+            # handle has just been closed with an unlink outstanding sits in delete-pending,
+            # and opening it there fails with ERROR_ACCESS_DENIED -> PermissionError, not
+            # FileExistsError. Catching only FileExistsError therefore let the exception out
+            # of this function whenever one caller released the lock while another was taking
+            # it -- measured at 2 runs in 8 with 24 concurrent submitters, each raising for
+            # most of its threads. Two phones submitting at the same moment is the premise
+            # this lock exists for, so the window is not hypothetical.
             if time.time() > deadline:
                 # STALE RATHER THAN CONTENDED: ten seconds is far longer than a read and a
                 # write, so a lock still held is a crashed holder, not a busy one. Taking it
@@ -551,10 +569,25 @@ def add_goal_to_live_fleet(goal: str, state_dir=None, priority: bool = False) ->
         cur["add_goal"] = adds
         # A TEMP NAME OF ITS OWN. `path + ".tmp"` is one name shared by every writer, so two
         # of them clobber each other's half-written file before either replace() runs.
-        tmp = "%s.%d.tmp" % (path, os.getpid())
+        # PER THREAD AS WELL AS PER PROCESS. The lock serialises writers, but its stale-break
+        # path can admit a second one, and threads of one process share a pid -- so a name
+        # keyed only on the pid is the shared name this comment warns about.
+        tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
         with open(tmp, "w", encoding="utf-8", newline="") as fh:
             json.dump(cur, fh, ensure_ascii=False)
-        os.replace(tmp, path)
+        # REPLACE CAN LOSE TO A READER. On Windows a rename onto a path someone else has open
+        # fails with PermissionError, and the fleet reads commands.json on its own schedule.
+        # Bounded, because failing loudly after two seconds is better than a goal that never
+        # lands and never says so.
+        _until = time.time() + 2.0
+        while True:
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if time.time() > _until:
+                    raise
+                time.sleep(0.02)
     finally:
         os.close(fd)
         try:
