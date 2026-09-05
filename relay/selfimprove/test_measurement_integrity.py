@@ -15,6 +15,7 @@ returns counts.
 import json
 import os
 import tempfile
+import pytest
 
 from relay import provenance as PROV
 from relay.selfimprove import experiment as EX
@@ -506,3 +507,54 @@ def test_the_ledger_lock_treats_a_delete_pending_file_as_contention(tmp_path, mo
         pass
     assert calls["n"] >= 3, "the refusals were not actually exercised"
     assert not os.path.exists(lock_path), "the lock must be released on the way out"
+
+
+def test_the_baseline_lock_treats_a_delete_pending_file_as_contention(tmp_path, monkeypatch):
+    """The fourth and last copy of the O_CREAT|O_EXCL loop, and the one that matters most.
+
+    Windows returns ERROR_ACCESS_DENIED -- PermissionError, not FileExistsError -- for a lock
+    file whose last handle has just closed with an unlink outstanding. Catching FileExistsError
+    alone let a raw PermissionError out of _baseline_lock, where a caller cannot tell it apart
+    from BaselineRefused, which is what this function raises when it genuinely cannot get the
+    lock. Measured in the identical loop in relay/task_router.py: 24 concurrent writers, 2
+    failures in 8 runs.
+
+    Editing frozen.py re-signs the constitution, so this fix carried the operator's explicit
+    instruction; the authority ledger holds it verbatim.
+    """
+    import os as _os
+    from relay.selfimprove import frozen as _F
+
+    lock_path = str(tmp_path / ".baseline.lock")
+    monkeypatch.setattr(_F, "_BASELINE_LOCK", lock_path)
+    real_open = _os.open
+    calls = {"n": 0}
+
+    def flaky(p, flags, *a, **k):
+        if str(p) == lock_path:
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise PermissionError(13, "Permission denied")
+        return real_open(p, flags, *a, **k)
+
+    monkeypatch.setattr(_os, "open", flaky)
+    with _F._baseline_lock(timeout_s=5.0):
+        pass
+    assert calls["n"] >= 3, "the refusals were not actually exercised"
+    assert not os.path.exists(lock_path), "the lock must be released on the way out"
+
+
+def test_a_lock_nobody_releases_is_still_refused_not_hung(tmp_path, monkeypatch):
+    """The timeout must survive the widened except. A PermissionError that never clears is a
+    held lock, and the answer to that is BaselineRefused -- not a raw OS error, and not a spin
+    that never ends."""
+    import os as _os
+    from relay.selfimprove import frozen as _F
+
+    lock_path = str(tmp_path / ".baseline.lock")
+    monkeypatch.setattr(_F, "_BASELINE_LOCK", lock_path)
+    monkeypatch.setattr(_os, "open", lambda *a, **k: (_ for _ in ()).throw(
+        PermissionError(13, "Permission denied")))
+    with pytest.raises(_F.BaselineRefused):
+        with _F._baseline_lock(timeout_s=0.2):
+            pass
