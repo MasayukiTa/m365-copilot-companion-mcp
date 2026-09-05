@@ -12,6 +12,7 @@ import io
 import json
 import os
 import tempfile
+import pytest
 
 from tools import evidence_trace as T
 from tools import evidence_trace as ET
@@ -275,3 +276,139 @@ def test_a_windows_path_is_absolute_even_when_the_grader_runs_on_linux():
     assert ET._is_absolute("\\\\server\\share\\x")
     assert not ET._is_absolute("../outside/x")
     assert not ET._is_absolute("sub/dir/x")
+
+
+# -- the same reasoning, applied to the other two instruments ---------------------------------
+
+def _run(wrapper, **kwargs):
+    """register() hands back a coroutine function -- that is the whole point of _to_async, and
+    calling it without awaiting returns a coroutine that never runs. Two of these tests passed
+    that way on the first run: they asserted on an empty ledger after invoking nothing."""
+    import asyncio
+    return asyncio.run(wrapper(**kwargs))
+
+
+def _ledger_rows(path):
+    import json as _json
+    if not os.path.isfile(path):
+        return []
+    with io.open(path, encoding="utf-8") as fh:
+        return [_json.loads(line) for line in fh if line.strip()]
+
+
+@pytest.fixture
+def own_ledger(tmp_path, monkeypatch):
+    """A ledger of this test's own, so these never write the operator's evidence file."""
+    from tools import tool_ledger as L
+    monkeypatch.setattr(L, "LEDGER_PATH", str(tmp_path / "events.jsonl"))
+    return str(tmp_path / "events.jsonl")
+
+
+def test_a_directly_registered_tool_reaches_the_ledger(own_ledger):
+    """THE GAP THIS FILE'S OWN ARGUMENT ALREADY DESCRIBED, left open in two of three places.
+
+    record_call and note_inbound live in call_tool's body, so a tool the host invokes directly
+    left no row and no arrival stamp. It cost a wrong diagnosis: promoting list_directory into
+    the direct set stopped the tool probe's own call being stamped, tool_inbound read false for
+    thirty-three minutes, and that was reported as a tool-path outage. The path was fine --
+    verify_probe_reply requires a token freshly written to a file here and absent from the
+    question, and the replies carried it.
+    """
+    from tools.registry import register
+
+    def list_directory(path="."):
+        """One line."""
+        return "ok:" + path
+
+    _run(register(list_directory), path="x")
+    rows = [(r.get("event"), r.get("tool")) for r in _ledger_rows(own_ledger)]
+    assert ("call", "list_directory") in rows
+
+
+def test_the_rows_stay_exactly_paired(own_ledger):
+    """Every analysis of this ledger divides by the pairing."""
+    from tools.registry import register
+
+    def quiet():
+        """One line."""
+        return "fine"
+
+    w = register(quiet)
+    _run(w)
+    _run(w)
+    rows = _ledger_rows(own_ledger)
+    assert len([r for r in rows if r.get("event") == "call"]) == 2
+    assert len([r for r in rows if r.get("event") == "outcome"]) == 2
+
+
+def test_a_raising_tool_is_recorded_as_a_failure_and_still_raises(own_ledger):
+    """A ledger that only holds successes describes a machine that never has problems."""
+    from tools.registry import register
+
+    def boom():
+        """One line."""
+        raise ValueError("nope")
+
+    with pytest.raises(ValueError):
+        _run(register(boom))
+    outs = [r for r in _ledger_rows(own_ledger) if r.get("event") == "outcome"]
+    assert len(outs) == 1 and outs[0].get("ok") is False
+
+
+def test_the_probes_own_call_is_stamped_when_it_arrives_directly(own_ledger, monkeypatch):
+    """The stamp is what tool_inbound reads, and list_directory is the tool the probe uses."""
+    seen = []
+    from tools import tool_probe as P
+    monkeypatch.setattr(P, "note_inbound", lambda name, args=None, **k: seen.append(name))
+    from tools.registry import register
+
+    def list_directory(path="."):
+        """One line."""
+        return "ok"
+
+    _run(register(list_directory), path="C:/x/.fleet/probe_challenge")
+    assert seen == ["list_directory"]
+
+
+def test_the_gateway_is_still_not_wrapped(own_ledger):
+    """call_tool records the inner tool under its real name. Recording the wrapper too would
+    double every gateway call and break the pairing above."""
+    from tools.registry import register
+
+    def call_tool(name="", arguments=None):
+        """One line."""
+        return "dispatched"
+
+    _run(register(call_tool), name="x")
+    assert _ledger_rows(own_ledger) == []
+
+
+def test_the_signature_survives_so_the_host_can_still_register_it(own_ledger):
+    """FastMCP refuses a function with *args. The wrapper has them, so it must present the
+    wrapped signature -- without this line every tool fails to register and the server does
+    not start."""
+    import inspect
+    from tools.registry import register
+
+    def list_directory(path=".", recursive=False):
+        """One line."""
+        return path
+
+    assert str(inspect.signature(register(list_directory))) == "(path='.', recursive=False)"
+
+
+def test_a_broken_ledger_does_not_break_the_tool(own_ledger, monkeypatch):
+    """Recording is best-effort by construction."""
+    from tools import tool_ledger as L
+
+    def explode(*a, **k):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(L, "record_call", explode)
+    from tools.registry import register
+
+    def quiet():
+        """One line."""
+        return "still fine"
+
+    assert _run(register(quiet)) == "still fine"

@@ -93,12 +93,68 @@ def _wrap_for_evidence(wrapped: Callable, original: Callable) -> Callable:
 
     @functools.wraps(wrapped)
     def evidence_wrapper(*args, **kwargs):
+        # THE SAME REASONING, APPLIED TO THE OTHER TWO INSTRUMENTS. The argument in this
+        # docstring -- that a directly registered tool never touches the gateway, so anything
+        # instrumented only there cannot see it -- was acted on for the evidence trace and not
+        # for the ledger or the probe's arrival stamp, which live in call_tool's body too.
+        #
+        # It cost a wrong diagnosis the night list_directory was promoted into the direct set
+        # (to honour MCP_TOOL_MAP_INCLUDE, which had been silently ignored). list_directory is
+        # the tool the probe uses, so its calls stopped being stamped: tool_inbound read false
+        # for thirty-three minutes and was reported as a tool-path outage. The path was fine.
+        # verify_probe_reply requires a token freshly written to a file on this machine and
+        # absent from the question, and the replies carried it -- which IS a completed round
+        # trip. The measurement had moved, not the system.
+        #
+        # fleet_submit is in that set as well, and matters more: it is the door an agent hands
+        # this machine work through, and an inbound goal with no ledger row cannot be audited.
+        #
+        # Best-effort throughout: a tool call must never fail because a record did.
+        _cid = None
+        try:
+            from tools import tool_probe as _probe
+            _probe.note_inbound(original.__name__, kwargs)
+        except Exception:
+            pass
+        try:
+            from tools import tool_ledger as _ledger
+            _cid = _ledger.record_call(original.__name__, kwargs)
+        except Exception:
+            _cid = None
+
+        def _finish(ok, result):
+            # The failure text goes in `error`, not `result`: the ledger's readers filter on
+            # ok and then read one field, and a failure whose reason sits in the success slot
+            # reads as a call that returned an exception message successfully.
+            if not _cid:
+                return
+            try:
+                from tools import tool_ledger as _l
+                if ok:
+                    _l.record_outcome(_cid, ok=True, result=result)
+                else:
+                    _l.record_outcome(_cid, ok=False, error=str(result))
+            except Exception:
+                pass
+
         try:
             from tools import evidence_trace as _trace
         except Exception:
-            return wrapped(*args, **kwargs)
+            try:
+                _out = wrapped(*args, **kwargs)
+            except Exception as exc:
+                _finish(False, "%s: %s" % (type(exc).__name__, exc))
+                raise
+            _finish(True, _out)
+            return _out
         if not _trace.enabled():
-            return wrapped(*args, **kwargs)
+            try:
+                _out = wrapped(*args, **kwargs)
+            except Exception as exc:
+                _finish(False, "%s: %s" % (type(exc).__name__, exc))
+                raise
+            _finish(True, _out)
+            return _out
         payload = dict(kwargs)
         if args:
             payload["_positional"] = list(args)
@@ -107,8 +163,10 @@ def _wrap_for_evidence(wrapped: Callable, original: Callable) -> Callable:
         except Exception as exc:
             _trace.record(original.__name__, payload, False,
                           "%s: %s" % (type(exc).__name__, exc), original)
+            _finish(False, "%s: %s" % (type(exc).__name__, exc))
             raise
         _trace.record(original.__name__, payload, True, out, original)
+        _finish(True, out)
         return out
 
     try:
