@@ -332,3 +332,71 @@ def test_a_thread_that_stops_answering_hands_the_process_back():
 def test_no_wedge_means_no_escalation():
     assert B.wedge_escalation_step(exiter=lambda c: pytest.fail("exited for nothing"),
                                    wedged_for=None) is False
+
+
+# -- busy is not wedged ---------------------------------------------------------------------
+
+class _FakeExecutor:
+    """Only what probe_connection reads off the executor."""
+
+    def __init__(self, idle):
+        self._idle = idle
+
+    def idle_for_s(self):
+        return self._idle
+
+    def submit_bounded(self, timeout, fn, *args, **kwargs):
+        raise TimeoutError("page executor did not complete its liveness probe")
+
+
+def _probe_with(monkeypatch, idle, timeout_s=10.0):
+    monkeypatch.setattr(B, "CTX", object())
+    monkeypatch.setattr(B, "PAGE_EXECUTOR", _FakeExecutor(idle))
+    monkeypatch.setattr(B, "_PAGE_THREAD_WEDGED", None, raising=False)
+    got = B.probe_connection(timeout_s=timeout_s, touch=lambda: True)
+    return got, B._PAGE_THREAD_WEDGED
+
+
+def test_a_thread_that_finished_a_job_while_we_waited_is_not_called_wedged(monkeypatch):
+    """THE FALSE ALARM. submit_bounded queues the probe and waits, so a thread part-way
+    through a real turn never reaches it inside the timeout. That was logged as "not
+    servicing its queue" once per probe cycle -- roughly every ten minutes, on cycles that
+    then completed normally. A line that cries wedge every cycle is how a real wedge goes
+    unread."""
+    got, wedged = _probe_with(monkeypatch, idle=3.0)
+    assert got is None, "a probe that could not run still answers 'do not know'"
+    assert wedged is None, "busy was recorded as wedged"
+
+
+def test_a_thread_that_finished_nothing_across_the_whole_wait_is_wedged(monkeypatch):
+    """The property the escalation actually needs, and the one that must survive."""
+    got, wedged = _probe_with(monkeypatch, idle=99.0)
+    assert got is None
+    assert wedged is not None, "a genuinely wedged thread was excused as busy"
+
+
+def test_a_thread_that_has_never_finished_anything_is_wedged(monkeypatch):
+    """None is no evidence, and no evidence must not read as permission -- a thread that
+    wedged on its first job has no completion to show."""
+    got, wedged = _probe_with(monkeypatch, idle=None)
+    assert wedged is not None
+
+
+def test_the_boundary_belongs_to_the_wedge(monkeypatch):
+    """Exactly at the timeout, nothing finished DURING the wait."""
+    _, wedged = _probe_with(monkeypatch, idle=10.0, timeout_s=10.0)
+    assert wedged is not None
+
+
+def test_the_executor_stamps_completion_after_the_job_not_before():
+    """A stamp taken on pickup answers 'did it start anything', which a thread wedged inside
+    a job answers yes to forever."""
+    import threading
+    ex = B.PageExecutor()
+    assert ex.idle_for_s() is None, "no evidence before anything has run"
+    started = threading.Event()
+    ex.start(lambda: (started.set(), ex.run_forever()))
+    started.wait(timeout=5)
+    ex.submit(lambda: 1)
+    idle = ex.idle_for_s()
+    assert idle is not None and idle < 5.0
