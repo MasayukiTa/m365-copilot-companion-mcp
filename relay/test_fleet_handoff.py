@@ -376,3 +376,92 @@ def test_both_readers_of_the_fleet_status_agree_on_what_live_means():
         % (ages[0], TR.FLEET_LIVE_MAX_AGE_S))
     assert "running" in body, "code_task no longer reads the running flag"
     assert "utf-8-sig" in body, "code_task no longer tolerates a BOM; the writers must match"
+
+
+def test_a_goal_in_done_with_no_fleet_is_not_finished(tmp_path, monkeypatch):
+    """`done/` holds the ROUTER's record, not a completed job, and the two can disagree.
+
+    A reader auditing the queue found the record in done/, found no matching *.delivered.json,
+    and reported a job that had left for_fleet/ by a route they could not determine. Nothing
+    had moved: the record and the handoff are two artifacts written in the same pass, under
+    different extensions, and only the handoff is the outstanding work. The docstring said
+    "finished", which is what made the wrong reading the natural one.
+    """
+    monkeypatch.setattr(TR, "TASKS", str(tmp_path / "tasks"))
+    TR.ensure_dirs()
+    jid = "abc123"
+    with open(os.path.join(TR.TASKS, "pending", "%s.json" % jid), "w", encoding="utf-8") as fh:
+        json.dump({"id": jid, "type": "fleet_goal", "payload": {"goal": "do a thing"},
+                   "created": time.time()}, fh)
+    TR.dispatch_once()
+
+    rec_path = os.path.join(TR.TASKS, "done", "%s.json" % jid)
+    assert os.path.isfile(rec_path), "the router leaves a record of every job it handled"
+    with open(rec_path, encoding="utf-8") as fh:
+        rec = json.load(fh)
+    assert rec["status"] == "awaiting_fleet"
+    assert rec["ts_done"] is None, "a record in done/ can still be unfinished; ts_done says so"
+
+    handoff = os.path.join(TR.TASKS, "for_fleet", "%s.txt" % jid)
+    assert os.path.isfile(handoff), "the outstanding work is the handoff, not the record"
+    assert not os.path.isfile(os.path.join(TR.TASKS, "done", "%s.delivered.json" % jid)), (
+        "the delivery record must appear only after a fleet actually took the goal")
+
+
+def test_a_lock_in_delete_pending_is_contention_not_a_failure(tmp_path, monkeypatch):
+    """Windows raises PermissionError, not FileExistsError, for a lock being released.
+
+    A file whose last handle has just closed with an unlink outstanding sits in delete-pending,
+    and O_CREAT|O_EXCL on it fails with ERROR_ACCESS_DENIED. Catching only FileExistsError let
+    that out of add_goal_to_live_fleet: with 24 concurrent submitters it raised in 2 runs out
+    of 8, most threads at a time. Deterministic here, because a race reproduced two times in
+    eight is not a test anyone can act on.
+    """
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setattr(TR, "FLEET_STATE_DIR", str(state))
+
+    real_open = os.open
+    calls = {"n": 0}
+
+    def flaky(path, flags, *a, **k):
+        if str(path).endswith("commands.json.lock"):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise PermissionError(13, "Permission denied")
+        return real_open(path, flags, *a, **k)
+
+    monkeypatch.setattr(os, "open", flaky)
+    TR.add_goal_to_live_fleet("survives a lock in delete-pending", str(state))
+
+    assert calls["n"] >= 3, "the two refusals were not actually exercised"
+    with io.open(os.path.join(str(state), "commands.json"), encoding="utf-8-sig") as fh:
+        data = json.load(fh)
+    assert [g["text"] for g in data["add_goal"]] == ["survives a lock in delete-pending"]
+
+
+def test_a_reader_holding_commands_json_does_not_lose_the_goal(tmp_path, monkeypatch):
+    """A rename onto a path someone else has open fails on Windows, and the fleet reads
+    commands.json on its own schedule. Bounded retry, so a goal does not vanish because the
+    consumer happened to be reading at that moment."""
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setattr(TR, "FLEET_STATE_DIR", str(state))
+
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def flaky(src, dst, *a, **k):
+        if str(dst).endswith("commands.json"):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise PermissionError(13, "Permission denied")
+        return real_replace(src, dst, *a, **k)
+
+    monkeypatch.setattr(os, "replace", flaky)
+    TR.add_goal_to_live_fleet("survives a reader", str(state))
+
+    assert calls["n"] >= 3, "the two refusals were not actually exercised"
+    with io.open(os.path.join(str(state), "commands.json"), encoding="utf-8-sig") as fh:
+        data = json.load(fh)
+    assert [g["text"] for g in data["add_goal"]] == ["survives a reader"]
