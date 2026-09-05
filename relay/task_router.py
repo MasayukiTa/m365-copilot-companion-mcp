@@ -53,6 +53,13 @@ DESTINATION = {
     "file": "local",
     "coding": "fleet",
     "research": "fleet",        # ordinary web research -> M365 (it has web access)
+    # An instruction handed in through the MCP door by an agent -- see tools/fleet_intake.py.
+    # It is its own type rather than borrowed from "coding" because the destination is the
+    # only thing known about it: what kind of work it is has not been decided by anyone yet,
+    # and labelling it "coding" would be the router asserting something it was not told.
+    # Named explicitly because DEFAULT_DESTINATION is claude, so an unlisted type would go
+    # somewhere the caller did not ask for.
+    "fleet_goal": "fleet",
     "deep-research": "claude",  # rigorous, cited, adversarially-verified -> the skill
 }
 DEFAULT_DESTINATION = "claude"

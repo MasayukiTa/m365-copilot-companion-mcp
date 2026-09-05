@@ -124,6 +124,7 @@ from tools.sql_ops import sqlite_query, sqlite_schema, sqlite_tables, sqlite_to_
 from tools.watcher_ops import watcher_events, watcher_start, watcher_stop
 from tools.auth_stats import get_summary as _auth_stats_summary
 from tools.tool_probe import get_summary as _tool_probe_summary
+from tools.fleet_intake import fleet_submit, fleet_queue
 from tools.jobs import (
     job_kill,
     job_list,
@@ -287,6 +288,8 @@ TOOLS = (
     pwsh_exec, pwsh_exec_file, shell_which,
     run_in_background, run_python_in_background,
     job_status, job_wait, job_output, job_list, job_kill,
+    # the door an agent walks through to hand this machine a goal
+    fleet_submit, fleet_queue,
     # processes / services / registry (Windows host introspection)
     process_list, process_info, process_kill,
     service_status, registry_read,
