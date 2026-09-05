@@ -157,3 +157,24 @@ def test_the_record_of_what_was_asked_for_is_still_written(state):
     TR.run_job({"id": "j9", "type": "fleet_goal", "payload": {"goal": "do the thing"}})
     with open(os.path.join(TR.TASKS, "for_fleet", "j9.txt"), encoding="utf-8") as fh:
         assert fh.read() == "do the thing"
+
+
+def test_where_the_instruction_came_from_reaches_the_archive(tmp_path, monkeypatch):
+    """It was recorded at the door and dropped at the record. The done/ file for the first
+    real submission read origin=None, and by then the pending file that held it was gone --
+    so the one place the difference survived had just been deleted."""
+    monkeypatch.setattr(TR, "TASKS", str(tmp_path / "tasks"))
+    monkeypatch.setattr(TR, "FLEET_STATE_DIR", str(tmp_path / "state"))
+    TR.ensure_dirs()
+    job = {"id": "j1", "type": "fleet_goal", "payload": {"goal": "do a thing"},
+           "origin": {"via": "mcp", "source": "an agent"}}
+    rec = TR.run_job(job, now_ts=1.0)
+    assert rec.get("origin") == {"via": "mcp", "source": "an agent"}
+
+
+def test_a_job_with_no_origin_does_not_grow_an_empty_one(tmp_path, monkeypatch):
+    monkeypatch.setattr(TR, "TASKS", str(tmp_path / "tasks"))
+    monkeypatch.setattr(TR, "FLEET_STATE_DIR", str(tmp_path / "state"))
+    TR.ensure_dirs()
+    rec = TR.run_job({"id": "j2", "type": "fleet_goal", "payload": {"goal": "x"}}, now_ts=1.0)
+    assert "origin" not in rec
