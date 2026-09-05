@@ -62,16 +62,13 @@ def _pending_count() -> int:
 
 
 def fleet_submit(goal: str, note: str = "", source: str = "") -> str:
-    """Hand this machine a goal to run on its worker fleet. Returns the job id.
+    """Queue a goal for this machine's worker fleet. Returns the job id.
 
-    Args:
-        goal: what to do, in one instruction. The whole task, not a reference to an earlier
-            message -- whatever runs this will not see the conversation it came from.
-        note: optional context for the human who reviews the queue. Never executed.
-        source: optional label for where the instruction came from (e.g. "phone").
+    goal: the whole instruction, standalone -- whatever runs it will not see this
+    conversation. note: context for the human reviewing the queue; never executed.
+    source: where the instruction came from.
 
-    The job is QUEUED, not started. It is written to .fleet/tasks/pending/ and picked up by
-    the consumer, which applies the approval gate. Nothing runs because this was called.
+    QUEUED, NOT STARTED. Nothing runs because this was called.
     """
     text = " ".join(str(goal or "").split())
     if not text:
