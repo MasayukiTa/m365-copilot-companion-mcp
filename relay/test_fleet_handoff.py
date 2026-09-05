@@ -465,3 +465,64 @@ def test_a_reader_holding_commands_json_does_not_lose_the_goal(tmp_path, monkeyp
     with io.open(os.path.join(str(state), "commands.json"), encoding="utf-8-sig") as fh:
         data = json.load(fh)
     assert [g["text"] for g in data["add_goal"]] == ["survives a reader"]
+
+
+def test_every_python_writer_of_commands_json_takes_the_same_lock(tmp_path, monkeypatch):
+    """A LOCK ONE WRITER TAKES IS NOT A LOCK.
+
+    The lock went into add_goal_to_live_fleet with a comment naming relay/code_task.py as the
+    other writer of this file -- and code_task kept its own unlocked read-append-write, as did
+    bench/fleet_ctl.py, whose docstring claims it "merges, so a queued add_goal isn't
+    clobbered". Two of the three Python writers could still delete the goals the lock existed
+    to protect. This drives the router's writer and fleet_ctl's merge together and requires
+    both to survive.
+    """
+    import threading
+    state = tmp_path / "state"
+    state.mkdir()
+    path = os.path.join(str(state), "commands.json")
+
+    n = 12
+    barrier = threading.Barrier(n * 2)
+    errors = []
+
+    def as_router(i):
+        barrier.wait()
+        try:
+            TR.add_goal_to_live_fleet("router goal %02d" % i, str(state))
+        except Exception as exc:
+            errors.append(exc)
+
+    def as_merger(i):
+        barrier.wait()
+        try:
+            TR.write_commands(path, lambda cur: cur.update({"flag%02d" % i: True}))
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = ([threading.Thread(target=as_router, args=(i,)) for i in range(n)]
+               + [threading.Thread(target=as_merger, args=(i,)) for i in range(n)])
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert not errors, errors
+    with io.open(path, encoding="utf-8-sig") as fh:
+        data = json.load(fh)
+    assert len(data.get("add_goal") or []) == n, (
+        "goals were lost: %d of %d survived" % (len(data.get("add_goal") or []), n))
+    assert sum(1 for k in data if k.startswith("flag")) == n, (
+        "merges were lost: %d of %d survived" % (sum(1 for k in data if k.startswith("flag")), n))
+
+
+def test_code_task_no_longer_writes_the_file_itself():
+    """The other writer named in the router's own comment. It is a separate PROCESS, so no
+    runtime test can hold the two together -- what is checkable is that it stopped keeping a
+    private copy of the read-append-write."""
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = io.open(os.path.join(repo, "relay", "code_task.py"), encoding="utf-8").read()
+    body = "\n".join(l for l in src.splitlines() if not l.strip().startswith("#"))
+    assert "add_goal_to_live_fleet" in body, "code_task must go through the shared writer"
+    assert 'cmds_path + ".tmp"' not in body, (
+        "code_task is writing commands.json itself again, outside the lock")
