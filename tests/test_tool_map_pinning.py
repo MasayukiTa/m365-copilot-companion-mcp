@@ -77,21 +77,44 @@ def test_the_essentials_are_never_traded_away(monkeypatch):
     assert "get_job_status" in got, "the execution-profile loop lost a tool it needs"
 
 
-def test_the_door_sits_near_the_front(monkeypatch):
-    """It is the tool an agent on someone's phone reaches for; behind the catalogue it costs
-    two extra round trips, measured at thirteen seconds on the first real submission."""
+def test_the_door_is_registered_rather_than_left_behind_the_catalogue(monkeypatch):
+    """It is the tool an agent reaches for on somebody's behalf, and behind the catalogue it
+    costs two extra round trips -- measured at thirteen seconds on the first real submission.
+
+    PRESENT, not first. An earlier version asserted it sat within the first three, which put
+    it ahead of the execution-profile tools and pushed get_job_status out at MAX=8. Those six
+    are a protocol; a protocol missing a piece is broken, not smaller. What matters here is
+    that fleet_submit is registered at all, and that it beats the optional tail.
+    """
     got = _registered(monkeypatch, MCP_TOOL_MAP="1", MCP_TOOL_MAP_MAX="10",
                       MCP_TOOL_MAP_INCLUDE="list_directory", MCP_EXECUTION_PROFILES="1")
-    assert got.index("fleet_submit") <= 2
+    assert "fleet_submit" in got
+    assert not (NICE & set(got)), "an optional default outranked the door"
+
+
+def test_the_protocol_tools_keep_their_places_at_the_shipped_minimum(monkeypatch):
+    """CI's catch, pinned. At MAX=8 the six local-turn tools plus unlock and the gateway fill
+    the budget exactly, and nothing may displace one of them."""
+    got = _registered(monkeypatch, MCP_TOOL_MAP="1", MCP_TOOL_MAP_MAX="8",
+                      MCP_EXECUTION_PROFILES="1")
+    for name in ("claim_turn", "heartbeat", "commit_turn", "abort_turn",
+                 "read_job_context", "get_job_status"):
+        assert name in got, "%s was displaced at the shipped minimum" % name
 
 
 # -- the silence, which is what made it last ----------------------------------------------------
 
 def test_the_cap_says_what_it_discarded(monkeypatch, capsys):
-    """A configuration that is ignored without a word is worse than one that is refused."""
+    """A configuration that is ignored without a word is worse than one that is refused.
+
+    On stderr. The first version printed to stdout and broke two tests that spawn this module
+    and READ its stdout -- one as a list of names, one as JSON. A diagnostic on a data channel
+    is not noise, it is corruption.
+    """
     _registered(monkeypatch, MCP_TOOL_MAP="1", MCP_TOOL_MAP_MAX="4",
                 MCP_TOOL_MAP_INCLUDE="list_directory", MCP_EXECUTION_PROFILES="1")
-    printed = capsys.readouterr().out
+    # STDERR, deliberately: stdout is a data channel that other tests parse.
+    printed = capsys.readouterr().err
     assert "[tool_map]" in printed and "cut" in printed
     assert "list_directory" in printed, "the cut tool was not named"
 
@@ -100,7 +123,7 @@ def test_nothing_is_said_when_nothing_is_cut(monkeypatch, capsys):
     """A line on every start would be noise, and noise is not a warning."""
     _registered(monkeypatch, MCP_TOOL_MAP="1", MCP_TOOL_MAP_MAX="70",
                 MCP_TOOL_MAP_INCLUDE="list_directory", MCP_EXECUTION_PROFILES="1")
-    assert "[tool_map]" not in capsys.readouterr().out
+    assert "[tool_map]" not in capsys.readouterr().err
 
 
 # -- shapes that must keep working ---------------------------------------------------------------

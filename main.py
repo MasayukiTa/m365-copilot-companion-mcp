@@ -720,7 +720,12 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
     #
     # An operator naming a tool is a stronger signal than a default list, so the pin now sits
     # between the tools that must be present and the ones that are merely nice.
-    _ESSENTIAL = (unlock, call_tool, fleet_submit, *_LOCAL_LOOP_PRIORITY)
+    # fleet_submit sits BEHIND the execution-profile tools, not ahead of them. Putting it
+    # third pushed get_job_status out at MCP_TOOL_MAP_MAX=8 and CI caught it: those six are a
+    # protocol the local-turn loop speaks, and a protocol with a piece missing is not a
+    # smaller protocol, it is a broken one. fleet_submit matters, but it degrades to being
+    # one catalogue lookup away; the loop does not degrade.
+    _ESSENTIAL = (unlock, call_tool, *_LOCAL_LOOP_PRIORITY, fleet_submit)
     _NICE = (list_unlocked, list_my_tools, env_info)
     # A SMALL registered set is not just about the 70 cap: each tool's schema costs input
     # tokens, and a Copilot Studio agent's model has a limited budget -- with all ~70 schemas
@@ -775,8 +780,13 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
     # configuration that is ignored without a word is worse than one that is refused.
     _dropped = [getattr(f, "__name__", "?") for f in _wanted[max(0, _MAX):]]
     if _dropped:
+        # ON STDERR, NOT STDOUT. Two existing tests spawn this module in a subprocess and read
+        # its stdout as data -- one splits it into tool names, the other parses it as JSON --
+        # so a diagnostic printed there is not noise, it is corruption, and CI said so. stdout
+        # is a data channel here; an explanation belongs beside it, not in it.
+        import sys as _sys
         print("[tool_map] MCP_TOOL_MAP_MAX=%d cut %d tool(s) that were asked for: %s"
-              % (_MAX, len(_dropped), ", ".join(_dropped)), flush=True)
+              % (_MAX, len(_dropped), ", ".join(_dropped)), file=_sys.stderr, flush=True)
     TOOLS = tuple(_head + _rest[: max(0, _MAX - len(_head))])
 # ----------------------------------------------------------------------------------------
 
