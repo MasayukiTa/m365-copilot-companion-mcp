@@ -462,7 +462,14 @@ def _read_job_gate(token):
 
 #: Where the fleet keeps its live state. The same directory code_task.py reads, deliberately:
 #: two answers to "is a fleet running" that can disagree is worse than either alone.
-FLEET_STATE_DIR = os.path.join(REPO, ".fleet")
+#:
+#: READ FROM THE ENVIRONMENT, because the repository already redirects exactly this. conftest
+#: points FLEET_STATE_DIR at a temp directory for every test run, and relay.project_memory
+#: resolves its own paths through the same variable. Hardcoding .fleet here would have made a
+#: test that reaches fleet_handoff() append add_goal to the OPERATOR'S commands.json -- which
+#: a running fleet reads and acts on, so not a dirtied record but a goal nobody asked for
+#: handed to a live run. Honouring the variable costs nothing and is already the convention.
+FLEET_STATE_DIR = os.environ.get("FLEET_STATE_DIR", "").strip() or os.path.join(REPO, ".fleet")
 
 #: A status.json older than this is not a live run, whatever it says inside. A fleet that died
 #: leaves its last snapshot behind, and a stale file claiming running=True would have every
