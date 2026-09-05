@@ -634,10 +634,21 @@ def run_job(job, now_ts=None):
             # scripts/ ever read that directory. Every fleet-bound job this router has ever
             # seen was filed as delivered and went nowhere. The file is still written, because
             # it is the record of what was asked for, but the delivery now actually happens.
+            #
+            # AND "awaiting_fleet" HAD THE SAME PROBLEM ONE LAYER DOWN. A goal that arrived
+            # while no fleet was running was written here, filed in done/ as awaiting_fleet,
+            # and that was the end of it: nothing re-tried it when a fleet later started, so
+            # it was not awaiting anything. Six of them had accumulated saying so.
+            #
+            # So for_fleet/ now means ONE thing -- goals still waiting for a fleet. A goal
+            # that was delivered leaves no file, because its done/ record already says
+            # "dispatched" and names how; a goal that was not leaves one, and every drain pass
+            # tries the waiting ones again while a fleet is live.
             goal = (job.get("payload") or {}).get("goal") or (job.get("payload") or {}).get("text", "")
-            with open(_p("for_fleet", "%s.txt" % jid), "w", encoding="utf-8") as f:
-                f.write(goal)
             rec["status"], rec["result"] = fleet_handoff(goal, jid)
+            if rec["status"] != "dispatched":
+                with open(_p("for_fleet", "%s.txt" % jid), "w", encoding="utf-8") as f:
+                    f.write(goal)
         else:  # claude
             with open(_p("for_claude", "%s.json" % jid), "w", encoding="utf-8") as f:
                 json.dump(job, f, ensure_ascii=False, indent=2)
@@ -685,6 +696,65 @@ def dispatch_once(now_ts=None):
             os.remove(claimed)
         out.append(rec)
     out.extend(_recheck_awaiting(now_ts=now_ts))
+    out.extend(_deliver_waiting_goals(now_ts=now_ts))
+    return out
+
+
+def _deliver_waiting_goals(now_ts=None, state_dir=None):
+    """Hand the fleet the goals that arrived while it was not running.
+
+    THE GAP THIS CLOSES. A fleet-bound goal submitted with no run in flight was filed as
+    "awaiting_fleet" and written to done/, which is terminal -- nothing looked at it again.
+    The status was the only thing waiting. Six such records had built up, each naming a goal
+    that would never be delivered however long a fleet ran afterwards.
+
+    Runs on every drain pass. With no fleet in flight it does nothing and costs one status
+    read, which is the same check fleet_handoff already makes.
+    """
+    out = []
+    ensure_dirs()
+    if not fleet_is_live(state_dir):
+        return out
+    try:
+        names = sorted(os.listdir(_p("for_fleet", "")))
+    except OSError:
+        return out
+    for name in names:
+        if not name.endswith(".txt"):
+            continue
+        path = _p("for_fleet", name)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                goal = fh.read()
+        except OSError:
+            continue
+        jid = name[:-4]
+        if not (goal or "").strip():
+            # Nothing to deliver and nothing to keep waiting for. Removing it is better than
+            # retrying an empty goal on every pass for the life of the machine.
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            continue
+        status, result = fleet_handoff(goal, jid, state_dir)
+        if status != "dispatched":
+            continue                       # still no run; leave it waiting
+        # DELETED ONLY AFTER DELIVERY SUCCEEDS. Removing it first would lose the goal if the
+        # write to the fleet failed, and a lost goal looks exactly like one never sent.
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        rec = {"id": jid, "type": "fleet_goal", "destination": "fleet", "ts_done": now_ts,
+               "status": status, "result": dict(result or {}, delivered_late=True),
+               "error": None}
+        try:
+            with open(_p("done", "%s.delivered.json" % jid), "w", encoding="utf-8") as fh:
+                json.dump(rec, fh, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+        out.append(rec)
     return out
 
 
