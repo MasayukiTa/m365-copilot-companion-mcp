@@ -6113,9 +6113,30 @@ def probe_connection(timeout_s=10.0, touch=None):
         # submit_bounded's own docstring says what to do here -- "callers must terminate the
         # bridge process and let the keepalive supervisor rebuild the page rather than
         # continuing with a possibly wedged owner thread" -- and this is that caller.
+        #
+        # SAY WHAT WAS OBSERVED, AT THE LEVEL IT DESERVES. This was logged as an ERROR reading
+        # "the page-owner thread is not servicing its queue", which is a stronger claim than a
+        # single ten-second timeout supports: submit_bounded puts the probe on the thread's
+        # QUEUE, and a thread part-way through opening a page and running a real turn does not
+        # reach that entry in time. It fired on roughly every probe cycle, all night, on cycles
+        # that then completed normally -- and an ERROR that fires on every healthy cycle is how
+        # a real wedge goes unnoticed. It also cost a wrong diagnosis: a 33-minute run of
+        # missing tool arrivals was attributed to this, and the evidence did not support it
+        # (the line fires on cycles where the call arrived too, and the longest wait, 52s, was
+        # a cycle that succeeded; the real cause was that directly registered tools were not
+        # being recorded).
+        #
+        # The clock and the ladder below are unchanged, and they are what actually decides:
+        # repeated failure escalates at PAGE_THREAD_WEDGE_LIMIT_S, and that escalation is still
+        # an ERROR. What changes is that the first missed probe no longer asserts a wedge it
+        # has not established. An earlier attempt tried to PROVE the thread was merely busy, by
+        # stamping job completions and treating a completion inside the wait window as proof of
+        # progress; it was reverted because the thread is usually inside ONE long job, so
+        # nothing completes during the wait and the healthy case looked identical to the wedge.
         if _PAGE_THREAD_WEDGED is None:
             _PAGE_THREAD_WEDGED = time.time()
-            logger.error("the page-owner thread is not servicing its queue (%s)", str(exc)[:160])
+            logger.warning("the page-owner thread did not answer a liveness probe within the "
+                           "timeout; it may be inside a job (%s)", str(exc)[:160])
         else:
             logger.warning("the page-owner thread is still wedged (%.0fs)",
                            page_thread_wedged_for_s() or 0.0)
