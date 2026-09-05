@@ -429,6 +429,27 @@ while ($true) {
         $reapOut = & $Py -c "import sys; sys.path.insert(0, r'$Root'); from relay.fleet_reaper import reap_stale_run; import json; r = reap_stale_run(); print(json.dumps(r) if r else '')" 2>$null
         if ($reapOut) { Write-Log "reaped stale fleet run: $reapOut" }
     } catch { }
+
+    # Drain the typed-job queue. An agent reaching the MCP server can hand this machine a goal
+    # (tools/fleet_intake.fleet_submit), and until something calls the router that goal just
+    # sits in .fleet/tasks/pending -- which is where the first real submission sat.
+    #
+    # ONE PASS FROM THIS LOOP, NOT A DAEMON. The router's own --poll-s mode would be a second
+    # long-lived process to start, supervise and reap; this loop already runs, already survives
+    # for days, and 15 seconds of latency is nothing against a goal that will take minutes.
+    # Fewer moving parts is the whole reason.
+    #
+    # Unattended is safe by construction rather than by promise: a LOCAL job still meets the
+    # approval gate (default mode confirms every first-seen class into awaiting/), a CLAUDE job
+    # is only written out, and a FLEET goal joins a run that is ALREADY in flight -- nothing
+    # here starts one, so no browser opens and no Copilot budget is spent by a queue drain.
+    try {
+        $routed = & $Py (Join-Path $Root "relay	ask_router.py") --once 2>$null
+        if ($routed -and $routed.Trim() -and $routed.Trim() -ne "[]") {
+            Write-Log "task_router: $($routed.Trim())"
+        }
+    } catch { }
+
     Invoke-ReviewAutoResume | Out-Null
 
     if (Test-ServerUp) {
