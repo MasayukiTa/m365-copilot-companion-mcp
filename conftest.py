@@ -52,13 +52,8 @@ LIVE_RECORD_REDIRECTS = {
                                   "RESULTS_PATH": "compare_results.jsonl"},
     "relay.selfimprove.runtime_config": {"ACTIVE_PATH": "active_manifest.json"},
     "relay.settle_replay": {"DEFAULT_TRACE": "settle_trace.jsonl"},
-    # FLEET_STATE_DIR is not a log. task_router now DELIVERS fleet-bound goals by appending
-    # add_goal to <state_dir>/commands.json, which a running fleet reads and acts on -- so a
-    # test that reaches fleet_handoff() without this redirect does not dirty a record, it
-    # hands the operator's live run a goal that nobody asked for.
     "relay.task_router": {"APPROVED_JOBS_FILE": "approved_jobs.json",
-                          "TASKS": "tasks.jsonl",
-                          "FLEET_STATE_DIR": "fleet_state"},
+                          "TASKS": "tasks.jsonl"},
     "tools.auth_stats": {"_STATS_FILE": "auth_stats.json"},
     "tools.skill_ops": {"_SKILL_USE_LOG": "skill_use.jsonl"},
     "relay.mechanism_telemetry": {"LOG": "mechanisms.jsonl"},
@@ -93,6 +88,18 @@ DELIBERATELY_NOT_REDIRECTED = {
         "read-only: the reconciler only ever reads finished transcripts to compare them, and "
         "writes nothing at all. Its own tests pass an explicit directory, so nothing here "
         "reaches the operator's store either way",
+    # ALREADY REDIRECTED, BY THE VARIABLE RATHER THAN BY THIS TABLE. task_router resolves it
+    # as os.environ["FLEET_STATE_DIR"] or .fleet, and conftest points that variable at a temp
+    # directory for every run -- the same mechanism relay.project_memory uses. Putting it in
+    # LIVE_RECORD_REDIRECTS instead would give it two answers that can disagree.
+    #
+    # It matters more than most entries here: this is not a log. task_router delivers a
+    # fleet-bound goal by appending add_goal to <state_dir>/commands.json, which a RUNNING
+    # fleet reads and acts on -- so an unredirected test write would not dirty a record, it
+    # would hand the operator's live run a goal nobody asked for.
+    ("relay.task_router", "FLEET_STATE_DIR"):
+        "resolved through the FLEET_STATE_DIR environment variable, which conftest already "
+        "points at a per-run temp directory; the .fleet path is only its fallback",
     ("tools.contract_gate", "_FLEET_DIR"):
         "a directory, not a record; the gate's own files are redirected by the tests that "
         "write them and the contract file is already per-test",

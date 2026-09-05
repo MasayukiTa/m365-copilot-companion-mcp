@@ -186,12 +186,20 @@ def test_the_memory_store_is_redirected_away_from_the_operators_own():
     実業務の62テーマと同居していた。さらに5件はテーマ名が
     記憶ヘッダーそのもので、前置された本文が新しいゴールとして
     記録されていた -- 記憶が自分を食っている。"""
+    # 実行して確かめる。以前はここで conftest.py の本文を読み、`"FLEET_STATE_DIR"` の
+    # 最初の一致の手前900文字に理由文があることを断言していた。別の場所に同じ名前の
+    # エントリ（task_router の分類）が足された瞬間に index() がそちらを掴んで落ちた --
+    # 守っている性質は何も変わらないのに。まず**効いているか**を見る。
+    import os as _os
     import io as _io
+    root = _os.environ.get("FLEET_STATE_DIR", "").strip()
+    assert root, "テスト実行中に FLEET_STATE_DIR が設定されていない"
+    repo = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    assert not _os.path.abspath(root).startswith(_os.path.abspath(repo)), (
+        "FLEET_STATE_DIR が運用者のリポジトリ内を指している: %s" % root)
+    # 理由が書き残されていること。どのエントリの隣かは問わない -- 場所は動く。
     src = _io.open("conftest.py", encoding="utf-8").read()
-    assert "FLEET_STATE_DIR" in src
-    i = src.index('"FLEET_STATE_DIR"')
-    block = src[max(0, i - 900):i]
-    assert "third production record" in block
+    assert "third production record" in src
 
 
 def test_a_primed_body_is_not_recorded_as_a_fresh_goal():
