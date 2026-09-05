@@ -356,3 +356,82 @@ def test_the_real_repo_bug_fix_still_matches_a_real_goal(tmp_path, monkeypatch):
     _approve_everything(root, db)
     got = F._with_matched_skill(CODING_GOAL)
     assert got != CODING_GOAL and F._SKILL_HEADER in got
+
+
+# -- the arms, because "it helps" is a claim and not a measurement ---------------------------
+
+def test_the_two_arms_return_different_text_for_the_same_input():
+    """manifest.py is explicit that an aspirational component is worse than an absent one:
+    seven knobs were once advertised and six dispatched to nothing, so every A/B over them
+    ran the same program twice and reported a p-value about noise. This is the check that
+    earns `skill` its place in EVOLVABLE_COMPONENTS."""
+    off = F.SKILL_VERSIONS["skill/off"](CODING_GOAL, "PROCEDURE BODY")
+    on = F.SKILL_VERSIONS["skill/v1"](CODING_GOAL, "PROCEDURE BODY")
+    assert off != on
+    assert off == CODING_GOAL
+    assert "PROCEDURE BODY" in on and on.endswith(CODING_GOAL)
+
+
+def test_the_default_arm_is_the_behaviour_in_place():
+    """A manifest that names nothing must not silently change what workers get."""
+    assert F._with_matched_skill(CODING_GOAL) != CODING_GOAL
+
+
+def test_the_off_arm_leaves_the_goal_exactly_as_it_was(monkeypatch):
+    """Selected through the real runtime_config, not by calling the arm directly -- the
+    dispatch is the part that has been wrong before."""
+    from relay.selfimprove import runtime_config as rc
+    monkeypatch.setattr(rc, "component",
+                        lambda name, default="": "skill/off" if name == "skill" else default)
+    assert F._with_matched_skill(CODING_GOAL) == CODING_GOAL
+
+
+def test_the_component_is_NOT_promoted_yet_and_that_is_deliberate():
+    """STEP ONE OF TWO, and the second step is not mine to take.
+
+    manifest.py prescribes the order: write the version table, show it dispatches
+    differently, and only then move the name into EVOLVABLE_COMPONENTS. The table exists and
+    the test above shows it dispatches -- so the first step is done and this records that the
+    second is outstanding rather than forgotten.
+
+    Two things make the promotion a human's act, not a batch item. manifest.py is inside the
+    frozen constitution, so editing it trips the baseline guard; and frozen.snapshot_baseline
+    says re-signing must be "a SPECIFIED decision by the operator -- specified meaning they
+    knew this particular act was included, not that they approved a batch that happened to
+    contain it". An instruction to keep going autonomously is exactly that batch.
+
+    To promote: add "skill" to EVOLVABLE_COMPONENTS with the two-step note, "skill": "skill/v1"
+    to DEFAULT_COMPONENTS, a known_versions("skill") branch reading SKILL_VERSIONS, and
+    "skill" to DISPATCHERS in selfimprove/test_evolution_loop.py -- then re-sign the frozen
+    baseline with a reason. This test then inverts.
+    """
+    from relay.selfimprove import manifest as M
+    assert "skill" not in M.EVOLVABLE_COMPONENTS, (
+        "promoted -- update this test to assert the promotion instead")
+    assert len(F.SKILL_VERSIONS) >= 2, "a component with one version has nothing to compare"
+
+
+def test_an_unknown_arm_falls_back_rather_than_breaking_a_run(monkeypatch):
+    from relay.selfimprove import runtime_config as rc
+    monkeypatch.setattr(rc, "component",
+                        lambda name, default="": "skill/typo" if name == "skill" else default)
+    assert F._with_matched_skill(CODING_GOAL) != CODING_GOAL
+
+
+def test_both_arms_still_ask_for_approval_of_a_near_miss(tmp_path, monkeypatch):
+    """The question to a human is not the thing under test, so it must not differ between
+    arms -- otherwise the comparison also compares how much got approved along the way."""
+    from relay.selfimprove import runtime_config as rc
+    for arm in ("skill/off", "skill/v1"):
+        root = tmp_path / arm.replace("/", "_")
+        _bundle(root, "bug-fix-drill", BUG_SKILL)
+        db = tmp_path / (arm.replace("/", "_") + ".sqlite3")
+        monkeypatch.setenv("MCP_SKILLS_PROJECT_ROOT", str(root))
+        monkeypatch.setenv("MCP_SKILLS_STATE_DB", str(db))
+        monkeypatch.setattr(rc, "component",
+                            lambda name, default="", _a=arm: _a if name == "skill" else default)
+        F._APPROVAL_ASKED.clear()
+        F._with_matched_skill(CODING_GOAL)
+        with sqlite3.connect(str(db)) as con:
+            rows = con.execute("SELECT COUNT(*) FROM approval_challenges").fetchone()
+        assert rows[0] == 1, "%s raised %d approval(s)" % (arm, rows[0])
