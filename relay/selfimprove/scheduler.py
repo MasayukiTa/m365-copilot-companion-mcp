@@ -276,7 +276,13 @@ def take_lock(lock_path=None, *, note=""):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     try:
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
+    except (FileExistsError, PermissionError):
+        # PERMISSIONERROR MEANS THE SAME THING HERE, AND ONLY ON WINDOWS. A lock file whose
+        # last handle has just closed with an unlink outstanding is in delete-pending, and
+        # creating it then returns ERROR_ACCESS_DENIED rather than "it exists". Catching
+        # FileExistsError alone meant a scheduler starting just as another released the lock
+        # crashed with PermissionError instead of reporting Blocked or taking the lock --
+        # the two outcomes this function is written to produce.
         if lock_held(path):
             raise Blocked("a campaign is already in flight")
         # A lock file older than STALE_LOCK_S is an abandoned one; take it over rather than
@@ -284,7 +290,7 @@ def take_lock(lock_path=None, *, note=""):
         release_lock(path)
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
+        except (FileExistsError, PermissionError):
             raise Blocked("a campaign is already in flight")
     with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
         json.dump({"started_at": time.time(), "pid": os.getpid(), "note": note}, fh)

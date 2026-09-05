@@ -459,3 +459,34 @@ def test_the_suite_itself_is_pointed_away_from_production():
     got = os.environ.get(ENV_PATH)
     assert got, "conftest が %s を設定していない" % ENV_PATH
     assert os.path.abspath(got) != os.path.abspath(DEFAULT_PATH)
+
+
+def test_the_ledger_lock_treats_a_delete_pending_file_as_contention(tmp_path, monkeypatch):
+    """Windows reports a lock being released as PermissionError, not FileExistsError.
+
+    This idiom was chosen because it "has to work identically on Windows", and the single way
+    Windows differs is the case it did not handle: a lock file whose last handle has just
+    closed with an unlink outstanding sits in delete-pending, and O_CREAT|O_EXCL on it returns
+    ERROR_ACCESS_DENIED. The exception then leaves the lock instead of being retried. Measured
+    in the identical copy of this loop in relay/task_router.py: 24 concurrent writers, 2
+    failures in 8 runs, most threads raising at once.
+    """
+    import os as _os
+    from relay.selfimprove import ledger as L
+
+    lock_path = str(tmp_path / "x.lock")
+    real_open = _os.open
+    calls = {"n": 0}
+
+    def flaky(p, flags, *a, **k):
+        if str(p) == lock_path:
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise PermissionError(13, "Permission denied")
+        return real_open(p, flags, *a, **k)
+
+    monkeypatch.setattr(_os, "open", flaky)
+    with L._exclusive(lock_path):
+        pass
+    assert calls["n"] >= 3, "the refusals were not actually exercised"
+    assert not os.path.exists(lock_path), "the lock must be released on the way out"

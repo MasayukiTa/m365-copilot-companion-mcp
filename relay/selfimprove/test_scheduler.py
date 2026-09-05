@@ -180,3 +180,32 @@ def test_the_nightly_run_refuses_rather_than_inventing_an_evaluator():
     with pytest.raises(Exception) as exc:
         S._refuse()
     assert "will not invent one" in str(exc.value)
+
+
+def test_a_lock_in_delete_pending_is_blocked_not_a_crash(tmp_path, monkeypatch):
+    """Windows reports a lock being released as PermissionError, not FileExistsError.
+
+    A file whose last handle has just closed with an unlink outstanding is in delete-pending,
+    and O_CREAT|O_EXCL on it returns ERROR_ACCESS_DENIED. take_lock has exactly two intended
+    outcomes -- it takes the lock, or it raises Blocked -- and catching FileExistsError alone
+    added a third: a scheduler starting just as another released the lock died with
+    PermissionError. The same gap was measured in the identical loop in relay/task_router.py
+    at 2 failures in 8 runs with 24 concurrent writers.
+    """
+    import os as _os
+    path = str(tmp_path / "campaign.lock")
+    real_open = _os.open
+    calls = {"n": 0}
+
+    def flaky(p, flags, *a, **k):
+        if str(p) == path:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise PermissionError(13, "Permission denied")
+        return real_open(p, flags, *a, **k)
+
+    monkeypatch.setattr(_os, "open", flaky)
+    # Nothing holds it, so the delete-pending refusal must resolve to taking the lock.
+    assert S.take_lock(path, note="after a delete-pending refusal") == path
+    assert calls["n"] >= 2, "the refusal was not actually exercised"
+    assert os.path.isfile(path)
