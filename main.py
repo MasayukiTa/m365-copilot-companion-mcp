@@ -705,7 +705,23 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
     # Keep the gateway immediately after unlock. Some hosts truncate or cache a
     # front-biased schema subset; losing diagnostic get_job_status is survivable, while
     # losing call_tool makes claimed work impossible.
-    _PRIORITY = (unlock, call_tool, *_LOCAL_LOOP_PRIORITY, list_unlocked, list_my_tools, env_info)
+    # fleet_submit SITS THIRD, BEHIND ONLY THE GATE AND THE GATEWAY. It is the one tool an
+    # agent on somebody's phone reaches for, and reaching it through the catalogue means two
+    # extra round trips before any work is handed over -- measured on the first real
+    # submission: catalogue at 23:44:53, signature at 23:44:59, the call itself at 23:45:06.
+    # Thirteen seconds, and that was the run that WORKED; the owner reports an earlier attempt
+    # that never found it at all. Its schema costs 121 tokens, trimmed from 200 by moving the
+    # reasoning into its module docstring, where it costs nothing at runtime.
+    # SPLIT IN TWO, because a pin has to be able to win. MCP_TOOL_MAP_INCLUDE is documented
+    # as pinning a tool "right after the priority set" -- but the priority set alone fills the
+    # budget, so a pinned tool could never be reached. list_directory sat in this operator's
+    # .env doing nothing, and raising the cap by one let in list_unlocked (367 tokens, the
+    # most expensive of the tail) instead of the tool actually asked for.
+    #
+    # An operator naming a tool is a stronger signal than a default list, so the pin now sits
+    # between the tools that must be present and the ones that are merely nice.
+    _ESSENTIAL = (unlock, call_tool, fleet_submit, *_LOCAL_LOOP_PRIORITY)
+    _NICE = (list_unlocked, list_my_tools, env_info)
     # A SMALL registered set is not just about the 70 cap: each tool's schema costs input
     # tokens, and a Copilot Studio agent's model has a limited budget -- with all ~70 schemas
     # loaded, even a short task prompt overflows (OpenAIModelTokenLimit) before any work. So
@@ -743,7 +759,7 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
         "run_in_background", "run_python_in_background", "job_kill",
     })
     _exec_direct = os.environ.get("MCP_TOOL_MAP_EXEC_DIRECT") == "1"
-    _pn = {getattr(f, "__name__", "") for f in _PRIORITY}
+    _pn = {getattr(f, "__name__", "") for f in _ESSENTIAL + _NICE}
     _want = [n.strip() for n in os.environ.get("MCP_TOOL_MAP_INCLUDE", "").split(",") if n.strip()]
     _pinned = [_ALL_TOOLS[n] for n in _want if n in _ALL_TOOLS and n not in _pn]
     _pinned_n = _pn | {getattr(f, "__name__", "") for f in _pinned}
@@ -751,7 +767,16 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
              and (_exec_direct or getattr(t, "__name__", "") not in _EXEC_ONLY_VIA_GATEWAY)]
     # The priority set itself can grow beyond the configured schema budget. Enforce
     # the cap here too; ordering above defines which critical tools survive.
-    _head = (list(_PRIORITY) + _pinned)[:max(0, _MAX)]
+    _wanted = list(_ESSENTIAL) + _pinned + list(_NICE)
+    _head = _wanted[:max(0, _MAX)]
+    # SAY WHAT THE CAP ATE. MCP_TOOL_MAP_INCLUDE=list_directory was set in this operator's .env
+    # and had no effect for as long as it has been there: the priority set alone fills the
+    # budget, so the pinned tool was dropped in silence and the setting read as working. A
+    # configuration that is ignored without a word is worse than one that is refused.
+    _dropped = [getattr(f, "__name__", "?") for f in _wanted[max(0, _MAX):]]
+    if _dropped:
+        print("[tool_map] MCP_TOOL_MAP_MAX=%d cut %d tool(s) that were asked for: %s"
+              % (_MAX, len(_dropped), ", ".join(_dropped)), flush=True)
     TOOLS = tuple(_head + _rest[: max(0, _MAX - len(_head))])
 # ----------------------------------------------------------------------------------------
 
