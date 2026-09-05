@@ -349,3 +349,30 @@ def test_an_empty_waiting_file_is_not_retried_forever(tmp_path, monkeypatch):
     _live(tmp_path)
     assert TR._deliver_waiting_goals(now_ts=2.0) == []
     assert not os.path.isfile(os.path.join(TR.TASKS, "for_fleet", "j5.txt"))
+
+
+def test_both_readers_of_the_fleet_status_agree_on_what_live_means():
+    """THE AGREEMENT IS THE REQUIREMENT, and nothing was holding it.
+
+    task_router and code_task both decide "is a fleet running" from the same file, and the
+    failure they exist to prevent is on the record: two fleets share the one dedicated Edge
+    and clobber each other's status.json, and the second run's work appeared as a phantom
+    worker behind the first. If the two readers disagree, one of them starts the second fleet.
+
+    They agree today -- age plus the running flag, thirty seconds, utf-8-sig -- but one holds
+    the threshold in a named constant and the other has it inline, so a change to either would
+    part them silently. This is the check that would notice.
+    """
+    import re
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = io.open(os.path.join(repo, "relay", "code_task.py"), encoding="utf-8").read()
+    i = src.index("def _fleet_is_live")
+    body = src[i:i + 700]
+    ages = [int(m) for m in re.findall(r"getmtime\(sp\)\)\s*>\s*(\d+)", body)]
+    assert ages, "code_task._fleet_is_live no longer compares the file age; re-derive this"
+    assert ages[0] == TR.FLEET_LIVE_MAX_AGE_S, (
+        "code_task treats a status file as live for %ds, task_router for %ds -- the two "
+        "disagree, and the one that says 'not live' will start a second fleet"
+        % (ages[0], TR.FLEET_LIVE_MAX_AGE_S))
+    assert "running" in body, "code_task no longer reads the running flag"
+    assert "utf-8-sig" in body, "code_task no longer tolerates a BOM; the writers must match"
