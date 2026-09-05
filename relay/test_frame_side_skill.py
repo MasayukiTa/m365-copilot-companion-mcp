@@ -386,29 +386,27 @@ def test_the_off_arm_leaves_the_goal_exactly_as_it_was(monkeypatch):
     assert F._with_matched_skill(CODING_GOAL) == CODING_GOAL
 
 
-def test_the_component_is_NOT_promoted_yet_and_that_is_deliberate():
-    """STEP ONE OF TWO, and the second step is not mine to take.
+def test_the_arm_is_declared_where_the_loop_reads_it():
+    """STEP TWO, taken 2026-09-05 on the operator's instruction ("昇格どうぞ").
 
     manifest.py prescribes the order: write the version table, show it dispatches
-    differently, and only then move the name into EVOLVABLE_COMPONENTS. The table exists and
-    the test above shows it dispatches -- so the first step is done and this records that the
-    second is outstanding rather than forgotten.
+    differently, and only then move the name into EVOLVABLE_COMPONENTS. The test above is
+    the "shown to dispatch differently" half; this is the half that says the loop can now
+    see it.
 
-    Two things make the promotion a human's act, not a batch item. manifest.py is inside the
-    frozen constitution, so editing it trips the baseline guard; and frozen.snapshot_baseline
-    says re-signing must be "a SPECIFIED decision by the operator -- specified meaning they
-    knew this particular act was included, not that they approved a batch that happened to
-    contain it". An instruction to keep going autonomously is exactly that batch.
-
-    To promote: add "skill" to EVOLVABLE_COMPONENTS with the two-step note, "skill": "skill/v1"
-    to DEFAULT_COMPONENTS, a known_versions("skill") branch reading SKILL_VERSIONS, and
-    "skill" to DISPATCHERS in selfimprove/test_evolution_loop.py -- then re-sign the frozen
-    baseline with a reason. This test then inverts.
+    manifest.py is inside the frozen constitution, so this also required re-signing the
+    baseline -- an act frozen.snapshot_baseline insists must be specified by the operator
+    rather than swept up in a batch. It was, and the instruction is quoted verbatim in the
+    authority ledger.
     """
     from relay.selfimprove import manifest as M
-    assert "skill" not in M.EVOLVABLE_COMPONENTS, (
-        "promoted -- update this test to assert the promotion instead")
-    assert len(F.SKILL_VERSIONS) >= 2, "a component with one version has nothing to compare"
+    assert "skill" in M.EVOLVABLE_COMPONENTS
+    assert M.DEFAULT_COMPONENTS["skill"] == "skill/v1", (
+        "the default arm must stay the behaviour in place; a manifest that names nothing "
+        "must not silently change what workers get")
+    assert M.known_versions("skill") == frozenset(F.SKILL_VERSIONS), (
+        "the allowlist and the dispatch table disagree, which is the second list "
+        "known_versions exists to avoid")
 
 
 def test_an_unknown_arm_falls_back_rather_than_breaking_a_run(monkeypatch):

@@ -15,7 +15,7 @@
     "relay/selfimprove/frozen.py": "1f2996c9023b419619e318553951548d0eb40fdbbbec188142324124f9124f8c",
     "relay/selfimprove/guards.py": "1967778b8a3d5e1ff58e7921f6c5a45387e7ebe5348be3c8c498585743eaad74",
     "relay/selfimprove/harness_tree.py": "f10903a544d5fbb0270f8be5034976c87e33c8c5537f2596c9c183969abe76e6",
-    "relay/selfimprove/manifest.py": "1be2a99123d696520f56e5297f0356c9be38716b0ff34b5922b6ae222d71e60c",
+    "relay/selfimprove/manifest.py": "4e9c776bce316557f9f531a9f18638f29a6b55a4011a4a5f8ee81f76bc2b146b",
     "relay/selfimprove/route_evaluator.py": "1ae754aeeb1ae50e9f1293f4fe6b45fcb18da966de30753f111f7a686d711b10",
     "relay/selfimprove/routing.py": "481015067ae0d4f23208a9859fff5dfb6164e38cb6462028c91be9bd6af1be5d",
     "relay/socket_route.py": "c6835b06906b5c4ef299e598639e6ac5b79c0d6bbd3287f87ce608acb1a84bec",
