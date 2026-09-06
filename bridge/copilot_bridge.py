@@ -5659,6 +5659,21 @@ def _do_tool_probe_turn(instruction):
 # network switches). The idle tool probe is the safest liveness signal because it already executes
 # on the Playwright owner thread and only while PAGE_LOCK is free. Require consecutive failures so
 # a single slow render never kills the process; exiting hands recovery to start_bridge -Keepalive.
+#: Below this, a probe turn that produced NO reply did not happen -- see the guard in
+#: _run_tool_probe that uses it. Chosen from the measured separation rather than picked: no
+#: successful probe in this bridge's log returned in under 10s, and the two empty-reply
+#: failures came back in 0s and 1s. 5.0 sits in that gap with room on both sides, so a real
+#: (if fast) turn is still recorded as a verdict and only a non-turn is skipped.
+PROBE_MIN_PLAUSIBLE_TURN_S = max(
+    0.5, float(os.environ.get("MCP_PROBE_MIN_PLAUSIBLE_TURN_S", "5"))
+)
+
+#: How soon to take the measurement properly after skipping a non-turn. Short, because the
+#: health strip is showing a stale (if honest) verdict until it lands.
+PROBE_EMPTY_TURN_RETRY_SEC = max(
+    5.0, float(os.environ.get("MCP_PROBE_EMPTY_TURN_RETRY_SEC", "30"))
+)
+
 PAGE_UNREACHABLE_RETRY_SEC = max(
     5.0, float(os.environ.get("MCP_PAGE_UNREACHABLE_RETRY_SEC", "20"))
 )
@@ -5773,9 +5788,11 @@ def _run_tool_probe():
             # makes the absence of an arrival mean something.
             _inbound_before = tool_probe.last_inbound_ts()
             instruction, expected_token = _next_tool_probe_challenge()
+            _turn_t0 = time.time()
             agent_loaded, reply, timed_out = _run_bounded_page_probe_call(
                 lambda: _do_tool_probe_turn(instruction)
             )
+            _turn_s = time.time() - _turn_t0
             if timed_out:
                 # A turn can time out with text already in hand: the model answers, but the
                 # answer is byte-for-byte what it said last time, so the settle check refuses
@@ -5859,6 +5876,37 @@ def _run_tool_probe():
             _inbound = tool_probe.last_inbound_ts() > _inbound_before
         except Exception:
             _inbound = None
+        # A TURN THAT CAME BACK EMPTY IN UNDER A SECOND NEVER RAN, AND "it did not run" is not
+        # the same finding as "the tool path is broken".
+        #
+        # The page is reopened at the start of a probe cycle. Send into it too soon and
+        # wait_for_idle answers "idle" immediately -- truthfully, because nothing is pending
+        # yet -- so read_last_response finds nothing and the probe publishes a red with an
+        # empty reply. Measured over this bridge's whole log: of 97 probes that succeeded, the
+        # gap between "agent page had closed -- reopened it" and the verdict was never below
+        # 10s (median 31s); both failures since the challenge was fixed sat at 0s and 1s.
+        # A real round trip takes 30-180s, so sub-second is not a fast failure, it is no turn.
+        #
+        # Recorded as the TRANSITIONAL "starting" kind, which record_probe deliberately keeps
+        # BESIDE the last verdict instead of replacing it, so the health strip keeps showing
+        # what was last actually measured and a short retry takes the measurement properly.
+        # Publishing the red instead cost real time once already: the 15:52 instance was
+        # chased as a stack fault before the mechanism was known.
+        # `timed_out` is excluded deliberately: a turn that waited out the clock DID run, by
+        # definition, so however the stub timings fall it is a verdict and not a non-turn.
+        # Folding it in here swallowed test_probe_timeout_skips_consent_recovery, which is the
+        # check that a timeout still reaches its own branch.
+        if (not ok) and not timed_out and not (reply or "").strip() \
+                and _turn_s < PROBE_MIN_PLAUSIBLE_TURN_S:
+            logger.info("tool probe: turn returned empty in %.1fs -- no turn happened, "
+                        "not recording a verdict; retrying shortly", _turn_s)
+            try:
+                tool_probe.record_probe(
+                    False, "starting",
+                    detail="probe turn returned empty in %.1fs; retrying" % _turn_s)
+            except Exception:
+                pass
+            return PROBE_EMPTY_TURN_RETRY_SEC
         tool_probe.record_probe(ok, kind, detail=(reply or "")[:200],
                                 alive=bool((reply or "").strip()), inbound=_inbound)
         # Additive: preserve the FULL reply (record_probe's `detail` above stays truncated to
