@@ -36,6 +36,29 @@ needs_records = pytest.mark.skipif(
     reason="no local fleet records in this checkout")
 
 
+def _transcript_lines(path):
+    """Yield a recorded transcript's lines, whether or not it has been compressed since.
+
+    THE RECORDS OUTLIVE THE UNCOMPRESSED FILE. history.json stores the path a transcript had
+    when the run finished, and transcripts are gzipped as they age, so `os.path.isfile(path)`
+    goes false for every entry eventually. Measured 2026-09-06: 16 of 16 history entries
+    pointed at a .jsonl that no longer existed and 16 of 16 had a .jsonl.gz beside it -- so
+    both tests below had stopped executing and skipped instead, permanently, with a message
+    that reads like missing data rather than a stale path. Reading the .gz is what keeps these
+    assertions alive on a machine that has been running for a while.
+
+    Returns [] when neither form is present, so callers keep their existing "skip if nothing
+    readable" behaviour on a genuinely fresh checkout.
+    """
+    if path and os.path.isfile(path):
+        return io.open(path, encoding="utf-8", errors="replace").readlines()
+    if path and os.path.isfile(path + ".gz"):
+        import gzip
+        with gzip.open(path + ".gz", "rt", encoding="utf-8", errors="replace") as fh:
+            return fh.readlines()
+    return []
+
+
 def _hm(ts):
     """The HH:mm string the cockpit renders, which is what decides whether a row repeats
     the one above it."""
@@ -132,10 +155,11 @@ def test_the_started_row_appears_exactly_when_it_shows_a_different_time():
     disagree = []
     for e in history:
         path = e.get("transcript") or ""
-        if not path or not os.path.isfile(path):
+        lines = _transcript_lines(path)
+        if not lines:
             continue
         meta = first = 0.0
-        for line in io.open(path, encoding="utf-8", errors="replace"):
+        for line in lines:
             if not line.strip():
                 continue
             try:
@@ -190,10 +214,11 @@ def test_queued_and_started_gap_is_recorded_for_the_next_person():
     pairs = []
     for e in history[-8:]:
         path = e.get("transcript") or ""
-        if not path or not os.path.isfile(path):
+        lines = _transcript_lines(path)
+        if not lines:
             continue
         meta = first = 0.0
-        for line in io.open(path, encoding="utf-8", errors="replace"):
+        for line in lines:
             if not line.strip():
                 continue
             try:
