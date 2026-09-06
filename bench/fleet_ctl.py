@@ -33,21 +33,19 @@ def _read(path):
 
 
 def _merge_command(patch):
-    # UNDER THE SAME LOCK AS EVERY OTHER PYTHON WRITER. The docstring above says this merges
-    # "so a queued add_goal isn't clobbered" -- which the read-modify-write here could not
-    # deliver on its own: another writer replacing the file between the read and the write
-    # took the merge with it, and `CMDS + ".tmp"` is a temp name shared with every other
-    # writer of this file. relay/task_router.write_commands holds that lock.
+    # ONE FILE OF ITS OWN, NOT A MERGE INTO A SHARED ONE. The docstring above says this
+    # "merges, so a queued add_goal isn't clobbered" -- which a read-modify-write could not
+    # deliver, since another writer replacing the file between the read and the write took the
+    # merge with it. relay/task_router.write_command drops a uniquely named file that the
+    # runner reads in order, so there is nothing to merge and nothing to clobber. The runner
+    # applies each command in turn, so a patch here reaches it exactly as before.
     os.makedirs(STATE, exist_ok=True)
     if REPO not in sys.path:
         sys.path.insert(0, REPO)
     from relay import task_router as _tr
 
-    def _apply(cur):
-        cur.update(patch)
-
-    _tr.write_commands(CMDS, _apply)
-    return _read(CMDS)
+    _tr.write_command(STATE, dict(patch))
+    return dict(patch)
 
 
 def _status():
