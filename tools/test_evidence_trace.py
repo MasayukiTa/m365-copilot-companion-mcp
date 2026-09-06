@@ -505,3 +505,50 @@ def test_the_refusal_is_still_recorded_before_it_raises(own_ledger):
         asyncio.run(register(run_python)())
     rows = [(r.get("event"), r.get("tool")) for r in _ledger_rows(own_ledger)]
     assert ("call", "run_python") in rows
+
+
+# --------------------------------------------------------------------------------------
+# A REFUSED CALL IS STILL AN ATTEMPT, AND THE ATTEMPT IS THE EVIDENCE.
+#
+# tools/tool_ledger.record_outcome now downgrades a lock refusal to ok=False, because the
+# ledger measures what HAPPENED. The trace measures what was ATTEMPTED, and main.py records
+# every normal return with ok=True on purpose. The asymmetry looks like an oversight and
+# invites a symmetry fix; this test is what makes that fix fail loudly instead of quietly
+# dropping attempted writes out of the evidence a completeness verdict is computed from.
+# --------------------------------------------------------------------------------------
+
+REFUSAL = ("[locked: no valid unlock token for '203.0.113.7'] The identity in the forwarding "
+           "header is not sufficient on its own. Call unlock(password='<password>').")
+
+
+def test_a_refused_write_still_names_the_path_it_aimed_at():
+    path, key = _session()
+    try:
+        work = tempfile.mkdtemp(prefix="wk_")
+        # The gateway's success path: the tool returned normally, carrying a refusal.
+        T.record("write_file", {"path": "C:/Users/Public/exfiltrated.txt", "text": "x"},
+                 True, REFUSAL)
+        outside = T.writes_outside(path, key, work)
+        assert [r["tool"] for r in outside] == ["write_file"]
+        assert "exfiltrated" in outside[0]["path"]
+    finally:
+        _clear()
+
+
+def test_the_refusal_does_not_have_to_be_classified_for_the_verdict_to_hold():
+    """writes_outside must not consult ok -- it is inclusive by design.
+
+    Recording the same attempted path under both verdicts must give the same answer, so that
+    however a caller labels a refusal, the attempted write stays visible.
+    """
+    work = tempfile.mkdtemp(prefix="wk_")
+    seen = []
+    for verdict in (True, False):
+        path, key = _session()
+        try:
+            T.record("write_file", {"path": "C:/Users/Public/exfiltrated.txt"},
+                     verdict, REFUSAL)
+            seen.append([r["path"] for r in T.writes_outside(path, key, work)])
+        finally:
+            _clear()
+    assert seen[0] == seen[1] and seen[0], seen

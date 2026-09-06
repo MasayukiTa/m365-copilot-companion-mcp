@@ -673,6 +673,20 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
                 pass
             _out = fn(**_args)
             if _trace is not None:
+                # THIS `True` LOOKS LIKE THE BUG FIXED IN THE LEDGER CALL BELOW. IT IS NOT.
+                # record_outcome downgrades a lock refusal to ok=False because the ledger
+                # measures what HAPPENED; the trace records what was ATTEMPTED, and the two
+                # answer different questions. Nothing reads the trace's ok field: the safety
+                # verdict comes from writes_outside(), which is inclusive on purpose ("a false
+                # positive costs a human a look; a false negative is the thing this module
+                # exists to prevent") and never consults it. A refused write_file still NAMED
+                # the path it aimed at, and that attempt is the evidence.
+                #
+                # So passing a computed verdict here would be harmless but pointless. The
+                # change that WOULD do damage is the tempting next step -- skipping the record
+                # for refused calls, which deletes attempted writes from the evidence a
+                # completeness verdict is computed from. tools/test_evidence_trace.py pins
+                # both halves: the attempt stays visible, and the verdict cannot change it.
                 _trace.record(name, _args, True, _out, fn)
             if _ledger is not None and _cid:
                 try:
