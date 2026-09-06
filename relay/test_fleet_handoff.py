@@ -526,3 +526,105 @@ def test_code_task_no_longer_writes_the_file_itself():
     assert "add_goal_to_live_fleet" in body, "code_task must go through the shared writer"
     assert 'cmds_path + ".tmp"' not in body, (
         "code_task is writing commands.json itself again, outside the lock")
+
+
+# -- the seam: what the router writes is what the runner reads ---------------------------------
+
+def test_the_runner_reads_back_exactly_the_goal_the_router_delivered(tmp_path, monkeypatch):
+    """THE JOIN NOBODY TESTED. Both halves had tests; the seam between them had none.
+
+    relay/task_router.add_goal_to_live_fleet writes commands.json; relay/fleet_runner reads it.
+    Each side was covered against its own fixture, so a key renamed on one side would pass
+    everything and deliver nothing. That is not hypothetical here: the archive wrote
+    `gate_verdict` while the scheduler read `verdict`, and an adapter wrote `keep` while the
+    policy read `kept` -- both sides green throughout, both found by a human reading code.
+
+    This drives the REAL writer and the REAL reader against one file, with no browser and no
+    Copilot turn: fleet_is_live only asks for a fresh status.json saying running.
+    """
+    from relay import fleet_runner as FR
+
+    state = tmp_path / "state"
+    state.mkdir()
+    with io.open(os.path.join(str(state), "status.json"), "w", encoding="utf-8") as fh:
+        json.dump({"running": True}, fh)
+
+    TR.add_goal_to_live_fleet("summarise last month's mail", str(state))
+
+    with io.open(os.path.join(str(state), "commands.json"), encoding="utf-8-sig") as fh:
+        on_disk = json.load(fh)
+    goals = FR.goals_from_command(on_disk)
+
+    assert [g["text"] for g in goals] == ["summarise last month's mail"], (
+        "the runner did not read back the goal the router wrote: %r" % (on_disk,))
+    assert goals[0]["priority"] is False
+
+
+def test_the_richer_entry_code_task_sends_survives_the_round_trip(tmp_path, monkeypatch):
+    """code_task adds cwd and checks so a retry re-runs WITH its acceptance gate. If those are
+    dropped in transit the goal still runs, and silently runs ungated -- which looks like a
+    pass."""
+    from relay import fleet_runner as FR
+
+    state = tmp_path / "state"
+    state.mkdir()
+    with io.open(os.path.join(str(state), "status.json"), "w", encoding="utf-8") as fh:
+        json.dump({"running": True}, fh)
+
+    entry = {"text": "fix the failing test", "priority": True,
+             "cwd": r"C:\work\proj", "checks": ["pytest -q"]}
+    TR.add_goal_to_live_fleet(entry["text"], str(state), entry=entry)
+
+    with io.open(os.path.join(str(state), "commands.json"), encoding="utf-8-sig") as fh:
+        goals = FR.goals_from_command(json.load(fh))
+
+    assert goals == [entry], "a field was lost between the writer and the reader: %r" % (goals,)
+
+
+def test_several_goals_arrive_in_the_order_they_were_sent(tmp_path, monkeypatch):
+    """Two phones, one run. The reader must see both, in order."""
+    from relay import fleet_runner as FR
+
+    state = tmp_path / "state"
+    state.mkdir()
+    with io.open(os.path.join(str(state), "status.json"), "w", encoding="utf-8") as fh:
+        json.dump({"running": True}, fh)
+
+    for i in range(3):
+        TR.add_goal_to_live_fleet("goal %d" % i, str(state))
+
+    with io.open(os.path.join(str(state), "commands.json"), encoding="utf-8-sig") as fh:
+        goals = FR.goals_from_command(json.load(fh))
+    assert [g["text"] for g in goals] == ["goal 0", "goal 1", "goal 2"]
+
+
+def test_a_full_job_from_the_intake_door_reaches_the_runners_reader(tmp_path, monkeypatch):
+    """END TO END, WITHOUT A BROWSER OR A COPILOT TURN: the door, the router, the file, the
+    reader. The only thing simulated is that a fleet is running, which fleet_is_live decides
+    from a fresh status.json -- so every line of the delivery path is the real one."""
+    from relay import fleet_runner as FR
+    from tools import fleet_intake as FI
+
+    state = tmp_path / "state"
+    state.mkdir()
+    with io.open(os.path.join(str(state), "status.json"), "w", encoding="utf-8") as fh:
+        json.dump({"running": True}, fh)
+    monkeypatch.setattr(TR, "TASKS", str(tmp_path / "tasks"))
+    monkeypatch.setattr(TR, "FLEET_STATE_DIR", str(state))
+    TR.ensure_dirs()
+
+    out = FI.fleet_submit("check the coating DB for last week", source="phone (verification)")
+    jid = out.split()[1]
+    TR.dispatch_once()
+
+    rec_path = os.path.join(TR.TASKS, "done", "%s.json" % jid)
+    with io.open(rec_path, encoding="utf-8") as fh:
+        rec = json.load(fh)
+    assert rec["status"] == "dispatched", "the router did not deliver it: %r" % (rec,)
+    assert rec["origin"]["source"] == "phone (verification)", "provenance was lost"
+    assert not os.path.isfile(os.path.join(TR.TASKS, "for_fleet", "%s.txt" % jid)), (
+        "a delivered goal must not also be left waiting")
+
+    with io.open(os.path.join(str(state), "commands.json"), encoding="utf-8-sig") as fh:
+        goals = FR.goals_from_command(json.load(fh))
+    assert [g["text"] for g in goals] == ["check the coating DB for last week"]
