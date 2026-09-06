@@ -15,6 +15,8 @@ same hermetic-import argument), and every Playwright-touching call this test exe
 monkeypatched out (relay.edge_recover.surface, B._bridge_auto_consent, B._do_tool_probe_turn,
 B._run_bounded_page_probe_call).
 """
+import time
+
 import relay.edge_recover as edge_recover
 import bridge.copilot_bridge as B
 
@@ -326,6 +328,79 @@ def test_a_refusal_is_reported_as_a_failure_and_not_as_an_unreachable_agent(monk
     refusal = ("同じ診断依頼が5回目です。判断は変わりません。発行元と目的が確認できるまで"
                "この回は実行を保留します。")
     _patch_probe_plumbing(monkeypatch, [(True, refusal, False)], arrived=False)
+    _patch_surface(monkeypatch, [])
+    recorded = []
+    monkeypatch.setattr(B.tool_probe, "record_probe",
+                        lambda ok, kind, **kw: recorded.append((ok, kind)))
+
+    B._run_tool_probe()
+
+    assert recorded[-1] == (False, "error")
+
+
+# ---------------------------------------------------------------------------------------
+# A NON-TURN IS NOT A FAILED TURN.
+#
+# The page is reopened at the start of a probe cycle; send into it too soon and wait_for_idle
+# answers "idle" immediately -- truthfully, nothing is pending yet -- so the reply is empty and
+# the probe published a red. Measured over the bridge's whole log: of 97 successful probes the
+# gap between "page reopened" and the verdict was never under 10s (median 31s), while both
+# failures since the challenge fix came back at 0s and 1s. A real round trip is 30-180s.
+# ---------------------------------------------------------------------------------------
+
+def test_an_empty_turn_that_returned_instantly_is_not_recorded_as_a_verdict(monkeypatch):
+    _reset_state(monkeypatch)
+    _patch_probe_plumbing(monkeypatch, [(True, "", False)], arrived=False)
+    _patch_surface(monkeypatch, [])
+    recorded = []
+    monkeypatch.setattr(B.tool_probe, "record_probe",
+                        lambda ok, kind, **kw: recorded.append((ok, kind)))
+
+    B._run_tool_probe()
+
+    # "starting" is the transitional kind record_probe keeps BESIDE the last verdict rather
+    # than replacing it, so the strip keeps showing what was last actually measured.
+    assert recorded[-1] == (False, "starting")
+    assert ("error" not in [k for _, k in recorded]), recorded
+
+
+def test_the_retry_is_short_so_the_measurement_is_taken_properly(monkeypatch):
+    _reset_state(monkeypatch)
+    _patch_probe_plumbing(monkeypatch, [(True, "", False)], arrived=False)
+    _patch_surface(monkeypatch, [])
+    monkeypatch.setattr(B.tool_probe, "record_probe", lambda *a, **kw: None)
+
+    assert B._run_tool_probe() == B.PROBE_EMPTY_TURN_RETRY_SEC
+
+
+def test_an_empty_turn_that_took_a_real_amount_of_time_is_still_a_verdict(monkeypatch):
+    """The guard must not swallow a genuine failure. A turn that actually ran and came back
+    with nothing is the connector incident this probe exists for."""
+    _reset_state(monkeypatch)
+
+    def _slow(fn, *a, **kw):
+        if fn is B._bridge_auto_consent:
+            return None
+        time.sleep(B.PROBE_MIN_PLAUSIBLE_TURN_S + 0.2)
+        return (True, "", False)
+
+    _patch_probe_plumbing(monkeypatch, [(True, "", False)], arrived=False)
+    monkeypatch.setattr(B, "_run_bounded_page_probe_call", _slow)
+    _patch_surface(monkeypatch, [])
+    recorded = []
+    monkeypatch.setattr(B.tool_probe, "record_probe",
+                        lambda ok, kind, **kw: recorded.append((ok, kind)))
+
+    B._run_tool_probe()
+
+    assert recorded[-1] == (False, "error")
+
+
+def test_a_reply_that_arrived_instantly_is_still_judged(monkeypatch):
+    """Only an EMPTY instant turn is skipped. Text back means a turn happened, however fast,
+    and a refusal that arrives quickly must still be recorded rather than retried forever."""
+    _reset_state(monkeypatch)
+    _patch_probe_plumbing(monkeypatch, [(True, "no.", False)], arrived=False)
     _patch_surface(monkeypatch, [])
     recorded = []
     monkeypatch.setattr(B.tool_probe, "record_probe",
