@@ -231,3 +231,83 @@ def test_a_live_fleet_stops_autostart_before_any_record_is_consulted(state):
     _live(state)
     may, why = TR.autostart_status(str(state))
     assert may is False and "already running" in why
+
+
+# -- the settings have to reach the process that reads them -------------------------------------
+
+def _in_subprocess(code, env=None):
+    """Run `code` in a fresh interpreter, the way the supervisor runs the router."""
+    import subprocess
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    e = dict(os.environ) if env is None else env
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", cwd=repo, env=e)
+    return (r.stdout or "").strip(), (r.stderr or "").strip()
+
+
+def test_the_router_reads_the_operators_env_file():
+    """A SETTING THAT NEVER REACHES THE BRANCH IT NAMES IS NOT A SETTING.
+
+    Every constant in task_router comes from os.environ, and the module runs as a fresh
+    subprocess: the supervisor launches `python relay/task_router.py --once` on each pass, into
+    an environment nobody had put .env into. Measured before this was wired: AUTOSTART False
+    and no agent URL, with both configured in .env. FLEET_INTAKE_AUTOSTART could have been set
+    to 1 and changed nothing -- the third flag in one night that did not reach its own branch.
+
+    Skipped where there is no .env (CI), because the property under test is that the file is
+    read, and there is nothing to read.
+    """
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    envfile = os.path.join(repo, ".env")
+    if not os.path.isfile(envfile):
+        pytest.skip("no .env in this checkout")
+    with io.open(envfile, encoding="utf-8-sig", errors="replace") as fh:
+        keys = [l.split("=", 1)[0].strip() for l in fh if "=" in l and not l.strip().startswith("#")]
+    key = next((k for k in ("MCP_FLEET_AGENT_URL", "MCP_IMPL_AGENT_URL") if k in keys), None)
+    if not key:
+        pytest.skip("this .env sets no agent URL to check with")
+
+    clean = {k: v for k, v in os.environ.items() if k not in ("MCP_FLEET_AGENT_URL",
+                                                              "MCP_IMPL_AGENT_URL")}
+    out, err = _in_subprocess(
+        "import sys; sys.path.insert(0, '.');"
+        "from relay import task_router as TR; print('URL' if TR._agent_url() else 'EMPTY')",
+        env=clean)
+    assert out == "URL", ("the router did not pick %s up from .env: %s / %s" % (key, out, err))
+
+
+def test_an_exported_variable_still_beats_the_file():
+    """override=False, and it matters here more than most places: conftest points
+    FLEET_STATE_DIR at a temp directory for every test run, and a file on disk must not be able
+    to take that back -- task_router delivers goals into <state_dir>/commands.d, so losing the
+    redirect would hand the operator's live fleet a goal from a test."""
+    marked = dict(os.environ, FLEET_STATE_DIR=r"C:\somewhere\deliberate")
+    out, err = _in_subprocess(
+        "import sys; sys.path.insert(0, '.');"
+        "from relay import task_router as TR; print(TR.FLEET_STATE_DIR)", env=marked)
+    assert out.endswith("deliberate"), ("the .env file overrode an exported variable: %s / %s"
+                                        % (out, err))
+
+
+def test_no_test_can_start_a_real_fleet(monkeypatch, tmp_path):
+    """THE GUARD THAT BECAME NECESSARY THE MOMENT THE FLAG WENT INTO .env.
+
+    task_router reads .env at import, so with FLEET_INTAKE_AUTOSTART=1 every test that imports
+    it inherited AUTOSTART True, and any test reaching fleet_handoff with no live fleet would
+    have spawned a real run: a browser, workers, and the tenant's Copilot budget. Two layers
+    answer that -- conftest clears the ambient value, and this refusal catches the test the
+    fixture missed. Checked with AUTOSTART forced back on, which is the state the fixture is
+    protecting against.
+    """
+    monkeypatch.setattr(TR, "AUTOSTART", True)
+    monkeypatch.setenv("MCP_FLEET_AGENT_URL", "https://example.invalid/agent")
+    sd = tmp_path / "fleet"
+    sd.mkdir()
+    out = TR.autostart_fleet([{"text": "must not open a browser"}], str(sd))
+    assert out["ok"] is False and "under pytest" in out["detail"]
+
+
+def test_the_ambient_flag_is_off_for_every_test():
+    """What conftest's autouse fixture is for. Without it this reads whatever .env says on the
+    machine the suite happens to run on, which is not a property of the code."""
+    assert TR.AUTOSTART is False

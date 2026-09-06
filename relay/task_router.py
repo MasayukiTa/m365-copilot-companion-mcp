@@ -60,6 +60,25 @@ import time
 from pathlib import Path
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# THE OPERATOR'S .env, WHICH THIS MODULE HAD NEVER READ. Every setting below comes from
+# os.environ, and this module runs as a fresh subprocess: the supervisor launches
+# `python relay/task_router.py --once` each pass, and that process inherits an environment
+# nobody put .env into. Measured: a fresh subprocess reported AUTOSTART False and no agent URL
+# while both were configured in .env. So FLEET_INTAKE_AUTOSTART could be set to 1 and change
+# nothing, which is the third time in one night that a flag turned out not to reach the branch
+# it names -- MCP_TOOL_MAP_INCLUDE was silently dropped by the tool cap, the autostart branch
+# itself was an empty stub, and now the flag that would have enabled it.
+#
+# override=False, so an explicitly exported variable still wins: conftest points FLEET_STATE_DIR
+# at a temp directory for every test run, and a file on disk must not be able to take that back.
+try:
+    from dotenv import load_dotenv as _load_dotenv
+
+    _load_dotenv(os.path.join(REPO, ".env"), override=False)
+except Exception:
+    pass
+
 TASKS = os.path.join(REPO, ".fleet", "tasks")
 SUBDIRS = ("pending", "running", "done", "awaiting", "for_fleet", "for_claude")
 VENVPY = os.path.join(REPO, ".venv", "Scripts", "python.exe")
@@ -706,6 +725,16 @@ def autostart_fleet(goals, state_dir=None, now=None, launcher=None) -> dict:
     """
     now = time.time() if now is None else now
     sd = state_dir or FLEET_STATE_DIR
+    # NOTHING IN A TEST RUN OPENS A BROWSER. This is the same systemic guard
+    # tools/notify_ops.notify_desktop uses, and for the same reason: this is the single point
+    # that spawns a real fleet, so refusing here once is worth more than every test remembering
+    # to patch. It became necessary the moment FLEET_INTAKE_AUTOSTART went into .env -- until
+    # then AUTOSTART was False everywhere and no test could reach this line by accident.
+    # PYTEST_CURRENT_TEST is not a complete signal (it is unset during collection and does not
+    # always cross into subprocesses), which is why conftest also forces AUTOSTART off; this is
+    # the layer that catches a test the fixture missed.
+    if os.environ.get("PYTEST_CURRENT_TEST") and launcher is None:
+        return {"ok": False, "detail": "refused: a real fleet launch under pytest"}
     goals = [g for g in (goals or []) if (g or {}).get("text")]
     if not goals:
         return {"ok": False, "detail": "no goals to start a fleet for"}
