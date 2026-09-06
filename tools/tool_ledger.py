@@ -119,8 +119,15 @@ def row_ok(row) -> bool:
     """
     try:
         ok = bool(row.get("ok"))
-        if not ok or row.get("event") != "outcome":
+        if not ok:
             return ok
+        # DELIBERATELY NOT GATED ON row["event"] == "outcome". It was, and that made the
+        # correction depend on a key the caller might not have kept: relay/evidence_manifest
+        # receives outcomes through for_task, and its own tests build them as bare
+        # {"ok": ..., "ts": ...}. A guard that silently returns the uncorrected value for a
+        # reshaped row is the seam both sides pass their tests across while nothing is
+        # actually checked. A call row cannot false-positive here anyway -- it carries `args`,
+        # not `result` -- so the guard bought nothing and cost the seam.
         result = row.get("result")
         if isinstance(result, dict):
             result = result.get("text")
