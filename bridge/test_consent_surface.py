@@ -409,3 +409,66 @@ def test_a_reply_that_arrived_instantly_is_still_judged(monkeypatch):
     B._run_tool_probe()
 
     assert recorded[-1] == (False, "error")
+
+
+# ---------------------------------------------------------------------------------------
+# A FAILURE CAUSED BY THE CONVERSATION MUST NOT KEEP THE CONVERSATION THAT CAUSED IT.
+#
+# The probe sends the same request into the same conversation every ten minutes, so the agent
+# accumulates a history of being asked and eventually answers the history: "疎通は確認済みの
+# ため、この1件ずつの反復は実行しません". Nothing was wrong with the tool path -- the reply
+# says so. But the recycle was gated on ok, so the one thing that would clear that context
+# never ran, and the refusal could not expire. Four cycles in a row, escalating.
+# ---------------------------------------------------------------------------------------
+
+def _patch_recycle(monkeypatch):
+    calls = []
+    monkeypatch.setattr(B, "_recycle_long_conversation",
+                        lambda force=False: calls.append(force) or True)
+    monkeypatch.setattr(B, "_PROBE_FAIL_STREAK", 0)
+    return calls
+
+
+def _run_failing_probe(monkeypatch, n):
+    for _ in range(n):
+        _patch_probe_plumbing(monkeypatch, [(True, "no, I will not repeat this", False)],
+                              arrived=False)
+        B._run_tool_probe()
+
+
+def test_one_failure_does_not_throw_away_the_evidence(monkeypatch):
+    """The original reasoning, preserved: a single failure must not be recycled away."""
+    _reset_state(monkeypatch)
+    _patch_surface(monkeypatch, [])
+    monkeypatch.setattr(B.tool_probe, "record_probe", lambda *a, **kw: None)
+    calls = _patch_recycle(monkeypatch)
+
+    _run_failing_probe(monkeypatch, 1)
+
+    assert calls == [], "a single failure recycled the conversation"
+
+
+def test_a_run_of_failures_replaces_the_conversation(monkeypatch):
+    _reset_state(monkeypatch)
+    _patch_surface(monkeypatch, [])
+    monkeypatch.setattr(B.tool_probe, "record_probe", lambda *a, **kw: None)
+    calls = _patch_recycle(monkeypatch)
+
+    _run_failing_probe(monkeypatch, B.PROBE_STUCK_CONVERSATION_FAILURES)
+
+    assert calls == [True], "the stuck conversation was never replaced (or not forced)"
+
+
+def test_a_success_clears_the_streak(monkeypatch):
+    """Otherwise unrelated failures spread over hours would eventually trip it."""
+    _reset_state(monkeypatch)
+    _patch_surface(monkeypatch, [])
+    monkeypatch.setattr(B.tool_probe, "record_probe", lambda *a, **kw: None)
+    calls = _patch_recycle(monkeypatch)
+
+    _run_failing_probe(monkeypatch, B.PROBE_STUCK_CONVERSATION_FAILURES - 1)
+    _patch_probe_plumbing(monkeypatch, [(True, "ok", False)], arrived=True)
+    B._run_tool_probe()
+    _run_failing_probe(monkeypatch, B.PROBE_STUCK_CONVERSATION_FAILURES - 1)
+
+    assert True not in calls, "the streak survived a success"
