@@ -345,3 +345,64 @@ if __name__ == "__main__":
     test_judge_prompt_contains_text_and_verdict_words()
     test_parse_judge_verdict()
     print("ALL QUALITY TESTS PASSED")
+
+
+# --------------------------------------------------------------------------------------------------
+# A RECORDED TRANSCRIPT PATH OUTLIVES THE UNCOMPRESSED FILE.
+#
+# A run stores the path its transcript had when it finished; transcripts are gzipped as they
+# age. _read_jsonl_last_assistant opened that path directly and swallowed the resulting
+# FileNotFoundError into None, so grading quietly stopped reading transcripts for older runs
+# and fell through to another body source without saying so. Measured on the live machine
+# 2026-09-06: 16 of 16 recorded transcripts had already become .jsonl.gz, i.e. the plain-path
+# reader was returning None for every record it was asked about.
+# --------------------------------------------------------------------------------------------------
+
+def _write_jsonl(path, rows):
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        for r in rows:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+_TRANSCRIPT_ROWS = [
+    {"meta": True, "ts": 1.0},
+    {"role": "user", "text": "hello", "ts": 2.0},
+    {"role": "assistant", "text": "the last assistant line", "ts": 3.0},
+]
+
+
+def test_the_last_assistant_line_is_read_from_a_plain_transcript():
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "r1_w0.jsonl")
+        _write_jsonl(p, _TRANSCRIPT_ROWS)
+        assert Q._read_jsonl_last_assistant(p) == "the last assistant line"
+
+
+def test_the_same_line_is_read_after_the_transcript_has_been_gzipped():
+    """THE regression: the caller still holds the .jsonl path, only a .jsonl.gz exists."""
+    import gzip
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "r1_w0.jsonl")
+        with gzip.open(p + ".gz", "wt", encoding="utf-8", newline="\n") as fh:
+            for r in _TRANSCRIPT_ROWS:
+                fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+        assert not os.path.isfile(p)
+        assert Q._read_jsonl_last_assistant(p) == "the last assistant line"
+
+
+def test_a_transcript_that_exists_in_neither_form_is_still_none():
+    """The contract the fix must not cost: a genuinely missing transcript reads as None
+    rather than raising into the grading path."""
+    with tempfile.TemporaryDirectory() as d:
+        assert Q._read_jsonl_last_assistant(os.path.join(d, "absent.jsonl")) is None
+
+
+def test_the_plain_file_wins_when_both_forms_exist():
+    """A stale .gz beside a current .jsonl must not shadow it."""
+    import gzip
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "r1_w0.jsonl")
+        _write_jsonl(p, _TRANSCRIPT_ROWS)
+        with gzip.open(p + ".gz", "wt", encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps({"role": "assistant", "text": "STALE", "ts": 3.0}) + "\n")
+        assert Q._read_jsonl_last_assistant(p) == "the last assistant line"

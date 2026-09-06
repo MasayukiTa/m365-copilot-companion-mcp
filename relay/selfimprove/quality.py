@@ -159,6 +159,25 @@ def score_text(text, goal=None):
 # 本文解決 (history item -> 採点対象テキスト)
 # --------------------------------------------------------------------------------------------------
 
+def _open_transcript(path):
+    """Open a recorded transcript, whether or not it has been compressed since it was written.
+
+    THE RECORD OUTLIVES THE UNCOMPRESSED FILE. A run stores the path its transcript had when
+    it finished; transcripts are gzipped as they age, so the stored path stops resolving and
+    every reader that opens it directly starts getting nothing. Here that surfaced as
+    _read_jsonl_last_assistant returning None -- caught by its own `except`, so grading simply
+    fell through to another body source and said nothing about it. Measured on this machine
+    2026-09-06: 16 of 16 recorded transcripts had already become .jsonl.gz.
+
+    Raises exactly like open() when neither form exists, so the caller's existing exception
+    handling and its "missing file -> None" contract are unchanged.
+    """
+    if not os.path.isfile(path) and os.path.isfile(path + ".gz"):
+        import gzip
+        return gzip.open(path + ".gz", "rt", encoding="utf-8")
+    return open(path, encoding="utf-8")
+
+
 def _read_jsonl_last_assistant(path):
     """jsonl transcript を読み、最後の role=="assistant" レコードの text を返す。
 
@@ -166,7 +185,7 @@ def _read_jsonl_last_assistant(path):
     """
     try:
         last = None
-        with open(path, encoding="utf-8") as f:
+        with _open_transcript(path) as f:
             for line in f:
                 line = line.strip()
                 if not line:
