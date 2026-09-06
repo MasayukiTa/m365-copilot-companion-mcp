@@ -5382,8 +5382,24 @@ def _bridge_edge_root_pid():
     return None
 
 
-def _recycle_long_conversation():
+#: Consecutive failed probes after which the conversation itself is treated as the fault and
+#: replaced. Not 1: a single failure is usually about the world, and the existing comment at
+#: the call site is right that recycling then would throw away the evidence. By the third in a
+#: row the evidence has been recorded three times and the conversation is the thing that has
+#: not changed.
+PROBE_STUCK_CONVERSATION_FAILURES = max(
+    2, int(os.environ.get("MCP_PROBE_STUCK_CONVERSATION_FAILURES", "3"))
+)
+
+#: Consecutive probe failures so far. Reset by any success.
+_PROBE_FAIL_STREAK = 0
+
+
+def _recycle_long_conversation(force=False):
     """Start a fresh conversation once the current one has run long enough.
+
+    `force` skips the length/idle thresholds, for the case where the conversation is not
+    merely old but poisoned -- see the streak handling in _run_tool_probe.
 
     Called from the idle probe AFTER its result is recorded, so a recycle never lands between
     the transitional "checking" state and the authoritative one -- the health surface would
@@ -5393,7 +5409,7 @@ def _recycle_long_conversation():
     """
     global _PERIODIC_RECYCLES, _BRIDGE_RECYCLES, _RECYCLE_PENDING_BEFORE_MB
     since_user = time.time() - _LAST_USER_TURN_TS
-    if not tool_probe.should_recycle_conversation(
+    if not force and not tool_probe.should_recycle_conversation(
             _CONVERSATION_TURNS, BRIDGE_CONVERSATION_MAX_TURNS,
             since_user, BRIDGE_RECYCLE_MIN_IDLE_SEC):
         return False
@@ -5922,7 +5938,23 @@ def _run_tool_probe():
             _report_recycle_memory_effect()
         except Exception:
             pass
+        # THE CONVERSATION CAN BE THE FAULT, AND THEN NOT RECYCLING IT IS A LATCH.
+        #
+        # Recycling only on success is right for ONE failure -- the comment below is correct
+        # that it would otherwise replace the evidence with a blank page. But the probe sends
+        # the same request into the SAME conversation every ten minutes, so the agent
+        # accumulates a history of being asked, and eventually answers the history instead of
+        # the question. Measured, four cycles running, escalating each time:
+        #   17:46  "呼び出せた。ただし…これ以上1件ずつのループは続けません"
+        #   17:56  "呼び出せます（疎通は確認済み）。ただしこの1件ずつの繰り返しは実行しません"
+        #   18:07  "同じ回答です。…この1件ずつの反復は実行しません"
+        # Nothing was wrong with the tool path in any of them -- it says so itself. And with
+        # the recycle gated on ok, the one thing that would clear that context never ran, so
+        # the refusal could not expire: a failure caused by the conversation kept the
+        # conversation that caused it.
+        global _PROBE_FAIL_STREAK
         if ok:
+            _PROBE_FAIL_STREAK = 0
             # ONLY AFTER A GOOD PROBE, and only after the record above. Recycling a
             # conversation that just failed would replace the evidence of the failure with a
             # blank page, and the next probe would report a healthy bridge that had never been
@@ -5931,6 +5963,20 @@ def _run_tool_probe():
                 _recycle_long_conversation()
             except Exception:
                 logger.warning("conversation recycle raised", exc_info=True)
+        else:
+            _PROBE_FAIL_STREAK += 1
+            if _PROBE_FAIL_STREAK >= PROBE_STUCK_CONVERSATION_FAILURES:
+                # The evidence is already on disk -- record_probe and journal_probe_failure
+                # both ran above, this time and the previous times -- so the objection to
+                # recycling after a failure does not apply once the streak is this long.
+                logger.info("tool probe: %d consecutive failures -- replacing the "
+                            "conversation, which is the thing that has not changed",
+                            _PROBE_FAIL_STREAK)
+                _PROBE_FAIL_STREAK = 0
+                try:
+                    _recycle_long_conversation(force=True)
+                except Exception:
+                    logger.warning("conversation recycle raised", exc_info=True)
         if _page_probe_requires_restart(kind):
             try:
                 tool_probe.record_probe(
