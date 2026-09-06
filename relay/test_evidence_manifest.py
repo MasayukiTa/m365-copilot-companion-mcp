@@ -254,3 +254,67 @@ def test_reading_the_pieces_does_not_accept_the_wrong_command():
     assert not EM.matches_check("echo pytest -x", "pytest -x")
     assert not EM.matches_check("pytest --collect-only -x", "pytest -x")
     assert not EM.matches_check("npm run lint && npm run build", "npm test")
+
+
+# ── a refusal is not a pass, and not a write ──────────────────────────────────────────────
+#
+# A gated tool that is denied returns its refusal as a NORMAL return value, so the gateway
+# recorded it with ok=True and an empty error. Measured on the live ledger: 233 refused
+# run_python/shell_exec calls and 39 refused writes. Read raw, this module took a refusal as
+# "the acceptance command passed" and as "a write happened" -- confirming a DONE on the
+# strength of a call that was turned away.
+
+REFUSAL = ("[locked: no valid unlock token for '203.0.113.7'] The identity in the forwarding "
+           "header is not sufficient on its own. Call unlock(password='<password>').")
+
+
+def refused(tool, ts, command=None, task="t1"):
+    """A call the server turned away, recorded the way the pre-fix gateway recorded it."""
+    args = {}
+    if command is not None:
+        args["command"] = {"text": command}
+    return {"call": {"tool": tool, "ts": ts, "task": task, "args": args},
+            "outcome": {"event": "outcome", "ok": True, "error": "", "ts": ts + 1,
+                        "result": {"text": REFUSAL, "len": len(REFUSAL),
+                                   "sha16": "0" * 16, "truncated": False}}}
+
+
+def test_a_refused_acceptance_command_does_not_confirm_the_claim():
+    events = [call("write_file", 100), refused("shell_exec", 200, command="pytest -x")]
+    v = EM.assess(True, CONTRACT, events)
+    assert v["evidence"]["check_runs_passed_after_last_write"] == 0
+    assert v["verdict"] != EM.SUPPORTED
+
+
+def test_a_refused_write_is_not_a_write():
+    # Only writes were attempted, and every one was refused: nothing changed in the workspace.
+    events = [refused("write_file", 100), call("shell_exec", 200, command="pytest -x")]
+    v = EM.assess(True, CONTRACT, events)
+    assert v["evidence"]["writes"] == 0
+
+
+def test_a_run_that_only_refused_writes_is_not_reported_as_completed_work():
+    events = [refused("write_file", 100), refused("replace_in_file", 110)]
+    v = EM.assess(True, CONTRACT, events)
+    # No write landed and nothing that could write was run -- the record contradicts the DONE.
+    assert v["verdict"] == EM.CONTRADICTED
+
+
+def test_a_genuine_pass_is_still_a_pass():
+    """The correction must not cost a real completion its verdict."""
+    events = [call("write_file", 100), call("shell_exec", 200, command="pytest -x")]
+    assert EM.assess(True, CONTRACT, events)["verdict"] == EM.SUPPORTED
+
+
+def test_the_correction_survives_an_outcome_that_kept_no_event_key():
+    """The seam: for_task hands over whole rows, but a caller may reshape them.
+
+    row_ok must not depend on row["event"], or this module silently reverts to reading the
+    raw verdict while both sides' tests still pass.
+    """
+    from tools import tool_ledger as L
+    bare = {"ok": True, "ts": 1.0,
+            "result": {"text": REFUSAL, "len": len(REFUSAL), "sha16": "0" * 16,
+                       "truncated": False}}
+    assert L.row_ok(bare) is False
+    assert EM._outcome_ok({"outcome": bare}) is False
