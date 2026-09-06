@@ -267,3 +267,49 @@ def test_the_registration_wrapper_only_ever_runs_in_the_server_process():
         "register() is imported outside the server process by %s; the ledger write inside its "
         "wrapper can no longer be assumed to hold the credentials it must redact."
         % sorted(importers - {"main.py"}))
+
+
+# -- which session a call arrived on, recorded so the gate can be designed on evidence --------
+
+def test_the_session_is_recorded_as_a_hash_not_the_identifier():
+    """A live session id in a file written on every tool call is a thing to lose, not a label."""
+    import hashlib
+    sid = "abc123-session"
+    expected = hashlib.sha256(sid.encode()).hexdigest()[:16]
+    assert len(expected) == 16
+    # the helper hashes whatever it finds; with no request context there is nothing to find
+    assert TL.session_fingerprint() == ""
+
+
+def test_a_call_outside_a_request_records_no_session(_held):
+    """Tests, the CLI and in-process hooks have no session. Writing an empty field for them
+    would put a column of blanks in the file that is supposed to answer the question.
+
+    Uses the autouse _held fixture rather than patching LEDGER_PATH: that fixture already
+    overrides _repo_path, so a second redirect goes nowhere and the assertion reads an empty
+    file -- which is how the first version of this test failed.
+    """
+    TL.record_call("something", {"a": 1})
+    rows = [json.loads(l) for l in io.open(str(_held), encoding="utf-8") if l.strip()]
+    assert rows and "session" not in rows[0]
+
+
+def test_the_session_reaches_the_row_when_there_is_one(_held, monkeypatch):
+    """THE MEASUREMENT ITSELF. Both writers of this ledger have to carry it -- the call_tool
+    gateway and register()'s wrapper for directly registered tools -- which is why it is taken
+    inside record_call rather than at either caller."""
+    monkeypatch.setattr(TL, "session_fingerprint", lambda: "0123456789abcdef")
+    TL.record_call("something", {"a": 1})
+    rows = [json.loads(l) for l in io.open(str(_held), encoding="utf-8") if l.strip()]
+    assert rows[0]["session"] == "0123456789abcdef"
+
+
+def test_recording_the_session_cannot_break_a_tool_call(_held, monkeypatch):
+    """It is bookkeeping. A tool call must not fail because the label could not be computed."""
+    def explode():
+        raise RuntimeError("no context here")
+
+    monkeypatch.setattr(TL, "session_fingerprint", explode)
+    TL.record_call("something", {"a": 1})   # must not raise
+    rows = [json.loads(l) for l in io.open(str(_held), encoding="utf-8") if l.strip()]
+    assert rows and rows[0]["tool"] == "something"
