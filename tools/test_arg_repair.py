@@ -108,9 +108,23 @@ def test_an_unreadable_signature_is_not_treated_as_an_error():
     assert got["action"] == R.RUN
 
 
-def test_empty_arguments_are_left_alone():
+def test_empty_arguments_are_not_rewritten_when_the_tool_can_run_on_them():
+    """Empty arguments are still never REMAPPED -- there is nothing to move. What changed is
+    that "no wrong names" no longer implies "callable": a tool with an unfilled required
+    parameter is explained instead of being handed to fn(**{}) to die on a bare TypeError."""
+    def all_optional(start_line: int = 1, end_line: int = 0) -> str:
+        return "ok"
+
+    got = R.repair(all_optional, {}, name="all_optional", read_only=True)
+    assert got["action"] == R.RUN and got["arguments"] == {} and not got["message"]
+
+
+def test_empty_arguments_on_a_tool_with_a_required_parameter_are_explained():
+    """read_file(path) cannot run on {}. This returned RUN before, and the caller's reward was
+    "missing 1 required positional argument" with no statement of the accepted form."""
     got = R.repair(read_file, {}, name="read_file", read_only=True)
-    assert got["action"] == R.RUN
+    assert got["action"] == R.EXPLAIN, got
+    assert "path" in got["message"]
 
 
 @pytest.mark.parametrize("guess", ["query", "task", "keywords", "scenario"])
@@ -118,3 +132,75 @@ def test_every_name_agents_actually_guessed_for_the_skill_lookup(guess):
     """All four appear in the ledger against skill_match."""
     got = R.repair(skill_match, {guess: "x"}, name="skill_match", read_only=True)
     assert got["action"] == R.REMAPPED and got["arguments"] == {"text": "x"}
+
+
+# ── the gateway's own envelope, arriving one level too deep ───────────────────────────────────
+
+def _unlock_like(password: str) -> str:
+    """Stand-in with the real unlock's shape: one required parameter, mutating."""
+    return "unlocked:" + password
+
+
+def test_the_gateway_envelope_is_unwrapped_even_for_a_mutating_tool():
+    """THE CALL THAT LOCKS A CALLER OUT OF THE SERVER.
+
+    call_tool(name=..., arguments={...}) is the documented form, so a caller that forwards its
+    own parameters verbatim arrives as {"name": ..., "arguments": {...}} with the real payload
+    intact one wrapper out. Measured in .fleet/tool_events.jsonl: unlock was called exactly this
+    way, with the correct password inside the envelope, and refused. Every mutating tool is
+    gated behind unlock, so that one refusal ends the conversation's ability to do anything.
+
+    Unlike the remap below this is not a guess -- the keys are the gateway's own two parameter
+    names and the payload is a dict -- so it is unwrapped for mutating tools too.
+    """
+    plan = R.repair(_unlock_like, {"name": "unlock", "arguments": {"password": "s3cret"}},
+                  name="unlock", read_only=False)
+    assert plan["action"] == R.RUN, plan
+    assert plan["arguments"] == {"password": "s3cret"}
+    assert _unlock_like(**plan["arguments"]) == "unlocked:s3cret"
+
+
+def test_an_envelope_naming_a_different_tool_is_not_unwrapped():
+    """The name inside the envelope must agree with the tool being dispatched. If it does not,
+    the caller meant something else and unwrapping would run this tool on another's payload."""
+    plan = R.repair(_unlock_like, {"name": "shell_exec", "arguments": {"password": "s3cret"}},
+                  name="unlock", read_only=False)
+    assert plan["action"] == R.EXPLAIN, plan
+
+
+def test_a_tool_that_really_takes_name_and_arguments_is_left_alone():
+    """The guard that keeps the unwrap from eating a legitimate signature."""
+    def gateway_like(name=None, arguments=None):
+        return (name, arguments)
+
+    plan = R.repair(gateway_like, {"name": "x", "arguments": {"a": 1}},
+                  name="gateway_like", read_only=True)
+    assert plan["action"] == R.RUN
+    assert plan["arguments"] == {"name": "x", "arguments": {"a": 1}}, (
+        "a tool whose own parameters are name/arguments was unwrapped out from under itself")
+
+
+# ── nothing unexpected is not the same as callable ────────────────────────────────────────────
+
+def test_a_call_missing_a_required_argument_is_explained_not_run():
+    """`{}` has no wrong names in it, so this returned RUN and the call reached fn(**{}) and
+    died on a bare "missing 1 required positional argument". 26 calls ended that way."""
+    plan = R.repair(_unlock_like, {}, name="unlock", read_only=False)
+    assert plan["action"] == R.EXPLAIN, plan
+    assert "password" in plan["message"]
+    assert "nothing was run" in plan["message"]
+
+
+def test_the_name_only_envelope_asks_for_what_is_missing():
+    """{"name": "unlock"} unwraps to {} -- there is genuinely no password in it. The caller
+    should be told what to supply, not handed a TypeError."""
+    plan = R.repair(_unlock_like, {"name": "unlock"}, name="unlock", read_only=False)
+    assert plan["action"] == R.EXPLAIN, plan
+    assert "missing required 'password'" in plan["message"]
+
+
+def test_a_satisfied_call_still_runs_untouched():
+    """The regression guard: the new required-argument check must not block correct calls."""
+    plan = R.repair(_unlock_like, {"password": "s3cret"}, name="unlock", read_only=False)
+    assert plan["action"] == R.RUN
+    assert plan["arguments"] == {"password": "s3cret"}

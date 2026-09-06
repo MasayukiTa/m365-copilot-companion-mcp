@@ -78,15 +78,57 @@ def repair(fn, arguments, name="", read_only=False):
     """
     args = dict(arguments or {})
     names, required, var_kw = accepted(fn)
+
+    # THE CALLER PASSED THE GATEWAY'S OWN ENVELOPE ONE LEVEL TOO DEEP.
+    #
+    # call_tool(name=..., arguments={...}) is the documented form, and a caller that forwards
+    # its own parameters verbatim arrives here as {"name": "<tool>", "arguments": {...}} -- the
+    # real arguments intact, one wrapper out. This is NOT a guess like the remap below: the keys
+    # are the gateway's two parameter names, `name` repeats the tool already being dispatched,
+    # and the payload is a dict. There is no second reading, so it is unwrapped for mutating
+    # tools too, where a guess would never be allowed.
+    #
+    # It matters because the refusal is silent about having the answer in hand. Measured on
+    # .fleet/tool_events.jsonl: unlock was called this way with the correct password inside the
+    # envelope and refused -- and unlock is the call that every mutating tool is gated behind,
+    # so one such refusal locks the caller out of the server for the rest of the conversation.
+    # 20 calls arrived carrying 'arguments' and 79 carrying 'name'.
+    #
+    # Guarded on the tool not having parameters of those names, so a tool that genuinely takes
+    # `name` or `arguments` is never unwrapped out from under itself.
+    _envelope_name_agrees = ("name" not in args
+                             or not name
+                             or str(args["name"]) == str(name))
+    if (args and not (names & {"name", "arguments"})
+            and set(args) <= {"name", "arguments"}
+            and isinstance(args.get("arguments", {}), dict)
+            and _envelope_name_agrees):
+        args = dict(args.get("arguments") or {})
+
     if var_kw:
         # The tool takes **kwargs, so nothing is unexpected and there is nothing to repair.
         return {"action": RUN, "arguments": args, "message": ""}
 
     unexpected = [k for k in args if k not in names]
-    if not unexpected:
-        return {"action": RUN, "arguments": args, "message": ""}
-
     unfilled = [p for p in required if p not in args]
+    if not unexpected:
+        if not unfilled:
+            return {"action": RUN, "arguments": args, "message": ""}
+        # NOTHING UNEXPECTED IS NOT THE SAME AS CALLABLE. An empty {} has no wrong names in it,
+        # so this returned RUN and the call reached fn(**{}) and died on a bare
+        # "missing 1 required positional argument". 26 calls ended that way. The caller is told
+        # what to supply instead, in the same shape as every other explanation here.
+        return {
+            "action": EXPLAIN,
+            "arguments": args,
+            "message": ("[call_tool %s: missing required %s. The accepted form is %s. "
+                        "Call it again with %s -- nothing was run.]"
+                        % (name or getattr(fn, "__name__", "tool"),
+                           ", ".join("'%s'" % u for u in sorted(unfilled)),
+                           signature_text(fn, name),
+                           ", ".join(sorted(required)))),
+        }
+
     sig = signature_text(fn, name)
 
     # THE ONLY CASE THAT IS FORCED. One name the tool does not know, one required parameter
