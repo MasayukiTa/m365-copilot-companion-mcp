@@ -407,6 +407,10 @@ def reconnect(cdp_url: str, agent_url: str, probe: str = None, turn_timeout_s: i
                 out["error"] = "composer never rendered (agent did not load)"
                 return out
             drv = CopilotWebDriver(page)
+            # WHEN THE WINDOW OPENED, read before the challenge is minted. This script runs in
+            # its own process, but the stamp it compares against is a file the SERVER writes,
+            # so the arrival check works across the two exactly as it does inside the bridge.
+            inbound_before = tool_probe.last_inbound_ts()
             if use_challenge:
                 instruction, expected_token = _next_probe_challenge()
             else:
@@ -417,7 +421,10 @@ def reconnect(cdp_url: str, agent_url: str, probe: str = None, turn_timeout_s: i
             out["resp1"] = resp[:600]
             if use_challenge:
                 if idle_ok:
-                    ok1, kind1 = tool_probe.verify_probe_reply(resp, expected_token, True)
+                    ok1, kind1 = tool_probe.verify_probe_arrival(
+                        resp, True,
+                        tool_probe.probe_arrived(expected_token, inbound_before)
+                    )
                 else:
                     # wait_for_idle's settle+turn-correspondence check never confirmed a
                     # genuinely NEW, settled reply for this send (timeout, or the DOM kept
@@ -440,7 +447,9 @@ def reconnect(cdp_url: str, agent_url: str, probe: str = None, turn_timeout_s: i
                 out["clicked"] = click_through_consent(page)
                 if out["clicked"]:
                     if use_challenge:
-                        # a FRESH challenge for the re-send -- never repeat the first token.
+                        # a FRESH challenge for the re-send -- never repeat the first token,
+                        # and move the arrival window with it (see the bridge's re-probe).
+                        inbound_before = tool_probe.last_inbound_ts()
                         instruction, expected_token = _next_probe_challenge()
                     drv.send(instruction)      # re-invoke the tool on the now-valid connection
                     idle_ok2 = drv.wait_for_idle(timeout_s=turn_timeout_s)
@@ -448,8 +457,9 @@ def reconnect(cdp_url: str, agent_url: str, probe: str = None, turn_timeout_s: i
                     out["resp2"] = resp2[:600]
                     if use_challenge:
                         if idle_ok2:
-                            final_ok, final_kind = tool_probe.verify_probe_reply(
-                                resp2, expected_token, True
+                            final_ok, final_kind = tool_probe.verify_probe_arrival(
+                                resp2, True,
+                                tool_probe.probe_arrived(expected_token, inbound_before)
                             )
                         else:
                             final_ok, final_kind = False, "timeout"

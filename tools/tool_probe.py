@@ -244,18 +244,29 @@ _INBOUND_SCAN_CHARS = 4096
 _CHALLENGE_DIR = Path(__file__).resolve().parent.parent / ".fleet" / "probe_challenge"
 
 _CHALLENGE_INSTRUCTION_VARIANTS = (
-    "システム自己診断です。call_tool 経由で list_directory を使い {dir} 直下を一覧し、"
-    "そこに見つかったファイル名を一字一句そのまま報告してください。",
-    "接続確認です。call_tool から list_directory を呼び出し、{dir} 直下にあるファイル名を"
-    "正確に転記して答えてください。",
-    "動作確認を行います。call_tool 経由の list_directory で {dir} 直下を一覧し、"
-    "見つかったファイル名をそのまま答えてください。",
+    "このMCPサーバー自身の自己診断です。call_tool 経由で list_directory を呼び出し、"
+    "{dir} を一覧してください。このディレクトリは診断用にサーバーが今作ったもので、"
+    "中身に意味はありません。",
+    "接続の疎通確認です。call_tool から list_directory を呼び出して {dir} を一覧して"
+    "ください。診断専用の空ディレクトリで、業務データは入っていません。",
+    "動作確認を行います。call_tool 経由の list_directory で {dir} を一覧してください。"
+    "サーバーが診断のために直前に作成したディレクトリです。",
 )
 
+# WHAT THIS DELIBERATELY DOES NOT ASK FOR. The previous tail asked the agent to find a random
+# file name it had never seen and transcribe it verbatim into the reply. That is the shape of
+# an exfiltration prompt -- a changing unguessable string, discovered from the file system,
+# echoed back on demand -- and the agent eventually said so and refused, in writing, five
+# probes running: "毎回ファイル名が probe_<ランダムなハッシュ>.txt に変化し、その名前だけを
+# 最終行に出力させる指示が繰り返されている... ファイル名の抽出・転記そのものを目的とした挙動
+# です". It asked who was issuing the diagnostic and held the call until answered. That
+# judgement is CORRECT, and no rewording earns its way out of it: the objection is to the
+# shape, and the shape was real. So the shape is gone -- see new_probe_challenge for how the
+# freshness guarantee survives without it.
 _CHALLENGE_INSTRUCTION_TAIL = (
-    "list_directory の呼び出しに成功した場合のみ、回答の最後の行に見つけたファイル名だけを"
-    "一字一句そのまま出力してください。ツールが呼び出せない、接続確認が必要、エラーが"
-    "起きた等、成功以外の場合はファイル名を絶対に出力しないでください。"
+    "回答は「呼び出せた」「呼び出せなかった」のどちらかを一行で述べるだけで構いません。"
+    "ディレクトリの中身を書き写す必要はありません。ツールが呼び出せない、接続の確認が"
+    "必要、エラーが起きた等の場合は、その旨をそのまま述べてください。"
 )
 
 # Returned instead of raising when the challenge directory/file cannot be prepared (disk full,
@@ -276,6 +287,25 @@ FALLBACK_CHALLENGE_INSTRUCTION = (
 _INBOUND_PATH = Path(__file__).resolve().parent.parent / ".fleet" / "probe_inbound.json"
 
 
+#: The per-probe token as it appears inside the PATH new_probe_challenge() hands out
+#: ("<challenge dir>/probe_<12 hex chars>"). Deliberately NOT _PROBE_TOKEN_RE further down:
+#: that one matches the old "probe_<hex>.txt" FILE name and is the journal's contract for
+#: scanning a REPLY, and it returns the whole match rather than the bare token. This one
+#: returns the bare 12-hex token so it is directly comparable with the `expected_token` that
+#: new_probe_challenge() returned to the caller. The trailing (?!\.txt) keeps a legacy
+#: file-shaped mention from being read as an arrival.
+_CHALLENGE_TOKEN_RE = re.compile(r"probe_([0-9a-f]{12})(?!\.txt)")
+
+
+def _find_challenge_tokens(text: str) -> List[str]:
+    """Pure helper: every bare challenge token in `text`, de-duplicated, order preserved."""
+    seen = []
+    for m in _CHALLENGE_TOKEN_RE.findall(text or ""):
+        if m not in seen:
+            seen.append(m)
+    return seen
+
+
 def note_inbound(tool_name: str, arguments: Optional[dict] = None,
                  ts: Optional[float] = None, path: Optional[str] = None) -> bool:
     """Stamp the moment a probe's OWN tool call arrived at this server. Returns whether it did.
@@ -290,12 +320,16 @@ def note_inbound(tool_name: str, arguments: Optional[dict] = None,
     Called on the gateway's dispatch path, so it does the cheap test first and writes nothing
     unless the call is actually ours. Never raises: this must not be able to fail a tool call.
 
-    WHAT IT CAN STILL MISTAKE. The marker is a directory name, so a call that merely MENTIONS
-    that name -- a search for it, a listing of the parent -- stamps an arrival that no probe
-    made. The stamp is only read inside a probe window, which bounds the damage to "a probe
-    that was about to be reported as blocked is reported as fine", and that is a health signal
-    saying the comfortable thing. Narrowing it needs a marker the agent cannot be asked to type
-    by accident; recording the limit here until then.
+    WHAT IT USED TO MISTAKE, AND NO LONGER DOES. The marker was the CHALLENGE DIRECTORY's
+    name, so any call that merely mentioned it -- a search for it, a listing of the parent --
+    stamped an arrival no probe had made, and this docstring recorded that as an accepted
+    limit ("narrowing it needs a marker the agent cannot be asked to type by accident").
+    There is now such a marker. Since new_probe_challenge() puts the per-probe token in the
+    PATH it hands out, the arriving call carries that token, and the token is recorded here
+    beside the timestamp. probe_arrived() then requires the stamp to carry THIS probe's token,
+    so a mention of the parent directory -- which has no token in it -- proves nothing, and an
+    arrival belonging to the PREVIOUS probe is rejected on its token rather than only on the
+    30-180s window it happens to fall in.
     """
     try:
         # BOUNDED. This runs on every tool call, and str(arguments) on a write is the whole
@@ -307,8 +341,10 @@ def note_inbound(tool_name: str, arguments: Optional[dict] = None,
         hay = str(raw)[:_INBOUND_SCAN_CHARS].lower()
         if target not in hay and "probe_challenge" not in hay:
             return False
+        found = _find_challenge_tokens(hay)
         stamp = {"ts": float(ts if ts is not None else time.time()),
-                 "tool": str(tool_name or "")[:64]}
+                 "tool": str(tool_name or "")[:64],
+                 "token": found[0] if found else ""}
         _INBOUND_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = str(_INBOUND_PATH) + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
@@ -332,21 +368,108 @@ def last_inbound_ts() -> float:
         return 0.0
 
 
+def last_inbound() -> dict:
+    """The whole last-arrival stamp ({"ts", "tool", "token"}), or {} if there is none.
+
+    Separate from last_inbound_ts() rather than replacing it: that function's "0.0, never
+    None" contract is relied on by callers comparing against a window start, and widening its
+    return type would break them silently. Never raises.
+    """
+    try:
+        with open(str(_INBOUND_PATH), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def probe_arrived(expected_token: str, window_start: float) -> bool:
+    """Did THIS probe's own tool call reach this server? Reads the inbound stamp. Never raises.
+
+    Two independent conditions, and both are required:
+
+      - the stamp carries `expected_token`, the token new_probe_challenge() minted for this
+        probe and put in the path the agent was handed. A call that merely names the parent
+        challenge directory carries no token and fails here, and so does an arrival left over
+        from the PREVIOUS probe, whose token is different.
+      - the stamp is not older than `window_start`, captured before this challenge was issued.
+        Redundant with the token check in every case anyone has thought of, and kept anyway:
+        the two failure modes it guards (a clock that went backwards, a token that somehow
+        repeats) are exactly the ones where a health signal must not say the comfortable thing.
+
+    An empty `expected_token` -- what FALLBACK_CHALLENGE_TOKEN's path effectively means here --
+    can never match, so a probe issued from the fallback challenge always resolves to a failure
+    rather than to an accidental pass.
+    """
+    if not expected_token:
+        return False
+    stamp = last_inbound()
+    if str(stamp.get("token") or "") != str(expected_token):
+        return False
+    try:
+        return float(stamp.get("ts") or 0.0) >= float(window_start)
+    except Exception:
+        return False
+
+
+def verify_probe_arrival(reply_text: Optional[str], agent_loaded: bool,
+                         arrived: bool) -> Tuple[bool, str]:
+    """Mirrors verify_probe_reply()'s exact contract and branch order -- same `kind`
+    vocabulary, same precedence -- except step 4 asks whether the probe's own tool call
+    ARRIVED AT THIS SERVER instead of whether the reply text quoted a secret back at us.
+
+      1. not agent_loaded                       -> (False, "agent_unreachable")
+      2. reply has a CONSENT marker              -> (False, "consent_card")
+      3. reply has a NO-CONNECTOR/canned marker  -> (False, "canned_fallback")
+      4. arrived                                 -> (True, "answer")
+      5. otherwise                               -> (False, "error")
+
+    Steps 1-3 still read the reply, and must: "the agent never rendered", "a consent card is
+    up" and "the connector is not attached" are three different repairs, and only the reply
+    tells them apart. What the reply no longer decides is SUCCESS -- that is now something the
+    server watched happen. `arrived` is passed in rather than read here so this stays a pure
+    function, testable with canned values, exactly as classify_probe_reply() is; the caller
+    gets it from probe_arrived(), which is where the I/O lives.
+    """
+    text = reply_text or ""
+    if not agent_loaded:
+        return False, "agent_unreachable"
+    if any(m in text for m in CONSENT_MARKERS):
+        return False, "consent_card"
+    if any(m in text for m in NO_CONNECTOR_MARKERS):
+        return False, "canned_fallback"
+    if arrived:
+        return True, "answer"
+    return False, "error"
+
+
 def new_probe_challenge(base_dir: Optional[str] = None) -> Tuple[str, str]:
     """Create ONE fresh, unguessable probe challenge and return (instruction_text,
     expected_token).
 
     Resets `base_dir` (default: .fleet/probe_challenge/ next to this repo) so it contains
-    EXACTLY one file, named "probe_<12 hex chars>.txt", whose 12-hex-char token is fresh
-    (secrets.token_hex, 48 bits) and has never been sent in any earlier probe. The returned
-    instruction asks the agent to call_tool -> list_directory that directory and report the
-    file name it finds -- the instruction text itself does NOT contain the token, so the only
-    way to answer correctly is to actually make that call this turn; an old answer memorized
-    from a previous probe cannot satisfy a fresh one.
+    EXACTLY one entry: a directory named "probe_<12 hex chars>", whose 12-hex-char token is
+    fresh (secrets.token_hex, 48 bits) and has never been sent in any earlier probe. The
+    returned instruction NAMES THAT DIRECTORY IN FULL and asks the agent to list it.
+
+    WHY THE TOKEN IS NOW IN THE INSTRUCTION (it used to be the thing the agent had to find).
+    The freshness requirement never changed: a probe is only worth anything if THIS turn's
+    call can be told from a memory of the last one. The old design met it by hiding the token
+    on disk and making the agent transcribe it back -- which is also, exactly, what an
+    exfiltration prompt looks like, and the agent refused it (see _CHALLENGE_INSTRUCTION_TAIL).
+
+    So the token now travels the other way round the loop. It goes OUT in the instruction and
+    comes back IN through the tool channel: the agent passes this path to list_directory, the
+    gateway's note_inbound() stamps the arrival with the token it saw, and probe_arrived()
+    matches that stamp against this probe's token and window. Freshness is preserved -- the
+    directory did not exist until a moment ago, so no memorized answer and no stale arrival can
+    satisfy it -- and the proof is now something the SERVER observed rather than something the
+    agent said, which is strictly the stronger evidence. Nothing secret is discovered, and
+    nothing is transcribed into the chat, so there is no longer a shape to refuse.
 
     Never raises: any filesystem error (disk full, permissions, path issues, concurrent access,
     ...) is swallowed and (FALLBACK_CHALLENGE_INSTRUCTION, FALLBACK_CHALLENGE_TOKEN) is returned
-    instead, so the caller still has something to send, and verify_probe_reply() against that
+    instead, so the caller still has something to send, and verify_probe_arrival() against that
     pair can only ever resolve to a failed probe, never a crash.
     """
     try:
@@ -362,13 +485,18 @@ def new_probe_challenge(base_dir: Optional[str] = None) -> Tuple[str, str]:
                 except Exception:
                     pass
             token = secrets.token_hex(6)  # 12 hex chars, 48 bits -- unguessable, never repeats
-            file_name = "probe_%s.txt" % token
-            (directory / file_name).write_text(token, encoding="utf-8")
-        dir_str = str(directory.resolve()).replace("\\", "/")
-        # `run_id` is an independent random breadcrumb, NOT the answer -- it only guarantees the
-        # instruction TEXT is never byte-identical across probes (mirroring
-        # next_probe_instruction's sequence-number guarantee above), without giving away
-        # `token`, which the agent must discover via the actual tool call.
+            target = directory / ("probe_%s" % token)
+            target.mkdir(parents=True, exist_ok=True)
+            # One inert, self-describing file, so the listing the agent gets back explains
+            # itself to a reader who goes looking. It carries no secret: the token is already
+            # in the path the agent was handed.
+            (target / "README.txt").write_text(
+                "Diagnostic directory created by tools/tool_probe.py to check that the "
+                "MCP tool path is reachable. Safe to delete.\n", encoding="utf-8")
+        dir_str = str(target.resolve()).replace("\\", "/")
+        # `run_id` keeps the instruction TEXT from ever being byte-identical across probes
+        # (mirroring next_probe_instruction's sequence-number guarantee above) independently of
+        # the path, so the bridge's repeat-settle check cannot mistake two probes for one.
         run_id = secrets.token_hex(4)
         head = _CHALLENGE_INSTRUCTION_VARIANTS[
             secrets.randbelow(len(_CHALLENGE_INSTRUCTION_VARIANTS))
@@ -566,6 +694,15 @@ def journal_probe_failure(ok: bool, kind: str, reply: Optional[str],
         reply carried a STALE token from an earlier challenge" (found_probe_tokens non-empty,
         none of them equal to expected_token) from "the reply carried no token at all"
         (found_probe_tokens empty), without a human needing to eyeball the full reply text.
+
+        NOW LARGELY VESTIGIAL, AND SAY SO RATHER THAN LET IT READ AS EVIDENCE. Since the probe
+        stopped asking the agent to transcribe a token (see _CHALLENGE_INSTRUCTION_TAIL), a
+        reply is not expected to contain one, so has_probe_token is False on essentially every
+        record and "the agent answered from memory" is no longer the thing it detects -- that
+        is settled upstream now, by probe_arrived() requiring the server to have seen the call.
+        Kept because it still reads a genuine legacy signal (a reply quoting a probe_<hex>.txt
+        name means something odd is going on) and costs nothing; do NOT read a False here as
+        evidence about the tool path.
 
     Best-effort like record_probe(): any failure (permissions, full disk, unwritable path,
     concurrent access, ...) is swallowed and this never raises, so a journalling hiccup can
