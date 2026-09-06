@@ -206,11 +206,28 @@ mcp = FastMCP(
         "matched Skill encodes decisions that were verified against the real data, and "
         "improvising past it has produced confident wrong answers. Skill trust never "
         "grants extra execution rights; unlock and contract gates still apply. "
-        "RULE 3: every tool lives BEHIND the call_tool gateway. Names like read_file / "
+        # 実測 2026-09-06 10:49-10:51: the owner sent two ordinary requests from a phone. The
+        # agent obeyed RULE 1 (catalogue, twice) and then tried to do the work itself: write_file
+        # and run_python both refused for want of an unlock token, it read .env three times
+        # looking for the password and was refused each time by the security guard, and it fell
+        # back to wandering the repo read-only. fleet_submit was never called once -- it is one
+        # of 175 names in a catalogue and nothing said it was the answer. Neither request
+        # reached the fleet. The door was measured working the same week; what was missing was
+        # any reason for the agent to use it.
+        "RULE 3 -- WORK TO BE CARRIED OUT GOES TO fleet_submit, NOT TO YOUR OWN HANDS. Your "
+        "connection has no unlock token, so write_file, run_python and shell WILL be refused, "
+        "and .env is refused too -- do not go looking for the password. When the request is a "
+        "TASK rather than a question (draft this, check that, run this, fix that, go and find "
+        "out), call fleet_submit(goal=<the whole instruction, verbatim>, source=<who asked>) "
+        "and say it is queued. fleet_submit is in your own tool list; it needs no unlock and no "
+        "gateway. A fleet runs on the owner's machine with the owner's own credentials and can "
+        "do what you cannot. Answer directly only when the request really is answerable with "
+        "read-only tools. "
+        "RULE 4: every tool lives BEHIND the call_tool gateway. Names like read_file / "
         "list_directory / run_python / glob are NOT in your own tool list and you will "
         "not find them there. Their absence from your tool list is EXPECTED and proves "
         "nothing. "
-        "RULE 4: you may never state that a capability is unavailable, that this "
+        "RULE 5: you may never state that a capability is unavailable, that this "
         "environment lacks filesystem access, or that only Microsoft 365 / GitHub tools "
         "are connected, unless you have already run call_tool(name='') in THIS "
         "conversation and the catalogue actually lacks what you need. Saying it without "
@@ -221,11 +238,11 @@ mcp = FastMCP(
         # 最初は「run_python で計算しろ」と書いたが、run_python は unlock 必須で、
         # 解錠に当たった回がまるごと拒否に戻り 5/10 -> 4/10 と悪化した。
         # そこで glob / list_directory 自身に件数を返させ、ここではそれを読めと言う。
-        "RULE 5: read-only listing tools (glob, list_directory, find_files) return "
+        "RULE 6: read-only listing tools (glob, list_directory, find_files) return "
         "the count on their FIRST line, e.g. '16 matches' or '16 files, 3 "
         "directories'. When asked how many, report THAT number verbatim. Never "
         "tally the listing yourself -- hand-counting is where answers drift. To count files of a kind, call glob('*.md', path) or list_directory(path, pattern='*.md') -- both filter first and hand you the number. Never enumerate an UNFILTERED list_directory and pick out the rows you want: every wrong answer measured came from doing that, and each one was low by one. If you want to cross-check, run both and compare the two first lines. Do not re-derive the number by picking rows out of an unfiltered listing: the run that did that had the correct count in hand, discarded it, and answered 15 instead of 16. "
-        "RULE 6: read-only tools (glob, list_directory, find_files, read_file, "
+        "RULE 7: read-only tools (glob, list_directory, find_files, read_file, "
         "search) need no unlock. Only mutating or executing tools (run_python, "
         "shell, write_file) do. Never refuse a read-only request on the grounds "
         "that you are not unlocked, and never reach for run_python when a "
@@ -241,7 +258,7 @@ mcp = FastMCP(
         # an agent reliably reads BEFORE its first refusal. It goes here, next to the unlock
         # sentence it modifies, because "carry a value between calls" is only free if the
         # instruction is in front of the model the whole time.
-        "RULE 7: unlock(password) replies with a line `unlock_token: <value>`. KEEP that "
+        "RULE 8: unlock(password) replies with a line `unlock_token: <value>`. KEEP that "
         "value for the rest of the conversation and pass it on every mutating or executing "
         "call: call_tool(name='run_python', arguments={...}, unlock_token='<value>'). It is "
         "shown once; if you lose it, call unlock again. A refusal mentioning a missing token "
