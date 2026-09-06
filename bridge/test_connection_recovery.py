@@ -24,6 +24,7 @@ which is how the missing reconnect survived in the first place.
 import logging
 import os
 import sys
+import time
 
 import pytest
 
@@ -374,3 +375,51 @@ def test_the_escalation_is_still_an_error(monkeypatch):
                                    wedged_for=B.PAGE_THREAD_WEDGE_LIMIT_S + 1) is True
     assert [lv for lv, _ in seen if lv == "error"], (
         "handing the process back to the supervisor is not a warning: %s" % seen)
+
+
+def test_a_short_wedge_is_not_a_warning(monkeypatch):
+    """SEVERITY BY THE CLOCK, NOT BY THE MISS.
+
+    Demoting the first miss from ERROR to WARNING was not enough. A missed probe is the normal
+    state of a thread inside a long job, so WARNING still fired on nearly every healthy cycle:
+    measured over one bridge.log, 140 first-miss lines plus 51 ladder lines were 100% of the
+    WARNING volume in the file. A level that fires on every cycle cannot distinguish anything,
+    and this one was slightly ANTI-correlated with trouble (8 of 132 preceded a failing probe,
+    6.1%, against a 9.9% base rate).
+    """
+    seen = _spy_logger(monkeypatch)
+    _timeout_probe(monkeypatch)
+    B._PAGE_THREAD_WEDGED = time.time() - 1.0
+    try:
+        assert B.probe_connection(touch=lambda: True) is None
+    finally:
+        B._PAGE_THREAD_WEDGED = None
+    assert seen, "the wedge was not logged at all"
+    assert not [lv for lv, _ in seen if lv in ("warning", "error", "critical")], (
+        "a one-second wedge is logged above INFO: %s" % seen)
+
+
+def test_a_wedge_approaching_the_hand_back_is_a_warning(monkeypatch):
+    """The counterpart: quieting the routine case must not quiet the real one.
+
+    Without this test the change has no failing case -- every assertion above is satisfied by a
+    module that never warns at all, which would be a strictly worse instrument than the noisy
+    one it replaced.
+    """
+    seen = _spy_logger(monkeypatch)
+    _timeout_probe(monkeypatch)
+    B._PAGE_THREAD_WEDGED = time.time() - (B.PAGE_THREAD_WEDGE_WARN_AFTER_S + 1.0)
+    try:
+        assert B.probe_connection(touch=lambda: True) is None
+    finally:
+        B._PAGE_THREAD_WEDGED = None
+    assert [lv for lv, _ in seen if lv == "warning"], (
+        "a wedge past half the escalation limit did not warn: %s" % seen)
+
+
+def test_the_warning_threshold_tracks_the_escalation_limit():
+    """Derived, not hardcoded. If the limit is raised and this stays at 60s, the warning goes
+    back to firing on ordinary cycles -- the exact defect the change removes."""
+    assert B.PAGE_THREAD_WEDGE_WARN_AFTER_S == B.PAGE_THREAD_WEDGE_LIMIT_S / 2.0
+    assert B.PAGE_THREAD_WEDGE_WARN_AFTER_S < B.PAGE_THREAD_WEDGE_LIMIT_S, (
+        "the warning must precede the hand-back, not coincide with it")
