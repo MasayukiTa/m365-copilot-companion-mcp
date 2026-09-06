@@ -645,6 +645,23 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
                 _ro = bool((_TOOL_ANNOTATIONS or {}).get(name, {}).get('readOnlyHint'))
                 _plan = _ar.repair(fn, _args, name=name, read_only=_ro)
                 if _plan['action'] == _ar.EXPLAIN:
+                    # THE ONLY EXIT THAT LEFT AN ORPHAN. record_call is already down by
+                    # here, and this return skipped past both record_outcome calls, so an
+                    # explained-and-not-run call wrote a call row with nothing to close it.
+                    # The ledger treats an unclosed row as "the call never returned" -- a
+                    # real finding, deliberately -- so leaving this one open files a tool
+                    # that was politely declined as one that hung. Measured: 4 such rows in
+                    # 11,616, every one of them today, against 0 on every prior day.
+                    #
+                    # ok=False because the tool did NOT run. That is the whole point of this
+                    # branch: the argument mapping was not certain enough to act on.
+                    if _ledger is not None and _cid:
+                        try:
+                            _ledger.record_outcome(_cid, ok=False,
+                                                   error="not run: " + str(_plan['message'])[:200],
+                                                   duration_s=time.time() - _t0)
+                        except Exception:
+                            pass
                     return _plan['message']
                 _args = _plan['arguments']
                 _note = _plan['message']

@@ -106,3 +106,66 @@ def test_a_large_cap_is_where_the_exclusion_actually_does_work(monkeypatch):
     removed = _registered(monkeypatch, MCP_TOOL_MAP="1", MCP_TOOL_MAP_MAX="70")
     assert EXEC <= kept
     assert not (EXEC & removed)
+
+
+# ---------------------------------------------------------------------------------------
+# EVERY EXIT FROM THE GATEWAY CLOSES ITS LEDGER ROW.
+#
+# The ledger writes the call row BEFORE the tool runs, deliberately, so a call that never
+# comes back leaves an unclosed row and that row is a finding. The cost of that design is
+# that any early return added later reads as a hang. One had been: the arg-repair EXPLAIN
+# branch returned its explanation without recording an outcome, so a call the gateway
+# politely declined to run was filed as one that never returned. Measured in the live
+# ledger: 4 unclosed rows in 11,616, all of them on the day the branch first fired,
+# against 0 on every prior day.
+#
+# Pinned as the invariant rather than as that one branch, because the next early return
+# will be added by someone who has not read this.
+# ---------------------------------------------------------------------------------------
+
+def _gateway_orphans(monkeypatch, tmp_path, calls):
+    """Run `calls` through the real gateway and return the ledger rows left unclosed."""
+    import json
+
+    monkeypatch.setenv("MCP_TOOL_MAP", "1")
+    monkeypatch.setenv("MCP_API_KEY", "test-key-not-a-real-one")
+    monkeypatch.setenv("FLEET_STATE_DIR", str(tmp_path))
+    import main
+    importlib.reload(main)
+    from tools import tool_ledger as TL
+    monkeypatch.setattr(TL, "LEDGER_PATH", tmp_path / "tool_events.jsonl")
+
+    call_tool = next(t for t in main.TOOLS if getattr(t, "__name__", "") == "call_tool")
+    for name, args in calls:
+        try:
+            call_tool(name=name, arguments=args)
+        except Exception:
+            pass    # a raising tool still has to close its row; that is the point
+
+    path = tmp_path / "tool_events.jsonl"
+    if not path.exists():
+        return []
+    rows = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    closed = {r["id"] for r in rows if r.get("event") == "outcome"}
+    return [r for r in rows if r.get("event") == "call" and r["id"] not in closed]
+
+
+def test_a_declined_call_closes_its_row_instead_of_looking_like_a_hang(monkeypatch, tmp_path):
+    """An argument the gateway will not guess at: explained back, not run -- and closed."""
+    orphans = _gateway_orphans(monkeypatch, tmp_path, [
+        ("list_directory", {"totally_unknown_parameter": "x", "another_unknown": "y"}),
+    ])
+    assert orphans == [], "a declined call left an unclosed ledger row: %r" % (orphans,)
+
+
+def test_no_gateway_exit_leaves_an_unclosed_row(monkeypatch, tmp_path):
+    """The invariant across the shapes that take different exits: one that runs, one whose
+    arguments are wrong, one that does not exist, and one the gateway declines."""
+    orphans = _gateway_orphans(monkeypatch, tmp_path, [
+        ("list_directory", {"path": "."}),                       # runs
+        ("list_directory", {"not_a_real_kwarg": 1}),             # TypeError path
+        ("no_such_tool_exists_anywhere", {"x": 1}),              # unknown name
+        ("list_directory", {"totally_unknown_parameter": "x",
+                            "another_unknown": "y"}),            # declined
+    ])
+    assert orphans == [], "unclosed ledger rows: %r" % ([r.get("tool") for r in orphans],)
