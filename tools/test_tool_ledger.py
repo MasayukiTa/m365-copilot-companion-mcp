@@ -288,3 +288,57 @@ def test_the_copied_literals_still_match_the_modules_that_own_them():
     # The two refusal strings security.py actually emits both open with the prefix.
     assert '"[locked: no valid unlock token' in src or "[locked: no valid unlock token" in src
     assert "[locked client IP:" in src
+
+
+# --------------------------------------------------------------------------------------
+# HISTORY CANNOT BE REWRITTEN, SO IT IS CORRECTED ON READ.
+#
+# The fix above only applies to rows written after it. 320 of 11,686 outcome rows already
+# on disk say ok=True with the refusal in `result`, and the ledger is append-only.
+# --------------------------------------------------------------------------------------
+
+def test_a_legacy_row_written_before_the_fix_reads_as_refused():
+    # Exactly the shape on disk: ok=True, empty error, refusal inside the bounded wrapper.
+    legacy = {"event": "outcome", "id": "x", "ok": True, "error": "",
+              "result": {"text": REFUSAL, "len": len(REFUSAL), "sha16": "0" * 16,
+                         "truncated": False}}
+    assert legacy["ok"] is True          # what the raw field still says
+    assert L.row_ok(legacy) is False     # what it actually was
+
+
+def test_a_genuine_success_still_reads_as_one():
+    row = {"event": "outcome", "id": "x", "ok": True,
+           "result": {"text": "wrote 12 bytes", "len": 14, "sha16": "0" * 16,
+                      "truncated": False}}
+    assert L.row_ok(row) is True
+
+
+def test_a_truncated_long_result_cannot_fake_a_refusal():
+    # _bounded cuts at MAX_INLINE, which must stay above the dominance bound or a clipped
+    # analysis beginning with the marker would read as the refusal itself.
+    assert L.MAX_INLINE > L._LOCK_REFUSAL_MAX_CHARS
+    long_text = "[locked" + " prose about the gate." * 300
+    row = {"event": "outcome", "id": "x", "ok": True,
+           "result": {"text": long_text[:L.MAX_INLINE], "len": len(long_text),
+                      "sha16": "0" * 16, "truncated": True}}
+    assert L.row_ok(row) is True
+
+
+def test_the_reader_never_raises_on_a_malformed_row():
+    for bad in ({}, {"event": "outcome", "ok": True, "result": None},
+                {"event": "outcome", "ok": True, "result": 7},
+                {"event": "call", "ok": True}):
+        assert L.row_ok(bad) in (True, False)
+
+
+def test_an_explicit_failure_is_left_alone_by_the_reader():
+    assert L.row_ok({"event": "outcome", "ok": False, "result": {"text": "boom"}}) is False
+
+
+def test_the_reader_agrees_with_what_record_outcome_now_writes(ledger):
+    """The write-side verdict and the read-side correction must not drift apart."""
+    cid = L.record_call("write_file", {"path": "x"})
+    L.record_outcome(cid, ok=True, result=REFUSAL)
+    row = [r for r in rows(ledger) if r["event"] == "outcome"][0]
+    assert row["ok"] is False
+    assert L.row_ok(row) is False
