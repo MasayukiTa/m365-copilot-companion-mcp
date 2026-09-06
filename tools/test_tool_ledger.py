@@ -199,3 +199,92 @@ def test_no_root_and_no_task_returns_everything_rather_than_guessing(ledger):
     L.record_call("read_file", {"path": "a"})
     L.record_call("read_file", {"path": "b"})
     assert len(L.for_task("")) == 2
+
+
+# --------------------------------------------------------------------------------------
+# A REFUSAL IS NOT A SUCCESS.
+#
+# A gated tool that is denied returns its refusal normally, so every call site passed
+# ok=True and the row was indistinguishable from one where the write happened. Measured
+# on the live ledger 2026-09-06: write_file and run_python refused for a missing unlock
+# token, filed ok=True, error="". Nothing branches on this field -- it is what later
+# measurements are taken over, and two success rates computed from it have already been
+# retracted.
+# --------------------------------------------------------------------------------------
+
+REFUSAL = ("[locked: no valid unlock token for '203.0.113.7'] The identity in the "
+           "forwarding header is not sufficient on its own. Call unlock(password="
+           "'<password>') and pass the returned `unlock_token` with the call.")
+
+
+def test_a_refused_call_is_not_recorded_as_a_success(ledger):
+    cid = L.record_call("write_file", {"path": "x"})
+    L.record_outcome(cid, ok=True, result=REFUSAL)
+    out = [r for r in rows(ledger) if r["event"] == "outcome"][0]
+    assert out["ok"] is False
+    assert out["error"] == "refused (locked)"
+    # The refusal itself is still stored verbatim; only the verdict changed.
+    assert REFUSAL[:20] in out["result"]["text"]
+
+
+def test_the_other_refusal_wording_is_caught_too(ledger):
+    # security.py emits two shapes: the token one above and this IP one.
+    cid = L.record_call("run_python", {"code": "1"})
+    L.record_outcome(cid, ok=True,
+                     result="[locked client IP: '203.0.113.7'] Mutating and execution "
+                            "tools require an unlock. Call unlock(password='<password>').")
+    assert [r for r in rows(ledger) if r["event"] == "outcome"][0]["ok"] is False
+
+
+def test_content_that_merely_quotes_a_refusal_is_still_a_success(ledger):
+    # read_file on a source file that documents the refusal must not be filed as refused.
+    # This is why the rule is startswith + length, not a substring test.
+    body = ("# -*- coding: utf-8 -*-\n"
+            "MARKER = \"[locked: no valid unlock token\"  # what security.py emits\n"
+            + "# padding so this is plainly a file, not a short error.\n" * 12)
+    cid = L.record_call("read_file", {"path": "security.py"})
+    L.record_outcome(cid, ok=True, result=body)
+    assert [r for r in rows(ledger) if r["event"] == "outcome"][0]["ok"] is True
+
+
+def test_a_long_analysis_beginning_with_the_marker_is_not_a_refusal(ledger):
+    # Dominance: a genuine refusal IS the whole short return value.
+    cid = L.record_call("run_python", {"code": "1"})
+    L.record_outcome(cid, ok=True, result="[locked" + " and here is why: " * 40)
+    assert [r for r in rows(ledger) if r["event"] == "outcome"][0]["ok"] is True
+
+
+def test_an_explicit_failure_is_never_upgraded(ledger):
+    cid = L.record_call("write_file", {"path": "x"})
+    L.record_outcome(cid, ok=False, result=REFUSAL, error="boom")
+    out = [r for r in rows(ledger) if r["event"] == "outcome"][0]
+    assert out["ok"] is False
+    assert out["error"] == "boom"     # the real reason is not overwritten
+
+
+def test_a_non_string_result_never_raises(ledger):
+    cid = L.record_call("glob", {"pattern": "*"})
+    L.record_outcome(cid, ok=True, result={"matches": ["[locked"]})
+    assert [r for r in rows(ledger) if r["event"] == "outcome"][0]["ok"] is True
+
+
+def test_the_copied_literals_still_match_the_modules_that_own_them():
+    """The prefix and the dominance bound are duplicated, so pin them to their sources.
+
+    tools/security.py is frozen and relay/relay_fleet.py is too heavy to import from a module
+    main.py loads first, so tool_ledger keeps its own copies. A copy is only as good as the
+    literal staying identical.
+    """
+    from relay import relay_fleet
+
+    assert L._LOCK_REFUSAL_MAX_CHARS == relay_fleet.LOCKED_DOMINANCE_MAX_CHARS
+    # Every marker relay_fleet matches on must start with the prefix this module keys off.
+    for marker in relay_fleet.LOCKED_MARKERS:
+        assert marker.lower().lstrip("[").startswith(
+            L._LOCK_REFUSAL_PREFIX.lstrip("[").lower()[:6])
+
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(L.__file__))),
+                            "tools", "security.py"), encoding="utf-8").read()
+    # The two refusal strings security.py actually emits both open with the prefix.
+    assert '"[locked: no valid unlock token' in src or "[locked: no valid unlock token" in src
+    assert "[locked client IP:" in src

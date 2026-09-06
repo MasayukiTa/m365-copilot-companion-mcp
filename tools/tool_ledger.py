@@ -78,6 +78,32 @@ def _bounded(value):
             "truncated": full > MAX_INLINE}
 
 
+#: The bracket prefix tools/security.py writes when it refuses a call, and the length above
+#: which a response is prose ABOUT a refusal rather than the refusal itself. Both are copied
+#: rather than imported: security.py is frozen, relay_fleet.py (which owns the same two-part
+#: rule in _looks_locked) is far too heavy for a module main.py imports before anything else,
+#: and this file stays stdlib-only on purpose. A test asserts the literals still match.
+_LOCK_REFUSAL_PREFIX = "[locked"
+_LOCK_REFUSAL_MAX_CHARS = 400
+
+
+def looks_refused(result) -> bool:
+    """True iff `result` IS a lock refusal, rather than content that merely contains one.
+
+    Same two-part rule as relay/relay_fleet.py::_looks_locked -- distinctive bracket marker
+    plus dominance -- but tightened from `in` to `startswith`, because the ledger sees the raw
+    return value, where a genuine refusal is the whole of it. read_file on a file that quotes a
+    refusal (this repo has several) satisfies a substring test and must not be filed as one.
+    """
+    try:
+        if not isinstance(result, str):
+            return False
+        text = result.strip()
+        return text.startswith(_LOCK_REFUSAL_PREFIX) and len(text) < _LOCK_REFUSAL_MAX_CHARS
+    except Exception:
+        return False
+
+
 def redact_args(arguments, _depth=0) -> dict:
     """Arguments with secret VALUES removed and the rest bounded.
 
@@ -215,6 +241,23 @@ def record_call(tool: str, arguments=None, *, task: str = "", worker: str = "",
 def record_outcome(call_id: str, *, ok: bool, result=None, error: str = "",
                    ts: float = None, duration_s: float = None) -> None:
     """Write the OUTCOME record for a call. Linked by id, never merged into the call record."""
+    # A REFUSAL IS NOT A SUCCESS. Every call site passes ok=True whenever the tool returned
+    # without raising, and a lock refusal returns normally -- so `write_file` denied for a
+    # missing unlock token was filed ok=True with an empty error. Measured on 2026-09-06:
+    # three such rows in one day, indistinguishable from writes that actually wrote.
+    #
+    # Nothing in the server branches on this field, which is exactly why it went unnoticed for
+    # 23k rows. The ledger is not control flow; it is the record every later measurement is
+    # taken OVER, and counting refusals as successes silently inflates any success or recovery
+    # rate computed from it. Two such rates have already had to be retracted here.
+    #
+    # Corrected in one place rather than at each call site: the next call site would repeat it.
+    # Only ever downgrades -- an explicit ok=False is never overridden -- and the reason stays
+    # a fixed string, because the refusal text is already stored verbatim in `result` and the
+    # error field is the one thing a reader scans in bulk.
+    if ok and looks_refused(result):
+        ok = False
+        error = error or "refused (locked)"
     _append({
         "schema": SCHEMA_VERSION,
         "event": "outcome",
