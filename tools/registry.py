@@ -11,6 +11,36 @@ from .trace_ops import wrap_for_trace
 _REGISTERED: list[dict] = []
 
 
+#: A refusal begins with this. tools/security.py calls the prefix load-bearing and says it must
+#: not change by a byte, because relay and bridge both key on it with str.startswith.
+_REFUSAL_PREFIX = "[locked"
+
+
+def _refuse_as_error(result) -> None:
+    """Raise a ToolError when a tool returned a lock refusal, so the client sees isError.
+
+    A REFUSAL RETURNED AS A STRING IS A SUCCESSFUL RESULT ON THE WIRE. Measured against a
+    throwaway server: returning the text gives isError=False, and the model is free to read it
+    as content and summarise around it. That is what happened -- an agent hit two refusals,
+    fell back to read-only tools, and answered as though the work were done, in a run where
+    nothing was written at all.
+
+    ToolError SPECIFICALLY, never a bare exception. Also measured: ToolError arrives with
+    isError=true and the message VERBATIM, so the "[locked" prefix survives; raising a plain
+    RuntimeError arrives as "Error calling tool 'x': [locked..." -- isError is set but the
+    prefix moves, and every startswith("[locked") reader in relay and bridge stops matching.
+
+    Placed in _to_async because it is the outermost wrapper and therefore the one place that
+    sees BOTH shapes: a directly registered tool refusing on its own, and call_tool passing an
+    inner tool's refusal back out. In-process callers hold the raw function and never reach
+    here, which is correct -- they are not the client this is for.
+    """
+    if isinstance(result, str) and result.startswith(_REFUSAL_PREFIX):
+        from fastmcp.exceptions import ToolError
+
+        raise ToolError(result)
+
+
 def _to_async(fn: Callable) -> Callable:
     """Wrap a synchronous tool function so FastMCP runs it OFF the event loop.
 
@@ -42,7 +72,9 @@ def _to_async(fn: Callable) -> Callable:
         call = functools.partial(fn, *args, **kwargs)
         # Default anyio thread limiter (40 tokens) lets many heavy tools run in
         # parallel; one run_python no longer makes a concurrent grep wait.
-        return await anyio.to_thread.run_sync(call)
+        out = await anyio.to_thread.run_sync(call)
+        _refuse_as_error(out)
+        return out
 
     # FastMCP / pydantic read the SIGNATURE + ANNOTATIONS to generate the input schema.
     # functools.wraps copies __wrapped__/__doc__/__name__/__annotations__, but we set
