@@ -1294,6 +1294,42 @@ def _watchdog_should_reset(status, stalled_s, now=None):
     return (True, "stalled %ds with no eval in flight -> wedged" % stalled_s)
 
 
+def goals_from_command(cmd) -> list:
+    """The `add_goal` entries in a fleet command file, as goals this run can queue.
+
+    MODULE LEVEL SO THE SEAM CAN BE TESTED. This was a closure inside main()'s _drain_commands,
+    which made it unreachable from a test -- so the writer of this file (relay/task_router.py's
+    add_goal_to_live_fleet) and its reader were each covered by their own tests and the JOIN
+    between them by none. That is the shape of two defects already on this project's record:
+    the archive wrote `gate_verdict` while the scheduler read `verdict`, and an adapter wrote
+    `keep` while the policy read `kept`. Both sides passed their own tests throughout.
+
+    Accepts a single entry or a list, a dict or a bare string. `checks` and `cwd` are carried
+    through so a RETRY re-runs WITH its acceptance gate rather than the bare prompt;
+    goal_fields reads them downstream. An entry without text contributes nothing rather than
+    raising -- one malformed row must not cost the rest of the file.
+    """
+    add = (cmd or {}).get("add_goal")
+    if add is None:
+        return []
+    items = add if isinstance(add, list) else [add]
+    out = []
+    for it in items:
+        try:
+            if isinstance(it, dict) and it.get("text"):
+                g = {"text": it["text"], "priority": bool(it.get("priority"))}
+                if it.get("checks"):
+                    g["checks"] = it["checks"]
+                if it.get("cwd"):
+                    g["cwd"] = it["cwd"]
+                out.append(g)
+            elif isinstance(it, str) and it:
+                out.append({"text": it, "priority": False})
+        except Exception:
+            pass
+    return out
+
+
 def _print_table(workers, total=None):
     # THE DENOMINATOR IS THE WORKERS, NOT THE GOALS THE RUN STARTED WITH. It was len(goals),
     # while the numerator counts terminal workers -- and a fan-out parent is terminal the
@@ -1838,24 +1874,8 @@ def main():
             if cmd.get("steer") is not None:
                 deliver_steers(cmd["steer"], workers, enqueue=add_box.append)
             # native chat / cockpit queued a new goal into the running fleet
-            add = cmd.get("add_goal")
-            if add is not None:
-                items = add if isinstance(add, list) else [add]
-                for it in items:
-                    try:
-                        if isinstance(it, dict) and it.get("text"):
-                            # carry checks/cwd through so a RETRY re-runs WITH its acceptance
-                            # gate (not just the bare prompt). goal_fields reads them downstream.
-                            g = {"text": it["text"], "priority": bool(it.get("priority"))}
-                            if it.get("checks"):
-                                g["checks"] = it["checks"]
-                            if it.get("cwd"):
-                                g["cwd"] = it["cwd"]
-                            add_box.append(g)
-                        elif isinstance(it, str) and it:
-                            add_box.append({"text": it, "priority": False})
-                    except Exception:
-                        pass
+            for g in goals_from_command(cmd):
+                add_box.append(g)
             # pause / resume the whole fleet: {"pause": true} freezes it in place (no new
             # turns, no new tabs), {"pause": false} resumes. Handy right before a network
             # switch so in-flight work isn't lost. Takes effect on the next sweep.
