@@ -214,6 +214,28 @@ def _no_writes_to_the_live_records(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _autostart_off(monkeypatch):
+    """No test starts a fleet because this machine's .env says to.
+
+    FLEET_INTAKE_AUTOSTART is a deployment choice: with it on, a fleet_goal that finds no run
+    in flight LAUNCHES one -- a browser, a set of workers, and the tenant's Copilot budget.
+    task_router reads .env at import, so the moment the operator turned it on, every test that
+    imports the module inherited it, and any test reaching fleet_handoff with no live fleet
+    would have spawned a real run.
+
+    Tests that are ABOUT autostart set it themselves; this only removes the ambient value.
+    autostart_fleet also refuses outright under pytest, because a fixture can be missed and a
+    subprocess does not see it.
+    """
+    try:
+        from relay import task_router as _tr
+        monkeypatch.setattr(_tr, "AUTOSTART", False, raising=False)
+    except Exception:
+        pass
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _no_desktop_toasts(monkeypatch):
     """Autouse for every test in the repo: stub known notify entry points."""
     calls = []
