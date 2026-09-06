@@ -351,20 +351,22 @@ def test_new_probe_challenge_directory_has_exactly_one_entry_named_with_the_toke
     # new_probe_challenge's docstring. Nothing inside it is the answer, so nothing inside it
     # is asserted on beyond its being inert.
     _, token = tool_probe.new_probe_challenge(base_dir=tmp_path)
-    entries = list(tmp_path.iterdir())
-    assert len(entries) == 1
-    assert entries[0].is_dir()
-    assert entries[0].name == "probe_%s" % token
-    assert token not in (entries[0] / "README.txt").read_text(encoding="utf-8")
+    # Two entries now: the challenge, and the standing README that explains this directory to
+    # anyone who lists it (see test_the_challenge_directory_explains_itself_to_anyone_who_
+    # lists_it for why that file exists and must survive the reset).
+    entries = sorted(tmp_path.iterdir(), key=lambda p: p.name)
+    assert [e.name for e in entries] == ["README.txt", "probe_%s" % token]
+    challenge = entries[1]
+    assert challenge.is_dir()
+    assert token not in (challenge / "README.txt").read_text(encoding="utf-8")
 
 
 def test_new_probe_challenge_resets_the_directory_each_call(tmp_path):
     (tmp_path / "stale_leftover.txt").write_text("stale", encoding="utf-8")
     (tmp_path / "another_stale_dir").mkdir()
     _, token = tool_probe.new_probe_challenge(base_dir=tmp_path)
-    entries = list(tmp_path.iterdir())
-    assert len(entries) == 1
-    assert token in entries[0].name
+    # Everything stale goes; the challenge and the standing README are what remain.
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["README.txt", "probe_%s" % token]
 
 
 def test_new_probe_challenge_instruction_hands_over_the_token_and_asks_for_no_transcription(
@@ -732,3 +734,31 @@ def test_the_no_tool_answer_is_classified_as_a_missing_connector():
     ok, kind = tool_probe.verify_probe_reply(reply, "deadbeef1234", agent_loaded=True)
     assert ok is False
     assert kind == "canned_fallback"
+
+
+def test_the_challenge_directory_explains_itself_to_anyone_who_lists_it(tmp_path):
+    """The parent is reset every probe, so it looks like a folder that keeps emptying itself
+    with a differently-named subdirectory each time. The agent listed it, said exactly that
+    -- "All 13 previously verified directories are gone" -- and spent the turn investigating
+    the probe instead of answering it. A standing README is the answer to the question the
+    layout provokes, so it must survive the reset."""
+    _, t1 = tool_probe.new_probe_challenge(base_dir=tmp_path)
+    readme = tmp_path / "README.txt"
+    assert readme.is_file()
+    body = readme.read_text(encoding="utf-8")
+    assert "probe_" in body                  # says what the subdirectories are
+    assert t1 not in body                    # but never the live token
+
+    # It survives the next reset, and the stale challenge does not.
+    _, t2 = tool_probe.new_probe_challenge(base_dir=tmp_path)
+    names = sorted(p.name for p in tmp_path.iterdir())
+    assert names == sorted(["README.txt", "probe_%s" % t2])
+    assert readme.read_text(encoding="utf-8") == body
+
+
+def test_the_readme_is_not_mistaken_for_a_challenge_token(tmp_path):
+    """note_inbound matches probe_<12 hex> in a path. The README must not create a false
+    arrival, and probe_arrived must still require the real token."""
+    _, token = tool_probe.new_probe_challenge(base_dir=tmp_path)
+    assert tool_probe._find_challenge_tokens(str(tmp_path / "README.txt")) == []
+    assert tool_probe._find_challenge_tokens(str(tmp_path / ("probe_%s" % token))) == [token]
