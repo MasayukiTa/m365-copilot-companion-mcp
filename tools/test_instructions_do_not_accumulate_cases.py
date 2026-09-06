@@ -125,3 +125,23 @@ def test_the_instructions_point_work_at_the_fleet():
     assert "fleet_submit" in text, (
         "nothing tells the agent to hand work to the fleet; a door nobody is told about is a "
         "door nobody uses")
+
+
+def test_reading_is_stated_not_to_need_an_unlock():
+    """RULE 3 said "TO CHANGE ANYTHING, CALL unlock FIRST", which is true and was still read
+    as "unlock first, then work". Observed live: asked to count the files on a Desktop -- a
+    read, needing no unlock -- the agent called unlock before doing it. That is not merely a
+    wasted call: an agent that unlocks first STOPS when it cannot get the password, so the
+    pre-emptive unlock can end a task that reading alone would have finished.
+
+    The owner separately reported a request from a phone that ended with the agent unable to
+    obtain the unlock password. Whether THAT request needed a write was never established, so
+    it is a matching symptom rather than a proven instance -- the observed pre-emptive unlock
+    above is the evidence this test rests on.
+
+    So the rule now says what does NOT need an unlock, in the same breath as what does.
+    """
+    text = instructions_text()
+    assert "READING NEEDS NO" in text
+    # The consequence, not just the fact -- the fact alone did not stop the abandonment.
+    assert "never abandon" in text
