@@ -198,6 +198,29 @@ def assess(claim_done: bool, contract: dict, events, now: float = None) -> dict:
                 "evidence": {}, "error": str(exc)[:200]}
 
 
+def _outcome_ok(event) -> bool:
+    """Whether a recorded call actually succeeded, with lock refusals excluded.
+
+    READING `outcome["ok"]` DIRECTLY IS WRONG HERE, and it was wrong in the two places this
+    replaces. A gated tool that is denied returns its refusal as a normal return value, so the
+    gateway recorded it with ok=True and an empty error; measured on this ledger, 233 refused
+    run_python/shell_exec calls and 39 refused writes are filed that way. This module then read
+    a refusal as "the acceptance command passed" and as "a write happened" -- confirming a DONE
+    claim on the strength of a call that was turned away.
+
+    tool_ledger.row_ok is the single place that knows the refusal shape; it corrects rows
+    written before the gateway itself was fixed, which is most of the history a verdict is
+    computed over. Imported lazily and defensively so that `assess`'s "pure; never raises"
+    contract survives even if the ledger module is unavailable.
+    """
+    outcome = (event or {}).get("outcome") or {}
+    try:
+        from tools import tool_ledger as _tl
+        return bool(_tl.row_ok(outcome))
+    except Exception:
+        return bool(outcome.get("ok"))
+
+
 def _assess(claim_done, contract, events):
     events = list(events or [])
     reasons = []
@@ -215,7 +238,7 @@ def _assess(claim_done, contract, events):
                 "evidence": ev}
 
     writes = [e for e in events if (e["call"].get("tool") in WRITE_TOOLS)
-              and (e.get("outcome") or {}).get("ok")]
+              and _outcome_ok(e)]
     ev["writes"] = len(writes)
     last_write_ts = max([w["call"].get("ts", 0) for w in writes], default=0.0)
     ev["last_write_ts"] = last_write_ts
@@ -252,7 +275,7 @@ def _assess(claim_done, contract, events):
             matched.append(e)
             if e["call"].get("ts", 0) >= last_write_ts:
                 after.append(e)
-                if (e.get("outcome") or {}).get("ok"):
+                if _outcome_ok(e):
                     passed.append(e)
     ev["check_runs"] = len(matched)
     ev["check_runs_after_last_write"] = len(after)
