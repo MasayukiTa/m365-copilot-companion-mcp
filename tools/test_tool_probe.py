@@ -344,13 +344,18 @@ def test_new_probe_challenge_token_differs_across_successive_calls(tmp_path):
     assert len({token1, token2, token3}) == 3
 
 
-def test_new_probe_challenge_directory_has_exactly_one_file_named_with_the_token(tmp_path):
+def test_new_probe_challenge_directory_has_exactly_one_entry_named_with_the_token(tmp_path):
+    # The challenge entry is now a DIRECTORY named probe_<token>, not a file named
+    # probe_<token>.txt holding the token as its contents. The token stopped being a secret
+    # hidden on disk for the agent to find and became the path the agent is handed -- see
+    # new_probe_challenge's docstring. Nothing inside it is the answer, so nothing inside it
+    # is asserted on beyond its being inert.
     _, token = tool_probe.new_probe_challenge(base_dir=tmp_path)
     entries = list(tmp_path.iterdir())
     assert len(entries) == 1
-    assert entries[0].is_file()
-    assert token in entries[0].name
-    assert entries[0].read_text(encoding="utf-8") == token
+    assert entries[0].is_dir()
+    assert entries[0].name == "probe_%s" % token
+    assert token not in (entries[0] / "README.txt").read_text(encoding="utf-8")
 
 
 def test_new_probe_challenge_resets_the_directory_each_call(tmp_path):
@@ -362,12 +367,29 @@ def test_new_probe_challenge_resets_the_directory_each_call(tmp_path):
     assert token in entries[0].name
 
 
-def test_new_probe_challenge_instruction_never_reveals_the_token(tmp_path):
-    # The instruction must ask the agent to LOOK, not just repeat the answer back to it --
-    # otherwise a "success" would prove nothing about the tool round-trip actually happening.
+def test_new_probe_challenge_instruction_hands_over_the_token_and_asks_for_no_transcription(
+        tmp_path):
+    """THIS TEST USED TO ASSERT THE OPPOSITE, and the assertion it made was the defect.
+
+    It read `assert token not in instruction`, on the reasoning that if the agent were told
+    the answer, a green probe would prove nothing about the round-trip. The reasoning was
+    sound; the design it forced was not. Hiding an unguessable string on disk and asking the
+    agent to transcribe it back, on a schedule, with the string changing every time, is the
+    shape of an exfiltration prompt -- and the live agent said exactly that and refused, five
+    probes running, asking who was issuing the diagnostic before it would comply.
+
+    The round-trip guarantee is not weakened by handing the token over, because success is no
+    longer something the agent SAYS. The token is minted per probe and goes out in the path;
+    the proof is the gateway stamping the arrival of a call carrying that token, checked by
+    probe_arrived(). Knowing the token buys nothing: a reply quoting it is not consulted.
+    """
     instruction, token = tool_probe.new_probe_challenge(base_dir=tmp_path)
-    assert token not in instruction
+    assert token in instruction
     assert "list_directory" in instruction
+    # The retired ask, in the words the refusals objected to. If any of these come back, the
+    # shape is back, and so is the refusal.
+    for banned in ("一字一句", "転記", "ファイル名だけ"):
+        assert banned not in instruction
 
 
 def test_new_probe_challenge_never_raises_on_unwritable_path():
