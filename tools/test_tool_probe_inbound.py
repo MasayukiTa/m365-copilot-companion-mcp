@@ -81,3 +81,122 @@ def test_the_summary_carries_it_separately_from_alive():
     assert "inbound" in names and "alive" in names
     src = inspect.getsource(TP.get_summary)
     assert '"tool_inbound"' in src and '"tool_alive"' in src
+
+
+# ---------------------------------------------------------------------------------------
+# THE ARRIVAL IS NOW THE VERDICT, not just a field reported beside it.
+#
+# It used to be that `ok` came from scanning the reply for a token the agent had to discover
+# on disk, and the arrival was recorded alongside as extra colour. That probe was refused by
+# the live agent on security grounds -- correctly; see tool_probe._CHALLENGE_INSTRUCTION_TAIL
+# -- so the token changed direction. It now goes OUT in the path and comes back IN through the
+# tool channel, and these tests pin the two halves of the check that replaced the scan.
+# ---------------------------------------------------------------------------------------
+
+def test_the_arrival_carries_the_token_it_was_called_with(inbound):
+    assert TP.note_inbound(
+        "list_directory", {"path": "C:/x/.fleet/probe_challenge/probe_0123456789ab"}) is True
+    assert json.loads(inbound.read_text(encoding="utf-8"))["token"] == "0123456789ab"
+
+
+def test_naming_only_the_parent_directory_proves_nothing(inbound):
+    """The limit note_inbound's docstring used to record as accepted, now closed. A call that
+    merely mentions the challenge directory still stamps -- it is cheap and harmless to record
+    -- but it carries no token, so it can no longer satisfy a probe."""
+    assert TP.note_inbound("list_directory", {"path": "C:/x/.fleet/probe_challenge"}) is True
+    assert json.loads(inbound.read_text(encoding="utf-8"))["token"] == ""
+    assert TP.probe_arrived("0123456789ab", 0.0) is False
+
+
+def test_the_previous_probes_arrival_does_not_satisfy_this_one(inbound):
+    """The failure the window alone could not catch: two probes inside one window, or a clock
+    that did not move. The token settles it without reference to time at all."""
+    TP.note_inbound("list_directory",
+                    {"path": "C:/x/.fleet/probe_challenge/probe_aaaaaaaaaaaa"}, ts=1000.0)
+    assert TP.probe_arrived("aaaaaaaaaaaa", 0.0) is True     # its own probe
+    assert TP.probe_arrived("bbbbbbbbbbbb", 0.0) is False    # the next one
+
+
+def test_an_arrival_from_before_the_window_is_rejected(inbound):
+    TP.note_inbound("list_directory",
+                    {"path": "C:/x/.fleet/probe_challenge/probe_aaaaaaaaaaaa"}, ts=1000.0)
+    assert TP.probe_arrived("aaaaaaaaaaaa", 999.0) is True
+    assert TP.probe_arrived("aaaaaaaaaaaa", 1001.0) is False
+
+
+def test_no_arrival_at_all_is_not_a_pass(inbound):
+    assert not inbound.exists()
+    assert TP.probe_arrived("aaaaaaaaaaaa", 0.0) is False
+
+
+def test_the_fallback_challenge_can_never_pass(inbound):
+    """new_probe_challenge returns FALLBACK_CHALLENGE_TOKEN when it cannot prepare the
+    directory. Whatever is stamped, that probe must resolve to a failure, never a pass."""
+    TP.note_inbound("list_directory",
+                    {"path": "C:/x/.fleet/probe_challenge/probe_aaaaaaaaaaaa"}, ts=1000.0)
+    assert TP.probe_arrived(TP.FALLBACK_CHALLENGE_TOKEN, 0.0) is False
+    assert TP.probe_arrived("", 0.0) is False
+
+
+def test_a_corrupt_stamp_reads_as_no_arrival(inbound, monkeypatch):
+    inbound.write_text("{not json", encoding="utf-8")
+    assert TP.last_inbound() == {}
+    assert TP.probe_arrived("aaaaaaaaaaaa", 0.0) is False
+
+
+def test_verify_probe_arrival_keeps_the_kind_vocabulary_and_precedence():
+    """Same five branches, same order, same names as verify_probe_reply -- readers, the health
+    strip and probe_kind_is_alive all key on these strings."""
+    assert TP.verify_probe_arrival("何でも", agent_loaded=False, arrived=True) == (
+        False, "agent_unreachable")
+    assert TP.verify_probe_arrival(
+        "接続マネージャーを開く", agent_loaded=True, arrived=True) == (False, "consent_card")
+    assert TP.verify_probe_arrival(
+        "実行不可", agent_loaded=True, arrived=True) == (False, "canned_fallback")
+    assert TP.verify_probe_arrival("呼び出せました", agent_loaded=True, arrived=True) == (
+        True, "answer")
+    assert TP.verify_probe_arrival("呼び出せました", agent_loaded=True, arrived=False) == (
+        False, "error")
+
+
+def test_a_confident_reply_without_an_arrival_is_still_a_failure():
+    """THE point of moving the proof to the server. An agent that says it called the tool, in
+    the words a green probe would once have accepted, does not make it true."""
+    ok, kind = TP.verify_probe_arrival(
+        "list_directory を呼び出し、正常に一覧できました。", agent_loaded=True, arrived=False)
+    assert (ok, kind) == (False, "error")
+
+
+def test_verify_probe_arrival_reads_nothing_from_disk():
+    """It stays a pure function, like classify_probe_reply: the I/O lives in probe_arrived so
+    the classification can be tested with canned values."""
+    src = inspect.getsource(TP.verify_probe_arrival)
+    tree = ast.parse(src.lstrip())
+    calls = {n.func.id for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    assert "open" not in calls
+    assert "last_inbound" not in calls
+
+
+def _attr_calls(module_path):
+    """Every `x.y(...)` callee name actually CALLED in a module, via the AST.
+
+    Deliberately not a substring search over the text: the change these tests guard left
+    explanatory comments naming the retired function, so `"verify_probe_reply" not in src`
+    would fail on prose while a real call sat one line below. Parse, don't grep.
+    """
+    import io
+    tree = ast.parse(io.open(module_path, encoding="utf-8").read())
+    return {n.func.attr for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+
+
+@pytest.mark.parametrize("module_path", ["bridge/copilot_bridge.py", "relay/edge_reconnect.py"])
+def test_the_probe_verdict_comes_from_the_arrival_not_the_reply(module_path):
+    """Both places that run a challenge probe must decide `ok` from the arrival. Leaving one
+    on verify_probe_reply would leave one of them asking the agent to transcribe a secret --
+    and that is the ask the live agent refused."""
+    calls = _attr_calls(module_path)
+    assert "verify_probe_arrival" in calls
+    assert "probe_arrived" in calls
+    assert "verify_probe_reply" not in calls

@@ -5784,7 +5784,10 @@ def _run_tool_probe():
                 # an unreachable tool path. Keep them apart -- the reply itself is the proof.
                 ok, kind = False, ("stale_repeat" if (reply or "").strip() else "timeout")
             else:
-                ok, kind = tool_probe.verify_probe_reply(reply, expected_token, agent_loaded)
+                ok, kind = tool_probe.verify_probe_arrival(
+                    reply, agent_loaded,
+                    tool_probe.probe_arrived(expected_token, _inbound_before)
+                )
                 if kind == "consent_card":
                     logger.info("tool probe: consent_card sighted -- driving recovery")
                     consented = False
@@ -5801,6 +5804,11 @@ def _run_tool_probe():
                             # `expected_token` themselves (rather than new `...2` names) so a
                             # single `expected_token` var always matches whatever `reply` ends
                             # up holding when the final record/journal calls below run.
+                            # The window start moves with the challenge, for the same reason
+                            # the token does: the final record below reports on whichever
+                            # probe actually ran last, so both halves of "did THIS one arrive"
+                            # have to belong to that probe.
+                            _inbound_before = tool_probe.last_inbound_ts()
                             instruction, expected_token = _next_tool_probe_challenge()
                             agent_loaded, reply, timed_out = _run_bounded_page_probe_call(
                                 lambda: _do_tool_probe_turn(instruction)
@@ -5810,8 +5818,9 @@ def _run_tool_probe():
                                     "stale_repeat" if (reply or "").strip() else "timeout"
                                 )
                             else:
-                                ok, kind = tool_probe.verify_probe_reply(
-                                    reply, expected_token, agent_loaded
+                                ok, kind = tool_probe.verify_probe_arrival(
+                                    reply, agent_loaded,
+                                    tool_probe.probe_arrived(expected_token, _inbound_before)
                                 )
                         except Exception:
                             logger.warning("tool probe: re-probe after auto-consent raised",

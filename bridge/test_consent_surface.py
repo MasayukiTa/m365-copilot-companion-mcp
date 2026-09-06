@@ -149,7 +149,7 @@ def test_reset_episode_gives_a_fresh_budget(monkeypatch):
 # ── _run_tool_probe: probe-result -> action decision (BUG 1) ───────────────────────────────
 
 def _patch_probe_plumbing(monkeypatch, page_thread_results, auto_consent_result=None,
-                           challenge_token="TESTTOKEN"):
+                           challenge_token="TESTTOKEN", arrived=True):
     """Stub out everything _run_tool_probe touches besides the pure classify/record logic:
     _run_bounded_page_probe_call (bypasses the real page-owner-thread queue),
     _do_tool_probe_turn (consumed once per call from `page_thread_results`), and
@@ -157,8 +157,15 @@ def _patch_probe_plumbing(monkeypatch, page_thread_results, auto_consent_result=
 
     Also stubs tool_probe.new_probe_challenge() (which _run_tool_probe now calls before every
     turn it sends -- see tools/tool_probe.py's new_probe_challenge) to a fixed, deterministic
-    (instruction, `challenge_token`) pair, so canned replies in `page_thread_results` can be
-    verified with a token the test controls instead of a real random one."""
+    (instruction, `challenge_token`) pair, so each turn in `page_thread_results` runs against
+    a token the test controls instead of a real random one.
+
+    `arrived` stubs tool_probe.probe_arrived, which is what decides a probe's success now that
+    the verdict is "did the call reach the server" rather than "did the reply quote the token
+    back" (see tools/tool_probe.py's verify_probe_arrival). It defaults to True so these
+    tests keep asking what they were written to ask -- which recovery ladder runs for which
+    reply -- with a healthy tool path underneath. Pass False for the case where the agent
+    talks but never actually calls anything."""
     results = iter(page_thread_results)
 
     def _fake_run_on_page_thread(fn, *a, **kw):
@@ -169,6 +176,7 @@ def _patch_probe_plumbing(monkeypatch, page_thread_results, auto_consent_result=
     monkeypatch.setattr(B, "_run_bounded_page_probe_call", _fake_run_on_page_thread)
     monkeypatch.setattr(B.tool_probe, "new_probe_challenge",
                         lambda *a, **kw: ("test challenge instruction", challenge_token))
+    monkeypatch.setattr(B.tool_probe, "probe_arrived", lambda *a, **kw: arrived)
     monkeypatch.setattr(B, "_LAST_USER_TURN_TS", 0.0)
     monkeypatch.setattr(B, "MCP_TOOL_PROBE_SEC", 600.0)
     monkeypatch.setattr(B, "TOOL_PROBE_MIN_IDLE_SEC", 30.0)
@@ -286,3 +294,43 @@ def test_probe_records_checking_before_the_real_turn(monkeypatch):
 
     assert recorded[0] == (False, "checking")
     assert recorded[-1] == (True, "answer")
+
+
+def test_a_reply_that_claims_success_without_calling_anything_is_not_a_pass(monkeypatch):
+    """WHAT THE OLD PROBE COULD NOT SEE. The verdict used to be "does the reply contain the
+    token", so a reply that talked about the tool convincingly was the whole evidence. Now the
+    server has to have watched the call arrive, and a confident sentence on its own is an
+    "error" -- which is the honest reading of a turn where nothing was called."""
+    _reset_state(monkeypatch)
+    _patch_probe_plumbing(
+        monkeypatch,
+        [(True, "list_directory を呼び出し、正常に一覧できました。", False)],
+        arrived=False,
+    )
+    _patch_surface(monkeypatch, [])
+    recorded = []
+    monkeypatch.setattr(B.tool_probe, "record_probe",
+                        lambda ok, kind, **kw: recorded.append((ok, kind)))
+
+    B._run_tool_probe()
+
+    assert recorded[-1] == (False, "error")
+
+
+def test_a_refusal_is_reported_as_a_failure_and_not_as_an_unreachable_agent(monkeypatch):
+    """The live incident this change came from: the agent answered at length, declining the
+    probe on security grounds, and called nothing. That is a failure -- but it is a REPLY
+    failure, so it must not be filed as agent_unreachable/canned_fallback, which would send
+    the recovery ladder after a connector that is fine."""
+    _reset_state(monkeypatch)
+    refusal = ("同じ診断依頼が5回目です。判断は変わりません。発行元と目的が確認できるまで"
+               "この回は実行を保留します。")
+    _patch_probe_plumbing(monkeypatch, [(True, refusal, False)], arrived=False)
+    _patch_surface(monkeypatch, [])
+    recorded = []
+    monkeypatch.setattr(B.tool_probe, "record_probe",
+                        lambda ok, kind, **kw: recorded.append((ok, kind)))
+
+    B._run_tool_probe()
+
+    assert recorded[-1] == (False, "error")
