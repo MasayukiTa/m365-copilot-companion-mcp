@@ -592,6 +592,201 @@ def add_goal_to_live_fleet(goal: str, state_dir=None, priority: bool = False,
     write_command(sd, {"add_goal": [item]})
 
 
+#: Where an autostart attempt is recorded, beside the run's own state. Kept so the NEXT pass
+#: can tell "a fleet is coming up" from "the last attempt died", which are the two situations
+#: that must not both lead to launching again.
+AUTOSTART_STATE = "autostart.json"
+
+#: How long a launched run may take to publish status.json before the attempt counts as failed.
+#: A cold start opens a browser and signs in; generous, because launching a second fleet is far
+#: worse than waiting. Two runs share one dedicated Edge and clobber each other's status.json.
+AUTOSTART_GRACE_S = float(os.environ.get("FLEET_INTAKE_AUTOSTART_GRACE_S", "240") or 240)
+
+#: How long to wait after an attempt that never became live. Without this the router would
+#: spawn a browser every drain pass -- every fifteen seconds -- for as long as the goal waits.
+AUTOSTART_BACKOFF_S = float(os.environ.get("FLEET_INTAKE_AUTOSTART_BACKOFF_S", "900") or 900)
+
+
+def _autostart_path(state_dir) -> str:
+    return os.path.join(state_dir or FLEET_STATE_DIR, AUTOSTART_STATE)
+
+
+def _read_autostart(state_dir) -> dict:
+    try:
+        with open(_autostart_path(state_dir), encoding="utf-8-sig") as fh:
+            return json.load(fh) or {}
+    except Exception:
+        return {}
+
+
+def _write_autostart(state_dir, rec: dict) -> None:
+    path = _autostart_path(state_dir)
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = "%s.%d.tmp" % (path, os.getpid())
+        with open(tmp, "w", encoding="utf-8", newline="") as fh:
+            json.dump(rec, fh, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _pid_alive(pid) -> bool:
+    """Whether a launched runner is still around. Windows has no os.kill(0), so ask the OS."""
+    try:
+        pid = int(pid)
+    except Exception:
+        return False
+    if pid <= 0:
+        return False
+    try:
+        out = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid, "/NH"],
+                             capture_output=True, text=True, encoding="utf-8",
+                             errors="replace", timeout=20)
+        return str(pid) in (out.stdout or "")
+    except Exception:
+        # UNKNOWN IS TREATED AS ALIVE, deliberately. The only thing this answer gates is
+        # whether to launch ANOTHER fleet, and two fleets sharing one Edge is the failure this
+        # whole check exists to prevent. Waiting out the grace period costs a delay.
+        return True
+
+
+def autostart_status(state_dir=None, now=None) -> tuple:
+    """(may_start, reason). Reads only; the reason is what the record will say.
+
+    Three states have to be told apart, and conflating any two of them is how this goes wrong:
+    a run that is already coming up (wait), an attempt that died (back off, then retry), and
+    nothing in flight (start). The first two both look like "no fleet is live".
+    """
+    now = time.time() if now is None else now
+    if not AUTOSTART:
+        return False, "autostart is off (FLEET_INTAKE_AUTOSTART)"
+    if fleet_is_live(state_dir):
+        return False, "a fleet is already running"
+    rec = _read_autostart(state_dir)
+    started = float(rec.get("started_at") or 0)
+    if started:
+        age = now - started
+        outcome = rec.get("outcome")
+        if outcome == "launched":
+            if age < AUTOSTART_GRACE_S and _pid_alive(rec.get("pid")):
+                return False, ("a fleet launched %.0fs ago is still coming up (pid %s)"
+                               % (age, rec.get("pid")))
+            # A LAUNCH WHOSE PROCESS IS GONE WHILE NOTHING IS LIVE HAS FAILED, and it is not
+            # recover_failed_autostart's job to say so first. That runs on the next drain pass,
+            # and between the crash and that pass this function would otherwise answer "nothing
+            # in flight" -- which is a relaunch every fifteen seconds against whatever made the
+            # first one die. Backing off from the launch time covers the gap.
+            if age < AUTOSTART_BACKOFF_S:
+                return False, ("the fleet launched %.0fs ago is not running and its process is "
+                               "gone; waiting out the %.0fs backoff"
+                               % (age, AUTOSTART_BACKOFF_S))
+        elif outcome in ("never_became_live", "launch_failed") and age < AUTOSTART_BACKOFF_S:
+            return False, ("the last autostart %s %.0fs ago; waiting out the %.0fs backoff"
+                           % (outcome.replace("_", " "), age, AUTOSTART_BACKOFF_S))
+    return True, "no run in flight and no recent attempt"
+
+
+def _agent_url() -> str:
+    return (os.environ.get("MCP_FLEET_AGENT_URL")
+            or os.environ.get("MCP_IMPL_AGENT_URL") or "").strip()
+
+
+def autostart_fleet(goals, state_dir=None, now=None, launcher=None) -> dict:
+    """Launch a fleet for `goals` (a list of goal dicts). Returns what happened.
+
+    THE GOALS GO IN THE LAUNCH, NOT THROUGH add_goal. A fleet started with no goals exits at
+    once, and delivering them afterwards means waiting for it to come up -- which the router
+    must not do inside a drain pass. So the caller hands them over here and they become the
+    run's goals-file: one JSON object per line, the format bench/review_build_goals.py writes
+    and _read_goals expects.
+
+    `launcher` is injectable so a test can drive this without starting a browser. Nothing in
+    production passes it.
+    """
+    now = time.time() if now is None else now
+    sd = state_dir or FLEET_STATE_DIR
+    goals = [g for g in (goals or []) if (g or {}).get("text")]
+    if not goals:
+        return {"ok": False, "detail": "no goals to start a fleet for"}
+    url = _agent_url()
+    if not url:
+        return {"ok": False, "detail": "no agent URL (MCP_FLEET_AGENT_URL / MCP_IMPL_AGENT_URL)"}
+
+    os.makedirs(sd, exist_ok=True)
+    goals_file = os.path.join(sd, "autostart.goals.jsonl")
+    with open(goals_file, "w", encoding="utf-8", newline="\n") as fh:
+        for g in goals:
+            fh.write(json.dumps(g, ensure_ascii=False) + "\n")
+
+    cmd = [sys.executable, "-m", "relay.fleet_runner",
+           "--goals-file", goals_file, "--agent-url", url, "--state-dir", sd]
+    try:
+        if launcher is not None:
+            pid = launcher(cmd)
+        else:
+            # DETACHED, because this router is a short-lived drain pass. A child that dies with
+            # its parent would be killed fifteen seconds later by the supervisor's next loop.
+            kwargs = {"cwd": REPO}
+            if os.name == "nt":
+                kwargs["creationflags"] = (getattr(subprocess, "DETACHED_PROCESS", 0)
+                                           | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+            else:
+                kwargs["start_new_session"] = True
+            pid = subprocess.Popen(cmd, **kwargs).pid
+    except Exception as exc:
+        rec = {"started_at": now, "pid": None, "outcome": "launch_failed",
+               "error": "%s: %s" % (type(exc).__name__, exc),
+               "goals": goals, "goals_file": goals_file}
+        _write_autostart(sd, rec)
+        return {"ok": False, "detail": rec["error"]}
+
+    # THE GOALS ARE IN THE RECORD, NOT ONLY IN THE LAUNCH. If this run never comes up they have
+    # to be recoverable: a goal that vanished because a browser failed to open is exactly the
+    # failure that reads as "it was never sent".
+    _write_autostart(sd, {"started_at": now, "pid": pid, "outcome": "launched",
+                          "goals": goals, "goals_file": goals_file})
+    return {"ok": True, "pid": pid, "goals": len(goals), "goals_file": goals_file}
+
+
+def recover_failed_autostart(state_dir=None, now=None) -> list:
+    """Put back the goals of an autostart that never became live. Returns what was restored.
+
+    Without this the goals are gone: they left for_fleet/ when the launch was made, and the run
+    that was supposed to carry them died. Restoring them into for_fleet/ is what makes the next
+    live fleet -- started by hand or by the next autostart -- pick them up, and it is why
+    autostart_fleet writes them into its record rather than only into the goals file.
+    """
+    now = time.time() if now is None else now
+    sd = state_dir or FLEET_STATE_DIR
+    rec = _read_autostart(sd)
+    if not rec or rec.get("outcome") not in ("launched",):
+        return []
+    started = float(rec.get("started_at") or 0)
+    if now - started < AUTOSTART_GRACE_S:
+        return []
+    if fleet_is_live(sd):
+        _write_autostart(sd, dict(rec, outcome="became_live"))
+        return []
+    if _pid_alive(rec.get("pid")):
+        return []
+    restored = []
+    ensure_dirs()
+    for g in rec.get("goals") or []:
+        text = (g or {}).get("text")
+        if not text:
+            continue
+        jid = uuid.uuid4().hex[:12]
+        try:
+            with open(_p("for_fleet", "%s.txt" % jid), "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
+            restored.append(jid)
+        except OSError:
+            pass
+    _write_autostart(sd, dict(rec, outcome="never_became_live", restored=restored))
+    return restored
+
+
 def fleet_handoff(goal: str, jid: str, state_dir=None):
     """Deliver a fleet-bound goal. Returns the (status, result) the job record should carry."""
     if not (goal or "").strip():
@@ -601,9 +796,18 @@ def fleet_handoff(goal: str, jid: str, state_dir=None):
         return "dispatched", {"handoff": "for_fleet/%s.txt" % jid,
                               "delivered": "add_goal", "note": "queued into the running fleet"}
     if AUTOSTART:
-        return "awaiting_fleet", {"handoff": "for_fleet/%s.txt" % jid,
-                                  "note": "autostart is on but is not implemented here; the "
-                                          "goal is recorded and waiting"}
+        may, why = autostart_status(state_dir)
+        if may:
+            out = autostart_fleet([{"text": goal}], state_dir)
+            if out.get("ok"):
+                return "dispatched", {"handoff": "for_fleet/%s.txt" % jid,
+                                      "delivered": "autostart",
+                                      "note": "started a fleet for this goal (pid %s)"
+                                              % out.get("pid")}
+            return "awaiting_fleet", {"handoff": "for_fleet/%s.txt" % jid,
+                                      "note": "autostart could not start a fleet: %s"
+                                              % out.get("detail")}
+        return "awaiting_fleet", {"handoff": "for_fleet/%s.txt" % jid, "note": why}
     # SAYS IT IS WAITING, rather than "dispatched". The old wording claimed delivery for a
     # file nobody read, and a status that overstates what happened is how a queue goes
     # unnoticed for months.
@@ -725,6 +929,14 @@ def dispatch_once(now_ts=None):
             os.remove(claimed)
         out.append(rec)
     out.extend(_recheck_awaiting(now_ts=now_ts))
+    # A LAUNCH THAT DIED HAS TO BE NOTICED BY SOMETHING THAT RUNS. Before this line the
+    # recovery existed and nothing called it, which is the same as not having written it --
+    # the goals of a fleet that failed to come up would sit in a record nobody read. Runs
+    # before the delivery pass so restored goals go out on this same sweep rather than the next.
+    try:
+        recover_failed_autostart(now=now_ts)
+    except Exception:
+        pass
     out.extend(_deliver_waiting_goals(now_ts=now_ts))
     return out
 
