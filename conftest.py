@@ -48,6 +48,15 @@ LIVE_RECORD_REDIRECTS = {
     # add terms to the operator's real contract file, which is append-only and first-wins.
     "relay.acceptance_contract": {"CONTRACT_PATH": "acceptance_contracts.jsonl"},
     "relay.selfimprove.ledger": {"DEFAULT_PATH": "hypotheses.jsonl"},
+    # THE OPERATOR'S TRACE DIRECTORY, WHICH IS NOT UNDER .fleet AND SO WAS NEVER SEEN.
+    # ~/.companion_runs holds the tool-call traces and the corrections log; a file there was
+    # observed changing during a test run. relay/selfimprove/trace_to_eval reads
+    # corrections_*.jsonl from it and promotes what qualifies into an evaluation ledger, so a
+    # corrections file a test wrote could be promoted as though a person had written it. Two
+    # modules declare the same directory, and both are redirected -- redirecting one would
+    # leave the other writing to the live path while the table claimed the matter was settled.
+    "tools.trace_ops": {"RUNS_DIR": "companion_runs"},
+    "tools.runlog_ops": {"RUNS_DIR": "companion_runs"},
     "relay.selfimprove.compare": {"QUEUE_PATH": "compare_queue.jsonl",
                                   "RESULTS_PATH": "compare_results.jsonl"},
     "relay.selfimprove.runtime_config": {"ACTIVE_PATH": "active_manifest.json"},
@@ -108,6 +117,15 @@ DELIBERATELY_NOT_REDIRECTED = {
         "wrote it would be testing the console, which none do",
     ("relay.selfimprove.loop", "SWEDIR"):
         "a benchmark working directory, not an operator record",
+    # NOT A PATH -- A DENY LIST. _SECURITY_STATE_DIRS is the set of directory NAMES the file
+    # tools refuse to touch: the tool-call trace, where a credential would land if a redaction
+    # rule were ever missed, and the approval queue, where a worker that could write would
+    # approve its own destructive operation. Nothing writes THROUGH this constant. Redirecting
+    # it would point the refusal at a temp directory and quietly disarm the check for the whole
+    # test run, which is the opposite of what this table is for.
+    ("tools.file_ops", "_SECURITY_STATE_DIRS"):
+        "a list of directory names the file tools refuse to touch, not a location anything "
+        "writes to; redirecting it would disarm that refusal during tests",
     ("relay.selfimprove.quality_loop", "SWEDIR"):
         "a benchmark working directory, not an operator record",
     ("relay.selfimprove.l2_cron", "DEFAULT_LOCK"):

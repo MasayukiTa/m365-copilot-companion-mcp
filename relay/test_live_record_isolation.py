@@ -43,8 +43,33 @@ def _module_path(file_path):
     return rel[:-3].replace("/", ".")
 
 
+#: The directories a test must not write into: places the OPERATOR's records live.
+#:
+#: NOT "anything outside the repo". That generalisation was considered and rejected: it would
+#: sweep in executables, read-only resources and configuration, and a guard that flags those
+#: gets exemptions written for it until nobody believes its failures any more. What earns a
+#: name here is that a live record accumulates in it -- something a later analysis reads back
+#: and draws a conclusion from.
+#:
+#: `.companion_runs` was added after tests were found writing into it (a file there changed
+#: during a run on 2026-09-06). It is under HOME, not the repo, which is exactly why the
+#: .fleet-only walk never saw it. relay/selfimprove/trace_to_eval reads corrections_*.jsonl
+#: from that directory and PROMOTES what qualifies into an evaluation ledger, so a corrections
+#: file written by a test could be promoted as though a person had written it. There were zero
+#: such files at the time, which is not a reason for an exemption: it is the reason there was
+#: no damage yet.
+RECORD_DIR_MARKERS = (".fleet", ".companion_runs")
+
+
 def fleet_constants():
-    """(module, CONSTANT) for every module-level constant whose value names .fleet."""
+    """(module, CONSTANT) for every module-level constant naming an operator-record directory.
+
+    A TRIPWIRE, NOT A PROOF. It reads the source for a constant whose text mentions one of the
+    marker directories; a path assembled at call time, or built from a name this does not know,
+    passes straight through. What it removes is the failure that actually happened five times
+    here: a shared record nobody thought about. Its own docstring said as much when it only
+    knew .fleet, and knowing one more name does not make it complete.
+    """
     found = set()
     for package in PACKAGES:
         root = os.path.join(REPO, package)
@@ -66,7 +91,8 @@ def fleet_constants():
                     if not isinstance(node, ast.Assign):
                         continue
                     segment = ast.get_source_segment(src, node) or ""
-                    if '".fleet"' not in segment and "'.fleet'" not in segment:
+                    if not any('"%s"' % m in segment or "'%s'" % m in segment
+                               for m in RECORD_DIR_MARKERS):
                         continue
                     for target in node.targets:
                         # Uppercase or _UPPERCASE: the module-level-constant convention. A
@@ -87,7 +113,8 @@ def test_every_shared_record_is_classified():
     known |= set(C.DELIBERATELY_NOT_REDIRECTED)
     unclassified = sorted(fleet_constants() - known)
     assert not unclassified, (
-        "these write under .fleet and are neither redirected for tests nor listed as "
+        "these name an operator-record directory and are neither redirected for tests nor "
+        "listed as "
         "deliberately unredirected -- add each to conftest.LIVE_RECORD_REDIRECTS, or to "
         "DELIBERATELY_NOT_REDIRECTED with the reason it is safe:\n  "
         + "\n  ".join("%s.%s" % pair for pair in unclassified))
@@ -160,3 +187,34 @@ def test_a_lazily_imported_module_is_patched_once_it_is_present(tmp_path, monkey
         value = _P(str(target)) if isinstance(original, _P) else str(target)
         monkeypatch.setattr(mod, const, value, raising=False)
         assert os.path.join(REPO, ".fleet") not in str(getattr(mod, const))
+
+
+def test_the_walk_reaches_records_outside_the_repo():
+    """The gap this guard had, pinned so it cannot come back quietly.
+
+    It looked only for `.fleet`, and the operator's trace directory is `~/.companion_runs` --
+    outside the repo, under a different name. Tests were writing there unnoticed. Both modules
+    that declare it must be found; there are two, which is itself why a name-based walk is
+    worth having.
+    """
+    found = fleet_constants()
+    assert ("tools.trace_ops", "RUNS_DIR") in found
+    assert ("tools.runlog_ops", "RUNS_DIR") in found
+
+
+def test_a_test_run_leaves_the_operators_trace_directory_alone():
+    """The property the classification is FOR, checked directly rather than inferred from the
+    table. Uses the same redirect the autouse fixture applies, then writes through the module's
+    own API and asserts the real directory did not gain a file."""
+    from pathlib import Path
+    from tools import trace_ops as TO
+
+    live = Path.home() / ".companion_runs"
+    before = set(p.name for p in live.glob("*")) if live.is_dir() else set()
+    TO.RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    (TO.RUNS_DIR / "isolation_probe.jsonl").write_text("{}\n", encoding="utf-8")
+
+    assert str(live) not in str(TO.RUNS_DIR), (
+        "RUNS_DIR still points at the operator's directory during tests: %s" % TO.RUNS_DIR)
+    after = set(p.name for p in live.glob("*")) if live.is_dir() else set()
+    assert after == before, "a test write reached the live trace directory: %s" % (after - before)
