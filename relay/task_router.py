@@ -49,11 +49,13 @@ Design notes:
 """
 import contextlib
 import hashlib
+import itertools
 import json
 import os
 import subprocess
 import sys
 import threading
+import uuid
 import time
 from pathlib import Path
 
@@ -512,119 +514,82 @@ def fleet_is_live(state_dir=None) -> bool:
         return False
 
 
-@contextlib.contextmanager
-def commands_lock(path):
-    """Hold the exclusive lock on a fleet commands.json for one read-modify-write.
+#: One file per command, under <state_dir>/commands.d/. See write_command.
+COMMANDS_DIR = "commands.d"
 
-    PUBLIC, BECAUSE A LOCK ONE WRITER TAKES IS NOT A LOCK. This was added inside
-    add_goal_to_live_fleet with a comment naming relay/code_task.py as the other writer -- and
-    code_task went on doing its own unlocked read-append-write, as did bench/fleet_ctl.py,
-    whose docstring claims it "merges, so a queued add_goal isn't clobbered". Three Python
-    writers, one lock, and the two unlocked ones lose exactly the goals the lock was added to
-    protect. The guard went where the work was, not on the path every writer takes.
+#: Strictly increasing within this process, so two commands written inside one clock tick still
+#: sort in the order they were sent. See write_command for why the clock alone cannot do it.
+_SEQ = itertools.count()
+_SEQ_LOCK = threading.Lock()
 
-    STILL UNPROTECTED: ui/CopilotChat.cs writes this file too, and takes no such lock. A
-    CreateNew open interoperates with O_CREAT|O_EXCL at the filesystem level, so the same
-    protocol is implementable there; it is not implemented, and this docstring is the record
-    of that rather than a claim of safety.
 
-    O_CREAT|O_EXCL, matching relay/selfimprove/ledger.py rather than introducing a second
-    locking idiom. PermissionError counts as contention: on Windows a lock file whose last
-    handle has just closed with an unlink outstanding is in delete-pending, and creating it
-    then returns ERROR_ACCESS_DENIED rather than "it exists".
+def _next_seq() -> int:
+    with _SEQ_LOCK:
+        return next(_SEQ)
+
+
+def write_command(state_dir, patch: dict) -> str:
+    """Leave one command for the running fleet. Returns the path written.
+
+    A FILE OF ITS OWN, WHICH IS WHY THERE IS NO LOCK. Every writer used to read the whole
+    commands.json, add its entry and write it back, so whichever replaced second silently
+    deleted the other's -- and a lost goal looks exactly like a goal that was never sent. A
+    lock fixed that for the Python writers and could not fix it for ui/CopilotChat.cs, which
+    writes the same file from a separately built binary and takes no lock; the reader took
+    none either. Giving each command its own uniquely named file removes the read-modify-write
+    that made a lock necessary: nothing merges, so nothing can clobber.
+
+    The name is time_ns, then a per-process sequence number, then a random tail.
+
+    ALL THREE ARE LOAD-BEARING, and the middle one was missing until a test caught it. The
+    reader takes these in filename order, so the name has to carry the order they were sent in
+    -- and time_ns cannot: Windows advances the clock in ~15.6 ms steps, so three goals sent in
+    a row read the SAME nanosecond and the random tail decided their order. Measured: 0, 1, 2
+    went in and 0, 2, 1 came out. The counter makes one process's writes strictly ordered
+    whatever the clock does. Two different processes writing inside one tick still order
+    arbitrarily between themselves, which is the truth about concurrent senders rather than a
+    gap: nothing here can know which of them meant to go first.
+
+    The random tail stays because a clock is not a counter across processes either -- without
+    it, two processes in the same tick with the same sequence number would collide, and here a
+    collision means one command silently overwrites another. That is the defect this repo just
+    fixed in new_experiment_id.
+
+    Written to .tmp in the same directory and renamed, so a reader never sees half a command;
+    the reader skips .tmp for the same reason. The rename is retried briefly because on Windows
+    a rename onto a path someone has open fails with PermissionError.
     """
-    lock = path + ".lock"
-    deadline = time.time() + 10.0
-    fd = None
-    while fd is None:
+    d = os.path.join(state_dir, COMMANDS_DIR)
+    os.makedirs(d, exist_ok=True)
+    name = "%019d-%09d-%s" % (time.time_ns(), _next_seq(), uuid.uuid4().hex[:8])
+    path = os.path.join(d, name + ".json")
+    tmp = os.path.join(d, name + ".tmp")
+    with open(tmp, "w", encoding="utf-8", newline="") as fh:
+        json.dump(patch, fh, ensure_ascii=False)
+    until = time.time() + 2.0
+    while True:
         try:
-            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except (FileExistsError, PermissionError):
-            if time.time() > deadline:
-                # STALE RATHER THAN CONTENDED: ten seconds is far longer than a read and a
-                # write, so a lock still held is a crashed holder, not a busy one. Taking it
-                # is better than dropping the goal, and saying so is better than either.
-                try:
-                    os.unlink(lock)
-                except OSError:
-                    pass
-                deadline = time.time() + 10.0
-            else:
-                time.sleep(0.02)
-    try:
-        yield
-    finally:
-        os.close(fd)
-        try:
-            os.unlink(lock)
-        except OSError:
-            pass
-
-
-def write_commands(path, mutate):
-    """Read commands.json, hand the dict to `mutate`, and write it back -- all under the lock.
-
-    `mutate(cur)` edits in place or returns the new dict. Every Python writer of this file
-    goes through here, so "the merge is safe" is a property of one function rather than a
-    claim repeated in three docstrings.
-    """
-    with commands_lock(path):
-        cur = {}
-        if os.path.isfile(path):
-            try:
-                with open(path, encoding="utf-8-sig") as fh:
-                    cur = json.load(fh) or {}
-            except Exception:
-                cur = {}
-        if not isinstance(cur, dict):
-            cur = {}
-        out = mutate(cur)
-        if out is not None:
-            cur = out
-        # A TEMP NAME OF ITS OWN, per process AND per thread. `path + ".tmp"` is one name
-        # shared by every writer, so two of them clobber each other's half-written file
-        # before either replace() runs -- and threads of one process share a pid, so a name
-        # keyed only on the pid is that same shared name.
-        tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
-        with open(tmp, "w", encoding="utf-8", newline="") as fh:
-            json.dump(cur, fh, ensure_ascii=False)
-        # REPLACE CAN LOSE TO A READER. On Windows a rename onto a path someone else has open
-        # fails with PermissionError, and the fleet reads commands.json on its own schedule.
-        # Bounded, because failing loudly after two seconds is better than a goal that never
-        # lands and never says so.
-        until = time.time() + 2.0
-        while True:
-            try:
-                os.replace(tmp, path)
-                return
-            except PermissionError:
-                if time.time() > until:
-                    raise
-                time.sleep(0.02)
+            os.replace(tmp, path)
+            return path
+        except PermissionError:
+            if time.time() > until:
+                raise
+            time.sleep(0.02)
 
 
 def add_goal_to_live_fleet(goal: str, state_dir=None, priority: bool = False,
                            entry: dict = None) -> None:
-    """Append a goal to the running fleet's command file. Written whole, then renamed.
+    """Append a goal to the running fleet's command channel.
 
     utf-8 with no BOM on the way out and utf-8-sig on the way in, matching code_task.py: the
     fleet reads both, and writing what the other writer writes is how the two stay compatible.
 
     `entry` lets a caller supply the whole command dict -- code_task adds `cwd` and `checks` --
-    so it can share this locked path instead of keeping its own unlocked copy of it.
+    so it can share this path instead of keeping its own copy of it.
     """
     sd = state_dir or FLEET_STATE_DIR
-    path = os.path.join(sd, "commands.json")
     item = dict(entry) if entry else {"text": goal, "priority": bool(priority)}
-
-    def _append(cur):
-        adds = cur.get("add_goal") or []
-        if not isinstance(adds, list):
-            adds = [adds]
-        adds.append(item)
-        cur["add_goal"] = adds
-
-    write_commands(path, _append)
+    write_command(sd, {"add_goal": [item]})
 
 
 def fleet_handoff(goal: str, jid: str, state_dir=None):

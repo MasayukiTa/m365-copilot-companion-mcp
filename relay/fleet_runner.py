@@ -1294,6 +1294,65 @@ def _watchdog_should_reset(status, stalled_s, now=None):
     return (True, "stalled %ds with no eval in flight -> wedged" % stalled_s)
 
 
+COMMANDS_DIR = "commands.d"
+
+
+def read_commands(state_dir) -> list:
+    """Every pending command for this run, oldest first, CONSUMED as it is read.
+
+    ONE FILE PER COMMAND, WHICH IS WHY THERE IS NO LOCK HERE. The single commands.json was a
+    read-modify-write on every writer: each read the whole file, added its own entry and wrote
+    it back, so whichever replaced second deleted the other's work -- and a lost goal looks
+    exactly like a goal that was never sent. A lock was added for the Python writers, but the
+    cockpit (ui/CopilotChat.cs) writes this file too and takes no lock, and this reader took
+    none either. A uniquely named file per command removes the read-modify-write entirely:
+    nothing merges, so nothing can clobber, and a writer needs no lock at all -- it only has to
+    land its own file atomically.
+
+    The legacy commands.json is still read, and must stay read: the shipped cockpit binaries
+    write it, and they are built separately from this file. With the Python writers moved to
+    commands.d/ the cockpit is its only writer, so its lack of a lock stops mattering -- one
+    writer cannot race itself.
+
+    A file that will not parse is renamed .bad rather than deleted, so it stops being retried
+    forever without the instruction in it being destroyed. `.tmp` files are a writer mid-flight
+    and are skipped.
+    """
+    out = []
+    legacy = os.path.join(state_dir, "commands.json")
+    try:
+        if os.path.isfile(legacy):
+            with open(legacy, encoding="utf-8-sig") as fh:   # tolerate a BOM from the C# cockpit
+                out.append(json.load(fh))
+            os.remove(legacy)
+    except Exception:
+        try:
+            os.remove(legacy)
+        except OSError:
+            pass
+    d = os.path.join(state_dir, COMMANDS_DIR)
+    try:
+        names = sorted(n for n in os.listdir(d) if n.endswith(".json"))
+    except OSError:
+        return out
+    for name in names:
+        path = os.path.join(d, name)
+        try:
+            with open(path, encoding="utf-8-sig") as fh:
+                out.append(json.load(fh))
+        except Exception:
+            try:
+                os.replace(path, path + ".bad")
+            except OSError:
+                pass
+            continue
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return out
+
+
 def goals_from_command(cmd) -> list:
     """The `add_goal` entries in a fleet command file, as goals this run can queue.
 
@@ -1776,7 +1835,6 @@ def main():
         ram_floor = settings_ram_floor(default=float(args.autoscale_headroom_mb))
     ram_box = [ram_floor]                                     # live RAM floor (cockpit-settable)
     eval_disk = None if args.eval_disk_gb < 0 else args.eval_disk_gb
-    commands_path = os.path.join(args.state_dir, "commands.json")
 
     # write an initial 'launching' snapshot so the cockpit shows something at once
     _write_atomic(status_path, {"started": started, "updated": started,
@@ -1821,12 +1879,14 @@ def main():
 
     def _drain_commands(workers):
         # cockpit -> fleet control channel. {"close":["w2"], "set_maxtabs":5}. Consume.
+        # EVERY pending command, oldest first -- see read_commands for why they are separate
+        # files now. One malformed command must not cost the ones behind it, so the body is
+        # per-command and its except is too.
+        for cmd in read_commands(args.state_dir):
+            _apply_command(cmd, workers)
+
+    def _apply_command(cmd, workers):
         try:
-            if not os.path.isfile(commands_path):
-                return
-            with open(commands_path, encoding="utf-8-sig") as f:   # tolerate a BOM from the C# cockpit
-                cmd = json.load(f)
-            os.remove(commands_path)
             by_name = {w.name: w for w in workers}
             for nm in cmd.get("close", []):
                 w = by_name.get(nm)

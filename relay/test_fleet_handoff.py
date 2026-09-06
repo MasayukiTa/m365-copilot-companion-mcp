@@ -45,11 +45,28 @@ def _status(state_dir, running, age_s=0.0):
 
 
 def _commands(state_dir):
-    p = os.path.join(str(state_dir), "commands.json")
-    if not os.path.isfile(p):
-        return {}
-    with open(p, encoding="utf-8-sig") as fh:
-        return json.load(fh)
+    """What the fleet would see, through the fleet's OWN reader.
+
+    THE REAL CONSUMER, NOT A COPY OF IT. These assertions used to open commands.json and parse
+    it here, which tested the writer against this file's idea of the format rather than against
+    relay/fleet_runner. Commands are one file each now, so the reader also decides the order
+    they arrive in; going through it means a change to either side shows up here.
+
+    read_commands CONSUMES what it returns, exactly as the running fleet does, so a test that
+    calls this twice sees the second call empty -- which is the truth about the channel.
+    Merged into one dict the way the runner applies them: add_goal entries accumulate in order,
+    every other key is last-one-wins.
+    """
+    from relay import fleet_runner as FR
+    merged = {}
+    for cmd in FR.read_commands(str(state_dir)):
+        for k, v in (cmd or {}).items():
+            if k == "add_goal":
+                items = v if isinstance(v, list) else [v]
+                merged.setdefault("add_goal", []).extend(items)
+            else:
+                merged[k] = v
+    return merged
 
 
 # -- is a fleet actually running ---------------------------------------------------------------
@@ -106,13 +123,13 @@ def test_other_commands_in_the_file_survive(state):
 
 def test_the_file_is_written_without_a_bom(state):
     """The fleet reads utf-8-sig, so a BOM parses -- but code_task.py writes none, and two
-    writers of one file should write it the same way."""
+    writers of one channel should write it the same way."""
     _status(state, True)
     TR.fleet_handoff("a goal", "j1", str(state))
-    with open(os.path.join(str(state), "commands.json"), "rb") as fh:
+    files = sorted(os.listdir(os.path.join(str(state), TR.COMMANDS_DIR)))
+    assert len(files) == 1, files
+    with open(os.path.join(str(state), TR.COMMANDS_DIR, files[0]), "rb") as fh:
         assert not fh.read(3).startswith(b"\xef\xbb\xbf")
-
-
 # -- what it does NOT do ---------------------------------------------------------------------------
 
 def test_with_no_run_in_flight_the_goal_waits_and_says_so(state):
@@ -195,11 +212,14 @@ def test_a_job_with_no_origin_does_not_grow_an_empty_one(tmp_path, monkeypatch):
 
 def test_goals_arriving_together_do_not_delete_each_other(tmp_path, monkeypatch):
     """THE ONE THAT WOULD HAVE LOST WORK. The instructions do not all come from one place --
-    two phones can submit at the same moment, and code_task.py writes commands.json too.
+    two phones can submit at the same moment, and code_task.py and the cockpit write here too.
 
-    The write was atomic; the read-append-write around it was not. Both callers read the same
-    list, each appended its own goal, and whichever replaced second silently deleted the
-    other. A lost goal is indistinguishable from a goal that was never sent.
+    The write was always atomic; the read-append-write AROUND it was not. Both callers read the
+    same list, each appended its own goal, and whichever replaced second silently deleted the
+    other. A lost goal is indistinguishable from a goal that was never sent. A lock fixed that
+    for the Python writers and could not fix it for the cockpit; one file per command removes
+    the read-modify-write that made a lock necessary at all. This is the test that would have
+    caught the original defect, and it still has to pass with no lock anywhere.
     """
     import threading
     state = tmp_path / "state"
@@ -222,14 +242,9 @@ def test_goals_arriving_together_do_not_delete_each_other(tmp_path, monkeypatch)
         t.join(timeout=30)
 
     assert not errors, errors
-    import json as _json
-    with io.open(str(state / "commands.json"), encoding="utf-8-sig") as fh:
-        got = _json.load(fh)
-    texts = sorted(g["text"] for g in got["add_goal"])
+    texts = sorted(g["text"] for g in _commands(state)["add_goal"])
     assert len(texts) == n, "%d of %d goals survived" % (len(texts), n)
     assert texts == sorted("goal %02d" % i for i in range(n))
-
-
 def test_the_command_file_is_never_left_half_written(tmp_path, monkeypatch):
     """Every writer used the same `commands.json.tmp`, so two of them clobbered each other's
     partial file before either replace() ran. Each takes a name of its own now."""
@@ -243,22 +258,45 @@ def test_the_command_file_is_never_left_half_written(tmp_path, monkeypatch):
     assert not leftovers, "left behind: %s" % leftovers
 
 
-def test_a_lock_left_by_a_crashed_writer_does_not_wedge_delivery(tmp_path, monkeypatch):
-    """A goal dropped because a previous process died holding a lock would be indistinguishable
-    from one never sent. Ten seconds is far longer than a read and a write."""
+def test_a_writer_that_died_midwrite_costs_nothing(tmp_path, monkeypatch):
+    """What replaced the stale-lock case, because there is no lock to go stale any more.
+
+    A writer that dies between opening its temp file and renaming it leaves a .tmp behind. That
+    file must not be delivered (it may be half a command) and must not stop anything else from
+    being delivered. The old design's equivalent hazard was a lock file left by a crashed
+    process, which wedged every later goal until it was broken by timeout -- a goal dropped for
+    that reason is indistinguishable from one never sent.
+    """
     state = tmp_path / "state"
     state.mkdir()
     monkeypatch.setattr(TR, "FLEET_STATE_DIR", str(state))
-    stale = state / "commands.json.lock"
-    stale.write_text("", encoding="utf-8")
-    monkeypatch.setattr(TR.time, "time", _clock_running_fast())
+    d = os.path.join(str(state), TR.COMMANDS_DIR)
+    os.makedirs(d, exist_ok=True)
+    with io.open(os.path.join(d, "0000000000000000000-dead.tmp"), "w", encoding="utf-8") as fh:
+        fh.write('{"add_goal": [{"text": "half a comm')
+
     TR.add_goal_to_live_fleet("after a crash", str(state))
-    import json as _json
-    with io.open(str(state / "commands.json"), encoding="utf-8-sig") as fh:
-        got = _json.load(fh)
-    assert [g["text"] for g in got["add_goal"]] == ["after a crash"]
+    assert [g["text"] for g in _commands(state)["add_goal"]] == ["after a crash"]
 
 
+def test_a_command_that_will_not_parse_is_set_aside_not_retried_forever(tmp_path, monkeypatch):
+    """Deleting it would destroy the instruction; leaving it would block the reader on every
+    sweep for the life of the run. It is renamed .bad, which does neither."""
+    from relay import fleet_runner as FR
+    state = tmp_path / "state"
+    state.mkdir()
+    d = os.path.join(str(state), TR.COMMANDS_DIR)
+    os.makedirs(d, exist_ok=True)
+    bad = os.path.join(d, "0000000000000000001-junk.json")
+    with io.open(bad, "w", encoding="utf-8") as fh:
+        fh.write("{not json")
+    TR.write_command(str(state), {"add_goal": [{"text": "the good one"}]})
+
+    got = FR.read_commands(str(state))
+    assert [g["text"] for c in got for g in FR.goals_from_command(c)] == ["the good one"]
+    assert not os.path.isfile(bad), "the unparsable command was left to be retried forever"
+    assert os.path.isfile(bad + ".bad"), "the instruction was destroyed instead of set aside"
+    assert FR.read_commands(str(state)) == [], "a .bad file came back on the next sweep"
 def _clock_running_fast():
     """A clock that jumps a minute per call, so the stale-lock deadline is reached at once
     instead of the test sleeping through it."""
@@ -298,13 +336,7 @@ def test_a_goal_that_arrived_with_no_fleet_is_delivered_when_one_starts(tmp_path
     out = TR._deliver_waiting_goals(now_ts=2.0)
     assert [r["status"] for r in out] == ["dispatched"]
     assert out[0]["result"]["delivered_late"] is True
-
-    import json as _json
-    with io.open(str(tmp_path / "state" / "commands.json"), encoding="utf-8-sig") as fh:
-        cmds = _json.load(fh)
-    assert [g["text"] for g in cmds["add_goal"]] == ["do the thing"]
-
-
+    assert [g["text"] for g in _commands(tmp_path / "state")["add_goal"]] == ["do the thing"]
 def test_a_delivered_goal_leaves_nothing_waiting(tmp_path, monkeypatch):
     """for_fleet/ means one thing now: goals still waiting. A delivered goal's record is its
     done/ entry, which says dispatched and how."""
@@ -408,42 +440,24 @@ def test_a_goal_in_done_with_no_fleet_is_not_finished(tmp_path, monkeypatch):
         "the delivery record must appear only after a fleet actually took the goal")
 
 
-def test_a_lock_in_delete_pending_is_contention_not_a_failure(tmp_path, monkeypatch):
-    """Windows raises PermissionError, not FileExistsError, for a lock being released.
+def test_two_writers_never_choose_the_same_filename(tmp_path, monkeypatch):
+    """What makes the lock unnecessary, so it is worth pinning directly.
 
-    A file whose last handle has just closed with an unlink outstanding sits in delete-pending,
-    and O_CREAT|O_EXCL on it fails with ERROR_ACCESS_DENIED. Catching only FileExistsError let
-    that out of add_goal_to_live_fleet: with 24 concurrent submitters it raised in 2 runs out
-    of 8, most threads at a time. Deterministic here, because a race reproduced two times in
-    eight is not a test anyone can act on.
+    The name is time_ns plus a random tail. The tail is not decoration: a clock is not a
+    counter, and this repo has already shipped an id that assumed otherwise -- Windows advances
+    time.time in ~15.6 ms steps, so a name derived from the clock alone repeats, and here a
+    repeat means one command silently overwrites another.
     """
     state = tmp_path / "state"
     state.mkdir()
-    monkeypatch.setattr(TR, "FLEET_STATE_DIR", str(state))
-
-    real_open = os.open
-    calls = {"n": 0}
-
-    def flaky(path, flags, *a, **k):
-        if str(path).endswith("commands.json.lock"):
-            calls["n"] += 1
-            if calls["n"] <= 2:
-                raise PermissionError(13, "Permission denied")
-        return real_open(path, flags, *a, **k)
-
-    monkeypatch.setattr(os, "open", flaky)
-    TR.add_goal_to_live_fleet("survives a lock in delete-pending", str(state))
-
-    assert calls["n"] >= 3, "the two refusals were not actually exercised"
-    with io.open(os.path.join(str(state), "commands.json"), encoding="utf-8-sig") as fh:
-        data = json.load(fh)
-    assert [g["text"] for g in data["add_goal"]] == ["survives a lock in delete-pending"]
-
-
-def test_a_reader_holding_commands_json_does_not_lose_the_goal(tmp_path, monkeypatch):
-    """A rename onto a path someone else has open fails on Windows, and the fleet reads
-    commands.json on its own schedule. Bounded retry, so a goal does not vanish because the
-    consumer happened to be reading at that moment."""
+    monkeypatch.setattr(TR.time, "time_ns", lambda: 1788600000000000000)
+    paths = {TR.write_command(str(state), {"n": i}) for i in range(200)}
+    assert len(paths) == 200, "%d of 200 names were distinct under one clock reading" % len(paths)
+    assert len(os.listdir(os.path.join(str(state), TR.COMMANDS_DIR))) == 200
+def test_a_reader_holding_the_file_does_not_lose_the_goal(tmp_path, monkeypatch):
+    """A rename onto a path someone else has open fails on Windows, and the fleet reads on its
+    own schedule. Bounded retry, so a goal does not vanish because the consumer happened to be
+    reading at that moment."""
     state = tmp_path / "state"
     state.mkdir()
     monkeypatch.setattr(TR, "FLEET_STATE_DIR", str(state))
@@ -452,7 +466,7 @@ def test_a_reader_holding_commands_json_does_not_lose_the_goal(tmp_path, monkeyp
     calls = {"n": 0}
 
     def flaky(src, dst, *a, **k):
-        if str(dst).endswith("commands.json"):
+        if str(dst).endswith(".json"):
             calls["n"] += 1
             if calls["n"] <= 2:
                 raise PermissionError(13, "Permission denied")
@@ -462,25 +476,21 @@ def test_a_reader_holding_commands_json_does_not_lose_the_goal(tmp_path, monkeyp
     TR.add_goal_to_live_fleet("survives a reader", str(state))
 
     assert calls["n"] >= 3, "the two refusals were not actually exercised"
-    with io.open(os.path.join(str(state), "commands.json"), encoding="utf-8-sig") as fh:
-        data = json.load(fh)
-    assert [g["text"] for g in data["add_goal"]] == ["survives a reader"]
+    assert [g["text"] for g in _commands(state)["add_goal"]] == ["survives a reader"]
+def test_every_writer_drops_its_own_file_and_none_are_lost(tmp_path, monkeypatch):
+    """A LOCK ONE WRITER TAKES IS NOT A LOCK -- so this channel no longer needs one.
 
-
-def test_every_python_writer_of_commands_json_takes_the_same_lock(tmp_path, monkeypatch):
-    """A LOCK ONE WRITER TAKES IS NOT A LOCK.
-
-    The lock went into add_goal_to_live_fleet with a comment naming relay/code_task.py as the
-    other writer of this file -- and code_task kept its own unlocked read-append-write, as did
-    bench/fleet_ctl.py, whose docstring claims it "merges, so a queued add_goal isn't
-    clobbered". Two of the three Python writers could still delete the goals the lock existed
-    to protect. This drives the router's writer and fleet_ctl's merge together and requires
-    both to survive.
+    The lock went into add_goal_to_live_fleet under a comment naming relay/code_task.py as the
+    other writer, and code_task kept its own unlocked read-append-write, as did
+    bench/fleet_ctl.py, whose docstring claimed it "merges, so a queued add_goal isn't
+    clobbered". ui/CopilotChat.cs writes here too, from a separately built binary that could
+    never have taken a Python lock. One file per command makes the question moot: this drives
+    goal writers and patch writers into the channel at the same moment and requires every
+    single edit to arrive.
     """
     import threading
     state = tmp_path / "state"
     state.mkdir()
-    path = os.path.join(str(state), "commands.json")
 
     n = 12
     barrier = threading.Barrier(n * 2)
@@ -493,29 +503,26 @@ def test_every_python_writer_of_commands_json_takes_the_same_lock(tmp_path, monk
         except Exception as exc:
             errors.append(exc)
 
-    def as_merger(i):
+    def as_patcher(i):
         barrier.wait()
         try:
-            TR.write_commands(path, lambda cur: cur.update({"flag%02d" % i: True}))
+            TR.write_command(str(state), {"flag%02d" % i: True})
         except Exception as exc:
             errors.append(exc)
 
     threads = ([threading.Thread(target=as_router, args=(i,)) for i in range(n)]
-               + [threading.Thread(target=as_merger, args=(i,)) for i in range(n)])
+               + [threading.Thread(target=as_patcher, args=(i,)) for i in range(n)])
     for t in threads:
         t.start()
     for t in threads:
         t.join(timeout=30)
 
     assert not errors, errors
-    with io.open(path, encoding="utf-8-sig") as fh:
-        data = json.load(fh)
-    assert len(data.get("add_goal") or []) == n, (
-        "goals were lost: %d of %d survived" % (len(data.get("add_goal") or []), n))
-    assert sum(1 for k in data if k.startswith("flag")) == n, (
-        "merges were lost: %d of %d survived" % (sum(1 for k in data if k.startswith("flag")), n))
-
-
+    merged = _commands(state)
+    assert len(merged.get("add_goal") or []) == n, (
+        "goals were lost: %d of %d survived" % (len(merged.get("add_goal") or []), n))
+    assert sum(1 for k in merged if k.startswith("flag")) == n, (
+        "patches were lost: %d of %d survived" % (sum(1 for k in merged if k.startswith("flag")), n))
 def test_code_task_no_longer_writes_the_file_itself():
     """The other writer named in the router's own comment. It is a separate PROCESS, so no
     runtime test can hold the two together -- what is checkable is that it stopped keeping a
@@ -533,33 +540,25 @@ def test_code_task_no_longer_writes_the_file_itself():
 def test_the_runner_reads_back_exactly_the_goal_the_router_delivered(tmp_path, monkeypatch):
     """THE JOIN NOBODY TESTED. Both halves had tests; the seam between them had none.
 
-    relay/task_router.add_goal_to_live_fleet writes commands.json; relay/fleet_runner reads it.
-    Each side was covered against its own fixture, so a key renamed on one side would pass
-    everything and deliver nothing. That is not hypothetical here: the archive wrote
-    `gate_verdict` while the scheduler read `verdict`, and an adapter wrote `keep` while the
-    policy read `kept` -- both sides green throughout, both found by a human reading code.
+    relay/task_router writes this channel; relay/fleet_runner reads it. Each side was covered
+    against its own fixture, so a key renamed on one side would pass everything and deliver
+    nothing. That is not hypothetical here: the archive wrote `gate_verdict` while the
+    scheduler read `verdict`, and an adapter wrote `keep` while the policy read `kept` -- both
+    sides green throughout, both found by a person reading code.
 
-    This drives the REAL writer and the REAL reader against one file, with no browser and no
-    Copilot turn: fleet_is_live only asks for a fresh status.json saying running.
+    This drives the REAL writer and the REAL reader, with no browser and no Copilot turn:
+    fleet_is_live only asks for a fresh status.json saying running.
     """
-    from relay import fleet_runner as FR
-
     state = tmp_path / "state"
     state.mkdir()
     with io.open(os.path.join(str(state), "status.json"), "w", encoding="utf-8") as fh:
         json.dump({"running": True}, fh)
 
     TR.add_goal_to_live_fleet("summarise last month's mail", str(state))
+    goals = _commands(state)["add_goal"]
 
-    with io.open(os.path.join(str(state), "commands.json"), encoding="utf-8-sig") as fh:
-        on_disk = json.load(fh)
-    goals = FR.goals_from_command(on_disk)
-
-    assert [g["text"] for g in goals] == ["summarise last month's mail"], (
-        "the runner did not read back the goal the router wrote: %r" % (on_disk,))
-    assert goals[0]["priority"] is False
-
-
+    assert [g["text"] for g in goals] == ["summarise last month's mail"]
+    assert goals[0].get("priority") is False
 def test_the_richer_entry_code_task_sends_survives_the_round_trip(tmp_path, monkeypatch):
     """code_task adds cwd and checks so a retry re-runs WITH its acceptance gate. If those are
     dropped in transit the goal still runs, and silently runs ungated -- which looks like a
@@ -575,14 +574,11 @@ def test_the_richer_entry_code_task_sends_survives_the_round_trip(tmp_path, monk
              "cwd": r"C:\work\proj", "checks": ["pytest -q"]}
     TR.add_goal_to_live_fleet(entry["text"], str(state), entry=entry)
 
-    with io.open(os.path.join(str(state), "commands.json"), encoding="utf-8-sig") as fh:
-        goals = FR.goals_from_command(json.load(fh))
-
+    goals = [g for c in FR.read_commands(str(state)) for g in FR.goals_from_command(c)]
     assert goals == [entry], "a field was lost between the writer and the reader: %r" % (goals,)
-
-
 def test_several_goals_arrive_in_the_order_they_were_sent(tmp_path, monkeypatch):
-    """Two phones, one run. The reader must see both, in order."""
+    """Two phones, one run. The reader must see both, in the order they were sent -- which is
+    now decided by the filename, so the ordering is the reader's to get right."""
     from relay import fleet_runner as FR
 
     state = tmp_path / "state"
@@ -593,16 +589,12 @@ def test_several_goals_arrive_in_the_order_they_were_sent(tmp_path, monkeypatch)
     for i in range(3):
         TR.add_goal_to_live_fleet("goal %d" % i, str(state))
 
-    with io.open(os.path.join(str(state), "commands.json"), encoding="utf-8-sig") as fh:
-        goals = FR.goals_from_command(json.load(fh))
+    goals = [g for c in FR.read_commands(str(state)) for g in FR.goals_from_command(c)]
     assert [g["text"] for g in goals] == ["goal 0", "goal 1", "goal 2"]
-
-
 def test_a_full_job_from_the_intake_door_reaches_the_runners_reader(tmp_path, monkeypatch):
-    """END TO END, WITHOUT A BROWSER OR A COPILOT TURN: the door, the router, the file, the
+    """END TO END, WITHOUT A BROWSER OR A COPILOT TURN: the door, the router, the channel, the
     reader. The only thing simulated is that a fleet is running, which fleet_is_live decides
     from a fresh status.json -- so every line of the delivery path is the real one."""
-    from relay import fleet_runner as FR
     from tools import fleet_intake as FI
 
     state = tmp_path / "state"
@@ -617,14 +609,33 @@ def test_a_full_job_from_the_intake_door_reaches_the_runners_reader(tmp_path, mo
     jid = out.split()[1]
     TR.dispatch_once()
 
-    rec_path = os.path.join(TR.TASKS, "done", "%s.json" % jid)
-    with io.open(rec_path, encoding="utf-8") as fh:
+    with io.open(os.path.join(TR.TASKS, "done", "%s.json" % jid), encoding="utf-8") as fh:
         rec = json.load(fh)
     assert rec["status"] == "dispatched", "the router did not deliver it: %r" % (rec,)
     assert rec["origin"]["source"] == "phone (verification)", "provenance was lost"
     assert not os.path.isfile(os.path.join(TR.TASKS, "for_fleet", "%s.txt" % jid)), (
         "a delivered goal must not also be left waiting")
 
-    with io.open(os.path.join(str(state), "commands.json"), encoding="utf-8-sig") as fh:
-        goals = FR.goals_from_command(json.load(fh))
-    assert [g["text"] for g in goals] == ["check the coating DB for last week"]
+    assert [g["text"] for g in _commands(state)["add_goal"]] == [
+        "check the coating DB for last week"]
+
+
+def test_order_survives_a_clock_that_does_not_move(tmp_path, monkeypatch):
+    """The ordering bug, made deterministic.
+
+    Windows advances time.time_ns in ~15.6 ms steps, so goals sent in quick succession share a
+    reading and the random tail decided their order. Measured before the per-process counter
+    went in: 0, 1, 2 were sent and 0, 2, 1 came out. Freezing the clock reproduces that
+    condition on any platform, so this fails on Linux CI too rather than only here.
+    """
+    from relay import fleet_runner as FR
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setattr(TR.time, "time_ns", lambda: 1788600000000000000)
+
+    for i in range(25):
+        TR.add_goal_to_live_fleet("goal %02d" % i, str(state))
+
+    goals = [g for c in FR.read_commands(str(state)) for g in FR.goals_from_command(c)]
+    assert [g["text"] for g in goals] == ["goal %02d" % i for i in range(25)], (
+        "commands written inside one clock tick did not keep their order")
