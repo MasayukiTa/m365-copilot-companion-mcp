@@ -127,6 +127,52 @@ def _append(row: dict) -> None:
         pass
 
 
+def session_fingerprint() -> str:
+    """A stable, non-reversible label for the MCP session this call arrived on, or "".
+
+    HERE, NOT IN tools/security.py. The first draft put it beside the unlock ContextVar, which
+    is where it conceptually belongs -- and that file is in FROZEN_MANIFEST and in
+    DELEGATION_EXCLUDED as "the unlock boundary". Adding a diagnostic there would have required
+    re-signing the constitution to land an observation that changes no authorisation at all.
+    The operator approved the measurement, not a re-signing of the security boundary, and those
+    are not the same permission. It lives with its only consumer instead.
+
+    OBSERVATION ONLY. Nothing reads it. It exists to settle one measured question before any
+    authorisation change is designed on top of it: does Copilot Studio keep ONE Mcp-Session-Id
+    across a conversation, one per turn, or none? Nobody here knows. FastMCP issues a session id
+    on streamable-HTTP; whether this client echoes it stably has never been looked at.
+
+    IT DECIDES BETWEEN TWO DESIGNS. The unlock token is a session credential the model must
+    carry in its own context, and it demonstrably loses it: 318 refusals in four days, ~22% of
+    which end with the agent quietly falling back to read-only tools and reporting as though the
+    work were done. If the session id is stable per conversation the credential can move to the
+    transport, where the model never touches it. If it rotates per turn there is no per-call
+    second factor on this transport at all, and the answer has to be something else. Guessing
+    wrong costs days.
+
+    Hashed, not stored raw: this file is appended to on every tool call, and a live session
+    identifier is not a thing to leave in a log. The hash answers "same session as before?",
+    which is the whole question.
+    """
+    sid = ""
+    try:
+        from fastmcp.server.dependencies import get_context
+
+        sid = str(getattr(get_context(), "session_id", "") or "")
+    except Exception:
+        sid = ""
+    if not sid:
+        try:
+            from fastmcp.server.dependencies import get_http_request
+
+            sid = str(get_http_request().headers.get("mcp-session-id") or "").strip()
+        except Exception:
+            sid = ""
+    if not sid:
+        return ""
+    return hashlib.sha256(sid.encode("utf-8", "replace")).hexdigest()[:16]
+
+
 def record_call(tool: str, arguments=None, *, task: str = "", worker: str = "",
                 turn=None, call_id: str = "", ts: float = None) -> str:
     """Write the CALL record, BEFORE the tool runs. Returns the id to pass to record_outcome.
@@ -135,7 +181,21 @@ def record_call(tool: str, arguments=None, *, task: str = "", worker: str = "",
     on success records the runs that did not need recording.
     """
     cid = call_id or new_call_id()
-    _append({
+    # WHICH MCP SESSION THIS ARRIVED ON, hashed. Recorded here rather than at either caller
+    # because there are two -- the call_tool gateway and register()'s wrapper for directly
+    # registered tools -- and a measurement that only sees one of them is the mistake this
+    # ledger spent the night fixing. Empty outside an HTTP request (tests, CLI, in-process
+    # hooks), which is correct: there is no session to name.
+    #
+    # PURELY OBSERVATIONAL. Nothing reads it yet. It exists to settle whether Copilot Studio
+    # keeps one session id across a conversation or mints one per turn, because the answer
+    # decides whether the unlock credential can move off the model's context and onto the
+    # transport. See tools.security.session_fingerprint.
+    try:
+        _sess = session_fingerprint()
+    except Exception:
+        _sess = ""
+    row = {
         "schema": SCHEMA_VERSION,
         "event": "call",
         "id": cid,
@@ -145,7 +205,10 @@ def record_call(tool: str, arguments=None, *, task: str = "", worker: str = "",
         "worker": str(worker or "")[:64],
         "turn": turn,
         "args": redact_args(arguments),
-    })
+    }
+    if _sess:
+        row["session"] = _sess
+    _append(row)
     return cid
 
 
