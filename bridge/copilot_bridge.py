@@ -6141,6 +6141,13 @@ _PAGE_THREAD_WEDGED = None
 #: 600s but the probe is submitted with its own short timeout and only its REPEATED failure counts.
 PAGE_THREAD_WEDGE_LIMIT_S = max(30.0, float(os.environ.get("MCP_PAGE_WEDGE_LIMIT_SEC", "120")))
 
+#: How long a wedge must last before it is logged at WARNING rather than INFO. A missed probe is
+#: the normal state of a thread inside a long job, so severity is decided by duration, not by the
+#: miss (see the emit site in probe_connection for the measurement that forced this). Half
+#: the escalation limit: far enough in that "just busy" is no longer the likely reading, early
+#: enough to precede the hand-back rather than coincide with it.
+PAGE_THREAD_WEDGE_WARN_AFTER_S = PAGE_THREAD_WEDGE_LIMIT_S / 2.0
+
 
 def page_thread_wedged_for_s():
     """Seconds the owner thread has been failing its liveness probe, or None if it is not."""
@@ -6236,13 +6243,30 @@ def probe_connection(timeout_s=10.0, touch=None):
         # stamping job completions and treating a completion inside the wait window as proof of
         # progress; it was reverted because the thread is usually inside ONE long job, so
         # nothing completes during the wait and the healthy case looked identical to the wedge.
+        # SEVERITY IS NOW SET BY THE CLOCK, NOT BY THE FACT OF A MISS. Demoting ERROR -> WARNING
+        # (above) was not enough: a missed probe is the NORMAL state of a thread inside a long
+        # job, so WARNING still fired on nearly every healthy cycle. Measured over one bridge.log:
+        # 140 first-miss lines + 51 ladder lines = 191 WARNINGs, and they were 100% of the WARNING
+        # volume in the file -- so the level itself carried no information and a real warning
+        # would have been indistinguishable from the noise. They are not merely uninformative but
+        # actively misleading: only 8 of 132 were followed by a failing probe (6.1%), BELOW the
+        # 9.9% base rate, so the line was very slightly ANTI-correlated with trouble.
+        #
+        # What is worth a warning is a wedge that has lasted long enough that "it is just inside a
+        # job" has stopped being the likely explanation -- i.e. one approaching the point where
+        # the process is handed back. Warning at half the escalation limit gives that heads-up
+        # while dropping the routine case to INFO: on the same log, 191 WARNINGs become 11
+        # (60s x7, 80s x2, 100s x1, 120s x1), and every one of the 11 is a genuinely long wedge.
+        # Derived from the limit rather than hardcoded, so raising MCP_PAGE_WEDGE_LIMIT_SEC moves
+        # the warning with it instead of silently making this fire on every cycle again.
         if _PAGE_THREAD_WEDGED is None:
             _PAGE_THREAD_WEDGED = time.time()
-            logger.warning("the page-owner thread did not answer a liveness probe within the "
-                           "timeout; it may be inside a job (%s)", str(exc)[:160])
+            logger.info("the page-owner thread did not answer a liveness probe within the "
+                        "timeout; it may be inside a job (%s)", str(exc)[:160])
         else:
-            logger.warning("the page-owner thread is still wedged (%.0fs)",
-                           page_thread_wedged_for_s() or 0.0)
+            wedged_for = page_thread_wedged_for_s() or 0.0
+            emit = logger.warning if wedged_for >= PAGE_THREAD_WEDGE_WARN_AFTER_S else logger.info
+            emit("the page-owner thread is still wedged (%.0fs)", wedged_for)
         return None
     except Exception as exc:
         if connection_is_dead(exc):
