@@ -221,7 +221,11 @@ mcp = FastMCP(
         # unlock) and what actually recovers it (call unlock), and offers the fleet for the
         # case that genuinely differs -- long, multi-step, wanted under supervision.
         "RULE 3 -- TO CHANGE ANYTHING, CALL unlock FIRST. write_file, run_python and shell are "
-        "refused until you do, and the refusal names the missing token. The password is not in "
+        "refused until you do, and the refusal names the missing token. READING NEEDS NO "
+        "UNLOCK: read_file, list_directory, glob and the rest of the read-only set work "
+        "without one, so do not call unlock before a task that only reads, and never abandon "
+        "a task you could have finished by reading because you could not get the password. "
+        "The password is not in "
         ".env and .env is refused on sight: do not go looking for it there. If you do not have "
         "it, say so and stop -- do not fall back to read-only tools and present the result as "
         "though the task were done. For work that is long or multi-step, or that you want "
