@@ -100,3 +100,28 @@ def test_the_skills_the_prompt_delegates_to_actually_exist():
     nothing, concludes there is no procedure, and invents one. That exact failure is recorded
     in skill_ops -- six Skills sat unreadable for weeks while callers re-derived their work."""
     assert skill_names(), "the prompt delegates to skills/ and there are none"
+
+
+def test_the_rules_are_numbered_once_each_and_in_order():
+    """Inserting a rule means renumbering the ones after it, and a duplicate number is the
+    natural mistake. It happened while adding RULE 3: two rules ended up numbered 7."""
+    import re
+    nums = [int(n) for n in re.findall(r"RULE (\d+)", instructions_text())]
+    assert nums == sorted(set(nums)), "rule numbers repeat or are out of order: %s" % nums
+    assert nums == list(range(1, len(nums) + 1)), "rule numbers are not 1..N: %s" % nums
+
+
+def test_the_instructions_point_work_at_the_fleet():
+    """MEASURED 2026-09-06. The owner sent two ordinary requests from a phone. The agent obeyed
+    RULE 1, then tried to do the work itself: write_file and run_python refused for want of an
+    unlock token, .env was read three times looking for the password and refused each time, and
+    it fell back to wandering the repo read-only. fleet_submit was never called -- one of 175
+    names in a catalogue, with nothing saying it was the answer. Neither request reached the
+    fleet, and the door had been measured working days earlier.
+
+    This pins the instruction, not the outcome: whether the agent then obeys is a separate
+    question, answered by whether a submission actually arrives."""
+    text = instructions_text()
+    assert "fleet_submit" in text, (
+        "nothing tells the agent to hand work to the fleet; a door nobody is told about is a "
+        "door nobody uses")
