@@ -104,6 +104,35 @@ def looks_refused(result) -> bool:
         return False
 
 
+def row_ok(row) -> bool:
+    """The verdict for a STORED outcome row, with refusals corrected on read.
+
+    record_outcome has filed refusals as failures since the commit that added it, but the rows
+    written before that say ok=True with the refusal text sitting in `result` -- 320 of 11,686
+    outcome rows when this was measured. The ledger is append-only and its worth is that it was
+    never edited, so history is corrected here, at read time, instead.
+
+    Read verdicts through this rather than row["ok"]: it also unwraps `result`, which is stored
+    as {"text": ...} by _bounded, and reaching past that wrapper by hand is the step every
+    ad-hoc query gets wrong. Truncation cannot fake a refusal -- _bounded cuts at MAX_INLINE
+    (2000), well above the 400-char dominance bound, so a clipped long result still reads long.
+    """
+    try:
+        ok = bool(row.get("ok"))
+        if not ok or row.get("event") != "outcome":
+            return ok
+        result = row.get("result")
+        if isinstance(result, dict):
+            result = result.get("text")
+        return not looks_refused(result)
+    except Exception:
+        # A reader that raises on one malformed row stops being used, same as read() above.
+        try:
+            return bool(row.get("ok"))
+        except Exception:
+            return False
+
+
 def redact_args(arguments, _depth=0) -> dict:
     """Arguments with secret VALUES removed and the rest bounded.
 
