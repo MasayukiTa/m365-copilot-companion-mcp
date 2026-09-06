@@ -432,3 +432,76 @@ def test_a_positional_call_is_recorded_too(own_ledger, monkeypatch):
     assert seen and "C:/x/.fleet/probe_challenge" in str(seen[0])
     rows = [r for r in _ledger_rows(own_ledger) if r.get("event") == "call"]
     assert rows and "probe_challenge" in json.dumps(rows[0].get("args"))
+
+
+# -- a refusal must not look like an answer -----------------------------------------------------
+
+def test_a_lock_refusal_reaches_the_client_as_an_error(own_ledger):
+    """A REFUSAL RETURNED AS A STRING IS A SUCCESSFUL RESULT ON THE WIRE.
+
+    Measured against a throwaway server: returning the text gives isError=false, and the model
+    reads it as content. That is what happened on 2026-09-06 -- an agent hit two refusals, fell
+    back to read-only tools, and answered as though the work were done, in a run where nothing
+    was written.
+    """
+    from fastmcp.exceptions import ToolError
+    from tools.registry import register
+    import asyncio
+
+    def write_file(path="."):
+        """One line."""
+        return "[locked: no valid unlock token for '1.2.3.4'] Call unlock(password=...)."
+
+    with pytest.raises(ToolError) as caught:
+        asyncio.run(register(write_file)(path="x"))
+    assert str(caught.value).startswith("[locked"), (
+        "the prefix must survive verbatim -- relay and bridge both key on it with startswith")
+
+
+def test_it_is_a_ToolError_and_not_a_bare_exception(own_ledger):
+    """Also measured: ToolError arrives with the message verbatim, while a plain exception
+    arrives as \"Error calling tool 'x': [locked...\" -- isError is set either way, but the
+    prefix moves and every reader of it stops matching."""
+    from fastmcp.exceptions import ToolError
+    from tools.registry import register
+    import asyncio
+
+    def write_file():
+        """One line."""
+        return "[locked client IP: '1.2.3.4'] Call unlock(password=...) first."
+
+    try:
+        asyncio.run(register(write_file)())
+        raise AssertionError("the refusal was returned, not raised")
+    except ToolError as exc:
+        assert type(exc) is ToolError, "a subclass or other exception changes the wire shape"
+        assert str(exc).startswith("[locked client IP")
+
+
+def test_an_ordinary_result_is_untouched(own_ledger):
+    """Only refusals change shape. A tool that merely mentions a lock in prose is not one."""
+    from tools.registry import register
+    import asyncio
+
+    def describe():
+        """One line."""
+        return "the door is [locked] in the sense that it needs a key"
+
+    assert asyncio.run(register(describe)()).startswith("the door")
+
+
+def test_the_refusal_is_still_recorded_before_it_raises(own_ledger):
+    """The ledger has to show the call and its outcome, or a refused call becomes invisible at
+    the moment it starts failing loudly."""
+    from fastmcp.exceptions import ToolError
+    from tools.registry import register
+    import asyncio
+
+    def run_python():
+        """One line."""
+        return "[locked: no valid unlock token for '1.2.3.4'] Call unlock(password=...)."
+
+    with pytest.raises(ToolError):
+        asyncio.run(register(run_python)())
+    rows = [(r.get("event"), r.get("tool")) for r in _ledger_rows(own_ledger)]
+    assert ("call", "run_python") in rows
