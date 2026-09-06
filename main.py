@@ -206,23 +206,28 @@ mcp = FastMCP(
         "matched Skill encodes decisions that were verified against the real data, and "
         "improvising past it has produced confident wrong answers. Skill trust never "
         "grants extra execution rights; unlock and contract gates still apply. "
-        # 実測 2026-09-06 10:49-10:51: the owner sent two ordinary requests from a phone. The
-        # agent obeyed RULE 1 (catalogue, twice) and then tried to do the work itself: write_file
-        # and run_python both refused for want of an unlock token, it read .env three times
-        # looking for the password and was refused each time by the security guard, and it fell
-        # back to wandering the repo read-only. fleet_submit was never called once -- it is one
-        # of 175 names in a catalogue and nothing said it was the answer. Neither request
-        # reached the fleet. The door was measured working the same week; what was missing was
-        # any reason for the agent to use it.
-        "RULE 3 -- WORK TO BE CARRIED OUT GOES TO fleet_submit, NOT TO YOUR OWN HANDS. Your "
-        "connection has no unlock token, so write_file, run_python and shell WILL be refused, "
-        "and .env is refused too -- do not go looking for the password. When the request is a "
-        "TASK rather than a question (draft this, check that, run this, fix that, go and find "
-        "out), call fleet_submit(goal=<the whole instruction, verbatim>, source=<who asked>) "
-        "and say it is queued. fleet_submit is in your own tool list; it needs no unlock and no "
-        "gateway. A fleet runs on the owner's machine with the owner's own credentials and can "
-        "do what you cannot. Answer directly only when the request really is answerable with "
-        "read-only tools. "
+        # 実測 2026-09-06, twice, and the second run corrected the first reading of the first.
+        #
+        # 10:49-10:51, from a phone: the agent obeyed RULE 1, then tried to do the work itself.
+        # write_file and run_python were refused for want of an unlock token, it read .env three
+        # times looking for the password and was refused each time, and it fell back to
+        # wandering the repo read-only. Neither of the owner's two requests produced anything.
+        #
+        # 11:04-11:12, the same request driven through the bridge: the agent called unlock,
+        # was granted a token, and wrote the file. The work got done. So the first reading --
+        # "it cannot do this, therefore it must hand over to the fleet" -- was wrong: it CAN,
+        # and the earlier failure was skipping unlock, not lacking the right. A rule whose
+        # stated reason is false earns nothing: this one now says what actually blocks (no
+        # unlock) and what actually recovers it (call unlock), and offers the fleet for the
+        # case that genuinely differs -- long, multi-step, wanted under supervision.
+        "RULE 3 -- TO CHANGE ANYTHING, CALL unlock FIRST. write_file, run_python and shell are "
+        "refused until you do, and the refusal names the missing token. The password is not in "
+        ".env and .env is refused on sight: do not go looking for it there. If you do not have "
+        "it, say so and stop -- do not fall back to read-only tools and present the result as "
+        "though the task were done. For work that is long or multi-step, or that you want "
+        "watched and resumable, hand the whole instruction to fleet_submit(goal=..., "
+        "source=<who asked>) instead and say it is queued: it needs no unlock and no gateway, "
+        "and a fleet runs it on the owner's machine under supervision. "
         "RULE 4: every tool lives BEHIND the call_tool gateway. Names like read_file / "
         "list_directory / run_python / glob are NOT in your own tool list and you will "
         "not find them there. Their absence from your tool list is EXPECTED and proves "
