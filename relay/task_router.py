@@ -778,6 +778,35 @@ def autostart_fleet(goals, state_dir=None, now=None, launcher=None) -> dict:
     return {"ok": True, "pid": pid, "goals": len(goals), "goals_file": goals_file}
 
 
+#: How far BEFORE a launch a run's own start stamp may sit and still be counted as that
+#: launch's run. The launch records its time before Popen and the run writes status.json a few
+#: seconds later, so in practice the stamp is always later; the slack only absorbs a clock that
+#: ticks backwards slightly, and stays far too small to match the previous run.
+_AUTOSTART_START_SLACK_S = 5.0
+
+
+def _run_started_since(state_dir, since) -> bool:
+    """Did a fleet run START at or after `since`? Never raises.
+
+    Distinct from fleet_is_live, which asks whether one is running NOW. This reads the same
+    status.json but looks at the run's own `started` stamp, so a run that has already finished
+    still answers yes -- which is the whole point, since a finished run and a run that never
+    came up look identical from the outside.
+
+    A stale status.json from an EARLIER run has a `started` older than `since` and correctly
+    answers no, so this cannot mistake the previous run for this launch's.
+    """
+    try:
+        sp = os.path.join(state_dir, "status.json")
+        if not os.path.isfile(sp):
+            return False
+        with open(sp, encoding="utf-8-sig") as fh:
+            started = float((json.load(fh) or {}).get("started") or 0)
+        return started > 0 and started >= (float(since) - _AUTOSTART_START_SLACK_S)
+    except Exception:
+        return False
+
+
 def recover_failed_autostart(state_dir=None, now=None) -> list:
     """Put back the goals of an autostart that never became live. Returns what was restored.
 
@@ -795,6 +824,18 @@ def recover_failed_autostart(state_dir=None, now=None) -> list:
     if now - started < AUTOSTART_GRACE_S:
         return []
     if fleet_is_live(sd):
+        _write_autostart(sd, dict(rec, outcome="became_live"))
+        return []
+    # DID IT EVER RUN -- not "is it running now". fleet_is_live answers the second question,
+    # and for a run that FINISHED inside the grace window the two answers differ: the fleet is
+    # gone and the pid has exited for exactly the same reason a successful run leaves. Asking
+    # only the present-tense question filed a completed run as one that never came up and
+    # handed its goal back to the queue, so the work would be done twice.
+    #
+    # Measured on the first real autostart: launched 15:14:19, finished DONE at 15:17:18,
+    # grace expired 15:18:19, and at 15:18:31 this function restored the goal it had already
+    # completed. Any run shorter than AUTOSTART_GRACE_S hits it, which is most small goals.
+    if _run_started_since(sd, started):
         _write_autostart(sd, dict(rec, outcome="became_live"))
         return []
     if _pid_alive(rec.get("pid")):

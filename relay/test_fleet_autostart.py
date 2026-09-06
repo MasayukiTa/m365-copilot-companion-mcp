@@ -311,3 +311,64 @@ def test_the_ambient_flag_is_off_for_every_test():
     """What conftest's autouse fixture is for. Without it this reads whatever .env says on the
     machine the suite happens to run on, which is not a property of the code."""
     assert TR.AUTOSTART is False
+
+
+# ---------------------------------------------------------------------------------------
+# A RUN THAT FINISHED IS NOT A RUN THAT NEVER STARTED.
+#
+# recover_failed_autostart asked fleet_is_live -- "is one running NOW" -- and for a run that
+# completed inside the grace window the answer is no, for exactly the same reason it is no
+# when the launch failed: the fleet is gone and the pid has exited. So a successful run was
+# filed as never_became_live and its goal handed back to the queue, to be done a second time.
+#
+# Found by running the first real autostart rather than by reading the code: launched
+# 15:14:19, DONE at 15:17:18, grace up at 15:18:19, and at 15:18:31 the goal it had already
+# completed reappeared in for_fleet/. AUTOSTART_GRACE_S is 240s, so every run shorter than
+# four minutes hit this -- which is most small goals.
+# ---------------------------------------------------------------------------------------
+
+def _write_status(state, started, running=False):
+    """The status.json a real fleet_runner writes: its own start stamp, and whether it is up."""
+    io.open(os.path.join(str(state), "status.json"), "w", encoding="utf-8").write(
+        json.dumps({"started": started, "running": running, "total": 1, "done_count": 1}))
+
+
+def test_a_run_that_finished_inside_the_grace_is_not_treated_as_never_started(state, monkeypatch):
+    """THE regression. The run came up, did the work and exited, all before the grace expired."""
+    monkeypatch.setattr(TR, "_pid_alive", lambda pid: False)     # a finished run has no pid
+    TR.autostart_fleet([{"text": "small goal"}], str(state), now=1000.0, launcher=_Launcher())
+    _write_status(state, started=1003.0, running=False)          # started after us, now done
+
+    restored = TR.recover_failed_autostart(str(state), now=1000.0 + TR.AUTOSTART_GRACE_S + 1)
+
+    assert restored == [], "a completed run's goal was handed back to the queue"
+    assert TR._read_autostart(str(state))["outcome"] == "became_live"
+
+
+def test_a_launch_that_truly_never_came_up_still_restores_its_goal(state, monkeypatch):
+    """The behaviour the fix must not cost: with no run of ours ever recorded, the goal is
+    still recoverable. A stale status.json from an EARLIER run must not rescue this launch."""
+    monkeypatch.setattr(TR, "_pid_alive", lambda pid: False)
+    _write_status(state, started=900.0, running=False)           # a PREVIOUS run, before us
+    TR.autostart_fleet([{"text": "doomed"}], str(state), now=1000.0, launcher=_Launcher())
+
+    restored = TR.recover_failed_autostart(str(state), now=1000.0 + TR.AUTOSTART_GRACE_S + 1)
+
+    assert len(restored) == 1
+    assert TR._read_autostart(str(state))["outcome"] == "never_became_live"
+
+
+def test_no_status_file_at_all_still_restores(state, monkeypatch):
+    """The first-ever autostart on a fresh machine: nothing has written status.json."""
+    monkeypatch.setattr(TR, "_pid_alive", lambda pid: False)
+    TR.autostart_fleet([{"text": "doomed"}], str(state), now=1000.0, launcher=_Launcher())
+    assert not os.path.isfile(os.path.join(str(state), "status.json"))
+
+    assert len(TR.recover_failed_autostart(str(state), now=1000.0 + TR.AUTOSTART_GRACE_S + 1)) == 1
+
+
+def test_run_started_since_reads_the_start_stamp_not_the_running_flag(state):
+    """The distinction the fix rests on, asserted directly: a stopped run still answers yes."""
+    _write_status(state, started=1003.0, running=False)
+    assert TR._run_started_since(str(state), 1000.0) is True     # finished, but it DID start
+    assert TR._run_started_since(str(state), 1100.0) is False    # belongs to an earlier launch
