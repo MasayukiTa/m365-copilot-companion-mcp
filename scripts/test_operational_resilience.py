@@ -104,3 +104,20 @@ def test_doctor_resolves_the_interpreter_the_supervisor_would_actually_use():
     # and the server line repeats it, rather than making the reader join two red lines
     assert "$script:pyProblem" in doctor
     assert doctor.index('Check "python_runnable"') < doctor.index('Check "server_up"')
+
+
+def test_quickstart_falls_back_to_the_preserved_crash_log():
+    """quickstart is the only surface most people touch, and its inline dump read the LIVE log
+    only -- the one that every relaunch truncates. On the case the dump exists to cover it was
+    routinely empty, so quickstart printed nothing while doctor, two lines above, printed the
+    reason. Two instruments disagreeing about one failure is worse than one, because the reader
+    believes the silent one."""
+    qs = (ROOT / "quickstart.bat").read_text(encoding="utf-8")
+    doctor = (ROOT / "scripts" / "doctor.ps1").read_text(encoding="utf-8")
+
+    assert "server.err.history.log" in qs, "quickstart still reads only the truncated log"
+    # same two files, same order, as doctor's own reader
+    assert qs.index("server.err.log") < qs.index("server.err.history.log")
+    assert doctor.index("$script:serverErrLog") < doctor.index("$script:serverErrHistory")
+    # and quickstart still runs the doctor, or none of its checks reach anyone
+    assert "scripts\doctor.ps1" in qs
