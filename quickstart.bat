@@ -160,6 +160,20 @@ if not defined SKIP56 (
     echo   you do not have yet -- you can re-run configure_env.bat later to add them.
     echo.
     powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\configure_env.ps1"
+    REM READ WHAT IT REPORTED. configure_env.ps1 uses distinct codes on purpose -- its own
+    REM comment says so -- and they were being discarded, so a cancelled dialog and a saved one
+    REM were indistinguishable from here. Checked highest-first because `if errorlevel N` is
+    REM "N or greater", and read immediately: any command in between resets it.
+    if errorlevel 4 (
+        echo   The dialog could not run on this machine. Put MCP_IMPL_AGENT_URL=... into .env
+        echo   by hand, then run quickstart.bat again.
+    ) else if errorlevel 3 (
+        echo   Saved, but the main agent URL was left BLANK -- chat and fleet will not work
+        echo   until it is set. Re-run configure_env.bat when you have it.
+    ) else if errorlevel 2 (
+        echo   The dialog was CANCELLED -- .env was not changed and the agent URL is still
+        echo   unset. Re-run configure_env.bat when you have it.
+    )
 ) else (
     echo.
     echo   Skipping STEP 5/6 ^(agent already configured^). Jumping to STEP 7 launch.
@@ -193,6 +207,12 @@ if /i "!PROV_SHORTCUT!"=="yes" (
 )
 if /i "!PROV_AUTOSTART!"=="yes" (
     powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\register-supervisor.ps1"
+    REM You asked for logon autostart and it may not have been created. Without this the
+    REM failure surfaces at the NEXT logon, as the stack simply not being there.
+    if errorlevel 1 (
+        echo   Logon autostart could NOT be registered -- see the ERROR line above. Everything
+        echo   else continues; start the stack from the Desktop launcher until this is fixed.
+    )
 ) else (
     echo   Logon autostart skipped. Register it later with scripts\register-supervisor.ps1
 )
