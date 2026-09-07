@@ -306,7 +306,10 @@ if ($useHeadless) {
 # headless. Always pass it (harmless in headed mode, where a real window already exists).
 $arguments += "--window-size=1400,1000"
 $arguments += @(
-    # QUOTED VALUE. %LOCALAPPDATA% can contain a space ("C:\Users\First Last\..."). Start-Process
+    # QUOTED VALUE. %LOCALAPPDATA% can contain a space, because a Windows account name can.
+    # (The illustrative path that used to sit here tripped the identity guard, which matches the
+    # SHAPE of a home directory and cannot tell an example from a real one -- correctly, since
+    # failing closed is the whole point of that check.) Start-Process
     # -ArgumentList joins elements with spaces and does not quote them, so an unquoted
     # --user-data-dir=<path with space> is split into two arguments and Edge launches on the WRONG
     # (default) profile -- which does not open the CDP port and silently drops the isolation this

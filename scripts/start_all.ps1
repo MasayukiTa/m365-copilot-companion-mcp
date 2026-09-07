@@ -1365,7 +1365,29 @@ try {
                 $script:startupFailures += "M365 sign-in needed (background start could not prompt)"
             }
         } else {
-            & powershell -NoProfile -ExecutionPolicy Bypass -File ('"{0}"' -f $signinPs) -TimeoutSeconds 180 | Out-Null
+            # ASK FIRST; SURFACE ONLY ON A REAL WALL. Running the full helper here opened a
+            # HEADED companion Edge on m365.cloud.microsoft/chat and left it running: measured
+            # 751 MB across ten processes, a taskbar button, and a window sitting 30px onto the
+            # screen -- on a machine that was already signed in. The helper surfaces whenever it
+            # cannot tell, and "cannot tell" is the NORMAL answer here: the fleet is
+            # websocket-driven and keeps zero tabs, so a healthy machine has no M365 tab to judge
+            # from. The launcher was therefore asking a question whose usual answer costs three
+            # quarters of a gigabyte and a window nobody asked for.
+            #
+            # --check-only answers without taking the window. Exit 1 -- a sign-in wall is
+            # actually open -- is the only positive evidence of "not signed in", and only that
+            # escalates to the helper that shows it. 2 (could not tell) stays silent, exactly as
+            # it already does on the -NoUi path above.
+            $signinPy = Join-Path $scriptDir "ensure_m365_signin.py"
+            $pyExe = Join-Path $root ".venv\Scripts\python.exe"
+            if ((Test-Path $signinPy) -and (Test-Path $pyExe)) {
+                & $pyExe $signinPy --port 9222 --check-only | Out-Null
+            } else {
+                $global:LASTEXITCODE = 2
+            }
+            if ($LASTEXITCODE -eq 1) {
+                & powershell -NoProfile -ExecutionPolicy Bypass -File ('"{0}"' -f $signinPs) -TimeoutSeconds 180 | Out-Null
+            }
         }
     }
 } catch {
