@@ -298,6 +298,76 @@ function Invoke-PostUpdateTail {
         }
     } catch { $rebuildNote = "`n`nUI rebuild skipped (error)." }
 
+    # STALE RUNNING SERVER after a Python-side update. ui/*.cs has a rebuild path above;
+    # the server's own code (relay/, tools/, main.py) had none. supervisor.ps1 is mutex-
+    # guarded and treats "already running" as a no-op, and the re-exec below only restarts
+    # THIS start_all -- so a server that was already up keeps executing the PRE-update code
+    # it imported at startup, indefinitely. /health still answers 200, so nothing surfaces
+    # it. The decision (did server code change? is a run live?) is delegated to the pure,
+    # pytest-covered scripts\stale_server_check.py so this stays in step with its tests.
+    # SAFETY: we NEVER swap the server while a fleet/review run is live -- that would drop
+    # the run. If we cannot tell whether a run is live, we assume it IS (report-only), the
+    # conservative side. When it is safe to swap, we only STOP the stale server and let
+    # supervisor.ps1 bring it back on fresh code via its normal health-probe restart -- we
+    # do not hand-roll the replacement here.
+    try {
+        $pyExe = Join-Path $root ".venv\Scripts\python.exe"
+        $staleChk = Join-Path $scriptDir "stale_server_check.py"
+        if ((Test-Path $pyExe) -and (Test-Path $staleChk) -and $changed) {
+            $pyVerdict = ($changed | & $pyExe $staleChk "--pyside") 2>$null
+            if ($LASTEXITCODE -eq 0 -and ($pyVerdict | Select-Object -Last 1) -eq "yes") {
+                # Is a fleet/review run LIVE? Ask the same module, which reads the
+                # authoritative signal defined by relay/fleet_reaper.py: the active-run
+                # marker .fleet\fleet_run_active.json (pid still alive), else status.json
+                # running==True. It only READS -- it never reaps -- and on any ambiguity
+                # it prints "yes" so we withhold the swap rather than risk a live run.
+                $fleetDir = Join-Path $root ".fleet"
+                $liveVerdict = (& $pyExe $staleChk "--runlive" $fleetDir) 2>$null
+                $runLive = -not ($LASTEXITCODE -eq 0 -and ($liveVerdict | Select-Object -Last 1) -eq "no")
+                if (-not $runLive) {
+                    # swap-needed: stop the stale server; supervisor restarts it on fresh code.
+                    try {
+                        # LOOK AT WHAT IS THERE BEFORE KILLING IT. Owning :8000 is not proof
+                        # of being our server: on this machine a system-Python main.py held
+                        # :8000 while the venv one ran portless, and a stray bridge held :8765
+                        # answering / but not /conv. A port is a claim, not an identity. Kill
+                        # only a process whose command line is this checkout's main.py; if the
+                        # holder is something else, say so and leave it -- a wrong kill here
+                        # takes down whatever unrelated program happened to bind the port.
+                        $stopped = 0
+                        Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction Stop |
+                            Select-Object -ExpandProperty OwningProcess -Unique |
+                            ForEach-Object {
+                                $owner = Get-CimInstance Win32_Process -Filter "ProcessId = $_" -ErrorAction SilentlyContinue
+                                $cl = if ($owner) { [string]$owner.CommandLine } else { "" }
+                                if ($cl -match 'main\.py') {
+                                    Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue
+                                    $stopped++
+                                } else {
+                                    Write-Host "[update] :8000 is held by pid $_ which is not this server ($cl); leaving it alone"
+                                }
+                            }
+                        if ($stopped -gt 0) {
+                            Write-Host "[update] server code changed and no run is live: stopped the stale server so supervisor restarts it on the new code"
+                            $rebuildNote += "`n`nServer updated (restarting on new code)."
+                        } else {
+                            Write-Host "[update] server code changed but nothing recognisable as this server holds :8000; not restarting anything"
+                            $rebuildNote += "`n`nServer code updated, but the running server could not be identified; restart it manually."
+                        }
+                    } catch {
+                        Write-Host "[update] wanted to swap the stale server but stopping it failed: $($_.Exception.Message)"
+                    }
+                } else {
+                    # report-only: a run is (or may be) live; do not disturb it.
+                    Write-Host "[update] server code changed but a run appears live: leaving the running server in place; a restart is needed once the run finishes"
+                    $rebuildNote += "`n`nServer code updated. It will take effect after the current run finishes and the server is restarted."
+                }
+            }
+        }
+    } catch {
+        Write-Host "[update] stale-server check skipped (error): $($_.Exception.Message)"
+    }
+
     Show-OwnedDialog ("Updated to the latest version.{0}" -f $rebuildNote) $Title "OK" "Information" | Out-Null
 
     # DESIGN NOTE: the update above just landed new files on disk, but THIS process

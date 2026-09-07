@@ -665,6 +665,41 @@ Check-TriState "unlock_password_usable" "Unlock password readable by THIS Window
     } `
     $script:unlockFix
 
+# STALE RUNNING SERVER. A `git pull` lands new relay/tools/main.py on disk, but a server
+# that is already running keeps executing the code it imported at startup -- /health still
+# answers 200 and every other check is green, so the checkout and the live process silently
+# disagree until the next real restart. supervisor.ps1 records the SHA each server starts on
+# in .setup\server_started_head.txt; here we compare it to the checkout's HEAD. The decision
+# itself lives in scripts\stale_server_check.py (pure, pytest-covered) so this check cannot
+# drift from what the tests assert. Tri-state: "stale" is red, "current" is green, and a
+# missing/unreadable marker ("unknown") is indeterminate -- never a silent pass.
+Check-TriState "server_not_stale" "Running server is on the current checkout (not stale after an update)" `
+    {
+        # Only meaningful when a server is actually up; server_up above already reports the down case.
+        $up = $false
+        try { $up = (Invoke-WebRequest -Uri 'http://127.0.0.1:8000/health' -TimeoutSec 4 -UseBasicParsing).StatusCode -eq 200 } catch { $up = $false }
+        $py = Join-Path $repo ".venv\Scripts\python.exe"
+        if (-not (Test-Path $py)) { return $null }
+        $checker = Join-Path $scriptDir "stale_server_check.py"
+        if (-not (Test-Path $checker)) { return $null }
+        $marker = Join-Path $repo ".setup\server_started_head.txt"
+        $head = (& git -C $repo rev-parse HEAD 2>$null)
+        if ($LASTEXITCODE -ne 0 -or -not $head) { return $null }
+        $runningFlag = if ($up) { "1" } else { "0" }
+        $v = Invoke-BoundedPythonFile $py $checker @($marker, $head.Trim(), $runningFlag)
+        if ($null -eq $v) { return $null }
+        $script:staleVerdict = $v
+        switch ($v) {
+            "current"   { return $true }
+            "no_server" { return $true }   # nothing running is server_up's concern, not this one
+            "stale"     { return $false }
+            default     { return $null }   # "unknown" / "error:*" -> indeterminate
+        }
+    } `
+    ("the running MCP server started on a different commit than the checkout is on now -- it is " +
+     "executing code an update has already replaced on disk. Restart it so the new code takes effect: " +
+     "close it (or let supervisor.ps1 cycle it) and re-run start_all.bat.")
+
 Check "auth_bearer" "Auth OK end-to-end (Bearer accepted on /mcp)" `
     {
         $key = $envv['MCP_API_KEY']; if (-not $key) { return $false }

@@ -243,6 +243,21 @@ function Start-Server {
         Start-Process -FilePath $Py -ArgumentList "main.py" -WorkingDirectory $Root -WindowStyle Hidden
     }
     Pop-Location
+    # RECORD THE SHA THIS SERVER STARTED ON, so doctor can later tell a running server
+    # apart from a checkout that has since moved past it (a `git pull` lands new
+    # relay/tools/main.py on disk, but THIS long-lived process keeps executing the code
+    # it imported here). The marker is a sidecar file next to the other .setup state,
+    # written best-effort: failing to record it must never stop the server coming up.
+    # doctor reads it via scripts\stale_server_check.py; see that module's header.
+    try {
+        $head = (& git -C $Root rev-parse HEAD 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $head) {
+            $markerDir = Join-Path $Root ".setup"
+            if (-not (Test-Path $markerDir)) { New-Item -ItemType Directory -Force $markerDir | Out-Null }
+            Set-Content -Path (Join-Path $markerDir "server_started_head.txt") `
+                        -Value $head.Trim() -Encoding ASCII -ErrorAction Stop
+        }
+    } catch { }
     # SAY WHAT WAS DONE, NOT WHAT WAS ACHIEVED. This used to read as though the server was up.
     # Whether it stayed up is decided by the health probe on the next pass, not here.
     Write-Log "MCP server process launched (stale instances cleared); output -> $srvErr"
