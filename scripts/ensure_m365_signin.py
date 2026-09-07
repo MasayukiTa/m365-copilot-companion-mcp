@@ -39,6 +39,18 @@ LOGIN_RE = re.compile(
     r"login\.microsoftonline|login\.live\.com|/adfs/|adfs\.|/oauth2/authorize|/signin|login_hint=",
     re.I)
 
+#: An m365/copilot URL that is MID-AUTHENTICATION rather than the loaded app. Presence of an
+#: m365 tab was being read as "signed in" on its own, but the account picker, an interrupted
+#: consent, and the CsrToSSR bounce all live on an m365/copilot URL too -- so a tab that had
+#: not finished authenticating counted as done. These fragments mark "not the app yet": the
+#: bounce carries redirfrom=/auth=, the sign-in surfaces carry /login or ?login, and the
+#: account chooser is /common/ or select_account. Matching any of them means we do NOT get to
+#: claim signed-in from the mere existence of the tab; we return "cannot tell" and let the
+#: caller wait or surface the window, which is safe either way.
+MID_AUTH_RE = re.compile(
+    r"redirfrom=|[?&]auth=|/login|[?&]login|select_account|/common/oauth2|prompt=",
+    re.I)
+
 SIGNED_IN_URL = "https://m365.cloud.microsoft/chat"
 
 
@@ -64,10 +76,18 @@ def state(port: int):
     t = tabs(port)
     if t is None:
         return None, "companion Edge is not answering on :%d" % port
-    if any(LOGIN_RE.search(x.get("url") or "") for x in t):
+    urls = [x.get("url") or "" for x in t]
+    if any(LOGIN_RE.search(u) for u in urls):
         return False, "a sign-in page is open"
-    if any(re.search(r"m365|copilot", x.get("url") or "", re.I) for x in t):
-        return True, "an M365 page is open and not on a sign-in wall"
+    m365 = [u for u in urls if re.search(r"m365|copilot", u, re.I)]
+    if m365:
+        # AN M365 TAB IS NOT PROOF ON ITS OWN. If every m365 tab is still on an
+        # authentication-in-progress URL (account picker, consent bounce, CsrToSSR), we have
+        # not reached the app -- reporting "signed in" here is the false positive #2 is about.
+        # Only a settled m365/copilot URL counts.
+        if all(MID_AUTH_RE.search(u) for u in m365):
+            return None, "an M365 tab is open but still mid-authentication, so nothing to confirm yet"
+        return True, "an M365 page is open, past any sign-in wall and not mid-authentication"
     return None, "no M365 page open, so nothing to judge from (the fleet opens no tabs)"
 
 

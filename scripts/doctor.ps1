@@ -507,9 +507,31 @@ if (-not $script:supervisorCmdLine) {
 }
 
 # 4. Companion Edge (:9222) for the fleet/agent
+# SAY WHAT IT SAID, not just "launch it". start_companion_edge.ps1 now redirects its launch
+# stderr to .setup\logs\companion_edge_<profile>.err.log, so when :9222 does not answer we can
+# show the actual reason (a locked profile, a bad --user-data-dir, an Edge that refused the
+# debugging port) instead of pointing the operator back at the command that just failed. Same
+# shape as the supervisor advice above.
+$script:edgeErrLog = Join-Path $repo ".setup\logs\companion_edge_copilot-companion-edge.err.log"
+$script:edgeFix = "launch it: powershell -File scripts\start_companion_edge.ps1   (then sign into M365 once)"
+if (-not (Test-EdgeCdp 9222)) {
+    try {
+        if (Test-Path $script:edgeErrLog) {
+            $edgeLines = @(Get-Content $script:edgeErrLog -Tail 10 -ErrorAction Stop |
+                           Where-Object { $_.Trim() })
+            if ($edgeLines.Count -gt 0) {
+                $script:edgeFix = ("the companion Edge was launched and it reported:" +
+                                   [Environment]::NewLine + "           " +
+                                   ($edgeLines -join ([Environment]::NewLine + "           ")) +
+                                   [Environment]::NewLine +
+                                   "           after fixing that, re-run: powershell -File scripts\start_companion_edge.ps1")
+            }
+        }
+    } catch { }
+}
 Check "edge_companion" "Companion Edge running (:9222 fleet/agent)" `
     { Test-EdgeCdp 9222 } `
-    "launch it: powershell -File scripts\start_companion_edge.ps1   (then sign into M365 once)"
+    $script:edgeFix
 
 # ONE IMPLEMENTATION, NOT TWO. This used to require an m365/copilot TAB to be open, which the
 # websocket-driven fleet never creates -- so a signed-in machine reported RED. The check now
