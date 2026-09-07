@@ -1,4 +1,4 @@
-﻿# setup_devtunnel.ps1 -- robust, idempotent Dev Tunnel setup for the MCP server's PUBLIC URL.
+# setup_devtunnel.ps1 -- robust, idempotent Dev Tunnel setup for the MCP server's PUBLIC URL.
 #
 # Fixes the three first-run defects seen on a fresh PC:
 #   1. winget did not install devtunnel  -> falls back to the official DIRECT DOWNLOAD (no winget).
@@ -13,6 +13,9 @@
 #   .\setup_devtunnel.ps1 -TunnelName foo # use/create a specific tunnel name
 param(
     [string]$TunnelName = "",     # empty -> reuse the existing tunnel if there is one, else create a default
+    # Entra/tenant-scoped access, applied instead of being printed as a command to type. Empty
+    # means "not chosen"; the anonymous switch is still MCP_TUNNEL_ALLOW_ANONYMOUS.
+    [string]$TenantId = "",
     [int]$Port = 8000,
     [switch]$DeviceCode
 )
@@ -591,6 +594,18 @@ if ($AllowAnonymous) {
             Write-Host "      If login/permission, run: devtunnel user login"
             exit 1
         }
+    }
+} elseif ($TenantId) {
+    # APPLIED, NOT PRINTED. This was documented as a command for the operator to type, which is
+    # not something an installer can rely on: the tunnel is unreachable until it is run.
+    Write-Host "      Granting Entra/tenant-scoped access (tenant $TenantId)..."
+    & $DevTunnel access create $target --tenant $TenantId 2>&1 | ForEach-Object { Write-Host "        $_" }
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "      Tenant-scoped access granted. Copilot Studio can reach this tunnel"
+        Write-Host "      when signed in to that tenant; it is NOT open to the anonymous internet."
+    } else {
+        Write-Host "      TENANT ACCESS GRANT FAILED (exit $LASTEXITCODE). The tunnel is not reachable"
+        Write-Host "      by a remote client until an access grant succeeds."
     }
 } else {
     Write-Host "      MCP_TUNNEL_ALLOW_ANONYMOUS is not set to 1 -- skipping anonymous access grant."

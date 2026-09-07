@@ -9,6 +9,11 @@
 # Nothing is ever stopped/killed; this only fills in what is missing. Safe to run any number of times.
 param(
     [switch]$NoUi,
+    # Bring up ONLY what a Copilot Studio connection test needs -- the supervisor, which is the
+    # MCP server and the tunnel host. No setup gate, no browser, no bridge, no UI. quickstart
+    # uses this between STEP 4 and STEP 5, because STEP 5 asks the operator to test a connection
+    # and the server did not exist until STEP 7.
+    [switch]$CoreOnly,
     [switch]$NoSplash
 )
 
@@ -726,6 +731,11 @@ function Invoke-Startup {
     # Background logon startup must never show interactive setup; a manual launch still does.
     if ($NoUi) {
         Write-Host "[setup] first-time interactive setup skipped (-NoUi)"
+    } elseif ($CoreOnly) {
+        # THE GATE ASKS FOR THE THING STEP 5 IS ABOUT TO CREATE. It demands MCP_IMPL_AGENT_URL,
+        # which does not exist until the operator has made the agent -- which is what they are
+        # opening Copilot Studio to do. Asking here would be a deadlock.
+        Write-Host "[setup] first-time interactive setup skipped (-CoreOnly)"
     } else {
         Invoke-FirstTimeSetupGate
     }
@@ -747,16 +757,32 @@ function Invoke-Startup {
         $venvPy = Join-Path $root ".venv\Scripts\python.exe"
         if (Test-Path $venvPy) {
             $envFile = Join-Path $root ".env"
-            $repair = & $venvPy -c "import sys; sys.path.insert(0,r'$root'); from dotenv import dotenv_values; from tools.env_portability import repair_unlock_password; print(repair_unlock_password(r'$envFile', dict(dotenv_values(r'$envFile')))['reason'])" 2>&1 | Select-Object -Last 1
-            if ($repair -match "re-established") {
-                Write-Host "[setup] the unlock password could not be decrypted by this account -- re-established it for this machine"
-            } elseif ($repair -match "^cannot|^refusing") {
-                # A REPAIR THAT FAILED LOOKED LIKE A MACHINE THAT NEVER NEEDED ONE. Only the
-                # success string was reported, so "cannot protect a new value here",
-                # "refusing to edit without a backup" and "cannot read .env" all landed as
-                # silence -- and the symptom is every mutating tool refused, hours later,
-                # while doctor is green.
-                Write-Host "[setup] UNLOCK PASSWORD REPAIR FAILED: $repair"
+            # A SCRIPT FILE, NOT A `-c` PAYLOAD -- the form that made the unlock CHECK
+            # unable to fail. It prints one line: noop:<why> / repaired:<password> / failed:<why>.
+            $repairScript = Join-Path $scriptDir "repair_unlock.py"
+            $repair = ""
+            if (Test-Path $repairScript) {
+                $repair = (& $venvPy $repairScript $envFile 2>&1 | Select-Object -Last 1)
+            }
+            if ($repair -like "repaired:*") {
+                # THE OPERATOR HAS TO BE TOLD. The repair generates a NEW password, so the one
+                # they wrote down on the machine that produced this .env no longer works here --
+                # and nothing used to say so. Printed to the console only, in the same place
+                # quickstart prints the other secrets; not written to any log.
+                $newPw = $repair.Substring("repaired:".Length)
+                Write-Host ""
+                Write-Host "  ============================================================"
+                Write-Host "  The unlock password could not be decrypted by this Windows"
+                Write-Host "  account, so a NEW one was established for this machine:"
+                Write-Host ""
+                Write-Host ("      " + $newPw)
+                Write-Host ""
+                Write-Host "  Write this down. Any password you brought from another PC no"
+                Write-Host "  longer works here. (The fleet and bridge unlock themselves.)"
+                Write-Host "  ============================================================"
+                Write-Host ""
+            } elseif ($repair -like "failed:*") {
+                Write-Host ("[setup] UNLOCK PASSWORD REPAIR FAILED: " + $repair.Substring("failed:".Length))
                 Write-Host "[setup] mutating tools (write_file, run_python, shell) will be refused until this is fixed."
             }
         }
@@ -793,8 +819,11 @@ function Invoke-Startup {
     #    tunnel; otherwise behave exactly as before.
     Set-SplashStatus $script:splash "Starting the MCP server and Dev Tunnel..."
     function Start-FreshSupervisor([string]$tn) {
-        $supArgs = @("-NoProfile","-ExecutionPolicy","Bypass","-File","$scriptDir\supervisor.ps1")
-        if ($tn) { $supArgs += @("-TunnelName", $tn); Write-Host "[1/4] supervisor (MCP server + tunnel '$tn'): starting" }
+        # QUOTED. -ArgumentList elements are joined with spaces and not quoted, so an
+        # install path containing one becomes two arguments and the launch fails.
+        $supArgs = @("-NoProfile","-ExecutionPolicy","Bypass","-File",
+                     ('"{0}"' -f (Join-Path $scriptDir "supervisor.ps1")))
+        if ($tn) { $supArgs += @("-TunnelName", ('"{0}"' -f $tn)); Write-Host "[1/4] supervisor (MCP server + tunnel '$tn'): starting" }
         else     { Write-Host "[1/4] supervisor (MCP server + tunnel): starting" }
         # ITS STARTUP ERROR WAS GOING NOWHERE -- the same hole d15a834 closed for the server,
         # still open on the thing that launches it. Hidden window, no redirection: when the
@@ -921,6 +950,13 @@ function Invoke-Startup {
         } catch { Write-Host "      (phantom-run sweep skipped: $($_.Exception.Message))" }
     }
 
+    if ($CoreOnly) {
+        # Everything a connection test needs is up. The browser, the bridge and the UI are not
+        # part of that path and are left for the full run at STEP 7.
+        Write-Host "[core] server and tunnel are up; browser, bridge and UI left for STEP 7"
+        return
+    }
+
     # 2) Companion Edge :9222 (the fleet / agent Edge). Idempotent; skip if the port answers.
     Set-SplashStatus $script:splash "Starting the agent browser..."
     if (Port-Up 9222) {
@@ -958,7 +994,8 @@ function Invoke-Startup {
         # console would leave a window that has to stay open for the app to work.
         $bridgeLog = Join-Path $script:diagDir "bridge.log"
         Start-Process powershell -WindowStyle Hidden -ArgumentList @(
-            "-NoProfile","-ExecutionPolicy","Bypass","-File","$scriptDir\start_bridge.ps1","-Keepalive") `
+            "-NoProfile","-ExecutionPolicy","Bypass","-File",
+            ('"{0}"' -f (Join-Path $scriptDir "start_bridge.ps1")), "-Keepalive") `
             -RedirectStandardOutput $bridgeLog -RedirectStandardError "$bridgeLog.err"
     }
 
