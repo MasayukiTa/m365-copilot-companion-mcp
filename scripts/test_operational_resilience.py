@@ -87,3 +87,20 @@ def test_the_crash_log_survives_the_relaunch_that_would_erase_it():
     assert preserve < launch, "the previous launch is copied out AFTER it has been truncated"
     # bounded, or an unattended machine fills its disk with the same stack trace
     assert "-gt 262144" in sup and "-Tail 400" in sup
+
+
+def test_doctor_resolves_the_interpreter_the_supervisor_would_actually_use():
+    """The silent death had no name. supervisor.ps1 falls back from .venv to bare `python`,
+    which on a fresh Windows machine is usually the Store App Execution Alias -- a stub that
+    opens the Store and exits writing nothing, so the crash log cannot explain it. doctor must
+    resolve it the SAME way or it answers a different question from the one that matters."""
+    doctor = (ROOT / "scripts" / "doctor.ps1").read_text(encoding="utf-8")
+    sup = (ROOT / "scripts" / "supervisor.ps1").read_text(encoding="utf-8")
+
+    assert 'Check "python_runnable"' in doctor
+    # same resolution order as the supervisor: .venv first, PATH second
+    assert r".venv\Scripts\python.exe" in doctor and r".venv\Scripts\python.exe" in sup
+    assert "WindowsApps" in doctor, "the one failure that leaves no trace is not named"
+    # and the server line repeats it, rather than making the reader join two red lines
+    assert "$script:pyProblem" in doctor
+    assert doctor.index('Check "python_runnable"') < doctor.index('Check "server_up"')
