@@ -123,6 +123,19 @@ function Check([string]$id, [string]$name, [scriptblock]$test, [string]$fix, [sw
     }
 }
 function Get-Json($url) { Invoke-RestMethod -Uri $url -TimeoutSec 4 -UseBasicParsing }
+# IS IT ACTUALLY AN EDGE DEBUG PORT? The callers fetched /json/version and discarded it, so
+# anything answering that URL with any JSON passed -- and the check's name claims a browser.
+# Measured, the real endpoint carries Browser="Edg/..." and a webSocketDebuggerUrl; a static
+# document that happens to be JSON carries neither.
+function Test-EdgeCdp([int]$port) {
+    try {
+        $v = Get-Json ("http://127.0.0.1:" + $port + "/json/version")
+    } catch {
+        return $false
+    }
+    if (-not $v) { return $false }
+    return (("" + $v.Browser) -like "Edg*") -and (("" + $v.webSocketDebuggerUrl) -like "ws://*")
+}
 
 Write-Host ""
 Write-Host "m365-copilot-companion-mcp  --  setup doctor" -ForegroundColor Cyan
@@ -495,7 +508,7 @@ if (-not $script:supervisorCmdLine) {
 
 # 4. Companion Edge (:9222) for the fleet/agent
 Check "edge_companion" "Companion Edge running (:9222 fleet/agent)" `
-    { Get-Json 'http://127.0.0.1:9222/json/version' | Out-Null; $true } `
+    { Test-EdgeCdp 9222 } `
     "launch it: powershell -File scripts\start_companion_edge.ps1   (then sign into M365 once)"
 
 # ONE IMPLEMENTATION, NOT TWO. This used to require an m365/copilot TAB to be open, which the
@@ -528,7 +541,7 @@ if ($signinCode -eq 2) {
 
 # 5. Bridge Edge (:9223) -- optional, only for conversation history/scrape
 Check "edge_bridge" "Bridge Edge running (:9223 history/scrape) [optional]" `
-    { Get-Json 'http://127.0.0.1:9223/json/version' | Out-Null; $true } `
+    { Test-EdgeCdp 9223 } `
     "optional: powershell -File scripts\start_bridge.ps1 -Keepalive   (only needed for past-conversation history)" `
     -Optional
 

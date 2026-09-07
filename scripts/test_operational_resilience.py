@@ -656,3 +656,22 @@ def test_no_tunnel_name_is_not_ownership():
     assert "IsNullOrWhiteSpace($name)) { return $null }" in owned, \
         "an unset tunnel name reads as owned again"
     assert "{ return $true }" not in owned.split("for ($attempt")[0]
+
+
+def test_the_cdp_checks_read_the_answer_instead_of_discarding_it():
+    """`Get-Json '...' | Out-Null; $true` passed on anything that answered that URL with any
+    JSON -- another browser, a dev server, a proxy -- while the check's name claims a browser.
+    The shape does fail closed on a dead port (measured: a request to a free port throws and the
+    check goes red), so this was not the green-while-broken case the others were; it was a check
+    confirming "something is there" under a name that says which something.
+
+    What the real endpoint returns, measured: Browser="Edg/152...", plus a webSocketDebuggerUrl
+    that makes it CDP rather than a document that happens to be JSON. Exercised against a live
+    Edge (true), a JSON impostor on another port (false) and a free port (false)."""
+    doctor = (ROOT / "scripts" / "doctor.ps1").read_text(encoding="utf-8")
+
+    assert "function Test-EdgeCdp" in doctor
+    assert '$v.Browser) -like "Edg*"' in doctor
+    assert '$v.webSocketDebuggerUrl) -like "ws://*"' in doctor
+    code = "\n".join(l for l in doctor.splitlines() if not l.lstrip().startswith("#"))
+    assert "json/version' | Out-Null; $true" not in code, "the discarded-answer form is back"
