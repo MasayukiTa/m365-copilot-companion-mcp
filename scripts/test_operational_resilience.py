@@ -751,3 +751,33 @@ def test_the_self_restart_keeps_every_switch_it_was_given():
     block = block[:block.index("Start-Process")]
     assert 'if ($CoreOnly) { $reArgs += "-CoreOnly" }' in block
     assert "'\"{0}\"' -f $selfPath" in block, "the script path is unquoted again"
+
+
+def test_the_daily_launcher_checks_the_m365_session():
+    """ensure_m365_signin was called from quickstart once, at install time, and by doctor with
+    --check-only as an [INFO] that counts toward nothing. start_all -- the Desktop shortcut, the
+    logon task, everything that runs day to day -- did not call it at all. M365 sessions expire,
+    and when one does the stack comes up entirely green while the agent silently cannot work.
+
+    Handing the operator a script to run by hand is not the fix; the launcher carries it. A
+    background start asks without surfacing a browser at nobody, a manual start brings the
+    window forward, bounded at 180s rather than the helper's 600s default.
+
+    THE PYTHON DIRECTLY in the background branch, because the wrapper ends with an unconditional
+    `exit 0` -- deliberately, so a missing sign-in never fails the whole setup -- which would
+    have made a check of its exit code dead code. Caught before committing this time. Measured:
+    no M365 tab and no browser both give 2 ("could not tell"), which is correctly ignored,
+    because the fleet opens no tabs and a signed-in machine looks the same."""
+    start_all = (ROOT / "scripts" / "start_all.ps1").read_text(encoding="utf-8")
+    wrapper = (ROOT / "scripts" / "ensure_m365_signin.ps1").read_text(encoding="utf-8")
+
+    assert "ensure_m365_signin" in start_all, "the daily launcher still does not look"
+    assert "[switch]$CheckOnly" in wrapper
+    # the wrapper still refuses to fail the setup, which is why the code is read elsewhere
+    assert "exit 0" in wrapper
+    block = start_all[start_all.index("THE SESSION EXPIRES AND NOTHING LOOKED"):]
+    block = block[:block.index("WHERE TO LOOK")]
+    assert "ensure_m365_signin.py" in block, "the background branch calls the wrapper again"
+    assert "$LASTEXITCODE -eq 1" in block
+    assert "-eq 2" not in block, "could-not-tell must not be reported as a fault"
+    assert "-TimeoutSeconds 180" in block
