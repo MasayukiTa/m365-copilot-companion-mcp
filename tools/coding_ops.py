@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+from . import contract_gate as _cg
 from .file_ops import _validate_path
 from .security import require_unlocked
 from .walk import iter_files, pruned_note
@@ -35,6 +36,71 @@ def _run(args: list[str], cwd: Optional[Path], timeout: int) -> str:
     if result.returncode != 0:
         output += f"\n[returncode: {result.returncode}]"
     return output or "(no output)"
+
+
+def _norm(p: str) -> str:
+    """Realpath-normalise a path string for reliable comparison across symlinks/junctions."""
+    try:
+        return os.path.normcase(os.path.realpath(p.strip()))
+    except Exception:
+        return os.path.normcase(p.strip())
+
+
+def _is_shared_worktree(cwd: Path):
+    """Is *cwd* the shared (main) working tree, rather than a dedicated linked worktree?
+
+    Compares `git rev-parse --git-dir` with `--git-common-dir`. When they resolve to the
+    same directory the checkout shares the repository's main working tree -- the place
+    where a branch switch or a wholesale stage would sweep up other workers' and the
+    owner's uncommitted changes. A linked worktree has a distinct --git-dir.
+
+    Returns True (shared), False (dedicated worktree), or None when the answer cannot be
+    determined -- callers treat None as fail-open (do not block on a guess).
+    """
+    try:
+        gd = _run(["git", "rev-parse", "--git-dir"], cwd, 15)
+        cd = _run(["git", "rev-parse", "--git-common-dir"], cwd, 15)
+    except Exception:
+        return None
+    if "[returncode:" in gd or "[returncode:" in cd:
+        return None
+
+    def _extract(out: str):
+        for line in out.splitlines():
+            line = line.strip()
+            if line and not line.startswith("["):
+                return line
+        return None
+
+    g = _extract(gd)
+    c = _extract(cd)
+    if not g or not c:
+        return None
+    base = str(cwd)
+    ga = g if os.path.isabs(g) else os.path.join(base, g)
+    ca = c if os.path.isabs(c) else os.path.join(base, c)
+    return _norm(ga) == _norm(ca)
+
+
+def _add_is_wholesale(paths: list) -> bool:
+    """True when a git add stages the whole tree: -A / --all / a bare '.' path."""
+    for raw in paths:
+        s = str(raw).strip()
+        if s in ("-A", "--all", "."):
+            return True
+    return False
+
+
+def _current_branch(cwd: Path):
+    """Current branch name, or None if detached/unknown."""
+    out = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd, 15)
+    if "[returncode:" in out:
+        return None
+    for line in out.splitlines():
+        line = line.strip()
+        if line and not line.startswith("["):
+            return line
+    return None
 
 
 def _note(skipped_big: int, partial_files: int, skipped_dirs=None) -> str:
@@ -332,6 +398,21 @@ def git_add(paths: list[str], repo_path: str = ".") -> str:
         cwd = repo if repo.is_dir() else repo.parent
         if not isinstance(paths, list) or not paths:
             return "[git_add error: 'paths' must be a non-empty list]"
+        # (A) Refuse wholesale staging. `-A` / `--all` / a bare `.` stage every change in the
+        # working tree, including other workers' and the owner's uncommitted files that this
+        # run does not own. Refuse without stopping the run and say what to do instead.
+        if _add_is_wholesale(paths):
+            return (
+                "[git_add refused: wholesale staging (-A / --all / '.') is not allowed here.\n"
+                "Why: this working tree is shared by other workers and the owner. Staging the\n"
+                "whole tree sweeps up their uncommitted changes into your commit.\n"
+                "Instead: pass the explicit paths you changed, e.g. git_add(['tools/x.py',\n"
+                "'tests/test_x.py']). Run git_status first to see exactly which files are yours.]"
+            )
+        # (B) Route through the destructive-op gate so an active contract can ask-before.
+        _g = _cg.check_op("shell_destructive", "git add -- " + " ".join(str(p) for p in paths))
+        if _g is not None:
+            return _g
         args = ["git", "add", "--"]
         for raw in paths:
             args.append(raw)
@@ -356,6 +437,21 @@ def git_commit(message: str, repo_path: str = ".", allow_empty: bool = False) ->
             return "[git_commit error: message is required]"
         repo = _validate_path(repo_path)
         cwd = repo if repo.is_dir() else repo.parent
+        # (A) Refuse committing directly onto a protected branch (main/master). A worker
+        # should land work on its own branch and open a PR, not write straight to main.
+        _br = _current_branch(cwd)
+        if _br in ("main", "master"):
+            return (
+                "[git_commit refused: committing directly onto '%s' is not allowed.\n"
+                "Why: shared history on the protected branch must not receive un-reviewed\n"
+                "commits from an automated run.\n"
+                "Instead: create a feature branch first (git_checkout(branch, create=True)) and\n"
+                "commit there, then open a pull request.]" % _br
+            )
+        # (B) Route through the destructive-op gate so an active contract can ask-before.
+        _g = _cg.check_op("shell_destructive", "git commit -m " + message)
+        if _g is not None:
+            return _g
         args = ["git", "commit", "-m", message]
         if allow_empty:
             args.append("--allow-empty")
@@ -396,6 +492,26 @@ def git_checkout(branch: str, repo_path: str = ".", create: bool = False) -> str
     try:
         repo = _validate_path(repo_path)
         cwd = repo if repo.is_dir() else repo.parent
+        # Creating a new branch (git checkout -b) discards nothing, so it is always allowed.
+        if not create:
+            # (A) Refuse a branch switch in the shared (main) working tree: it would carry the
+            # owner's and other workers' uncommitted changes onto another branch.
+            if _is_shared_worktree(cwd) is True:
+                return (
+                    "[git_checkout refused: switching branches in the shared working tree is not\n"
+                    "allowed.\n"
+                    "Why: this checkout shares the repository's main working tree with other\n"
+                    "workers and the owner. A branch switch here sweeps their uncommitted changes\n"
+                    "onto the target branch.\n"
+                    "Instead: create an isolated worktree for your branch, e.g.\n"
+                    "  git worktree add -b <branch> ../wt/<branch> <base>\n"
+                    "and work there. To start a NEW branch in place, use create=True (git\n"
+                    "checkout -b), which is permitted because it discards nothing.]"
+                )
+            # (B) Route through the destructive-op gate so an active contract can ask-before.
+            _g = _cg.check_op("shell_destructive", "git checkout " + str(branch))
+            if _g is not None:
+                return _g
         args = ["git", "checkout"]
         if create:
             args.append("-b")
