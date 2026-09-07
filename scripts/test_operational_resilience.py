@@ -695,3 +695,24 @@ def test_the_exit_code_has_something_to_count():
     # each recording sits with the message that already reported it
     assert start_all.index("UNLOCK PASSWORD REPAIR FAILED") < \
         start_all.index('$script:startupFailures += ("unlock password repair failed: ')
+
+
+def test_appending_to_env_cannot_join_the_new_key_onto_the_last_one():
+    """MEASURED, all three forms:
+
+        echo KEY=1 >> f                          -> "KEY=1 \r\n"   the space lands in the VALUE
+        >> f echo KEY=1                          -> "KEY=1\r\n"    the form that was in use
+        >> f echo KEY=1  (no trailing newline)   -> "A=1KEY=1\r\n"  THE KEYS ARE JOINED
+
+    So the trailing-space fault does not apply here -- the redirection-first form was already
+    right about that, and claiming otherwise would be repeating a guess as a finding. The join
+    does apply, and it destroys the key that was already there: if that is MCP_API_KEY, the
+    Bearer token is silently wrong and nothing works.
+
+    Both appends were added today, both by me."""
+    qs = (ROOT / "quickstart.bat").read_text(encoding="utf-8")
+
+    code = "\n".join(l for l in qs.splitlines() if not l.strip().lower().startswith("rem"))
+    assert '>> ".env" echo' not in code, "an append that can join lines is back"
+    assert code.count("[IO.File]::AppendAllText") >= 2
+    assert "$b[$b.Length-1] -ne 10" in code, "nothing checks for the trailing newline"

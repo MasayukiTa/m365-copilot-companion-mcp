@@ -154,7 +154,12 @@ if not exist ".setup" mkdir ".setup"
 if "!TUNNEL_ACCESS!"=="anonymous" (
     findstr /b /r "MCP_TUNNEL_ALLOW_ANONYMOUS=1" ".env" >nul 2>nul
     if errorlevel 1 (
-        >> ".env" echo MCP_TUNNEL_ALLOW_ANONYMOUS=1
+        REM A .env WITHOUT A TRAILING NEWLINE JOINS THE NEW KEY ONTO THE LAST ONE.
+        REM Measured: >> ".env" echo KEY=1 against a file ending "A=1" produces "A=1KEY=1",
+        REM destroying A=1 -- and if that is MCP_API_KEY the Bearer token is silently wrong.
+        REM (The redirection-first form was already right about NOT padding the value; only
+        REM `echo X >> f` does that.) PowerShell can look at the last byte first.
+        powershell -NoProfile -Command "$p = Join-Path (Get-Location) '.env'; $b = [IO.File]::ReadAllBytes($p); if ($b.Length -gt 0 -and $b[$b.Length-1] -ne 10) { [IO.File]::AppendAllText($p, [Environment]::NewLine) }; [IO.File]::AppendAllText($p, 'MCP_TUNNEL_ALLOW_ANONYMOUS=1' + [Environment]::NewLine)"
         echo   Recorded: anonymous access. ^(MCP_TUNNEL_ALLOW_ANONYMOUS=1 in .env^)
     )
 )
@@ -294,7 +299,8 @@ echo   M365 Copilot). Leave it blank to set it later with configure_env.bat.
 set "IMPL_URL="
 set /p IMPL_URL="   MCP_IMPL_AGENT_URL: "
 if "!IMPL_URL!"=="" echo   Left unset. Chat and fleet will not work until it is set.
-if not "!IMPL_URL!"=="" >> ".env" echo MCP_IMPL_AGENT_URL=!IMPL_URL!
+REM Same reason: a joined line would take MCP_API_KEY with it.
+if not "!IMPL_URL!"=="" powershell -NoProfile -Command "$p = Join-Path (Get-Location) '.env'; $b = [IO.File]::ReadAllBytes($p); if ($b.Length -gt 0 -and $b[$b.Length-1] -ne 10) { [IO.File]::AppendAllText($p, [Environment]::NewLine) }; [IO.File]::AppendAllText($p, 'MCP_IMPL_AGENT_URL=!IMPL_URL!' + [Environment]::NewLine)"
 if not "!IMPL_URL!"=="" echo   Saved to .env.
 :after_cfg_fallback
 
