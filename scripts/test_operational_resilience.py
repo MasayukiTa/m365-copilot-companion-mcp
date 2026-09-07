@@ -282,3 +282,39 @@ def test_quickstart_reads_the_exit_codes_those_scripts_go_to_the_trouble_of_retu
 
     after_reg = qs[qs.index("register-supervisor.ps1"):]
     assert "if errorlevel 1" in after_reg
+
+
+def test_doctor_asks_whether_the_unlock_password_can_be_read_here():
+    """THE FAULT THAT LEAVES EVERYTHING GREEN. MCP_UNLOCK_PASSWORD_PROTECTED is DPAPI, bound to
+    one Windows account on one machine, so an .env carried from another PC holds a blob this
+    account cannot open. The server starts, the Bearer check passes, doctor reports ALL GREEN --
+    and every write, run_python and shell call is refused. This project has already lost days to
+    it. env_portability.problems() was written to report exactly this and had no caller outside
+    its own tests.
+
+    Verified to go RED, not merely to exist: problems() was run against an .env holding an
+    undecryptable blob (FAIL) and against a locally-set password (PASS)."""
+    doctor = (ROOT / "scripts" / "doctor.ps1").read_text(encoding="utf-8")
+
+    assert 'Check "unlock_password_usable"' in doctor
+    assert "from tools.env_portability import problems" in doctor
+    # bounded: doctor must not hang because Python did
+    assert "function Invoke-BoundedPython" in doctor
+    assert "$p.Kill()" in doctor
+    # being unable to ask is not evidence of a fault
+    assert "could not ask; not evidence of a fault" in doctor
+
+
+def test_a_failed_unlock_repair_is_reported_not_only_a_successful_one():
+    """repair_unlock_password returns "cannot protect a new value here: ...", "refusing to edit
+    without a backup: ..." and "cannot read ...". Matching only "re-established" made every one
+    of those land as silence -- so a repair that FAILED looked exactly like a machine that never
+    needed one, and the symptom arrives hours later as every mutating tool refused."""
+    start_all = (ROOT / "scripts" / "start_all.ps1").read_text(encoding="utf-8")
+    ep = (ROOT / "tools" / "env_portability.py").read_text(encoding="utf-8")
+
+    assert 'elseif ($repair -match "^cannot|^refusing")' in start_all
+    assert "UNLOCK PASSWORD REPAIR FAILED" in start_all
+    # the reasons really do start with those words
+    assert '"reason": "cannot protect a new value here' in ep or "cannot protect a new value here" in ep
+    assert "refusing to edit without a backup" in ep

@@ -552,6 +552,47 @@ function Mcp-Status([hashtable]$headers) {
         return 0
     }
 }
+# THE FAULT THAT LEAVES EVERYTHING GREEN. MCP_UNLOCK_PASSWORD_PROTECTED is DPAPI, bound to one
+# Windows account on one machine, so an .env carried from another PC holds a blob this account
+# cannot open. The server starts, the Bearer check passes, doctor reports ALL GREEN -- and every
+# write, run_python and shell call is refused, because there is nothing to compare against.
+# env_portability.problems() was written to report this and had no caller outside its own tests.
+#
+# BOUNDED. doctor must not hang because Python did: the process is given 15 seconds and killed.
+function Invoke-BoundedPython([string]$py, [string]$code, [int]$timeoutSec = 15) {
+    $out = [System.IO.Path]::GetTempFileName()
+    try {
+        $p = Start-Process -FilePath $py -ArgumentList @("-c", $code) -NoNewWindow -PassThru `
+                           -RedirectStandardOutput $out -RedirectStandardError ($out + ".err")
+        if (-not $p.WaitForExit($timeoutSec * 1000)) {
+            try { $p.Kill() } catch { }
+            return $null
+        }
+        if ($p.ExitCode -ne 0) { return $null }
+        return (Get-Content $out -Raw -ErrorAction SilentlyContinue)
+    } catch {
+        return $null
+    } finally {
+        Remove-Item $out, ($out + ".err") -Force -ErrorAction SilentlyContinue
+    }
+}
+$script:unlockFix = ("MCP_UNLOCK_PASSWORD_PROTECTED was written by a different Windows account " +
+                     "or PC and cannot be decrypted here, so every mutating tool will be " +
+                     "refused while everything else looks fine. start_all.bat re-establishes it " +
+                     "automatically -- run it once, then re-run this check.")
+Check "unlock_password_usable" "Unlock password readable by THIS Windows account" `
+    {
+        $py = Join-Path $repo ".venv\Scripts\python.exe"
+        if (-not (Test-Path $py)) { return $true }   # no venv: python_runnable already said so
+        $code = ("import sys, json; sys.path.insert(0, r'" + $repo + "'); " +
+                 "from dotenv import dotenv_values; from tools.env_portability import problems; " +
+                 "print(len(problems(dict(dotenv_values(r'" + $envPath + "')))))")
+        $n = Invoke-BoundedPython $py $code
+        if ($null -eq $n) { return $true }           # could not ask; not evidence of a fault
+        ([string]$n).Trim() -eq "0"
+    } `
+    $script:unlockFix
+
 Check "auth_bearer" "Auth OK end-to-end (Bearer accepted on /mcp)" `
     {
         $key = $envv['MCP_API_KEY']; if (-not $key) { return $false }
