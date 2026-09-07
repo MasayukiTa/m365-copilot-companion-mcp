@@ -87,12 +87,57 @@ if errorlevel 1 (
 
 echo.
 echo ===========================================================================
+echo  How should Copilot Studio be allowed to reach this machine?
+echo ===========================================================================
+echo   The tunnel needs an access grant or NOTHING can connect to it -- the
+echo   connection test in STEP 5 will fail. Asked before the tunnel is created,
+echo   because the grant is part of creating it.
+echo.
+echo   [A] Anonymous  - anyone who knows the URL can reach the server. The file
+echo                    and shell tools are then on the public internet, gated
+echo                    ONLY by your Bearer token. Simplest, and least private.
+echo   [T] Tenant     - only accounts in your Entra tenant. You will be asked for
+echo                    the tenant id. More restrictive; needs that id to hand.
+echo   [N] Neither    - decide later. Copilot Studio will NOT connect until you do.
+echo.
+set "TUNNEL_ACCESS="
+set "TENANT_ID="
+choice /C ATN /N /M "   Press A, T or N: "
+REM Read errorlevel IMMEDIATELY -- choice sets it (A=1, T=2, N=3) and any command
+REM in between resets it. Delayed expansion is on, so !ERRORLEVEL! is the runtime value.
+if "!ERRORLEVEL!"=="1" set "TUNNEL_ACCESS=anonymous"
+if "!ERRORLEVEL!"=="2" set "TUNNEL_ACCESS=tenant"
+if "!ERRORLEVEL!"=="3" set "TUNNEL_ACCESS=none"
+REM FLATTENED ON PURPOSE. `set /p` inside a parenthesized block did not settle before the `if`
+REM that reads it, so an empty answer was not detected. One statement per line, no block.
+if not "!TUNNEL_ACCESS!"=="tenant" goto :after_tenant_id
+set /p TENANT_ID="   Entra tenant id (GUID): "
+if "!TENANT_ID!"=="" echo   No tenant id given -- treating this as 'decide later'.
+if "!TENANT_ID!"=="" set "TUNNEL_ACCESS=none"
+:after_tenant_id
+REM RECORD THE DECISION, NOT THE ACT -- the same pattern as the convenience block below, and for
+REM the same reason: the absence of a decision must never be read as consent to expose anything.
+if not exist ".setup" mkdir ".setup"
+> ".setup\tunnel_access_choice" echo access=!TUNNEL_ACCESS!
+if "!TUNNEL_ACCESS!"=="anonymous" (
+    findstr /b /r "MCP_TUNNEL_ALLOW_ANONYMOUS=1" ".env" >nul 2>nul
+    if errorlevel 1 (
+        >> ".env" echo MCP_TUNNEL_ALLOW_ANONYMOUS=1
+        echo   Recorded: anonymous access. ^(MCP_TUNNEL_ALLOW_ANONYMOUS=1 in .env^)
+    )
+)
+if "!TUNNEL_ACCESS!"=="none" (
+    echo   Recorded: no grant yet. STEP 5's connection test will fail until you
+    echo   re-run quickstart.bat and choose A or T.
+)
+
+echo ===========================================================================
 echo  STEP 4/7  Dev Tunnel  (install + sign-in + tunnel + public URL)
 echo ===========================================================================
 echo   Installs the devtunnel CLI (winget or direct download), signs you in
 echo   (browser or device code), creates the tunnel, and prints the PUBLIC URL.
 echo.
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\setup_devtunnel.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\setup_devtunnel.ps1" -TenantId "!TENANT_ID!"
 REM Capture the Dev Tunnel setup exit code BEFORE any other command: a plain
 REM `set` succeeds and would RESET errorlevel to 0, so we must grab it first.
 set "DT_RC=%ERRORLEVEL%"
@@ -115,6 +160,20 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+
+echo.
+echo ===========================================================================
+echo  Starting the MCP server  ^(STEP 5 asks you to test a connection to it^)
+echo ===========================================================================
+REM THE CONNECTION TEST IN STEP 5 NEEDS A SERVER. copilot_studio_values.ps1 tells the reader to
+REM press "Add connection / Test" and watch the tool list load, and until now the server was not
+REM launched until STEP 7 -- so the first thing that happens on the only manual step of the whole
+REM install was a connection error. -CoreOnly starts the supervisor (server + tunnel host) and
+REM nothing else; STEP 7's full run is idempotent and leaves it alone.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\start_all.ps1" -CoreOnly
+echo.
+echo   Waiting for the MCP server to answer (up to 90s)...
+powershell -NoProfile -Command "$sw = [Diagnostics.Stopwatch]::StartNew(); $ok = $false; while ($sw.Elapsed.TotalSeconds -lt 90) { try { if ((Invoke-WebRequest -Uri 'http://127.0.0.1:8000/health' -TimeoutSec 3 -UseBasicParsing).StatusCode -eq 200) { $ok = $true; break } } catch { }; Start-Sleep -Seconds 2 }; if ($ok) { Write-Host ('   Server answered after {0:N0}s -- the connection test in the next step will work.' -f $sw.Elapsed.TotalSeconds) } else { Write-Host '   Server did not answer within 90s. Continue with STEP 5 anyway; the health check at the end says why.' }"
 
 REM STEP 5 (Copilot Studio) and STEP 6 (paste agent URLs) are the manual leg. If
 REM .env already carries a non-empty agent URL, that leg was done on a previous
