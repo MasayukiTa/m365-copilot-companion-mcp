@@ -91,12 +91,17 @@ function Server-Is-Outdated([string]$repo) {
 function Stop-Bridge-Processes() {
     # Take the keepalive supervisor down first, otherwise it just respawns the python we are
     # about to stop and the restart silently does nothing.
+    #
+    # SCOPED TO THIS CHECKOUT, like the main.py stop below. Matching 'start_bridge.ps1' or
+    # 'copilot_bridge.py' on the command line alone reaps another clone of this repo on the
+    # same machine -- the exact over-broad kill the main.py path was already fixed to avoid.
+    # Anchor both to this checkout's root so we only stop the bridge WE are restarting.
     try {
         Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -and ($_.CommandLine -match 'start_bridge\.ps1') } |
+            Where-Object { $_.CommandLine -and ($_.CommandLine -match 'start_bridge\.ps1') -and ($_.CommandLine -like "*$root*") } |
             ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
         Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -and ($_.CommandLine -match 'copilot_bridge\.py') } |
+            Where-Object { $_.CommandLine -and ($_.CommandLine -match 'copilot_bridge\.py') -and ($_.CommandLine -like "*$root*") } |
             ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     } catch { }
 }
