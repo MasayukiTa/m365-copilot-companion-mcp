@@ -1153,3 +1153,11 @@ if ($script:startupFailures.Count -gt 0) {
 # the bridge failed silently in a hidden process, and until now its message went nowhere.
 Write-Host ("  Logs: " + $script:diagDir) -ForegroundColor DarkGray
 Write-Host ("        supervisor: " + (Join-Path $env:TEMP 'm365-companion-supervisor.log')) -ForegroundColor DarkGray
+
+# THE COUNT IS THE EXIT CODE, the same convention doctor uses. Until now this script reported
+# its problems in prose and exited 0 regardless, so a caller could not tell a startup that
+# failed from one that worked -- and quickstart, which launches it twice, went on to the manual
+# Copilot Studio step after a launch that had not happened. Nothing read this code before
+# (quickstart ignored it; start_all.bat runs the VBS without checking; the Desktop launcher and
+# the logon task do not look either), so giving it meaning cannot break anything that works.
+exit $script:startupFailures.Count

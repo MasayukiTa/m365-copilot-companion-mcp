@@ -481,3 +481,28 @@ def test_an_unanswerable_access_prompt_records_the_safe_answer():
     decision was a blank. An absent answer is the same answer as N and is written down as one."""
     qs = (ROOT / "quickstart.bat").read_text(encoding="utf-8")
     assert 'if "!TUNNEL_ACCESS!"=="" set "TUNNEL_ACCESS=none"' in qs
+
+
+def test_start_all_reports_its_failure_count_and_quickstart_reads_it():
+    """It already collected $script:startupFailures and printed them last, deliberately, so they
+    would not scroll past -- and then exited 0 regardless. A startup that failed and one that
+    worked were indistinguishable to the caller, which is why quickstart went on to the manual
+    Copilot Studio step after a launch that had not happened.
+
+    The count is the code, the convention doctor already uses. Nothing read it before
+    (start_all.bat runs the VBS without checking; the Desktop launcher and logon task do not
+    look), so giving it meaning cannot break what works. Both quickstart launches were exercised
+    against a stub returning 0 and 2."""
+    start_all = (ROOT / "scripts" / "start_all.ps1").read_text(encoding="utf-8")
+    qs = (ROOT / "quickstart.bat").read_text(encoding="utf-8")
+
+    assert "exit $script:startupFailures.Count" in start_all
+    # both launches read it -- the core one because STEP 5's connection test depends on it
+    assert "The core startup reported problem" in qs
+    assert 'set "START_ALL_BAD=%ERRORLEVEL%"' in qs
+    # captured immediately, before any command can reset it
+    tail = qs[qs.index('set "START_ALL_BAD=%ERRORLEVEL%"') - 200:]
+    assert tail.index("start_all.ps1") < tail.index('set "START_ALL_BAD=%ERRORLEVEL%"')
+    # neither stops the run: the health check at the end reports either way
+    assert "exit /b" not in qs[qs.index("The core startup reported problem"):
+                               qs.index("STEP 5/7")]
