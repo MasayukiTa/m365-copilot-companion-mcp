@@ -132,14 +132,67 @@ Check "agent_url" "Agent URL configured (Copilot Studio agent pasted)" `
     { ($envv['MCP_FLEET_AGENT_URL']) -or ($envv['MCP_IMPL_AGENT_URL']) } `
     "double-click configure_env.bat and paste the Copilot Studio agent URL (README STEP 4)"
 
+# WHETHER A SUPERVISOR IS RUNNING WAS NEVER CHECKED. The only supervisor-related check was
+# "hosts the tunnel named in .env", which returns true when there is no supervisor at all --
+# nothing to mismatch, so nothing to report. The server_up advice below then asked the reader
+# to read that green as "the stack HAS been started", which it does not mean. Both branches of
+# the advice looked identical from the output, so neither could be acted on.
+function Get-RunningSupervisorCommandLineDoctor {
+    try {
+        $p = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+             Where-Object { $_.CommandLine -and ($_.CommandLine -match 'supervisor\.ps1') } |
+             Select-Object -First 1
+        if ($p) { return $p.CommandLine }
+    } catch { }
+    return ""
+}
+$script:supervisorCmdLine = Get-RunningSupervisorCommandLineDoctor
+Check "supervisor_running" "Supervisor running (it is what relaunches the server)" `
+    { [bool]$script:supervisorCmdLine } `
+    "the stack has not been started on this machine: double-click start_all.bat"
+
+# SAY WHY. DO NOT POINT AT A FILE. The reason the server died is already on this machine, and
+# doctor knows the path; telling every user to go and open it is not a diagnosis a product can
+# ship. One week passed with this failure reported and the log never read once.
+$script:serverErrLog = Join-Path $repo ".setup\logs\server.err.log"
+$script:serverErrHistory = Join-Path $repo ".setup\logs\server.err.history.log"
+function Get-ServerDeathReason {
+    # Newest first: the live log holds only the CURRENT launch (Start-Process truncates it on
+    # every relaunch, roughly once a minute), so a crash that produces nothing leaves it empty.
+    # The history file is where the supervisor now preserves each launch before truncating.
+    foreach ($f in @($script:serverErrLog, $script:serverErrHistory)) {
+        try {
+            if (Test-Path $f) {
+                $lines = @(Get-Content $f -Tail 12 -ErrorAction Stop | Where-Object { $_.Trim() })
+                if ($lines.Count -gt 0) { return $lines }
+            }
+        } catch { }
+    }
+    return @()
+}
+$script:serverFix = ""
+if (-not $script:supervisorCmdLine) {
+    $script:serverFix = ("the stack has not been started on this machine -- nothing is " +
+                         "relaunching the server. Double-click start_all.bat.")
+} else {
+    $reason = Get-ServerDeathReason
+    if ($reason.Count -gt 0) {
+        $script:serverFix = ("the supervisor is relaunching the server and it is DYING ON " +
+                             "STARTUP. It said:" + [Environment]::NewLine + "           " +
+                             ($reason -join ([Environment]::NewLine + "           ")))
+    } else {
+        $script:serverFix = ("the supervisor is relaunching the server and it is dying on " +
+                             "startup, but it produced no output to explain why -- so it is " +
+                             "failing before it can write anything (a missing interpreter, or " +
+                             "a working directory it cannot enter). Do NOT run start_all.bat: " +
+                             "the supervisor is already doing that on a loop.")
+    }
+}
+
 # 2. local MCP server
 Check "server_up" "MCP server up (http://127.0.0.1:8000/health)" `
     { (Invoke-WebRequest -Uri 'http://127.0.0.1:8000/health' -TimeoutSec 4 -UseBasicParsing).StatusCode -eq 200 } `
-    ("if the stack has NOT been started: double-click start_all.bat. If it HAS -- the " +
-     "'Running supervisor' check below is green -- then the server is being launched and is " +
-     "dying, and the reason is in .setup\logs\server.err.log (last 20 lines). Read that " +
-     "before restarting anything: the supervisor is already relaunching it on a loop, so " +
-     "running start_all.bat again changes nothing.")
+    $script:serverFix
 
 # 3. Dev Tunnel -- LAYERED diagnosis. A single reachability probe cannot tell "CLI not
 #    installed" from "not logged in" from "tunnel deleted/expired" from "exists but not
@@ -313,22 +366,21 @@ TunnelCheck "tunnel_serving" "Dev Tunnel host serving (public URL -> server)" `
 # distinguish from "not hosted at all". Uses Check (not TunnelCheck) so it runs
 # independently of the tunnel dependency chain above: if no supervisor is running there
 # is nothing to mismatch, so it passes.
-function Get-RunningSupervisorCommandLineDoctor {
-    try {
-        $p = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-             Where-Object { $_.CommandLine -and ($_.CommandLine -match 'supervisor\.ps1') } |
-             Select-Object -First 1
-        if ($p) { return $p.CommandLine }
-    } catch { }
-    return ""
+# NOT APPLICABLE IS NOT A PASS. With no supervisor running there is nothing to compare .env
+# against, and reporting that as green is what made "the stack was never started" look
+# identical to "the stack is up and correct" -- the exact ambiguity the server advice depended
+# on. The supervisor_running check above answers the prior question; this one only answers
+# whether a RUNNING supervisor hosts the right tunnel.
+$script:tunnelMatchFix = "The running supervisor is hosting a different (stale/borrowed) tunnel than .env names. Re-run start_all.bat -- it now stops the stale supervisor and re-hosts your own tunnel."
+if (-not $script:supervisorCmdLine) {
+    Write-Host ("  [SKIP] Running supervisor hosts the tunnel named in .env") -ForegroundColor DarkGray
+    Write-Host ("         no supervisor is running -- see the supervisor check above") -ForegroundColor DarkGray
+    Add-Result "tunnel_supervisor_match" $false "Running supervisor hosts the tunnel named in .env" $script:tunnelMatchFix $false $false $true
+} else {
+    Check "tunnel_supervisor_match" "Running supervisor hosts the tunnel named in .env" `
+        { -not (Test-SupervisorTunnelDrift -RunningCommandLine $script:supervisorCmdLine -EnvTunnelName $tname) } `
+        $script:tunnelMatchFix
 }
-Check "tunnel_supervisor_match" "Running supervisor hosts the tunnel named in .env" `
-    {
-        $runCmdLine = Get-RunningSupervisorCommandLineDoctor
-        if (-not $runCmdLine) { return $true }   # no supervisor running -- nothing to mismatch
-        -not (Test-SupervisorTunnelDrift -RunningCommandLine $runCmdLine -EnvTunnelName $tname)
-    } `
-    "The running supervisor is hosting a different (stale/borrowed) tunnel than .env names. Re-run start_all.bat -- it now stops the stale supervisor and re-hosts your own tunnel."
 
 # 4. Companion Edge (:9222) for the fleet/agent
 Check "edge_companion" "Companion Edge running (:9222 fleet/agent)" `
