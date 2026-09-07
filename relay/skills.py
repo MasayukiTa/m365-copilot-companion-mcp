@@ -208,6 +208,29 @@ class SkillStore:
         self._init_db()
 
     def _default_gate_dir(self) -> Path:
+        """Where approval questions are written.
+
+        THE ONE OF THE THREE WITH NO ESCAPE HATCH, AND IT LEAKED FOR MONTHS. db_path and
+        project_root can both be pointed elsewhere (MCP_SKILLS_STATE_DB, MCP_SKILLS_PROJECT_ROOT)
+        and the tests do point them at a tmp_path. This one always resolved to the real
+        ALLOWED_BASE, which is the operator's home directory, so any test reaching the
+        "ask about a near-miss skill" path wrote a REAL approval question into the REAL queue --
+        and relay_fleet._with_matched_skill constructs SkillStore(root) with no gate_dir, so the
+        tests had no way to isolate it even knowing.
+
+        Measured 2026-09-07: 378 pending questions in ~/.companion_gates, every single one
+        naming a pytest temp directory, none naming a skill that exists, 202 already past their
+        24h TTL. pytest's tmp_path is freshly numbered per run, so nothing ever deduplicated --
+        each run added more. The owner was looking at a backlog of ~370 decisions of which
+        exactly zero were real, while SkillStore.unapproved() on the actual project returned [].
+        The count was still climbing during the investigation, from a test run in flight.
+
+        MCP_SKILLS_GATE_DIR mirrors MCP_SKILLS_STATE_DB so the isolation a test already asks for
+        actually covers the third thing this object writes.
+        """
+        override = os.environ.get("MCP_SKILLS_GATE_DIR", "").strip()
+        if override:
+            return Path(override).expanduser().resolve()
         try:
             from tools.file_ops import ALLOWED_BASE
             return (ALLOWED_BASE / ".companion_gates").resolve()

@@ -31,6 +31,7 @@ import io
 import os
 import sqlite3
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -111,6 +112,13 @@ def trusted_skills(tmp_path, monkeypatch):
     db = tmp_path / "skills.sqlite3"
     monkeypatch.setenv("MCP_SKILLS_PROJECT_ROOT", str(root))
     monkeypatch.setenv("MCP_SKILLS_STATE_DB", str(db))
+    # THE THIRD THING THIS STORE WRITES, AND THE ONE THAT WAS NOT ISOLATED. The two lines above
+    # kept the registry and its database inside tmp_path; approval QUESTIONS went to the real
+    # ~/.companion_gates, because gate_dir had no override and relay_fleet builds the store with
+    # no gate_dir argument. Every run of the near-miss tests below left real, unanswerable
+    # questions in the operator's queue -- 378 of them by the time anyone counted, none naming a
+    # skill that exists, because tmp_path is renumbered per run and nothing ever deduplicated.
+    monkeypatch.setenv("MCP_SKILLS_GATE_DIR", str(tmp_path / "gates"))
     _approve_everything(root, db)
     return root
 
@@ -433,3 +441,40 @@ def test_both_arms_still_ask_for_approval_of_a_near_miss(tmp_path, monkeypatch):
         with sqlite3.connect(str(db)) as con:
             rows = con.execute("SELECT COUNT(*) FROM approval_challenges").fetchone()
         assert rows[0] == 1, "%s raised %d approval(s)" % (arm, rows[0])
+
+
+def test_an_approval_question_never_lands_in_the_operators_real_queue(tmp_path, monkeypatch):
+    """THE LEAK THIS FILE CAUSED, PINNED FROM THE OUTSIDE.
+
+    db_path and project_root were overridable and were overridden; gate_dir was neither, so the
+    questions these tests raise were written to the real ~/.companion_gates. 378 accumulated,
+    every one naming a pytest temp directory that no longer exists, 202 already past their 24h
+    TTL. None of them could ever be approved -- confirm_approval reloads the bundle from the
+    path -- so they were pure noise in front of the decisions that mattered, and the real
+    registry's unapproved() was empty the whole time.
+
+    This asserts the property rather than the plumbing: with the override set, nothing is
+    written outside it. A future store that grows a fourth on-disk artefact fails here too.
+    """
+    from relay.skills import SkillStore
+
+    gates = tmp_path / "gates"
+    monkeypatch.setenv("MCP_SKILLS_GATE_DIR", str(gates))
+    store = SkillStore(tmp_path / "proj", db_path=tmp_path / "s.sqlite3")
+    assert store.gate_dir == gates.resolve(), (
+        "the gate directory ignored MCP_SKILLS_GATE_DIR: %s" % store.gate_dir)
+
+    home_gates = Path.home() / ".companion_gates"
+    assert store.gate_dir != home_gates.resolve(), (
+        "approval questions from a test would land in the operator's real queue")
+
+
+def test_without_the_override_the_gate_dir_is_still_the_shared_one(tmp_path, monkeypatch):
+    """The regression guard. The fix must not quietly relocate the REAL queue -- the cockpit
+    reads that path, and a store that invented its own would raise questions nobody ever sees.
+    """
+    from relay.skills import SkillStore
+
+    monkeypatch.delenv("MCP_SKILLS_GATE_DIR", raising=False)
+    store = SkillStore(tmp_path / "proj", db_path=tmp_path / "s.sqlite3")
+    assert store.gate_dir.name == ".companion_gates"
