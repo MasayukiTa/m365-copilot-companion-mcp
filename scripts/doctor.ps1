@@ -156,19 +156,37 @@ Check "supervisor_running" "Supervisor running (it is what relaunches the server
 # ship. One week passed with this failure reported and the log never read once.
 $script:serverErrLog = Join-Path $repo ".setup\logs\server.err.log"
 $script:serverErrHistory = Join-Path $repo ".setup\logs\server.err.history.log"
-function Get-ServerDeathReason {
+# TEXT ON STDERR IS NOT A CAUSE OF DEATH. A healthy server writes deprecation warnings and
+# uvicorn's own "Application startup complete" / "Uvicorn running on ..." to stderr, so the
+# last non-empty lines of this file are, on a machine whose log survives a launch that WORKED,
+# a description of SUCCESS. Presenting them as the reason it died is worse than printing
+# nothing: a reader given a false cause stops looking for the real one.
+#
+# Those same lines are still worth reading, because they say something true: a log ending in
+# "startup complete" is from a launch that came up, so it cannot explain a server that is down
+# now -- which means the current crash is producing no output at all, and that is the finding.
+$script:STARTED_MARKERS = @("Application startup complete", "Uvicorn running on")
+
+function Get-ServerLastOutput {
+    # Returns @{ lines; started; source } -- or $null when neither file has anything.
     # Newest first: the live log holds only the CURRENT launch (Start-Process truncates it on
     # every relaunch, roughly once a minute), so a crash that produces nothing leaves it empty.
-    # The history file is where the supervisor now preserves each launch before truncating.
+    # The history file is where the supervisor preserves each launch before truncating.
     foreach ($f in @($script:serverErrLog, $script:serverErrHistory)) {
         try {
             if (Test-Path $f) {
                 $lines = @(Get-Content $f -Tail 12 -ErrorAction Stop | Where-Object { $_.Trim() })
-                if ($lines.Count -gt 0) { return $lines }
+                if ($lines.Count -gt 0) {
+                    $started = $false
+                    foreach ($m in $script:STARTED_MARKERS) {
+                        if ($lines -match [regex]::Escape($m)) { $started = $true }
+                    }
+                    return @{ lines = $lines; started = $started; source = $f }
+                }
             }
         } catch { }
     }
-    return @()
+    return $null
 }
 # THE INTERPRETER THE SUPERVISOR WOULD ACTUALLY USE. Resolved exactly as supervisor.ps1
 # resolves it, or this check answers a different question from the one that matters:
@@ -207,11 +225,20 @@ if (-not $script:supervisorCmdLine) {
     $script:serverFix = ("the stack has not been started on this machine -- nothing is " +
                          "relaunching the server. Double-click start_all.bat.")
 } else {
-    $reason = Get-ServerDeathReason
-    if ($reason.Count -gt 0) {
+    $out = Get-ServerLastOutput
+    if ($out -and -not $out.started) {
         $script:serverFix = ("the supervisor is relaunching the server and it is DYING ON " +
-                             "STARTUP. It said:" + [Environment]::NewLine + "           " +
-                             ($reason -join ([Environment]::NewLine + "           ")))
+                             "STARTUP. Its last output was:" + [Environment]::NewLine +
+                             "           " +
+                             ($out.lines -join ([Environment]::NewLine + "           ")))
+    } elseif ($out -and $out.started) {
+        # SAY WHAT THIS LOG ACTUALLY SHOWS. It records a launch that reached "startup complete",
+        # so it describes a server that came UP -- it cannot be the reason one is down now.
+        $script:serverFix = ("the supervisor is relaunching the server and it is dying, but " +
+                             "the only output on record is from a launch that STARTED " +
+                             "SUCCESSFULLY, so it does not explain this failure. The current " +
+                             "crash is producing no output at all. Do NOT run start_all.bat: " +
+                             "the supervisor is already doing that on a loop.")
     } else {
         if ($script:pyProblem) {
             # The Python check above already found the cause; repeat it here rather than send
