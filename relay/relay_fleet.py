@@ -557,11 +557,24 @@ LOCKED_MARKERS = ("locked client ip", "[locked:")
 # Chosen well above the longest real error and well below a genuine multi-sentence review.
 LOCKED_DOMINANCE_MAX_CHARS = 400
 MAX_UNLOCK_ATTEMPTS = int(os.environ.get("MCP_FLEET_MAX_UNLOCK", "4"))
+#: THE TOKEN IS THE SECOND FACTOR AND THIS TEXT USED TO DENY IT EXISTED. The old wording told
+#: the worker that once unlock succeeded the tools "使えるので" -- just work on that connection.
+#: That is only true while MCP_REQUIRE_UNLOCK_TOKEN is off. With it on, tools/security.py
+#: unlocks the IP and then refuses every mutating call that arrives without the token it just
+#: handed back, saying so in as many words: "Call unlock(password='<password>') and pass the
+#: returned `unlock_token` with the call." The worker followed this prefix, believed the
+#: connection was now open, never passed the token, and was refused until its attempts ran out
+#: -- at which point the stuck reason below blamed a rotating IP or a wrong password, neither of
+#: which was true. Two jobs lost seventeen and six turns to that on 2026-09-07 before the cause
+#: was found. The password alone was never the whole story; say what the server actually wants.
 UNLOCK_PREFIX = (
-    "【要解錠】書込/実行ツールは接続のIP単位ロック解除が必要です。まず最初に call_tool で "
-    "'unlock' ツールを引数 {\"password\": \"%s\"} で1回だけ実行し、解錠に成功したら（以後その"
-    "接続で書込/実行ツールが使えるので）当初のゴールをそのまま続行してください。解錠後は "
-    "password を二度と出力しないこと。\n--- 元のゴール ---\n"
+    "【要解錠】書込/実行ツールはロック解除が必要です。まず最初に call_tool で "
+    "'unlock' ツールを引数 {\"password\": \"%s\"} で1回だけ実行してください。"
+    "**その戻り値に含まれる unlock_token を必ず保持し、以後の書込/実行系の call_tool すべてに "
+    "引数 unlock_token として渡してください。** IPの解錠だけでは足りず、トークンを付けない呼び出しは "
+    "拒否されます（拒否メッセージ自体にもそう書かれています）。トークンを付けて解錠できたら"
+    "当初のゴールをそのまま続行してください。解錠後は password を二度と出力しないこと"
+    "（unlock_token は引数として渡すのは必要です）。\n--- 元のゴール ---\n"
 )
 
 
@@ -3502,8 +3515,17 @@ class RelayWorker:
                 self.status = "ready"
                 return
             self.status, self.outcome = "stuck", "STUCK"
-            self.reason = ("⚠ unlock を %d 回投入したが解錠が続かない。M365バックエンドの送信元IPが"
-                           "毎回変わる(unlockはIP単位)か、MCP_UNLOCK_PASSWORD不一致の可能性。"
+            # NAME THE CAUSE THAT ACTUALLY HAPPENS. This listed a rotating backend IP and a wrong
+            # password, and on 2026-09-07 it was neither: MCP_REQUIRE_UNLOCK_TOKEN was on, the
+            # unlock succeeded, and every following call was refused for arriving without the
+            # token. Whoever reads this line is trying to find out why, so the possibility that
+            # was true must be in it -- and it is the cheapest one to check.
+            self.reason = ("⚠ unlock を %d 回投入したが解錠が続かない。"
+                           "(1) MCP_REQUIRE_UNLOCK_TOKEN が有効で、unlock_token を後続の "
+                           "call_tool に渡せていない (lock_refusals.jsonl の site が "
+                           "security.py:324 ならこれ)、"
+                           "(2) M365バックエンドの送信元IPが毎回変わる(unlockはIP単位)、"
+                           "(3) MCP_UNLOCK_PASSWORD 不一致。のいずれか。"
                            % self._unlock_attempts)
             return
         # TOOL-BACKEND-UNREACHABLE: the agent's tool calls failed (devtunnel/network blip) and it
