@@ -237,7 +237,7 @@ if not "!DOCTOR_BAD!"=="0" (
     REM down, and this is the only install method there is - if quickstart cannot say why the
     REM server died, nobody can. The supervisor relaunches it on a loop, so re-running
     REM start_all.bat would change nothing either.
-    powershell -NoProfile -Command "$p = '%~dp0.setup\logs\server.err.log'; if ((Test-Path $p) -and (Get-Item $p).Length -gt 0) { Write-Host '   ---------------------------------------------------------------'; Write-Host '   The MCP server tried to start and stopped. It reported:'; Write-Host '   ---------------------------------------------------------------'; Get-Content -Tail 25 $p; Write-Host '   ---------------------------------------------------------------' }"
+    powershell -NoProfile -Command "$d = '%~dp0.setup\logs'; foreach ($p in @((Join-Path $d 'server.err.log'), (Join-Path $d 'server.err.history.log'))) { if ((Test-Path $p) -and (Get-Item $p).Length -gt 0) { Write-Host '   ---------------------------------------------------------------'; Write-Host '   The MCP server tried to start and stopped. It reported:'; Write-Host '   ---------------------------------------------------------------'; Get-Content -Tail 25 $p; Write-Host '   ---------------------------------------------------------------'; break } }"
     echo.
     echo   Fix what is shown above, then run quickstart.bat again.
     echo   It resumes from where it stopped - nothing is repeated unnecessarily.
