@@ -579,3 +579,24 @@ def test_the_chat_backend_is_checked_not_just_the_browser_it_drives():
     assert "-Optional" not in block
     # an HTTP error still means something is serving; a dropped connection does not
     assert "else { $false }" in block
+
+
+def test_a_held_but_dead_bridge_port_is_named_rather_than_relaunched_into():
+    """/conv is the liveness probe, and a bridge started outside the venv answers / but not
+    /conv -- so this branch concluded "down", launched another that could not bind the port, and
+    repeated. Seen running for five and a half hours with four bridge processes alive, each pass
+    printing "[3/4] bridge: starting" as though it had worked.
+
+    Named, not killed: the owner is a process this stack did not start, and the rule here is not
+    to touch those. Recorded as a startup failure instead, which the exit code now carries.
+    Verified against the live fault: it names pid and command line."""
+    start_all = (ROOT / "scripts" / "start_all.ps1").read_text(encoding="utf-8")
+
+    assert "Get-NetTCPConnection -LocalPort 8765" in start_all
+    assert "is HELD by pid" in start_all
+    # not killed
+    block = start_all[start_all.index("STARTING ANOTHER CANNOT HELP"):]
+    block = block[:block.index("bridge: starting (headless keepalive)")]
+    assert "Stop-Process" not in block, "it kills a process this stack did not start"
+    # and it counts, so the exit code and quickstart see it
+    assert '$script:startupFailures += "bridge: :8765 held by pid' in start_all
