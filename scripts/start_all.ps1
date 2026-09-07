@@ -750,6 +750,14 @@ function Invoke-Startup {
             $repair = & $venvPy -c "import sys; sys.path.insert(0,r'$root'); from dotenv import dotenv_values; from tools.env_portability import repair_unlock_password; print(repair_unlock_password(r'$envFile', dict(dotenv_values(r'$envFile')))['reason'])" 2>&1 | Select-Object -Last 1
             if ($repair -match "re-established") {
                 Write-Host "[setup] the unlock password could not be decrypted by this account -- re-established it for this machine"
+            } elseif ($repair -match "^cannot|^refusing") {
+                # A REPAIR THAT FAILED LOOKED LIKE A MACHINE THAT NEVER NEEDED ONE. Only the
+                # success string was reported, so "cannot protect a new value here",
+                # "refusing to edit without a backup" and "cannot read .env" all landed as
+                # silence -- and the symptom is every mutating tool refused, hours later,
+                # while doctor is green.
+                Write-Host "[setup] UNLOCK PASSWORD REPAIR FAILED: $repair"
+                Write-Host "[setup] mutating tools (write_file, run_python, shell) will be refused until this is fixed."
             }
         }
     } catch {
