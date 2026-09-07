@@ -428,7 +428,11 @@ Check "tunnel_name_private" "Dev Tunnel name is private (no identifying token)" 
 # the CLI is temporarily unreachable. A transient timeout is WARN/indeterminate rather than
 # falsely declaring another account's tunnel or launching an unnecessary repair.
 function Test-TunnelOwned([string]$name) {
-    if ([string]::IsNullOrWhiteSpace($name)) { return $true }
+    # NOTHING TO OWN IS NOT OWNERSHIP. Returning true here reported "owned by this account" for
+    # a machine with no tunnel name configured at all -- and this check is not part of the
+    # tunnel chain, so it is not skipped when the name is missing. $null is the contract this
+    # function already has for "could not be determined", which is exactly what this is.
+    if ([string]::IsNullOrWhiteSpace($name)) { return $null }
     $bareName = (($name -split '\.')[0]).ToLowerInvariant()
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         # The CLI commonly needs 6-8s even on a healthy connection (token refresh/service round
