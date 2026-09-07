@@ -2146,7 +2146,15 @@ class RelayWorker:
         # -- the worker's identity -- and neither is written back into it. Held in a local
         # because the fan-out branch below needs the same text and matching twice would cost a
         # second filesystem-and-SQLite pass per worker.
-        composed_goal = _with_theme_memory(_with_matched_skill(self.goal), theme_text=self.goal)
+        # The standing エージェント契約 wraps OUTERMOST as a PREFIX, so the body still ends with
+        # the bare goal (the suffix invariant _composed_prefix and the replay/recycle branches
+        # depend on) while the contract is present regardless of whether a skill or theme note
+        # matched. Its clauses are about not disturbing the shared tree and history, so it
+        # applies to every worker -- unlike the coding-discipline block, which is gated on a
+        # verification card. theme_text stays the bare goal so the theme bucket is still
+        # derived from the goal, not from the contract.
+        composed_goal = _with_repo_contract(
+            _with_theme_memory(_with_matched_skill(self.goal), theme_text=self.goal))
         initial_body, preflight_unlock = _initial_job_with_unlock(composed_goal, plan_mode)
         # Kept for the branches that REBUILD the job for a fresh conversation -- a replay and
         # a token-limit recycle. Both hand the agent a chat with no history at all, so they
@@ -4815,6 +4823,7 @@ _MEMORY_HEADER = "--- このテーマでの過去の作業メモ ---"
 
 #: Header for a procedure the FRAME matched and put in front of the worker.
 _SKILL_HEADER = "--- この作業の承認済み手順（このとおり進める） ---"
+_CONTRACT_HEADER = "【エージェント契約（既定の共通制約）】"
 
 
 #: (name, digest) pairs this process has already asked about, so a run with twenty workers
@@ -5011,6 +5020,33 @@ def _with_theme_memory(goal_text, theme_text=None):
         if not notes:
             return goal_text
         return "%s\n%s\n--- メモここまで ---\n\n%s" % (_MEMORY_HEADER, notes, text)
+    except Exception:
+        return goal_text
+
+
+def _with_repo_contract(goal_text):
+    """Prepend the standing エージェント契約 to the body that is sent. Never raises.
+
+    The constraints (隠離 / 選択的 add / main への直接コミット禁止 / 新規テストの CI 登録 /
+    Windows 依存の禁止 / レビュー指摘は裏を取ってから) were hand-copied onto every goal;
+    this centralises them the way _with_matched_skill centralises the procedure. Applied to
+    the sent BODY only, never to self.goal (the worker's identity), and header-guarded so a
+    rebuild for a replay or a token-limit recycle does not prepend it twice.
+
+    PREPENDED, so the body still ENDS with the bare goal. relay_fleet derives
+    _composed_prefix by stripping the goal off the suffix, and the replay / recycle branches
+    rebuild a fresh chat from that prefix; a contract placed after the goal would break that
+    suffix invariant (test_fanout_carries_the_procedure guards it). It sits OUTSIDE the
+    theme note and the matched procedure -- it is a standing constraint, not the how-to for
+    this task -- so the reading order is contract, then memory, then procedure, then goal.
+    On any failure the original body is returned unchanged.
+    """
+    try:
+        from relay.repo_contract import repo_contract_text
+        text = str(goal_text or "")
+        if not text or _CONTRACT_HEADER in text:
+            return goal_text
+        return repo_contract_text() + text
     except Exception:
         return goal_text
 
