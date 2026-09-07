@@ -147,9 +147,27 @@ function Get-RunningSupervisorCommandLineDoctor {
     return ""
 }
 $script:supervisorCmdLine = Get-RunningSupervisorCommandLineDoctor
+# NOT RUNNING HAS TWO CAUSES AND THEY NEED DIFFERENT ANSWERS. start_all.ps1 now captures the
+# supervisor's own startup output, so "never started" and "started and died" are separable --
+# and when it died, "double-click start_all.bat" is the operation that just failed.
+$script:supErrLog = Join-Path $repo ".setup\logs\supervisor.err.log"
+$script:supFix = "the stack has not been started on this machine: double-click start_all.bat"
+if (-not $script:supervisorCmdLine) {
+    try {
+        if (Test-Path $script:supErrLog) {
+            $supLines = @(Get-Content $script:supErrLog -Tail 10 -ErrorAction Stop |
+                          Where-Object { $_.Trim() })
+            if ($supLines.Count -gt 0) {
+                $script:supFix = ("the supervisor was started and STOPPED. It said:" +
+                                  [Environment]::NewLine + "           " +
+                                  ($supLines -join ([Environment]::NewLine + "           ")))
+            }
+        }
+    } catch { }
+}
 Check "supervisor_running" "Supervisor running (it is what relaunches the server)" `
     { [bool]$script:supervisorCmdLine } `
-    "the stack has not been started on this machine: double-click start_all.bat"
+    $script:supFix
 
 # SAY WHY. DO NOT POINT AT A FILE. The reason the server died is already on this machine, and
 # doctor knows the path; telling every user to go and open it is not a diagnosis a product can
