@@ -1200,6 +1200,46 @@ if ($script:startupFailures.Count -gt 0) {
     Write-Host ""
 }
 
+# THE SESSION EXPIRES AND NOTHING LOOKED. ensure_m365_signin is called from quickstart once, at
+# install time, and by doctor with --check-only as an [INFO] that counts toward nothing. The
+# launcher that runs every day -- the Desktop shortcut, the logon task -- did not call it at all,
+# so an expired M365 session produced a completely green startup and an agent that silently could
+# not work. Handing the operator a script to run by hand is not the fix; the launcher carries it.
+#
+# A background logon start never surfaces UI, which is the rule this file already follows, so it
+# asks and records. A manual start brings the window forward, bounded at 180s rather than the
+# helper's 600s default, because a launcher that can block for ten minutes is its own fault.
+#
+# "could not tell" stays silent in both: the fleet is websocket-driven and opens no tabs, so a
+# signed-in machine looks identical to one with no tab, and reporting that would send somebody to
+# fix what is not broken.
+try {
+    $signinPs = Join-Path $scriptDir "ensure_m365_signin.ps1"
+    if ((Test-Path $signinPs) -and (-not $CoreOnly)) {
+        if ($NoUi) {
+            # THE PYTHON DIRECTLY, not the wrapper. ensure_m365_signin.ps1 ends with an
+            # unconditional `exit 0` -- deliberately, so a missing sign-in never fails the
+            # whole setup -- which means a check of its exit code can never fire. Its exit
+            # codes are 0 signed in / 1 a sign-in wall is open / 2 could not tell.
+            $signinPy = Join-Path $scriptDir "ensure_m365_signin.py"
+            $pyExe = Join-Path $root ".venv\Scripts\python.exe"
+            if ((Test-Path $signinPy) -and (Test-Path $pyExe)) {
+                & $pyExe $signinPy --port 9222 --check-only | Out-Null
+            } else {
+                $global:LASTEXITCODE = 2
+            }
+            if ($LASTEXITCODE -eq 1) {
+                Write-Host "[m365] a sign-in is needed, and a background start cannot show it." -ForegroundColor Yellow
+                $script:startupFailures += "M365 sign-in needed (background start could not prompt)"
+            }
+        } else {
+            & powershell -NoProfile -ExecutionPolicy Bypass -File ('"{0}"' -f $signinPs) -TimeoutSeconds 180 | Out-Null
+        }
+    }
+} catch {
+    Write-Host ("[m365] sign-in check skipped (" + $_.Exception.Message + ")") -ForegroundColor DarkGray
+}
+
 # WHERE TO LOOK, PRINTED EVERY TIME. Named whether or not anything failed, because the case
 # that needs it most -- "the chat window does not respond" -- produces no error here at all:
 # the bridge failed silently in a hidden process, and until now its message went nowhere.

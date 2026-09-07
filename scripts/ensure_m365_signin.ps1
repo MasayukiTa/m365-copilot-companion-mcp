@@ -5,7 +5,9 @@
 #
 # The real work is in ensure_m365_signin.py: it probes in the BACKGROUND and only brings the
 # browser forward if a sign-in wall is actually showing.
-param([int]$Port = 9222, [double]$TimeoutSeconds = 600)
+# -CheckOnly asks the question without taking the window, so a background start can
+# report a needed sign-in instead of surfacing a browser at nobody.
+param([int]$Port = 9222, [double]$TimeoutSeconds = 600, [switch]$CheckOnly)
 
 $ErrorActionPreference = "Continue"
 $root = Split-Path -Parent $PSScriptRoot
@@ -22,7 +24,9 @@ if (-not (Test-Path $script)) {
     exit 0
 }
 
-& $py $script --port $Port --timeout $TimeoutSeconds
+$pyArgs = @($script, "--port", $Port, "--timeout", $TimeoutSeconds)
+if ($CheckOnly) { $pyArgs += "--check-only" }
+& $py @pyArgs
 $code = $LASTEXITCODE
 
 # NEVER FAIL THE WHOLE SETUP OVER THIS. If sign-in did not finish, everything else that was
