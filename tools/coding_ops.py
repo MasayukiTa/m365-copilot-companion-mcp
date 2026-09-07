@@ -660,34 +660,57 @@ def worktree_remove(worktree_path: str, repo_path: str = ".", prune: bool = True
         if _g is not None:
             return _g
 
-        parts: list[str] = []
-        done = _run(["git", "worktree", "remove", "--force", str(wt)], repo_cwd, 30)
-        removed_by_git = "[returncode:" not in done
-        parts.append("git worktree remove: " + ("ok" if removed_by_git else done.strip()))
-
-        # (C) Fallback delete, but only when it CANNOT touch the shared tree. `shared` is
-        # False (genuine linked worktree) or None (unknown). Only act on the definite case;
-        # an unknown answer must not license deleting a directory that might be the main tree.
-        if not removed_by_git and wt.exists():
-            if shared is False:
-                shutil.rmtree(str(wt), ignore_errors=True)
-                if wt.exists():
-                    parts.append("rmtree fallback: directory still present")
-                else:
-                    parts.append("rmtree fallback: removed")
-            else:
-                parts.append(
-                    "rmtree fallback SKIPPED: could not confirm this is a linked worktree, "
-                    "so an OS delete might have hit the shared tree"
-                )
-
-        if prune:
-            pr = _run(["git", "worktree", "prune"], repo_cwd, 30)
-            parts.append("git worktree prune: " + ("ok" if "[returncode:" not in pr
-                                                    else pr.strip()))
-        return "\n".join(parts)
+        # (C) The actual teardown -- remove --force first, guarded rmtree fallback, prune --
+        # lives in a gate-free helper so out-of-process callers (the bench teardown sites)
+        # can share the exact same guarantee without needing an unlock session or a contract
+        # context they do not have.
+        return _worktree_teardown(wt, repo_cwd, shared, prune)
     except Exception as e:
         return f"[worktree_remove error: {type(e).__name__}: {e}]"
+
+
+def _worktree_teardown(wt: Path, repo_cwd: Path, shared, prune: bool = True) -> str:
+    """Remove a linked worktree and prune, without any unlock/contract gate.
+
+    Shared by `worktree_remove` (which applies the gates first) and by the bench teardown
+    sites, which run as their own processes. `git worktree remove --force` goes first; the
+    rmtree fallback runs ONLY when `shared is False` (a proven linked worktree), never when
+    it is True (the shared tree) or None (git could not tell). `prune` clears stale
+    administrative entries afterwards. Returns a short multi-line report; raises nothing that
+    the caller has not already wrapped.
+
+    Args:
+        wt: Validated path of the linked worktree to remove.
+        repo_cwd: Directory to run the git commands from.
+        shared: Result of `_resolves_into_common_dir` -- True/False/None.
+        prune: Run `git worktree prune` afterwards.
+    """
+    parts: list[str] = []
+    done = _run(["git", "worktree", "remove", "--force", str(wt)], repo_cwd, 30)
+    removed_by_git = "[returncode:" not in done
+    parts.append("git worktree remove: " + ("ok" if removed_by_git else done.strip()))
+
+    # Fallback delete, but only when it CANNOT touch the shared tree. `shared` is
+    # False (genuine linked worktree) or None (unknown). Only act on the definite case;
+    # an unknown answer must not license deleting a directory that might be the main tree.
+    if not removed_by_git and wt.exists():
+        if shared is False:
+            shutil.rmtree(str(wt), ignore_errors=True)
+            if wt.exists():
+                parts.append("rmtree fallback: directory still present")
+            else:
+                parts.append("rmtree fallback: removed")
+        else:
+            parts.append(
+                "rmtree fallback SKIPPED: could not confirm this is a linked worktree, "
+                "so an OS delete might have hit the shared tree"
+            )
+
+    if prune:
+        pr = _run(["git", "worktree", "prune"], repo_cwd, 30)
+        parts.append("git worktree prune: " + ("ok" if "[returncode:" not in pr
+                                                else pr.strip()))
+    return "\n".join(parts)
 
 
 def worktree_add(worktree_path: str, branch: str, base: str = "HEAD",
