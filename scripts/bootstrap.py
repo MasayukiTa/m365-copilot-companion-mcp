@@ -556,7 +556,13 @@ def step_dev_tunnel() -> None:
     dt = find_executable("devtunnel", "devtunnel.exe")
     # Also check the winget per-user install location used by supervisor.ps1.
     if not dt:
-        cand = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Links" / "devtunnel.exe"
+        # Both install locations: winget puts it under WinGet\Links, and the direct
+        # download setup_devtunnel.ps1 falls back to puts it under LOCALAPPDATA\devtunnel
+        # and appends THAT to the user PATH -- which a running session cannot see.
+        local = Path(os.environ.get("LOCALAPPDATA", ""))
+        cand = local / "Microsoft" / "WinGet" / "Links" / "devtunnel.exe"
+        if not cand.exists():
+            cand = local / "devtunnel" / "devtunnel.exe"
         if cand.exists():
             dt = str(cand)
 
@@ -1041,6 +1047,21 @@ def run_all(steps=STEPS, state=None, state_file=STATE_FILE) -> int:
     """
     if state is None:
         state = load_state(state_file)
+
+    # A DONE FLAG IS A MEMORY OF AN ACT, NOT EVIDENCE OF ITS RESULT. state.json travels with a
+    # folder copy, a OneDrive sync or a ZIP restore; .venv does not, or arrives broken. Skipping
+    # on the flag alone let STEP 1 report success on a machine with no interpreter, after which
+    # supervisor.ps1 falls back to bare `python` -- the Store alias, on a fresh Windows box --
+    # and every later symptom points somewhere else.
+    #
+    # Only the steps that make or need the venv are cleared. The other four produce their own
+    # artefacts and re-running them is not free.
+    if not VENV_PYTHON.exists():
+        cleared = [n for n in ("ensure_venv", "install_deps", "verify")
+                   if state.get("done", {}).pop(n, None)]
+        if cleared:
+            log("    .venv is missing, so these are not done after all: %s" % ", ".join(cleared))
+            save_state(state, state_file)
 
     # First-line resume banner: when at least one step is already done, tell the
     # user up front how far along we are and which step we resume from, so an

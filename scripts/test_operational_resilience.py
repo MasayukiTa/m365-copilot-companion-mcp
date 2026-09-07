@@ -196,3 +196,43 @@ def test_the_first_server_launch_does_not_wait_out_the_debounce():
     wait = qs.index("Waiting for the MCP server to answer")
     doctor_call = qs.index("scripts\doctor.ps1")
     assert wait < doctor_call, "the health check still runs before the wait"
+
+
+def test_every_devtunnel_resolver_knows_both_install_locations():
+    """setup_devtunnel.ps1 installs by winget when it can and DIRECT-DOWNLOADS to
+    %LOCALAPPDATA%\devtunnel when it cannot, appending that directory to the USER PATH -- which
+    the already-running cmd cannot see, and that cmd is quickstart, the parent of start_all,
+    supervisor and doctor. So on exactly the locked-down machines that needed the fallback, the
+    CLI was installed and unfindable, and doctor advised installing what was already there.
+
+    All four resolvers, not the two that happened to be noticed: this is one failure class."""
+    installer = (ROOT / "scripts" / "setup_devtunnel.ps1").read_text(encoding="utf-8")
+    assert 'Join-Path $env:LOCALAPPDATA "devtunnel"' in installer, "the install location moved"
+
+    for rel in ("scripts/doctor.ps1", "scripts/heal_tunnel.ps1", "scripts/supervisor.ps1"):
+        src = (ROOT / rel).read_text(encoding="utf-8")
+        assert 'Join-Path $env:LOCALAPPDATA "devtunnel\devtunnel.exe"' in src, rel
+    boot = (ROOT / "scripts" / "bootstrap.py").read_text(encoding="utf-8")
+    assert 'local / "devtunnel" / "devtunnel.exe"' in boot
+
+
+def test_the_supervisor_refuses_rather_than_looping_on_an_interpreter_that_cannot_run():
+    """It fell back from .venv to bare `python`, which on a fresh machine is usually the App
+    Execution Alias under WindowsApps -- not an interpreter; run with arguments it returns an
+    error code. The loop would fail identically twice a pass, every fifteen seconds, forever,
+    while reporting itself as running -- which is what doctor shows, in green."""
+    sup = (ROOT / "scripts" / "supervisor.ps1").read_text(encoding="utf-8")
+
+    assert "REFUSING TO RUN" in sup
+    assert "exit 3" in sup
+    # Built from a backslash constant, not typed out: the previous version of this line
+    # asked for one backslash where the regex needs two (an escaped backslash matches a
+    # literal one), because the heredoc that wrote the test de-escaped it. Counting
+    # backslashes by eye through three layers of quoting is how that goes wrong.
+    bs = chr(92)
+    assert ("-match '" + bs * 2 + "WindowsApps" + bs * 2 + "'") in sup, \
+        "the Store alias is not detected"
+    # the refusal happens before the loop can start using it
+    assert sup.index("REFUSING TO RUN") < sup.index("$serverMiss -ge $FailuresBeforeAction")
+    # and the old unconditional fallback is gone
+    assert 'if (-not (Test-Path $Py)) { $Py = "python" }' not in sup
