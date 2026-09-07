@@ -551,3 +551,31 @@ def test_auth_ok_end_to_end_means_more_than_not_401():
     assert "($noKey -eq 401) -or ($noKey -eq 403)" in auth
     assert "$withKey -ge 200" in auth and "$withKey -lt 500" in auth, "5xx passes again"
     assert "$withKey -ne 404" in auth
+
+
+def test_the_chat_backend_is_checked_not_just_the_browser_it_drives():
+    """The only bridge check probed the Edge CDP port and was marked optional -- "only needed
+    for past-conversation history". The thing CopilotChat actually talks to is the HTTP server
+    on :8765, and nothing looked at it.
+
+    OBSERVED on the machine that was supposed to be working, while writing this: / answered 200
+    while /conv dropped the connection, and :8765 was held by a process started with the SYSTEM
+    python rather than the venv's -- so it could not serve. start_all uses /conv as its liveness
+    probe, decided the bridge was down, started another, and the wedged one kept the port. Four
+    bridge processes, five and a half hours, behind a green health check.
+
+    /conv and not /, precisely because /conv is what start_all trusts: probing / would have
+    passed there and called a broken chat backend fine."""
+    doctor = (ROOT / "scripts" / "doctor.ps1").read_text(encoding="utf-8")
+    start_all = (ROOT / "scripts" / "start_all.ps1").read_text(encoding="utf-8")
+
+    assert 'Check "bridge_backend"' in doctor
+    assert "127.0.0.1:8765/conv" in doctor
+    # the same endpoint start_all decides on, or the two instruments can disagree
+    assert "127.0.0.1:8765/conv" in start_all
+    # required: a chat backend that does not serve is not a complete setup
+    block = doctor[doctor.index('Check "bridge_backend"'):]
+    block = block[:block.index("# 5b.")]
+    assert "-Optional" not in block
+    # an HTTP error still means something is serving; a dropped connection does not
+    assert "else { $false }" in block
