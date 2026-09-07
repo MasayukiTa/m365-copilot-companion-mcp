@@ -154,3 +154,168 @@ def test_scope_add_failure_yields_none_and_noops(shared_repo, tmp_path, monkeypa
         entered["val"] = p
     assert entered["val"] is None
     assert shared_repo.is_dir()
+
+
+# ---- survey_worktrees: 読み取り専用の棚卸し -------------------------------
+#
+# survey_worktrees は「消して良いか」を報告するだけで、何も削除しない。
+# ここでは実 git で worktree を作り、判定と「非破壊」を実挙動で確かめる。
+
+def _row_for(rows, path):
+    target = str(pathlib.Path(path).resolve())
+    for r in rows:
+        if str(pathlib.Path(r["path"]).resolve()) == target:
+            return r
+    return None
+
+
+def test_survey_reports_and_deletes_nothing(shared_repo, tmp_path):
+    # 共有ツリー + リンク worktree を1つ用意する。
+    wt = tmp_path / "wt"
+    C.worktree_add(str(wt), "feat/survey1", "HEAD", repo_path=str(shared_repo))
+    before = set(_worktrees(shared_repo))
+
+    rows = C.survey_worktrees(repo_path=str(shared_repo))
+    assert isinstance(rows, list)
+    assert not any("error" in r for r in rows), rows
+
+    # 共有(メイン)ツリーは is_main=True かつ削除候補ではない。
+    main_row = _row_for(rows, shared_repo)
+    assert main_row is not None
+    assert main_row["is_main"] is True
+    assert main_row["safe_to_remove"] is False
+
+    # リンク worktree も報告に含まれる。
+    wt_row = _row_for(rows, wt)
+    assert wt_row is not None
+    assert wt_row["is_main"] is False
+    assert wt_row["branch"] == "feat/survey1"
+
+    # 決定的に読み取り専用: 呼んだあとも worktree 集合は不変。
+    after = set(_worktrees(shared_repo))
+    assert after == before
+    assert wt.is_dir()
+    assert shared_repo.is_dir() and (shared_repo / "a.txt").exists()
+
+
+def test_survey_flags_dirty_worktree_not_safe(shared_repo, tmp_path):
+    # HEAD が base(main) に含まれていても、未コミット変更があれば safe にしない。
+    wt = tmp_path / "wt"
+    C.worktree_add(str(wt), "feat/survey2", "HEAD", repo_path=str(shared_repo))
+    (wt / "scratch.txt").write_text("uncommitted\n", encoding="utf-8")
+
+    rows = C.survey_worktrees(repo_path=str(shared_repo))
+    wt_row = _row_for(rows, wt)
+    assert wt_row is not None
+    assert wt_row["dirty"] is True
+    assert wt_row["safe_to_remove"] is False
+    # 何も消していない。
+    assert wt.is_dir() and (wt / "scratch.txt").exists()
+
+
+def test_survey_flags_merged_clean_worktree_safe(shared_repo, tmp_path):
+    # 新規ブランチを main と同じ committed HEAD から生やし、変更しない。
+    # HEAD は main に含まれ(merged)、dirty でなく、locked/main でもない -> safe_to_remove=True。
+    wt = tmp_path / "wt"
+    C.worktree_add(str(wt), "feat/survey3", "HEAD", repo_path=str(shared_repo))
+
+    rows = C.survey_worktrees(repo_path=str(shared_repo), base="main")
+    wt_row = _row_for(rows, wt)
+    assert wt_row is not None
+    assert wt_row["dirty"] is False
+    assert wt_row["merged_into_base"] is True
+    assert wt_row["safe_to_remove"] is True
+    # 報告のみ: worktree は残っている。
+    assert wt.is_dir()
+
+
+def test_survey_returns_error_list_on_bad_repo(tmp_path):
+    # git リポジトリでない場所を渡しても、常に list を返し、例外を漏らさない。
+    rows = C.survey_worktrees(repo_path=str(tmp_path))
+    assert isinstance(rows, list) and rows
+    assert "error" in rows[0]
+
+
+# ---- survey_worktrees: 読み取り専用、削除はしない -----------------------------
+
+def _find(rows, path):
+    key = str(pathlib.Path(path).resolve())
+    for r in rows:
+        if str(pathlib.Path(r["path"]).resolve()) == key:
+            return r
+    return None
+
+
+def test_survey_lists_main_and_marks_it_unsafe(shared_repo):
+    rows = C.survey_worktrees(repo_path=str(shared_repo))
+    assert isinstance(rows, list) and rows
+    main = _find(rows, shared_repo)
+    assert main is not None
+    assert main["is_main"] is True
+    # 共有(メイン)ツリーは決して削除候補にしない。
+    assert main["safe_to_remove"] is False
+
+
+def test_survey_merged_clean_linked_is_safe(shared_repo, tmp_path):
+    # base(HEAD)から枝分かれしたままのクリーンな worktree → merged・not dirty → safe。
+    wt = tmp_path / "wtm"
+    C.worktree_add(str(wt), "feat/merged", "HEAD", repo_path=str(shared_repo))
+    rows = C.survey_worktrees(repo_path=str(shared_repo))
+    row = _find(rows, wt)
+    assert row is not None
+    assert row["is_main"] is False
+    assert row["dirty"] is False
+    assert row["merged_into_base"] is True
+    assert row["safe_to_remove"] is True
+
+
+def test_survey_dirty_linked_is_unsafe(shared_repo, tmp_path):
+    # 未コミットの変更があれば、たとえ merged でも削除は安全でない。
+    wt = tmp_path / "wtd"
+    C.worktree_add(str(wt), "feat/dirty", "HEAD", repo_path=str(shared_repo))
+    (wt / "scratch.txt").write_text("unsaved\n", encoding="utf-8")
+    rows = C.survey_worktrees(repo_path=str(shared_repo))
+    row = _find(rows, wt)
+    assert row is not None
+    assert row["dirty"] is True
+    assert row["safe_to_remove"] is False
+
+
+def test_survey_unmerged_clean_linked_is_unsafe(shared_repo, tmp_path):
+    # base に取り込まれていないコミットが乗っている→削除で未マージの作業を失う→unsafe。
+    wt = tmp_path / "wtu"
+    C.worktree_add(str(wt), "feat/unmerged", "HEAD", repo_path=str(shared_repo))
+    (wt / "n.txt").write_text("new\n", encoding="utf-8")
+    _git(wt, "add", "n.txt")
+    _git(wt, "commit", "-m", "ahead of base")
+    rows = C.survey_worktrees(repo_path=str(shared_repo))
+    row = _find(rows, wt)
+    assert row is not None
+    assert row["dirty"] is False
+    assert row["merged_into_base"] is False
+    assert row["safe_to_remove"] is False
+
+
+def test_survey_is_read_only_no_worktree_removed(shared_repo, tmp_path):
+    # survey の前後で worktree 本数が変わらない(何も削除しない)ことを実 git で確かめる。
+    wt = tmp_path / "wtro"
+    C.worktree_add(str(wt), "feat/ro", "HEAD", repo_path=str(shared_repo))
+    before = set(_worktrees(shared_repo))
+    C.survey_worktrees(repo_path=str(shared_repo))
+    after = set(_worktrees(shared_repo))
+    assert before == after
+    assert wt.is_dir()   # survey は対象を消さない
+
+
+def test_survey_never_returns_safe_for_locked(shared_repo, tmp_path):
+    wt = tmp_path / "wtl"
+    C.worktree_add(str(wt), "feat/locked", "HEAD", repo_path=str(shared_repo))
+    _git(shared_repo, "worktree", "lock", str(wt))
+    try:
+        rows = C.survey_worktrees(repo_path=str(shared_repo))
+        row = _find(rows, wt)
+        assert row is not None
+        assert row["locked"] is True
+        assert row["safe_to_remove"] is False
+    finally:
+        _git(shared_repo, "worktree", "unlock", str(wt))

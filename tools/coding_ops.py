@@ -751,3 +751,194 @@ def worktree_scope(worktree_path: str, branch: str, base: str = "HEAD",
         # is not a genuine linked worktree.
         if ok:
             worktree_remove(worktree_path, repo_path)
+
+
+# --------------------------------------------------------------------------------------
+# Read-only survey of existing worktrees.
+#
+# Over a long run this repository accumulated many linked worktrees whose owning run had
+# long finished. Deciding which are safe to discard is a judgement call, and that call must
+# stay with a human (or a separate, deliberate step): this function only REPORTS. It never
+# removes a worktree and never shells out to anything destructive, so a caller cannot turn
+# it into an auto-cleanup by accident.
+#
+# For each linked worktree it answers the questions that make a discard safe or unsafe:
+#   * locked        -- `git worktree lock` was set; git itself will refuse --force, and the
+#                      lock usually means the owner is still using it.
+#   * prunable      -- git already considers the entry stale (the directory is gone).
+#   * detached      -- no branch; nothing named survives a removal.
+#   * branch        -- the branch this worktree checks out, if any.
+#   * branch_exists -- whether that branch ref still exists.
+#   * merged_into_base -- whether HEAD is already contained in the base ref (default the
+#                      repository's main branch). True means removing loses no unmerged work.
+#   * dirty         -- uncommitted changes present in the worktree; removing would drop them.
+#   * is_main       -- the shared (main) working tree itself; never a discard candidate.
+#   * safe_to_remove -- a conservative AND of the above: not main, not locked, not dirty,
+#                      and either prunable or already merged into base. `detached` alone is
+#                      deliberately NOT enough (a detached HEAD may carry unreferenced
+#                      commits). A None in any input it depends on makes this None, never True.
+
+
+def _git_raw(repo_cwd, args, timeout=30):
+    """Run a read-only git command and return (returncode, stdout). No sugaring.
+
+    coding_ops._run wraps output in '[stdout]'/'(no output)' markers, which is fine for
+    reporting but destroys the exact-string and exit-code signals the survey depends on
+    (e.g. an empty `status --porcelain` means clean, not '(no output)'). So the read-only
+    survey uses this raw helper instead.
+    """
+    try:
+        r = subprocess.run(["git", *args], cwd=str(repo_cwd), capture_output=True,
+                           text=True, encoding="utf-8", errors="replace",
+                           timeout=timeout, shell=False)
+        return r.returncode, r.stdout
+    except Exception:
+        return None, ""
+
+
+def _porcelain_worktrees(repo_cwd):
+    """Parse `git worktree list --porcelain` into dicts. Read-only."""
+    rc, out = _git_raw(repo_cwd, ["worktree", "list", "--porcelain"], 30)
+    if rc != 0:
+        return None, out
+    items = []
+    cur = {}
+    for line in out.splitlines():
+        if not line.strip():
+            if cur:
+                items.append(cur)
+                cur = {}
+            continue
+        if line.startswith("worktree "):
+            cur = {"path": line[len("worktree "):]}
+        elif line == "bare":
+            cur["bare"] = True
+        elif line == "detached":
+            cur["detached"] = True
+        elif line == "locked" or line.startswith("locked "):
+            cur["locked"] = True
+        elif line == "prunable" or line.startswith("prunable "):
+            cur["prunable"] = True
+        elif line.startswith("HEAD "):
+            cur["head"] = line[len("HEAD "):]
+        elif line.startswith("branch "):
+            ref = line[len("branch "):]
+            cur["branch"] = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
+    if cur:
+        items.append(cur)
+    return items, out
+
+
+def _ref_exists(repo_cwd, ref):
+    rc, _ = _git_raw(repo_cwd, ["show-ref", "--verify", "--quiet",
+                               "refs/heads/" + ref], 15)
+    return rc == 0
+
+
+def _is_ancestor(repo_cwd, maybe_ancestor, descendant):
+    """True when *maybe_ancestor* is contained in *descendant*'s history. None if unknowable."""
+    rc, _ = _git_raw(repo_cwd, ["merge-base", "--is-ancestor",
+                               maybe_ancestor, descendant], 15)
+    if rc == 0:
+        return True
+    if rc == 1:
+        return False
+    return None                    # any other exit (incl. error) -> cannot tell
+
+
+def survey_worktrees(repo_path: str = ".", base: str = "") -> list:
+    """Report, WITHOUT deleting anything, whether each linked worktree is safe to discard.
+
+    Strictly read-only: it runs only `git worktree list`, `show-ref`, `merge-base` and
+    `status`, and returns a list of per-worktree dicts. It performs no removal and asks no
+    caller to perform one.
+
+    Args:
+        repo_path: The repository to survey.
+        base: Ref to test 'already merged' against. Defaults to the repo's main branch
+              ('main' if it exists, else 'master', else 'HEAD').
+
+    Returns:
+        On success, a list of dicts (one per worktree). On failure, a one-element list
+        [{"error": "..."}] so callers always get a list.
+    """
+    locked = require_unlocked()
+    if locked:
+        return [{"error": locked}]
+    try:
+        repo = _validate_path(repo_path)
+        repo_cwd = repo if repo.is_dir() else repo.parent
+        items, raw = _porcelain_worktrees(repo_cwd)
+        if items is None:
+            return [{"error": raw.strip()}]
+
+        if not base:
+            base = "main" if _ref_exists(repo_cwd, "main") else (
+                "master" if _ref_exists(repo_cwd, "master") else "HEAD")
+
+        rows = []
+        for it in items:
+            path = it.get("path", "")
+            is_main = False
+            try:
+                is_main = _is_shared_worktree(Path(path)) is True
+            except Exception:
+                is_main = False
+            branch = it.get("branch")
+            detached = bool(it.get("detached"))
+            lockedwt = bool(it.get("locked"))
+            prunable = bool(it.get("prunable"))
+            head = it.get("head")
+
+            branch_exists = _ref_exists(repo_cwd, branch) if branch else False
+
+            merged = None
+            if head:
+                merged = _is_ancestor(repo_cwd, head, base)
+
+            # `status` in the worktree tells us whether a removal would drop work.
+            dirty = None
+            if prunable:
+                dirty = False          # the checkout is already gone; nothing to drop
+            elif Path(path).is_dir():
+                rc, st = _git_raw(repo_cwd, ["-C", path, "status", "--porcelain"], 20)
+                if rc != 0:
+                    dirty = None
+                else:
+                    dirty = st.strip() != ""
+
+            # Conservative: only True when we are sure removing loses nothing that
+            # is not already preserved elsewhere. `prunable` (checkout already gone) and
+            # `merged is True` (HEAD contained in base) both mean that. `detached` alone
+            # is NOT sufficient -- a detached HEAD can still carry commits that no branch
+            # points at, and removing it would strand them.
+            if is_main or lockedwt:
+                safe = False
+            elif dirty is True:
+                safe = False
+            elif dirty is None:
+                safe = None
+            elif prunable or merged is True:
+                safe = True
+            elif merged is None:
+                safe = None
+            else:
+                safe = False
+
+            rows.append({
+                "path": path,
+                "is_main": is_main,
+                "branch": branch,
+                "branch_exists": branch_exists,
+                "detached": detached,
+                "locked": lockedwt,
+                "prunable": prunable,
+                "head": head,
+                "merged_into_base": merged,
+                "base": base,
+                "dirty": dirty,
+                "safe_to_remove": safe,
+            })
+        return rows
+    except Exception as e:
+        return [{"error": "%s: %s" % (type(e).__name__, e)}]
