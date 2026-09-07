@@ -170,6 +170,38 @@ function Get-ServerDeathReason {
     }
     return @()
 }
+# THE INTERPRETER THE SUPERVISOR WOULD ACTUALLY USE. Resolved exactly as supervisor.ps1
+# resolves it, or this check answers a different question from the one that matters:
+#     $Py = Join-Path $Root ".venv\Scripts\python.exe"
+#     if (-not (Test-Path $Py)) { $Py = "python" }
+# With no .venv that is bare `python`, which on a fresh Windows machine is usually the Store
+# App Execution Alias -- a stub that opens the Microsoft Store and exits without writing a
+# single byte to stderr. The server then dies silently, and a silent death is the one thing
+# the crash log cannot explain.
+$script:pyPath = Join-Path $repo ".venv\Scripts\python.exe"
+$script:pyIsVenv = Test-Path $script:pyPath
+if (-not $script:pyIsVenv) {
+    $cmd = Get-Command python -ErrorAction SilentlyContinue | Select-Object -First 1
+    $script:pyPath = if ($cmd) { $cmd.Source } else { "" }
+}
+$script:pyProblem = ""
+if (-not $script:pyPath) {
+    $script:pyProblem = ("no Python at all: this checkout has no .venv and there is no python " +
+                         "on PATH. Run setup.bat, which creates the .venv the supervisor looks " +
+                         "for first.")
+} elseif ($script:pyPath -match '\\WindowsApps\\') {
+    # Named specifically because it is the failure that leaves NO trace: the alias exits
+    # quietly, so there is nothing in the crash log to read and nothing to deduce.
+    $script:pyProblem = ("this checkout has no .venv, so the supervisor falls back to bare " +
+                         "'python' -- and on this machine that resolves to the Microsoft Store " +
+                         "App Execution Alias (" + $script:pyPath + "). That stub opens the " +
+                         "Store and exits without writing anything, so the server dies leaving " +
+                         "no error to read. Run setup.bat to create the .venv.")
+}
+Check "python_runnable" "Python the supervisor would use (.venv, else PATH)" `
+    { [bool]$script:pyPath -and -not $script:pyProblem } `
+    $(if ($script:pyProblem) { $script:pyProblem } else { "run setup.bat to create the .venv" })
+
 $script:serverFix = ""
 if (-not $script:supervisorCmdLine) {
     $script:serverFix = ("the stack has not been started on this machine -- nothing is " +
@@ -181,11 +213,18 @@ if (-not $script:supervisorCmdLine) {
                              "STARTUP. It said:" + [Environment]::NewLine + "           " +
                              ($reason -join ([Environment]::NewLine + "           ")))
     } else {
-        $script:serverFix = ("the supervisor is relaunching the server and it is dying on " +
-                             "startup, but it produced no output to explain why -- so it is " +
-                             "failing before it can write anything (a missing interpreter, or " +
-                             "a working directory it cannot enter). Do NOT run start_all.bat: " +
-                             "the supervisor is already doing that on a loop.")
+        if ($script:pyProblem) {
+            # The Python check above already found the cause; repeat it here rather than send
+            # the reader hunting up the list for a red line they may not connect to this one.
+            $script:serverFix = ("the supervisor is relaunching the server and it dies without " +
+                                 "writing anything, because " + $script:pyProblem)
+        } else {
+            $script:serverFix = ("the supervisor is relaunching the server and it is dying on " +
+                                 "startup, but it produced no output to explain why. The " +
+                                 "interpreter check above passed, so this is not a missing " +
+                                 "Python. Do NOT run start_all.bat: the supervisor is already " +
+                                 "doing that on a loop.")
+        }
     }
 }
 
