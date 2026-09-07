@@ -444,7 +444,11 @@ def test_another_window_of_the_same_exe_is_not_the_cockpit(monkeypatch):
     fake = types.SimpleNamespace(
         process_iter=lambda attrs=None: [_P(["FleetCockpit.exe", "--authority"])])
     monkeypatch.setitem(sys.modules, "psutil", fake)
-    monkeypatch.setattr(TR, "COCKPIT_EXE", r"C:\x\FleetCockpit.exe")
+    # os.path.join, not a literal Windows path. On Linux os.path.basename does not treat the
+    # backslash as a separator, so a hardcoded "C:\..." made `want` the entire string and the
+    # image name never matched. This passed on Windows and failed in CI -- the local OS is this
+    # machine's circumstance, not the test's environment.
+    monkeypatch.setattr(TR, "COCKPIT_EXE", os.path.join("x", "FleetCockpit.exe"))
     assert TR.cockpit_is_up() is False
 
     fake.process_iter = lambda attrs=None: [_P(["FleetCockpit.exe"])]
