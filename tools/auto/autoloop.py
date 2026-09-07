@@ -221,6 +221,37 @@ def count_failures(output):
     return None
 
 
+#: What one verification round actually told us -- a different question from "how many
+#: failures", and the one the loop needs to decide whether to keep iterating. The bench harness
+#: prints OK or HIDDEN_TESTS_FAILED and DELIBERATELY withholds the count so a solver cannot
+#: hill-climb the hidden tests; it reports failure perfectly well while count_failures() can
+#: only answer None. Folding that into "the output could not be read" discards the only signal
+#: such a runner has, and the loop then spends its whole budget with no gradient at all.
+SIGNAL_PASS = "pass"
+SIGNAL_FAIL = "fail"        # verify ran and returned non-zero; no count is available
+SIGNAL_UNKNOWN = "unknown"  # verify was never reached, or did not finish
+
+
+def failure_signal(result):
+    """PASS / FAIL / UNKNOWN for one edit_and_verify result.
+
+    READ FROM THE EXIT STATUS, NOT THE TEXT. The status is already authoritative and needs no
+    pattern kept in step with whatever a runner happens to print -- which is how count_failures
+    came to answer None for a runner that was reporting failure clearly.
+
+    A timeout is UNKNOWN, not FAIL: a command that did not finish reported nothing. So is any
+    stage before the verify command (edit, syntax, pre-image, stop) -- those say something about
+    the edit, not about whether the goal is met.
+    """
+    if not isinstance(result, dict):
+        return SIGNAL_UNKNOWN
+    if result.get("ok"):
+        return SIGNAL_PASS
+    if result.get("stage") == "verify" and isinstance(result.get("exit_code"), int):
+        return SIGNAL_FAIL
+    return SIGNAL_UNKNOWN
+
+
 def trajectory(run_id, root=None):
     """What the recorded iterations show: failures going down, flat, worse, or unknown.
 

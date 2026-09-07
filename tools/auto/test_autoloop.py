@@ -336,3 +336,53 @@ def test_the_guard_creates_no_branches(repo):
     before = git(repo, "branch", "--list").stdout
     A.restore_point(str(repo))
     assert git(repo, "branch", "--list").stdout == before
+
+
+# -- what a verification round actually told us ----------------------------------------------
+# MEASURED, not supposed. Of 626 goal records on disk, 188 carry checks and 178 of those run
+# bench/eval_one.py, which prints OK or HIDDEN_TESTS_FAILED and deliberately withholds the count
+# so a solver cannot hill-climb the hidden tests. count_failures() answers None for every one of
+# those failures -- the same answer it gives for output it could not read at all. The loop then
+# treats a clearly-reported failure as "unknown", never spends patience, and runs its whole
+# budget with no gradient. failure_signal exists to keep the two apart.
+
+def test_a_binary_runner_reports_failure_even_though_no_count_can_be_read():
+    """THE DEFECT. The bench harness's own failure output, through both readers."""
+    result = {"ok": False, "stage": "verify", "exit_code": 1, "output": "HIDDEN_TESTS_FAILED"}
+    assert A.count_failures(result["output"]) is None      # no count, correctly
+    assert A.failure_signal(result) == A.SIGNAL_FAIL  # but failure IS known
+
+
+def test_the_binary_runner_passing_is_a_pass_on_both_readers():
+    result = {"ok": True, "stage": "verified", "exit_code": 0, "output": "OK"}
+    assert A.count_failures(result["output"]) == 0
+    assert A.failure_signal(result) == A.SIGNAL_PASS
+
+
+def test_a_timeout_is_unknown_not_failure():
+    """A command that did not finish reported nothing. Calling that a failure would spend the
+    loop's patience on a runner it never actually heard from."""
+    assert A.failure_signal(
+        {"ok": False, "stage": "timeout", "exit_code": None, "output": ""}
+    ) == A.SIGNAL_UNKNOWN
+
+
+@pytest.mark.parametrize("stage", ["edit", "syntax", "pre-image", "stop"])
+def test_stages_before_the_verify_command_are_unknown(stage):
+    """These say something about the edit, not about whether the goal is met."""
+    assert A.failure_signal(
+        {"ok": False, "stage": stage, "exit_code": None}
+    ) == A.SIGNAL_UNKNOWN
+
+
+def test_a_non_dict_is_unknown_rather_than_an_exception():
+    assert A.failure_signal(None) == A.SIGNAL_UNKNOWN
+    assert A.failure_signal("verified") == A.SIGNAL_UNKNOWN
+
+
+def test_the_signal_is_read_from_the_exit_status_not_the_text():
+    """Text patterns are what let count_failures fall out of step with a runner. A verify round
+    that returned non-zero is a failure whatever it printed -- including nothing."""
+    assert A.failure_signal(
+        {"ok": False, "stage": "verify", "exit_code": 2, "output": ""}
+    ) == A.SIGNAL_FAIL

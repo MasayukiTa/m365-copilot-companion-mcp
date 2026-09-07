@@ -168,3 +168,71 @@ def test_custom_state_reaches_the_candidate(monkeypatch):
 
     L.run(cand, verify="pytest", max_iter=2, custom_state={"repo_kind": "go"})
     assert seen["repo_kind"] == "go" and seen["iteration"] == 1
+
+
+# -- a binary runner has a gradient of exactly zero -------------------------------------------
+# bench/eval_one.py prints OK or HIDDEN_TESTS_FAILED and withholds the count on purpose, so a
+# solver cannot hill-climb the hidden tests. count_failures() therefore answers None on every
+# failing round, the `isinstance(fails, int)` branch never runs, patience is never spent, and the
+# loop uses its whole budget without ever knowing whether it was getting closer. 178 of the 188
+# goal records that carry checks on this machine are exactly that shape.
+
+BINARY_FAIL = {"ok": False, "stage": "verify", "exit_code": 1, "output": "HIDDEN_TESTS_FAILED"}
+
+
+def test_by_default_a_binary_runner_still_burns_the_whole_budget(monkeypatch):
+    """THE MEASURED BEHAVIOUR, PINNED. Not an endorsement -- changing when a loop gives up is a
+    trade that has to be measured on real runs first, so the default must not move silently."""
+    fake_cell(monkeypatch, [dict(BINARY_FAIL) for _ in range(5)])
+    out = L.run(always, verify="eval_one.py", max_iter=5, patience=2)
+    assert out["iterations"] == 5
+    assert out["stop"] == L.MAX_ITER
+
+
+def test_with_binary_patience_consecutive_reported_failures_are_stagnation(monkeypatch):
+    """A runner that cannot say "fewer than last time" can never report improvement, so repeated
+    failures ARE stagnation. Opt-in, and it must stop on patience, not on the hard budget."""
+    fake_cell(monkeypatch, [dict(BINARY_FAIL) for _ in range(5)])
+    out = L.run(always, verify="eval_one.py", max_iter=5, patience=2, binary_patience=True)
+    assert out["stop"] == L.NO_PROGRESS
+    assert out["iterations"] == 2
+
+
+def test_binary_patience_does_not_stop_on_a_timeout(monkeypatch):
+    """A command that never finished reported nothing. Spending patience on it would give up on
+    an infrastructure fault as though the work had stalled."""
+    timeout = {"ok": False, "stage": "timeout", "exit_code": None, "output": ""}
+    fake_cell(monkeypatch, [dict(timeout) for _ in range(4)])
+    out = L.run(always, verify="eval_one.py", max_iter=4, patience=2, binary_patience=True)
+    assert out["stop"] == L.MAX_ITER
+    assert out["iterations"] == 4
+
+
+def test_binary_patience_still_lets_a_pass_converge(monkeypatch):
+    fake_cell(monkeypatch, [dict(BINARY_FAIL),
+                            {"ok": True, "stage": "verified", "exit_code": 0, "output": "OK"}])
+    out = L.run(always, verify="eval_one.py", max_iter=5, patience=2, binary_patience=True)
+    assert out["stop"] == L.CONVERGED and out["iterations"] == 2
+
+
+def test_a_counting_runner_is_unaffected_by_the_flag(monkeypatch):
+    """The flag must only reach rounds where no count could be read. A runner that prints numbers
+    keeps the existing improvement/stagnation logic, flag or no flag."""
+    rounds = [{"ok": False, "stage": "verify", "exit_code": 1, "output": "%d failed" % n}
+              for n in (5, 4, 3, 2)]
+    for flag in (False, True):
+        fake_cell(monkeypatch, [dict(r) for r in rounds])
+        out = L.run(always, verify="pytest", max_iter=4, patience=2, binary_patience=flag)
+        assert out["stop"] == L.MAX_ITER, flag        # improving every round: never stagnant
+        assert out["iterations"] == 4, flag
+
+
+def test_every_round_records_what_the_verification_told_us(monkeypatch):
+    """Without this in the history there is nothing to audit later: "unknown" and "reported a
+    failure" look identical in the trajectory, which is how the gradient went missing."""
+    fake_cell(monkeypatch, [dict(BINARY_FAIL),
+                            {"ok": False, "stage": "timeout", "exit_code": None, "output": ""},
+                            {"ok": True, "stage": "verified", "exit_code": 0, "output": "OK"}])
+    out = L.run(always, verify="eval_one.py", max_iter=3)
+    assert [h["signal"] for h in out["history"]] == ["fail", "unknown", "pass"]
+    assert [h["fails"] for h in out["history"]] == [None, None, 0]
