@@ -204,6 +204,15 @@ echo ===========================================================================
 echo.
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\start_all.ps1"
 
+REM WAIT FOR THE SERVER BEFORE MEASURING IT. start_all returns once the supervisor PROCESS
+REM exists; the server it launches has to import and bind after that. Checking health at the
+REM moment start_all returns produced the three red lines -- server down, tunnel not serving,
+REM Bearer rejected -- on machines where nothing was wrong except the question being asked too
+REM early. Bounded, and it says what it is waiting for: a silent pause reads as a hang.
+echo.
+echo   Waiting for the MCP server to answer (up to 90s)...
+powershell -NoProfile -Command "$ok = $false; for ($i = 0; $i -lt 45; $i++) { try { if ((Invoke-WebRequest -Uri 'http://127.0.0.1:8000/health' -TimeoutSec 2 -UseBasicParsing).StatusCode -eq 200) { $ok = $true; break } } catch { }; Start-Sleep -Seconds 2 }; if ($ok) { Write-Host ('   Server answered after about ' + ($i * 2) + 's.') } else { Write-Host '   Server did not answer within 90s -- the health check below will say why.' }"
+
 echo.
 echo ===========================================================================
 echo  Sign in to M365 on the companion browser
@@ -237,7 +246,12 @@ if not "!DOCTOR_BAD!"=="0" (
     REM down, and this is the only install method there is - if quickstart cannot say why the
     REM server died, nobody can. The supervisor relaunches it on a loop, so re-running
     REM start_all.bat would change nothing either.
-    powershell -NoProfile -Command "$d = '%~dp0.setup\logs'; foreach ($p in @((Join-Path $d 'server.err.log'), (Join-Path $d 'server.err.history.log'))) { if ((Test-Path $p) -and (Get-Item $p).Length -gt 0) { Write-Host '   ---------------------------------------------------------------'; Write-Host '   The MCP server tried to start and stopped. It reported:'; Write-Host '   ---------------------------------------------------------------'; Get-Content -Tail 25 $p; Write-Host '   ---------------------------------------------------------------'; break } }"
+    REM ONLY WHEN THE SERVER IS THE THING THAT IS DOWN. This block used to fire on ANY red
+    REM line, so an unrelated failure -- a tunnel name, a missing agent URL -- printed "the
+    REM MCP server tried to start and stopped" over a server that was running fine, quoting
+    REM uvicorn's own startup lines as evidence. It now probes /health first, and says
+    REM plainly when the only output on record is from a launch that succeeded.
+    powershell -NoProfile -Command "$up = $false; try { $up = (Invoke-WebRequest -Uri 'http://127.0.0.1:8000/health' -TimeoutSec 4 -UseBasicParsing).StatusCode -eq 200 } catch { }; if (-not $up) { $d = '%~dp0.setup\logs'; foreach ($p in @((Join-Path $d 'server.err.log'), (Join-Path $d 'server.err.history.log'))) { if ((Test-Path $p) -and (Get-Item $p).Length -gt 0) { $t = Get-Content -Tail 25 $p; $ok = ($t -match 'Application startup complete') -or ($t -match 'Uvicorn running on'); Write-Host '   ---------------------------------------------------------------'; if ($ok) { Write-Host '   The MCP server is not answering, and the only output on record is from'; Write-Host '   a launch that STARTED SUCCESSFULLY -- it does not explain this failure.' } else { Write-Host '   The MCP server tried to start and stopped. Its last output was:' }; Write-Host '   ---------------------------------------------------------------'; $t; Write-Host '   ---------------------------------------------------------------'; break } } }"
     echo.
     echo   Fix what is shown above, then run quickstart.bat again.
     echo   It resumes from where it stopped - nothing is repeated unnecessarily.
