@@ -77,11 +77,38 @@ if errorlevel 1 (
     ) else (
         echo   !BEHIND! update^(s^) available on the remote branch.
         set /p ANS="   Pull them now with a fast-forward? [y/N] "
-        if /i "!ANS!"=="y" (
-            git pull --ff-only
-        ) else (
-            echo   Skipped. You can pull later with: git pull --ff-only
-        )
+        REM DECIDE HERE, ACT OUTSIDE. Labels are not valid inside a parenthesised block --
+        REM cmd rejects the whole file with ") was unexpected at this time" -- so the answer
+        REM becomes a flag and everything that acts on it happens after the blocks close.
+        if /i "!ANS!"=="y" set "DO_PULL=1"
+        if not "!ANS!"=="y" echo   Skipped. You can pull later with: git pull --ff-only
+    )
+)
+
+if defined DO_PULL (
+    git pull --ff-only
+    REM READ THE RESULT. A pull that fails -- dirty tree, diverged branch, no network -- printed
+    REM its error among everything else and the run carried on, so the operator believed they
+    REM were current while running the old code.
+    if errorlevel 1 (
+        echo.
+        echo   UPDATE FAILED -- this checkout is still on the older version. The error is just
+        echo   above. Everything below continues to run from the code you have now.
+    ) else (
+        REM AND A SUCCESSFUL PULL REWRITES THIS FILE WHILE CMD IS EXECUTING IT. cmd resumes a
+        REM batch file from a byte offset after every line, so replacing it underneath a running
+        REM instance continues at whatever now occupies that offset -- a partial line, the middle
+        REM of another block, or nothing. Undefined, and silent. Stopping is the only safe move
+        REM once the script has changed itself.
+        echo.
+        echo ===========================================================================
+        echo  Updated. Please run quickstart.bat again.
+        echo ===========================================================================
+        echo   The update replaced this script while it was running, so it cannot safely
+        echo   continue in this window. Nothing is lost -- it resumes where it left off.
+        echo.
+        pause
+        exit /b 0
     )
 )
 
@@ -108,6 +135,11 @@ REM in between resets it. Delayed expansion is on, so !ERRORLEVEL! is the runtim
 if "!ERRORLEVEL!"=="1" set "TUNNEL_ACCESS=anonymous"
 if "!ERRORLEVEL!"=="2" set "TUNNEL_ACCESS=tenant"
 if "!ERRORLEVEL!"=="3" set "TUNNEL_ACCESS=none"
+REM MEASURED: with stdin closed, `choice` prints "ERROR: The file is either empty or does not
+REM contain the valid choices" and sets none of the above, leaving this empty. The effect was
+REM already safe -- nothing is granted -- but nothing SAID so either, and the recorded decision
+REM was a blank. An absent answer is the same answer as N, and is now written down as one.
+if "!TUNNEL_ACCESS!"=="" set "TUNNEL_ACCESS=none"
 REM FLATTENED ON PURPOSE. `set /p` inside a parenthesized block did not settle before the `if`
 REM that reads it, so an empty answer was not detected. One statement per line, no block.
 if not "!TUNNEL_ACCESS!"=="tenant" goto :after_tenant_id
@@ -334,6 +366,20 @@ if not "!DOCTOR_BAD!"=="0" (
     echo.
     echo   Fix what is shown above, then run quickstart.bat again.
     echo   It resumes from where it stopped - nothing is repeated unnecessarily.
+    goto :after_banner
+)
+REM "COULD NOT DETERMINE" IS NOT "COMPLETE". doctor's exit code is the number of FAILURES, and
+REM a required check that could not be answered is neither a failure nor a completion -- it used
+REM to land in the same counter as an absent optional component and print COMPLETE over it.
+set "DOCTOR_UNKNOWN=0"
+for /f "tokens=2 delims==" %%U in ('findstr /b "unknown=" ".setup\logs\doctor_summary.txt" 2^>nul') do set "DOCTOR_UNKNOWN=%%U"
+if not "!DOCTOR_UNKNOWN!"=="0" (
+    echo ===========================================================================
+    echo  SETUP NOT CONFIRMED - !DOCTOR_UNKNOWN! required check^(s^) could not be answered
+    echo ===========================================================================
+    echo   Nothing failed, but something required could not be determined -- look for
+    echo   the [WARN] lines above; each printed what to retry. Re-run quickstart.bat
+    echo   once that is resolved. It resumes; nothing is repeated unnecessarily.
     goto :after_banner
 )
 echo ===========================================================================
