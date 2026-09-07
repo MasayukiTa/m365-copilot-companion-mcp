@@ -519,6 +519,28 @@ Check "edge_bridge" "Bridge Edge running (:9223 history/scrape) [optional]" `
     "optional: powershell -File scripts\start_bridge.ps1 -Keepalive   (only needed for past-conversation history)" `
     -Optional
 
+# 4c. The chat backend itself. edge_bridge above probes the Edge the bridge DRIVES; this is
+#     the HTTP server CopilotChat talks to, and nothing looked at it -- so a bridge that holds
+#     the port without serving read as ALL GREEN. Seen doing exactly that: / answered 200 while
+#     /conv dropped the connection, because the process holding :8765 had been started with the
+#     system python instead of the venv's and could not import what it needs.
+#
+#     /conv, not /, because /conv is the endpoint start_all itself uses to decide whether the
+#     bridge is alive -- probing / would have passed here and called a broken chat backend fine.
+Check "bridge_backend" "Chat backend serving (:8765 /conv)" `
+    {
+        try {
+            $r = Invoke-WebRequest -Uri 'http://127.0.0.1:8765/conv' -TimeoutSec 6 -UseBasicParsing
+            [int]$r.StatusCode -lt 500
+        } catch {
+            # An HTTP error status still means something is serving; a dropped or refused
+            # connection does not.
+            if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode.value__ -lt 500 }
+            else { $false }
+        }
+    } `
+    "the chat backend is not answering on :8765. If a process holds the port but does not serve, it was probably started outside the venv (check the command line of the owner of :8765): stop it, then run start_all.bat, which relaunches the bridge with the venv interpreter."
+
 # 5b. UI apps (CopilotChat.exe / FleetCockpit.exe) -- gitignored, so a fresh clone has neither
 #     until the first build. Checked individually so the fix line names the missing one.
 $copilotChatExe = Join-Path $repo "ui\CopilotChat.exe"
