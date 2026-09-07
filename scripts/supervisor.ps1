@@ -177,6 +177,28 @@ function Start-Server {
     try { if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force $logDir | Out-Null } } catch { }
     $srvOut = Join-Path $logDir "server.log"
     $srvErr = Join-Path $logDir "server.err.log"
+
+    # PRESERVE THE PREVIOUS LAUNCH BEFORE TRUNCATING IT. -RedirectStandardError truncates, and
+    # this function runs about once a minute while the server is failing, so the one file that
+    # explains the crash is erased by the next attempt -- roughly sixty times an hour. Anyone
+    # reading it afterwards, as the doctor told them to, sees only the newest launch and quite
+    # possibly nothing at all. Carry it into a history file first, newest last, capped so an
+    # unattended machine cannot fill its disk with the same stack trace.
+    $srvHist = Join-Path $logDir "server.err.history.log"
+    try {
+        if ((Test-Path $srvErr) -and ((Get-Item $srvErr).Length -gt 0)) {
+            $stamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+            Add-Content -Path $srvHist -Value ("=== launch ending " + $stamp + " ===") -Encoding UTF8
+            Get-Content $srvErr -ErrorAction Stop | Add-Content -Path $srvHist -Encoding UTF8
+            # Trim from the front: the oldest crash is the least useful and the newest must
+            # never be the one that gets dropped.
+            if ((Get-Item $srvHist).Length -gt 262144) {
+                $keep = Get-Content $srvHist -Tail 400 -ErrorAction Stop
+                Set-Content -Path $srvHist -Value $keep -Encoding UTF8
+            }
+        }
+    } catch { }
+
     try {
         Start-Process -FilePath $Py -ArgumentList "main.py" -WorkingDirectory $Root `
                       -WindowStyle Hidden -RedirectStandardOutput $srvOut -RedirectStandardError $srvErr
