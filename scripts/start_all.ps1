@@ -729,6 +729,33 @@ function Invoke-Startup {
         Invoke-FirstTimeSetupGate
     }
 
+    # A .ENV CARRIED FROM ANOTHER PC IS PRESENT AND UNUSABLE, WHICH NOTHING WAS LOOKING FOR.
+    #
+    # MCP_UNLOCK_PASSWORD_PROTECTED is a DPAPI value bound to one Windows account on one machine.
+    # Copy .env to a new PC and it decrypts nowhere: unlock() then reports the OTHER variable as
+    # "not configured", every mutating and executing tool is refused, and the stack looks healthy
+    # the whole time because startup does not need the password. Three days went into "the server
+    # will not start" on a server that was starting perfectly.
+    #
+    # setup.ps1 cannot fix it -- it writes .env only when there is none, and a copied file exists.
+    # So the repair belongs here, on the path that runs every time. It is NOT interactive: the
+    # password is generated (setup.ps1 makes it with RNGCryptoServiceProvider), so a machine that
+    # cannot read the stored one can simply establish its own. Runs under -NoUi too, because a
+    # background logon start is exactly when nobody is present to be asked.
+    try {
+        $venvPy = Join-Path $root ".venv\Scripts\python.exe"
+        if (Test-Path $venvPy) {
+            $envFile = Join-Path $root ".env"
+            $repair = & $venvPy -c "import sys; sys.path.insert(0,r'$root'); from dotenv import dotenv_values; from tools.env_portability import repair_unlock_password; print(repair_unlock_password(r'$envFile', dict(dotenv_values(r'$envFile')))['reason'])" 2>&1 | Select-Object -Last 1
+            if ($repair -match "re-established") {
+                Write-Host "[setup] the unlock password could not be decrypted by this account -- re-established it for this machine"
+            }
+        }
+    } catch {
+        # Never fatal. A machine that cannot run this still starts; it just keeps the fault it had.
+        Write-Host "[setup] unlock-password check skipped ($($_.Exception.Message))"
+    }
+
     # Pre-flight update check (best-effort, non-blocking). Runs once before any service starts.
     # In background logon startup this is skipped because update prompts are visible dialogs.
     if ($NoUi) {
