@@ -501,8 +501,15 @@ def test_the_launch_asks_for_no_console_window():
     (Python310 python.exe -m relay.fleet_runner), class CASCADIA_HOSTING_WINDOW_CLASS, hosting a
     PseudoConsole. So the flag was applied to the process that did not need it and missed the one
     that did. CREATE_NO_WINDOW gives a console with no window that descendants inherit.
+
+    Skipped off Windows: these constants exist nowhere else, launch_creationflags returns 0
+    there by design, and asserting the flags on a Linux runner asserts nothing about the
+    behaviour. Reading them off the module rather than hardcoding 0x08000000 keeps the test
+    honest about which flag it means.
     """
     import subprocess as sp
+    if os.name != "nt":
+        pytest.skip("console creation flags exist only on Windows")
     flags = TR.launch_creationflags()
     assert flags & sp.CREATE_NO_WINDOW, (
         "the launch does not ask for a windowless console: %r" % flags)
