@@ -82,48 +82,82 @@ def log(msg: str):
 # ---------------------------------------------------------------------------
 def kill_relay():
     log("STEP 1: Killing any existing relay.openai_endpoint_server processes …")
-    # Try psutil first; fall back to PowerShell Get-CimInstance
-    killed = False
+    # Select ONLY the venv python actually running our endpoint module, and
+    # never this process or its ancestors. Both selection paths below feed the
+    # SAME hardened selector (retry_controller._endpoint_pids): the old bare
+    # substring 'openai_endpoint_server' in cmdline / CommandLine LIKE '%...%'
+    # would also match an unrelated python that merely carried that string as an
+    # argument, and could kill the shell that launched us -- the exact process-
+    # kill failure class this sweep exists to remove.
+    from retry_controller import _ancestor_pids, _endpoint_pids  # same dir
+
+    my_ancestors = _ancestor_pids()
+    rows = _relay_proc_rows()
+    targets = _endpoint_pids(rows, my_ancestors, str(VENV_PY))
+    if not targets:
+        log("  no matching endpoint processes found")
+        return
+    for pid in targets:
+        log(f"  killing endpoint pid {pid}")
+        subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                       capture_output=True, text=True)
+    time.sleep(2)
+
+
+def _relay_proc_rows():
+    """[(pid, command_line)] for every python.exe, via psutil or PowerShell.
+
+    Enumeration only -- selection is left entirely to _endpoint_pids so the
+    guards (venv-python path, -m run target, self/ancestor exclusion) apply
+    identically no matter which enumeration path ran.
+    """
     try:
         import psutil  # type: ignore
-        for proc in psutil.process_iter(["pid", "cmdline"]):
+        rows = []
+        for proc in psutil.process_iter(["pid", "name", "cmdline"]):
             try:
-                cmdline = " ".join(proc.info.get("cmdline") or [])
-                if "openai_endpoint_server" in cmdline:
-                    log(f"  psutil: killing pid {proc.pid}")
-                    proc.kill()
-                    killed = True
+                name = (proc.info.get("name") or "").lower()
+                if name and "python" not in name:
+                    continue
+                cmd = " ".join(proc.info.get("cmdline") or [])
+                rows.append((int(proc.pid), cmd))
             except Exception:
                 pass
-        if killed:
-            time.sleep(2)
-        else:
-            log("  psutil: no matching processes found")
+        return rows
     except ImportError:
-        log("  psutil not available; falling back to PowerShell")
-        _kill_relay_powershell()
+        log("  psutil not available; enumerating via PowerShell")
+        return _relay_proc_rows_powershell()
 
 
-def _kill_relay_powershell():
-    """Use PowerShell Get-CimInstance / taskkill to kill relay processes."""
+def _relay_proc_rows_powershell():
+    """PowerShell fallback enumeration: (pid, command_line) for each python.exe."""
+    ps_cmd = (
+        "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+        "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
+    )
     try:
-        ps_cmd = (
-            "Get-CimInstance Win32_Process -Filter "
-            "\"CommandLine LIKE '%openai_endpoint_server%'\" | "
-            "ForEach-Object { taskkill /PID $_.ProcessId /F }"
-        )
         result = subprocess.run(
-            ["powershell", "-NonInteractive", "-Command", ps_cmd],
-            capture_output=True,
-            text=True,
-            timeout=20,
+            ["powershell", "-NonInteractive", "-NoProfile", "-Command", ps_cmd],
+            capture_output=True, text=True, timeout=20,
         )
-        out = (result.stdout + result.stderr).strip()
-        if out:
-            log(f"  powershell kill output: {out[:400]}")
-        time.sleep(2)
     except Exception as exc:
-        log(f"  WARNING: relay kill via powershell failed (ignored): {exc}")
+        log(f"  WARNING: relay enumeration via powershell failed (ignored): {exc}")
+        return []
+    out = (result.stdout or "").strip()
+    try:
+        data = json.loads(out) if out else []
+    except Exception:
+        return []
+    if isinstance(data, dict):
+        data = [data]
+    rows = []
+    for item in data:
+        try:
+            pid = int(item.get("ProcessId"))
+        except (TypeError, ValueError):
+            continue
+        rows.append((pid, item.get("CommandLine") or ""))
+    return rows
 
 
 # ---------------------------------------------------------------------------
