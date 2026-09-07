@@ -457,3 +457,56 @@ def test_another_window_of_the_same_exe_is_not_the_cockpit(monkeypatch):
 
 class _FakeProc:
     pid = 4242
+
+
+def test_a_tunnel_goal_is_not_gated_behind_the_bench_disk_floor(state):
+    """A GOAL FROM A PHONE IS NOT A BENCH EVAL.
+
+    The floor protects against SWE-bench Docker builds -- five concurrent ones once filled C:
+    and corrupted WSL. Autostart passed no --disk-floor-gb, so a tunnel goal inherited that
+    bench reserve, and below the floor the run admits NOTHING: every sweep refuses, breaks and
+    defers, with no timeout. The reason is printed once a minute into the coordinator's log,
+    which is exactly where the person holding the phone cannot look -- and they have already
+    been told the goal is queued and will be picked up.
+
+    An ordinary goal writes kilobytes. Both relay_fleet.disk_admission_ok and --disk-floor-gb
+    already say "0 = disable the disk gate (normal, non-bench use)"; this only passes it.
+    """
+    launcher = _Launcher()
+    plan = TR.autostart_fleet([{"text": "anything", "priority": False}], str(state),
+                              launcher=launcher)
+    assert plan["ok"] is True, plan
+    cmd = launcher.calls[0]
+    assert "--disk-floor-gb" in cmd, "the disk gate was left at the bench default: %s" % cmd
+    assert cmd[cmd.index("--disk-floor-gb") + 1] == "0", (
+        "a tunnel goal is still gated on free space: %s" % cmd)
+
+
+def test_the_goal_still_reaches_the_launch_alongside_the_floor_flag(state):
+    """The regression guard: appending an argument must not displace the goals file."""
+    launcher = _Launcher()
+    TR.autostart_fleet([{"text": "the goal", "priority": False}], str(state), launcher=launcher)
+    cmd = launcher.calls[0]
+    assert "--goals-file" in cmd and cmd[cmd.index("--goals-file") + 1].endswith(".jsonl")
+    assert "--state-dir" in cmd
+
+
+def test_the_launch_asks_for_no_console_window():
+    """A GOAL FROM A PHONE MUST NOT PUT A BLACK WINDOW ON THE DESKTOP.
+
+    DETACHED_PROCESS was the wrong flag for the shape of this launch. It gives the spawned
+    process no console -- but that process is the venv's python shim, which execs the real
+    interpreter, and a console application started by a parent with no console ALLOCATES A NEW
+    ONE. Measured while it was on screen: the window belonged to the GRANDCHILD
+    (Python310 python.exe -m relay.fleet_runner), class CASCADIA_HOSTING_WINDOW_CLASS, hosting a
+    PseudoConsole. So the flag was applied to the process that did not need it and missed the one
+    that did. CREATE_NO_WINDOW gives a console with no window that descendants inherit.
+    """
+    import subprocess as sp
+    flags = TR.launch_creationflags()
+    assert flags & sp.CREATE_NO_WINDOW, (
+        "the launch does not ask for a windowless console: %r" % flags)
+    assert not (flags & sp.DETACHED_PROCESS), (
+        "DETACHED_PROCESS is back; the grandchild will allocate its own console window")
+    assert flags & sp.CREATE_NEW_PROCESS_GROUP, (
+        "a Ctrl+C in the router's console would travel to the run")
