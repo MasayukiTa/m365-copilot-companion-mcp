@@ -29,9 +29,9 @@ def _armed(tmp_path, monkeypatch):
     """
     import tools.file_ops as FO
     monkeypatch.setattr(FO, "ALLOWED_BASE", tmp_path)
-    monkeypatch.setattr(CG, "_FLEET_DIR", str(tmp_path))
     monkeypatch.setattr(CG, "_CONTRACT_FILE", tmp_path / "active_contract.json")
-    monkeypatch.setattr(CG, "_SEEN", {"active_contract": False, "retired_via_api": False})
+    # The gate's seen/retired sidecars derive from _CONTRACT_FILE.parent, so redirecting the
+    # contract file above already isolates them -- there is no module-global state to patch.
     (tmp_path / "active_contract.json").write_text(
         json.dumps({"active": True, "ask_before": ["shell_destructive"]}), encoding="utf-8")
 

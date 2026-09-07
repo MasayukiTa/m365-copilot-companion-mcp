@@ -67,7 +67,7 @@ _CONTRACT_FILE = _FLEET_DIR / "active_contract.json"
 # Contract loading
 # ---------------------------------------------------------------------------
 
-# HAS THIS PROCESS EVER SEEN AN ACTIVE CONTRACT, AND WAS IT RETIRED PROPERLY.
+# HAS ANY PROCESS EVER SEEN AN ACTIVE CONTRACT, AND WAS THAT ONE RETIRED PROPERLY.
 #
 # The policy file lives under .fleet, which every worker can write, and `load_contract`
 # answered "missing" and "corrupt" with the same value the caller uses for "no contract is
@@ -75,11 +75,84 @@ _CONTRACT_FILE = _FLEET_DIR / "active_contract.json"
 # same fail-open shape this repository has already been bitten by once, and it is recorded
 # as a rule: unknown must fall to the dangerous side.
 #
-# A worker can write files. It cannot write this process's memory. So the server remembers
-# that it saw a contract, and a contract that then VANISHES is treated as tampering rather
-# than as an absence -- unless it was retired through deactivate_contract(), which is the
-# legitimate way for it to go away.
-_SEEN = {"active_contract": False, "retired_via_api": False}
+# A worker can write files. So the server remembers that it saw a contract, and a contract
+# that then VANISHES is treated as tampering rather than as an absence -- unless it was
+# retired through deactivate_contract(), which is the legitimate way for it to go away.
+#
+# WHY THIS MEMORY IS A FILE, NOT A MODULE GLOBAL. It used to be a dict in this module. The
+# only place that records a legitimate retirement -- deactivate_contract() at the end of a
+# run -- executes in the fleet-runner PROCESS, while the gate that must honour it runs in
+# the MCP SERVER process. A module global cannot cross that boundary: the runner set its
+# flag and the server never saw it, so the server suspected forever and every gated op
+# queued a human approval. The same split appeared in tests -- one test setting the flag
+# left it set for the next, which then refused real git operations. Both are the same root:
+# per-process memory for a fact two processes share. The record now lives on disk beside the
+# contract, where any process reading .fleet sees the same answer.
+#
+# Two sidecar files, both under _FLEET_DIR next to active_contract.json:
+#   _SEEN_FILE     -- the identity of the last active contract observed (its `started`
+#                     stamp, or a hash of the contract when `started` is absent).
+#   _RETIRED_FILE  -- the identity of the contract that deactivate_contract() last retired.
+# A vanished contract is legitimate ONLY when a retirement record exists whose identity
+# matches the last-seen contract. A different contract's retirement does not excuse it, so
+# deleting a NEW active contract is still flagged -- the fail-closed default is preserved.
+
+
+def _seen_file() -> Path:
+    return _CONTRACT_FILE.parent / "contract_seen.json"
+
+
+def _retired_file() -> Path:
+    return _CONTRACT_FILE.parent / "contract_retired.json"
+
+
+def _contract_identity(data: dict) -> str:
+    """A stable id for one contract, independent of its mutable `active` flag.
+
+    `started` is the epoch a contract was activated and does not change while it is in
+    force, so it names THIS contract and not the next one. When it is absent, fall back to a
+    hash of the contract with `active` removed, so toggling active=false at retirement does
+    not change the identity. Never derive identity from `active` itself.
+    """
+    started = data.get("started")
+    if started is not None:
+        return "started:%r" % (started,)
+    ident = {k: v for k, v in data.items() if k != "active"}
+    blob = json.dumps(ident, sort_keys=True, ensure_ascii=False)
+    return "hash:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()[:32]
+
+
+def _atomic_write_json(path: Path, obj: dict) -> None:
+    tmp = str(path) + ".tmp"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Path(tmp).write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, str(path))
+
+
+def _read_json_file(path: Path) -> Optional[dict]:
+    try:
+        if not path.is_file():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _record_seen(identity: str) -> None:
+    """Persist that an active contract with this identity was observed.
+
+    Best-effort: a filesystem that will not accept the write leaves the sidecar absent,
+    which reads back as "never saw an active contract" -- the safe direction, because a
+    later absence is then treated as an ordinary no-contract case rather than excused.
+    """
+    try:
+        current = _read_json_file(_seen_file())
+        if current and current.get("identity") == identity:
+            return
+        _atomic_write_json(_seen_file(), {"identity": identity, "at": time.time()})
+    except Exception:
+        pass
 
 
 def contract_state() -> tuple:
@@ -102,7 +175,7 @@ def contract_state() -> tuple:
     if not isinstance(data, dict):
         return ("unreadable", None)
     if data.get("active"):
-        _SEEN["active_contract"] = True
+        _record_seen(_contract_identity(data))
         return ("active", data)
     return ("inactive", data)
 
@@ -110,13 +183,26 @@ def contract_state() -> tuple:
 def policy_state_is_suspect() -> Optional[str]:
     """Reason the policy state cannot be trusted right now, or None.
 
-    Two cases, and only two: the file is present and unreadable, or it is gone after this
-    process had seen an active one and nothing retired it.
+    Two cases, and only two: the file is present and unreadable, or it is gone after some
+    process had seen an active one and no matching retirement was recorded.
+
+    All three inputs are on disk, so this answer is the same in the MCP server process and
+    the fleet-runner process. FAIL CLOSED is preserved: an absence is excused ONLY when a
+    retirement record exists AND names the same contract that was last seen active. If the
+    seen record is missing (write failed, or genuinely never active) an absence is the
+    ordinary no-contract case; if it is present but no matching retirement exists, the
+    absence is tampering and gating stands.
     """
     state, _ = contract_state()
     if state == "unreadable":
         return "the contract file exists and could not be read as a policy object"
-    if state == "absent" and _SEEN["active_contract"] and not _SEEN["retired_via_api"]:
+    if state == "absent":
+        seen = _read_json_file(_seen_file())
+        if not seen or not seen.get("identity"):
+            return None
+        retired = _read_json_file(_retired_file())
+        if retired and retired.get("identity") == seen.get("identity"):
+            return None
         return "an active contract was in force and its file has since disappeared"
     return None
 
@@ -135,19 +221,29 @@ def load_contract() -> Optional[dict]:
 def deactivate_contract() -> None:
     """Set active=false in the contract file (called by fleet_runner on exit).
 
-    Also records that the contract went away legitimately, so its later absence is not read
-    as tampering."""
-    _SEEN["retired_via_api"] = True
+    Also records, ON DISK, that the contract went away legitimately, so its later absence is
+    not read as tampering by ANY process. The record names the specific contract retired
+    (its identity), so it excuses only that contract's disappearance and not a different one
+    that a later worker might delete. Written before the file is flipped/removed so the
+    record is never missing for a contract already gone."""
     try:
-        if not _CONTRACT_FILE.is_file():
-            return
-        data = json.loads(_CONTRACT_FILE.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            return
-        data["active"] = False
-        tmp = str(_CONTRACT_FILE) + ".tmp"
-        Path(tmp).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, str(_CONTRACT_FILE))
+        data = None
+        if _CONTRACT_FILE.is_file():
+            loaded = json.loads(_CONTRACT_FILE.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        if data is None:
+            # Nothing to identify; fall back to whatever we last saw active, so a retirement
+            # issued after the file is already gone still excuses that same contract.
+            seen = _read_json_file(_seen_file())
+            identity = seen.get("identity") if seen else None
+        else:
+            identity = _contract_identity(data)
+        if identity:
+            _atomic_write_json(_retired_file(), {"identity": identity, "at": time.time()})
+        if data is not None:
+            data["active"] = False
+            _atomic_write_json(_CONTRACT_FILE, data)
     except Exception:
         pass
 
