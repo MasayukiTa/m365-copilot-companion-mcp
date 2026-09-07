@@ -981,8 +981,12 @@ function Invoke-Startup {
         Stop-Bridge-Processes
         Start-Sleep -Seconds 2
     }
-    if (Proc-Running 'start_bridge\.ps1') {
-        Write-Host "[3/4] bridge keepalive: already running"
+    # A KEEPALIVE PROCESS IS NOT A SERVING BRIDGE. This branch asked only whether the wrapper
+    # existed, so a wedged python holding :8765 behind a live keepalive reported "already
+    # running" and nothing looked further -- which is how it stayed that way for five and a half
+    # hours. Both, or fall through to the diagnosis below.
+    if ((Proc-Running 'start_bridge\.ps1') -and (Http-Up "http://127.0.0.1:8765/conv")) {
+        Write-Host "[3/4] bridge keepalive: already running and serving"
     } elseif (Http-Up "http://127.0.0.1:8765/conv") {
         Write-Host "[3/4] bridge :8765: already serving (no keepalive supervisor, but up)"
     } else {

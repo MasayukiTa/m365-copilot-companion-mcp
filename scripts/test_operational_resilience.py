@@ -600,3 +600,17 @@ def test_a_held_but_dead_bridge_port_is_named_rather_than_relaunched_into():
     assert "Stop-Process" not in block, "it kills a process this stack did not start"
     # and it counts, so the exit code and quickstart see it
     assert '$script:startupFailures += "bridge: :8765 held by pid' in start_all
+
+
+def test_a_keepalive_process_is_not_a_serving_bridge():
+    """THE ROOT OF THE FIVE-AND-A-HALF-HOUR LOOP. The first branch asked only whether the
+    start_bridge.ps1 wrapper existed, so a wedged python holding :8765 behind a live keepalive
+    reported "already running" and nothing looked further -- the port-owner diagnosis below it
+    was never even reached. Process existence standing in for liveness, which is the same shape
+    as the supervisor check that was green whether or not a supervisor was running."""
+    start_all = (ROOT / "scripts" / "start_all.ps1").read_text(encoding="utf-8")
+
+    assert "(Proc-Running 'start_bridge\.ps1') -and (Http-Up" in start_all
+    assert "already running and serving" in start_all
+    # and the diagnosis below is now reachable when it is running but not serving
+    assert start_all.index("already running and serving") < start_all.index("is HELD by pid")
