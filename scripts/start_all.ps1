@@ -784,6 +784,9 @@ function Invoke-Startup {
             } elseif ($repair -like "failed:*") {
                 Write-Host ("[setup] UNLOCK PASSWORD REPAIR FAILED: " + $repair.Substring("failed:".Length))
                 Write-Host "[setup] mutating tools (write_file, run_python, shell) will be refused until this is fixed."
+                # COUNTED, not only printed. The exit code is the number of startup problems and
+                # nothing was feeding it: this one means every mutating tool is refused.
+                $script:startupFailures += ("unlock password repair failed: " + $repair.Substring("failed:".Length))
             }
         }
     } catch {
@@ -1082,6 +1085,9 @@ function Invoke-Startup {
                         }
                     } catch {
                         Write-Host "[4/4] ${app}: rebuild failed ($_) -- see docs\TROUBLESHOOTING.md ('csc.exe not found' row)"
+                        # COUNTED. A UI that did not build is a startup problem, and the exit
+                        # code exists to carry exactly that.
+                        $script:startupFailures += "${app}: rebuild failed"
                     }
                 } else {
                     Write-Host "[4/4] $app.exe not built yet, and ui\rebuild_ui.ps1 is missing -- see docs\TROUBLESHOOTING.md"

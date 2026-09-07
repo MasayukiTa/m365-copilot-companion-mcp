@@ -675,3 +675,23 @@ def test_the_cdp_checks_read_the_answer_instead_of_discarding_it():
     assert '$v.webSocketDebuggerUrl) -like "ws://*"' in doctor
     code = "\n".join(l for l in doctor.splitlines() if not l.lstrip().startswith("#"))
     assert "json/version' | Out-Null; $true" not in code, "the discarded-answer form is back"
+
+
+def test_the_exit_code_has_something_to_count():
+    """Making $script:startupFailures.Count the exit code was only half a fix: the array was
+    fed by exactly two things -- an exception escaping Invoke-Startup entirely, and the bridge
+    port case added alongside it. Every individual component failure was printed and not
+    counted, so the code the caller now reads was almost always 0 regardless.
+
+    The instrument existing while nothing feeds it is the same shape as everything else found
+    today. These two are failures the code already KNOWS about: an unlock repair that failed
+    means every mutating tool is refused, and a UI that did not build means the windows the
+    setup promises will not open."""
+    start_all = (ROOT / "scripts" / "start_all.ps1").read_text(encoding="utf-8")
+
+    assert "exit $script:startupFailures.Count" in start_all
+    assert '$script:startupFailures += ("unlock password repair failed: ' in start_all
+    assert '$script:startupFailures += "${app}: rebuild failed"' in start_all
+    # each recording sits with the message that already reported it
+    assert start_all.index("UNLOCK PASSWORD REPAIR FAILED") < \
+        start_all.index('$script:startupFailures += ("unlock password repair failed: ')
