@@ -135,11 +135,18 @@ def unlock_password_from_env(environ=None) -> str:
         # STDERR, NEVER STDOUT. This module is imported by processes whose stdout is parsed as
         # data and by the MCP server's stdio transport, where a stray line breaks the protocol.
         try:
+            # THE EXCEPTION OBJECT DOES NOT GO IN. `exc` is raised while handling the
+            # protected value, so its message can carry a fragment of that value -- and this
+            # is the unlock password's own path. The TYPE carries the whole diagnostic
+            # difference that matters here (an OSError is "wrong machine or account", a
+            # binascii/ValueError is "the value is malformed"), so nothing is lost by leaving
+            # the message out. Structural, not conditional: a runtime `if` around a log line
+            # does not remove the flow, it only hides it from the reader.
             _log.warning(
-                "%s is set but this Windows account cannot decrypt it (%s: %s). DPAPI values are "
+                "%s is set but this Windows account cannot decrypt it (%s). DPAPI values are "
                 "bound to one user on one machine, so an .env copied from another PC or account "
                 "cannot be opened here. Re-run the setup on THIS machine to re-protect it.",
-                UNLOCK_PASSWORD_PROTECTED_VAR, type(exc).__name__, exc)
+                UNLOCK_PASSWORD_PROTECTED_VAR, type(exc).__name__)
         except Exception:
             pass
         return ""
