@@ -236,3 +236,49 @@ def test_the_supervisor_refuses_rather_than_looping_on_an_interpreter_that_canno
     assert sup.index("REFUSING TO RUN") < sup.index("$serverMiss -ge $FailuresBeforeAction")
     # and the old unconditional fallback is gone
     assert 'if (-not (Test-Path $Py)) { $Py = "python" }' not in sup
+
+
+def test_the_supervisors_own_startup_output_is_captured_and_read():
+    """d15a834 closed this hole for the server and left it open on the thing that launches it.
+    A supervisor that dies during startup -- Constrained Language Mode refusing New-Object
+    Mutex, AppLocker blocking the script, its own "REFUSING TO RUN: no usable Python" -- wrote
+    its reason into a hidden window that discards it, and doctor then advised double-clicking
+    start_all.bat, which is the operation that just ran.
+
+    Capturing it is half the fix; the reader is the other half. The server's log went unread for
+    a week when only the capture existed."""
+    start_all = (ROOT / "scripts" / "start_all.ps1").read_text(encoding="utf-8")
+    doctor = (ROOT / "scripts" / "doctor.ps1").read_text(encoding="utf-8")
+
+    assert "supervisor.err.log" in start_all, "the supervisor's startup output is discarded"
+    assert "-RedirectStandardError $supErr" in start_all
+    # a log that cannot be opened must not keep the stack down
+    assert start_all.count("Start-Process powershell -WindowStyle Hidden -ArgumentList $supArgs") == 2
+
+    assert "supervisor.err.log" in doctor, "nobody reads it"
+    assert "was started and STOPPED" in doctor, "the two causes are not separated"
+
+
+def test_quickstart_reads_the_exit_codes_those_scripts_go_to_the_trouble_of_returning():
+    """configure_env.ps1 returns 2 (cancelled), 3 (saved but the agent URL is still blank) and
+    4 (the dialog could not run); its own comment calls 3 "A DISTINCT CODE. The caller can tell
+    ... from ...", and the caller was not looking. register-supervisor.ps1 returns 1 when it
+    cannot write the Startup entry -- the whole point of the step the user just agreed to --
+    and that surfaced only at the next logon, as the stack not being there."""
+    qs = (ROOT / "quickstart.bat").read_text(encoding="utf-8")
+    cfg = (ROOT / "scripts" / "configure_env.ps1").read_text(encoding="utf-8")
+    reg = (ROOT / "scripts" / "register-supervisor.ps1").read_text(encoding="utf-8")
+
+    for code in ("exit 2", "exit 3", "exit 4"):
+        assert code in cfg, "configure_env no longer returns %s" % code
+    assert "exit 1" in reg
+
+    after_cfg = qs[qs.index("configure_env.ps1"):]
+    for n in (4, 3, 2):
+        assert "if errorlevel %d" % n in after_cfg, "code %d is still discarded" % n
+    # highest first: `if errorlevel N` means "N or greater", so 2 first would swallow 3 and 4
+    assert (after_cfg.index("if errorlevel 4") < after_cfg.index("if errorlevel 3")
+            < after_cfg.index("if errorlevel 2"))
+
+    after_reg = qs[qs.index("register-supervisor.ps1"):]
+    assert "if errorlevel 1" in after_reg

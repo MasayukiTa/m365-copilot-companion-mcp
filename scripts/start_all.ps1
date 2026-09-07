@@ -1,4 +1,4 @@
-﻿# start_all.ps1 -- idempotent DAILY startup for the whole stack.
+# start_all.ps1 -- idempotent DAILY startup for the whole stack.
 # Called by start_all.bat (double-click). Brings up, in order and ONLY IF NOT ALREADY RUNNING:
 #   1. supervisor.ps1  (MCP server + devtunnel host)   -- mutex-guarded; the live tunnel is NEVER
 #      killed, so re-running while a tunnel/supervisor is already up is a no-op.
@@ -589,7 +589,8 @@ function Ensure-ConvenienceProvisioning {
         if (-not (Test-Path $markerPath)) {
             Write-Host "[provision] no consent on record -- creating nothing."
             Write-Host "[provision] run quickstart.bat to be asked, or scripts\make_desktop_shortcut.ps1"
-            Write-Host "[provision] and scriptsegister-supervisor.ps1 to do either by hand."
+            Write-Host "[provision] and scripts
+egister-supervisor.ps1 to do either by hand."
             return
         }
 
@@ -787,7 +788,20 @@ function Invoke-Startup {
         $supArgs = @("-NoProfile","-ExecutionPolicy","Bypass","-File","$scriptDir\supervisor.ps1")
         if ($tn) { $supArgs += @("-TunnelName", $tn); Write-Host "[1/4] supervisor (MCP server + tunnel '$tn'): starting" }
         else     { Write-Host "[1/4] supervisor (MCP server + tunnel): starting" }
-        Start-Process powershell -WindowStyle Hidden -ArgumentList $supArgs
+        # ITS STARTUP ERROR WAS GOING NOWHERE -- the same hole d15a834 closed for the server,
+        # still open on the thing that launches it. Hidden window, no redirection: when the
+        # supervisor dies on startup (Constrained Language Mode refusing New-Object Mutex,
+        # AppLocker blocking the script, a dot-source that fails, or its own new "REFUSING TO
+        # RUN: no usable Python" exit) the reason is discarded, and doctor then says "double-
+        # click start_all.bat" -- the operation that just ran.
+        $supErr = Join-Path $script:diagDir "supervisor.err.log"
+        try {
+            Start-Process powershell -WindowStyle Hidden -ArgumentList $supArgs -RedirectStandardError $supErr
+        } catch {
+            # Starting it matters more than capturing it: a previous instance holding the file
+            # must not be able to keep the stack down.
+            Start-Process powershell -WindowStyle Hidden -ArgumentList $supArgs
+        }
     }
     function Get-RunningSupervisorProcesses {
         # All Win32_Process entries whose command line launches supervisor.ps1. Normally
