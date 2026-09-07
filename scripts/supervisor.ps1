@@ -416,17 +416,29 @@ Invoke-FleetAutoResume -DryRun:$FleetResumeDryRun | Out-Null
 Invoke-ReviewAutoResume | Out-Null
 
 # THE DEBOUNCE IS FOR A SERVER THAT MIGHT COME BACK, NOT FOR ONE THAT WAS NEVER STARTED.
-# Starting at zero meant the FIRST launch waited for four consecutive failures -- 15s apart, so
-# 45-60 seconds -- before Start-Server was called even once. start_all.ps1 launches only this
-# supervisor (it never runs main.py itself), and quickstart runs doctor immediately after
-# start_all returns, so on every fresh machine the health check ran inside a window where the
-# server did not yet exist BY DESIGN. That is the three red lines: server down, tunnel not
-# serving, Bearer rejected -- all one cause, and none of them a fault.
+# Starting at zero meant the FIRST launch waited out four consecutive failures. MEASURED on
+# this machine: "supervisor up" at 11:44:39, "MCP server process launched" at 11:45:52 -- 73
+# seconds, and the ten runs before it were all 65-75s. start_all.ps1 launches only this
+# supervisor (it never runs main.py itself) and quickstart runs doctor as soon as start_all
+# returns, so on every fresh machine the health check ran inside a window where the server did
+# not yet exist BY DESIGN: server down, tunnel not serving, Bearer rejected -- one cause, and
+# none of them a fault.
 #
-# Pre-loading the counter makes the first failing check act at once. It cannot cause a spurious
-# restart: if a server is already up, the first check passes and resets this to zero before the
-# branch is ever reached.
-$serverMiss = $FailuresBeforeAction - 1
+# THE CONDITION IS "NOTHING IS LISTENING", NOT "THE FIRST CHECK FAILED". Priming the counter
+# instead would let one transient /health timeout fire Start-Server against a server that is
+# perfectly healthy -- and Start-Server kills whatever owns the port (see its first act). When
+# no process owns the port there is nothing to kill and nothing to protect, so launching at
+# once is safe; in every other case the debounce still does its job.
+$serverMiss = 0
+try {
+    $portOwner = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop
+} catch {
+    $portOwner = $null
+}
+if (-not $portOwner) {
+    Write-Log "nothing is listening on :$Port at startup -> launching the server now, without the debounce"
+    Start-Server
+}
 $tunnelMiss = 0
 $loggedIn = $null   # tri-state ($null unknown / $true / $false) -- log only on transition
 

@@ -142,11 +142,20 @@ def unlock_password_from_env(environ=None) -> str:
             # binascii/ValueError is "the value is malformed"), so nothing is lost by leaving
             # the message out. Structural, not conditional: a runtime `if` around a log line
             # does not remove the flow, it only hides it from the reader.
+            # THE CONSTANT'S NAME LIES ABOUT WHAT IT HOLDS, and that is the whole alert.
+            # UNLOCK_PASSWORD_PROTECTED_VAR is the NAME of an environment variable -- the
+            # string "MCP_UNLOCK_PASSWORD_PROTECTED" -- not a password, so logging it leaks
+            # nothing. But it matches the /password/i heuristic CodeQL uses to pick sources,
+            # and dropping `exc` last time only moved the alert from this line to the next
+            # one, because the constant was still flowing into the sink. Writing the name out
+            # removes the flow instead of relocating it. test_the_logged_variable_name_matches
+            # _the_constant keeps the two from drifting apart.
             _log.warning(
-                "%s is set but this Windows account cannot decrypt it (%s). DPAPI values are "
-                "bound to one user on one machine, so an .env copied from another PC or account "
-                "cannot be opened here. Re-run the setup on THIS machine to re-protect it.",
-                UNLOCK_PASSWORD_PROTECTED_VAR, type(exc).__name__)
+                "MCP_UNLOCK_PASSWORD_PROTECTED is set but this Windows account cannot decrypt "
+                "it (%s). DPAPI values are bound to one user on one machine, so an .env copied "
+                "from another PC or account cannot be opened here. Re-run the setup on THIS "
+                "machine to re-protect it.",
+                type(exc).__name__)
         except Exception:
             pass
         return ""

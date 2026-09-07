@@ -69,3 +69,18 @@ def test_the_undecryptable_warning_never_carries_the_value_that_failed(monkeypat
     assert secret not in joined, "the failing value reached the log"
     if joined:
         assert "ValueError" in joined, "the exception TYPE is the diagnostic and must survive"
+
+
+def test_the_logged_variable_name_matches_the_constant():
+    """The warning names MCP_UNLOCK_PASSWORD_PROTECTED as a literal, because passing the
+    constant kept CodeQL's /password/i source heuristic alive -- dropping the exception only
+    moved alert #25 to #26 on the following line. A literal cannot flow, but it also cannot
+    follow a rename, so this pins the two together."""
+    import inspect
+
+    from tools import secret_store as S
+
+    src = inspect.getsource(S.unlock_password_from_env)
+    assert S.UNLOCK_PASSWORD_PROTECTED_VAR == "MCP_UNLOCK_PASSWORD_PROTECTED"
+    assert S.UNLOCK_PASSWORD_PROTECTED_VAR in src, "the message no longer names the variable"
+    assert "UNLOCK_PASSWORD_PROTECTED_VAR, type(exc)" not in src, "the constant flows again"
