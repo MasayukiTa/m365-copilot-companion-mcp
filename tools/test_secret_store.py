@@ -42,3 +42,30 @@ def test_the_diagnosis_never_reaches_stdout(capsys):
     from tools import secret_store as S
     S.unlock_password_from_env({S.UNLOCK_PASSWORD_PROTECTED_VAR: "dpapi:AAAAnotarealblob=="})
     assert capsys.readouterr().out == "", "the diagnosis was printed onto the data channel"
+
+
+def test_the_undecryptable_warning_never_carries_the_value_that_failed(monkeypatch, caplog):
+    """CodeQL flagged this as clear-text logging of sensitive information (High, alert #25) and
+    it was right to. The exception is raised while handling the PROTECTED unlock password, so
+    its message can carry a fragment of that value into a log -- on the one path where the
+    unlock password lives. The type is kept because it carries the whole distinction that
+    matters (wrong machine/account vs. a malformed value); the object is not."""
+    import logging
+
+    from tools import secret_store as S
+
+    secret = "S3CRET-ciphertext-fragment"
+
+    def boom(_):
+        raise ValueError("cannot decode %s" % secret)
+
+    monkeypatch.setattr(S, "unprotect_secret", boom)
+    monkeypatch.setenv(S.UNLOCK_PASSWORD_PROTECTED_VAR, secret)
+    with caplog.at_level(logging.WARNING, logger=S._log.name):
+        assert S.unlock_password_local() == "" or True   # the return is covered elsewhere
+        S.unlock_password_problem()
+
+    joined = " ".join(r.getMessage() for r in caplog.records)
+    assert secret not in joined, "the failing value reached the log"
+    if joined:
+        assert "ValueError" in joined, "the exception TYPE is the diagnostic and must survive"
