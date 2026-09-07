@@ -1,4 +1,4 @@
-﻿// FleetCockpit.cs -- native Windows (WPF) LIVE cockpit for parallel execution.
+// FleetCockpit.cs -- native Windows (WPF) LIVE cockpit for parallel execution.
 //
 // relay/fleet_runner.py drives N autonomous Copilot conversations at once and writes a
 // live snapshot to .fleet/status.json after every round-robin sweep. This window tails
@@ -5982,10 +5982,14 @@ class CockpitWindow : Window
 
     int RetMbStep() { return _retMb >= 1000 ? 500 : 100; }
 
-    //: Coarse near the top, fine near the bottom. The interesting settings are "a bit under the
-    //: published 100" and "quite low because we are being refused", and a flat step of 1 would
-    //: mean holding the button down to reach either.
-    int RateStep() { return _rateCeiling > 100 ? 25 : (_rateCeiling > 20 ? 10 : 5); }
+    //: FIXED, because a step computed from the current value changes under the button as you
+    //: press it, and the two directions disagree at every boundary: from 100 minus gave 90
+    //: (step 10) while from 110 minus gave 85 (step 25), so + followed by - did not return you
+    //: to where you started. The earlier version was coarse near the top so the button need not
+    //: be held down -- a fair concern -- but an increment you cannot predict is worse than a few
+    //: more presses, and 5 still reaches both of the settings that matter (a bit under the
+    //: published 100, and low because we are being refused) quickly.
+    const int RATE_STEP = 5;
 
     void SetRateCeiling(int v)
     {
@@ -6088,8 +6092,8 @@ class CockpitWindow : Window
 
         // -- Rate ceiling: the line admission holds at, and the strip's denominator --
         col.Children.Add(SectionHeader(T("set_rate_section")));
-        var rcMinus = MiniButton("−"); rcMinus.Click += delegate { SetRateCeiling(_rateCeiling - RateStep()); };
-        var rcPlus = MiniButton("+"); rcPlus.Click += delegate { SetRateCeiling(_rateCeiling + RateStep()); };
+        var rcMinus = MiniButton("−"); rcMinus.Click += delegate { SetRateCeiling(_rateCeiling - RATE_STEP); };
+        var rcPlus = MiniButton("+"); rcPlus.Click += delegate { SetRateCeiling(_rateCeiling + RATE_STEP); };
         _rateCeilingValue = new TextBlock();
         _rateCeilingValue.Text = _rateCeiling == 0 ? T("ret_keep") : _rateCeiling.ToString();
         col.Children.Add(SettingsStepperRow(T("rate_rpm"), _rateCeilingValue, rcMinus, rcPlus));
