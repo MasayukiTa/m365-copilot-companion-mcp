@@ -1038,6 +1038,16 @@ STEPS = [
 ]
 
 
+#: Never skipped, whatever the checkpoint says. `verify` is a CHECK -- it imports main.py in a
+#: subprocess and counts the tools -- and a check that is skipped has stopped being one. Its
+#: flag can also arrive from another machine inside a copied .setup/state.json.
+ALWAYS_REVALIDATE = ("verify",)
+
+#: Cleared when a revalidating step fails, so the next run rebuilds rather than skipping back to
+#: the same failure. These are the steps that produce what `verify` verifies.
+REPAIRED_BY_RERUN = ("ensure_venv", "install_deps")
+
+
 def run_all(steps=STEPS, state=None, state_file=STATE_FILE) -> int:
     """Resumable driver. Returns a process exit code.
 
@@ -1074,7 +1084,12 @@ def run_all(steps=STEPS, state=None, state_file=STATE_FILE) -> int:
             % (done_count, total, next_pending))
 
     for name, fn in steps:
-        if is_done(state, name):
+        # A CHECK THAT IS SKIPPED IS NOT A CHECK. `verify` imports main.py and counts the tools,
+        # so it is the step that catches an empty or broken venv -- and it was being skipped on
+        # a flag that can arrive from another machine in a copied .setup/state.json, while
+        # setup.bat has meanwhile created a fresh EMPTY venv with uv (so the "is .venv missing"
+        # guard above never fires on that path). It is cheap next to what it protects.
+        if is_done(state, name) and name not in ALWAYS_REVALIDATE:
             log("--- %-14s already done (skipping)" % name)
             continue
         try:
@@ -1087,6 +1102,14 @@ def run_all(steps=STEPS, state=None, state_file=STATE_FILE) -> int:
             log("(Progress saved. Completed steps will be skipped on the next run.)")
             return 2
         except StepError as e:
+            # RE-RUNNING MUST REPAIR, NOT RETRY THE SAME SKIP. When verification fails, the steps
+            # that were supposed to produce what it verifies are no longer trustworthy -- whatever
+            # their flags say -- so they are cleared. Otherwise the advice below sends the reader
+            # back into a run that skips straight to the same failure.
+            if name in ALWAYS_REVALIDATE:
+                for stale in REPAIRED_BY_RERUN:
+                    if state.get("done", {}).pop(stale, None):
+                        log("    (cleared '%s' so the next run rebuilds it)" % stale)
             save_state(state, state_file)
             log("")
             log("FAILED at step '%s': %s" % (name, str(e)))

@@ -556,40 +556,59 @@ function Mcp-Status([hashtable]$headers) {
 # Windows account on one machine, so an .env carried from another PC holds a blob this account
 # cannot open. The server starts, the Bearer check passes, doctor reports ALL GREEN -- and every
 # write, run_python and shell call is refused, because there is nothing to compare against.
-# env_portability.problems() was written to report this and had no caller outside its own tests.
 #
-# BOUNDED. doctor must not hang because Python did: the process is given 15 seconds and killed.
-function Invoke-BoundedPython([string]$py, [string]$code, [int]$timeoutSec = 15) {
+# THE LOGIC IS A FILE, NOT A `-c` PAYLOAD. Passed as @("-c", $code), Start-Process does not quote
+# the element and python received only the first word -- a SyntaxError, read as "could not ask",
+# converted to PASS. The first version of this check could only ever be green.
+#
+# BOUNDED, and every argument quoted: doctor must not hang because python did, and a path with a
+# space must not become two arguments.
+function Invoke-BoundedPythonFile([string]$py, [string]$script, [string[]]$scriptArgs, [int]$timeoutSec = 15) {
     $out = [System.IO.Path]::GetTempFileName()
+    $err = $out + ".err"
     try {
-        $p = Start-Process -FilePath $py -ArgumentList @("-c", $code) -NoNewWindow -PassThru `
-                           -RedirectStandardOutput $out -RedirectStandardError ($out + ".err")
+        $argList = @(('"{0}"' -f $script))
+        foreach ($a in $scriptArgs) { $argList += ('"{0}"' -f $a) }
+        $p = Start-Process -FilePath $py -ArgumentList $argList -NoNewWindow -PassThru `
+                           -RedirectStandardOutput $out -RedirectStandardError $err
         if (-not $p.WaitForExit($timeoutSec * 1000)) {
             try { $p.Kill() } catch { }
             return $null
         }
-        if ($p.ExitCode -ne 0) { return $null }
-        return (Get-Content $out -Raw -ErrorAction SilentlyContinue)
+        $text = (Get-Content $out -Raw -ErrorAction SilentlyContinue)
+        if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+        return $text.Trim()
     } catch {
         return $null
     } finally {
-        Remove-Item $out, ($out + ".err") -Force -ErrorAction SilentlyContinue
+        Remove-Item $out, $err -Force -ErrorAction SilentlyContinue
     }
 }
+$script:unlockVerdict = "unknown"
 $script:unlockFix = ("MCP_UNLOCK_PASSWORD_PROTECTED was written by a different Windows account " +
                      "or PC and cannot be decrypted here, so every mutating tool will be " +
                      "refused while everything else looks fine. start_all.bat re-establishes it " +
                      "automatically -- run it once, then re-run this check.")
-Check "unlock_password_usable" "Unlock password readable by THIS Windows account" `
+# COULD-NOT-ASK IS INDETERMINATE, NOT A PASS. Check-TriState exists for this: $null is neither a
+# security PASS nor a repairable FAIL, and it keeps the run from reporting completion on it.
+Check-TriState "unlock_password_usable" "Unlock password readable by THIS Windows account" `
     {
         $py = Join-Path $repo ".venv\Scripts\python.exe"
-        if (-not (Test-Path $py)) { return $true }   # no venv: python_runnable already said so
-        $code = ("import sys, json; sys.path.insert(0, r'" + $repo + "'); " +
-                 "from dotenv import dotenv_values; from tools.env_portability import problems; " +
-                 "print(len(problems(dict(dotenv_values(r'" + $envPath + "')))))")
-        $n = Invoke-BoundedPython $py $code
-        if ($null -eq $n) { return $true }           # could not ask; not evidence of a fault
-        ([string]$n).Trim() -eq "0"
+        if (-not (Test-Path $py)) { return $null }      # python_runnable already reported that
+        $checker = Join-Path $scriptDir "check_unlock_usable.py"
+        if (-not (Test-Path $checker)) { return $null }
+        $v = Invoke-BoundedPythonFile $py $checker @($envPath)
+        if ($null -eq $v) { return $null }
+        $script:unlockVerdict = $v
+        if ($v -eq "ok") { return $true }
+        if ($v -eq "unset") {
+            $script:unlockFix = ("no unlock password is configured at all, so every mutating " +
+                                 "tool (write_file, run_python, shell) will be refused. Re-run " +
+                                 "setup.bat, which generates one.")
+            return $false
+        }
+        if ($v -like "error:*") { return $null }
+        return $false
     } `
     $script:unlockFix
 

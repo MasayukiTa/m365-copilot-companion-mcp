@@ -94,8 +94,9 @@ class StateMachineTests(unittest.TestCase):
         self.assertEqual(rec.calls, ["ensure_venv", "install_deps", "verify"],
                          "the venv-dependent steps did not re-run")
 
-    def test_an_existing_venv_leaves_every_checkpoint_alone(self):
-        """The clearing must be caused by the venv being absent, not by running at all."""
+    def test_an_existing_venv_leaves_the_build_checkpoints_alone(self):
+        """The clearing must be caused by the venv being absent, not by running at all. `verify`
+        is exempt: it is a CHECK and always runs (see the test below)."""
         state = {"done": {n: True for n in ("ensure_venv", "install_deps", "verify")}}
         bootstrap.save_state(state, self.state_file)
 
@@ -106,7 +107,49 @@ class StateMachineTests(unittest.TestCase):
             rc = bootstrap.run_all(steps=rec.steps, state_file=self.state_file)
 
         self.assertEqual(rc, 0)
-        self.assertEqual(rec.calls, [], "steps re-ran even though the venv was there")
+        self.assertEqual(rec.calls, ["verify"],
+                         "a build step re-ran, or the check did not")
+
+    # 1c. A check that is skipped is not a check --------------------------------
+    def test_verify_always_runs_even_when_the_checkpoint_says_it_is_done(self):
+        """The .venv-missing guard does not fire on the path that actually happens: setup.bat
+        creates the venv with uv BEFORE bootstrap runs, so a machine carrying a copied
+        state.json arrives with a fresh EMPTY venv and flags saying the dependencies are
+        installed. step_verify imports main.py in a subprocess and counts the tools, so it is
+        exactly the step that catches that -- and it was the one being skipped."""
+        state = {"done": {n: True for n in ("ensure_venv", "install_deps", "verify")}}
+        bootstrap.save_state(state, self.state_file)
+
+        present = Path(self.tmp.name) / "python.exe"
+        present.write_text("", encoding="utf-8")
+        with mock.patch.object(bootstrap, "VENV_PYTHON", present):
+            rec = RecordingSteps(["ensure_venv", "install_deps", "verify"])
+            bootstrap.run_all(steps=rec.steps, state_file=self.state_file)
+
+        self.assertIn("verify", rec.calls)
+        self.assertEqual(bootstrap.ALWAYS_REVALIDATE, ("verify",))
+
+    def test_a_failed_verify_clears_what_the_next_run_has_to_rebuild(self):
+        """Otherwise "re-run to retry this step" retries only verify, forever: the steps that
+        produce what it verifies stay marked done and are skipped straight back to the same
+        failure."""
+        state = {"done": {n: True for n in ("ensure_venv", "install_deps", "verify")}}
+        bootstrap.save_state(state, self.state_file)
+
+        present = Path(self.tmp.name) / "python.exe"
+        present.write_text("", encoding="utf-8")
+        with mock.patch.object(bootstrap, "VENV_PYTHON", present):
+            rec = RecordingSteps(
+                ["ensure_venv", "install_deps", "verify"],
+                raisers={"verify": bootstrap.StepError("no module named fastmcp")},
+            )
+            rc = bootstrap.run_all(steps=rec.steps, state_file=self.state_file)
+
+        self.assertEqual(rc, 1)
+        after = bootstrap.load_state(self.state_file)
+        self.assertFalse(bootstrap.is_done(after, "install_deps"),
+                         "install_deps still marked done after verification failed")
+        self.assertFalse(bootstrap.is_done(after, "ensure_venv"))
 
     # 2. ActionNeeded pause then resume --------------------------------------
     def test_action_needed_pauses_and_resume_skips_completed(self):
