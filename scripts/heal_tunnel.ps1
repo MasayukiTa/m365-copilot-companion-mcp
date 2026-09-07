@@ -57,6 +57,15 @@ $envPath = Join-Path $root ".env"
 # -----------------------------------------------------------------------------
 $DevTunnel = "devtunnel"
 $wingetDt = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links\devtunnel.exe"
+# AND THE DIRECT DOWNLOAD. setup_devtunnel.ps1 falls back to
+# %LOCALAPPDATA%\devtunnel\devtunnel.exe when winget is unavailable and appends that
+# directory to the USER PATH -- which the already-running cmd session that launched this
+# script cannot see. Looking only at the winget path and PATH means the CLI is installed
+# and unfindable, on precisely the locked-down machines that needed the fallback.
+if (-not (Test-Path $wingetDt)) {
+    $directDt = Join-Path $env:LOCALAPPDATA "devtunnel\devtunnel.exe"
+    if (Test-Path $directDt) { $wingetDt = $directDt }
+}
 if (Test-Path $wingetDt) { $DevTunnel = $wingetDt }
 
 # Bounded devtunnel invocation -- Start-Job + poll-with-deadline (same pattern as
