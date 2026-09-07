@@ -775,7 +775,83 @@ def autostart_fleet(goals, state_dir=None, now=None, launcher=None) -> dict:
     # failure that reads as "it was never sent".
     _write_autostart(sd, {"started_at": now, "pid": pid, "outcome": "launched",
                           "goals": goals, "goals_file": goals_file})
-    return {"ok": True, "pid": pid, "goals": len(goals), "goals_file": goals_file}
+    cockpit = ensure_cockpit()
+    return {"ok": True, "pid": pid, "goals": len(goals), "goals_file": goals_file,
+            "cockpit": cockpit}
+
+
+#: The built cockpit. A module constant rather than a path computed inside the function, so a
+#: test can point it at a file that is not there -- "never built" is a normal state on a host
+#: that only serves, and it must not turn a working fleet launch into a failure.
+COCKPIT_EXE = os.path.join(REPO, "ui", "FleetCockpit.exe")
+
+#: argv words that mean this FleetCockpit process is one of the OTHER windows the same
+#: executable serves. Matching the image name alone would read the approval prompt or the
+#: authority dashboard as "the cockpit is up" and leave the fleet unwatched -- the mistake
+#: tools/notify_ops.cockpit_running documents from the opposite direction.
+_COCKPIT_OTHER_WINDOWS = ("--approval-gate", "--authority")
+
+
+def cockpit_is_up() -> bool:
+    """True iff the ORDINARY cockpit window is already running. Never raises.
+
+    A process whose cmdline cannot be read is counted as the cockpit: one unwatched fleet is a
+    smaller harm than a second window, because the ordinary cockpit takes NO mutex (unlike the
+    other two windows) and a duplicate really does appear.
+    """
+    try:
+        import psutil
+    except Exception:
+        return True          # cannot tell -> do not launch
+    want = os.path.basename(COCKPIT_EXE).lower()
+    try:
+        for proc in psutil.process_iter(["name", "cmdline"]):
+            if (proc.info.get("name") or "").lower() != want:
+                continue
+            argv = proc.info.get("cmdline") or []
+            if any(str(a).lower() in _COCKPIT_OTHER_WINDOWS for a in argv[1:]):
+                continue     # a different window of the same exe
+            return True
+    except Exception:
+        return True
+    return False
+
+
+def ensure_cockpit() -> str:
+    """Put the cockpit on screen for a fleet that autostart brought up. Returns what happened.
+
+    A FLEET STARTED FROM A PHONE HAS NOBODY WATCHING IT. start_all.ps1 opens the cockpit
+    alongside everything else, so a fleet the operator starts at the desk is visible. Autostart
+    is the other door: a goal arrives over the tunnel, a run begins, and the only thing on the
+    desktop is the runner's console. Measured on 2026-09-07 -- a natural-language goal reached
+    the fleet and completed in 2m10s with FleetCockpit.exe built but not running, so the fleet
+    ran entirely unobserved and the console was the only surface.
+
+    Bounded, because the ordinary cockpit takes NO mutex: unlike --approval-gate and --authority
+    a second launch really does open a second window, and an unbounded launcher once opened
+    forty-two of them and took the machine down (see tools/notify_ops). So this checks first and
+    launches at most one.
+
+    Best effort throughout. A missing build, no psutil, a refused spawn: none of them may turn a
+    fleet that IS running into a reported failure, so every path returns a string and none raise.
+    """
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return "skipped (test run)"
+    if os.name != "nt":
+        return "skipped (not windows)"
+    if not os.path.isfile(COCKPIT_EXE):
+        return "unavailable (FleetCockpit.exe not built)"
+    if cockpit_is_up():
+        return "already running"
+    try:
+        subprocess.Popen(
+            [COCKPIT_EXE], cwd=REPO,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return "launched"
+    except Exception as exc:
+        return "launch failed: %s: %s" % (type(exc).__name__, exc)
 
 
 #: How far BEFORE a launch a run's own start stamp may sit and still be counted as that
