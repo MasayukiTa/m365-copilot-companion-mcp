@@ -596,19 +596,84 @@ def write_command(state_dir, patch: dict) -> str:
             time.sleep(0.02)
 
 
+#: A goal handed to a live fleet carries an ack nonce. The fleet stamps <state_dir>/acked/
+#: <ack>.json the instant it consumes the command, and the sender waits for that stamp before
+#: it dares call the goal delivered. This exists because the ONLY prior evidence of delivery
+#: was the sender's own "dispatched" record -- which is written whether or not anything read
+#: the command -- so a run that ended in the up-to-30s window fleet_is_live cannot see took the
+#: goal down with it and left "delivered" behind. The receiver's stamp is the first proof that
+#: is on the reader's side of the handoff.
+ACKED_DIR = "acked"
+
+
+def _ack_dir(state_dir=None) -> str:
+    return os.path.join(state_dir or FLEET_STATE_DIR, ACKED_DIR)
+
+
+def _new_ack() -> str:
+    return uuid.uuid4().hex
+
+
+def ack_seen(ack: str, state_dir=None) -> bool:
+    """Whether the fleet has stamped this ack -- i.e. actually consumed the command.
+
+    A missing file is a firm "not yet", not an error: the stamp appears only when read_commands
+    on the fleet side removes the command it came in on, so its absence is exactly the state
+    this check is here to report.
+    """
+    if not ack:
+        return False
+    try:
+        return os.path.isfile(os.path.join(_ack_dir(state_dir), "%s.json" % ack))
+    except OSError:
+        return False
+
+
+#: How long fleet_handoff waits for the receiver's stamp before it stops claiming delivery and
+#: parks the goal as waiting instead. Short by default -- a live fleet drains commands every
+#: few seconds -- and env-tunable so a test can drop it to near zero rather than sleep. The
+#: failure it guards against is the reverse of the old one: better to under-claim and re-park a
+#: goal the fleet did in fact take than to over-claim one it never saw.
+FLEET_ACK_WAIT_S = float(os.environ.get("FLEET_ACK_WAIT_S", "8") or 8)
+
+
+def _wait_for_ack(ack: str, state_dir=None, timeout_s=None) -> bool:
+    """Poll for the receiver's ack stamp up to timeout_s. Returns True once seen.
+
+    Polling, not a watch, because the writer is another process (or the C# cockpit) and there
+    is no shared primitive to wait on. The interval is small and the ceiling low, so the caller
+    blocks briefly at most.
+    """
+    deadline = time.time() + (FLEET_ACK_WAIT_S if timeout_s is None else timeout_s)
+    while True:
+        if ack_seen(ack, state_dir):
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
 def add_goal_to_live_fleet(goal: str, state_dir=None, priority: bool = False,
-                           entry: dict = None) -> None:
-    """Append a goal to the running fleet's command channel.
+                           entry: dict = None) -> str:
+    """Append a goal to the running fleet's command channel. Returns the ack nonce written.
 
     utf-8 with no BOM on the way out and utf-8-sig on the way in, matching code_task.py: the
     fleet reads both, and writing what the other writer writes is how the two stay compatible.
 
     `entry` lets a caller supply the whole command dict -- code_task adds `cwd` and `checks` --
     so it can share this path instead of keeping its own copy of it.
+
+    The returned ack nonce is stamped by the fleet when it consumes the command; callers that
+    need proof of delivery wait on ack_seen()/`_wait_for_ack`. An `entry` without its own `ack`
+    gets one so this path always yields a nonce a caller can wait on; an entry that already
+    carries one is left as the caller set it.
     """
     sd = state_dir or FLEET_STATE_DIR
     item = dict(entry) if entry else {"text": goal, "priority": bool(priority)}
+    ack = item.get("ack") or _new_ack()
+    item["ack"] = ack
     write_command(sd, {"add_goal": [item]})
+    return ack
 
 
 #: Where an autostart attempt is recorded, beside the run's own state. Kept so the NEXT pass
@@ -983,14 +1048,45 @@ def recover_failed_autostart(state_dir=None, now=None) -> list:
     return restored
 
 
+def _park_in_for_fleet(goal, jid):
+    """Write the goal into for_fleet/<jid>.txt so a waiting goal is visible on disk, not just
+    named in a status string. Returns the handoff path label either way. Best-effort: a goal
+    the queue cannot see is the very failure this module exists to prevent, but if the write
+    itself fails the caller still reports "waiting" rather than a false "delivered"."""
+    ensure_dirs()
+    try:
+        with open(_p("for_fleet", "%s.txt" % jid), "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(goal)
+    except OSError:
+        pass
+    return "for_fleet/%s.txt" % jid
+
+
 def fleet_handoff(goal: str, jid: str, state_dir=None):
     """Deliver a fleet-bound goal. Returns the (status, result) the job record should carry."""
     if not (goal or "").strip():
         return "error", {"handoff": "for_fleet/%s.txt" % jid, "detail": "empty goal"}
     if fleet_is_live(state_dir):
-        add_goal_to_live_fleet(goal, state_dir)
-        return "dispatched", {"handoff": "for_fleet/%s.txt" % jid,
-                              "delivered": "add_goal", "note": "queued into the running fleet"}
+        # PARK FIRST, CLAIM SECOND. The goal is written to for_fleet/ before the command goes
+        # out, so if this process dies mid-handoff -- or the fleet ends in the up-to-30s window
+        # fleet_is_live cannot see -- the goal is on disk as waiting, not merely named in a
+        # "dispatched" record nobody re-reads. It is removed only once the fleet stamps its ack.
+        _park_in_for_fleet(goal, jid)
+        ack = add_goal_to_live_fleet(goal, state_dir)
+        if _wait_for_ack(ack, state_dir):
+            try:
+                os.remove(_p("for_fleet", "%s.txt" % jid))
+            except OSError:
+                pass
+            return "dispatched", {"handoff": "for_fleet/%s.txt" % jid,
+                                  "delivered": "add_goal", "ack": ack,
+                                  "note": "consumed by the running fleet (ack stamped)"}
+        # SENT BUT UNCONFIRMED. The command was written and the fleet looked live, but no ack
+        # arrived in time -- exactly the run-ended-in-the-window case. Leave the goal parked in
+        # for_fleet/ and say awaiting, rather than claim a delivery that may have vanished.
+        return "awaiting_fleet", {"handoff": "for_fleet/%s.txt" % jid, "ack": ack,
+                                  "note": "handed to a live fleet but no ack within "
+                                          "%ss; parked as waiting" % FLEET_ACK_WAIT_S}
     if AUTOSTART:
         may, why = autostart_status(state_dir)
         if may:
@@ -1000,14 +1096,14 @@ def fleet_handoff(goal: str, jid: str, state_dir=None):
                                       "delivered": "autostart",
                                       "note": "started a fleet for this goal (pid %s)"
                                               % out.get("pid")}
-            return "awaiting_fleet", {"handoff": "for_fleet/%s.txt" % jid,
+            return "awaiting_fleet", {"handoff": _park_in_for_fleet(goal, jid),
                                       "note": "autostart could not start a fleet: %s"
                                               % out.get("detail")}
-        return "awaiting_fleet", {"handoff": "for_fleet/%s.txt" % jid, "note": why}
+        return "awaiting_fleet", {"handoff": _park_in_for_fleet(goal, jid), "note": why}
     # SAYS IT IS WAITING, rather than "dispatched". The old wording claimed delivery for a
     # file nobody read, and a status that overstates what happened is how a queue goes
     # unnoticed for months.
-    return "awaiting_fleet", {"handoff": "for_fleet/%s.txt" % jid,
+    return "awaiting_fleet", {"handoff": _park_in_for_fleet(goal, jid),
                               "note": "no fleet run is in flight; the goal waits for one"}
 
 

@@ -1296,6 +1296,50 @@ def _watchdog_should_reset(status, stalled_s, now=None):
 
 COMMANDS_DIR = "commands.d"
 
+#: The receiver's proof of delivery. When a command carrying add_goal items is consumed, the
+#: fleet writes <state_dir>/acked/<ack>.json for each item that has an `ack`. The sender
+#: (task_router.fleet_handoff) waits for this stamp before it records the goal as delivered;
+#: without it, delivery was only ever attested by the sender's own record, which is written
+#: whether or not anything read the command. The stamp is placed just before the command file
+#: is removed, so it appears exactly when the goal has really been taken in -- never earlier.
+ACKED_DIR = "acked"
+
+
+def _stamp_acks(cmd, state_dir) -> None:
+    """Stamp acked/<ack>.json for every add_goal item in `cmd` that carries an ack nonce.
+
+    Best-effort and never raises: a fleet that cannot write the stamp still consumed the goal,
+    and the sender's fallback is to re-park a goal as waiting, which is the safe direction. An
+    item without an ack (an older sender, or the C# cockpit) is simply not stamped -- those
+    callers do not wait on one.
+    """
+    try:
+        items = cmd.get("add_goal") if isinstance(cmd, dict) else None
+    except AttributeError:
+        return
+    if not items:
+        return
+    d = os.path.join(state_dir, ACKED_DIR)
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        return
+    for item in items:
+        ack = item.get("ack") if isinstance(item, dict) else None
+        if not ack:
+            continue
+        path = os.path.join(d, "%s.json" % ack)
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8", newline="") as fh:
+                json.dump({"ack": ack, "ts": time.time()}, fh, ensure_ascii=False)
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
 
 def read_commands(state_dir) -> list:
     """Every pending command for this run, oldest first, CONSUMED as it is read.
@@ -1323,7 +1367,9 @@ def read_commands(state_dir) -> list:
     try:
         if os.path.isfile(legacy):
             with open(legacy, encoding="utf-8-sig") as fh:   # tolerate a BOM from the C# cockpit
-                out.append(json.load(fh))
+                cmd = json.load(fh)
+            out.append(cmd)
+            _stamp_acks(cmd, state_dir)
             os.remove(legacy)
     except Exception:
         try:
@@ -1339,13 +1385,15 @@ def read_commands(state_dir) -> list:
         path = os.path.join(d, name)
         try:
             with open(path, encoding="utf-8-sig") as fh:
-                out.append(json.load(fh))
+                cmd = json.load(fh)
+            out.append(cmd)
         except Exception:
             try:
                 os.replace(path, path + ".bad")
             except OSError:
                 pass
             continue
+        _stamp_acks(cmd, state_dir)
         try:
             os.remove(path)
         except OSError:
