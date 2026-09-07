@@ -441,6 +441,8 @@ jobs:
             tools/test_pip_install_target.py \
             tools/test_policy_state_fails_closed.py \
             tools/test_procedural_memory_japanese.py \
+            tools/test_env_portability.py \
+            tools/test_secret_store.py \
             tools/test_secrets_are_not_readable.py \
             tools/test_setup_tls.py \
             tools/test_shell_timeout_tree.py \

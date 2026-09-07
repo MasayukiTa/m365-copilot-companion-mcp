@@ -114,6 +114,83 @@ def merge_for_new_machine(old_text: str, current_text: str = "") -> dict:
             "kept_local": kept_local, "added_defaults": added}
 
 
+def repair_unlock_password(env_path: str, environ=None) -> dict:
+    """Re-establish an unusable unlock password on THIS machine. Returns what was done.
+
+    FIX THE CAUSE, NOT THE MESSAGE. The first version of this work improved the sentence
+    unlock() prints when the password cannot be read. That was the wrong layer: a clearer
+    description of a broken install is still a broken install, and it puts a person in the loop
+    for something no person chose. The password is not a human secret -- setup.ps1 generates it
+    with RNGCryptoServiceProvider and prints it once -- so when the stored one cannot be opened
+    here, the machine can simply establish a new one and carry on.
+
+    Why the install cannot recover on its own today: setup.ps1 writes .env only when there is
+    none ("already exists (left untouched)"), and a .env copied from another PC exists. So the
+    undecryptable value survives every subsequent setup run, forever.
+
+    Narrow on purpose. It acts ONLY when there is no usable password AND the protected value is
+    present and undecryptable. A missing password is first-time setup's job; a working one is
+    never touched; and the old .env is copied aside before anything is written, because this
+    edits the file that holds every other secret on the machine.
+    """
+    from tools.secret_store import (PROBLEM_UNDECRYPTABLE, UNLOCK_PASSWORD_PROTECTED_VAR,
+                                    UNLOCK_PASSWORD_VAR, protect_secret,
+                                    unlock_password_from_env, unlock_password_problem)
+
+    env = dict(os.environ if environ is None else environ)
+    if unlock_password_from_env(env):
+        return {"acted": False, "reason": "the unlock password is readable"}
+    if unlock_password_problem() != PROBLEM_UNDECRYPTABLE:
+        return {"acted": False, "reason": "no password is configured; that is setup's job"}
+
+    import binascii
+    import os as _os
+    import shutil
+
+    fresh = binascii.hexlify(_os.urandom(8)).decode("ascii")   # same shape setup.ps1 generates
+    try:
+        protected = protect_secret(fresh)
+    except Exception as exc:
+        return {"acted": False, "reason": "cannot protect a new value here: %s" % exc}
+
+    try:
+        with open(env_path, "r", encoding="utf-8-sig") as fh:
+            text = fh.read()
+    except Exception as exc:
+        return {"acted": False, "reason": "cannot read %s: %s" % (env_path, exc)}
+
+    try:
+        shutil.copyfile(env_path, env_path + ".before-unlock-repair")
+    except Exception as exc:
+        return {"acted": False, "reason": "refusing to edit without a backup: %s" % exc}
+
+    out, replaced = [], False
+    for line in text.splitlines():
+        key = line.split("=", 1)[0].strip() if "=" in line else ""
+        if key == UNLOCK_PASSWORD_PROTECTED_VAR:
+            out.append("%s=%s" % (UNLOCK_PASSWORD_PROTECTED_VAR, protected))
+            replaced = True
+        elif key == UNLOCK_PASSWORD_VAR:
+            continue                     # a stale plain value would silently win over the new one
+        else:
+            out.append(line)
+    if not replaced:
+        out.append("%s=%s" % (UNLOCK_PASSWORD_PROTECTED_VAR, protected))
+
+    # No BOM: this file is read by python-dotenv, by PowerShell and by the setup scripts, and a
+    # BOM has broken the first key in it before.
+    with open(env_path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("\n".join(out) + "\n")
+
+    env[UNLOCK_PASSWORD_PROTECTED_VAR] = protected
+    env.pop(UNLOCK_PASSWORD_VAR, None)
+    if environ is None:
+        os.environ[UNLOCK_PASSWORD_PROTECTED_VAR] = protected
+        os.environ.pop(UNLOCK_PASSWORD_VAR, None)
+    return {"acted": True, "reason": "re-established the unlock password for this machine",
+            "backup": env_path + ".before-unlock-repair"}
+
+
 def problems(environ=None) -> list:
     """Configuration faults that a health check would otherwise miss. [] when there are none.
 
