@@ -28,6 +28,7 @@ from tools.coding_ops import (
 )
 from tools.auto_ops import (edit_and_verify, loop_trajectory, loop_until_verified,
                             restore_point, roll_back)
+from tools.recurrent_ops import recurrent_begin, recurrent_state, recurrent_step
 from tools.data_ops import read_excel, read_json, summarize_table, write_excel, write_json
 from tools.diagram_ops import render_diagram, render_mermaid_png
 from tools.env_ops import env_info, pip_install, which
@@ -336,6 +337,10 @@ TOOLS = (
     # one file and nothing sat above it, so a failing test left a tree half-edited across a
     # boundary no tool could see.
     edit_and_verify, loop_trajectory, loop_until_verified, restore_point, roll_back,
+    # the same loop with control inverted, so the agent's turn is the block: each
+    # round is generated after the previous one's verdict, and depth follows from
+    # the exit rules rather than from a list of rounds written in advance.
+    recurrent_begin, recurrent_state, recurrent_step,
     # git (read)
     git_status, git_diff, git_log, git_branch, git_blame,
     # git (write)

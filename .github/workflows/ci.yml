@@ -428,6 +428,7 @@ jobs:
             tools/auto/test_autoloop.py \
             tools/auto/test_loop_runner.py \
             tools/test_auto_ops.py \
+            tools/test_recurrent_ops.py \
             tools/test_batch_syntax.py \
             tools/test_command_judge.py \
             tools/test_command_net_adversarial.py \
