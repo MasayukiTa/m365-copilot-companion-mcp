@@ -512,5 +512,99 @@ class LoadDotenvOverrideTests(unittest.TestCase):
             self.assertEqual(bootstrap.os.environ["MCP_TEST_KEY"], "from_dotenv")
 
 
+class GenEnvBackfillsMissingSecretsTests(unittest.TestCase):
+    """An existing .env that has LOST its required secrets must be repaired by gen_env, not
+    left for step_verify to fail on forever. gen_env stays append-only: a secret that is
+    already present (even blank/placeholder) is the user's value and is never overwritten."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self._orig_root = bootstrap.ROOT
+        bootstrap.ROOT = self.root
+
+    def tearDown(self):
+        bootstrap.ROOT = self._orig_root
+        self.tmp.cleanup()
+
+    def test_missing_api_key_and_unlock_are_generated(self):
+        env = self.root / ".env"
+        env.write_text("SOME_OTHER=1\n", encoding="utf-8")
+        bootstrap.step_gen_env()
+        text = env.read_text(encoding="utf-8-sig")
+        # Both secrets now present and non-placeholder.
+        api = bootstrap._read_env_value("MCP_API_KEY")
+        self.assertTrue(api and not api.startswith("replace"),
+                        "MCP_API_KEY was not generated into an existing .env")
+        prot = bootstrap._read_env_value(bootstrap.UNLOCK_PASSWORD_PROTECTED_VAR)
+        self.assertTrue(prot, "protected unlock password was not generated")
+        # The pre-existing line is preserved.
+        self.assertIn("SOME_OTHER=1", text)
+
+    def test_existing_secrets_are_not_overwritten(self):
+        env = self.root / ".env"
+        env.write_text(
+            "MCP_API_KEY=keepme\n"
+            "MCP_UNLOCK_PASSWORD=keepme_too\n",
+            encoding="utf-8",
+        )
+        bootstrap.step_gen_env()
+        text = env.read_text(encoding="utf-8-sig")
+        # The user's values survive verbatim, and no duplicate key is appended.
+        self.assertEqual(bootstrap._read_env_value("MCP_API_KEY"), "keepme")
+        self.assertEqual(bootstrap._read_env_value("MCP_UNLOCK_PASSWORD"), "keepme_too")
+        self.assertEqual(text.count("MCP_API_KEY="), 1)
+        self.assertEqual(text.count("MCP_UNLOCK_PASSWORD="), 1)
+        # The protected form must NOT be added when a plain unlock password already exists.
+        self.assertNotIn(bootstrap.UNLOCK_PASSWORD_PROTECTED_VAR + "=", text)
+
+    def test_only_api_key_missing_generates_only_api_key(self):
+        env = self.root / ".env"
+        # Unlock present (protected form); API key absent.
+        env.write_text(
+            bootstrap.UNLOCK_PASSWORD_PROTECTED_VAR + "=abc123\n",
+            encoding="utf-8",
+        )
+        bootstrap.step_gen_env()
+        api = bootstrap._read_env_value("MCP_API_KEY")
+        self.assertTrue(api and not api.startswith("replace"))
+        # The existing protected unlock value is untouched, and no plain unlock line is minted.
+        self.assertEqual(bootstrap._read_env_value(bootstrap.UNLOCK_PASSWORD_PROTECTED_VAR), "abc123")
+
+    def test_repaired_env_then_passes_verify(self):
+        # End to end: a .env missing both secrets is repaired by gen_env so that a subsequent
+        # verify no longer fails on the .env-key check (the dead end this fix removes). We stub
+        # the tool-count import so the test does not need the whole server importable.
+        env = self.root / ".env"
+        env.write_text("SOME_OTHER=1\n", encoding="utf-8")
+        bootstrap.step_gen_env()
+        with mock.patch.object(bootstrap, "_count_tools_via_subprocess", return_value=42):
+            bootstrap.step_verify()  # must not raise StepError on the key check
+
+
+class GenEnvFreshStillWritesSecretsTests(unittest.TestCase):
+    """Guard the original path: when NO .env exists, gen_env still writes a fresh one carrying
+    both secrets. The backfill branch must not have cannibalised the create branch."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self._orig_root = bootstrap.ROOT
+        bootstrap.ROOT = self.root
+        # No .env.example in the temp root -> gen_env uses its built-in minimal template.
+
+    def tearDown(self):
+        bootstrap.ROOT = self._orig_root
+        self.tmp.cleanup()
+
+    def test_fresh_env_has_both_secrets(self):
+        bootstrap.step_gen_env()
+        env = self.root / ".env"
+        self.assertTrue(env.exists())
+        api = bootstrap._read_env_value("MCP_API_KEY")
+        self.assertTrue(api and not api.startswith("replace"))
+        self.assertTrue(bootstrap._read_env_value(bootstrap.UNLOCK_PASSWORD_PROTECTED_VAR))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
