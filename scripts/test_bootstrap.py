@@ -71,6 +71,43 @@ class StateMachineTests(unittest.TestCase):
         for n in ("a", "b", "c"):
             self.assertTrue(bootstrap.is_done(state, n))
 
+    # 1b. A done flag is not evidence the venv exists -------------------------
+    def test_a_missing_venv_clears_the_checkpoints_that_claim_it_exists(self):
+        """state.json travels with a folder copy, a OneDrive sync or a ZIP restore; .venv does
+        not, or arrives broken. Skipping on the flag alone let STEP 1 report success on a
+        machine with NO interpreter -- after which supervisor.ps1 falls back to bare `python`,
+        which on a fresh Windows box is the Store alias, and every later symptom points
+        somewhere else. Only the venv-dependent steps are cleared; the other four produce their
+        own artefacts and re-running them is not free."""
+        state = {"done": {n: True for n in ("ensure_venv", "install_deps", "gen_env",
+                                            "check_edge", "dev_tunnel", "gen_connector",
+                                            "verify")}}
+        bootstrap.save_state(state, self.state_file)
+
+        missing = Path(self.tmp.name) / "no-such-venv" / "python.exe"
+        with mock.patch.object(bootstrap, "VENV_PYTHON", missing):
+            rec = RecordingSteps(["ensure_venv", "install_deps", "gen_env", "check_edge",
+                                  "dev_tunnel", "gen_connector", "verify"])
+            rc = bootstrap.run_all(steps=rec.steps, state_file=self.state_file)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(rec.calls, ["ensure_venv", "install_deps", "verify"],
+                         "the venv-dependent steps did not re-run")
+
+    def test_an_existing_venv_leaves_every_checkpoint_alone(self):
+        """The clearing must be caused by the venv being absent, not by running at all."""
+        state = {"done": {n: True for n in ("ensure_venv", "install_deps", "verify")}}
+        bootstrap.save_state(state, self.state_file)
+
+        present = Path(self.tmp.name) / "python.exe"
+        present.write_text("", encoding="utf-8")
+        with mock.patch.object(bootstrap, "VENV_PYTHON", present):
+            rec = RecordingSteps(["ensure_venv", "install_deps", "verify"])
+            rc = bootstrap.run_all(steps=rec.steps, state_file=self.state_file)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(rec.calls, [], "steps re-ran even though the venv was there")
+
     # 2. ActionNeeded pause then resume --------------------------------------
     def test_action_needed_pauses_and_resume_skips_completed(self):
         # First run: 'b' raises ActionNeeded -> a done, b/c pending, rc=2.

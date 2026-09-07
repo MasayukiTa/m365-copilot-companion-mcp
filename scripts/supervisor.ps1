@@ -82,15 +82,49 @@ if (-not $TunnelName) {
 }
 if (-not $TunnelName) { $TunnelName = "m365-copilot-companion" }
 
-$Py = Join-Path $Root ".venv\Scripts\python.exe"
-if (-not (Test-Path $Py)) { $Py = "python" }
 $Log = Join-Path $env:TEMP "m365-companion-supervisor.log"
+
+# A SUPERVISOR THAT CANNOT RUN PYTHON MUST NOT KEEP TRYING. Falling back to bare `python` was
+# meant as a safety net, but on a machine with no .venv it usually resolves to the App Execution
+# Alias under WindowsApps -- which is not an interpreter; run with arguments it returns an error
+# code. The loop would then fail identically twice a pass, every fifteen seconds, forever, while
+# reporting itself as running. Saying it once and stopping is better than doing nothing loudly.
+$Py = Join-Path $Root ".venv\Scripts\python.exe"
+if (-not (Test-Path $Py)) {
+    $fallback = Get-Command python -ErrorAction SilentlyContinue | Select-Object -First 1
+    $why = ""
+    if (-not $fallback) {
+        $why = "there is no .venv in this checkout and no python on PATH"
+    } elseif ($fallback.Source -match '\\WindowsApps\\') {
+        $why = ("there is no .venv in this checkout, and 'python' on PATH is the Windows Store " +
+                "App Execution Alias (" + $fallback.Source + "), which is not an interpreter")
+    }
+    if ($why) {
+        $stamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+        $msg = ("$stamp  REFUSING TO RUN: $why. Run setup.bat (or quickstart.bat) to create " +
+                "the .venv, then start the stack again. Exiting rather than retrying this " +
+                "every 15 seconds.")
+        try { Add-Content -Path $Log -Value $msg -Encoding UTF8 } catch { }
+        Write-Host $msg
+        exit 3
+    }
+    $Py = $fallback.Source
+}
 
 # Prefer the winget-installed devtunnel (kept current) over an older copy that may
 # be earlier on PATH (e.g. an IT-deployed one in System32). Older host builds drop
 # their relay connection much more often. Falls back to "devtunnel" on PATH.
 $DevTunnel = "devtunnel"
 $wingetDt = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links\devtunnel.exe"
+# AND THE DIRECT DOWNLOAD. setup_devtunnel.ps1 falls back to
+# %LOCALAPPDATA%\devtunnel\devtunnel.exe when winget is unavailable and appends that
+# directory to the USER PATH -- which the already-running cmd session that launched this
+# script cannot see. Looking only at the winget path and PATH means the CLI is installed
+# and unfindable, on precisely the locked-down machines that needed the fallback.
+if (-not (Test-Path $wingetDt)) {
+    $directDt = Join-Path $env:LOCALAPPDATA "devtunnel\devtunnel.exe"
+    if (Test-Path $directDt) { $wingetDt = $directDt }
+}
 if (Test-Path $wingetDt) { $DevTunnel = $wingetDt }
 
 # Single-instance guard: if another supervisor already holds the mutex, exit quietly.
