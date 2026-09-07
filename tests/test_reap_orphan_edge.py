@@ -166,3 +166,65 @@ def test_every_managed_profile_has_an_owner():
     from relay import edge_recover
     for profile in edge_recover.MANAGED_EDGE_PROFILES.values():
         assert profile in reap.OWNERS, "%s has no declared owner" % profile
+
+
+# --- Added 2026-09-07: the two ways a naive process match kills a HEALTHY browser. ---
+
+def test_owner_alive_fails_CLOSED_when_powershell_cannot_be_run(monkeypatch):
+    """If the ownership check itself cannot run, we must NOT conclude the owner is gone.
+
+    The original _ps() returned "" on any PowerShell failure, indistinguishable from a
+    query that ran and found nothing. owner_alive() read that "" as 0 owners -> orphan,
+    and under --stop would kill a live run's browser on a transient PowerShell hiccup.
+    _ps() now returns the _PS_FAILED sentinel on failure and owner_alive() treats it as
+    'assume alive, do not reap'.
+    """
+    monkeypatch.setattr(reap, "_ps", lambda script, timeout=40: reap._PS_FAILED)
+    assert reap.owner_alive("fleet_runner") is True
+
+
+def test_owner_alive_reads_a_real_zero_as_gone(monkeypatch):
+    """A query that actually ran and returned 0 still means the owner is gone -- fail-closed
+    must not become 'never reap anything'."""
+    monkeypatch.setattr(reap, "_ps", lambda script, timeout=40: "0\n")
+    assert reap.owner_alive("fleet_runner") is False
+
+
+def test_owner_alive_reads_a_positive_count_as_alive(monkeypatch):
+    monkeypatch.setattr(reap, "_ps", lambda script, timeout=40: "2\n")
+    assert reap.owner_alive("fleet_runner") is True
+
+
+def test_browser_procs_fails_safe_to_zero_when_powershell_cannot_be_run(monkeypatch):
+    """An unreadable process table reports nothing running, not garbage -- and 'nothing
+    running' is never treated as an orphan (survey skips profiles with no procs)."""
+    monkeypatch.setattr(reap, "_ps", lambda script, timeout=40: reap._PS_FAILED)
+    assert reap.browser_procs("copilot-eval-edge") == (0, 0)
+
+
+def test_profile_match_is_anchored_to_the_user_data_dir_flag():
+    """The regex must match a real --user-data-dir=...\\<profile> and refuse an incidental
+    mention of the profile name elsewhere on the command line (a tab URL, an extension
+    path), which under --stop would be a browser stopped by coincidence."""
+    import re as _re
+    rx = _re.compile(reap._profile_dir_regex("copilot-eval-edge"))
+
+    # real launches: quoted and bare, both slash styles, child process inherits the flag
+    assert rx.search(r'msedge.exe --user-data-dir="C:\\Users\\x\\copilot-eval-edge" --foo')
+    assert rx.search(r'msedge.exe --user-data-dir=C:\\Users\\x\\copilot-eval-edge')
+    assert rx.search(r'msedge.exe --user-data-dir=C:/Users/x/copilot-eval-edge --type=gpu')
+
+    # strangers: profile name present, but NOT as the user-data-dir path segment
+    assert not rx.search(r'msedge.exe --user-data-dir=C:\\Users\\x\\other https://copilot-eval-edge.example.com')
+    assert not rx.search(r'msedge.exe https://site/copilot-eval-edge/page')
+    # a different profile's Edge must not match this profile
+    assert not rx.search(r'msedge.exe --user-data-dir=C:\\Users\\x\\copilot-companion-edge')
+
+
+def test_profile_regex_escapes_metacharacters():
+    """A future profile name with regex metacharacters must be matched literally, not as a
+    pattern -- the name is escaped before it goes into the .NET regex."""
+    import re as _re
+    rx = _re.compile(reap._profile_dir_regex("a.b+c"))
+    assert rx.search(r'--user-data-dir=C:\\d\\a.b+c')
+    assert not rx.search(r'--user-data-dir=C:\\d\\aXbbc')  # '.' and '+' must be literal
