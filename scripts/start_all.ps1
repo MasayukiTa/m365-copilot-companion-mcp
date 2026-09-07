@@ -1144,6 +1144,34 @@ function Invoke-Startup {
             "-NoProfile","-ExecutionPolicy","Bypass","-File",
             ('"{0}"' -f (Join-Path $scriptDir "start_bridge.ps1")), "-Keepalive") `
             -RedirectStandardOutput $bridgeLog -RedirectStandardError "$bridgeLog.err"
+        # DID IT SURVIVE? Fire-and-forget was asymmetric with the supervisor, the :8765-held
+        # branch above, and the UI rebuild -- all of which are counted. The bridge exits at
+        # once on "No agent page. Set MCP_IMPL_AGENT_URL...", most likely on a fresh PC where
+        # that env var is unset, and the reason went only to $bridgeLog.err -- never to
+        # startupFailures and never to the screen. HasExited cannot be the probe here: the
+        # -Keepalive WRAPPER stays alive in its own loop and relaunches the dead child every
+        # 3s, so the process is "still running" while nothing serves. /conv is the same
+        # liveness signal this whole block already keys on, so that is what is checked. The
+        # first-start Edge bring-up plus a Python import needs a few seconds before /conv can
+        # answer, so this polls rather than probing once.
+        $bridgeUp = $false
+        for ($bi = 0; $bi -lt 8; $bi++) {
+            Start-Sleep -Seconds 2
+            if (Http-Up "http://127.0.0.1:8765/conv") { $bridgeUp = $true; break }
+        }
+        if (-not $bridgeUp) {
+            $why = "bridge: started but :8765/conv did not answer within ~16s"
+            try {
+                if (Test-Path "$bridgeLog.err") {
+                    $brLines = @(Get-Content "$bridgeLog.err" -Tail 5 -ErrorAction Stop |
+                                 Where-Object { $_.Trim() })
+                    if ($brLines.Count -gt 0) { $why = $why + ": " + ($brLines -join " / ") }
+                }
+            } catch { }
+            Write-Host ("[3/4] " + $why) -ForegroundColor Yellow
+            Write-Host "        (A fresh PC often has MCP_IMPL_AGENT_URL unset, which the bridge exits on -- see $bridgeLog.err.)" -ForegroundColor Yellow
+            $script:startupFailures += $why
+        }
         }
     }
 

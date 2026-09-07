@@ -376,6 +376,12 @@ echo   Checking in the background. The browser window is only brought forward if
 echo   you actually need to sign in - it will not interrupt you otherwise.
 echo.
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\ensure_m365_signin.ps1"
+REM EXIT CODE INTENTIONALLY NOT CHECKED. Unlike devtunnel/configure_env/start_all/doctor,
+REM whose distinct codes a person has to act on, ensure_m365_signin.ps1 always exits 0 BY
+REM DESIGN (see its "NEVER FAIL THE WHOLE SETUP OVER THIS" block): a not-yet-completed
+REM sign-in is resumable, the wrapper prints its own "(sign-in not completed yet...)" line,
+REM and the health check that runs immediately below reports the sign-in state either way.
+REM A checked errorlevel here would only ever read 0, so there is nothing to branch on.
 
 echo.
 echo ===========================================================================
