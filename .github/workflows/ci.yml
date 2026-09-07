@@ -93,6 +93,7 @@ jobs:
             tests/test_tool_map_pinning.py \
             scripts/test_watch_grade.py \
             scripts/test_ensure_m365_signin.py \
+            scripts/test_ensure_m365_signin_state.py \
             scripts/test_check_no_identifying_names.py \
             scripts/test_check_integration_evidence.py \
             scripts/test_stale_server_check.py \
