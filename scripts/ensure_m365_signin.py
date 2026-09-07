@@ -95,15 +95,22 @@ def main(argv=None):
         # something they cannot do.
         print("  sign-in needed (%s)" % why if ready is False else "  cannot tell (%s)" % why)
         return 1 if ready is False else 2
-    if ready is None:
+    if ready is None and tabs(a.port) is None:
         # NOT a sign-in failure. Saying "sign in" when the browser is not running sends the
         # person to do something they cannot do.
         print("  the companion Edge is not running (%s)." % why)
         print("  start the stack first (start_all.bat), then run this again.")
         return 2
-
-    print("  M365 sign-in is needed (%s)." % why)
-    print("  Bringing the companion Edge window to the front for you...")
+    if ready is None:
+        # EDGE IS ANSWERING AND HAS NO M365 TAB -- which is what a fresh machine looks like,
+        # because start_companion_edge.ps1 opens it at about:blank. This used to take the branch
+        # above and report the browser as not running, so setup ended without ever offering a
+        # sign-in, the wrapper turned the 2 into a 0, and doctor logged it as INFO. Opening the
+        # page is the whole point of this path; if they are already signed in it costs a tab.
+        print("  no M365 page is open yet, so there is nothing to judge from (%s)." % why)
+    else:
+        print("  M365 sign-in is needed (%s)." % why)
+    print("  Opening the page and bringing the companion Edge window to the front...")
     try:
         from relay import edge_recover
     except Exception as exc:

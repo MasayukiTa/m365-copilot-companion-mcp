@@ -335,8 +335,87 @@ def test_a_failed_unlock_repair_is_reported_not_only_a_successful_one():
     start_all = (ROOT / "scripts" / "start_all.ps1").read_text(encoding="utf-8")
     ep = (ROOT / "tools" / "env_portability.py").read_text(encoding="utf-8")
 
-    assert 'elseif ($repair -match "^cannot|^refusing")' in start_all
+    # The repair now runs scripts/repair_unlock.py, which prints one of
+    # noop:<why> / repaired:<password> / failed:<why> -- a script file rather than a `-c`
+    # payload, for the reason the unlock CHECK had to become one.
+    assert 'repair -like "failed:*"' in start_all
     assert "UNLOCK PASSWORD REPAIR FAILED" in start_all
     # the reasons really do start with those words
     assert '"reason": "cannot protect a new value here' in ep or "cannot protect a new value here" in ep
     assert "refusing to edit without a backup" in ep
+
+
+def test_the_server_is_up_before_step_5_asks_for_a_connection_test():
+    """copilot_studio_values.ps1 tells the operator "Add connection / Test (the tool list should
+    load)", and the server was not launched until STEP 7 -- so the first thing that happened on
+    the only manual step of the install was a connection error. The 90-second wait added earlier
+    sits after STEP 7 and cannot help."""
+    qs = (ROOT / "quickstart.bat").read_text(encoding="utf-8")
+    start_all = (ROOT / "scripts" / "start_all.ps1").read_text(encoding="utf-8")
+    values = (ROOT / "scripts" / "copilot_studio_values.ps1").read_text(encoding="utf-8")
+
+    assert "Add connection" in values, "STEP 5 no longer asks for a connection test"
+    assert "[switch]$CoreOnly" in start_all
+    # the gate demands the agent URL, which is what STEP 5 exists to create -- asking would deadlock
+    assert "first-time interactive setup skipped (-CoreOnly)" in start_all
+    core = qs.index("-CoreOnly")
+    step5 = qs.index("STEP 5/7")
+    full = qs.index("STEP 7/7")
+    assert core < step5 < full, "the core start is not between the tunnel and the manual step"
+
+
+def test_the_tunnel_access_decision_is_asked_recorded_and_applied():
+    """MEASURED on the machine that works: `devtunnel access list` shows +Anonymous [connect]
+    while MCP_TUNNEL_ALLOW_ANONYMOUS is absent from its .env -- so the working configuration was
+    granted some other way, and a new machine following the default gets a tunnel with NO grant.
+    Nothing can connect to it, and STEP 5's test fails.
+
+    Anonymous exposure is not switched on quietly: setup_devtunnel's own comment says it "must
+    be a deliberate choice by the operator, not a silent default". So it is asked, the answer is
+    recorded the way the convenience block records its own, and whichever was chosen is applied.
+    The tenant option used to be a command printed for the operator to type."""
+    qs = (ROOT / "quickstart.bat").read_text(encoding="utf-8")
+    dt = (ROOT / "scripts" / "setup_devtunnel.ps1").read_text(encoding="utf-8")
+
+    assert "choice /C ATN" in qs
+    assert 'tunnel_access_choice' in qs, "the decision is not recorded"
+    # asked BEFORE the tunnel is created, because the grant is part of creating it
+    assert qs.index("choice /C ATN") < qs.index("STEP 4/7")
+    # default stays off: the env line is only written on an explicit A
+    assert 'if "!TUNNEL_ACCESS!"=="anonymous" (' in qs
+    # and tenant access is applied, not printed
+    assert "[string]$TenantId" in dt
+    assert "access create $target --tenant $TenantId" in dt
+    # `set /p` is not inside a parenthesized block: measured, it did not settle before the `if`
+    assert "goto :after_tenant_id" in qs
+
+
+def test_a_fresh_browser_with_no_tab_leads_to_a_sign_in():
+    """start_companion_edge.ps1 opens at about:blank, so a fresh machine has no M365 tab.
+    state() answers None for that AND for "Edge is not answering", and the setup path treated
+    both as "the companion Edge is not running" -- returning 2, which the wrapper turns into 0
+    and doctor logs as INFO. quickstart therefore finished reporting success with nobody signed
+    in. --check-only is untouched: with no tab it still answers "cannot tell", because the fleet
+    is websocket-driven and a signed-in machine shows no tabs either."""
+    signin = (ROOT / "scripts" / "ensure_m365_signin.py").read_text(encoding="utf-8")
+
+    assert 'if ready is None and tabs(a.port) is None:' in signin, \
+        "the two reasons for None are conflated again"
+    assert "no M365 page is open yet" in signin
+    # the check-only path still declines to judge
+    assert "return 1 if ready is False else 2" in signin
+
+
+def test_the_new_unlock_password_reaches_the_operator():
+    """repair_unlock_password generates a NEW random password -- correctly, the old one is
+    unreadable on this account -- and returned only a reason and a backup path. The operator
+    arrived with a password written down from the machine that produced the .env, and nothing
+    ever told them it no longer works. Everything green; unlock() simply refuses."""
+    ep = (ROOT / "tools" / "env_portability.py").read_text(encoding="utf-8")
+    start_all = (ROOT / "scripts" / "start_all.ps1").read_text(encoding="utf-8")
+
+    assert '"password": fresh' in ep
+    assert (ROOT / "scripts" / "repair_unlock.py").exists()
+    assert "repair_unlock.py" in start_all
+    assert 'repair -like "repaired:*"' in start_all
+    assert "Write this down" in start_all
