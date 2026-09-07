@@ -155,7 +155,12 @@ if "!TUNNEL_ACCESS!"=="anonymous" (
     REM REPLACED, NOT APPENDED. Get-AllowAnonymous takes the FIRST matching line and breaks, so
     REM an older MCP_TUNNEL_ALLOW_ANONYMOUS=0 further up the file would keep winning and the
     REM operator would be told the choice was recorded while nothing had changed.
-    powershell -NoProfile -Command "$p = Join-Path (Get-Location) '.env'; $keep = @(); if (Test-Path $p) { $keep = @(Get-Content $p | Where-Object { $_ -notmatch '^\s*MCP_TUNNEL_ALLOW_ANONYMOUS\s*=' }) }; $keep += 'MCP_TUNNEL_ALLOW_ANONYMOUS=1'; [IO.File]::WriteAllLines($p, $keep, (New-Object System.Text.UTF8Encoding($false)))"
+    REM BOTH SIDES, NOT JUST THE WRITE. WriteAllLines with a no-BOM UTF8Encoding fixed the
+    REM write, but Get-Content without -Encoding still read .env as the ANSI codepage, so a
+    REM non-ASCII line was decoded wrong and written back as UTF-8 of the wrong string.
+    REM Measured on a file with one Japanese comment line: ASCII write destroyed it outright,
+    REM the write-only fix turned it into mojibake, and fixing both round-trips it unchanged.
+    powershell -NoProfile -Command "$p = Join-Path (Get-Location) '.env'; $keep = @(); if (Test-Path $p) { $keep = @(Get-Content $p -Encoding UTF8 | Where-Object { $_ -notmatch '^\s*MCP_TUNNEL_ALLOW_ANONYMOUS\s*=' }) }; $keep += 'MCP_TUNNEL_ALLOW_ANONYMOUS=1'; [IO.File]::WriteAllLines($p, $keep, (New-Object System.Text.UTF8Encoding($false)))"
     echo   Recorded: anonymous access. ^(MCP_TUNNEL_ALLOW_ANONYMOUS=1 in .env^)
 )
 if "!TUNNEL_ACCESS!"=="none" (
