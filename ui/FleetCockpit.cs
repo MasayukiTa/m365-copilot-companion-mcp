@@ -1496,7 +1496,7 @@ class CockpitWindow : Window
         _list = new ListBox();
         _list.BorderThickness = new Thickness(0);
         _list.Background = Brushes.Transparent;
-        _list.Padding = new Thickness(16, 6, 16, 4);   // was bottom 24 — left a gap between the last row and the composer
+        _list.Padding = new Thickness(16, 6, 16, 18);  // bottom clears the composer DropShadow (BlurRadius 14 + ShadowDepth 2 ≈ 12px) so the last row is not overlapped by the shadow
         ScrollViewer.SetVerticalScrollBarVisibility(_list, ScrollBarVisibility.Auto);
         ScrollViewer.SetHorizontalScrollBarVisibility(_list, ScrollBarVisibility.Disabled);
         // Pixel scroll (not item scroll) so the list can SIZE TO CONTENT inside an Auto row and
