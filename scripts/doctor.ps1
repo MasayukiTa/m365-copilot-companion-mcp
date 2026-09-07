@@ -53,6 +53,9 @@ if (Test-Path $envPath) {
 }
 
 $script:ok = 0; $script:bad = 0; $script:warn = 0
+# COUNTED APART FROM $warn, which also holds optional components being absent -- a complete
+# setup. This is required checks that could not be determined, which is not one.
+$script:unknown = 0
 # Machine-readable accumulator: one entry per check, in the exact order checks run
 # (== the dependency order documented at the top of this file). This -- not the
 # colored console text -- is the single source of truth a repair dispatcher reads.
@@ -79,6 +82,8 @@ function Check-TriState([string]$id, [string]$name, [scriptblock]$test, [string]
         Write-Host ("  [WARN] " + $name + " (temporarily indeterminate)") -ForegroundColor Yellow
         Write-Host ("         retry: " + $fix) -ForegroundColor DarkYellow
         $script:warn++
+        # Check-TriState is used only for REQUIRED checks, so every indeterminate here is one.
+        $script:unknown++
         return
     }
     $pass = [bool]$value
@@ -646,4 +651,15 @@ if ($Json) {
 # start_all.ps1 does not invoke doctor.ps1 at all), so this cannot break anything that
 # already works, and it gives scripts\repair.ps1 (and any other automation) a cheap
 # "is there anything to do" signal without re-parsing -Json output.
+# THE COUNTS GO WHERE A CALLER CAN READ THEM. The exit code is the number of failures and
+# stays that way -- repair.ps1 parses -Json, and quickstart prints "N check(s) failed" from it.
+# An indeterminate required check is neither a failure nor a completion, and quickstart needs
+# to know about it to stop saying SETUP COMPLETE over one.
+try {
+    $sumDir = Join-Path $repo ".setup\logs"
+    if (-not (Test-Path $sumDir)) { New-Item -ItemType Directory -Force $sumDir | Out-Null }
+    Set-Content -Path (Join-Path $sumDir "doctor_summary.txt") -Encoding ASCII -Value @(
+        ("bad=" + $script:bad), ("warn=" + $script:warn), ("unknown=" + $script:unknown))
+} catch { }
+
 exit $script:bad

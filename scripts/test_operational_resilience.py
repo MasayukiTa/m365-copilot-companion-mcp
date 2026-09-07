@@ -419,3 +419,65 @@ def test_the_new_unlock_password_reaches_the_operator():
     assert "repair_unlock.py" in start_all
     assert 'repair -like "repaired:*"' in start_all
     assert "Write this down" in start_all
+
+
+def test_a_required_check_that_could_not_be_answered_is_not_a_complete_setup():
+    """$script:warn holds two different things: an OPTIONAL component being absent, which is a
+    complete setup, and a REQUIRED check that could not be determined, which is not. doctor
+    exits with $script:bad, so neither reached quickstart and the banner said COMPLETE over a
+    run where something required was never established.
+
+    I introduced a case of this today: making the unlock check Check-TriState stopped "could not
+    ask" being reported as a PASS -- correct -- but the indeterminate it produces lands in warn,
+    and the install still declared itself complete. Fixing the inner fail-open had moved the
+    problem outward rather than removing it.
+
+    Check-TriState is used only for required checks, so counting its indeterminates separately
+    is exact. Verified by running the whole quickstart flow with every external call stubbed:
+    unknown=2 prints NOT CONFIRMED, unknown=0 prints COMPLETE."""
+    doctor = (ROOT / "scripts" / "doctor.ps1").read_text(encoding="utf-8")
+    qs = (ROOT / "quickstart.bat").read_text(encoding="utf-8")
+
+    assert "$script:unknown = 0" in doctor
+    assert "$script:unknown++" in doctor
+    assert "doctor_summary.txt" in doctor, "the counts are not published anywhere"
+    # the exit code keeps meaning "number of failures": repair.ps1 parses -Json, and quickstart
+    # prints "N check(s) failed" from it
+    assert "exit $script:bad" in doctor
+    assert "SETUP NOT CONFIRMED" in qs
+    # COMMENTS OUT FIRST -- the third time today an assertion matched the prose explaining
+    # a thing rather than the thing. A REM line above the banner quotes "SETUP COMPLETE".
+    qs_code = "\n".join(l for l in qs.splitlines()
+                        if not l.strip().lower().startswith("rem"))
+    assert qs_code.index("SETUP NOT CONFIRMED") < qs_code.index("SETUP COMPLETE"), \
+        "the complete banner is reached before the unanswered case is considered"
+
+
+def test_the_update_step_reads_its_result_and_stops_after_replacing_itself():
+    """Two problems, and the second is the dangerous one. `git pull --ff-only`'s result was not
+    read, so a failed pull left the operator believing they were current while running the old
+    code. And a SUCCESSFUL pull rewrites quickstart.bat while cmd is executing it -- cmd resumes
+    a batch file from a byte offset after each line, so replacing it underneath a running
+    instance continues at whatever now occupies that offset. Undefined, and silent.
+
+    No labels: the first attempt put goto targets inside the parenthesised block and cmd
+    rejected the entire file with ") was unexpected at this time". Measured, both of them."""
+    qs = (ROOT / "quickstart.bat").read_text(encoding="utf-8")
+
+    assert 'if defined DO_PULL (' in qs
+    assert "UPDATE FAILED" in qs
+    assert "Updated. Please run quickstart.bat again." in qs
+    # the decision is taken inside the block, acted on outside it
+    assert qs.index('set "DO_PULL=1"') < qs.index("if defined DO_PULL (")
+    # and no label was reintroduced into the git block
+    git_block = qs[qs.index("STEP 3/7"):qs.index("STEP 4/7")]
+    assert ":do_pull" not in git_block, "a label is back inside a parenthesised block"
+
+
+def test_an_unanswerable_access_prompt_records_the_safe_answer():
+    """MEASURED: with stdin closed, `choice` prints "ERROR: The file is either empty or does not
+    contain the valid choices" and sets none of the branches, leaving the variable empty. The
+    effect was already safe -- nothing is granted -- but nothing said so, and the recorded
+    decision was a blank. An absent answer is the same answer as N and is written down as one."""
+    qs = (ROOT / "quickstart.bat").read_text(encoding="utf-8")
+    assert 'if "!TUNNEL_ACCESS!"=="" set "TUNNEL_ACCESS=none"' in qs
