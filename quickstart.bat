@@ -152,16 +152,11 @@ REM the same reason: the absence of a decision must never be read as consent to 
 if not exist ".setup" mkdir ".setup"
 > ".setup\tunnel_access_choice" echo access=!TUNNEL_ACCESS!
 if "!TUNNEL_ACCESS!"=="anonymous" (
-    findstr /b /r "MCP_TUNNEL_ALLOW_ANONYMOUS=1" ".env" >nul 2>nul
-    if errorlevel 1 (
-        REM A .env WITHOUT A TRAILING NEWLINE JOINS THE NEW KEY ONTO THE LAST ONE.
-        REM Measured: >> ".env" echo KEY=1 against a file ending "A=1" produces "A=1KEY=1",
-        REM destroying A=1 -- and if that is MCP_API_KEY the Bearer token is silently wrong.
-        REM (The redirection-first form was already right about NOT padding the value; only
-        REM `echo X >> f` does that.) PowerShell can look at the last byte first.
-        powershell -NoProfile -Command "$p = Join-Path (Get-Location) '.env'; $b = [IO.File]::ReadAllBytes($p); if ($b.Length -gt 0 -and $b[$b.Length-1] -ne 10) { [IO.File]::AppendAllText($p, [Environment]::NewLine) }; [IO.File]::AppendAllText($p, 'MCP_TUNNEL_ALLOW_ANONYMOUS=1' + [Environment]::NewLine)"
-        echo   Recorded: anonymous access. ^(MCP_TUNNEL_ALLOW_ANONYMOUS=1 in .env^)
-    )
+    REM REPLACED, NOT APPENDED. Get-AllowAnonymous takes the FIRST matching line and breaks, so
+    REM an older MCP_TUNNEL_ALLOW_ANONYMOUS=0 further up the file would keep winning and the
+    REM operator would be told the choice was recorded while nothing had changed.
+    powershell -NoProfile -Command "$p = Join-Path (Get-Location) '.env'; $keep = @(); if (Test-Path $p) { $keep = @(Get-Content $p | Where-Object { $_ -notmatch '^\s*MCP_TUNNEL_ALLOW_ANONYMOUS\s*=' }) }; $keep += 'MCP_TUNNEL_ALLOW_ANONYMOUS=1'; Set-Content -Path $p -Value $keep -Encoding ASCII"
+    echo   Recorded: anonymous access. ^(MCP_TUNNEL_ALLOW_ANONYMOUS=1 in .env^)
 )
 if "!TUNNEL_ACCESS!"=="none" (
     echo   Recorded: no grant yet. STEP 5's connection test will fail until you
@@ -174,7 +169,11 @@ echo ===========================================================================
 echo   Installs the devtunnel CLI (winget or direct download), signs you in
 echo   (browser or device code), creates the tunnel, and prints the PUBLIC URL.
 echo.
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\setup_devtunnel.ps1" -TenantId "!TENANT_ID!"
+set "ANON_FLAG="
+if "!TUNNEL_ACCESS!"=="anonymous" set "ANON_FLAG=-ForceAnonymous"
+REM PASSED, not left to be re-derived. The file and the environment can both disagree with the
+REM answer just given; the answer wins for this run.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\setup_devtunnel.ps1" -TenantId "!TENANT_ID!" !ANON_FLAG!
 REM Capture the Dev Tunnel setup exit code BEFORE any other command: a plain
 REM `set` succeeds and would RESET errorlevel to 0, so we must grab it first.
 set "DT_RC=%ERRORLEVEL%"
