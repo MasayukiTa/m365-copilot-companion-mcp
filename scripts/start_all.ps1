@@ -768,7 +768,14 @@ function Invoke-Startup {
             $repairScript = Join-Path $scriptDir "repair_unlock.py"
             $repair = ""
             if (Test-Path $repairScript) {
-                $repair = (& $venvPy $repairScript $envFile 2>&1 | Select-Object -Last 1)
+                # BY PREFIX, NOT BY POSITION. 2>&1 merges stderr into the stream, so the
+                # LAST line is whatever came last -- one deprecation warning and the verdict
+                # matches neither "repaired:*" nor "failed:*", losing both the new password and
+                # the failure recording. repair_unlock.py emits exactly one verdict line.
+                $repairLines = @(& $venvPy $repairScript $envFile 2>&1)
+                $repair = ($repairLines | Where-Object {
+                    $_ -match '^(noop|repaired|failed|error):'
+                } | Select-Object -Last 1)
             }
             if ($repair -like "repaired:*") {
                 # THE OPERATOR HAS TO BE TOLD. The repair generates a NEW password, so the one
@@ -842,7 +849,29 @@ function Invoke-Startup {
         # click start_all.bat" -- the operation that just ran.
         $supErr = Join-Path $script:diagDir "supervisor.err.log"
         try {
-            Start-Process powershell -WindowStyle Hidden -ArgumentList $supArgs -RedirectStandardError $supErr
+            # DID IT SURVIVE? This was fire-and-forget: supervisor.ps1 exits 3 when there is
+            # no usable Python, and start_all printed "starting" and moved on regardless --
+            # asymmetric with the unlock repair, the bridge port and the UI rebuild, which are
+            # all counted. A supervisor that died is the difference between a stack that comes
+            # up in ninety seconds and one that never comes up at all.
+            $supProc = Start-Process powershell -WindowStyle Hidden -ArgumentList $supArgs -RedirectStandardError $supErr -PassThru
+            if ($supProc) {
+                # It refuses within its first few statements, long before the health loop, so a
+                # short wait separates "died on startup" from "running".
+                $null = $supProc.WaitForExit(3000)
+                if ($supProc.HasExited) {
+                    $why = "supervisor exited immediately (code $($supProc.ExitCode))"
+                    try {
+                        if (Test-Path $supErr) {
+                            $supLines = @(Get-Content $supErr -Tail 5 -ErrorAction Stop |
+                                          Where-Object { $_.Trim() })
+                            if ($supLines.Count -gt 0) { $why = $why + ": " + ($supLines -join " / ") }
+                        }
+                    } catch { }
+                    Write-Host ("[1/4] " + $why) -ForegroundColor Yellow
+                    $script:startupFailures += $why
+                }
+            }
         } catch {
             # Starting it matters more than capturing it: a previous instance holding the file
             # must not be able to keep the stack down.
