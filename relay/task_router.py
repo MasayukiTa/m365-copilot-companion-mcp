@@ -626,6 +626,18 @@ AUTOSTART_GRACE_S = float(os.environ.get("FLEET_INTAKE_AUTOSTART_GRACE_S", "240"
 AUTOSTART_BACKOFF_S = float(os.environ.get("FLEET_INTAKE_AUTOSTART_BACKOFF_S", "900") or 900)
 
 
+def launch_creationflags() -> int:
+    """Windows creation flags for spawning a fleet. Split out so it can be tested.
+
+    The spawn itself cannot be exercised in a test -- autostart_fleet refuses to Popen under
+    pytest, deliberately, because reaching that line for real opens a browser. So the decision
+    lives here where it can be asserted without one, rather than in a source-text check that
+    would pass on a comment.
+    """
+    return (getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+
+
 def _autostart_path(state_dir) -> str:
     return os.path.join(state_dir or FLEET_STATE_DIR, AUTOSTART_STATE)
 
@@ -748,18 +760,56 @@ def autostart_fleet(goals, state_dir=None, now=None, launcher=None) -> dict:
         for g in goals:
             fh.write(json.dumps(g, ensure_ascii=False) + "\n")
 
+    # THE DISK GATE IS FOR BENCH EVALS, AND A GOAL FROM A PHONE IS NOT ONE.
+    #
+    # The floor exists because five concurrent SWE-bench Docker builds once filled C: and
+    # corrupted WSL, so an eval-bearing tab is admitted only if free space survives the build it
+    # is about to start. relay_fleet.disk_admission_ok and --disk-floor-gb both say the same
+    # thing about the other case: "normal (non-bench) use may not want a reserve", "0 = disable
+    # the disk gate (normal, non-bench use)". Autostart never passed the flag, so a tunnel goal
+    # inherited the bench floor -- 6 GB by default, 3 GB as configured here.
+    #
+    # What that cost: with C: below the floor the run admits NOTHING. Every sweep refuses, breaks
+    # and defers, forever -- there is no timeout and no give-up. The reason is printed once a
+    # minute into the coordinator's log, which is the one place a person holding a phone cannot
+    # look. The submitter has already been told "queued -- it will be picked up by its runner".
+    # So the goal is accepted, a browser is opened (spending more of the disk that was the
+    # problem), and nothing ever runs, silently. The same shape was measured before from the
+    # desk: two calibration runs sat admitting nothing for twenty-five minutes each and a stack
+    # dump was the only way to find out.
+    #
+    # An ordinary goal writes a transcript and some status JSON -- kilobytes. Gating it behind a
+    # multi-gigabyte Docker reserve was a category error, and the failure it produced (silent,
+    # unobservable from the device that asked) is worse than the disk pressure it was avoiding.
+    # Bench runs still pass their own floor and keep the protection that was actually earned.
     cmd = [sys.executable, "-m", "relay.fleet_runner",
-           "--goals-file", goals_file, "--agent-url", url, "--state-dir", sd]
+           "--goals-file", goals_file, "--agent-url", url, "--state-dir", sd,
+           "--disk-floor-gb", "0"]
     try:
         if launcher is not None:
             pid = launcher(cmd)
         else:
-            # DETACHED, because this router is a short-lived drain pass. A child that dies with
-            # its parent would be killed fifteen seconds later by the supervisor's next loop.
+            # CREATE_NO_WINDOW, NOT DETACHED_PROCESS -- AND THE DIFFERENCE IS A WINDOW ON THE
+            # OPERATOR'S DESKTOP.
+            #
+            # DETACHED_PROCESS gives the child NO console. That is fine for the child, but the
+            # child here is .venv\Scripts\python.exe, a shim that execs the real interpreter, and
+            # a console application started by a process with no console gets a BRAND NEW one --
+            # which Windows Terminal then puts on screen. Measured: the visible window belonged
+            # to PID 18152 (Python310\python.exe -m relay.fleet_runner), class
+            # CASCADIA_HOSTING_WINDOW_CLASS, hosting a PseudoConsole; its parent was the shim
+            # this call spawned. So the flag was applied to the process that did not need it and
+            # missed the one that did, and every goal sent from a phone popped a black window on
+            # a desktop nobody was sitting at.
+            #
+            # CREATE_NO_WINDOW gives this process a console with no window, and descendants
+            # INHERIT it rather than allocating their own -- which is what reaches the grandchild.
+            # CREATE_NEW_PROCESS_GROUP is kept so a Ctrl+C in the router's own console does not
+            # travel to the run. Detachment was never what kept the child alive: Windows does not
+            # kill children when a parent exits unless they share a job object, and these do not.
             kwargs = {"cwd": REPO}
             if os.name == "nt":
-                kwargs["creationflags"] = (getattr(subprocess, "DETACHED_PROCESS", 0)
-                                           | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+                kwargs["creationflags"] = launch_creationflags()
             else:
                 kwargs["start_new_session"] = True
             pid = subprocess.Popen(cmd, **kwargs).pid
