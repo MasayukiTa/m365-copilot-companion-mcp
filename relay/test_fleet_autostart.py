@@ -19,6 +19,7 @@ import json
 import os
 import sys
 import time
+import types
 
 import pytest
 
@@ -372,3 +373,83 @@ def test_run_started_since_reads_the_start_stamp_not_the_running_flag(state):
     _write_status(state, started=1003.0, running=False)
     assert TR._run_started_since(str(state), 1000.0) is True     # finished, but it DID start
     assert TR._run_started_since(str(state), 1100.0) is False    # belongs to an earlier launch
+
+
+# ── the cockpit, for a fleet nobody is watching ────────────────────────────────────────────────
+
+def test_a_fleet_started_from_the_tunnel_puts_the_cockpit_on_screen(monkeypatch, tmp_path):
+    """THE DESK AND THE PHONE ARE DIFFERENT DOORS. start_all.ps1 opens the cockpit alongside
+    everything else, so a fleet started at the desk is visible. Autostart is the other door, and
+    it opened nothing: measured 2026-09-07, a natural-language goal reached the fleet and
+    finished in 2m10s with FleetCockpit.exe built but not running -- the run was unobserved and
+    the runner's console was the only surface on the desktop."""
+    exe = tmp_path / "FleetCockpit.exe"
+    exe.write_text("", encoding="utf-8")
+    spawned = []
+    monkeypatch.setattr(TR, "COCKPIT_EXE", str(exe))
+    monkeypatch.setattr(TR, "cockpit_is_up", lambda: False)
+    monkeypatch.setattr(TR.os, "name", "nt")
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setattr(TR.subprocess, "Popen", lambda cmd, **k: spawned.append((cmd, k)) or _FakeProc())
+    assert TR.ensure_cockpit() == "launched"
+    assert spawned and spawned[0][0] == [str(exe)]
+
+
+def test_the_cockpit_is_not_opened_twice(monkeypatch, tmp_path):
+    """THE ORDINARY COCKPIT TAKES NO MUTEX. --approval-gate and --authority each hold one, so a
+    duplicate launch of those raises the existing window; this one really does open a second.
+    An unbounded launcher opened forty-two windows in a day and took the machine down."""
+    exe = tmp_path / "FleetCockpit.exe"
+    exe.write_text("", encoding="utf-8")
+    monkeypatch.setattr(TR, "COCKPIT_EXE", str(exe))
+    monkeypatch.setattr(TR, "cockpit_is_up", lambda: True)
+    monkeypatch.setattr(TR.os, "name", "nt")
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setattr(TR.subprocess, "Popen",
+                        lambda *a, **k: pytest.fail("a second cockpit window was opened"))
+    assert TR.ensure_cockpit() == "already running"
+
+
+def test_a_missing_build_does_not_fail_the_launch(monkeypatch, tmp_path):
+    """A host that only serves never compiled the UI. The fleet is running either way, and
+    reporting it as failed because a window is absent would be a lie about the fleet."""
+    monkeypatch.setattr(TR, "COCKPIT_EXE", str(tmp_path / "nope.exe"))
+    monkeypatch.setattr(TR.os, "name", "nt")
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    assert TR.ensure_cockpit().startswith("unavailable")
+
+
+def test_a_cockpit_that_cannot_be_spawned_is_reported_not_raised(monkeypatch, tmp_path):
+    """ensure_cockpit sits on the success path of autostart_fleet. If it raised, a fleet that
+    IS up would be reported as a launch failure and the goal would look unsent."""
+    exe = tmp_path / "FleetCockpit.exe"
+    exe.write_text("", encoding="utf-8")
+    monkeypatch.setattr(TR, "COCKPIT_EXE", str(exe))
+    monkeypatch.setattr(TR, "cockpit_is_up", lambda: False)
+    monkeypatch.setattr(TR.os, "name", "nt")
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    def boom(*a, **k):
+        raise OSError("access denied")
+    monkeypatch.setattr(TR.subprocess, "Popen", boom)
+    assert TR.ensure_cockpit().startswith("launch failed")
+
+
+def test_another_window_of_the_same_exe_is_not_the_cockpit(monkeypatch):
+    """One executable serves three windows. Matching the image name alone would read the
+    approval prompt as "the cockpit is up" and leave the fleet unwatched."""
+    class _P:
+        def __init__(self, argv):
+            self.info = {"name": "fleetcockpit.exe", "cmdline": argv}
+
+    fake = types.SimpleNamespace(
+        process_iter=lambda attrs=None: [_P(["FleetCockpit.exe", "--authority"])])
+    monkeypatch.setitem(sys.modules, "psutil", fake)
+    monkeypatch.setattr(TR, "COCKPIT_EXE", r"C:\x\FleetCockpit.exe")
+    assert TR.cockpit_is_up() is False
+
+    fake.process_iter = lambda attrs=None: [_P(["FleetCockpit.exe"])]
+    assert TR.cockpit_is_up() is True
+
+
+class _FakeProc:
+    pid = 4242
