@@ -35,6 +35,7 @@ supervisor itself is gone).
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 
@@ -49,13 +50,52 @@ OWNERS = {
 SUPERVISED = ("copilot-bridge-edge",)
 
 
+def _profile_dir_regex(profile):
+    r"""A .NET regex string that matches an Edge command line ONLY when `profile` is the
+    trailing path segment of its --user-data-dir value.
+
+    The old condition was `CommandLine -match '<profile>'`, a bare substring test: the
+    profile name appearing anywhere on the line -- a tab URL, an extension path, an
+    unrelated argument -- counted as a match, and under --stop that is a browser stopped by
+    coincidence. Edge launches every process of a profile (the window AND its renderer, GPU
+    and utility children) with the SAME `--user-data-dir=...\<profile>`, so pinning the match
+    to that flag keeps the child-inclusive behaviour browser_procs/stop_profile rely on
+    while refusing an incidental mention elsewhere.
+
+    The name is escaped for regex use (managed names are plain [a-z-] today, but a future
+    one must not be able to inject metacharacters). The value may be quoted or bare, and may
+    use either slash, so we anchor on a path separator before the name and require a quote,
+    whitespace or end-of-string after it.
+    """
+    name = re.escape(profile)
+    # NB: single backslashes below are for the .NET regex, doubled for the Python literal.
+    return r'--user-data-dir="?[^"]*[\\/]%s(?=["\s]|$)' % name
+
+
+
+#: Sentinel: PowerShell could not be run (missing, timed out, or raised). Distinguished
+#: from an empty-but-successful result so ownership can fail CLOSED on it.
+_PS_FAILED = None
+
+
 def _ps(script, timeout=40):
+    """Run a PowerShell snippet. Return its stdout, or `_PS_FAILED` (None) if PowerShell
+    itself could not be run or errored.
+
+    The old contract returned "" on failure, which is indistinguishable from a query that
+    ran and legitimately found nothing. owner_alive() read that "" as "owner not running"
+    and, under --stop, would then kill a HEALTHY Edge whose owner was in fact alive -- the
+    one mistake reap_orphan_edge.py must never make. Callers now treat _PS_FAILED as
+    "unknown" and fall back to the safe (do-not-reap) answer.
+    """
     try:
         out = subprocess.run(["powershell", "-NoProfile", "-Command", script],
                              capture_output=True, text=True, timeout=timeout)
-        return out.stdout or ""
     except Exception:
-        return ""
+        return _PS_FAILED
+    if out.returncode != 0:
+        return _PS_FAILED
+    return out.stdout or ""
 
 
 def owner_alive(pattern):
@@ -64,21 +104,34 @@ def owner_alive(pattern):
     python.exe AND powershell.exe: a series driven from a .ps1 wrapper is just as much an
     owner as one started directly, and missing that would reap a browser out from under a
     live run -- the one mistake this script must never make.
+
+    FAIL CLOSED. If the ownership check itself cannot be performed (PowerShell missing,
+    timed out, or errored), we do NOT get to conclude the owner is gone. Returning True
+    keeps the browser -- an unreadable process table stops the reap rather than licensing
+    it, mirroring relay.edge_recover.profile_is_running. The reverse (fail-open) would let
+    a transient PowerShell failure be read as "owner dead" and kill a live run's browser.
     """
     script = ("@(Get-CimInstance Win32_Process -Filter \"Name='python.exe' OR "
               "Name='powershell.exe' OR Name='pwsh.exe'\" | "
               "Where-Object { $_.CommandLine -match '%s' }).Count" % pattern)
-    out = _ps(script).strip()
+    out = _ps(script)
+    if out is _PS_FAILED:
+        return True  # unknown ownership -> assume alive, do not reap
+    out = out.strip()
     return out.isdigit() and int(out) > 0
 
 
 def browser_procs(profile):
     """(count, total MB) for every Edge process on `profile`, children included."""
+    pred = "$_.CommandLine -and $_.CommandLine -match '%s'" % _profile_dir_regex(profile)
     script = ("$p = Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | "
-              "Where-Object { $_.CommandLine -match '%s' }; "
+              "Where-Object { %s }; "
               "\"{0} {1}\" -f @($p).Count, [int](($p | "
-              "Measure-Object WorkingSetSize -Sum).Sum / 1MB)" % profile)
-    parts = _ps(script).split()
+              "Measure-Object WorkingSetSize -Sum).Sum / 1MB)" % pred)
+    out = _ps(script)
+    if out is _PS_FAILED:
+        return 0, 0
+    parts = out.split()
     if len(parts) == 2 and parts[0].isdigit() and parts[1].lstrip("-").isdigit():
         return int(parts[0]), int(parts[1])
     return 0, 0
@@ -86,12 +139,13 @@ def browser_procs(profile):
 
 def stop_profile(profile):
     """Stop every Edge process on this profile. Returns how many were asked to stop."""
+    pred = "$_.CommandLine -and $_.CommandLine -match '%s'" % _profile_dir_regex(profile)
     n, _ = browser_procs(profile)
     if n:
         _ps("Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | "
-            "Where-Object { $_.CommandLine -match '%s' } | "
+            "Where-Object { %s } | "
             "ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop } "
-            "catch {} }" % profile, timeout=60)
+            "catch {} }" % pred, timeout=60)
     return n
 
 

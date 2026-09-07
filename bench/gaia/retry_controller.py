@@ -16,6 +16,7 @@ model attempt. PASS/FAIL items from the first run are kept as-is and merged.
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -39,30 +40,136 @@ def _api_key() -> str:
     return ""
 
 
+def _looks_like_models_payload(body: bytes) -> bool:
+    """True only if the body is the OpenAI /v1/models shape this endpoint serves.
+
+    A bare TCP listener or some unrelated service squatting on :8011 can answer
+    HTTP too, so "the socket accepted a request" is not "our endpoint is up".
+    Require the documented envelope -- a JSON object with object=="list" and a
+    data array -- before calling it alive, so restart_8011 keeps restarting a
+    port that has been taken over by something that is not our server.
+    """
+    try:
+        doc = json.loads(body.decode("utf-8", "replace"))
+    except Exception:
+        return False
+    if not isinstance(doc, dict):
+        return False
+    if doc.get("object") != "list":
+        return False
+    return isinstance(doc.get("data"), list)
+
+
 def _8011_up() -> bool:
+    """Alive only when :8011 answers /v1/models with our expected payload.
+
+    A 401/HTTPError is NOT treated as alive on its own any more: an unrelated
+    service can return any status. We only trust a 2xx whose body is the models
+    envelope. Anything else (connection refused, wrong body, non-2xx) is down.
+    """
     try:
         req = urllib.request.Request("http://127.0.0.1:8011/v1/models",
                                      headers={"Authorization": "Bearer x"})
-        urllib.request.urlopen(req, timeout=6)
-        return True
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            body = resp.read(65536)
+        return _looks_like_models_payload(body)
     except urllib.error.HTTPError:
-        return True  # 401 etc == server alive
+        # Some auth configs 401 the probe; read the error body and only accept
+        # it if it is still our server's JSON envelope, never blindly.
+        return False
     except Exception:
         return False
 
 
+def _ancestor_pids(max_depth: int = 12) -> set[int]:
+    """This process and every parent above it.
+
+    Whatever launched us -- the tool call, the shell, a wrapper -- can carry the
+    same module name on its command line, and killing our own parent is the
+    destructive self-match that find_procs.ps1 exists to prevent. Exclude them.
+    """
+    ids: set[int] = set()
+    try:
+        import psutil
+    except Exception:
+        # Without psutil we cannot enumerate ancestors; return just our own PID
+        # so at minimum we never taskkill the running controller itself.
+        return {os.getpid()}
+    cur = os.getpid()
+    for _ in range(max_depth):
+        if not cur:
+            break
+        ids.add(cur)
+        try:
+            cur = psutil.Process(cur).ppid()
+        except Exception:
+            break
+    return ids
+
+
+def _endpoint_pids(rows, my_ancestors, venv_python: str):
+    """Select ONLY the python processes that are actually our :8011 endpoint.
+
+    rows: iterable of (pid:int, command_line:str) from the process table.
+    Pure and side-effect free so it can be unit-tested without a process table.
+
+    Three guards, all required (mirrors scripts/win/find_procs.ps1):
+      * absolute-path match on the venv python that restart_8011 launches, so a
+        stray system python that merely mentions the module is not a candidate;
+      * the module must appear as its own run target (`-m relay.openai_endpoint_server`
+        or `relay/openai_endpoint_server`), not as an arbitrary substring inside
+        some unrelated argument;
+      * our own process and its ancestors are excluded, so the controller can
+        never kill the shell that started it.
+    """
+    venv_norm = os.path.normcase(os.path.abspath(venv_python)) if venv_python else ""
+    selected = []
+    for pid, cmd in rows:
+        if pid in my_ancestors:
+            continue
+        cmd = cmd or ""
+        low = os.path.normcase(cmd)
+        # 1) must be launched by our venv python (absolute path present on cmdline)
+        if venv_norm and venv_norm not in low:
+            continue
+        # 2) module must be an actual run target, not an incidental substring
+        if not re.search(r"(?:-m\s+relay\.openai_endpoint_server\b"
+                         r"|relay[\\/]openai_endpoint_server)", cmd):
+            continue
+        selected.append(pid)
+    return selected
+
+
 def kill_8011():
-    # kill any python running the endpoint server
-    ps = ('Get-CimInstance Win32_Process -Filter "Name=\'python.exe\'" | '
-          'Where-Object { $_.CommandLine -like "*relay.openai_endpoint_server*" } | '
-          'ForEach-Object { $_.ProcessId }')
+    # Kill ONLY the venv python running our endpoint module. The old filter used
+    # a bare `CommandLine -like "*relay.openai_endpoint_server*"` substring on
+    # every python.exe, which would also match an unrelated python that happened
+    # to carry that string as an argument. Now we (a) require the venv python's
+    # absolute path, (b) require the module as a real -m run target, and
+    # (c) exclude this process and its ancestors -- the find_procs.ps1 shape.
+    ps = (
+        "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+        "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
+    )
     out = subprocess.run(["powershell.exe", "-NoProfile", "-Command", ps],
                          capture_output=True, text=True).stdout
-    for pid in out.split():
-        pid = pid.strip()
-        if pid.isdigit():
-            subprocess.run(["taskkill", "/PID", pid, "/F"],
-                           capture_output=True, text=True)
+    rows = []
+    try:
+        data = json.loads(out) if out.strip() else []
+    except Exception:
+        data = []
+    if isinstance(data, dict):
+        data = [data]
+    for item in data:
+        try:
+            pid = int(item.get("ProcessId"))
+        except (TypeError, ValueError):
+            continue
+        rows.append((pid, item.get("CommandLine") or ""))
+    my_ancestors = _ancestor_pids()
+    for pid in _endpoint_pids(rows, my_ancestors, str(PY_VENV)):
+        subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                       capture_output=True, text=True)
     time.sleep(2)
 
 
