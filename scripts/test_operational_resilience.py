@@ -174,8 +174,19 @@ def test_the_first_server_launch_does_not_wait_out_the_debounce():
     qs = (ROOT / "quickstart.bat").read_text(encoding="utf-8")
 
     # the counter starts primed, so the first failing check acts instead of counting to four
-    assert "$serverMiss = $FailuresBeforeAction - 1" in sup
-    assert "$serverMiss = 0\n$tunnelMiss = 0" not in sup, "the cold-start window is back"
+    # MEASURED, not assumed: this machine's supervisor log shows "supervisor up" at 11:44:39
+    # and "MCP server process launched" at 11:45:52 -- 73 seconds -- and the ten runs before it
+    # were all 65-75s.
+    #
+    # The condition is "nothing owns the port", NOT "the first check failed". Priming the
+    # counter would let one transient /health timeout fire Start-Server against a server that
+    # is perfectly healthy, and Start-Server kills whatever owns the port before relaunching.
+    assert "Get-NetTCPConnection -LocalPort $Port -State Listen" in sup
+    assert "if (-not $portOwner)" in sup
+    assert "$serverMiss = $FailuresBeforeAction - 1" not in sup, "the unsafe form is back"
+    assert sup.index("nothing is listening on :$Port at startup") \
+        < sup.index("$serverMiss -ge $FailuresBeforeAction"), \
+        "the cold-start launch sits inside the debounce branch"
 
     # the premise: nothing but the supervisor starts the server
     assert "supervisor.ps1" in start_all
