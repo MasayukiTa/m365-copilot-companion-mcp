@@ -639,3 +639,20 @@ def test_the_supervisor_probe_matches_this_checkout_and_not_whoever_mentions_it(
         assert '$_.Name -match \'^(powershell|pwsh)\'' in code, what
         assert '-notlike "*register-supervisor*"' in code, what
         assert 'Join-Path $scriptDir "supervisor.ps1"' in code, what
+
+
+def test_no_tunnel_name_is_not_ownership():
+    """Test-TunnelOwned returned $true for an empty name, so a machine with no MCP_TUNNEL_NAME
+    at all reported "Dev Tunnel name is owned by this account". And this check is not part of
+    the tunnel chain, so it is not skipped when the name is missing -- it simply went green.
+
+    $null is the contract the function already had for "could not be determined", which is what
+    this is. Verified: with the name stubbed empty the line reads [WARN] indeterminate rather
+    than [ OK ], and that now counts toward the unanswered-required total."""
+    doctor = (ROOT / "scripts" / "doctor.ps1").read_text(encoding="utf-8")
+
+    owned = doctor[doctor.index("function Test-TunnelOwned"):]
+    owned = owned[:owned.index("\n}\n")]
+    assert "IsNullOrWhiteSpace($name)) { return $null }" in owned, \
+        "an unset tunnel name reads as owned again"
+    assert "{ return $true }" not in owned.split("for ($attempt")[0]
