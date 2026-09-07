@@ -1822,6 +1822,44 @@ def _continue_nudge(count):
             "書いてください（同じ作業の繰り返しは不要です）。" % (phrase, count))
 
 
+#: THE SAME DISEASE THE CONTINUE NUDGE WAS CURED OF, ON THE OTHER BRANCH.
+#:
+#: The escalation above fixed CONTINUE and the refuter's own UNCLEAR retry, and left the
+#: REFUTED branch alone: it sets `self.job = REFUTE_FIX_JOB % reason` once and the job stays in
+#: self.job. When send() defers (GenerationInProgress, and the sweep must not block) the very
+#: same bytes go out on the next turn. Measured over 1,756 transcripts: of 303 consecutive
+#: reviewer-remark pairs, 81 were byte-identical, and ALL 81 had no worker response between
+#: them -- i.e. every one was this re-send, not a refuter that repeated itself. The refuter
+#: never once returned the same remark (the 222 differing pairs have a median Jaccard of 0.08).
+#:
+#: The harm is the one already recorded for the CONTINUE branch: byte-identical re-injection
+#: degrades the M365 Copilot model until it refuses to answer (~5 repeats, observed live).
+#: The measurement harm is separate and just as real -- every "how many refute rounds did this
+#: take" figure counts those re-sends as rounds, so the round counts are inflated by an unknown
+#: amount until this is separated.
+#:
+#: Same shape as _continue_nudge: pure, count-driven, first attempt byte-identical to the old
+#: constant so nothing that passed before changes.
+_REFUTE_RESEND_PHRASES = (
+    "先ほどの指摘への対応がまだ確認できていません。",
+    "同じ指摘を再送しています。未対応の点だけを手短に処理してください。",
+    "この指摘は未解決のままです。対応済みならその根拠を、未対応なら対応を示してください。",
+)
+
+
+def _refute_fix_job(reason, attempt=1):
+    """The REFUTED-branch job text for the attempt-th send of the SAME reason (1-based).
+
+    attempt 1 returns the original constant unchanged. attempt 2+ prefixes an escalating
+    phrase that embeds the count, so no two sends of one reason are ever byte-identical.
+    """
+    body = REFUTE_FIX_JOB % (reason or "(no reason)")
+    if attempt <= 1:
+        return body
+    phrase = _REFUTE_RESEND_PHRASES[(attempt - 2) % len(_REFUTE_RESEND_PHRASES)]
+    return "%s（再送%d回目）\n%s" % (phrase, attempt, body)
+
+
 _PHASE_LABELS = {
     "pending":     "Queued",
     "ready":       "Starting",
@@ -1979,6 +2017,13 @@ class RelayWorker:
         self.max_refute = max_refute
         self.refute_count = 0
         self._refuter_session = None
+        #: The reason of the refute round currently being worked, and how many times ITS job has
+        #: been put on the wire. A deferred send leaves self.job intact, so without this the same
+        #: bytes go out again next sweep -- see _refute_fix_job for the measurement.
+        self._refute_reason = ""
+        self._refute_attempt = 0
+        #: The last job text actually sent, so a re-send can be recognised as one.
+        self._last_sent_job = ""
         # deep-research delegation (ported from the single-agent relay): a fleet worker can emit
         # `RESEARCH: <query>` and the relay spawns the Researcher sub-agent in a side page, feeds
         # its report back, and the worker continues -- the accuracy lever the single-agent relay
@@ -2529,6 +2574,17 @@ class RelayWorker:
             self._last_was_steer = True
         else:
             self._last_was_steer = False
+        # A DEFERRED SEND LEAVES self.job INTACT, SO THE NEXT SWEEP RE-SENDS IT VERBATIM.
+        # Recognise that here and vary the text rather than putting identical bytes on the wire
+        # a second time. Scoped to the REFUTED branch because that is the one measured to do it
+        # (81 of 303 consecutive remark pairs) and the one still on the old constant; the
+        # CONTINUE branch already composes fresh text from its own count.
+        if (self._refute_reason
+                and self.job
+                and self.job == self._last_sent_job
+                and not self._last_was_steer):
+            self._refute_attempt += 1
+            self.job = _refute_fix_job(self._refute_reason, self._refute_attempt)
         try:
             self._count_before = self.drv._answers().count()
             self.drv._count_before = self._count_before
@@ -2628,6 +2684,7 @@ class RelayWorker:
         self._send_fail_streak = 0
         self._redirect_renavs = 0
         self._tx.user(self.turn, self.job)     # persist the full sent prompt for this turn
+        self._last_sent_job = self.job         # so the next turn can recognise a verbatim re-send
         self._last_text, self._stable_since, self._t_send = None, None, time.time()
         self._settle_state = _settle.SettleState()
         self.status = "waiting"
@@ -4247,7 +4304,11 @@ class RelayWorker:
                        % (self.refute_count, kind,
                           (": " + reason) if reason else ""))[:300]
         if kind == "REFUTED":
-            self.job = REFUTE_FIX_JOB % (reason or "(no reason)")
+            # A NEW refute round: reset the resend counter, so its first send is byte-identical
+            # to what this branch has always produced.
+            self._refute_reason = reason or "(no reason)"
+            self._refute_attempt = 1
+            self.job = _refute_fix_job(self._refute_reason, 1)
             self.status = "ready"
             return False
         if self.fresh_replay_count:
