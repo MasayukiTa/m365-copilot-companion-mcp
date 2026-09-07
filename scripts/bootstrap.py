@@ -457,10 +457,47 @@ def step_gen_env() -> None:
         ):
             if not any(line.strip().startswith(key + "=") for line in current.splitlines()):
                 missing.append(f"{key}={value}")
-        if missing:
+
+        # THE SECRETS ARE ALSO A MISSING KEY. The block above only ever backfilled non-secret
+        # defaults, so an existing .env that had lost MCP_API_KEY or the unlock password (a bad
+        # hand-edit, a partial merge, a truncated sync) was left without them -- and because
+        # this step returns early on "exists", it never regenerated them either. The result was
+        # step_verify failing on every subsequent run with no step able to repair it, i.e. a
+        # dead end that only a human editing .env by hand could break. So treat an ABSENT
+        # secret as a missing key and mint a fresh one, on exactly the same append-only terms:
+        # if the key is already present (even blank/placeholder -- that is the user's value to
+        # keep or fix), it is NOT touched. We never overwrite an existing secret here.
+        secret_lines = []
+        have_api = any(line.lstrip().startswith("MCP_API_KEY=") for line in current.splitlines())
+        have_unlock = any(
+            line.lstrip().startswith("MCP_UNLOCK_PASSWORD=")
+            or line.lstrip().startswith(UNLOCK_PASSWORD_PROTECTED_VAR + "=")
+            for line in current.splitlines()
+        )
+        minted_unlock = None
+        if not have_api:
+            secret_lines.append("MCP_API_KEY=" + secrets.token_hex(20))
+        if not have_unlock:
+            minted_unlock = secrets.token_hex(8)
+            secret_lines.append(UNLOCK_PASSWORD_PROTECTED_VAR + "=" + protect_secret(minted_unlock))
+
+        appended = missing + secret_lines
+        if appended:
             suffix = "" if not current or current.endswith(("\n", "\r")) else "\n"
-            env_path.write_text(current + suffix + "\n".join(missing) + "\n", encoding="utf-8")
-            log("    OK: .env already exists; added safe default(s): " + ", ".join(missing))
+            env_path.write_text(current + suffix + "\n".join(appended) + "\n", encoding="utf-8")
+            if missing:
+                log("    OK: .env already exists; added safe default(s): " + ", ".join(missing))
+            if secret_lines:
+                # Name the KEYS, never the values, in the transcript -- same rule the fresh-.env
+                # path follows: the log file is what an operator is asked to send when setup fails.
+                log("    OK: .env was missing required secret(s); generated: "
+                    + ", ".join(s.split("=", 1)[0] for s in secret_lines))
+                if minted_unlock is not None:
+                    # ON SCREEN ONLY (show_only never reaches the transcript): the protected form
+                    # is what lands in .env, so this print is the one chance to read the real value.
+                    show_only("    Your unlock password:           " + minted_unlock)
+                    _transcribe("    (a new unlock password was shown on screen; not recorded here. "
+                                "Re-read it with scripts/copilot_studio_values.ps1)")
         else:
             log("    OK: .env already exists (left untouched)")
         return

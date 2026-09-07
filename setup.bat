@@ -54,9 +54,21 @@ if defined CABUNDLE (
 
 
 REM --- 1. Prefer the project venv if it already exists ---------------------
+REM EXISTENCE IS NOT RUNNABILITY. bootstrap.py is the repair logic, and a repair tool that
+REM can only be launched by the interpreter it is meant to repair is no repair at all. A .venv
+REM copied from another machine (folder copy / OneDrive sync / ZIP restore) carries a
+REM python.exe whose base Python has moved or is gone, so it exists on disk yet cannot execute
+REM -- and launching bootstrap.py with it dies before any of that repair runs. So PROBE it the
+REM same way we already probe py/python below (a trivial 'import sys'), and only adopt it if it
+REM actually runs. If it does not, fall through to the py/python/uv routes, which can rebuild
+REM the venv; do NOT set PYEXE to a dead interpreter.
 if exist ".venv\Scripts\python.exe" (
-    set "PYEXE=.venv\Scripts\python.exe"
-    goto :have_python
+    ".venv\Scripts\python.exe" -c "import sys" >nul 2>nul
+    if not errorlevel 1 (
+        set "PYEXE=.venv\Scripts\python.exe"
+        goto :have_python
+    )
+    echo .venv\Scripts\python.exe exists but could not run; looking for another Python.
 )
 
 REM --- 2. Existing per-user Python on PATH ---------------------------------
