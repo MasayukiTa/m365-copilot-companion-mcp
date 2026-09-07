@@ -67,7 +67,7 @@ def test_doctor_reads_the_crash_log_instead_of_telling_the_user_to():
     path the whole time."""
     doctor = (ROOT / "scripts" / "doctor.ps1").read_text(encoding="utf-8")
 
-    assert "function Get-ServerDeathReason" in doctor
+    assert "function Get-ServerLastOutput" in doctor
     assert "$script:serverFix" in doctor
     # the old advice handed over a path and a line count and left the reader to it
     assert "(last 20 lines). Read that" not in doctor
@@ -121,3 +121,67 @@ def test_quickstart_falls_back_to_the_preserved_crash_log():
     assert doctor.index("$script:serverErrLog") < doctor.index("$script:serverErrHistory")
     # and quickstart still runs the doctor, or none of its checks reach anyone
     assert "scripts\doctor.ps1" in qs
+
+
+def test_a_successful_startup_is_never_reported_as_the_reason_it_died():
+    """MEASURED on this machine: a HEALTHY server's stderr ends with uvicorn's own
+        INFO:     Application startup complete.
+        INFO:     Uvicorn running on http://127.0.0.1:8000
+    preceded by deprecation warnings. Reading "the last non-empty lines of stderr" as a cause of
+    death therefore announces SUCCESS as a cause of death on any machine whose log survives a
+    launch that worked -- worse than silence, because a reader given a false cause stops looking.
+    Those lines still carry a true finding: the log is from a launch that came up, so it cannot
+    explain a server that is down now."""
+    doctor = (ROOT / "scripts" / "doctor.ps1").read_text(encoding="utf-8")
+    qs = (ROOT / "quickstart.bat").read_text(encoding="utf-8")
+
+    assert "Application startup complete" in doctor and "Uvicorn running on" in doctor
+    # The two cases are separate branches on the marker, which is what makes the distinction --
+    # not the wording, which is concatenated across source lines and cannot be matched here.
+    # The rendered message was checked by running doctor with the health probe stubbed false
+    # against this machine's real log, which ends in "Application startup complete": it says the
+    # output on record is from a launch that started successfully and does not explain the
+    # failure. A source assertion cannot see that; it can only see that the branch exists.
+    assert "$script:STARTED_MARKERS" in doctor
+    assert doctor.count("$out.started") >= 2, "the started/not-started cases are not split"
+    # quickstart carries the same distinction, and only fires when the server is really down
+    assert "Application startup complete" in qs
+    assert "127.0.0.1:8000/health" in qs, "the block still fires on any red line"
+
+
+def test_the_server_block_in_quickstart_is_gated_on_the_server_not_on_any_red_line():
+    """It fired whenever doctor found ANY failure and stderr was non-empty, so an unrelated red
+    -- a tunnel name, a missing agent URL -- printed "the MCP server tried to start and stopped"
+    over a server that was running perfectly."""
+    qs = (ROOT / "quickstart.bat").read_text(encoding="utf-8")
+    block = qs[qs.index("$up = $false"):]
+    assert block.index("Invoke-WebRequest") < block.index("server.err.log"), \
+        "the log is read before the server is probed"
+
+
+def test_the_first_server_launch_does_not_wait_out_the_debounce():
+    """THE CAUSE OF THE THREE RED LINES, and it is not a fault at all.
+
+    start_all.ps1 launches only the supervisor -- it never runs main.py itself -- and the
+    supervisor counted FailuresBeforeAction (4) health checks at IntervalSeconds (15) apart
+    before calling Start-Server even once. quickstart runs doctor as soon as start_all returns,
+    so on every fresh machine the health check ran inside a 45-60 second window where the server
+    did not yet exist BY DESIGN: server down, tunnel not serving, Bearer rejected -- one cause,
+    no fault. It reproduced identically on two different weeks.
+    """
+    sup = (ROOT / "scripts" / "supervisor.ps1").read_text(encoding="utf-8")
+    start_all = (ROOT / "scripts" / "start_all.ps1").read_text(encoding="utf-8")
+    qs = (ROOT / "quickstart.bat").read_text(encoding="utf-8")
+
+    # the counter starts primed, so the first failing check acts instead of counting to four
+    assert "$serverMiss = $FailuresBeforeAction - 1" in sup
+    assert "$serverMiss = 0\n$tunnelMiss = 0" not in sup, "the cold-start window is back"
+
+    # the premise: nothing but the supervisor starts the server
+    assert "supervisor.ps1" in start_all
+    assert 'ArgumentList "main.py"' in sup
+
+    # and quickstart waits for the server before asking whether it is healthy
+    wait = qs.index("Waiting for the MCP server to answer")
+    doctor_call = qs.index("scripts\doctor.ps1")
+    assert wait < doctor_call, "the health check still runs before the wait"

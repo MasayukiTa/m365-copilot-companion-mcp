@@ -415,7 +415,18 @@ Write-Log "supervisor up (tunnel=$TunnelName port=$Port interval=${IntervalSecon
 Invoke-FleetAutoResume -DryRun:$FleetResumeDryRun | Out-Null
 Invoke-ReviewAutoResume | Out-Null
 
-$serverMiss = 0
+# THE DEBOUNCE IS FOR A SERVER THAT MIGHT COME BACK, NOT FOR ONE THAT WAS NEVER STARTED.
+# Starting at zero meant the FIRST launch waited for four consecutive failures -- 15s apart, so
+# 45-60 seconds -- before Start-Server was called even once. start_all.ps1 launches only this
+# supervisor (it never runs main.py itself), and quickstart runs doctor immediately after
+# start_all returns, so on every fresh machine the health check ran inside a window where the
+# server did not yet exist BY DESIGN. That is the three red lines: server down, tunnel not
+# serving, Bearer rejected -- all one cause, and none of them a fault.
+#
+# Pre-loading the counter makes the first failing check act at once. It cannot cause a spurious
+# restart: if a server is already up, the first check passes and resets this to zero before the
+# branch is ever reached.
+$serverMiss = $FailuresBeforeAction - 1
 $tunnelMiss = 0
 $loggedIn = $null   # tri-state ($null unknown / $true / $false) -- log only on transition
 
