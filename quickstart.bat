@@ -155,7 +155,7 @@ if "!TUNNEL_ACCESS!"=="anonymous" (
     REM REPLACED, NOT APPENDED. Get-AllowAnonymous takes the FIRST matching line and breaks, so
     REM an older MCP_TUNNEL_ALLOW_ANONYMOUS=0 further up the file would keep winning and the
     REM operator would be told the choice was recorded while nothing had changed.
-    powershell -NoProfile -Command "$p = Join-Path (Get-Location) '.env'; $keep = @(); if (Test-Path $p) { $keep = @(Get-Content $p | Where-Object { $_ -notmatch '^\s*MCP_TUNNEL_ALLOW_ANONYMOUS\s*=' }) }; $keep += 'MCP_TUNNEL_ALLOW_ANONYMOUS=1'; Set-Content -Path $p -Value $keep -Encoding ASCII"
+    powershell -NoProfile -Command "$p = Join-Path (Get-Location) '.env'; $keep = @(); if (Test-Path $p) { $keep = @(Get-Content $p | Where-Object { $_ -notmatch '^\s*MCP_TUNNEL_ALLOW_ANONYMOUS\s*=' }) }; $keep += 'MCP_TUNNEL_ALLOW_ANONYMOUS=1'; [IO.File]::WriteAllLines($p, $keep, (New-Object System.Text.UTF8Encoding($false)))"
     echo   Recorded: anonymous access. ^(MCP_TUNNEL_ALLOW_ANONYMOUS=1 in .env^)
 )
 if "!TUNNEL_ACCESS!"=="none" (
