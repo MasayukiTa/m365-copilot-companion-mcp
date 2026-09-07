@@ -176,6 +176,39 @@ def fleet_runs_active():
         return []
 
 
+def _mine_pids():
+    """This process PID plus its full ancestor chain, so a kill can never select
+    verify_stack.py itself or the shell/launcher that started it. Without this the
+    `main\\.py` marker would happily match this very script's own command line and
+    `taskkill /T` would reap the caller -- the process-kill failure class this file
+    is meant to be safe against."""
+    mine = set()
+    try:
+        import psutil  # type: ignore
+        p = psutil.Process()
+        while p is not None:
+            mine.add(int(p.pid))
+            try:
+                p = p.parent()
+            except Exception:
+                break
+    except Exception:
+        # psutil absent: walk ParentProcessId via CIM from our own PID.
+        mine.add(int(os.getpid()))
+        try:
+            walk = ("$p=%d; while($p -and $p -ne 0){ $p; "
+                    "$q=(Get-CimInstance Win32_Process -Filter \"ProcessId=$p\"); "
+                    "if($q){ $p=$q.ParentProcessId } else { break } }" % os.getpid())
+            out = subprocess.run(["powershell", "-NoProfile", "-Command", walk],
+                                 capture_output=True, text=True, timeout=20).stdout
+            for x in out.split():
+                if x.strip().isdigit():
+                    mine.add(int(x))
+        except Exception:
+            pass
+    return mine
+
+
 def stop_and_wait(match, label, timeout_s=120):
     """Stop the matching processes and wait for a launcher to put one back.
 
@@ -183,13 +216,21 @@ def stop_and_wait(match, label, timeout_s=120):
     notice and replace it -- and because launching one from here would mean reproducing the
     environment its own launcher sets, which is how two subtly different bridges come to
     exist on one machine.
+
+    The candidate set excludes this process and its ancestors ($mine): the markers are
+    plain substrings (e.g. `main\\.py`) that this very script's command line can satisfy,
+    and `taskkill /T` reaps a whole tree -- so an unguarded match could kill the caller.
     """
+    mine = _mine_pids()
+    excl = "@(%s)" % ",".join(str(p) for p in sorted(mine)) if mine else "@()"
+    pred = ("$mine=%s; $_.CommandLine -match '%s' -and "
+            "($mine -notcontains [int]$_.ProcessId)" % (excl, match))
     kill = ("Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
-            "Where-Object { $_.CommandLine -match '%s' } | "
+            "Where-Object { %s } | "
             "Sort-Object ParentProcessId | Select-Object -First 1 | "
-            "ForEach-Object { taskkill /PID $_.ProcessId /T /F }" % match)
+            "ForEach-Object { taskkill /PID $_.ProcessId /T /F }" % pred)
     count = ("(Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
-             "Where-Object { $_.CommandLine -match '%s' } | Measure-Object).Count" % match)
+             "Where-Object { %s } | Measure-Object).Count" % pred)
     print("     stopping %s and waiting for its launcher..." % label)
     subprocess.run(["powershell", "-NoProfile", "-Command", kill],
                    capture_output=True, text=True, timeout=60)
