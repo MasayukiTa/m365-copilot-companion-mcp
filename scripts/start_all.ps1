@@ -315,9 +315,15 @@ function Invoke-PostUpdateTail {
         try {
             $selfPath = Join-Path $scriptDir "start_all.ps1"
             if (Test-Path $selfPath) {
-                $reArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $selfPath)
+                # EVERY SWITCH THIS RUN WAS GIVEN, and the path quoted. -CoreOnly was missing:
+                # a self-restart during the core start would come back as a FULL start, walk into
+                # Invoke-FirstTimeSetupGate and demand the agent URL -- which is precisely what
+                # STEP 5 has not created yet, because -CoreOnly exists to run BEFORE STEP 5.
+                # $selfPath was unquoted too, so an install path with a space split the argument.
+                $reArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ('"{0}"' -f $selfPath))
                 if ($NoUi) { $reArgs += "-NoUi" }
                 if ($NoSplash) { $reArgs += "-NoSplash" }
+                if ($CoreOnly) { $reArgs += "-CoreOnly" }
                 $env:MCP_STARTALL_REEXEC = "1"
                 Start-Process powershell -WindowStyle Hidden -ArgumentList $reArgs | Out-Null
                 # Terminate THIS (old) process hard. A bare `exit` here throws a
