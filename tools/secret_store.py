@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import base64
 import ctypes
+import logging
 import os
 from ctypes import wintypes
+
+_log = logging.getLogger(__name__)
 
 UNLOCK_PASSWORD_VAR = "MCP_UNLOCK_PASSWORD"
 UNLOCK_PASSWORD_PROTECTED_VAR = "MCP_UNLOCK_PASSWORD_PROTECTED"
@@ -83,18 +86,62 @@ def unprotect_secret(value: str) -> str:
     return _blob_to_bytes(plain_blob).decode("utf-8")
 
 
+#: Why the unlock password could not be read, or "" when there is nothing wrong.
+#:
+#: A FAILURE TO DECRYPT IS NOT AN ABSENCE, AND SAYING SO COST A DAY OF DIAGNOSIS.
+#: The protected value is bound to ONE Windows user on ONE machine (protect_secret calls
+#: CryptProtectData with no LOCAL_MACHINE flag), so an .env carried to a new PC -- or to a second
+#: account on the same PC -- holds a blob this user cannot open. That raised, the except swallowed
+#: it, "" came back, and unlock() reported "MCP_UNLOCK_PASSWORD is not configured": a message
+#: naming the variable that ISN'T set while the one that IS set sat there undecryptable. Nothing
+#: in the logs said DPAPI. Startup is unaffected, so the stack looks healthy right up to the first
+#: mutating tool, and then every one of them is refused for a reason nobody can see.
+#:
+#: Module state rather than an exception because every caller treats "" as "not configured" and
+#: changing that contract would rewrite the gate itself. The reason is recorded beside the answer
+#: so a caller that wants to explain can, and one that does not is unaffected.
+_LAST_PROBLEM = [""]
+
+#: Diagnostic codes. Callers should test these rather than match the prose.
+PROBLEM_UNSET = "unset"
+PROBLEM_UNDECRYPTABLE = "undecryptable"
+
+
+def unlock_password_problem() -> str:
+    """The reason the last read failed: "", PROBLEM_UNSET or PROBLEM_UNDECRYPTABLE."""
+    return _LAST_PROBLEM[0]
+
+
 def unlock_password_from_env(environ=None) -> str:
-    """Read the unlock password from a plain legacy or protected env value."""
+    """Read the unlock password from a plain legacy or protected env value.
+
+    Returns "" when it cannot be read; call unlock_password_problem() for WHY.
+    """
     env = environ if environ is not None else os.environ
     plain = (env.get(UNLOCK_PASSWORD_VAR) or "").strip()
     if plain:
+        _LAST_PROBLEM[0] = ""
         return plain
     protected = (env.get(UNLOCK_PASSWORD_PROTECTED_VAR) or "").strip()
     if not protected:
+        _LAST_PROBLEM[0] = PROBLEM_UNSET
         return ""
     try:
-        return unprotect_secret(protected)
-    except Exception:
+        value = unprotect_secret(protected)
+        _LAST_PROBLEM[0] = ""
+        return value
+    except Exception as exc:
+        _LAST_PROBLEM[0] = PROBLEM_UNDECRYPTABLE
+        # STDERR, NEVER STDOUT. This module is imported by processes whose stdout is parsed as
+        # data and by the MCP server's stdio transport, where a stray line breaks the protocol.
+        try:
+            _log.warning(
+                "%s is set but this Windows account cannot decrypt it (%s: %s). DPAPI values are "
+                "bound to one user on one machine, so an .env copied from another PC or account "
+                "cannot be opened here. Re-run the setup on THIS machine to re-protect it.",
+                UNLOCK_PASSWORD_PROTECTED_VAR, type(exc).__name__, exc)
+        except Exception:
+            pass
         return ""
 
 
