@@ -72,6 +72,14 @@ def main():
     check("preflight_job_has_unlock", "unlock" in (w.job or ""))
     check("preflight_job_has_password", PW in (w.job or ""))
     check("preflight_job_keeps_goal", "フォルダ作って" in (w.job or ""))
+    # THE TOKEN, NOT JUST THE PASSWORD. These four assertions used to stop at "the job mentions
+    # unlock and carries the password", which both held while the prefix was telling workers the
+    # connection would simply be open afterwards. With MCP_REQUIRE_UNLOCK_TOKEN on, the server
+    # unlocks the IP and then refuses every call that arrives without the token it returned, so
+    # a prefix that never mentions unlock_token produces a worker that is refused until its
+    # attempts run out. The test passed throughout. Assert the hand-off itself.
+    check("preflight_job_names_the_token", "unlock_token" in (w.job or ""))
+    check("preflight_job_says_to_pass_it", "渡して" in (w.job or ""))
 
     # A later locked reply (for example after backend IP rotation) still injects a bounded retry.
     w._decide(LOCKED)
@@ -81,6 +89,7 @@ def main():
     check("inject_job_keeps_goal", "フォルダ作って" in (w.job or ""))
     check("inject_not_terminal", w.outcome is None and w.status != "stuck")
     check("reason_no_password_leak", PW not in (w.reason or ""))
+    check("inject_job_names_the_token", "unlock_token" in (w.job or ""))
 
     # 2. cap: after MAX_UNLOCK_ATTEMPTS injections, the next locked reply -> STUCK (no infinite loop)
     w2 = RelayWorker("g", "u1")
@@ -90,6 +99,11 @@ def main():
     w2._decide(LOCKED)                                  # one past the cap
     check("cap_goes_stuck", w2.status == "stuck" and w2.outcome == "STUCK")
     check("cap_reason_actionable", "unlock" in (w2.reason or "") and PW not in (w2.reason or ""))
+    # THE REASON MUST LIST THE CAUSE THAT HAPPENS. It named a rotating backend IP and a wrong
+    # password; on 2026-09-07 it was neither, and the two jobs that hit this spent 17 and 6
+    # turns before anyone looked past the reason it printed. Whoever reads it is trying to find
+    # out why, so the token-enforcement case belongs in it -- and it is the cheapest to check.
+    check("cap_reason_names_token_enforcement", "unlock_token" in (w2.reason or ""))
 
     # 3. missing password -> STUCK with a clear 'not configured' reason (patch the local reader)
     orig = rf._unlock_password
