@@ -506,3 +506,26 @@ def test_start_all_reports_its_failure_count_and_quickstart_reads_it():
     # neither stops the run: the health check at the end reports either way
     assert "exit /b" not in qs[qs.index("The core startup reported problem"):
                                qs.index("STEP 5/7")]
+
+
+def test_a_blocked_setup_dialog_asks_in_the_console_instead_of_dead_ending():
+    """configure_env.ps1 exits 4 when Add-Type/WinForms is refused -- its own comment names
+    AppLocker on managed machines, which is the kind of machine this gets installed on. The only
+    way out was the printed advice "edit .env by hand", which an installer cannot rely on, and
+    the one REQUIRED value stayed unset.
+
+    cmd can ask for a line of text on any machine. Only the required key: the fleet URL is
+    optional and falls back to the main one. Exercised with configure_env stubbed to 4 and the
+    agent URL absent -- the fallback ran and reached the .env write."""
+    qs = (ROOT / "quickstart.bat").read_text(encoding="utf-8")
+    cfg = (ROOT / "scripts" / "configure_env.ps1").read_text(encoding="utf-8")
+
+    assert "exit 4" in cfg, "configure_env no longer reports a blocked dialog"
+    assert "CFG_DIALOG_BLOCKED" in qs
+    assert "MCP_IMPL_AGENT_URL: " in qs, "the console fallback does not ask"
+    assert "by hand, then run quickstart.bat again." not in qs, "the dead-end advice is back"
+    # only asks when the key is still absent, so a re-run does not append a duplicate
+    fb = qs[qs.index("CONSOLE FALLBACK"):]
+    assert fb.index('findstr /b /r "MCP_IMPL_AGENT_URL=..*"') < fb.index("set /p IMPL_URL")
+    # flattened: set /p inside a block did not settle before the if that read it
+    assert "goto :after_cfg_fallback" in qs

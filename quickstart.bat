@@ -263,9 +263,10 @@ if not defined SKIP56 (
     REM comment says so -- and they were being discarded, so a cancelled dialog and a saved one
     REM were indistinguishable from here. Checked highest-first because `if errorlevel N` is
     REM "N or greater", and read immediately: any command in between resets it.
+    if errorlevel 4 set "CFG_DIALOG_BLOCKED=1"
     if errorlevel 4 (
-        echo   The dialog could not run on this machine. Put MCP_IMPL_AGENT_URL=... into .env
-        echo   by hand, then run quickstart.bat again.
+        echo   The dialog could not run on this machine -- that is usually AppLocker blocking
+        echo   the WinForms assembly. Asking here instead.
     ) else if errorlevel 3 (
         echo   Saved, but the main agent URL was left BLANK -- chat and fleet will not work
         echo   until it is set. Re-run configure_env.bat when you have it.
@@ -277,6 +278,25 @@ if not defined SKIP56 (
     echo.
     echo   Skipping STEP 5/6 ^(agent already configured^). Jumping to STEP 7 launch.
 )
+
+REM CONSOLE FALLBACK FOR A BLOCKED DIALOG. Exit 4 means Add-Type/WinForms was refused -- the
+REM script's own comment names AppLocker on managed machines -- and the only way out was "edit
+REM .env by hand", which an installer cannot rely on. cmd can ask for a line of text anywhere.
+REM Only the required key; the fleet URL is optional and falls back to the main one.
+REM Flattened deliberately: `set /p` inside a parenthesised block did not settle before the `if`
+REM that read it, and a label inside one makes cmd reject the entire file.
+if not defined CFG_DIALOG_BLOCKED goto :after_cfg_fallback
+findstr /b /r "MCP_IMPL_AGENT_URL=..*" ".env" >nul 2>nul
+if not errorlevel 1 goto :after_cfg_fallback
+echo.
+echo   Paste the main agent URL (the address bar URL when the agent is open in
+echo   M365 Copilot). Leave it blank to set it later with configure_env.bat.
+set "IMPL_URL="
+set /p IMPL_URL="   MCP_IMPL_AGENT_URL: "
+if "!IMPL_URL!"=="" echo   Left unset. Chat and fleet will not work until it is set.
+if not "!IMPL_URL!"=="" >> ".env" echo MCP_IMPL_AGENT_URL=!IMPL_URL!
+if not "!IMPL_URL!"=="" echo   Saved to .env.
+:after_cfg_fallback
 
 echo.
 echo ===========================================================================
