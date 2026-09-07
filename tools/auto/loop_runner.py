@@ -47,7 +47,7 @@ DEFAULT_PATIENCE = 2
 
 def run(candidate, verify=None, repo=".", run_id="", max_iter=5,
         quality_threshold=0, patience=DEFAULT_PATIENCE, custom_state=None,
-        timeout_s=autoloop.DEFAULT_TIMEOUT_S):
+        timeout_s=autoloop.DEFAULT_TIMEOUT_S, binary_patience=False):
     """Iterate `candidate` until it converges or a stated condition stops it.
 
     candidate(state) -> edits, called once per round. `state` carries `iteration`, `history`,
@@ -57,6 +57,9 @@ def run(candidate, verify=None, repo=".", run_id="", max_iter=5,
     verify: the command whose exit status decides, passed through to the cell.
     quality_threshold: stop once the failure count is at or below this. 0 means "no failures".
     max_iter: hard budget. There is deliberately no unlimited setting.
+    binary_patience: spend patience on a failure the verify command reported without a count
+        (`failure_signal` == FAIL while `count_failures` == None). Default False, because it
+        makes the loop give up sooner on any runner that does not print a number.
 
     Returns {stop, iterations, converged, history, last, state}.
     """
@@ -90,8 +93,9 @@ def run(candidate, verify=None, repo=".", run_id="", max_iter=5,
                                           timeout_s=timeout_s)
         state["result"] = result
         fails = autoloop.count_failures(result.get("output") or "")
+        signal = autoloop.failure_signal(result)
         history.append({"iteration": i, "ok": result.get("ok"), "stage": result.get("stage"),
-                        "fails": fails, "reverted": result.get("reverted"),
+                        "fails": fails, "signal": signal, "reverted": result.get("reverted"),
                         "ts": time.time()})
 
         if result.get("stopped"):
@@ -117,6 +121,16 @@ def run(candidate, verify=None, repo=".", run_id="", max_iter=5,
                 if flat >= patience:
                     stop = NO_PROGRESS
                     break
+        elif binary_patience and signal == autoloop.SIGNAL_FAIL:
+            # A BINARY RUNNER STILL SAYS SOMETHING. It cannot say "fewer failures than last
+            # time", so no round can ever count as improvement -- which means consecutive
+            # failures are stagnation by definition, and the loop otherwise burns its whole
+            # budget with no gradient. OFF BY DEFAULT: this changes when a loop gives up, and
+            # that trade has to be measured on real runs before it becomes the default.
+            flat += 1
+            if flat >= patience:
+                stop = NO_PROGRESS
+                break
 
     return {
         "stop": stop,
