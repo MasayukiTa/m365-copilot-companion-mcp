@@ -203,6 +203,14 @@ REM launched until STEP 7 -- so the first thing that happens on the only manual 
 REM install was a connection error. -CoreOnly starts the supervisor (server + tunnel host) and
 REM nothing else; STEP 7's full run is idempotent and leaves it alone.
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\start_all.ps1" -CoreOnly
+REM READ IT. start_all reports its problems in prose and used to exit 0 regardless, so a launch
+REM that failed and one that worked were indistinguishable from here -- and this is the launch
+REM STEP 5's connection test depends on.
+if errorlevel 1 (
+    echo.
+    echo   The core startup reported problem^(s^) -- see the lines above. The wait below will
+    echo   say whether the server came up anyway.
+)
 echo.
 echo   Waiting for the MCP server to answer (up to 90s)...
 powershell -NoProfile -Command "$sw = [Diagnostics.Stopwatch]::StartNew(); $ok = $false; while ($sw.Elapsed.TotalSeconds -lt 90) { try { if ((Invoke-WebRequest -Uri 'http://127.0.0.1:8000/health' -TimeoutSec 3 -UseBasicParsing).StatusCode -eq 200) { $ok = $true; break } } catch { }; Start-Sleep -Seconds 2 }; if ($ok) { Write-Host ('   Server answered after {0:N0}s -- the connection test in the next step will work.' -f $sw.Elapsed.TotalSeconds) } else { Write-Host '   Server did not answer within 90s. Continue with STEP 5 anyway; the health check at the end says why.' }"
@@ -314,6 +322,14 @@ echo  STEP 7/7  Launch the whole stack  (server + tunnel + Edge + bridge + UI)
 echo ===========================================================================
 echo.
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\start_all.ps1"
+set "START_ALL_BAD=%ERRORLEVEL%"
+REM Captured immediately: any command in between resets it -- the trap this file documents in
+REM the two places it was already hit.
+if not "%START_ALL_BAD%"=="0" (
+    echo.
+    echo   Startup reported %START_ALL_BAD% problem^(s^). They are listed just above; the health
+    echo   check below says what each one means for the finished setup.
+)
 
 REM WAIT FOR THE SERVER BEFORE MEASURING IT. start_all returns once the supervisor PROCESS
 REM exists; the server it launches has to import and bind after that. Checking health at the
