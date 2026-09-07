@@ -182,7 +182,13 @@ def test_the_first_server_launch_does_not_wait_out_the_debounce():
     # counter would let one transient /health timeout fire Start-Server against a server that
     # is perfectly healthy, and Start-Server kills whatever owns the port before relaunching.
     assert "Get-NetTCPConnection -LocalPort $Port -State Listen" in sup
-    assert "if (-not $portOwner)" in sup
+    # A FAILED QUERY IS NOT AN EMPTY ANSWER. Catching the exception into $null made "could not
+    # inspect the port" indistinguishable from "nothing owns it", and this branch calls
+    # Start-Server, whose first act is to kill whatever owns the port. The debounce is the
+    # correct behaviour when we cannot tell.
+    assert "$portQueried = $true" in sup
+    assert "if ($portQueried -and -not $portOwner)" in sup
+    assert "if (-not $portOwner) {" not in sup, "a failed query licenses the kill again"
     assert "$serverMiss = $FailuresBeforeAction - 1" not in sup, "the unsafe form is back"
     assert sup.index("nothing is listening on :$Port at startup") \
         < sup.index("$serverMiss -ge $FailuresBeforeAction"), \
@@ -296,13 +302,29 @@ def test_doctor_asks_whether_the_unlock_password_can_be_read_here():
     undecryptable blob (FAIL) and against a locally-set password (PASS)."""
     doctor = (ROOT / "scripts" / "doctor.ps1").read_text(encoding="utf-8")
 
-    assert 'Check "unlock_password_usable"' in doctor
-    assert "from tools.env_portability import problems" in doctor
-    # bounded: doctor must not hang because Python did
-    assert "function Invoke-BoundedPython" in doctor
+    assert 'Check-TriState "unlock_password_usable"' in doctor, \
+        "a check that cannot ask must not be able to report PASS"
+    # THE LOGIC IS A FILE, NOT A `-c` PAYLOAD. Measured: Start-Process -ArgumentList @("-c",
+    # $code) does not quote the element, python received only the first word and answered
+    # SyntaxError, the non-zero exit was read as "could not ask", and "could not ask" was
+    # converted to PASS -- so the first version of this check could only ever be green. Both
+    # sides had been tested; the seam between them had not.
+    assert (ROOT / "scripts" / "check_unlock_usable.py").exists()
+    assert "check_unlock_usable.py" in doctor
+    assert "function Invoke-BoundedPythonFile" in doctor
+    # COMMENTS OUT FIRST. The line above explains the removed form by quoting it, and an
+    # assertion that reads prose as code fails on its own explanation -- a mistake this repo
+    # has already made once.
+    doctor_code = "\n".join(l for l in doctor.splitlines() if not l.lstrip().startswith("#"))
+    assert '@("-c", $code)' not in doctor_code, "the payload form that could not survive is back"
+    # every argument quoted, so a path with a space is not two arguments
+    assert "'\"{0}\"' -f $script" in doctor
+    # bounded: doctor must not hang because python did
     assert "$p.Kill()" in doctor
-    # being unable to ask is not evidence of a fault
-    assert "could not ask; not evidence of a fault" in doctor
+    # and the checker itself distinguishes the three states, unset included
+    checker = (ROOT / "scripts" / "check_unlock_usable.py").read_text(encoding="utf-8")
+    for verdict in ("undecryptable", "unset", "ok"):
+        assert ('print("%s")' % verdict) in checker or ("'%s'" % verdict) in checker, verdict
 
 
 def test_a_failed_unlock_repair_is_reported_not_only_a_successful_one():

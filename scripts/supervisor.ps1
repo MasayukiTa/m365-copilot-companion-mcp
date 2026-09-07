@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
   Keeps the MCP server and the Dev Tunnel host alive.
 
@@ -464,12 +464,18 @@ Invoke-ReviewAutoResume | Out-Null
 # no process owns the port there is nothing to kill and nothing to protect, so launching at
 # once is safe; in every other case the debounce still does its job.
 $serverMiss = 0
+# A FAILED QUERY IS NOT AN EMPTY ANSWER. Catching the exception into $null made 'the port
+# could not be inspected' indistinguishable from 'nothing owns it' -- and the branch below
+# calls Start-Server, whose first act is to kill whatever owns the port. An inspection that
+# fails must not license that; the debounce is the correct behaviour when we cannot tell.
+$portQueried = $false
 try {
     $portOwner = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop
+    $portQueried = $true
 } catch {
     $portOwner = $null
 }
-if (-not $portOwner) {
+if ($portQueried -and -not $portOwner) {
     Write-Log "nothing is listening on :$Port at startup -> launching the server now, without the debounce"
     Start-Server
 }
