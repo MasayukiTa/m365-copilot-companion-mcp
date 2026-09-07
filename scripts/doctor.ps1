@@ -621,10 +621,23 @@ Check "auth_bearer" "Auth OK end-to-end (Bearer accepted on /mcp)" `
     {
         $key = $envv['MCP_API_KEY']; if (-not $key) { return $false }
         $withKey = Mcp-Status @{ Authorization = ("Bearer " + $key) }
-        # accepted iff the server did not reject the token (not 401/403) and it actually answered
-        ($withKey -ne 0) -and ($withKey -ne 401) -and ($withKey -ne 403)
+        $noKey = Mcp-Status @{}
+        $script:authWithKey = $withKey
+        $script:authNoKey = $noKey
+        # MEASURED against this server: a correct key answers 400 -- the probe body is not a full
+        # MCP handshake, and auth ran first and passed -- no key answers 401, and a bogus path
+        # answers 404. So requiring 200 would be wrong, but "anything that is not 401" was far
+        # too weak: 404, 405 and 500 all passed it.
+        #
+        # AND A SERVER WITH AUTH TURNED OFF PASSED TOO, because nothing asked what happens
+        # WITHOUT the key -- which is the only observation that says anything about auth.
+        # 5xx was still passing: excluding 0/401/403/404 one at a time left server errors in.
+        # A range is the right shape -- anything outside 2xx-4xx is not an authenticated answer.
+        ($withKey -ge 200) -and ($withKey -lt 500) `
+            -and ($withKey -ne 401) -and ($withKey -ne 403) -and ($withKey -ne 404) `
+            -and (($noKey -eq 401) -or ($noKey -eq 403))
     } `
-    "Bearer rejected (401/403): the 'Bearer <MCP_API_KEY>' in Copilot Studio must match .env exactly; if 0, the server is down -> start_all.bat"
+    "the /mcp endpoint did not behave like an authenticated one. 0 = the server is down (start_all.bat); 401/403 with the key = the 'Bearer <MCP_API_KEY>' in Copilot Studio does not match .env; 404 = the server is answering but /mcp is not there; anything else without the key NOT being refused means authentication is not being enforced."
 
 Write-Host ""
 Write-Host "---------------------------------------------"
