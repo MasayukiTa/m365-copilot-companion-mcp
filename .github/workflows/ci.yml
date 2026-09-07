@@ -432,6 +432,7 @@ jobs:
             relay/test_turn_outcome.py \
             relay/test_upstream_throttle.py \
             relay/test_veto_measurement_is_honest.py \
+            relay/test_git_push_safety.py \
             tools/auto/test_autoloop.py \
             tools/auto/test_loop_runner.py \
             tools/test_auto_ops.py \
