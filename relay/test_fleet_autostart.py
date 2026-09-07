@@ -92,7 +92,28 @@ def test_a_second_goal_while_the_first_is_still_coming_up_does_not_start_another
     assert "coming up" in why
 
 
-def test_once_the_run_is_live_autostart_has_nothing_to_do(state):
+@pytest.fixture
+def autoack(monkeypatch):
+    """Stamp each goal's ack the instant it is written, standing in for a fleet that drained it.
+
+    Same purpose as the fixture of the same name in test_fleet_handoff, reused here: fleet_handoff
+    now waits for the receiver's stamp before reporting a goal delivered, and no fleet drains in
+    these unit tests. Wrapping the real writer to stamp through the runner's real _stamp_acks lets
+    a live-looking handoff reach 'dispatched' without a 30-second wait.
+    """
+    from relay.test_fleet_handoff import _stamp_pending_acks
+    real = TR.add_goal_to_live_fleet
+
+    def wrapper(goal, state_dir=None, priority=False, entry=None):
+        ack = real(goal, state_dir=state_dir, priority=priority, entry=entry)
+        _stamp_pending_acks(state_dir or TR.FLEET_STATE_DIR)
+        return ack
+
+    monkeypatch.setattr(TR, "add_goal_to_live_fleet", wrapper)
+    return wrapper
+
+
+def test_once_the_run_is_live_autostart_has_nothing_to_do(state, autoack):
     """fleet_handoff never reaches autostart while a run is live -- the goal joins it instead."""
     _live(state)
     status, result = TR.fleet_handoff("join the running one", "j1", str(state))
@@ -203,7 +224,7 @@ def test_a_launch_that_raises_is_recorded_and_not_reported_as_started(state):
     assert TR._read_autostart(str(state))["outcome"] == "launch_failed"
 
 
-def test_the_handoff_says_which_way_the_goal_went(state):
+def test_the_handoff_says_which_way_the_goal_went(state, autoack):
     """dispatched-by-autostart and dispatched-by-add_goal are different events, and the record
     is the only place the difference survives."""
     TR.autostart_fleet([{"text": "seed"}], str(state), now=1.0, launcher=_Launcher())
