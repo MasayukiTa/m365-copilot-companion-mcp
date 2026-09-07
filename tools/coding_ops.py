@@ -1,3 +1,4 @@
+import contextlib
 import os
 import py_compile
 import shutil
@@ -569,3 +570,184 @@ def diff_files(path_a: str, path_b: str, max_lines: int = 400) -> str:
         return "\n".join(diff)
     except Exception as e:
         return f"[diff_files error: {type(e).__name__}: {e}]"
+
+
+# --------------------------------------------------------------------------------------
+# Scoped worktree lifecycle.
+#
+# Isolated work belongs in a dedicated linked worktree, never in the shared (main) working
+# tree -- that rule is already stated by git_checkout above. What was missing was the OTHER
+# half of the lifecycle: taking the worktree down again. Two existing call sites
+# (bench/pro_capture.py, bench/pro_cycle.py) each grew their own teardown, and both learned
+# the same lesson the hard way on Windows:
+#
+#   * `shutil.rmtree` cannot unlink the locked `.git` administrative entry, so it leaves a
+#     HUSK -- a directory that git no longer tracks as a worktree but whose `.git` file still
+#     resolves to the MAIN repository. A later step that walks that husk reads the harness's
+#     own checkout and can submit the parent repo's state as if it were the work.
+#   * A teardown that deletes by PATH, without first asking whether the path is the shared
+#     working tree, can delete the very tree that holds every other worker's and the owner's
+#     uncommitted changes.
+#
+# The two functions below are the single, safe teardown those sites should route through:
+# `git worktree remove --force` first (git removes its own administrative files properly),
+# rmtree only as a fallback and only when doing so cannot touch the shared tree, and a
+# `git worktree prune` to clear any now-stale bookkeeping. `worktree_scope` wraps add +
+# guaranteed teardown so an exception mid-work still tears the worktree down.
+
+
+def _resolves_into_common_dir(worktree_path: Path, repo_cwd: Path):
+    """True when *worktree_path* shares the repository's main working tree / git dir.
+
+    A husk left by a half-finished rmtree still carries a `.git` that points at the main
+    repository's common dir. Removing such a directory with rmtree would be deleting inside
+    (or alongside) the shared checkout. Returns True (shared -- refuse to rmtree),
+    False (a genuine linked worktree, safe to fall back on), or None when git cannot answer
+    and the caller must not guess.
+    """
+    if not worktree_path.exists():
+        # Nothing on disk to be unsafe about.
+        return False
+    shared = _is_shared_worktree(worktree_path)
+    if shared is True:
+        return True
+    if shared is None:
+        # git could not tell us whether this is a linked worktree. Compare the two paths
+        # directly as a last resort: if the worktree path IS the repo path, it is shared.
+        try:
+            if _norm(str(worktree_path)) == _norm(str(repo_cwd)):
+                return True
+        except Exception:
+            return None
+        return None
+    return False
+
+
+def worktree_remove(worktree_path: str, repo_path: str = ".", prune: bool = True) -> str:
+    """Tear down a dedicated linked worktree safely.
+
+    Routes through `git worktree remove --force`; on failure falls back to an OS delete ONLY
+    when the target is provably not the shared (main) working tree, then prunes stale
+    worktree bookkeeping. Refuses outright to delete the shared working tree.
+
+    Args:
+        worktree_path: Path of the linked worktree to remove.
+        repo_path: The repository whose worktree list owns it (for remove/prune).
+        prune: Run `git worktree prune` afterwards to clear stale administrative entries.
+    """
+    locked = require_unlocked()
+    if locked:
+        return locked
+    try:
+        wt = _validate_path(worktree_path)
+        repo = _validate_path(repo_path)
+        repo_cwd = repo if repo.is_dir() else repo.parent
+
+        # (A) Never delete the shared working tree. A teardown that swept it up would take
+        # every other worker's and the owner's uncommitted changes with it.
+        shared = _resolves_into_common_dir(wt, repo_cwd)
+        if shared is True:
+            return (
+                "[worktree_remove refused: the path resolves to the shared (main) working\n"
+                "tree, not a dedicated linked worktree.\n"
+                "Why: removing it would delete the checkout that holds other workers' and the\n"
+                "owner's uncommitted changes.\n"
+                "Instead: pass the path of the linked worktree you created for this run.]"
+            )
+
+        # (B) Route through the destructive-op gate so an active contract can ask-before.
+        _g = _cg.check_op("shell_destructive", "git worktree remove --force " + str(wt))
+        if _g is not None:
+            return _g
+
+        parts: list[str] = []
+        done = _run(["git", "worktree", "remove", "--force", str(wt)], repo_cwd, 30)
+        removed_by_git = "[returncode:" not in done
+        parts.append("git worktree remove: " + ("ok" if removed_by_git else done.strip()))
+
+        # (C) Fallback delete, but only when it CANNOT touch the shared tree. `shared` is
+        # False (genuine linked worktree) or None (unknown). Only act on the definite case;
+        # an unknown answer must not license deleting a directory that might be the main tree.
+        if not removed_by_git and wt.exists():
+            if shared is False:
+                shutil.rmtree(str(wt), ignore_errors=True)
+                if wt.exists():
+                    parts.append("rmtree fallback: directory still present")
+                else:
+                    parts.append("rmtree fallback: removed")
+            else:
+                parts.append(
+                    "rmtree fallback SKIPPED: could not confirm this is a linked worktree, "
+                    "so an OS delete might have hit the shared tree"
+                )
+
+        if prune:
+            pr = _run(["git", "worktree", "prune"], repo_cwd, 30)
+            parts.append("git worktree prune: " + ("ok" if "[returncode:" not in pr
+                                                    else pr.strip()))
+        return "\n".join(parts)
+    except Exception as e:
+        return f"[worktree_remove error: {type(e).__name__}: {e}]"
+
+
+def worktree_add(worktree_path: str, branch: str, base: str = "HEAD",
+                 repo_path: str = ".") -> str:
+    """Create a dedicated linked worktree on a NEW branch, off *base*.
+
+    A new branch discards nothing, and a linked worktree keeps this run's edits out of the
+    shared checkout -- the isolation git_checkout points callers at. Off an explicit base
+    (a committed ref by default) so the new worktree never carries the shared tree's
+    uncommitted changes.
+
+    Args:
+        worktree_path: Where to create the linked worktree.
+        branch: New branch name to create for it.
+        base: Committed ref to branch from (default HEAD).
+        repo_path: The repository to add the worktree to.
+    """
+    locked = require_unlocked()
+    if locked:
+        return locked
+    try:
+        repo = _validate_path(repo_path)
+        repo_cwd = repo if repo.is_dir() else repo.parent
+        wt = _validate_path(worktree_path)
+        _g = _cg.check_op("shell_destructive",
+                          "git worktree add -b %s %s %s" % (branch, wt, base))
+        if _g is not None:
+            return _g
+        return _run(["git", "worktree", "add", "-b", branch, str(wt), base], repo_cwd, 60)
+    except Exception as e:
+        return f"[worktree_add error: {type(e).__name__}: {e}]"
+
+
+@contextlib.contextmanager
+def worktree_scope(worktree_path: str, branch: str, base: str = "HEAD",
+                   repo_path: str = "."):
+    """Create an isolated linked worktree, yield its path, and ALWAYS tear it down.
+
+    FOR IN-PROCESS CALLERS. This is the shape the two bench teardown sites should share: the
+    worktree is removed in a `finally`, so an exception mid-work cannot leave a husk behind,
+    and the removal goes through `worktree_remove`, which refuses to touch the shared tree
+    and never lets an rmtree fallback hit it.
+
+    Yields the worktree path on success, or None when creation failed (teardown then has
+    nothing to do and is a safe no-op).
+
+    Args:
+        worktree_path: Where to create the linked worktree.
+        branch: New branch name to create for it.
+        base: Committed ref to branch from (default HEAD).
+        repo_path: The repository to add the worktree to.
+    """
+    created = worktree_add(worktree_path, branch, base, repo_path)
+    ok = "[returncode:" not in created and not created.startswith("[worktree_add") \
+        and not created.startswith("[locked")
+    try:
+        yield (worktree_path if ok else None)
+    finally:
+        # Only tear down what we actually created. If add failed, there is no linked
+        # worktree to remove -- and worktree_remove would in any case refuse anything that
+        # is not a genuine linked worktree.
+        if ok:
+            worktree_remove(worktree_path, repo_path)
