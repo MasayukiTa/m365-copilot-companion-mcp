@@ -306,7 +306,13 @@ if ($useHeadless) {
 # headless. Always pass it (harmless in headed mode, where a real window already exists).
 $arguments += "--window-size=1400,1000"
 $arguments += @(
-    "--user-data-dir=$dataDir",
+    # QUOTED VALUE. %LOCALAPPDATA% can contain a space ("C:\Users\First Last\..."). Start-Process
+    # -ArgumentList joins elements with spaces and does not quote them, so an unquoted
+    # --user-data-dir=<path with space> is split into two arguments and Edge launches on the WRONG
+    # (default) profile -- which does not open the CDP port and silently drops the isolation this
+    # whole script exists for. The rest of the launcher already quotes every path it passes this
+    # way (start_all.ps1's supervisor/bridge launches); this is the one that was missed.
+    "--user-data-dir=`"$dataDir`"",
     # CDP has no built-in authentication. Keep it reachable only by local
     # processes; remote users still reach the MCP server through Dev Tunnel.
     "--remote-debugging-address=127.0.0.1",
@@ -373,7 +379,25 @@ Write-Host "Launching dedicated companion Edge:"
 Write-Host "  exe:     $edge"
 Write-Host "  profile: $dataDir   (isolated from your main Edge)"
 Write-Host "  port:    $Port"
-Start-Process -FilePath $edge -ArgumentList $arguments | Out-Null
+# CAPTURE THE LAUNCH ERROR, so a failure is not silent. This was fire-and-forget: if Edge
+# refused to start (a locked profile from a half-dead prior instance, a bad --user-data-dir,
+# an msedge that will not honour --remote-debugging-port), nothing was written anywhere and
+# the CDP port simply never came up -- doctor could only say "launch it" again, the operation
+# that had just failed. Mirrors the supervisor launch in start_all.ps1, which redirects its
+# stderr to .setup\logs for exactly this reason. Per-profile file so the companion (:9222)
+# and the bridge (:9223), which share THIS script under different -Profile values, do not
+# overwrite each other's log. Best-effort: if the log dir cannot be created we still launch.
+$edgeErrLog = $null
+try {
+    $diagDir = Join-Path $repoRoot ".setup\logs"
+    New-Item -ItemType Directory -Force $diagDir | Out-Null
+    $edgeErrLog = Join-Path $diagDir "companion_edge_$Profile.err.log"
+} catch { $edgeErrLog = $null }
+if ($edgeErrLog) {
+    Start-Process -FilePath $edge -ArgumentList $arguments -RedirectStandardError $edgeErrLog | Out-Null
+} else {
+    Start-Process -FilePath $edge -ArgumentList $arguments | Out-Null
+}
 
 function Hide-Companion {
     if (-not $Background) { return }
