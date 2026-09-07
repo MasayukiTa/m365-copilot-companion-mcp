@@ -5,7 +5,7 @@ never stage all 50 at once). After a fleet batch finishes:
 
   python bench/pro_capture.py --preds .fleet/swe/pro_preds_50.json [--keep]   # --keep = don't delete
 """
-import argparse, hashlib, json, os, shutil, subprocess, time
+import argparse, hashlib, json, os, pathlib, shutil, subprocess, time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SW = os.path.join(REPO, ".fleet", "swe")
@@ -227,26 +227,36 @@ def main():
         if not over:
             captured += 1
         if not (a.keep or a.keep_worktrees):
-            # `git worktree remove` FIRST, rmtree only as a fallback.
+            # BOTH IMPORT FORMS -- run as `python bench/pro_capture.py` (sys.path[0] is bench/)
+            # and imported as `bench.pro_capture` from tests. Same reason as _routed_diff above.
+            try:
+                from tools import coding_ops
+            except ImportError:
+                import sys as _sys
+                _sys.path.insert(0, REPO)
+                from tools import coding_ops
+            # THE ONE TEARDOWN PATH. `git worktree remove --force` first, a guarded rmtree
+            # fallback only when the target is provably a linked worktree, then prune. This is
+            # exactly the guarantee `worktree_remove` gives in-process; sharing the helper is
+            # what keeps this capture step from ever rmtree-ing a husk that still resolves to
+            # the MAIN repository -- the failure that let it submit the harness's own diff as a
+            # prediction, and that left 1,110 MB of checkouts behind under a 3.0 GB floor.
             #
-            # rmtree(ignore_errors=True) cannot delete the locked `.git` entry on Windows, so
-            # it leaves a husk -- a directory that still resolves to the MAIN repository, which
-            # is how this step came to be capable of submitting the harness's own diff as a
-            # prediction. It also leaves the checkout's bulk behind often enough to matter:
-            # measured mid-run, 1,110 MB of worktrees with free disk at 3.1 GB against a 3.0 GB
-            # admission floor, which is the state that had every worker sitting at turn zero.
-            #
-            # git removes its own worktree properly, administrative files included, and
-            # --force is right here because the checkout has just been read and is finished
-            # with.
-            done = subprocess.run(["git", "-C", REPO, "worktree", "remove", "--force", p],
-                                  capture_output=True, text=True, encoding="utf-8",
-                                  errors="replace")
-            if done.returncode != 0:
-                shutil.rmtree(p, ignore_errors=True)
+            # It goes through the gate-free `_worktree_teardown`, not `worktree_remove`,
+            # because this script runs as its own process with no HTTP/unlock context; the
+            # gated entry would refuse here and leave the husk it was meant to remove. Safety
+            # is preserved by computing `shared` the same way the gated path does and never
+            # letting the rmtree fallback run unless it is False.
+            wt = pathlib.Path(p)
+            shared = coding_ops._resolves_into_common_dir(wt, pathlib.Path(REPO))
+            if shared is True:
+                print("WARNING: refusing to remove %s -- it resolves to the shared repository"
+                      % p)
+            else:
+                report = coding_ops._worktree_teardown(wt, pathlib.Path(REPO), shared)
                 if os.path.isdir(p):
                     print("WARNING: could not remove worktree %s (%s)"
-                          % (p, (done.stderr or "").strip()[:80]))
+                          % (p, report.replace("\n", " | ")[:120]))
 
     with open(a.preds, "w", encoding="utf-8") as f:
         json.dump(preds, f, ensure_ascii=False)
