@@ -4,6 +4,24 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _code(path):
+    """A script's CODE, with its comment lines removed.
+
+    Source assertions kept matching the comment that explains a fix rather than the fix, which
+    made them pass on the very state they were written to forbid -- three times in one day. A
+    PowerShell/batch comment is a line whose first non-space character is # or a REM, so drop
+    those lines before asserting. Trailing comments are left alone: no assertion here depends
+    on the tail of a code line."""
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        t = line.strip()
+        if t.startswith("#") or t.upper().startswith("REM "):
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+
 def test_bridge_keepalive_uses_a_nonblocking_single_supervisor_mutex():
     source = (ROOT / "scripts" / "start_bridge.ps1").read_text(encoding="utf-8")
 
@@ -737,7 +755,14 @@ def test_the_access_choice_beats_the_file_and_the_environment():
     assert "-ForceAnonymous" in qs and "ANON_FLAG" in qs
     # replaced, not appended: an older line further up would otherwise keep winning
     assert "MCP_TUNNEL_ALLOW_ANONYMOUS\s*=" in qs
-    assert "Set-Content -Path $p -Value $keep" in qs
+    # AND WRITTEN AS UTF-8 ON BOTH SIDES. The rewrite used Set-Content -Encoding ASCII, which
+    # replaces every non-ASCII byte with a question mark, and read with a bare Get-Content,
+    # which decodes as the ANSI codepage. Measured on a .env carrying one Japanese comment:
+    # ASCII write destroyed it, fixing only the write turned it into mojibake, and fixing both
+    # round-trips it unchanged. No BOM, because that is what everything here reads back.
+    assert "[IO.File]::WriteAllLines($p, $keep, (New-Object System.Text.UTF8Encoding($false)))" in qs
+    assert "Get-Content $p -Encoding UTF8" in qs
+    assert "-Encoding ASCII" not in qs, "an ASCII rewrite of .env destroys non-ASCII values"
 
 
 def test_the_self_restart_keeps_every_switch_it_was_given():
@@ -831,3 +856,33 @@ def test_a_supervisor_that_dies_immediately_is_noticed():
     assert '$script:startupFailures += $why' in start_all
     # it refuses within its first statements, so a short wait separates death from running
     assert "$supProc.WaitForExit(3000)" in start_all
+
+
+def test_the_launcher_does_not_surface_a_browser_when_it_cannot_tell():
+    """The manual start ran the FULL sign-in helper, which surfaces the window whenever it
+    cannot tell whether you are signed in. "Cannot tell" is the normal answer here: the fleet is
+    websocket-driven and keeps zero tabs, so a healthy machine has no M365 tab to judge from.
+    The result on a machine that was already signed in was a headed companion Edge sitting on
+    m365.cloud.microsoft/chat -- 751 MB across ten processes, a taskbar button, and a window
+    30px onto the screen -- opened by the launcher every time it ran.
+
+    Only exit 1 (a sign-in wall is actually open) is positive evidence of "not signed in", and
+    only that may take the window."""
+    start_all = _code(ROOT / "scripts" / "start_all.ps1")
+
+    # the manual path asks with --check-only, exactly as the background path does
+    assert start_all.count("--check-only") >= 2, "both paths must ask without taking the window"
+    # ...and the helper that CAN surface is reachable only behind a check for exit code 1
+    lines = start_all.splitlines()
+    surfacing = [i for i, l in enumerate(lines) if "-TimeoutSeconds 180" in l]
+    assert surfacing, "the helper that can surface the window is gone; this test is now blind"
+    for i in surfacing:
+        prev = ""
+        for j in range(i - 1, -1, -1):
+            if lines[j].strip():
+                prev = lines[j].strip()
+                break
+        assert prev == "if ($LASTEXITCODE -eq 1) {", (
+            "the surfacing helper must sit directly under a check for exit 1, so 2 (cannot "
+            "tell) never opens a window; found %r above line %d" % (prev, i + 1)
+        )
