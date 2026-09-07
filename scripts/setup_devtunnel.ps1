@@ -16,6 +16,10 @@ param(
     # Entra/tenant-scoped access, applied instead of being printed as a command to type. Empty
     # means "not chosen"; the anonymous switch is still MCP_TUNNEL_ALLOW_ANONYMOUS.
     [string]$TenantId = "",
+    # THE ANSWER JUST GIVEN, which must beat both the file and the environment. Get-AllowAnonymous
+    # reads $env: first and then takes the FIRST matching .env line, so a stale key or an
+    # inherited variable silently overrode a fresh choice.
+    [switch]$ForceAnonymous,
     [int]$Port = 8000,
     [switch]$DeviceCode
 )
@@ -44,7 +48,10 @@ function Get-AllowAnonymous {
     if (-not $v) { return $false }
     return ($v.Trim().ToLowerInvariant() -in @("1", "true", "yes"))
 }
-$AllowAnonymous = Get-AllowAnonymous
+$AllowAnonymous = $ForceAnonymous.IsPresent -or (Get-AllowAnonymous)
+if ($ForceAnonymous.IsPresent) {
+    Write-Host "      Anonymous access was chosen for this run (-ForceAnonymous)."
+}
 
 # Run devtunnel and return stdout lines with the welcome/banner/upgrade noise stripped.
 function Dt {
@@ -598,14 +605,24 @@ if ($AllowAnonymous) {
 } elseif ($TenantId) {
     # APPLIED, NOT PRINTED. This was documented as a command for the operator to type, which is
     # not something an installer can rely on: the tunnel is unreachable until it is run.
+    # THROUGH Dt, like every other CLI call here. The first version of this line invoked
+    # $DevTunnel, which is not defined anywhere in this file -- so the more restrictive of the
+    # two choices was the one that could not work.
     Write-Host "      Granting Entra/tenant-scoped access (tenant $TenantId)..."
-    & $DevTunnel access create $target --tenant $TenantId 2>&1 | ForEach-Object { Write-Host "        $_" }
-    if ($LASTEXITCODE -eq 0) {
+    $tenantOut = Dt access create $target --tenant $TenantId
+    $tenantExit = $LASTEXITCODE
+    $tenantOut | ForEach-Object { Write-Host "        $_" }
+    if ($tenantExit -eq 0) {
         Write-Host "      Tenant-scoped access granted. Copilot Studio can reach this tunnel"
         Write-Host "      when signed in to that tenant; it is NOT open to the anonymous internet."
     } else {
-        Write-Host "      TENANT ACCESS GRANT FAILED (exit $LASTEXITCODE). The tunnel is not reachable"
-        Write-Host "      by a remote client until an access grant succeeds."
+        # A FAILURE OF STEP 4, not a note. A tunnel with no access grant cannot be connected to,
+        # which is the entire reason the choice is offered -- carrying on would hand the operator
+        # a connection test that cannot pass.
+        Write-Host "      ERROR: tenant access grant failed (exit ${tenantExit}). The tunnel is not"
+        Write-Host "      reachable by a remote client until an access grant succeeds."
+        Write-Host "      If login/permission, run: devtunnel user login"
+        exit 1
     }
 } else {
     Write-Host "      MCP_TUNNEL_ALLOW_ANONYMOUS is not set to 1 -- skipping anonymous access grant."

@@ -716,3 +716,38 @@ def test_appending_to_env_cannot_join_the_new_key_onto_the_last_one():
     assert '>> ".env" echo' not in code, "an append that can join lines is back"
     assert code.count("[IO.File]::AppendAllText") >= 2
     assert "$b[$b.Length-1] -ne 10" in code, "nothing checks for the trailing newline"
+
+
+def test_the_access_choice_beats_the_file_and_the_environment():
+    """Choosing A did not reliably grant anonymous access. Get-AllowAnonymous reads the parent
+    environment FIRST and then scans .env taking the FIRST match and breaking -- so appending
+    the key at the end had no effect whenever the variable was set in the environment, or .env
+    already carried the key with another value further up. The operator was told "Recorded:
+    anonymous access" and the tunnel was created without the grant.
+
+    Two changes, because either alone is insufficient: the answer is passed as -ForceAnonymous
+    so THIS run does what was just chosen, and the key is REPLACED in .env so the choice
+    survives to later runs. Verified against a .env already carrying =0: one line remains, it
+    says 1, and the other keys are untouched."""
+    qs = (ROOT / "quickstart.bat").read_text(encoding="utf-8")
+    dt = (ROOT / "scripts" / "setup_devtunnel.ps1").read_text(encoding="utf-8")
+
+    assert "[switch]$ForceAnonymous" in dt
+    assert "$AllowAnonymous = $ForceAnonymous.IsPresent -or (Get-AllowAnonymous)" in dt
+    assert "-ForceAnonymous" in qs and "ANON_FLAG" in qs
+    # replaced, not appended: an older line further up would otherwise keep winning
+    assert "MCP_TUNNEL_ALLOW_ANONYMOUS\s*=" in qs
+    assert "Set-Content -Path $p -Value $keep" in qs
+
+
+def test_the_self_restart_keeps_every_switch_it_was_given():
+    """start_all re-executes itself after an update and rebuilt only -NoUi and -NoSplash. A
+    restart during the core start would come back as a FULL start, walk into
+    Invoke-FirstTimeSetupGate and demand the agent URL -- which is exactly what STEP 5 has not
+    created yet, since -CoreOnly exists to run before STEP 5. Its own path was unquoted too."""
+    start_all = (ROOT / "scripts" / "start_all.ps1").read_text(encoding="utf-8")
+
+    block = start_all[start_all.index("$reArgs = @("):]
+    block = block[:block.index("Start-Process")]
+    assert 'if ($CoreOnly) { $reArgs += "-CoreOnly" }' in block
+    assert "'\"{0}\"' -f $selfPath" in block, "the script path is unquoted again"
