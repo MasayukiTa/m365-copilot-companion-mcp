@@ -225,7 +225,10 @@ REM run -- offer to skip straight to STEP 7 (launch). `..*` requires at least on
 REM character after `=`, so a blank `MCP_IMPL_AGENT_URL=` line does NOT count as
 REM configured (same pattern style as the MCP_TUNNEL_URL gate in STEP 4).
 set "SKIP56="
-findstr /b /r "MCP_IMPL_AGENT_URL=..* MCP_FLEET_AGENT_URL=..*" ".env" >nul 2>nul
+REM IMPL ALONE. `findstr /r` treats the space as OR -- measured: FLEET only also exits 0 --
+REM so a machine with just the fleet URL skipped the step that sets the REQUIRED one and
+REM called itself configured. The fleet URL is optional and falls back to this very key.
+findstr /b /r "MCP_IMPL_AGENT_URL=..*" ".env" >nul 2>nul
 if not errorlevel 1 (
     echo.
     echo   An agent URL is already configured -- Copilot Studio step appears DONE.

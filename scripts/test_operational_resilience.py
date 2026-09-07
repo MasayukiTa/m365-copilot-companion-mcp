@@ -781,3 +781,53 @@ def test_the_daily_launcher_checks_the_m365_session():
     assert "$LASTEXITCODE -eq 1" in block
     assert "-eq 2" not in block, "could-not-tell must not be reported as a fault"
     assert "-TimeoutSeconds 180" in block
+
+
+def test_the_skip_test_asks_about_the_key_it_actually_needs():
+    """`findstr /r` treats a space as OR. Measured against a .env holding only one of the two:
+
+        IMPL only  -> exit 0   skip STEP 5/6
+        FLEET only -> exit 0   skip STEP 5/6   <- and IMPL is still empty
+        neither    -> exit 1   do STEP 5/6
+
+    So a machine carrying just the fleet URL skipped the step that sets the REQUIRED key and
+    reported "already configured". The fleet URL is optional and falls back to IMPL, and the
+    console fallback three lines below already tested IMPL alone -- the two disagreed."""
+    qs = (ROOT / "quickstart.bat").read_text(encoding="utf-8")
+
+    code = "\n".join(l for l in qs.splitlines() if not l.strip().lower().startswith("rem"))
+    assert 'MCP_IMPL_AGENT_URL=..* MCP_FLEET_AGENT_URL=..*' not in code, "the OR pattern is back"
+    assert 'findstr /b /r "MCP_IMPL_AGENT_URL=..*" ".env"' in code
+
+
+def test_the_repair_verdict_is_chosen_by_prefix_not_by_position():
+    """repair_unlock.py puts one verdict line on stdout, and the caller took the LAST line of a
+    2>&1 merged stream. Measured with a warning arriving after the verdict:
+
+        by position -> "DeprecationWarning: something"
+        by prefix   -> "noop:the unlock password is readable"
+
+    A mismatched verdict matches neither "repaired:*" nor "failed:*", so the new password is
+    never shown AND the failure is never recorded. This machine emits nothing on stderr, which
+    is the only reason it worked here. My code, from today, and the same class -- taking an
+    answer and dropping it -- this round of work exists to remove."""
+    start_all = (ROOT / "scripts" / "start_all.ps1").read_text(encoding="utf-8")
+
+    assert "Select-Object -Last 1)" not in start_all.split("repairScript")[1][:200], \
+        "the verdict is picked by position again"
+    assert "'^(noop|repaired|failed|error):'" in start_all
+
+
+def test_a_supervisor_that_dies_immediately_is_noticed():
+    """Start-Process fire-and-forget: no -PassThru, no exit code. supervisor.ps1 exits 3 when
+    there is no usable Python -- added today -- and start_all printed "[1/4] supervisor:
+    starting" and moved on regardless, asymmetric with the unlock repair, the bridge port and
+    the UI rebuild, which are all counted. A supervisor that died is the difference between a
+    stack that comes up in ninety seconds and one that never comes up at all."""
+    start_all = (ROOT / "scripts" / "start_all.ps1").read_text(encoding="utf-8")
+
+    assert "-RedirectStandardError $supErr -PassThru" in start_all
+    assert "$supProc.HasExited" in start_all
+    assert '$script:startupFailures += $why' in start_all
+    # it refuses within its first statements, so a short wait separates death from running
+    assert "$supProc.WaitForExit(3000)" in start_all
