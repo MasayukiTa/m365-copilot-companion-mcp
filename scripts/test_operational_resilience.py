@@ -529,3 +529,25 @@ def test_a_blocked_setup_dialog_asks_in_the_console_instead_of_dead_ending():
     assert fb.index('findstr /b /r "MCP_IMPL_AGENT_URL=..*"') < fb.index("set /p IMPL_URL")
     # flattened: set /p inside a block did not settle before the if that read it
     assert "goto :after_cfg_fallback" in qs
+
+
+def test_auth_ok_end_to_end_means_more_than_not_401():
+    """The last check in the run, the one whose name promises the whole path works, passed on
+    any status that was not 401/403/0 -- so 404, 405 and 500 all read as "Auth OK end-to-end".
+    And a server with authentication switched off passed too, because nothing asked what
+    happens WITHOUT the key, which is the only observation that says anything about auth.
+
+    MEASURED against the live server: correct key -> 400 (the probe body is not a full MCP
+    handshake; auth ran first and passed), no key -> 401, wrong key -> 401, bogus path -> 404.
+    So requiring 200 would be wrong. Every failing mode was then exercised through the real
+    doctor with Mcp-Status stubbed: 404, 500, an unenforced 400/400, a rejected key and a dead
+    server all go red; only 400/401 stays green. 5xx passed the first version of this fix --
+    excluding codes one at a time left server errors in -- which is why it is a range now."""
+    doctor = (ROOT / "scripts" / "doctor.ps1").read_text(encoding="utf-8")
+
+    auth = doctor[doctor.index('Check "auth_bearer"'):]
+    auth = auth[:auth.index("Write-Host")]
+    assert "$noKey = Mcp-Status @{}" in auth, "nothing checks that a missing key is refused"
+    assert "($noKey -eq 401) -or ($noKey -eq 403)" in auth
+    assert "$withKey -ge 200" in auth and "$withKey -lt 500" in auth, "5xx passes again"
+    assert "$withKey -ne 404" in auth
