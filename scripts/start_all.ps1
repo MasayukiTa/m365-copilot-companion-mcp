@@ -986,6 +986,31 @@ function Invoke-Startup {
     } elseif (Http-Up "http://127.0.0.1:8765/conv") {
         Write-Host "[3/4] bridge :8765: already serving (no keepalive supervisor, but up)"
     } else {
+        # STARTING ANOTHER CANNOT HELP IF THE PORT IS ALREADY TAKEN. /conv is the liveness
+        # probe, and a bridge started outside the venv answers / but not /conv -- so this branch
+        # concluded "down", launched another that could not bind, and repeated. Seen running for
+        # five and a half hours with four bridge processes alive, each pass reporting "starting".
+        #
+        # NAMED, NOT KILLED: the owner is a process this stack did not start, and the rule here
+        # is not to touch those. It is recorded as a startup failure instead, which the exit code
+        # now carries.
+        $portOwner8765 = $null
+        try {
+            $portOwner8765 = Get-NetTCPConnection -LocalPort 8765 -State Listen -ErrorAction Stop |
+                             Select-Object -ExpandProperty OwningProcess -Unique | Select-Object -First 1
+        } catch { $portOwner8765 = $null }
+        if ($portOwner8765) {
+            $ownerCmd = ""
+            try {
+                $ownerCmd = (Get-CimInstance Win32_Process -Filter ("ProcessId=" + $portOwner8765) `
+                             -ErrorAction Stop).CommandLine
+            } catch { }
+            Write-Host "[3/4] bridge: :8765 is HELD by pid $portOwner8765 but /conv does not answer." -ForegroundColor Yellow
+            if ($ownerCmd) { Write-Host ("        " + (Hide-Secrets $ownerCmd)) -ForegroundColor Yellow }
+            Write-Host "        Starting another bridge cannot bind that port. Stop pid $portOwner8765, then run this again." -ForegroundColor Yellow
+            Write-Host "        (A bridge started outside .venv answers / but not /conv, which is what this looks like.)" -ForegroundColor Yellow
+            $script:startupFailures += "bridge: :8765 held by pid $portOwner8765 and not serving /conv"
+        } else {
         Write-Host "[3/4] bridge: starting (headless keepalive)"
         # ITS ERROR MESSAGE IS THE MOST USEFUL ONE IN THE WHOLE STARTUP and it was going
         # nowhere. The bridge exits with "No agent page. Set MCP_IMPL_AGENT_URL..." -- exactly
@@ -997,6 +1022,7 @@ function Invoke-Startup {
             "-NoProfile","-ExecutionPolicy","Bypass","-File",
             ('"{0}"' -f (Join-Path $scriptDir "start_bridge.ps1")), "-Keepalive") `
             -RedirectStandardOutput $bridgeLog -RedirectStandardError "$bridgeLog.err"
+        }
     }
 
     # 4) WPF apps. Launch only if not already running; build them first if the exe is missing.
