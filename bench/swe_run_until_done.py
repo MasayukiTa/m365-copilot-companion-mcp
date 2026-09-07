@@ -103,14 +103,63 @@ def log(msg):
         pass
 
 
-def fleet_pids():
+def _fleet_mine_pids():
+    """This PID plus its ancestor chain -- never kill the orchestrator itself."""
+    mine = {int(os.getpid())}
+    try:
+        import psutil  # type: ignore
+        p = psutil.Process().parent()
+        while p is not None:
+            mine.add(int(p.pid))
+            try:
+                p = p.parent()
+            except Exception:
+                break
+    except Exception:
+        pass
+    return mine
+
+
+# relay.fleet_runner must appear as an actual run target -- `-m relay.fleet_runner`
+# or a `relay/fleet_runner(.py)` script path -- NOT as an arbitrary substring. The
+# old bare `-like '*relay.fleet_runner*'` also matched a python that merely carried
+# the module name as an argument (a log path, a --grep value, this orchestrator's
+# own docstring-derived cmdline), and taskkill /F would then reap the wrong process.
+_FLEET_RUN_TARGET = re.compile(r"(?:-m\s+relay\.fleet_runner\b|relay[\\/]fleet_runner)")
+
+
+def _all_python_rows():
     ps = subprocess.run(
         ["powershell", "-NoProfile", "-Command",
          "Get-CimInstance Win32_Process -Filter \"name='python.exe'\" | "
-         "Where-Object { $_.CommandLine -like '*relay.fleet_runner*' } | "
-         "ForEach-Object { $_.ProcessId }"],
+         "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"],
         capture_output=True, text=True, errors="replace")
-    return [p.strip() for p in (ps.stdout or "").split() if p.strip().isdigit()]
+    out = (ps.stdout or "").strip()
+    try:
+        data = json.loads(out) if out else []
+    except Exception:
+        return []
+    if isinstance(data, dict):
+        data = [data]
+    rows = []
+    for item in data:
+        try:
+            pid = int(item.get("ProcessId"))
+        except (TypeError, ValueError):
+            continue
+        rows.append((pid, item.get("CommandLine") or ""))
+    return rows
+
+
+def fleet_pids():
+    mine = _fleet_mine_pids()
+    pids = []
+    for pid, cmd in _all_python_rows():
+        if pid in mine:
+            continue
+        if _FLEET_RUN_TARGET.search(cmd):
+            pids.append(str(pid))
+    return pids
 
 
 def kill_pids(pids):
