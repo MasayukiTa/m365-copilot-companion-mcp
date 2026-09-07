@@ -5027,7 +5027,7 @@ def _with_theme_memory(goal_text, theme_text=None):
 def _with_repo_contract(goal_text):
     """Prepend the standing エージェント契約 to the body that is sent. Never raises.
 
-    The constraints (隠離 / 選択的 add / main への直接コミット禁止 / 新規テストの CI 登録 /
+    The constraints (隔離 / 選択的 add / main への直接コミット禁止 / 新規テストの CI 登録 /
     Windows 依存の禁止 / レビュー指摘は裏を取ってから) were hand-copied onto every goal;
     this centralises them the way _with_matched_skill centralises the procedure. Applied to
     the sent BODY only, never to self.goal (the worker's identity), and header-guarded so a
