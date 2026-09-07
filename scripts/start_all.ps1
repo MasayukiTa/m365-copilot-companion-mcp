@@ -844,8 +844,18 @@ function Invoke-Startup {
         # All Win32_Process entries whose command line launches supervisor.ps1. Normally
         # zero or one; returned as an array so a drift-restart can stop every match.
         try {
+            # SCOPED -- this list is what a drift restart STOPS. A bare name match finds
+            # anything that mentions the file: measured, four matches here and three of them
+            # were shell commands that merely contained the string. Stopping those would kill
+            # another checkout's supervisor, or somebody's shell.
+            $supPath = Join-Path $scriptDir "supervisor.ps1"
             return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-                      Where-Object { $_.CommandLine -and ($_.CommandLine -match 'supervisor\.ps1') })
+                      Where-Object {
+                          $_.CommandLine -and
+                          ($_.Name -match '^(powershell|pwsh)') -and
+                          ($_.CommandLine -like ("*" + $supPath + "*")) -and
+                          ($_.CommandLine -notlike "*register-supervisor*")
+                      })
         } catch { return @() }
     }
     # main.py が自分のソースより古ければ落とす。supervisor が居れば数十秒で拾い直し、

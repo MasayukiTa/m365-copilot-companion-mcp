@@ -143,9 +143,18 @@ Check "agent_url" "Agent URL configured (Copilot Studio agent pasted)" `
 # to read that green as "the stack HAS been started", which it does not mean. Both branches of
 # the advice looked identical from the output, so neither could be acted on.
 function Get-RunningSupervisorCommandLineDoctor {
+    # SCOPED, because a bare match on the file name finds anything that MENTIONS it -- measured:
+    # four matches here, three of them shell commands that merely contained the string. -like
+    # rather than -match so a path of backslashes needs no escaping.
+    $supPath = Join-Path $scriptDir "supervisor.ps1"
     try {
         $p = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-             Where-Object { $_.CommandLine -and ($_.CommandLine -match 'supervisor\.ps1') } |
+             Where-Object {
+                 $_.CommandLine -and
+                 ($_.Name -match '^(powershell|pwsh)') -and
+                 ($_.CommandLine -like ("*" + $supPath + "*")) -and
+                 ($_.CommandLine -notlike "*register-supervisor*")
+             } |
              Select-Object -First 1
         if ($p) { return $p.CommandLine }
     } catch { }

@@ -614,3 +614,28 @@ def test_a_keepalive_process_is_not_a_serving_bridge():
     assert "already running and serving" in start_all
     # and the diagnosis below is now reachable when it is running but not serving
     assert start_all.index("already running and serving") < start_all.index("is HELD by pid")
+
+
+def test_the_supervisor_probe_matches_this_checkout_and_not_whoever_mentions_it():
+    """MEASURED while writing this. `CommandLine -match 'supervisor\.ps1'` selected five
+    processes on this machine: the real supervisor, another powershell, and three bash commands
+    that contained the string because they were SEARCHING for it. This project already has the
+    lesson written down -- a process query matches the process making it.
+
+    doctor took -First 1, so "Supervisor running" could go green on a shell command. Worse,
+    start_all's drift restart STOPS every match: on a two-checkout machine that kills the other
+    one's supervisor, and here it would have killed a shell.
+
+    Scoped by this checkout's resolved script path, requiring a PowerShell host, excluding the
+    register/unregister scripts that share the name. -like rather than -match, so a path of
+    backslashes needs no escaping -- a count that has already gone wrong once today."""
+    doctor = (ROOT / "scripts" / "doctor.ps1").read_text(encoding="utf-8")
+    start_all = (ROOT / "scripts" / "start_all.ps1").read_text(encoding="utf-8")
+
+    for src, what in ((doctor, "doctor"), (start_all, "start_all")):
+        code = "\n".join(l for l in src.splitlines() if not l.lstrip().startswith("#"))
+        assert "$_.CommandLine -match 'supervisor\.ps1'" not in code, \
+            "%s matches anything that mentions the file again" % what
+        assert '$_.Name -match \'^(powershell|pwsh)\'' in code, what
+        assert '-notlike "*register-supervisor*"' in code, what
+        assert 'Join-Path $scriptDir "supervisor.ps1"' in code, what
