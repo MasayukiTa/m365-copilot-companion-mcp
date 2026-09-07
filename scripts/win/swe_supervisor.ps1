@@ -52,7 +52,16 @@ function Test-Composer {
 function Repair-Cockpit([int]$level) {
     if ($level -le 1) {
         Say "repair 1: restore and foreground the cockpit window"
-        $p = Get-Process -Name FleetCockpit -EA SilentlyContinue | Select-Object -First 1
+        # The ordinary cockpit window only -- not the approval-gate / authority windows the
+        # same exe serves (task_router._COCKPIT_OTHER_WINDOWS). Foregrounding one of those
+        # instead would leave the composer we need to reach still buried.
+        $otherW = @('--approval-gate', '--authority')
+        $cim = @(Get-CimInstance Win32_Process -Filter "Name='FleetCockpit.exe'" |
+            Where-Object {
+                $cl = [string]$_.CommandLine
+                -not ($otherW | Where-Object { $cl -like ('*' + $_ + '*') })
+            }) | Select-Object -First 1
+        $p = if ($cim) { Get-Process -Id $cim.ProcessId -EA SilentlyContinue } else { $null }
         if ($p -and $p.MainWindowHandle -ne [IntPtr]::Zero) {
             [Win32.Sup]::ShowWindow($p.MainWindowHandle, 9) | Out-Null
             [Win32.Sup]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
@@ -62,8 +71,22 @@ function Repair-Cockpit([int]$level) {
     }
     # RESTARTING THE COCKPIT IS NOT FREE: it drops the window a person may be reading and
     # any run in flight, so it is the second remedy, never the first.
+    #
+    # ONLY THE ORDINARY COCKPIT WINDOW. FleetCockpit.exe also serves the approval-gate and
+    # authority-dashboard windows (see task_router._COCKPIT_OTHER_WINDOWS); a blanket
+    # `Get-Process -Name FleetCockpit | Stop-Process` reaps those too, dropping a pending
+    # approval prompt or the authority view along with the composer we meant to restart.
+    # Select by command line and exclude the other windows, killing only the plain cockpit.
     Say "repair 2: restart the cockpit"
-    Get-Process -Name FleetCockpit -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue
+    $other = @('--approval-gate', '--authority')
+    $plain = @(Get-CimInstance Win32_Process -Filter "Name='FleetCockpit.exe'" |
+        Where-Object {
+            $cl = [string]$_.CommandLine
+            -not ($other | Where-Object { $cl -like ('*' + $_ + '*') })
+        })
+    foreach ($c in $plain) {
+        try { Stop-Process -Id $c.ProcessId -Force -EA SilentlyContinue } catch { }
+    }
     Start-Sleep -Seconds 4
     $exe = Join-Path $repo "ui\FleetCockpit.exe"
     if (Test-Path $exe) { Start-Process -FilePath $exe | Out-Null; Start-Sleep -Seconds 12 }
