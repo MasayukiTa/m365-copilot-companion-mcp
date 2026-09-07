@@ -1,7 +1,7 @@
 """repo_contract.py -- the shared エージェント契約 instruction block.
 
 This is the single source of truth for the standing constraints that were being hand-
-copied into every fleet goal (隠離 / 選択的 add / main への直接コミット禁止 / 新規テストの
+copied into every fleet goal (隔離 / 選択的 add / main への直接コミット禁止 / 新規テストの
 CI 登録 / Windows 依存の禁止 / レビュー指摘は裏を取ってから). It is modelled directly on
 coding_discipline.py: keep the shared block in one file and prepend it to the jobs it
 applies to, rather than letting drifting copies accumulate in each goal string.
@@ -43,9 +43,9 @@ def repo_contract_text() -> str:
     """
     return (
         "【エージェント契約（既定の共通制約）】以下はこの作業で常に守ること。\n"
-        "(1) 隠離。自分の作業が終わるまで、他の走行から見える状態を変えないこと。作業ツリー・HEAD・"
-        "共有ファイルは他の走行と共有されている。どうやって隠離するか、そもそも隠離が要るかは"
-        "実行するあなたが判断する（読むだけの作業に隠離は不要）。\n"
+        "(1) 隔離。自分の作業が終わるまで、他の走行から見える状態を変えないこと。作業ツリー・HEAD・"
+        "共有ファイルは他の走行と共有されている。どうやって隔離するか、そもそも隔離が要るかは"
+        "実行するあなたが判断する（読むだけの作業に隔離は不要）。\n"
         "(2) git add -A / git add . を使わず、変更したファイルだけを明示的に add する。\n"
         "(3) 指示が無い限り main にコミットしない。\n"
         "(4) 新規テストファイルは .github/workflows/ci.yml の明示リストに追加する"

@@ -15,7 +15,7 @@ from relay import relay_fleet
 # The six standing clauses, each identified by a fragment that is unique to it. Kept as a
 # list so a dropped clause names itself in the failure rather than collapsing the count.
 _CLAUSES = [
-    "隠離",                       # (1) isolate until done
+    "隔離",                       # (1) isolate until done
     "git add -A",                # (2) explicit add, no add -A / add .
     "main にコミットしない",         # (3) no direct commit to main
     "ci.yml",                    # (4) register a new test in the CI list
