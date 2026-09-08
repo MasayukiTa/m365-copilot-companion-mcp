@@ -690,6 +690,49 @@ AUTOSTART_GRACE_S = float(os.environ.get("FLEET_INTAKE_AUTOSTART_GRACE_S", "240"
 #: spawn a browser every drain pass -- every fifteen seconds -- for as long as the goal waits.
 AUTOSTART_BACKOFF_S = float(os.environ.get("FLEET_INTAKE_AUTOSTART_BACKOFF_S", "900") or 900)
 
+#: When an autostarted run gets --fanout. fleet_runner exposes the flag and threads it into
+#: run_relay_fleet(fanout=...), but autostart_fleet never passed it, so a goal that arrives
+#: from the tunnel could never be split -- the one path where a phone-sized instruction is
+#: most likely to be "a quarter of mail", which is exactly the size problem fan-out exists
+#: for. The flag's own help is the policy this honours: "Off by default -- a goal that fits
+#: should not pay for a split turn and a merge turn." So it is turned on per size, not always:
+#: a goal whose text is at least this many characters is long enough that a split/merge turn
+#: is worth its cost. 0 (or a non-positive value) disables the size heuristic entirely.
+AUTOSTART_FANOUT_MIN_CHARS = int(
+    os.environ.get("FLEET_INTAKE_AUTOSTART_FANOUT_MIN_CHARS", "600") or 600)
+
+
+def _truthy_env(name):
+    """An explicit operator override, or None when the variable is unset.
+
+    Returns True/False when FLEET_INTAKE_AUTOSTART_FANOUT is set to a yes/no value, and None
+    when it is absent -- so the caller can tell "forced on", "forced off" and "decide by size"
+    apart. A blank string is treated as unset, matching how the other flags here read .env.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return None
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _wants_fanout(goals) -> bool:
+    """Should this launch pass --fanout?
+
+    An explicit FLEET_INTAKE_AUTOSTART_FANOUT wins in both directions. Otherwise fan out when
+    ANY goal is long enough to be worth a split -- one oversized goal in the batch is reason
+    enough, and the runner still decides per goal (short ones skip the split turn at depth 0,
+    subtasks_from refuses a split that came back too small or too large). With the size
+    heuristic disabled (threshold <= 0) and no override, the answer is False, which is the
+    old behaviour exactly.
+    """
+    override = _truthy_env("FLEET_INTAKE_AUTOSTART_FANOUT")
+    if override is not None:
+        return override
+    if AUTOSTART_FANOUT_MIN_CHARS <= 0:
+        return False
+    return any(len((g or {}).get("text") or "") >= AUTOSTART_FANOUT_MIN_CHARS
+               for g in (goals or []))
+
 
 def launch_creationflags() -> int:
     """Windows creation flags for spawning a fleet. Split out so it can be tested.
@@ -850,6 +893,12 @@ def autostart_fleet(goals, state_dir=None, now=None, launcher=None) -> dict:
     cmd = [sys.executable, "-m", "relay.fleet_runner",
            "--goals-file", goals_file, "--agent-url", url, "--state-dir", sd,
            "--disk-floor-gb", "0"]
+    # FAN-OUT WAS WIRED EVERYWHERE BUT HERE. fleet_runner parses --fanout and passes it to
+    # run_relay_fleet(fanout=...); the worker gates the split turn itself (depth 0 only). The
+    # missing link was this command line: without the flag an autostarted goal could never
+    # split, however large. Added by goal size so a goal that fits pays nothing for it.
+    if _wants_fanout(goals):
+        cmd.append("--fanout")
     try:
         if launcher is not None:
             pid = launcher(cmd)

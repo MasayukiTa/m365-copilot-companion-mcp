@@ -538,3 +538,71 @@ def test_the_launch_asks_for_no_console_window():
         "DETACHED_PROCESS is back; the grandchild will allocate its own console window")
     assert flags & sp.CREATE_NEW_PROCESS_GROUP, (
         "a Ctrl+C in the router's console would travel to the run")
+
+
+# ── --fanout reaches the launch ──────────────────────────────────────────────────
+#
+# fleet_runner has always understood --fanout and passed it into run_relay_fleet; the gap was
+# that autostart_fleet built its command line without it, so a goal that came in from the
+# tunnel with nothing running could not be split no matter how large it was. These pin the
+# fix and the policy behind it: on by size, off for a goal that fits, overridable either way.
+
+
+def _big_goal(n=None):
+    n = TR.AUTOSTART_FANOUT_MIN_CHARS if n is None else n
+    return "メールを全件抽出して一覧化 " + ("x" * n)
+
+
+def test_a_goal_too_small_to_split_is_launched_without_fanout(state):
+    launcher = _Launcher()
+    TR.autostart_fleet([{"text": "read yesterday's mail"}], str(state), launcher=launcher)
+    assert "--fanout" not in launcher.calls[0], (
+        "a short goal paid for a split turn and a merge turn it did not need")
+
+
+def test_a_goal_large_enough_is_launched_with_fanout(state):
+    launcher = _Launcher()
+    TR.autostart_fleet([{"text": _big_goal()}], str(state), launcher=launcher)
+    assert "--fanout" in launcher.calls[0], (
+        "an oversized goal was launched without --fanout, so it can never be split")
+
+
+def test_one_large_goal_in_the_batch_turns_fanout_on_for_the_launch(state):
+    launcher = _Launcher()
+    TR.autostart_fleet([{"text": "tiny"}, {"text": _big_goal()}], str(state), launcher=launcher)
+    assert "--fanout" in launcher.calls[0]
+
+
+def test_the_operator_can_force_fanout_off_for_a_large_goal(state, monkeypatch):
+    monkeypatch.setenv("FLEET_INTAKE_AUTOSTART_FANOUT", "0")
+    launcher = _Launcher()
+    TR.autostart_fleet([{"text": _big_goal()}], str(state), launcher=launcher)
+    assert "--fanout" not in launcher.calls[0], (
+        "an explicit off override did not win over the size heuristic")
+
+
+def test_the_operator_can_force_fanout_on_for_a_small_goal(state, monkeypatch):
+    monkeypatch.setenv("FLEET_INTAKE_AUTOSTART_FANOUT", "1")
+    launcher = _Launcher()
+    TR.autostart_fleet([{"text": "tiny"}], str(state), launcher=launcher)
+    assert "--fanout" in launcher.calls[0], (
+        "an explicit on override did not win over the size heuristic")
+
+
+def test_a_zero_threshold_disables_the_size_heuristic(state, monkeypatch):
+    # Threshold <= 0 with no override means never fan out by size -- the old behaviour.
+    monkeypatch.setattr(TR, "AUTOSTART_FANOUT_MIN_CHARS", 0)
+    launcher = _Launcher()
+    TR.autostart_fleet([{"text": _big_goal()}], str(state), launcher=launcher)
+    assert "--fanout" not in launcher.calls[0]
+
+
+def test_fanout_does_not_disturb_the_rest_of_the_command(state):
+    # The flag is added, not substituted: goals-file, agent-url, state-dir and the 0 disk
+    # floor all still travel exactly as before.
+    launcher = _Launcher()
+    TR.autostart_fleet([{"text": _big_goal()}], str(state), launcher=launcher)
+    cmd = launcher.calls[0]
+    assert "--goals-file" in cmd and "--agent-url" in cmd and "--state-dir" in cmd
+    assert cmd[cmd.index("--disk-floor-gb") + 1] == "0"
+    assert cmd[:3] == [sys.executable, "-m", "relay.fleet_runner"]
