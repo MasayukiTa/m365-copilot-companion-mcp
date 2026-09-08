@@ -406,6 +406,7 @@ jobs:
             relay/selfimprove/test_frozen_surfaces.py \
             relay/selfimprove/test_reliability.py \
             relay/test_claim_verdict.py \
+            relay/test_conv_registry_points_at_this_run.py \
             relay/test_conv_title.py \
             relay/test_edge_cache_trim.py \
             relay/test_edge_disk_cap.py \
