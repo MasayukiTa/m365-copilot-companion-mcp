@@ -1,3 +1,4 @@
+import contextlib
 import os
 import py_compile
 import shutil
@@ -706,3 +707,398 @@ def diff_files(path_a: str, path_b: str, max_lines: int = 400) -> str:
         return "\n".join(diff)
     except Exception as e:
         return f"[diff_files error: {type(e).__name__}: {e}]"
+
+
+# --------------------------------------------------------------------------------------
+# Scoped worktree lifecycle.
+#
+# Isolated work belongs in a dedicated linked worktree, never in the shared (main) working
+# tree -- that rule is already stated by git_checkout above. What was missing was the OTHER
+# half of the lifecycle: taking the worktree down again. Two existing call sites
+# (bench/pro_capture.py, bench/pro_cycle.py) each grew their own teardown, and both learned
+# the same lesson the hard way on Windows:
+#
+#   * `shutil.rmtree` cannot unlink the locked `.git` administrative entry, so it leaves a
+#     HUSK -- a directory that git no longer tracks as a worktree but whose `.git` file still
+#     resolves to the MAIN repository. A later step that walks that husk reads the harness's
+#     own checkout and can submit the parent repo's state as if it were the work.
+#   * A teardown that deletes by PATH, without first asking whether the path is the shared
+#     working tree, can delete the very tree that holds every other worker's and the owner's
+#     uncommitted changes.
+#
+# The two functions below are the single, safe teardown those sites should route through:
+# `git worktree remove --force` first (git removes its own administrative files properly),
+# rmtree only as a fallback and only when doing so cannot touch the shared tree, and a
+# `git worktree prune` to clear any now-stale bookkeeping. `worktree_scope` wraps add +
+# guaranteed teardown so an exception mid-work still tears the worktree down.
+
+
+def _resolves_into_common_dir(worktree_path: Path, repo_cwd: Path):
+    """True when *worktree_path* shares the repository's main working tree / git dir.
+
+    A husk left by a half-finished rmtree still carries a `.git` that points at the main
+    repository's common dir. Removing such a directory with rmtree would be deleting inside
+    (or alongside) the shared checkout. Returns True (shared -- refuse to rmtree),
+    False (a genuine linked worktree, safe to fall back on), or None when git cannot answer
+    and the caller must not guess.
+    """
+    if not worktree_path.exists():
+        # Nothing on disk to be unsafe about.
+        return False
+    shared = _is_shared_worktree(worktree_path)
+    if shared is True:
+        return True
+    if shared is None:
+        # git could not tell us whether this is a linked worktree. Compare the two paths
+        # directly as a last resort: if the worktree path IS the repo path, it is shared.
+        try:
+            if _norm(str(worktree_path)) == _norm(str(repo_cwd)):
+                return True
+        except Exception:
+            return None
+        return None
+    return False
+
+
+def worktree_remove(worktree_path: str, repo_path: str = ".", prune: bool = True) -> str:
+    """Tear down a dedicated linked worktree safely.
+
+    Routes through `git worktree remove --force`; on failure falls back to an OS delete ONLY
+    when the target is provably not the shared (main) working tree, then prunes stale
+    worktree bookkeeping. Refuses outright to delete the shared working tree.
+
+    Args:
+        worktree_path: Path of the linked worktree to remove.
+        repo_path: The repository whose worktree list owns it (for remove/prune).
+        prune: Run `git worktree prune` afterwards to clear stale administrative entries.
+    """
+    locked = require_unlocked()
+    if locked:
+        return locked
+    try:
+        wt = _validate_path(worktree_path)
+        repo = _validate_path(repo_path)
+        repo_cwd = repo if repo.is_dir() else repo.parent
+
+        # (A) Never delete the shared working tree. A teardown that swept it up would take
+        # every other worker's and the owner's uncommitted changes with it.
+        shared = _resolves_into_common_dir(wt, repo_cwd)
+        if shared is True:
+            return (
+                "[worktree_remove refused: the path resolves to the shared (main) working\n"
+                "tree, not a dedicated linked worktree.\n"
+                "Why: removing it would delete the checkout that holds other workers' and the\n"
+                "owner's uncommitted changes.\n"
+                "Instead: pass the path of the linked worktree you created for this run.]"
+            )
+
+        # (B) Route through the destructive-op gate so an active contract can ask-before.
+        _g = _cg.check_op("shell_destructive", "git worktree remove --force " + str(wt))
+        if _g is not None:
+            return _g
+
+        # (C) The actual teardown -- remove --force first, guarded rmtree fallback, prune --
+        # lives in a gate-free helper so out-of-process callers (the bench teardown sites)
+        # can share the exact same guarantee without needing an unlock session or a contract
+        # context they do not have.
+        return _worktree_teardown(wt, repo_cwd, shared, prune)
+    except Exception as e:
+        return f"[worktree_remove error: {type(e).__name__}: {e}]"
+
+
+def _worktree_teardown(wt: Path, repo_cwd: Path, shared, prune: bool = True) -> str:
+    """Remove a linked worktree and prune, without any unlock/contract gate.
+
+    Shared by `worktree_remove` (which applies the gates first) and by the bench teardown
+    sites, which run as their own processes. `git worktree remove --force` goes first; the
+    rmtree fallback runs ONLY when `shared is False` (a proven linked worktree), never when
+    it is True (the shared tree) or None (git could not tell). `prune` clears stale
+    administrative entries afterwards. Returns a short multi-line report; raises nothing that
+    the caller has not already wrapped.
+
+    Args:
+        wt: Validated path of the linked worktree to remove.
+        repo_cwd: Directory to run the git commands from.
+        shared: Result of `_resolves_into_common_dir` -- True/False/None.
+        prune: Run `git worktree prune` afterwards.
+    """
+    parts: list[str] = []
+    done = _run(["git", "worktree", "remove", "--force", str(wt)], repo_cwd, 30)
+    removed_by_git = "[returncode:" not in done
+    parts.append("git worktree remove: " + ("ok" if removed_by_git else done.strip()))
+
+    # Fallback delete, but only when it CANNOT touch the shared tree. `shared` is
+    # False (genuine linked worktree) or None (unknown). Only act on the definite case;
+    # an unknown answer must not license deleting a directory that might be the main tree.
+    if not removed_by_git and wt.exists():
+        if shared is False:
+            shutil.rmtree(str(wt), ignore_errors=True)
+            if wt.exists():
+                parts.append("rmtree fallback: directory still present")
+            else:
+                parts.append("rmtree fallback: removed")
+        else:
+            parts.append(
+                "rmtree fallback SKIPPED: could not confirm this is a linked worktree, "
+                "so an OS delete might have hit the shared tree"
+            )
+
+    if prune:
+        pr = _run(["git", "worktree", "prune"], repo_cwd, 30)
+        parts.append("git worktree prune: " + ("ok" if "[returncode:" not in pr
+                                                else pr.strip()))
+    return "\n".join(parts)
+
+
+def worktree_add(worktree_path: str, branch: str, base: str = "HEAD",
+                 repo_path: str = ".") -> str:
+    """Create a dedicated linked worktree on a NEW branch, off *base*.
+
+    A new branch discards nothing, and a linked worktree keeps this run's edits out of the
+    shared checkout -- the isolation git_checkout points callers at. Off an explicit base
+    (a committed ref by default) so the new worktree never carries the shared tree's
+    uncommitted changes.
+
+    Args:
+        worktree_path: Where to create the linked worktree.
+        branch: New branch name to create for it.
+        base: Committed ref to branch from (default HEAD).
+        repo_path: The repository to add the worktree to.
+    """
+    locked = require_unlocked()
+    if locked:
+        return locked
+    try:
+        repo = _validate_path(repo_path)
+        repo_cwd = repo if repo.is_dir() else repo.parent
+        wt = _validate_path(worktree_path)
+        _g = _cg.check_op("shell_destructive",
+                          "git worktree add -b %s %s %s" % (branch, wt, base))
+        if _g is not None:
+            return _g
+        return _run(["git", "worktree", "add", "-b", branch, str(wt), base], repo_cwd, 60)
+    except Exception as e:
+        return f"[worktree_add error: {type(e).__name__}: {e}]"
+
+
+@contextlib.contextmanager
+def worktree_scope(worktree_path: str, branch: str, base: str = "HEAD",
+                   repo_path: str = "."):
+    """Create an isolated linked worktree, yield its path, and ALWAYS tear it down.
+
+    FOR IN-PROCESS CALLERS. This is the shape the two bench teardown sites should share: the
+    worktree is removed in a `finally`, so an exception mid-work cannot leave a husk behind,
+    and the removal goes through `worktree_remove`, which refuses to touch the shared tree
+    and never lets an rmtree fallback hit it.
+
+    Yields the worktree path on success, or None when creation failed (teardown then has
+    nothing to do and is a safe no-op).
+
+    Args:
+        worktree_path: Where to create the linked worktree.
+        branch: New branch name to create for it.
+        base: Committed ref to branch from (default HEAD).
+        repo_path: The repository to add the worktree to.
+    """
+    created = worktree_add(worktree_path, branch, base, repo_path)
+    ok = "[returncode:" not in created and not created.startswith("[worktree_add") \
+        and not created.startswith("[locked")
+    try:
+        yield (worktree_path if ok else None)
+    finally:
+        # Only tear down what we actually created. If add failed, there is no linked
+        # worktree to remove -- and worktree_remove would in any case refuse anything that
+        # is not a genuine linked worktree.
+        if ok:
+            worktree_remove(worktree_path, repo_path)
+
+
+# --------------------------------------------------------------------------------------
+# Read-only survey of existing worktrees.
+#
+# Over a long run this repository accumulated many linked worktrees whose owning run had
+# long finished. Deciding which are safe to discard is a judgement call, and that call must
+# stay with a human (or a separate, deliberate step): this function only REPORTS. It never
+# removes a worktree and never shells out to anything destructive, so a caller cannot turn
+# it into an auto-cleanup by accident.
+#
+# For each linked worktree it answers the questions that make a discard safe or unsafe:
+#   * locked        -- `git worktree lock` was set; git itself will refuse --force, and the
+#                      lock usually means the owner is still using it.
+#   * prunable      -- git already considers the entry stale (the directory is gone).
+#   * detached      -- no branch; nothing named survives a removal.
+#   * branch        -- the branch this worktree checks out, if any.
+#   * branch_exists -- whether that branch ref still exists.
+#   * merged_into_base -- whether HEAD is already contained in the base ref (default the
+#                      repository's main branch). True means removing loses no unmerged work.
+#   * dirty         -- uncommitted changes present in the worktree; removing would drop them.
+#   * is_main       -- the shared (main) working tree itself; never a discard candidate.
+#   * safe_to_remove -- a conservative AND of the above: not main, not locked, not dirty,
+#                      and either prunable or already merged into base. `detached` alone is
+#                      deliberately NOT enough (a detached HEAD may carry unreferenced
+#                      commits). A None in any input it depends on makes this None, never True.
+
+
+def _git_raw(repo_cwd, args, timeout=30):
+    """Run a read-only git command and return (returncode, stdout). No sugaring.
+
+    coding_ops._run wraps output in '[stdout]'/'(no output)' markers, which is fine for
+    reporting but destroys the exact-string and exit-code signals the survey depends on
+    (e.g. an empty `status --porcelain` means clean, not '(no output)'). So the read-only
+    survey uses this raw helper instead.
+    """
+    try:
+        r = subprocess.run(["git", *args], cwd=str(repo_cwd), capture_output=True,
+                           text=True, encoding="utf-8", errors="replace",
+                           timeout=timeout, shell=False)
+        return r.returncode, r.stdout
+    except Exception:
+        return None, ""
+
+
+def _porcelain_worktrees(repo_cwd):
+    """Parse `git worktree list --porcelain` into dicts. Read-only."""
+    rc, out = _git_raw(repo_cwd, ["worktree", "list", "--porcelain"], 30)
+    if rc != 0:
+        return None, out
+    items = []
+    cur = {}
+    for line in out.splitlines():
+        if not line.strip():
+            if cur:
+                items.append(cur)
+                cur = {}
+            continue
+        if line.startswith("worktree "):
+            cur = {"path": line[len("worktree "):]}
+        elif line == "bare":
+            cur["bare"] = True
+        elif line == "detached":
+            cur["detached"] = True
+        elif line == "locked" or line.startswith("locked "):
+            cur["locked"] = True
+        elif line == "prunable" or line.startswith("prunable "):
+            cur["prunable"] = True
+        elif line.startswith("HEAD "):
+            cur["head"] = line[len("HEAD "):]
+        elif line.startswith("branch "):
+            ref = line[len("branch "):]
+            cur["branch"] = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
+    if cur:
+        items.append(cur)
+    return items, out
+
+
+def _ref_exists(repo_cwd, ref):
+    rc, _ = _git_raw(repo_cwd, ["show-ref", "--verify", "--quiet",
+                               "refs/heads/" + ref], 15)
+    return rc == 0
+
+
+def _is_ancestor(repo_cwd, maybe_ancestor, descendant):
+    """True when *maybe_ancestor* is contained in *descendant*'s history. None if unknowable."""
+    rc, _ = _git_raw(repo_cwd, ["merge-base", "--is-ancestor",
+                               maybe_ancestor, descendant], 15)
+    if rc == 0:
+        return True
+    if rc == 1:
+        return False
+    return None                    # any other exit (incl. error) -> cannot tell
+
+
+def survey_worktrees(repo_path: str = ".", base: str = "") -> list:
+    """Report, WITHOUT deleting anything, whether each linked worktree is safe to discard.
+
+    Strictly read-only: it runs only `git worktree list`, `show-ref`, `merge-base` and
+    `status`, and returns a list of per-worktree dicts. It performs no removal and asks no
+    caller to perform one.
+
+    Args:
+        repo_path: The repository to survey.
+        base: Ref to test 'already merged' against. Defaults to the repo's main branch
+              ('main' if it exists, else 'master', else 'HEAD').
+
+    Returns:
+        On success, a list of dicts (one per worktree). On failure, a one-element list
+        [{"error": "..."}] so callers always get a list.
+    """
+    locked = require_unlocked()
+    if locked:
+        return [{"error": locked}]
+    try:
+        repo = _validate_path(repo_path)
+        repo_cwd = repo if repo.is_dir() else repo.parent
+        items, raw = _porcelain_worktrees(repo_cwd)
+        if items is None:
+            return [{"error": raw.strip()}]
+
+        if not base:
+            base = "main" if _ref_exists(repo_cwd, "main") else (
+                "master" if _ref_exists(repo_cwd, "master") else "HEAD")
+
+        rows = []
+        for it in items:
+            path = it.get("path", "")
+            is_main = False
+            try:
+                is_main = _is_shared_worktree(Path(path)) is True
+            except Exception:
+                is_main = False
+            branch = it.get("branch")
+            detached = bool(it.get("detached"))
+            lockedwt = bool(it.get("locked"))
+            prunable = bool(it.get("prunable"))
+            head = it.get("head")
+
+            branch_exists = _ref_exists(repo_cwd, branch) if branch else False
+
+            merged = None
+            if head:
+                merged = _is_ancestor(repo_cwd, head, base)
+
+            # `status` in the worktree tells us whether a removal would drop work.
+            dirty = None
+            if prunable:
+                dirty = False          # the checkout is already gone; nothing to drop
+            elif Path(path).is_dir():
+                rc, st = _git_raw(repo_cwd, ["-C", path, "status", "--porcelain"], 20)
+                if rc != 0:
+                    dirty = None
+                else:
+                    dirty = st.strip() != ""
+
+            # Conservative: only True when we are sure removing loses nothing that
+            # is not already preserved elsewhere. `prunable` (checkout already gone) and
+            # `merged is True` (HEAD contained in base) both mean that. `detached` alone
+            # is NOT sufficient -- a detached HEAD can still carry commits that no branch
+            # points at, and removing it would strand them.
+            if is_main or lockedwt:
+                safe = False
+            elif dirty is True:
+                safe = False
+            elif dirty is None:
+                safe = None
+            elif prunable or merged is True:
+                safe = True
+            elif merged is None:
+                safe = None
+            else:
+                safe = False
+
+            rows.append({
+                "path": path,
+                "is_main": is_main,
+                "branch": branch,
+                "branch_exists": branch_exists,
+                "detached": detached,
+                "locked": lockedwt,
+                "prunable": prunable,
+                "head": head,
+                "merged_into_base": merged,
+                "base": base,
+                "dirty": dirty,
+                "safe_to_remove": safe,
+            })
+        return rows
+    except Exception as e:
+        return [{"error": "%s: %s" % (type(e).__name__, e)}]
