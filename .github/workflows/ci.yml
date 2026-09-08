@@ -452,6 +452,7 @@ jobs:
             tools/test_gate_is_not_demoted.py \
             tools/test_gate_not_demoted_by_a_switch.py \
             tools/test_bridge_judge.py \
+            tools/test_bridge_stream_parsing.py \
             tools/test_judge_backend.py \
             tools/test_judge_wiring.py \
             tools/test_ledger_never_writes_a_secret.py \
