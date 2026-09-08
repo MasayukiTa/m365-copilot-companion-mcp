@@ -3632,7 +3632,25 @@ class Handler(BaseHTTPRequestHandler):
             if not PAGE_LOCK.acquire(blocking=False):
                 self._json({"ok": False, "error": "busy"}); return
             try:
-                run_on_page_thread(lambda: self._json({"url": PAGE.url}))
+                # NO PAGE IS A NORMAL STATE, AND THIS HANDLER DIED ON IT. `PAGE.url` on a None
+                # PAGE raises inside the page thread, the request ends without a response, and
+                # the socket closes mid-request -- so a caller sees a connection failure and
+                # concludes the bridge is DOWN. It is not: /status answers 200 beside it, saying
+                # has_resident_page false, which is the very condition this line cannot survive.
+                #
+                # That misreading is the whole cost. ui/CopilotChat.cs probes /conv before every
+                # send, and on failure refuses to send and offers to restart the stack -- so a
+                # healthy bridge with no page open presents as an unreachable one, and restarting
+                # the stack does not fix it because nothing is broken. Reported by the operator
+                # after the stack had already come back up. 2026-09-09.
+                #
+                # /switch and /new next to this one already ask for a page and answer "no agent
+                # page" when there is none. This is the same guard, and it was missing here.
+                page = PAGE
+                if page is None:
+                    self._json({"ok": True, "url": ""})
+                else:
+                    run_on_page_thread(lambda: self._json({"ok": True, "url": page.url}))
             finally:
                 PAGE_LOCK.release()
             return
