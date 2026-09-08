@@ -155,6 +155,8 @@ jobs:
             scripts/test_settle_stage0_replay.py \
             scripts/test_collect_lens_corpus.py \
             scripts/test_analyze_lens_corpus.py \
+            scripts/test_tunnel_url_belongs_to_this_machine.py \
+            scripts/test_env_is_written_as_utf8_without_bom.py \
             scripts/test_bootstrap.py \
             scripts/test_bootstrap_p2c.py \
             scripts/test_repair_unlock_output.py \

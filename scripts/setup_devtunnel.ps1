@@ -40,7 +40,7 @@ function Get-AllowAnonymous {
     if (-not $v) {
         $envPath0 = Join-Path $root ".env"
         if (Test-Path $envPath0) {
-            foreach ($ln in Get-Content $envPath0) {
+            foreach ($ln in Get-Content $envPath0 -Encoding UTF8) {
                 if ($ln -match '^MCP_TUNNEL_ALLOW_ANONYMOUS=(.*)$') { $v = $matches[1]; break }
             }
         }
@@ -453,7 +453,7 @@ $existingNames = @($existingIds | ForEach-Object { ($_ -split '\.')[0] })
 if (-not $TunnelName) {
     $envPath0 = Join-Path $root ".env"
     if (Test-Path $envPath0) {
-        foreach ($ln in Get-Content $envPath0) {
+        foreach ($ln in Get-Content $envPath0 -Encoding UTF8) {
             if ($ln -match '^MCP_TUNNEL_NAME=(.+)$') { $TunnelName = $matches[1].Trim(); break }
         }
     }
@@ -684,10 +684,13 @@ if ($url) {
     try {
         $envPath = Join-Path $root ".env"
         if (Test-Path $envPath) {
-            $lines = @(Get-Content $envPath | Where-Object { $_ -notmatch '^# devtunnel \(auto\)|^MCP_TUNNEL_NAME=|^MCP_TUNNEL_URL=' })
+            $lines = @(Get-Content $envPath -Encoding UTF8 | Where-Object { $_ -notmatch '^# devtunnel \(auto\)|^MCP_TUNNEL_NAME=|^MCP_TUNNEL_URL=|^MCP_TUNNEL_HOST=' })
             $lines += "# devtunnel (auto) -- the public URL to register in Copilot Studio; supervisor hosts MCP_TUNNEL_NAME"
             $lines += "MCP_TUNNEL_NAME=$target"
-            Set-Content -Path $envPath -Value $lines -Encoding ASCII
+            # NOT -Encoding ASCII (drops every non-ASCII line to '?') and NOT
+            # -Encoding UTF8 (PS 5.1 writes a BOM, which folds into the first key
+            # name and breaks the .env parser). UTF8Encoding($false) is no-BOM.
+            [IO.File]::WriteAllLines($envPath, $lines, (New-Object System.Text.UTF8Encoding($false)))
         }
     } catch { }
     exit 1
@@ -698,11 +701,18 @@ Write-Host "==================================================================="
 try {
     $envPath = Join-Path $root ".env"
     if (Test-Path $envPath) {
-        $lines = @(Get-Content $envPath | Where-Object { $_ -notmatch '^# devtunnel \(auto\)|^MCP_TUNNEL_NAME=|^MCP_TUNNEL_URL=' })
+        $lines = @(Get-Content $envPath -Encoding UTF8 | Where-Object { $_ -notmatch '^# devtunnel \(auto\)|^MCP_TUNNEL_NAME=|^MCP_TUNNEL_URL=|^MCP_TUNNEL_HOST=' })
         $lines += "# devtunnel (auto) -- the public URL to register in Copilot Studio; supervisor hosts MCP_TUNNEL_NAME"
         $lines += "MCP_TUNNEL_NAME=$target"
         $lines += "MCP_TUNNEL_URL=$url"
-        Set-Content -Path $envPath -Value $lines -Encoding ASCII
+        # WHICH MACHINE MINTED IT. A devtunnel URL is reachable only while a
+        # machine hosts that tunnel, and .env is carried to a new PC during
+        # setup -- so without this, bootstrap.py sees a non-empty URL belonging
+        # to the old machine and skips provisioning. Reported 2026-09-08.
+        $lines += "MCP_TUNNEL_HOST=$($env:COMPUTERNAME.ToLower())"
+        # No-BOM UTF-8: ASCII would drop non-ASCII lines to '?', and PS 5.1's
+        # -Encoding UTF8 emits a BOM that breaks the .env parser.
+        [IO.File]::WriteAllLines($envPath, $lines, (New-Object System.Text.UTF8Encoding($false)))
         Write-Host "Recorded MCP_TUNNEL_NAME and MCP_TUNNEL_URL in .env."
     } else {
         Write-Host "ERROR: .env not found at $envPath -- cannot record MCP_TUNNEL_URL."
