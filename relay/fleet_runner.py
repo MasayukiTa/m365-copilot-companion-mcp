@@ -1425,50 +1425,6 @@ def _watchdog_should_reset(status, stalled_s, now=None):
 
 COMMANDS_DIR = "commands.d"
 
-#: The receiver's proof of delivery. When a command carrying add_goal items is consumed, the
-#: fleet writes <state_dir>/acked/<ack>.json for each item that has an `ack`. The sender
-#: (task_router.fleet_handoff) waits for this stamp before it records the goal as delivered;
-#: without it, delivery was only ever attested by the sender's own record, which is written
-#: whether or not anything read the command. The stamp is placed just before the command file
-#: is removed, so it appears exactly when the goal has really been taken in -- never earlier.
-ACKED_DIR = "acked"
-
-
-def _stamp_acks(cmd, state_dir) -> None:
-    """Stamp acked/<ack>.json for every add_goal item in `cmd` that carries an ack nonce.
-
-    Best-effort and never raises: a fleet that cannot write the stamp still consumed the goal,
-    and the sender's fallback is to re-park a goal as waiting, which is the safe direction. An
-    item without an ack (an older sender, or the C# cockpit) is simply not stamped -- those
-    callers do not wait on one.
-    """
-    try:
-        items = cmd.get("add_goal") if isinstance(cmd, dict) else None
-    except AttributeError:
-        return
-    if not items:
-        return
-    d = os.path.join(state_dir, ACKED_DIR)
-    try:
-        os.makedirs(d, exist_ok=True)
-    except OSError:
-        return
-    for item in items:
-        ack = item.get("ack") if isinstance(item, dict) else None
-        if not ack:
-            continue
-        path = os.path.join(d, "%s.json" % ack)
-        tmp = path + ".tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8", newline="") as fh:
-                json.dump({"ack": ack, "ts": time.time()}, fh, ensure_ascii=False)
-            os.replace(tmp, path)
-        except OSError:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-
 
 def read_commands(state_dir) -> list:
     """Every pending command for this run, oldest first, CONSUMED as it is read.
@@ -1498,7 +1454,6 @@ def read_commands(state_dir) -> list:
             with open(legacy, encoding="utf-8-sig") as fh:   # tolerate a BOM from the C# cockpit
                 cmd = json.load(fh)
             out.append(cmd)
-            _stamp_acks(cmd, state_dir)
             os.remove(legacy)
     except Exception:
         try:
@@ -1522,7 +1477,25 @@ def read_commands(state_dir) -> list:
             except OSError:
                 pass
             continue
-        _stamp_acks(cmd, state_dir)
+        # LANDING MARK: prove the goal was actually READ here, not merely dispatched.
+        # The sender (relay/task_router.fleet_handoff) filed the goal "dispatched" the
+        # instant fleet_is_live() returned True -- but that check trusts a status.json up
+        # to FLEET_LIVE_MAX_AGE_S old, so a run that had already died still looked live for
+        # up to 30s. A goal handed over in that window was written here, consumed-on-read
+        # by no one, and lost, while its done/ record said "dispatched". Nothing on the
+        # receiving side ever recorded that a command was taken, so the sender's claim
+        # could never be checked. When a command carries an `ack` path, drop a small
+        # receipt there the moment before we delete the command: an audit can then tell a
+        # goal a live fleet really picked up from one that vanished into the stale window.
+        ack = (cmd or {}).get("ack") if isinstance(cmd, dict) else None
+        if isinstance(ack, str) and ack:
+            try:
+                os.makedirs(os.path.dirname(ack), exist_ok=True)
+                with open(ack, "w", encoding="utf-8", newline="\n") as afh:
+                    json.dump({"read": True, "ts": time.time(), "file": name}, afh,
+                              ensure_ascii=False)
+            except OSError:
+                pass
         try:
             os.remove(path)
         except OSError:

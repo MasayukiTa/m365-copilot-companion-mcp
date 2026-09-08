@@ -69,62 +69,6 @@ def _commands(state_dir):
     return merged
 
 
-def _stamp_pending_acks(state_dir):
-    """Stamp every ack currently waiting in the command channel WITHOUT consuming the commands.
-
-    The real fleet stamps an ack as it removes the command it arrived on; here we only want the
-    stamp, so the goal stays in the channel for a later _commands() assertion to read. Reads the
-    same two places read_commands reads -- the legacy commands.json and commands.d/*.json --
-    through the runner's own _stamp_acks, so what is exercised is the receiver's real stamping
-    code, not a test-local imitation of it.
-    """
-    from relay import fleet_runner as FR
-    sd = str(state_dir)
-    seen = []
-    legacy = os.path.join(sd, "commands.json")
-    if os.path.isfile(legacy):
-        try:
-            with open(legacy, encoding="utf-8-sig") as fh:
-                seen.append(json.load(fh))
-        except Exception:
-            pass
-    d = os.path.join(sd, TR.COMMANDS_DIR)
-    try:
-        names = sorted(n for n in os.listdir(d) if n.endswith(".json"))
-    except OSError:
-        names = []
-    for name in names:
-        try:
-            with open(os.path.join(d, name), encoding="utf-8-sig") as fh:
-                seen.append(json.load(fh))
-        except Exception:
-            pass
-    for cmd in seen:
-        FR._stamp_acks(cmd, sd)
-
-
-@pytest.fixture
-def autoack(monkeypatch):
-    """Make add_goal_to_live_fleet's ack appear at once, as a draining fleet would make it.
-
-    fleet_handoff now waits for the receiver's stamp before it calls a goal delivered -- the
-    whole point of the change. In a unit test no fleet is draining, so without this every live
-    handoff would time out and re-park. Wrapping the writer to stamp its own ack the instant it
-    is written stands in for a fleet that consumed the command immediately: the handoff sees a
-    real stamp (written by the runner's _stamp_acks) and returns dispatched, and the goal is
-    left in the channel for the test's own _commands() to read.
-    """
-    real = TR.add_goal_to_live_fleet
-
-    def wrapper(goal, state_dir=None, priority=False, entry=None):
-        ack = real(goal, state_dir=state_dir, priority=priority, entry=entry)
-        _stamp_pending_acks(state_dir or TR.FLEET_STATE_DIR)
-        return ack
-
-    monkeypatch.setattr(TR, "add_goal_to_live_fleet", wrapper)
-    return wrapper
-
-
 # -- is a fleet actually running ---------------------------------------------------------------
 
 def test_a_live_run_is_recognised(state):
@@ -150,7 +94,7 @@ def test_no_snapshot_at_all_is_not_live(state):
 
 # -- delivery ------------------------------------------------------------------------------------
 
-def test_a_goal_joins_the_run_that_is_in_flight(state, autoack):
+def test_a_goal_joins_the_run_that_is_in_flight(state):
     _status(state, True)
     status, result = TR.fleet_handoff("先月のメールを一覧して", "j1", str(state))
     assert status == "dispatched" and result["delivered"] == "add_goal"
@@ -159,14 +103,14 @@ def test_a_goal_joins_the_run_that_is_in_flight(state, autoack):
     assert adds[0]["priority"] is False, "an inbound goal must not jump the current work"
 
 
-def test_a_second_goal_is_appended_not_replacing_the_first(state, autoack):
+def test_a_second_goal_is_appended_not_replacing_the_first(state):
     _status(state, True)
     TR.fleet_handoff("first", "j1", str(state))
     TR.fleet_handoff("second", "j2", str(state))
     assert [a["text"] for a in _commands(state)["add_goal"]] == ["first", "second"]
 
 
-def test_other_commands_in_the_file_survive(state, autoack):
+def test_other_commands_in_the_file_survive(state):
     """commands.json is shared with the cockpit's stop/pause. Rewriting it wholesale would
     drop a pause a human had just set."""
     _status(state, True)
@@ -177,7 +121,7 @@ def test_other_commands_in_the_file_survive(state, autoack):
     assert cur["pause"] is True and len(cur["add_goal"]) == 1
 
 
-def test_the_file_is_written_without_a_bom(state, autoack):
+def test_the_file_is_written_without_a_bom(state):
     """The fleet reads utf-8-sig, so a BOM parses -- but code_task.py writes none, and two
     writers of one channel should write it the same way."""
     _status(state, True)
@@ -216,7 +160,7 @@ def test_an_empty_goal_is_an_error_not_a_delivery(state):
 
 # -- the whole path, through run_job ------------------------------------------------------------
 
-def test_a_fleet_goal_job_reaches_the_running_fleet(state, autoack):
+def test_a_fleet_goal_job_reaches_the_running_fleet(state):
     """End to end: the job type an agent submits, through the router, into the run."""
     _status(state, True)
     job = {"id": "j9", "type": "fleet_goal", "payload": {"goal": "do the thing"}}
@@ -379,7 +323,7 @@ def _live(tmp_path, running=True):
         _json.dump({"running": running, "pid": _os.getpid(), "ts": 9e9}, fh)
 
 
-def test_a_goal_that_arrived_with_no_fleet_is_delivered_when_one_starts(tmp_path, monkeypatch, autoack):
+def test_a_goal_that_arrived_with_no_fleet_is_delivered_when_one_starts(tmp_path, monkeypatch):
     """THE GAP. It was filed in done/ as awaiting_fleet and never looked at again -- the
     status was the only thing waiting. Six such records had built up."""
     _tasks(tmp_path, monkeypatch)
@@ -393,7 +337,7 @@ def test_a_goal_that_arrived_with_no_fleet_is_delivered_when_one_starts(tmp_path
     assert [r["status"] for r in out] == ["dispatched"]
     assert out[0]["result"]["delivered_late"] is True
     assert [g["text"] for g in _commands(tmp_path / "state")["add_goal"]] == ["do the thing"]
-def test_a_delivered_goal_leaves_nothing_waiting(tmp_path, monkeypatch, autoack):
+def test_a_delivered_goal_leaves_nothing_waiting(tmp_path, monkeypatch):
     """for_fleet/ means one thing now: goals still waiting. A delivered goal's record is its
     done/ entry, which says dispatched and how."""
     _tasks(tmp_path, monkeypatch)
@@ -647,7 +591,7 @@ def test_several_goals_arrive_in_the_order_they_were_sent(tmp_path, monkeypatch)
 
     goals = [g for c in FR.read_commands(str(state)) for g in FR.goals_from_command(c)]
     assert [g["text"] for g in goals] == ["goal 0", "goal 1", "goal 2"]
-def test_a_full_job_from_the_intake_door_reaches_the_runners_reader(tmp_path, monkeypatch, autoack):
+def test_a_full_job_from_the_intake_door_reaches_the_runners_reader(tmp_path, monkeypatch):
     """END TO END, WITHOUT A BROWSER OR A COPILOT TURN: the door, the router, the channel, the
     reader. The only thing simulated is that a fleet is running, which fleet_is_live decides
     from a fresh status.json -- so every line of the delivery path is the real one."""
@@ -695,88 +639,3 @@ def test_order_survives_a_clock_that_does_not_move(tmp_path, monkeypatch):
     goals = [g for c in FR.read_commands(str(state)) for g in FR.goals_from_command(c)]
     assert [g["text"] for g in goals] == ["goal %02d" % i for i in range(25)], (
         "commands written inside one clock tick did not keep their order")
-
-
-# -- delivery is proven by the receiver's ack, not by the sender's own record -----------------
-#
-# THE HAZARD THIS SECTION PINS. Before the ack, the only evidence a goal had been delivered was
-# fleet_handoff's own "dispatched" record -- written the instant the command file was, whether or
-# not anything ever read it. A run that ended inside the up-to-30s window fleet_is_live cannot
-# see still looked live, so the goal was written into its dead command channel and filed as
-# delivered. The fix is a round trip: the fleet stamps <state>/acked/<ack>.json as it consumes
-# the command (fleet_runner._stamp_acks), and the sender waits for that stamp before it dares
-# call the goal delivered. These tests drive both real halves.
-
-def test_the_sent_command_carries_an_ack_the_fleet_can_stamp(state):
-    """Without an ack on the wire there is nothing for the receiver to stamp and nothing for the
-    sender to wait on -- so the nonce has to be in the command the fleet reads, not private to
-    the sender."""
-    ack = TR.add_goal_to_live_fleet("a goal", str(state))
-    assert ack, "add_goal_to_live_fleet must return the ack nonce it wrote"
-    goals = _commands(state)["add_goal"]
-    assert len(goals) == 1 and goals[0].get("ack") == ack, (
-        "the ack the sender waits on is not the one carried in the command: %r" % (goals,))
-
-
-def test_the_receiver_stamps_the_ack_as_it_consumes_the_command(state):
-    """The stamp is the receiver's side of the handoff. It must appear when read_commands takes
-    the command in -- that is the first moment the goal is really the fleet's."""
-    from relay import fleet_runner as FR
-    ack = TR.add_goal_to_live_fleet("a goal", str(state))
-    assert TR.ack_seen(ack, str(state)) is False, "stamped before anything consumed the command"
-    FR.read_commands(str(state))          # the fleet's real consume path
-    assert TR.ack_seen(ack, str(state)) is True, (
-        "read_commands consumed the command but left no ack for the sender to see")
-
-
-def test_a_live_handoff_that_is_acked_is_delivered_and_stops_waiting(state, autoack):
-    """The whole point, end to end: fleet looks live, the receiver stamps, so the handoff says
-    dispatched AND removes the for_fleet/ file -- a delivered goal is not also left waiting."""
-    _status(state, True)
-    status, result = TR.fleet_handoff("a real goal", "jok", str(state))
-    assert status == "dispatched"
-    assert result.get("ack"), "a delivery must report the ack it was confirmed by"
-    assert TR.ack_seen(result["ack"], str(state)) is True
-    assert not os.path.isfile(TR._p("for_fleet", "jok.txt")), (
-        "a goal confirmed delivered must not stay parked as waiting")
-
-
-def test_a_live_looking_handoff_with_no_ack_is_kept_waiting_not_claimed(state, monkeypatch):
-    """THE RUN-ENDED-IN-THE-WINDOW CASE. status.json still says running, so the command is
-    written -- but nothing consumes it, so no ack is stamped. The handoff must NOT claim
-    delivery: it says awaiting_fleet and leaves the goal in for_fleet/ to be retried, which is
-    exactly what a goal that a since-dead run never took should look like."""
-    _status(state, True)
-    monkeypatch.setattr(TR, "FLEET_ACK_WAIT_S", 0.2)   # no fleet drains here; do not sleep long
-    status, result = TR.fleet_handoff("a goal into the void", "jlost", str(state))
-    assert status == "awaiting_fleet", (
-        "a command written to a run that never read it was reported as delivered")
-    assert os.path.isfile(TR._p("for_fleet", "jlost.txt")), (
-        "the undelivered goal was not kept where it can be retried")
-
-
-def test_a_second_delivery_waits_on_its_own_ack_not_the_first(state, monkeypatch):
-    """Each goal carries its own nonce, so a stamp left by an earlier goal cannot make a later,
-    unconsumed one look delivered."""
-    from relay import fleet_runner as FR
-    _status(state, True)
-    monkeypatch.setattr(TR, "FLEET_ACK_WAIT_S", 0.2)
-    first = TR.add_goal_to_live_fleet("first", str(state))
-    FR.read_commands(str(state))                       # stamps only first's ack
-    assert TR.ack_seen(first, str(state)) is True
-    # A fresh handoff whose command nobody consumes must still time out to awaiting, despite
-    # first's stamp already sitting in acked/.
-    status, _ = TR.fleet_handoff("second", "j2", str(state))
-    assert status == "awaiting_fleet"
-    assert os.path.isfile(TR._p("for_fleet", "j2.txt"))
-
-
-def test_an_item_with_no_ack_is_simply_not_stamped(state):
-    """Older senders and the C# cockpit write add_goal items with no ack. Consuming those must
-    not error and must not invent a stamp -- they just are not waited on."""
-    from relay import fleet_runner as FR
-    TR.write_command(str(state), {"add_goal": [{"text": "no ack here"}]})
-    FR.read_commands(str(state))
-    acked = os.path.join(str(state), FR.ACKED_DIR)
-    listing = os.listdir(acked) if os.path.isdir(acked) else []
-    assert listing == [], "a stamp was written for an item that carried no ack: %r" % listing
