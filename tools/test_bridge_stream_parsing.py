@@ -7,7 +7,14 @@ wire contract passes either way -- so they are pinned here as pure-function case
 """
 import pytest
 
-from tools.judge_backend import JudgeTransportError, parse_bridge_stream
+# REACH THROUGH THE MODULE, NEVER A from-IMPORT. tools/test_bridge_judge.py calls
+# importlib.reload(judge_backend) to make it re-read MCP_JUDGE_BACKEND. A reload updates
+# the module dict IN PLACE, so the functions keep their old identity but the CLASSES are
+# rebuilt -- parse_bridge_stream then raises the NEW JudgeTransportError while a name
+# bound here at import time still points at the OLD one, and pytest.raises does not match.
+# The tests then fail with the very exception they were asserting, and only when something
+# reloaded first: green alone, green in the order I happened to run locally, red in CI.
+import tools.judge_backend as jb
 
 
 def _sse(*objs):
@@ -17,11 +24,11 @@ def _sse(*objs):
 
 def test_the_last_replace_is_the_answer():
     body = _sse({"delta": "thin"}, {"delta": "king"}, {"replace": "FINAL"}, {})
-    assert parse_bridge_stream(body) == "FINAL"
+    assert jb.parse_bridge_stream(body) == "FINAL"
 
 
 def test_deltas_are_used_only_when_no_replace_arrived():
-    assert parse_bridge_stream(_sse({"delta": "a"}, {"delta": "b"})) == "ab"
+    assert jb.parse_bridge_stream(_sse({"delta": "a"}, {"delta": "b"})) == "ab"
 
 
 def test_an_empty_replace_is_a_settled_empty_answer_not_a_missing_one():
@@ -32,7 +39,7 @@ def test_an_empty_replace_is_a_settled_empty_answer_not_a_missing_one():
     partial text it had been streaming instead. The distinction has to be `is not None`.
     """
     body = _sse({"delta": "partial"}, {"replace": ""})
-    assert parse_bridge_stream(body) == ""
+    assert jb.parse_bridge_stream(body) == ""
 
 
 def test_a_bridge_error_is_a_transport_failure_not_a_verdict():
@@ -42,13 +49,13 @@ def test_a_bridge_error_is_a_transport_failure_not_a_verdict():
     whatever it can out of it -- so a dead turn arrives dressed as a decision about a
     destructive command. It must raise instead.
     """
-    with pytest.raises(JudgeTransportError):
-        parse_bridge_stream(_sse({"delta": "[bridge error: page closed]"}))
+    with pytest.raises(jb.JudgeTransportError):
+        jb.parse_bridge_stream(_sse({"delta": "[bridge error: page closed]"}))
 
 
 def test_a_bridge_error_inside_a_replace_also_raises():
-    with pytest.raises(JudgeTransportError):
-        parse_bridge_stream(_sse({"replace": "[bridge error: timeout]"}))
+    with pytest.raises(jb.JudgeTransportError):
+        jb.parse_bridge_stream(_sse({"replace": "[bridge error: timeout]"}))
 
 
 def test_junk_lines_are_skipped_rather_than_fatal():
@@ -60,11 +67,11 @@ def test_junk_lines_are_skipped_rather_than_fatal():
             "data: \n\n"
             + _sse([1, 2, 3])          # valid JSON, wrong shape
             + _sse({"replace": "OK"}))
-    assert parse_bridge_stream(body) == "OK"
+    assert jb.parse_bridge_stream(body) == "OK"
 
 
 def test_an_empty_body_is_empty_text_not_an_exception():
     """Emptiness is the CALLER's decision to escalate: _bridge_stream raises on it, because
     there it means the socket produced nothing. Here it is just no text."""
-    assert parse_bridge_stream("") == ""
-    assert parse_bridge_stream(None) == ""
+    assert jb.parse_bridge_stream("") == ""
+    assert jb.parse_bridge_stream(None) == ""
