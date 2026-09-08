@@ -1395,6 +1395,31 @@ def socket_fault_is_transport(reason):
         return False
 
 
+def _commit_subject_from_goal(goal):
+    """The commit subject a goal names, so `git log` can be asked whether it is already there.
+
+    Read, never invented. If the goal quotes a subject -- `commit "fix the empty-input case"`
+    or a `-m "..."` -- that quoted text is the thing to look for; a subject this function made
+    up would be looked for, not found, and reported as `absent`, which is the one wrong answer
+    that turns the safe check into a re-send. So when nothing is quoted, this returns None and
+    the caller falls back to refusing rather than guessing.
+
+    Matches the first quoted run after a commit/-m cue, single or double quotes, English or
+    the Japanese コミット cue. Whitespace is collapsed the way `%s` output is, so a subject
+    wrapped across lines in the goal still equals the one git prints.
+    """
+    text = goal or ""
+    if not text:
+        return None
+    import re as _re
+    cue = _re.search(r"(?:-m|commit|コミット)\b", text, _re.IGNORECASE)
+    scope = text[cue.start():] if cue else text
+    m = _re.search(r"[\"'「“]([^\"'」”]{3,200})[\"'」”]", scope)
+    if not m:
+        return None
+    return " ".join(m.group(1).split()).strip() or None
+
+
 def auto_concurrency(n_goals, per_tab_mb=None, headroom_mb=None, hard_cap=100):
     """How many heavy M365 tabs we can afford open at once, given free RAM right now.
     Keep `headroom_mb` for the user's other work; budget `per_tab_mb` per Copilot tab.
@@ -4430,6 +4455,55 @@ class RelayWorker:
             pass
         print("[relay_fleet] %s: %s" % (self.name, self.reason), flush=True)
 
+    def _effect_checker(self):
+        """A callable that says whether this goal's effect is already in the world, or None.
+
+        Returns None whenever the effect cannot be observed from here -- which is the common
+        case and is why nothing changes for it: `resend_decision_for_landed_act` refuses when
+        the checker is None, exactly as the code did before this method existed. A checker is
+        returned only for an effect `effect_is_checkable` recognises AND for which a
+        repository to look in is known, so the SAFE default survives a missing repo.
+
+        The repository is the goal's own working directory -- `self.cwd`, the tree the goal
+        was told to run in and the one its commit would land in -- with `self._effect_repo` as
+        an explicit override when the fleet set one. It is READ, never guessed: this process is
+        not the one that ran the turn, so inventing a path would check the wrong tree and
+        mis-report `absent`. When neither is set there is nowhere to look, so this returns None
+        and the caller keeps the safe refuse.
+        """
+        try:
+            from relay.transport_policy import (
+                effect_is_checkable, CHECK_PRESENT, CHECK_ABSENT, CHECK_UNKNOWN)
+        except Exception:
+            return None
+        if not effect_is_checkable(self.goal or ""):
+            return None
+        repo = getattr(self, "_effect_repo", None) or (getattr(self, "cwd", None) or None)
+        if not repo:
+            return None
+
+        def _check(goal):
+            # THE COMMIT'S OWN TRACE. `git log` is read-only and cannot itself change the
+            # tree, so asking the question has no effect of its own -- the property that lets
+            # a check stand in for a guess. The commit subject the goal named is looked for
+            # among recent commits; found means the act landed, not-found means it did not.
+            subject = _commit_subject_from_goal(goal)
+            if not subject:
+                return CHECK_UNKNOWN
+            try:
+                import subprocess
+                out = subprocess.run(
+                    ["git", "-C", repo, "log", "-n", "40", "--format=%s"],
+                    capture_output=True, text=True, timeout=20)
+            except Exception:
+                return CHECK_UNKNOWN
+            if out.returncode != 0:
+                return CHECK_UNKNOWN
+            subjects = [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+            return CHECK_PRESENT if subject in subjects else CHECK_ABSENT
+
+        return _check
+
     def _socket_route_fault(self, reason):
         """See socket_fault_is_transport. A method so the worker reads as one object."""
         return socket_fault_is_transport(reason)
@@ -4504,9 +4578,25 @@ class RelayWorker:
         # So an acting goal whose turn may already have landed is not re-sent at all, on
         # either transport. The worker ends and says why. A person who can check whether the
         # mail went can re-queue it; nothing here can check, and guessing repeats the act.
+        #
+        # UNLESS THE EFFECT ITSELF CAN BE CHECKED. "Nothing here can check" is true for mail
+        # and false for a git commit: `git log` shows whether the commit the goal named is
+        # already there. `resend_decision_for_landed_act` refuses exactly as before for every
+        # effect with no checker (the default, and the mail case), and only for a checkable
+        # effect with a working checker does it replace the guess with a look -- re-sending an
+        # already-present commit as a safe no-op, or re-sending a genuinely-absent one as the
+        # recovery the reconnect budget was for.
         if landed and self._goal_may_act():
-            self._refuse_resend(reason, delivery)
-            return False
+            decision = "refuse"
+            try:
+                from relay.transport_policy import resend_decision_for_landed_act
+                decision = resend_decision_for_landed_act(
+                    self.goal or "", checker=self._effect_checker())
+            except Exception:
+                decision = "refuse"
+            if decision != "resend":
+                self._refuse_resend(reason, delivery)
+                return False
 
         spent = getattr(self, "_socket_reconnects_total", 0)
         cap = SOCKET_RECONNECTS_IF_DELIVERED if landed else SOCKET_RECONNECTS_PER_GOAL
@@ -4592,8 +4682,16 @@ class RelayWorker:
         except Exception:
             _delivery = "unknown"
         if (_delivery == "delivered" or getattr(self, "_landed_pending", False))                 and self._goal_may_act():
-            self._refuse_resend(reason, _delivery)
-            return False
+            decision = "refuse"
+            try:
+                from relay.transport_policy import resend_decision_for_landed_act
+                decision = resend_decision_for_landed_act(
+                    self.goal or "", checker=self._effect_checker())
+            except Exception:
+                decision = "refuse"
+            if decision != "resend":
+                self._refuse_resend(reason, _delivery)
+                return False
         # RECORDED IMMEDIATELY, not at the end: a run that dies mid-goal still leaves the
         # evidence behind, and this line is the only place the pairing of a goal with the
         # reason it needed a tab exists at all.

@@ -270,6 +270,7 @@ jobs:
             relay/selfimprove/test_authority_ledger.py \
             relay/selfimprove/test_route_evaluator.py \
             relay/test_transport_policy.py \
+            relay/test_resend_checkable.py \
             relay/test_socket_driver.py \
             relay/test_socket_route.py \
             relay/test_fanout.py \
