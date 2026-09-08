@@ -6144,6 +6144,24 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     return [{"name": w.name, "goal": w.goal, "outcome": w.outcome,
              "turns": w.turn, "reason": w.reason,
              "verified": w.verified, "verify_attempts": w.verify_attempts,
+             # THE RUN IDENTITY, CARRIED INTO THE FINAL SNAPSHOT TOO.
+             #
+             # `run_id` is a parameter of this call (fleet_runner.py passes
+             # "r<hex started>_a<attempt>"), the same string baked into every worker's
+             # transcript filename here (`<run_id>_<name>.jsonl`). The LIVE snapshot
+             # (fleet_runner._snapshot) derives it by re-reading that filename via
+             # _run_id_of() on every tick while the run is active. This FINAL return
+             # value -- built once, after the sweep exits -- had never carried the field
+             # at all, so a worker that only ever appeared in status.json AFTER the run
+             # finished (which is exactly when the cockpit archives it: running flips to
+             # False and every worker is terminal at once) got an empty run_id. Measured:
+             # mid-run status.json workers carried run_id "r6a9fd978_a0"; the SAME workers'
+             # entries in the final status.json (written once run_relay_fleet returns) had
+             # no "run_id" key at all -- so ArchiveTerminal's S(w, "run_id") read "" and the
+             # archived row joined to nothing, same defect this file's own comments already
+             # describe for `verified` ("BOTH ARCHIVE SITES GET THIS" applies here to both
+             # SNAPSHOT SITES instead).
+             "run_id": run_id,
              # carry the captured conversation identity into the FINAL snapshot so the
              # cockpit keeps the Copilot title/URL (and /history link) on finished cards
              # instead of reverting to the bare goal text.

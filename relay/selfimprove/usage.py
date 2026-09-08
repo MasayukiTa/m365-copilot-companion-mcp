@@ -98,16 +98,37 @@ def usage_section(history_path=None, status_path=None, segments=6):
                 c = sum(1 for h in chunk if (h.get("status") or "") == _DONE)
                 trend.append(round(c / len(chunk), 4))
 
-    # verify_rate from the LIVE snapshot (history rows don't carry verified); best-effort. Only count
-    # workers where verification ACTUALLY ran (verified in True/False) -- otherwise the metric is null,
+    # verify_rate over the ARCHIVE, falling back to the live snapshot.
+    #
+    # This read only the live snapshot, and said why: "history rows don't carry verified". They
+    # do now -- the cockpit archives the field as of 2026-09-08 -- and the difference is not
+    # cosmetic. The live snapshot holds the workers of the CURRENT run and nothing else, so the
+    # number beside "44 tasks" was computed over as few as one worker: a single unverified
+    # worker rendered as 0.0, which reads like a measured all-time rate and is a sample of one.
+    #
+    # Older rows predate the field and simply do not count -- they are not verifiable and never
+    # were, which is exactly what `verified in (True, False)` already means. So the rate starts
+    # thin and thickens as runs land, rather than being wrong on a full-looking denominator.
+    #
+    # Only workers where verification ACTUALLY ran are counted; otherwise the metric is null,
     # not a misleading 0% (SWE-bench workers, for instance, never set verified).
-    verify_rate = None
-    if isinstance(status, dict):
-        workers = status.get("workers") or []
-        verifiable = [w for w in workers if isinstance(w, dict) and str(w.get("verified")) in ("True", "False")]
-        if verifiable:
-            ver = sum(1 for w in verifiable if str(w.get("verified")) == "True")
-            verify_rate = round(ver / len(verifiable), 4)
+    def _rate(rows):
+        verifiable = [w for w in rows
+                      if isinstance(w, dict) and str(w.get("verified")) in ("True", "False")]
+        if not verifiable:
+            return None, 0
+        ver = sum(1 for w in verifiable if str(w.get("verified")) == "True")
+        return round(ver / len(verifiable), 4), len(verifiable)
+
+    verify_rate, verify_n = _rate(items)
+    verify_source = "history"
+    if verify_rate is None:
+        # Nothing archived carries it yet (a fresh install, or a checkout from before the field
+        # existed). The live run is then the only evidence there is -- reported as such, so a
+        # reader can tell a one-run sample from an accumulated rate.
+        verify_rate, verify_n = _rate((status or {}).get("workers") or []
+                                      if isinstance(status, dict) else [])
+        verify_source = "live" if verify_rate is not None else "none"
 
     # recent window = last min(50, n//3) tasks, so "lately" is visible vs the all-time rate
     win = min(50, max(1, n // 3)) if n else 0
@@ -147,6 +168,11 @@ def usage_section(history_path=None, status_path=None, segments=6):
         "recent_window": win,
         "median_turns": median_turns,
         "verify_rate": verify_rate,
+        # WHAT THE RATE WAS COMPUTED OVER. A rate with no denominator beside it cannot be told
+        # apart from a rate over one worker, and that is precisely how 0.0 came to sit next to
+        # "44 tasks" and read as an all-time figure.
+        "verify_n": verify_n,
+        "verify_source": verify_source,
         "status_mix": status_mix,
         "trend": trend,
         "persona_leak_rate": persona_leak_rate,
