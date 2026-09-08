@@ -2503,6 +2503,13 @@ def main():
             "max_turns": max_turns, "reason": r["reason"],
             "verified": r.get("verified"),
             "verify_attempts": r.get("verify_attempts", 0),
+            # Carried through from relay_fleet.run_relay_fleet's final return value (which now
+            # sets it from its own `run_id` parameter). Without this the LIVE snapshot (built by
+            # _snapshot()/_run_id_of() every tick) had run_id, but the FINAL snapshot -- the one
+            # on disk the instant `running` flips to False, which is exactly when the cockpit's
+            # ArchiveTerminal sees every worker terminal at once -- did not. Same defect class as
+            # `verified`/`verify_attempts` above, just in the OTHER snapshot builder.
+            "run_id": r.get("run_id", ""),
             "conv_url": r.get("conv_url", ""),
             "conv_title": r.get("conv_title", ""),
             "transcript": r.get("transcript", ""),
