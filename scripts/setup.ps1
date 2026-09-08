@@ -119,7 +119,9 @@ if (Test-Path ".env") {
     $unlockPw = New-Hex 8    # 16 hex chars
 
     if (Test-Path ".env.example") {
-        $lines = Get-Content ".env.example"
+        # PS 5.1 reads with the ANSI codepage unless told otherwise, so a UTF-8
+        # .env.example comes back mojibake and is written straight back out.
+        $lines = Get-Content ".env.example" -Encoding UTF8
     } else {
         $lines = @(
             "MCP_API_KEY=replace",
@@ -133,7 +135,11 @@ if (Test-Path ".env") {
         elseif ($line -match "^\s*MCP_UNLOCK_PASSWORD\s*=") { "MCP_UNLOCK_PASSWORD=$unlockPw" }
         else { $line }
     }
-    Set-Content -Path ".env" -Value $out -Encoding ASCII
+    # NOT ASCII: it replaces every non-ASCII byte with '?', so a Japanese line
+    # carried over from .env.example is destroyed on the way in. NOT PS 5.1's
+    # -Encoding UTF8 either: that writes a BOM, which folds into the first key
+    # name and makes the .env parser miss it. UTF8Encoding($false) is no-BOM.
+    [IO.File]::WriteAllLines((Join-Path (Get-Location) ".env"), $out, (New-Object System.Text.UTF8Encoding($false)))
     Write-Ok "Wrote .env with fresh random MCP_API_KEY and MCP_UNLOCK_PASSWORD"
     Write-Host "    Keep these secret. Your Bearer token is: $apiKey" -ForegroundColor Magenta
     Write-Host "    Your unlock password is:               $unlockPw" -ForegroundColor Magenta

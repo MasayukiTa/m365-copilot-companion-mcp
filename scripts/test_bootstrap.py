@@ -308,21 +308,48 @@ class DevTunnelNeverBlocksTests(unittest.TestCase):
             except Exception as e:  # noqa: BLE001
                 self.fail("provision failure was not swallowed: %r" % e)
 
-    def test_short_circuits_when_url_already_present(self):
-        # Signed in and .env already has MCP_TUNNEL_URL -> must NOT re-host.
+    def _run_with_env(self, values):
+        """Run step_dev_tunnel signed in, with .env answering from `values`. Returns whether
+        provisioning ran."""
         called = {"provision": False}
 
-        def _should_not_run(*a, **k):
+        def _mark(*a, **k):
             called["provision"] = True
 
         with mock.patch.object(bootstrap, "find_executable", return_value="devtunnel"), \
              mock.patch.object(bootstrap, "_devtunnel_logged_in", return_value=True), \
-             mock.patch.object(bootstrap, "_read_env_value",
-                               return_value="https://x-8000.jpe1.devtunnels.ms/"), \
-             mock.patch.object(bootstrap, "_provision_dev_tunnel", _should_not_run):
+             mock.patch.object(bootstrap, "_read_env_value", values.get), \
+             mock.patch.object(bootstrap, "_this_host", return_value="pc-new"), \
+             mock.patch.object(bootstrap, "_provision_dev_tunnel", _mark):
             bootstrap.step_dev_tunnel()
-        self.assertFalse(called["provision"],
-                         "provisioning ran even though MCP_TUNNEL_URL was already set")
+        return called["provision"]
+
+    URL = "https://x-8000.jpe1.devtunnels.ms/"
+
+    def test_short_circuits_when_this_machine_minted_the_url(self):
+        # Signed in, and the URL carries this machine's stamp -> must NOT re-host (~30s).
+        ran = self._run_with_env({"MCP_TUNNEL_URL": self.URL, "MCP_TUNNEL_HOST": "pc-new"})
+        self.assertFalse(ran, "re-hosted a tunnel this machine had already provisioned")
+
+    def test_provisions_when_the_url_came_from_another_machine(self):
+        """THE NEW-PC FAILURE (reported 2026-09-08).
+
+        This test used to assert the opposite -- that a non-empty MCP_TUNNEL_URL was enough to
+        skip -- and that is exactly the bug it locked in. Setting up a new PC starts by
+        carrying .env across, so the URL is present and belongs to the OLD machine; setup
+        skipped provisioning, and the address pasted into Copilot Studio pointed at a tunnel
+        this machine does not host. A devtunnel URL is reachable only while a machine hosts
+        that tunnel, so it is a fact about a machine, and .env travels between machines.
+        """
+        ran = self._run_with_env({"MCP_TUNNEL_URL": self.URL, "MCP_TUNNEL_HOST": "pc-old"})
+        self.assertTrue(ran, "trusted a URL minted on a different machine")
+
+    def test_provisions_when_no_machine_is_recorded(self):
+        """A .env written before the stamp existed. Provenance unknown, so do not trust it:
+        re-hosting the same tunnel name yields the same URL, so being wrong costs ~30s once,
+        and the re-host writes the stamp that settles it from then on."""
+        ran = self._run_with_env({"MCP_TUNNEL_URL": self.URL})
+        self.assertTrue(ran, "trusted a URL of unknown provenance")
 
     def test_provision_targets_renamed_tunnel_from_env(self):
         # FIX 3: if the user renamed the tunnel (MCP_TUNNEL_NAME in .env) and

@@ -677,14 +677,38 @@ def step_dev_tunnel() -> None:
         return
     log("    OK: devtunnel reports a signed-in user.")
 
-    # Short-circuit: if .env already has a non-empty MCP_TUNNEL_URL, the tunnel
-    # was already provisioned on a previous run. Do NOT re-host (each host costs
-    # ~30s) on every resume -- just report it and move on.
+    # Short-circuit: if .env already carries a URL THIS MACHINE minted, the tunnel was
+    # provisioned on a previous run here. Do NOT re-host (each host costs ~30s) on every
+    # resume -- just report it and move on.
+    #
+    # "ALREADY SET" WAS NOT THE QUESTION. This tested only that the value was non-empty, and
+    # the comment justified that with "provisioned on a previous run" -- true only if the
+    # previous run was on this machine. A .env carried over from another PC, which is how a
+    # new machine is normally set up, also has a non-empty URL, so setup skipped provisioning
+    # and left the old machine's tunnel address in place. Everything reported OK; the URL
+    # pasted into Copilot Studio pointed at a tunnel this machine does not host, and the
+    # operator was left with a working-looking setup that cannot connect. Reported from a
+    # real new-PC setup, 2026-09-08.
+    #
+    # So the URL is trusted only when MCP_TUNNEL_HOST says this machine minted it. A URL with
+    # no host recorded is of unknown provenance: re-provision, because hosting the SAME tunnel
+    # name yields the same URL, so the cost of being wrong is ~30s while the cost of trusting
+    # it is the silent failure above. The re-host writes MCP_TUNNEL_HOST, so this is a
+    # one-time correction per machine.
     existing_url = _read_env_value("MCP_TUNNEL_URL")
-    if existing_url:
-        log("    OK: MCP_TUNNEL_URL already set in .env (%s); skipping re-host."
+    recorded_host = _read_env_value("MCP_TUNNEL_HOST")
+    if existing_url and recorded_host and recorded_host == _this_host():
+        log("    OK: MCP_TUNNEL_URL already set in .env by this machine (%s); skipping re-host."
             % existing_url)
         return
+    if existing_url and recorded_host:
+        log("    NOTE: .env carries a MCP_TUNNEL_URL minted on '%s', not this machine (%s)."
+            % (recorded_host, _this_host()))
+        log("          That tunnel is not hosted here, so the URL would not connect. "
+            "Re-provisioning for this machine.")
+    elif existing_url:
+        log("    NOTE: .env carries a MCP_TUNNEL_URL with no record of which machine minted "
+            "it. Re-provisioning to be sure it belongs to this one.")
 
     # Signed in and no URL recorded yet: finish the rest unattended -- create the
     # tunnel + port + access (idempotent), briefly host it to obtain the public
@@ -833,6 +857,21 @@ def _dt_tunnel_url(dt: str, tunnel: str) -> str | None:
     return m.group(0) if m else None
 
 
+def _this_host() -> str:
+    """The machine identity recorded beside a minted tunnel URL.
+
+    A devtunnel URL is only reachable while some machine HOSTS that tunnel, so a URL is a
+    fact about a machine, not about an account -- and .env travels between machines. This is
+    what lets a later run tell "I minted this" from "I inherited this".
+
+    platform.node() rather than COMPUTERNAME: same answer on Windows, and it does not return
+    an empty string on a box where the variable is unset. Lowercased because Windows reports
+    the name in either case depending on how it is read, and a case flip must not read as a
+    different machine.
+    """
+    return (platform.node() or "").strip().lower()
+
+
 def _write_tunnel_to_env(tunnel: str, url: str | None) -> None:
     """Write MCP_TUNNEL_NAME (and MCP_TUNNEL_URL if known) into .env, preserving
     every other line. Strips any prior '# devtunnel (auto)' / MCP_TUNNEL_* lines
@@ -866,6 +905,7 @@ def _write_tunnel_to_env(tunnel: str, url: str | None) -> None:
             ln.startswith("# devtunnel (auto)")
             or ln.startswith("MCP_TUNNEL_NAME=")
             or ln.startswith("MCP_TUNNEL_URL=")
+            or ln.startswith("MCP_TUNNEL_HOST=")
         )
     ]
     kept.append(
@@ -875,6 +915,12 @@ def _write_tunnel_to_env(tunnel: str, url: str | None) -> None:
     kept.append("MCP_TUNNEL_NAME=" + tunnel)
     if url:
         kept.append("MCP_TUNNEL_URL=" + url)
+        # STAMPED ONLY BESIDE A URL. The host answers "who minted this URL", so writing it
+        # without one would claim provenance for a value that is not there -- and a later run
+        # would then trust an inherited URL that arrives afterwards. When the URL below is a
+        # preserved earlier value rather than one minted now, this still names the machine
+        # that is keeping it, which is the machine that must host it.
+        kept.append("MCP_TUNNEL_HOST=" + _this_host())
     # CRLF endings, UTF-8 WITHOUT BOM (encoding='utf-8' never emits a BOM).
     env_path.write_text("\r\n".join(kept) + "\r\n", encoding="utf-8", newline="")
 
