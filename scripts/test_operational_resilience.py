@@ -424,19 +424,33 @@ def test_a_fresh_browser_with_no_tab_leads_to_a_sign_in():
     assert "return 1 if ready is False else 2" in signin
 
 
-def test_the_new_unlock_password_reaches_the_operator():
+def test_the_new_unlock_password_reaches_the_operator_without_being_echoed():
     """repair_unlock_password generates a NEW random password -- correctly, the old one is
-    unreadable on this account -- and returned only a reason and a backup path. The operator
-    arrived with a password written down from the machine that produced the .env, and nothing
-    ever told them it no longer works. Everything green; unlock() simply refuses."""
+    unreadable on this account -- and writes it (protected) into .env. The operator arrived with
+    a password written down from the machine that produced the .env, and must be told that one no
+    longer works AND how to read the new one.
+
+    But the value itself must NOT travel back over repair_unlock.py's stdout: start_all captures
+    that stream and it can reach logs, and this repository is public (py/clear-text-logging).
+    So the "repaired:" line carries only a non-secret note, and start_all prints where to read the
+    new value instead of echoing it."""
     ep = (ROOT / "tools" / "env_portability.py").read_text(encoding="utf-8")
     start_all = (ROOT / "scripts" / "start_all.ps1").read_text(encoding="utf-8")
+    repair = (ROOT / "scripts" / "repair_unlock.py").read_text(encoding="utf-8")
 
     assert '"password": fresh' in ep
     assert (ROOT / "scripts" / "repair_unlock.py").exists()
     assert "repair_unlock.py" in start_all
     assert 'repair -like "repaired:*"' in start_all
-    assert "Write this down" in start_all
+
+    # The operator is still informed and pointed at the value -- just not handed it on stdout.
+    assert "written to .env" in start_all
+    assert "copilot_studio_values.ps1" in start_all
+
+    # The leak is closed on both sides: repair_unlock.py never formats the password into its
+    # verdict line, and start_all no longer slices a secret out of the "repaired:" payload.
+    assert "repaired:%s" not in repair, "the new password must not be printed to stdout"
+    assert "$newPw" not in start_all, "start_all must not extract/echo the password"
 
 
 def test_a_required_check_that_could_not_be_answered_is_not_a_complete_setup():
