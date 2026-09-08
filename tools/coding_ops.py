@@ -82,6 +82,124 @@ def _is_shared_worktree(cwd: Path):
     return _norm(ga) == _norm(ca)
 
 
+def _realpath_strict(p: str) -> str:
+    """Realpath-normalise *p*, RAISING if the real path cannot be resolved.
+
+    `_norm` above swallows a realpath failure and falls back to the raw string. That is fine
+    for a best-effort comparison, but it is exactly the wrong default for a guard that decides
+    whether a DESTRUCTIVE operation may proceed: an unresolvable path would then compare equal
+    to itself and read as "confirmed". This variant keeps the failure so the caller can treat
+    "could not confirm" as "do not allow" (fail-closed) rather than as "safe".
+
+    On Windows a checkout may be reached through a symlink, a junction, a differently-cased
+    drive letter, or a trailing separator; os.path.realpath resolves the link/junction and
+    os.path.normcase folds case and separators so two spellings of one directory match.
+    """
+    real = os.path.realpath(p)
+    # realpath never raises on a non-existent tail, so verify the target actually resolves to
+    # something on disk; "the path we are about to operate on does not exist" is a
+    # cannot-confirm, not a safe.
+    if not os.path.exists(real):
+        raise OSError(f"path does not resolve to an existing location: {p!r}")
+    return os.path.normcase(real)
+
+
+def _count_local_changes(cwd: Path) -> Optional[int]:
+    """How many tracked files have uncommitted changes in *cwd*'s working tree.
+
+    Used to WARN before an operation that would discard them, so nothing is thrown away
+    silently. Counts porcelain lines (staged or unstaged, plus untracked). Returns None when
+    the count cannot be taken -- a None must be surfaced as "unknown", never as zero.
+    """
+    out = _run(["git", "status", "--porcelain"], cwd, 15)
+    if "[returncode:" in out:
+        return None
+    # `_run` returns the sentinel "(no output)" when the command printed nothing, which for
+    # `status --porcelain` means a CLEAN tree. Counting that sentinel as a change would report
+    # 1 for a repository with nothing to discard -- so map it to zero explicitly.
+    if out.strip() == "(no output)":
+        return 0
+    return sum(1 for line in out.splitlines() if line.strip() and not line.startswith("["))
+
+
+def _dedicated_root_ok(op_path: str, cwd: Path):
+    """Is *op_path* positively confirmed to be a DEDICATED repo root that may take a
+    destructive git operation?
+
+    This is the affirmative counterpart to `_is_shared_worktree`. That predicate only blocks
+    when it can PROVE the tree is shared and fail-opens (returns None) otherwise; for a
+    destructive operation that is too weak. Here the default is deny: a call is allowed only
+    when both of these hold, and refused with a reason otherwise.
+
+      1. `git rev-parse --show-toplevel` and *op_path* resolve, via realpath + normcase, to
+         the SAME directory -- so the operation is at the checkout root, not a subdirectory or
+         a look-alike path. If either realpath cannot be resolved, this fails CLOSED: a path
+         we could not confirm is not treated as safe (a past incident here read a confirmation
+         failure as "safe" and stopped a healthy process).
+      2. `_is_shared_worktree(cwd)` is exactly False -- the tree is affirmatively a dedicated
+         linked worktree, not the shared main tree and not an undetermined guess.
+
+    Returns (True, "") when allowed, or (False, reason) where *reason* says why it was refused
+    and what to do instead. The caller is an agent, so a reason lets it pick another route.
+    """
+    try:
+        top = _run(["git", "rev-parse", "--show-toplevel"], cwd, 15)
+    except Exception as e:  # pragma: no cover - subprocess launch failure
+        return (False, _dedicated_deny_msg(
+            f"could not run 'git rev-parse --show-toplevel' ({type(e).__name__}). "
+            "The repository root could not be confirmed."))
+    if "[returncode:" in top:
+        return (False, _dedicated_deny_msg(
+            "'git rev-parse --show-toplevel' failed; this may not be a git working tree. "
+            "The repository root could not be confirmed."))
+    toplevel = None
+    for line in top.splitlines():
+        line = line.strip()
+        if line and not line.startswith("["):
+            toplevel = line
+            break
+    if not toplevel:
+        return (False, _dedicated_deny_msg(
+            "'git rev-parse --show-toplevel' returned no path. "
+            "The repository root could not be confirmed."))
+
+    # FAIL-CLOSED on any realpath resolution failure. "Could not confirm" is not "safe".
+    try:
+        real_top = _realpath_strict(toplevel)
+        real_op = _realpath_strict(str(op_path))
+    except OSError as e:
+        return (False, _dedicated_deny_msg(
+            f"the real path could not be resolved ({e}). A checkout that cannot be resolved "
+            "to a concrete on-disk root is not treated as safe."))
+
+    if real_top != real_op:
+        return (False, _dedicated_deny_msg(
+            "the path being operated on is not the checkout root. Destructive operations are "
+            "only allowed at the repository top level, run them from '%s'." % toplevel))
+
+    shared = _is_shared_worktree(cwd)
+    if shared is not False:
+        detail = ("this is the shared (main) working tree" if shared is True
+                  else "whether this checkout is dedicated could not be determined")
+        return (False, _dedicated_deny_msg(
+            detail + ". A destructive operation is only allowed in a checkout affirmatively "
+            "confirmed to be a dedicated linked worktree."))
+
+    return (True, "")
+
+
+def _dedicated_deny_msg(reason: str) -> str:
+    """A refusal an agent can act on: why it was refused, and the concrete alternative."""
+    return (
+        "[refused: this checkout is not a confirmed dedicated repository root.\n"
+        "Why: %s\n"
+        "Instead: create an isolated worktree for your branch and run the operation there:\n"
+        "  git worktree add -b <branch> ../wt/<branch> <base>\n"
+        "then operate from that worktree's root. To start a NEW branch in place without "
+        "discarding anything, use create=True (git checkout -b).]" % reason
+    )
+
+
 def _add_is_wholesale(paths: list) -> bool:
     """True when a git add stages the whole tree: -A / --all / a bare '.' path."""
     for raw in paths:
@@ -508,6 +626,25 @@ def git_checkout(branch: str, repo_path: str = ".", create: bool = False) -> str
                     "and work there. To start a NEW branch in place, use create=True (git\n"
                     "checkout -b), which is permitted because it discards nothing.]"
                 )
+            # (A2) Affirmatively confirm this checkout is a dedicated repo root before a
+            # discarding switch. _is_shared_worktree above only blocks a PROVEN shared tree;
+            # this predicate refuses unless the checkout is positively confirmed dedicated
+            # AND the operating path realpath-matches the checkout root, and it fails closed
+            # when confirmation is impossible.
+            _ok, _reason = _dedicated_root_ok(str(cwd), cwd)
+            if not _ok:
+                # A branch switch discards nothing from the index but replaces the working
+                # tree; count what is uncommitted so it is not swept away silently.
+                _n = _count_local_changes(cwd)
+                _warn = ""
+                if _n is None:
+                    _warn = ("\n[warning: the number of uncommitted changes could not be "
+                             "determined; treating as unknown, not zero.]")
+                elif _n > 0:
+                    _warn = ("\n[warning: %d uncommitted change(s) in this working tree would "
+                             "be at risk from a branch switch; none were discarded because the "
+                             "switch was refused.]" % _n)
+                return _reason.replace("[refused:", "[git_checkout refused:", 1) + _warn
             # (B) Route through the destructive-op gate so an active contract can ask-before.
             _g = _cg.check_op("shell_destructive", "git checkout " + str(branch))
             if _g is not None:
