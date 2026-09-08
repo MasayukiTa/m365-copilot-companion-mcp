@@ -339,3 +339,105 @@ def delivery_status(reason: str) -> str:
 def duplicate_risk(reason: str) -> bool:
     """True when re-sending this turn could repeat an act the model already performed."""
     return delivery_status(reason) in ("delivered", "unknown")
+
+
+# ------------------------------------------------------------------------------------------
+# Is the act's EFFECT one that can be checked before deciding to re-send?
+# ------------------------------------------------------------------------------------------
+#
+# `goal_may_act` answers one question -- does this goal do something to the world -- and the
+# reconnect budget refused every acting goal whose turn might already have landed. That is the
+# right default and stays the default. But it is too coarse for the acts this fleet actually
+# runs: almost all of them are git commits, and a commit LEAVES A TRACE. `git log` shows
+# whether the commit the turn was about is already there. So the ambiguity a re-send would
+# gamble on -- did the turn land -- is not a gamble for a commit; it is a lookup.
+#
+# THE SECOND AXIS IS "CAN THE EFFECT BE OBSERVED", NOT "IS IT REVERSIBLE". A mail send cannot
+# be observed from here at all: nothing this process can read tells it whether the message
+# went, so re-sending is a guess and a guess is a second mail. A commit can be observed, and
+# an observation is not a guess. The rule that falls out of the module's own comment --
+# "confirm the commit already exists ... where we can confirm, we may re-send" -- is exactly
+# this split.
+#
+# DELIBERATELY NARROW, and narrow on the SAFE side. Only effects that (a) act and (b) leave a
+# trace this process can read without side effects belong here. Anything not listed is treated
+# as unobservable and keeps the old refuse-on-landed behaviour. A false negative here costs a
+# lost turn and a message to a person; a false positive would re-send an act nobody can check,
+# which is the very thing the refuse branch exists to prevent -- so the list only grows for an
+# effect whose checker has actually been written and measured.
+#
+# Git commit/push are the only members today because they are the only acts this fleet does in
+# bulk AND the only ones with a checker below. English and Japanese, matched with the same verb
+# discipline `ACTING` uses so a noun or a past-tense description is not read as a request.
+CHECKABLE_EFFECT = (
+    r"\bcommit\b",
+    r"\bpush\b",
+    r"コミット(?:して(?!い)|しろ|せよ|します|する|してください)",
+    r"プッシュ(?:して(?!い)|しろ|せよ|します|する|してください)",
+)
+
+
+def effect_is_checkable(goal: str) -> bool:
+    """Whether this goal's real-world effect can be observed before re-sending.
+
+    True only for a goal that BOTH acts and whose act leaves a trace this process can read
+    (a commit in `git log`). A goal that does not act is not the question this answers -- it
+    is idempotent and never reached the refuse branch -- so this returns False for it, keeping
+    the predicate about acting goals alone.
+
+    Unknown stays False, which routes an un-checkable landed act to the existing refusal. The
+    careful side is the default here exactly as it is for `needs_tab` and `goal_may_act`.
+    """
+    text = (goal or "")
+    if not goal_may_act(text):
+        return False
+    for pattern in CHECKABLE_EFFECT:
+        if re.search(pattern, text, re.IGNORECASE):
+            return True
+    return False
+
+
+#: What a checker is allowed to conclude about an effect it was asked to look for.
+#: `present`  -- the effect is already in the world (a re-send would be a no-op).
+#: `absent`   -- the effect is demonstrably NOT in the world (a re-send is safe and needed).
+#: `unknown`  -- the checker could not tell (treated as un-checkable: refuse).
+CHECK_PRESENT, CHECK_ABSENT, CHECK_UNKNOWN = "present", "absent", "unknown"
+
+RESEND, REFUSE = "resend", "refuse"
+
+
+def resend_decision_for_landed_act(goal: str, checker=None) -> str:
+    """'resend' or 'refuse' for a landed, acting goal -- consulting a checker when it can.
+
+    The caller has already established the two facts that make this branch dangerous: the turn
+    MAY ALREADY HAVE LANDED, and the goal ACTS. Left there, the only safe answer is 'refuse',
+    because re-sending gambles on whether the act ran. This function keeps that answer for
+    every effect that cannot be observed -- and for a checkable effect, replaces the gamble
+    with a look.
+
+    `checker` is a callable taking the goal and returning one of CHECK_PRESENT / CHECK_ABSENT
+    / CHECK_UNKNOWN. It is the caller's, not this module's, because only the caller knows
+    where the repository is and how to read it; this module owns the DECISION, not the I/O.
+    A checker that raises is read as CHECK_UNKNOWN -- a checker failing is not evidence the
+    effect is absent.
+
+      * effect not checkable, or no checker            -> refuse   (unchanged default)
+      * checker says the effect is already present     -> resend   (the re-send is a no-op)
+      * checker says the effect is absent              -> resend   (the act did not happen)
+      * checker says unknown / raises                  -> refuse   (fall back to careful)
+
+    Re-sending on 'present' is safe because the model, re-handed a goal whose commit already
+    exists, has nothing left to do that changes the world -- and it is preferred over refusing
+    so a transient socket wobble on an already-finished commit does not end the worker. The
+    'absent' case is the one the count was meant for all along: the act did not land, so the
+    turn is genuinely lost and re-sending it is the recovery, not a duplicate.
+    """
+    if not effect_is_checkable(goal) or checker is None:
+        return REFUSE
+    try:
+        verdict = checker(goal)
+    except Exception:
+        verdict = CHECK_UNKNOWN
+    if verdict in (CHECK_PRESENT, CHECK_ABSENT):
+        return RESEND
+    return REFUSE
