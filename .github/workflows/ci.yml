@@ -157,6 +157,7 @@ jobs:
             scripts/test_analyze_lens_corpus.py \
             scripts/test_bootstrap.py \
             scripts/test_bootstrap_p2c.py \
+            scripts/test_repair_unlock_output.py \
             scripts/test_operational_resilience.py \
             scripts/test_bridge_startup_reporting.py \
             scripts/test_start_companion_edge_headless.py \
