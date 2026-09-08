@@ -12938,6 +12938,25 @@ class CockpitWindow : Window
             // without these a completed conversation strands on "本文はまだ取得できません" even
             // though the jsonl transcript exists on disk.
             e["transcript"] = S(w, "transcript"); e["name"] = S(w, "name");
+            // CARRY THE VERDICT, NOT JUST THE STATUS. relay_fleet.py warns beside its own
+            // panel ledger that anything reaching an analysis only through history.json is
+            // "hostage to a second program choosing to carry the field" -- this is that
+            // program, and it was not carrying this one.
+            //
+            // The worker keeps a three-state answer: null = never checked, false = the
+            // acceptance check ran and failed, true = it passed. `status` cannot express
+            // that: "done" covers both "proved" and "never asked". Dropping it here is why
+            // the self-improvement dashboard reports verify_rate 0.0 -- it reads this file,
+            // and the field has never been in it. Measured: 44 archived rows, none carrying
+            // `verified`, while the live snapshot for the same worker carries it.
+            //
+            // run_id names the run so a row joins to its transcripts and to the other
+            // ledgers; `key` is "<epoch>#<worker>", unique per row and joining to nothing.
+            // BOTH ARCHIVE SITES GET THIS. Fixing one and leaving the other is the exact
+            // shape of the misses this file already records.
+            e["verified"] = w.ContainsKey("verified") ? w["verified"] : null;
+            e["verify_attempts"] = I(w, "verify_attempts");
+            e["run_id"] = S(w, "run_id");
             e["turn"] = I(w, "turn"); e["seq"] = _history.Count;
             e["ts"] = NowUnix();   // P2: archived-at timestamp -> date-group subheaders in History
             CarryTimeline(e, w, started);
@@ -12991,6 +13010,12 @@ class CockpitWindow : Window
             // see _archiveTerminal: carry transcript path + name so the history row can show the
             // full disk transcript even when conv_url is empty.
             e["transcript"] = S(w, "transcript"); e["name"] = S(w, "name");
+            // Same three fields as the terminal-archive path above, and for the same
+            // reason -- a row archived by hand must not be poorer than one archived
+            // automatically, or the history depends on which route retired the worker.
+            e["verified"] = w.ContainsKey("verified") ? w["verified"] : null;
+            e["verify_attempts"] = I(w, "verify_attempts");
+            e["run_id"] = S(w, "run_id");
             e["turn"] = I(w, "turn"); e["seq"] = _history.Count;
             e["ts"] = NowUnix();   // P2: archived-at timestamp -> date-group subheaders in History
             CarryTimeline(e, w, started);

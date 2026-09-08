@@ -159,6 +159,36 @@ STATUS_PILL = {
     "content_refused": ("内容拒否", "bad"),
 }
 
+def _run_id_of(worker, started) -> str:
+    """The run this worker belongs to: `r<hex>_a<attempt>`, as the transcripts spell it.
+
+    READ, NEVER INVENTED. The transcript file is named `<run_id>_<name>.jsonl` and that name is
+    the only run identity in this system that survives a restart and is shared by every worker
+    of the same run. Deriving it from the path the worker already carries keeps one source of
+    truth; minting a second one here would add a fifth notion of "run" to the four that already
+    fail to join.
+
+    Falls back to `r<hex of started>` when there is no transcript yet (a worker that has not
+    written a turn). That is the same shape and the same run, minus the attempt number, so it
+    still groups the run's rows together rather than leaving them anonymous.
+    """
+    path = str(getattr(worker, "transcript", "") or "")
+    if path:
+        base = os.path.basename(path)
+        for suffix in (".jsonl.gz", ".jsonl", ".json"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+                break
+        # `<run_id>_<name>` -- the worker name is the last segment, so the rest is the run id.
+        head = base.rsplit("_", 1)[0]
+        if head and head != base:
+            return head
+    try:
+        return "r%x" % int(started or 0)
+    except Exception:
+        return ""
+
+
 def merge_conv_rows(existing, entries, now=None):
     """Merge fleet conversation rows into the shared registry. PURE: list in, list out.
 
@@ -1030,6 +1060,20 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
             "conv_title": getattr(w, "conv_title", ""),
             "verified": getattr(w, "verified", None),
             "verify_attempts": getattr(w, "verify_attempts", 0),
+            # THE NAME OF THE RUN THIS WORKER BELONGS TO, stated rather than left implicit.
+            #
+            # Four notions of "run" exist in the ledgers and none of them join: ownership.jsonl
+            # keys on a process id, mechanisms.jsonl on an epoch, history.json on
+            # "<epoch>#<worker>", and the transcripts on "<run_id>_<name>" -- while judge.jsonl
+            # (5,712 verdicts) and skill_use.jsonl carry no identity at all. Measured across
+            # every ledger: no two share a value under any identity-shaped key, so not one of
+            # those verdicts can be attached to the work that provoked it.
+            #
+            # The transcripts hold the only identity that names a run rather than a process or
+            # a moment, and every worker already carries its transcript path -- so the id is
+            # present, spelled into a filename, where nothing can join on it. Lift it out and
+            # publish it under its own name; the file name stays the source of truth.
+            "run_id": _run_id_of(w, started),
             # epoch by which an in-progress BLOCKING acceptance eval must finish (0 = idle).
             # The watchdog reads this from a frozen status.json: a future value means the main
             # thread is legitimately busy in a bounded eval, NOT a wedged Edge -> don't reset.
