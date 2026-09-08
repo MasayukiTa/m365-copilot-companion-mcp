@@ -242,13 +242,60 @@ def test_the_keeper_does_not_trust_the_toolwindow_bit_on_a_window_it_has_not_see
     残したまま、ログ上は『対応済み』になる。
 
     だから keeper がその handle を初めて見た時は、隠して→印を付けて→出し直す手順を
-    無条件で通す。所属を再評価させるのは表示し直す行為であって、ビットではない。"""
+    無条件で通す。所属を再評価させるのは表示し直す行為であって、ビットではない。
+
+    ただし『無条件』は**表示されている窓に対して**の話である。未表示の窓まで通すと窓が
+    生える -- それは下の test_the_keeper_never_shows_a_window_that_was_never_shown で固定
+    している。"""
     src = (ROOT / "scripts" / "win" / "edge_keeper.ps1").read_text(encoding="utf-8")
     assert "HandledWindows" in src, "見た handle を覚えていない"
-    # 初見なら、ビットが立っていても手順を通すこと
-    i = src.index("$key = [string]$h")
-    guard = src[i:i + 460]
-    assert "-not $script:HandledWindows.ContainsKey($key)" in guard
+    # 初見なら、ビットが立っていても手順を通すこと。分岐が増えて位置がずれても壊れない
+    # よう、固定幅で切らずに『可視の窓を扱う枝』を名指しで取り出す。
+    i = src.index("elseif (-not $script:HandledWindows.ContainsKey($key)")
+    guard = src[i:src.index("}", src.index("$script:HandledWindows[$key] = $true", i))]
     assert "-or" in guard, "初見でもビットが立っていれば飛ばしている"
     # 手順そのものは残っていること
     assert "ShowWindow($h, 0)" in guard and "ShowWindow($h, 6)" in guard
+
+
+def test_the_keeper_never_shows_a_window_that_was_never_shown():
+    """未表示の窓に ShowWindow を打たないこと。**これが今回の実害の本体。**
+
+    手順は ShowWindow(SW_MINIMIZE=6) で終わる。WS_VISIBLE が落ちている窓にこれを打つと
+    Windows は WS_VISIBLE を**立てて**最小化表示する -- keeper 自身が20行上でそう書いて
+    いる。最初の最小化にはそのガードがあるのに、印を付けた後の出し直しは初見で無条件
+    だった。結果、窓を持たないはずの --headless=new の Edge に窓が生えた。
+
+    実測(2026-09-08): :9222(copilot-companion-edge) と :9223(copilot-bridge-edge) が
+    どちらも visible=True iconic=True TOOLWINDOW=True。片方のタイトルは "about:blank"。
+    姿を見せないための処理が、姿を見せた原因だった。
+
+    一度も表示されていない窓には再評価すべきタスクバー所属が無い。だからビットだけ立てて
+    触らない。シェルはスタイルを『最初の表示』で読むので、今立てたビットが読まれる。"""
+    src = (ROOT / "scripts" / "win" / "edge_keeper.ps1").read_text(encoding="utf-8")
+    i = src.index("$key = [string]$h")
+    # 未表示の枝が、可視判定の否定で始まっていること
+    branch = src[i:src.index("elseif", i)]
+    assert "if (-not [K]::IsWindowVisible($h))" in branch, "未表示を先に分けていない"
+    # その枝では ShowWindow を一切呼ばないこと（呼べば窓が生える）
+    assert "ShowWindow" not in branch, \
+        "未表示の窓に ShowWindow を打っている -- これが窓を生やした操作そのもの"
+    # ビットは立てること（将来その窓が表示されたときに読まれる）
+    assert "SetWindowLong($h, -20, ($ex -bor 0x80)" in branch
+
+
+def test_the_recovery_path_has_the_same_guard_as_the_keeper():
+    """同じ取りこぼしを rehide() 側にも残さないこと。
+
+    このファイルの冒頭が記録しているとおり、この一族の欠陥は必ず『片方に入れて片方に
+    入れ忘れる』形で出る。keeper と _REHIDE_PS は同じ手順を持つので、同じガードを持つ。"""
+    src = (ROOT / "relay" / "edge_recover.py").read_text(encoding="utf-8-sig")
+    snippet = src[src.index("_REHIDE_PS"):src.index("def rehide")]
+    j = snippet.index("$ex = [RK]::GetWindowLong($h, -20)")
+    tail = snippet[j:]
+    assert "if ([RK]::IsWindowVisible($h))" in tail, \
+        "印を付ける手順に可視ガードが無い -- 未表示の窓を出し直してしまう"
+    # 未表示側では ShowWindow を使わず、ビットだけ立てること
+    else_branch = tail[tail.index("} else {"):]
+    assert "ShowWindow" not in else_branch
+    assert "SetWindowLong" in else_branch
