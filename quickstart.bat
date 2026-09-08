@@ -204,6 +204,45 @@ if errorlevel 1 (
 
 echo.
 echo ===========================================================================
+echo  Convenience setup  (asked BEFORE anything is created)
+echo ===========================================================================
+echo   These two change your machine outside this folder, so they are asked
+echo   first and your answer is recorded. Say no and nothing is created.
+echo.
+set "PROV_SHORTCUT=no"
+set "PROV_AUTOSTART=no"
+set /p MKLNK="   Create a one-click 'M365 Companion' launcher on your Desktop? [Y/n] "
+if /i not "!MKLNK!"=="n" set "PROV_SHORTCUT=yes"
+set /p MKAUTO="   Start the background supervisor automatically when you log on? [y/N] "
+if /i "!MKAUTO!"=="y" set "PROV_AUTOSTART=yes"
+
+REM RECORD THE DECISION, NOT THE ACT. start_all.ps1 provisions from this marker, so it must be
+REM written BEFORE the first start_all call below (the -CoreOnly launch), not after -- otherwise
+REM the question is put to someone whose answer can no longer matter. start_all.ps1 provisioned
+REM both whenever this marker was ABSENT, so the absence of a decision was read as consent.
+REM Logon autostart was never asked about at all.
+if not exist ".setup" mkdir ".setup"
+> ".setup\convenience_provisioned" echo shortcut=!PROV_SHORTCUT!
+>> ".setup\convenience_provisioned" echo autostart=!PROV_AUTOSTART!
+if /i "!PROV_SHORTCUT!"=="yes" (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\make_desktop_shortcut.ps1"
+) else (
+    echo   Desktop launcher skipped. Create it later with scripts\make_desktop_shortcut.ps1
+)
+if /i "!PROV_AUTOSTART!"=="yes" (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\register-supervisor.ps1"
+    REM You asked for logon autostart and it may not have been created. Without this the
+    REM failure surfaces at the NEXT logon, as the stack simply not being there.
+    if errorlevel 1 (
+        echo   Logon autostart could NOT be registered -- see the ERROR line above. Everything
+        echo   else continues; start the stack from the Desktop launcher until this is fixed.
+    )
+) else (
+    echo   Logon autostart skipped. Register it later with scripts\register-supervisor.ps1
+)
+
+echo.
+echo ===========================================================================
 echo  Starting the MCP server  ^(STEP 5 asks you to test a connection to it^)
 echo ===========================================================================
 REM THE CONNECTION TEST IN STEP 5 NEEDS A SERVER. copilot_studio_values.ps1 tells the reader to
@@ -310,44 +349,6 @@ REM Same reason: a joined line would take MCP_API_KEY with it.
 if not "!IMPL_URL!"=="" powershell -NoProfile -Command "$p = Join-Path (Get-Location) '.env'; $b = [IO.File]::ReadAllBytes($p); if ($b.Length -gt 0 -and $b[$b.Length-1] -ne 10) { [IO.File]::AppendAllText($p, [Environment]::NewLine) }; [IO.File]::AppendAllText($p, 'MCP_IMPL_AGENT_URL=!IMPL_URL!' + [Environment]::NewLine)"
 if not "!IMPL_URL!"=="" echo   Saved to .env.
 :after_cfg_fallback
-
-echo.
-echo ===========================================================================
-echo  Convenience setup  (asked BEFORE anything is created)
-echo ===========================================================================
-echo   These two change your machine outside this folder, so they are asked
-echo   first and your answer is recorded. Say no and nothing is created.
-echo.
-set "PROV_SHORTCUT=no"
-set "PROV_AUTOSTART=no"
-set /p MKLNK="   Create a one-click 'M365 Companion' launcher on your Desktop? [Y/n] "
-if /i not "!MKLNK!"=="n" set "PROV_SHORTCUT=yes"
-set /p MKAUTO="   Start the background supervisor automatically when you log on? [y/N] "
-if /i "!MKAUTO!"=="y" set "PROV_AUTOSTART=yes"
-
-REM RECORD THE DECISION, NOT THE ACT. start_all.ps1 provisioned both whenever this marker was
-REM ABSENT, so the absence of a decision was read as consent -- and the question below used to
-REM be asked AFTER the shortcut had already been created, which made answering "n" do nothing.
-REM Logon autostart was never asked about at all.
-if not exist ".setup" mkdir ".setup"
-> ".setup\convenience_provisioned" echo shortcut=!PROV_SHORTCUT!
->> ".setup\convenience_provisioned" echo autostart=!PROV_AUTOSTART!
-if /i "!PROV_SHORTCUT!"=="yes" (
-    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\make_desktop_shortcut.ps1"
-) else (
-    echo   Desktop launcher skipped. Create it later with scripts\make_desktop_shortcut.ps1
-)
-if /i "!PROV_AUTOSTART!"=="yes" (
-    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\register-supervisor.ps1"
-    REM You asked for logon autostart and it may not have been created. Without this the
-    REM failure surfaces at the NEXT logon, as the stack simply not being there.
-    if errorlevel 1 (
-        echo   Logon autostart could NOT be registered -- see the ERROR line above. Everything
-        echo   else continues; start the stack from the Desktop launcher until this is fixed.
-    )
-) else (
-    echo   Logon autostart skipped. Register it later with scripts\register-supervisor.ps1
-)
 
 echo.
 echo ===========================================================================

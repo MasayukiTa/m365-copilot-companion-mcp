@@ -88,6 +88,7 @@ jobs:
             tools/test_fleet_intake.py \
             tests/test_security_state_is_not_readable.py \
             tests/test_git_shared_guard.py \
+            tests/test_dedicated_root_guard.py \
             tests/test_unlock_token.py \
             tests/test_exec_via_gateway.py \
             tests/test_tool_map_pinning.py \
@@ -95,6 +96,7 @@ jobs:
             scripts/test_ensure_m365_signin.py \
             scripts/test_ensure_m365_signin_state.py \
             scripts/test_check_no_identifying_names.py \
+            scripts/test_check_no_identifying_names_metadata.py \
             scripts/test_check_integration_evidence.py \
             scripts/test_stale_server_check.py \
             scripts/test_run_script_style_tests.py \
@@ -353,6 +355,8 @@ jobs:
             relay/test_refuter_socket.py \
             scripts/test_workload_multiturn.py \
             tools/test_lock_state_matching_records.py \
+            tools/test_worktree_lifecycle.py \
+            tools/test_bench_worktree_wiring.py \
             tools/test_memory_ops_local.py \
             tools/test_notify_ops_dashboard_guard.py \
             tools/test_notify_ops_newlines.py \
@@ -402,6 +406,7 @@ jobs:
             relay/selfimprove/test_frozen_surfaces.py \
             relay/selfimprove/test_reliability.py \
             relay/test_claim_verdict.py \
+            relay/test_conv_registry_points_at_this_run.py \
             relay/test_conv_title.py \
             relay/test_edge_cache_trim.py \
             relay/test_edge_disk_cap.py \
@@ -496,6 +501,13 @@ jobs:
 
       - name: Run Windows path tests
         run: python -m pytest -q tools/test_file_ops.py
+
+      # These are skipped on the ubuntu job because gen_env protects the secrets it writes
+      # with DPAPI, which does not exist there. This is the job where that capability is
+      # real, so this is where they must run -- a skip on the other job is only honest
+      # while this line stands.
+      - name: Run DPAPI-dependent bootstrap tests
+        run: python -m pytest -q scripts/test_bootstrap.py scripts/test_bootstrap_p2c.py
 
       - name: Run force-push updater integration tests
         shell: powershell

@@ -32,6 +32,7 @@ import argparse
 import glob
 import json
 import os
+import pathlib
 import shutil
 import stat
 import subprocess
@@ -1260,16 +1261,33 @@ def _discard():
     work = os.path.join(SW, "work")
     if not os.path.isdir(work):
         return
+    # BOTH IMPORT FORMS -- run as `python bench/pro_cycle.py` (sys.path[0] is bench/) and
+    # imported as `bench.pro_cycle` from tests.
+    try:
+        from tools import coding_ops
+    except ImportError:
+        sys.path.insert(0, REPO)
+        from tools import coding_ops
     left = []
     for name in os.listdir(work):
         path = os.path.join(work, name)
         if not os.path.isdir(path):
             continue
-        # ignore_errors=True WAS HIDING A REAL FAILURE. Windows marks the files under .git
-        # read-only, and rmtree cannot unlink those; with errors ignored, each batch left 4-8 MB
-        # behind and reported nothing. Eight batches in, eight directories were still there and
-        # the log had never once mentioned it. Clear the bit and retry, then SAY what survived.
-        shutil.rmtree(path, onerror=_force_writable)
+        # THE SAME TEARDOWN PATH pro_capture uses: `git worktree remove --force` first so git
+        # drops both the checkout and its registration, then a guarded rmtree fallback that
+        # runs ONLY for a proven linked worktree. Going straight to rmtree (what this did) skips
+        # git's own bookkeeping and leaves a husk whose `.git` still points at the MAIN repo --
+        # the exact husk this sweep exists to prevent.
+        wt = pathlib.Path(path)
+        shared = coding_ops._resolves_into_common_dir(wt, pathlib.Path(REPO))
+        if shared is True:
+            log("  refusing to remove %s -- it resolves to the shared repository" % name)
+            continue
+        coding_ops._worktree_teardown(wt, pathlib.Path(REPO), shared)
+        # Last-resort local sweep for the read-only .git bits git left, only when a genuine
+        # linked worktree is still on disk (shared is never True past the guard above).
+        if os.path.isdir(path):
+            shutil.rmtree(path, onerror=_force_writable)
         if os.path.isdir(path):
             left.append(name)
     if left:

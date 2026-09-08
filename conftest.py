@@ -414,3 +414,36 @@ def _fresh_route_incident_clock():
     except Exception:
         pass
     yield
+
+
+@pytest.fixture(autouse=True)
+def _fresh_contract_gate_seen():
+    """Reset the gate's process-global "have I ever seen an active contract" memory.
+
+    contract_gate._SEEN is module-global and MUTATED IN PLACE: contract_state() sets
+    _SEEN["active_contract"] = True whenever it reads an active contract file. A test that
+    points _CONTRACT_FILE at a temporary active contract (with monkeypatch, which restores the
+    FILE) but does not also restore _SEEN leaves that flag True for the rest of the process.
+    From then on policy_state_is_suspect() reports "an active contract was in force and its
+    file has since disappeared" -- because the real contract file is absent -- and check_op
+    fires on every shell_destructive op. Later tests that actually run git (the worktree
+    lifecycle suite) then find worktree_add returning the gate's refusal string instead of
+    creating the worktree, and fail only in a full run, never alone.
+
+    Same shape and same place as _no_leftover_kill_switch and _fresh_route_incident_clock
+    above: reset a process-global between tests so one test cannot reach the next. Tests that
+    are ABOUT this memory set _SEEN themselves, which is unaffected.
+    """
+    try:
+        import tools.contract_gate as _cg
+        _cg._SEEN["active_contract"] = False
+        _cg._SEEN["retired_via_api"] = False
+    except Exception:
+        yield
+        return
+    yield
+    try:
+        _cg._SEEN["active_contract"] = False
+        _cg._SEEN["retired_via_api"] = False
+    except Exception:
+        pass
