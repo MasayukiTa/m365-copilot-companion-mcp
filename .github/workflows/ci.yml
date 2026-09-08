@@ -354,6 +354,8 @@ jobs:
             relay/test_refuter_socket.py \
             scripts/test_workload_multiturn.py \
             tools/test_lock_state_matching_records.py \
+            tools/test_worktree_lifecycle.py \
+            tools/test_bench_worktree_wiring.py \
             tools/test_memory_ops_local.py \
             tools/test_notify_ops_dashboard_guard.py \
             tools/test_notify_ops_newlines.py \
