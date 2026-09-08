@@ -502,6 +502,13 @@ jobs:
       - name: Run Windows path tests
         run: python -m pytest -q tools/test_file_ops.py
 
+      # These are skipped on the ubuntu job because gen_env protects the secrets it writes
+      # with DPAPI, which does not exist there. This is the job where that capability is
+      # real, so this is where they must run -- a skip on the other job is only honest
+      # while this line stands.
+      - name: Run DPAPI-dependent bootstrap tests
+        run: python -m pytest -q scripts/test_bootstrap.py scripts/test_bootstrap_p2c.py
+
       - name: Run force-push updater integration tests
         shell: powershell
         run: |
