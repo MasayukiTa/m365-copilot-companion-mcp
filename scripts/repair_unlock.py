@@ -69,7 +69,13 @@ def main() -> int:
         print("failed:%s: %s" % (type(exc).__name__, _scrub(exc, env)))
         return 0
 
-    reason = str(result.get("reason") or "")
+    # SCRUB EVERYTHING THAT COMES BACK OUT, not just the field that obviously holds a secret.
+    # `result` is what repair_unlock_password(env_path, env) returned, and `env` carried the
+    # password in, so every field of it is downstream of the password -- a reason string that
+    # quoted the offending value would put it on this stream just as surely as printing
+    # `password` did. Scrubbing at the boundary means the later prints do not each have to
+    # remember; the cost is one pass over a short string.
+    reason = _scrub(str(result.get("reason") or ""), env)
     if not result.get("acted"):
         print("noop:%s" % reason)
         return 0
