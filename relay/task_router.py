@@ -80,7 +80,7 @@ except Exception:
     pass
 
 TASKS = os.path.join(REPO, ".fleet", "tasks")
-SUBDIRS = ("pending", "running", "done", "awaiting", "for_fleet", "for_claude")
+SUBDIRS = ("pending", "running", "done", "awaiting", "awaiting_ack", "for_fleet", "for_claude")
 VENVPY = os.path.join(REPO, ".venv", "Scripts", "python.exe")
 APPROVED_JOBS_FILE = os.path.join(REPO, ".fleet", "approved_jobs.json")
 
@@ -596,66 +596,37 @@ def write_command(state_dir, patch: dict) -> str:
             time.sleep(0.02)
 
 
-#: A goal handed to a live fleet carries an ack nonce. The fleet stamps <state_dir>/acked/
-#: <ack>.json the instant it consumes the command, and the sender waits for that stamp before
-#: it dares call the goal delivered. This exists because the ONLY prior evidence of delivery
-#: was the sender's own "dispatched" record -- which is written whether or not anything read
-#: the command -- so a run that ended in the up-to-30s window fleet_is_live cannot see took the
-#: goal down with it and left "delivered" behind. The receiver's stamp is the first proof that
-#: is on the reader's side of the handoff.
-ACKED_DIR = "acked"
+#: Where the fleet drops a receipt when it actually READS a command. One file per goal id,
+#: written by relay/fleet_runner.read_commands the instant before it deletes the command. Its
+#: presence is the only proof on the receiving side that a dispatched goal was picked up rather
+#: than lost into the stale-status window (see fleet_landing_confirmed and the probe note).
+ACKS_DIR = "acks"
 
 
-def _ack_dir(state_dir=None) -> str:
-    return os.path.join(state_dir or FLEET_STATE_DIR, ACKED_DIR)
+def _ack_path(jid: str, state_dir=None) -> str:
+    sd = state_dir or FLEET_STATE_DIR
+    return os.path.join(sd, ACKS_DIR, "%s.ack" % jid)
 
 
-def _new_ack() -> str:
-    return uuid.uuid4().hex
+def fleet_landing_confirmed(jid: str, state_dir=None) -> bool:
+    """Whether the running fleet has actually read the goal handed over as `jid`.
 
-
-def ack_seen(ack: str, state_dir=None) -> bool:
-    """Whether the fleet has stamped this ack -- i.e. actually consumed the command.
-
-    A missing file is a firm "not yet", not an error: the stamp appears only when read_commands
-    on the fleet side removes the command it came in on, so its absence is exactly the state
-    this check is here to report.
+    dispatched IS NOT DELIVERED. fleet_handoff writes a done/ record saying "dispatched" the
+    moment fleet_is_live() is True, but that check trusts a status.json up to
+    FLEET_LIVE_MAX_AGE_S old -- so a run that had already died still read as live for up to
+    30s, and a goal queued in that window went into commands.d/ that no one would ever read.
+    read_commands now drops an ack receipt as it consumes a command; this reports whether that
+    receipt exists, which is what turns "we said we delivered it" into "the fleet took it".
     """
-    if not ack:
-        return False
     try:
-        return os.path.isfile(os.path.join(_ack_dir(state_dir), "%s.json" % ack))
+        return os.path.isfile(_ack_path(jid, state_dir))
     except OSError:
         return False
 
 
-#: How long fleet_handoff waits for the receiver's stamp before it stops claiming delivery and
-#: parks the goal as waiting instead. Short by default -- a live fleet drains commands every
-#: few seconds -- and env-tunable so a test can drop it to near zero rather than sleep. The
-#: failure it guards against is the reverse of the old one: better to under-claim and re-park a
-#: goal the fleet did in fact take than to over-claim one it never saw.
-FLEET_ACK_WAIT_S = float(os.environ.get("FLEET_ACK_WAIT_S", "8") or 8)
-
-
-def _wait_for_ack(ack: str, state_dir=None, timeout_s=None) -> bool:
-    """Poll for the receiver's ack stamp up to timeout_s. Returns True once seen.
-
-    Polling, not a watch, because the writer is another process (or the C# cockpit) and there
-    is no shared primitive to wait on. The interval is small and the ceiling low, so the caller
-    blocks briefly at most.
-    """
-    deadline = time.time() + (FLEET_ACK_WAIT_S if timeout_s is None else timeout_s)
-    while True:
-        if ack_seen(ack, state_dir):
-            return True
-        if time.time() >= deadline:
-            return False
-        time.sleep(0.05)
-
-
 def add_goal_to_live_fleet(goal: str, state_dir=None, priority: bool = False,
-                           entry: dict = None) -> str:
-    """Append a goal to the running fleet's command channel. Returns the ack nonce written.
+                           entry: dict = None, jid: str = None) -> None:
+    """Append a goal to the running fleet's command channel.
 
     utf-8 with no BOM on the way out and utf-8-sig on the way in, matching code_task.py: the
     fleet reads both, and writing what the other writer writes is how the two stay compatible.
@@ -663,17 +634,16 @@ def add_goal_to_live_fleet(goal: str, state_dir=None, priority: bool = False,
     `entry` lets a caller supply the whole command dict -- code_task adds `cwd` and `checks` --
     so it can share this path instead of keeping its own copy of it.
 
-    The returned ack nonce is stamped by the fleet when it consumes the command; callers that
-    need proof of delivery wait on ack_seen()/`_wait_for_ack`. An `entry` without its own `ack`
-    gets one so this path always yields a nonce a caller can wait on; an entry that already
-    carries one is left as the caller set it.
+    `jid`, when given, adds an `ack` path to the command so the fleet leaves a receipt when it
+    reads it. `add_goal` readers (goals_from_command) ignore the extra key, so this is safe for
+    every existing consumer; it only gives the sender a way to check the goal actually landed.
     """
     sd = state_dir or FLEET_STATE_DIR
     item = dict(entry) if entry else {"text": goal, "priority": bool(priority)}
-    ack = item.get("ack") or _new_ack()
-    item["ack"] = ack
-    write_command(sd, {"add_goal": [item]})
-    return ack
+    patch = {"add_goal": [item]}
+    if jid:
+        patch["ack"] = _ack_path(jid, sd)
+    write_command(sd, patch)
 
 
 #: Where an autostart attempt is recorded, beside the run's own state. Kept so the NEXT pass
@@ -1116,26 +1086,34 @@ def fleet_handoff(goal: str, jid: str, state_dir=None):
     if not (goal or "").strip():
         return "error", {"handoff": "for_fleet/%s.txt" % jid, "detail": "empty goal"}
     if fleet_is_live(state_dir):
-        # PARK FIRST, CLAIM SECOND. The goal is written to for_fleet/ before the command goes
-        # out, so if this process dies mid-handoff -- or the fleet ends in the up-to-30s window
-        # fleet_is_live cannot see -- the goal is on disk as waiting, not merely named in a
-        # "dispatched" record nobody re-reads. It is removed only once the fleet stamps its ack.
-        _park_in_for_fleet(goal, jid)
-        ack = add_goal_to_live_fleet(goal, state_dir)
-        if _wait_for_ack(ack, state_dir):
-            try:
-                os.remove(_p("for_fleet", "%s.txt" % jid))
-            except OSError:
-                pass
-            return "dispatched", {"handoff": "for_fleet/%s.txt" % jid,
-                                  "delivered": "add_goal", "ack": ack,
-                                  "note": "consumed by the running fleet (ack stamped)"}
-        # SENT BUT UNCONFIRMED. The command was written and the fleet looked live, but no ack
-        # arrived in time -- exactly the run-ended-in-the-window case. Leave the goal parked in
-        # for_fleet/ and say awaiting, rather than claim a delivery that may have vanished.
-        return "awaiting_fleet", {"handoff": "for_fleet/%s.txt" % jid, "ack": ack,
-                                  "note": "handed to a live fleet but no ack within "
-                                          "%ss; parked as waiting" % FLEET_ACK_WAIT_S}
+        # Clear any stale receipt for this id before queueing, so a confirmation seen later
+        # belongs to THIS handoff and not a previous run's leftover file.
+        try:
+            os.remove(_ack_path(jid, state_dir))
+        except OSError:
+            pass
+        add_goal_to_live_fleet(goal, state_dir, jid=jid)
+        # RECORD THE OPEN CLAIM so a later pass can check it. "dispatched" is written to done/
+        # now, but done/ is terminal -- nothing re-reads it -- so on its own it can never be
+        # corrected when the fleet turns out to have died inside the stale-status window. This
+        # marker is the one thing _reconcile_landings scans: it holds the goal so a goal lost to
+        # that window can be re-queued, and it is deleted the moment the ack proves the goal
+        # landed. Best-effort: a goal already on the channel must not be lost because the marker
+        # write failed, so the delivery above happens first and this cannot raise past here.
+        try:
+            with open(_p("awaiting_ack", "%s.json" % jid), "w", encoding="utf-8") as _mf:
+                json.dump({"id": jid, "goal": goal, "ts": time.time(),
+                           "ack": _ack_path(jid, state_dir)}, _mf, ensure_ascii=False)
+        except OSError:
+            pass
+        # STILL "dispatched", because the goal is on the channel and joining the run in flight
+        # is the right destination. But delivery is now CHECKABLE: the command carries an ack
+        # path, the fleet drops a receipt when it reads it, and fleet_landing_confirmed(jid)
+        # (or the reconcile pass) tells a delivered goal apart from one lost to the stale
+        # window fleet_is_live cannot close on its own. `ack` names where that receipt lands.
+        return "dispatched", {"handoff": "for_fleet/%s.txt" % jid,
+                              "delivered": "add_goal", "note": "queued into the running fleet",
+                              "ack": _ack_path(jid, state_dir)}
     if AUTOSTART:
         may, why = autostart_status(state_dir)
         if may:
@@ -1154,6 +1132,110 @@ def fleet_handoff(goal: str, jid: str, state_dir=None):
     # unnoticed for months.
     return "awaiting_fleet", {"handoff": _park_in_for_fleet(goal, jid),
                               "note": "no fleet run is in flight; the goal waits for one"}
+
+
+#: How long a "dispatched" goal may wait for its landing ack before _reconcile_landings treats
+#: it as lost to the stale-status window and re-queues it. Must be comfortably longer than
+#: FLEET_LIVE_MAX_AGE_S (the width of that window) plus one drain interval, so a fleet that is
+#: genuinely alive but slow to read its command channel is not re-queued out from under itself.
+RECONCILE_ACK_GRACE_S = float(os.environ.get("FLEET_RECONCILE_ACK_GRACE_S", "90") or 90)
+
+
+def _reconcile_landings(now_ts=None, state_dir=None):
+    """Turn every "dispatched" claim into a checked outcome, using the fleet's landing acks.
+
+    THE GAP THIS CLOSES. fleet_handoff files a goal "dispatched" the instant fleet_is_live() is
+    True, but that check trusts a status.json up to FLEET_LIVE_MAX_AGE_S old: a run that had
+    already died still read as live for up to that long, and a goal queued in that window went
+    into commands.d/ that no live reader would ever consume. "dispatched" was the only record,
+    done/ is terminal, and nothing ever revisited the claim -- so a goal lost this way looked
+    exactly like one delivered. The receiving side now drops an ack when it actually reads a
+    command; this pass is the reader of those acks.
+
+    For each open claim in awaiting_ack/:
+      * ack present            -> the fleet really took it. Record done/<id>.landed.json and
+                                  drop the marker. This is the confirmation "dispatched" could
+                                  never give on its own.
+      * no ack, past the grace -> lost to the stale window. Re-queue it as a for_fleet/ waiter
+                                  (the same channel _deliver_waiting_goals drains on the next
+                                  live pass, which will hand it over WITH a fresh ack), record
+                                  done/<id>.reconcile-requeued.json, and drop the marker.
+      * no ack, still in grace -> leave it; a live-but-slow fleet has not answered yet.
+
+    Runs on every drain pass. Costs one listdir when there are no open claims.
+    """
+    out = []
+    ensure_dirs()
+    # AGE IS MEASURED ON THE WALL CLOCK, not on now_ts. now_ts is a record stamp the caller may
+    # pass as any monotonic value (tests pass small integers), and comparing a marker ts taken
+    # from time.time() against that would make the grace meaningless. now_ts is only written
+    # into the done/ records below.
+    now = time.time()
+    try:
+        names = sorted(os.listdir(_p("awaiting_ack", "")))
+    except OSError:
+        return out
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        mpath = _p("awaiting_ack", name)
+        try:
+            with open(mpath, encoding="utf-8") as fh:
+                marker = json.load(fh)
+        except Exception:
+            continue  # unreadable -- leave for manual inspection rather than losing the claim
+        jid = marker.get("id", name[:-5])
+        goal = marker.get("goal", "")
+        if fleet_landing_confirmed(jid, state_dir):
+            rec = {"id": jid, "type": "fleet_goal", "destination": "fleet", "ts_done": now_ts,
+                   "status": "dispatched", "result": {"landing_confirmed": True,
+                   "ack": _ack_path(jid, state_dir)}, "error": None}
+            try:
+                with open(_p("done", "%s.landed.json" % jid), "w", encoding="utf-8") as fh:
+                    json.dump(rec, fh, ensure_ascii=False, indent=2)
+            except OSError:
+                pass
+            try:
+                os.remove(mpath)
+            except OSError:
+                pass
+            out.append(rec)
+            continue
+        age = now - float(marker.get("ts", now))
+        if age <= RECONCILE_ACK_GRACE_S:
+            continue  # live-but-slow fleet may still read it; do not re-queue yet
+        # Past the grace with no ack: the goal was lost into the stale-status window. Put it
+        # back on the waiter channel so a live fleet picks it up again, this time with an ack
+        # we can confirm. Written before the marker is removed, so a crash between the two
+        # leaves a waiter (re-tried) rather than nothing (lost).
+        requeued = False
+        if (goal or "").strip():
+            try:
+                with open(_p("for_fleet", "%s.txt" % jid), "w", encoding="utf-8") as fh:
+                    fh.write(goal)
+                requeued = True
+            except OSError:
+                pass
+        rec = {"id": jid, "type": "fleet_goal", "destination": "fleet", "ts_done": now_ts,
+               "status": "awaiting_fleet",
+               "result": {"landing_confirmed": False, "reconciled": True,
+                          "requeued": requeued,
+                          "note": "no landing ack within %ss; goal was lost to the "
+                                  "stale-status window and has been re-queued"
+                                  % int(RECONCILE_ACK_GRACE_S)},
+               "error": None}
+        try:
+            with open(_p("done", "%s.reconcile-requeued.json" % jid), "w",
+                      encoding="utf-8") as fh:
+                json.dump(rec, fh, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+        try:
+            os.remove(mpath)
+        except OSError:
+            pass
+        out.append(rec)
+    return out
 
 
 def run_job(job, now_ts=None):
@@ -1276,6 +1358,14 @@ def dispatch_once(now_ts=None):
     # before the delivery pass so restored goals go out on this same sweep rather than the next.
     try:
         recover_failed_autostart(now=now_ts)
+    except Exception:
+        pass
+    # RECONCILE BEFORE DELIVERY. Turn open "dispatched" claims into confirmed landings or
+    # re-queued waiters first, so a goal that was lost to the stale-status window is back on
+    # the for_fleet/ channel in time for _deliver_waiting_goals to hand it over on this same
+    # sweep rather than the next.
+    try:
+        out.extend(_reconcile_landings(now_ts=now_ts))
     except Exception:
         pass
     out.extend(_deliver_waiting_goals(now_ts=now_ts))

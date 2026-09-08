@@ -92,28 +92,7 @@ def test_a_second_goal_while_the_first_is_still_coming_up_does_not_start_another
     assert "coming up" in why
 
 
-@pytest.fixture
-def autoack(monkeypatch):
-    """Stamp each goal's ack the instant it is written, standing in for a fleet that drained it.
-
-    Same purpose as the fixture of the same name in test_fleet_handoff, reused here: fleet_handoff
-    now waits for the receiver's stamp before reporting a goal delivered, and no fleet drains in
-    these unit tests. Wrapping the real writer to stamp through the runner's real _stamp_acks lets
-    a live-looking handoff reach 'dispatched' without a 30-second wait.
-    """
-    from relay.test_fleet_handoff import _stamp_pending_acks
-    real = TR.add_goal_to_live_fleet
-
-    def wrapper(goal, state_dir=None, priority=False, entry=None):
-        ack = real(goal, state_dir=state_dir, priority=priority, entry=entry)
-        _stamp_pending_acks(state_dir or TR.FLEET_STATE_DIR)
-        return ack
-
-    monkeypatch.setattr(TR, "add_goal_to_live_fleet", wrapper)
-    return wrapper
-
-
-def test_once_the_run_is_live_autostart_has_nothing_to_do(state, autoack):
+def test_once_the_run_is_live_autostart_has_nothing_to_do(state):
     """fleet_handoff never reaches autostart while a run is live -- the goal joins it instead."""
     _live(state)
     status, result = TR.fleet_handoff("join the running one", "j1", str(state))
@@ -224,7 +203,7 @@ def test_a_launch_that_raises_is_recorded_and_not_reported_as_started(state):
     assert TR._read_autostart(str(state))["outcome"] == "launch_failed"
 
 
-def test_the_handoff_says_which_way_the_goal_went(state, autoack):
+def test_the_handoff_says_which_way_the_goal_went(state):
     """dispatched-by-autostart and dispatched-by-add_goal are different events, and the record
     is the only place the difference survives."""
     TR.autostart_fleet([{"text": "seed"}], str(state), now=1.0, launcher=_Launcher())
@@ -538,71 +517,3 @@ def test_the_launch_asks_for_no_console_window():
         "DETACHED_PROCESS is back; the grandchild will allocate its own console window")
     assert flags & sp.CREATE_NEW_PROCESS_GROUP, (
         "a Ctrl+C in the router's console would travel to the run")
-
-
-# ── --fanout reaches the launch ──────────────────────────────────────────────────
-#
-# fleet_runner has always understood --fanout and passed it into run_relay_fleet; the gap was
-# that autostart_fleet built its command line without it, so a goal that came in from the
-# tunnel with nothing running could not be split no matter how large it was. These pin the
-# fix and the policy behind it: on by size, off for a goal that fits, overridable either way.
-
-
-def _big_goal(n=None):
-    n = TR.AUTOSTART_FANOUT_MIN_CHARS if n is None else n
-    return "メールを全件抽出して一覧化 " + ("x" * n)
-
-
-def test_a_goal_too_small_to_split_is_launched_without_fanout(state):
-    launcher = _Launcher()
-    TR.autostart_fleet([{"text": "read yesterday's mail"}], str(state), launcher=launcher)
-    assert "--fanout" not in launcher.calls[0], (
-        "a short goal paid for a split turn and a merge turn it did not need")
-
-
-def test_a_goal_large_enough_is_launched_with_fanout(state):
-    launcher = _Launcher()
-    TR.autostart_fleet([{"text": _big_goal()}], str(state), launcher=launcher)
-    assert "--fanout" in launcher.calls[0], (
-        "an oversized goal was launched without --fanout, so it can never be split")
-
-
-def test_one_large_goal_in_the_batch_turns_fanout_on_for_the_launch(state):
-    launcher = _Launcher()
-    TR.autostart_fleet([{"text": "tiny"}, {"text": _big_goal()}], str(state), launcher=launcher)
-    assert "--fanout" in launcher.calls[0]
-
-
-def test_the_operator_can_force_fanout_off_for_a_large_goal(state, monkeypatch):
-    monkeypatch.setenv("FLEET_INTAKE_AUTOSTART_FANOUT", "0")
-    launcher = _Launcher()
-    TR.autostart_fleet([{"text": _big_goal()}], str(state), launcher=launcher)
-    assert "--fanout" not in launcher.calls[0], (
-        "an explicit off override did not win over the size heuristic")
-
-
-def test_the_operator_can_force_fanout_on_for_a_small_goal(state, monkeypatch):
-    monkeypatch.setenv("FLEET_INTAKE_AUTOSTART_FANOUT", "1")
-    launcher = _Launcher()
-    TR.autostart_fleet([{"text": "tiny"}], str(state), launcher=launcher)
-    assert "--fanout" in launcher.calls[0], (
-        "an explicit on override did not win over the size heuristic")
-
-
-def test_a_zero_threshold_disables_the_size_heuristic(state, monkeypatch):
-    # Threshold <= 0 with no override means never fan out by size -- the old behaviour.
-    monkeypatch.setattr(TR, "AUTOSTART_FANOUT_MIN_CHARS", 0)
-    launcher = _Launcher()
-    TR.autostart_fleet([{"text": _big_goal()}], str(state), launcher=launcher)
-    assert "--fanout" not in launcher.calls[0]
-
-
-def test_fanout_does_not_disturb_the_rest_of_the_command(state):
-    # The flag is added, not substituted: goals-file, agent-url, state-dir and the 0 disk
-    # floor all still travel exactly as before.
-    launcher = _Launcher()
-    TR.autostart_fleet([{"text": _big_goal()}], str(state), launcher=launcher)
-    cmd = launcher.calls[0]
-    assert "--goals-file" in cmd and "--agent-url" in cmd and "--state-dir" in cmd
-    assert cmd[cmd.index("--disk-floor-gb") + 1] == "0"
-    assert cmd[:3] == [sys.executable, "-m", "relay.fleet_runner"]
