@@ -398,12 +398,22 @@ if ($pids.Count -gt 0) {
   # window WS_EX_TOOLWINDOW takes it out of the taskbar and Alt+Tab while leaving it a
   # live, drivable window. Measured on the bridge Edge: CDP :9223 and the bridge kept
   # answering with the flag set.
+  # A window that was never shown must not be put through the hide/mark/re-show dance: it
+  # ends in ShowWindow(SW_MINIMIZE), and the guard six lines above says what that does to a
+  # WS_VISIBLE-clear window -- Windows sets WS_VISIBLE and shows it minimized. Guarding only
+  # the FIRST minimize and leaving this one unconditional is how a headless Edge acquired a
+  # window anyway. An unshown window has no taskbar membership to re-evaluate, so setting
+  # the bit is the whole job; the shell reads the style at first show.
   if ($h -ne [IntPtr]::Zero) {
     $ex = [RK]::GetWindowLong($h, -20)
     if (($ex -band 0x80) -eq 0) {
-      [RK]::ShowWindow($h, 0) | Out-Null                       # SW_HIDE, momentarily:
-      [RK]::SetWindowLong($h, -20, ($ex -bor 0x80) -band (-bnot 0x40000)) | Out-Null
-      [RK]::ShowWindow($h, 6) | Out-Null                       # back to minimized
+      if ([RK]::IsWindowVisible($h)) {
+        [RK]::ShowWindow($h, 0) | Out-Null                     # SW_HIDE, momentarily:
+        [RK]::SetWindowLong($h, -20, ($ex -bor 0x80) -band (-bnot 0x40000)) | Out-Null
+        [RK]::ShowWindow($h, 6) | Out-Null                     # back to minimized
+      } else {
+        [RK]::SetWindowLong($h, -20, ($ex -bor 0x80) -band (-bnot 0x40000)) | Out-Null
+      }
     }
   }
 }
