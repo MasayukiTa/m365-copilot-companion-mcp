@@ -170,3 +170,75 @@ if __name__ == "__main__":
     test_missing_history_degrades_to_empty_but_valid()
     test_persona_flagged_capped_at_10()
     print("ALL USAGE TESTS PASSED")
+
+
+def test_verify_rate_prefers_the_archive_over_the_live_run(tmp_path):
+    """A rate over the CURRENT run is a rate over as few as one worker.
+
+    verify_rate read only .fleet/status.json, and said why: "history rows don't carry
+    verified". They do now. The difference is not cosmetic -- the live snapshot holds only the
+    workers of the run that happens to be in progress, so on 2026-09-08 a single unverified
+    worker rendered as 0.0 sitting beside "44 tasks", which reads like an all-time figure and
+    was a sample of one.
+    """
+    import json
+    import os
+    from relay.selfimprove import usage as U
+
+    d = str(tmp_path)
+    history = os.path.join(d, "history.json")
+    status = os.path.join(d, "status.json")
+    # archive: 3 verifiable, 2 of them true
+    with open(history, "w", encoding="utf-8") as fh:
+        json.dump([{"status": "done", "verified": True}, {"status": "done", "verified": True},
+                   {"status": "stuck", "verified": False}, {"status": "done"}], fh)
+    # live: a single unverified worker -- the shape that produced the misleading 0.0
+    with open(status, "w", encoding="utf-8") as fh:
+        json.dump({"workers": [{"verified": "False"}]}, fh)
+
+    u = U.usage_section(history_path=history, status_path=status)
+    assert u["verify_rate"] == round(2 / 3, 4), "the live run overrode the archive"
+    assert u["verify_n"] == 3
+    assert u["verify_source"] == "history"
+
+
+def test_it_falls_back_to_the_live_run_when_nothing_archived_carries_the_field(tmp_path):
+    """A checkout from before the field existed, or a fresh install. The live run is then the
+    only evidence there is -- reported as such, so a reader can tell it from an accumulated
+    rate rather than having to guess."""
+    import json
+    import os
+    from relay.selfimprove import usage as U
+
+    d = str(tmp_path)
+    history = os.path.join(d, "history.json")
+    status = os.path.join(d, "status.json")
+    with open(history, "w", encoding="utf-8") as fh:
+        json.dump([{"status": "done"}, {"status": "stuck"}], fh)      # no `verified` anywhere
+    with open(status, "w", encoding="utf-8") as fh:
+        json.dump({"workers": [{"verified": "True"}, {"verified": "False"}]}, fh)
+
+    u = U.usage_section(history_path=history, status_path=status)
+    assert u["verify_rate"] == 0.5
+    assert u["verify_source"] == "live"
+    assert u["verify_n"] == 2
+
+
+def test_no_evidence_anywhere_is_null_not_zero(tmp_path):
+    """Nothing verifiable is not 0% verified. A misleading 0 is worse than an honest null --
+    that distinction is the reason the original guarded on `verified in (True, False)`."""
+    import json
+    import os
+    from relay.selfimprove import usage as U
+
+    d = str(tmp_path)
+    history = os.path.join(d, "history.json")
+    status = os.path.join(d, "status.json")
+    with open(history, "w", encoding="utf-8") as fh:
+        json.dump([{"status": "done"}], fh)
+    with open(status, "w", encoding="utf-8") as fh:
+        json.dump({"workers": [{"status": "waiting"}]}, fh)
+
+    u = U.usage_section(history_path=history, status_path=status)
+    assert u["verify_rate"] is None
+    assert u["verify_source"] == "none"

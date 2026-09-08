@@ -12783,14 +12783,35 @@ class CockpitWindow : Window
     }
 
     // ── persistent history: finished/released tasks stack until cleared ───────────
+    // "COULD NOT READ IT" AND "THERE IS NOTHING TO READ" ARE NOT THE SAME ANSWER, and this pair
+    // of methods treated them as one. LoadHistory emptied _history first and swallowed every
+    // failure, so a load that failed was indistinguishable from a first run -- and the next
+    // SaveHistory then wrote the empty list over the file it had just failed to read.
+    //
+    // MEASURED 2026-09-08. The cockpit started at 18:21:10 with an empty _history. No worker
+    // reached a terminal state for the next 24 minutes, so nothing saved and the file still held
+    // its 44 rows at 18:44. At 18:45 a run archived its first worker, SaveHistory fired, and 44
+    // rows became 1. Nothing reported anything. Set against 218 runs' worth of transcripts on
+    // disk, the 44 rows that survived were themselves the remains of earlier rounds of this --
+    // the oldest was from 03:40 the same morning.
+    //
+    // The trigger for that particular failed load is not established, and this does not pretend
+    // to fix it. What it fixes is the consequence: a load that fails now refuses to let the
+    // save destroy the evidence, and the unreadable file is kept under a dated name rather than
+    // overwritten, so the next reader still has something to look at.
+    bool _historyLoaded;          // false = the last LoadHistory could not read the file
+
     void LoadHistory()
     {
         _history = new List<object>();
         _archivedKeys = new System.Collections.Generic.HashSet<string>();
+        _historyLoaded = false;
         try
         {
-            if (!File.Exists(_historyPath)) return;
+            // Absent is a legitimately empty history -- a first run. That is a successful load.
+            if (!File.Exists(_historyPath)) { _historyLoaded = true; return; }
             var arr = _js.DeserializeObject(File.ReadAllText(_historyPath, Encoding.UTF8)) as object[];
+            // Present but not an array is CORRUPT, not empty: do not claim it loaded.
             if (arr == null) return;
             foreach (object o in arr)
             {
@@ -12798,11 +12819,33 @@ class CockpitWindow : Window
                 var d = o as Dictionary<string, object>;
                 if (d != null && d.ContainsKey("key")) _archivedKeys.Add(S(d, "key"));
             }
+            _historyLoaded = true;
+        }
+        catch (Exception) { }
+        if (!_historyLoaded) PreserveUnreadableHistory();
+    }
+
+    // Keep what could not be read. Renaming rather than copying means the next save writes a new
+    // file instead of appending to a damaged one, and the original bytes are still on disk for
+    // whoever asks what went wrong.
+    void PreserveUnreadableHistory()
+    {
+        try
+        {
+            if (!File.Exists(_historyPath)) return;
+            string kept = _historyPath + ".unreadable-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+            if (!File.Exists(kept)) File.Move(_historyPath, kept);
         }
         catch (Exception) { }
     }
+
     void SaveHistory()
     {
+        // A SAVE AFTER A FAILED LOAD IS A DELETION. _history holds only what this session
+        // archived, so writing it over a file whose contents were never read replaces every
+        // earlier row with the handful from this run. Refusing costs the current session's rows
+        // until the next clean start; writing costs every row ever recorded.
+        if (!_historyLoaded) return;
         try { File.WriteAllText(_historyPath, _js.Serialize(_history), new UTF8Encoding(false)); }
         catch (Exception) { }
     }
