@@ -155,9 +155,30 @@ while ($true) {
         # sees a handle. Hiding and re-showing is what makes the shell re-evaluate membership;
         # the bit alone never does. After that first pass the handle is known to have been
         # shown while marked, and the cheap bit test is enough to keep the loop quiet.
+        #
+        # ...BUT NOT ON A WINDOW THAT WAS NEVER SHOWN. The sequence ends in
+        # ShowWindow(SW_MINIMIZE), and this file says twenty lines above what that does to a
+        # window with WS_VISIBLE clear: Windows SETS WS_VISIBLE and shows it minimized. The
+        # first minimize is guarded against exactly that; this one ran UNCONDITIONALLY on a
+        # handle's first sighting, so the keeper's own taskbar treatment was what revealed a
+        # headless Edge. Measured 2026-09-08: :9222 (copilot-companion-edge) and :9223
+        # (copilot-bridge-edge), both launched --headless=new, both sitting at
+        # visible=True iconic=True TOOLWINDOW=True -- window-less instances turned into
+        # minimized windows by the code whose job was to keep them out of sight, one of them
+        # titled "about:blank".
+        #
+        # A window that has never been shown has no taskbar membership to re-evaluate, so it
+        # needs no dance at all: set the bit and leave it alone. The shell reads the style at
+        # FIRST show, so a bit set now is the bit that will be read if it is ever shown.
         $ex = [K]::GetWindowLong($h, -20)
         $key = [string]$h
-        if (-not $script:HandledWindows.ContainsKey($key) -or ($ex -band 0x80) -eq 0) {
+        if (-not [K]::IsWindowVisible($h)) {
+            if (($ex -band 0x80) -eq 0) {
+                [K]::SetWindowLong($h, -20, ($ex -bor 0x80) -band (-bnot 0x40000)) | Out-Null
+            }
+            $script:HandledWindows[$key] = $true
+        }
+        elseif (-not $script:HandledWindows.ContainsKey($key) -or ($ex -band 0x80) -eq 0) {
             [K]::ShowWindow($h, 0) | Out-Null
             [K]::SetWindowLong($h, -20, ($ex -bor 0x80) -band (-bnot 0x40000)) | Out-Null
             [K]::ShowWindow($h, 6) | Out-Null

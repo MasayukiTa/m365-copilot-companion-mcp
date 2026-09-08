@@ -373,9 +373,164 @@ def aggregation_prompt(parent_goal, results, limit_each=1200):
     return "\n".join(parts)
 
 
+# ── FAN-OUT FAMILY VIEW (derived, for the cockpit)  ───────────────────────────────────
+# THE LINEAGE WAS ALREADY IN status.json AND NOTHING READ IT. Every worker entry the
+# runner writes already carries campaign_id / parent_task_id / role / depth / subtask_index
+# (relay/fleet_runner.py _snapshot + _final_worker_entry). But raw ids are not a display:
+# a person looking at the cockpit cannot tell a parent that split from a child slice, an
+# aggregator waiting for its family from one already merging, or -- the failure this was
+# written for -- a goal that PROPOSED a split (emitted SUBTASKS_READY) whose children were
+# never admitted, which looks identical to an ordinary single-goal worker.
+#
+# This is a PURE projection of the snapshot the runner already produces. It invents no ids,
+# opens no files, and does not touch when fan-out fires -- it only reads the workers list and
+# labels each entry so the UI can render the family without inferring anything itself.
+
+_TERMINAL_OK = {"DONE", "FANOUT"}
+
+
+def _wnorm(w):
+    """Read a worker snapshot dict tolerantly (missing keys -> neutral defaults)."""
+    g = w.get
+    return {
+        "name": g("name") or "",
+        "campaign_id": g("campaign_id") or "",
+        "task_id": g("task_id") or "",
+        "parent_task_id": g("parent_task_id"),
+        "role": (g("role") or "").lower(),
+        "depth": int(g("depth") or 0),
+        "subtask_index": g("subtask_index"),
+        "outcome": (g("outcome") or "").upper(),
+        "status": (g("status") or "").lower(),
+        "last": g("last") or g("display_result") or g("last_response") or "",
+    }
+
+
+def fanout_family_view(workers):
+    """Label each worker with a display-ready fan-out marker derived from lineage already
+    present in the snapshot. Returns {worker_name: marker_dict}.
+
+    marker_dict keys (always present):
+      kind            : "solo" | "parent" | "child" | "aggregator" | "stalled_parent"
+      campaign_id     : the family id ("" for a solo worker)
+      label           : short English one-liner for the card badge
+    kind-specific keys:
+      child           -> subtask_index, subtask_of (parent name or "")
+      parent/stalled  -> children_total, children_done, missing_slices, fanin_state,
+                         split_proposed_not_run (True only for stalled_parent)
+      aggregator      -> children_total, children_done, missing_slices, fanin_state
+
+    fanin_state (parent/aggregator): "pending" (children still running),
+      "ready" (all children finished, no merge yet), "merging" (an aggregator is running),
+      "merged" (an aggregator finished ok).
+
+    Nothing here fabricates: a solo worker that never proposed a split is honestly "solo";
+    only a worker that emitted SUBTASKS_READY yet has no admitted children is flagged
+    "stalled_parent" -- the split that was proposed and silently never ran.
+    """
+    ws = [_wnorm(w) for w in (workers or [])]
+
+    kids = {}          # campaign_id -> [child records]
+    aggs = {}          # campaign_id -> [aggregator records]
+    by_task = {}       # task_id -> record (to name a child's parent)
+    for w in ws:
+        if w["task_id"]:
+            by_task[w["task_id"]] = w
+        if w["campaign_id"]:
+            if w["role"] == "subtask":
+                kids.setdefault(w["campaign_id"], []).append(w)
+            elif w["role"] == "aggregator":
+                aggs.setdefault(w["campaign_id"], []).append(w)
+
+    def _child_records(cid):
+        recs = []
+        for c in kids.get(cid, []):
+            recs.append({
+                "subtask_index": c["subtask_index"],
+                "outcome": c["outcome"],
+                "finished": c["outcome"] in _TERMINAL_OK,
+            })
+        return recs
+
+    def _fanin(cid):
+        recs = _child_records(cid)
+        total = len(recs)
+        done = sum(1 for r in recs if r["finished"])
+        miss = missing_slices(collapse_retries(recs)) if recs else []
+        agg_list = aggs.get(cid, [])
+        agg_ok = any(a["outcome"] in _TERMINAL_OK for a in agg_list)
+        agg_running = any(a["outcome"] not in _TERMINAL_OK for a in agg_list)
+        if agg_ok:
+            state = "merged"
+        elif agg_running:
+            state = "merging"
+        elif recs and ready_to_aggregate(recs):
+            state = "ready"
+        else:
+            state = "pending"
+        return total, done, miss, state
+
+    view = {}
+    for w in ws:
+        cid = w["campaign_id"]
+        name = w["name"]
+        if w["role"] == "subtask":
+            parent = by_task.get(w["parent_task_id"] or "")
+            idx = w["subtask_index"]
+            view[name] = {
+                "kind": "child",
+                "campaign_id": cid,
+                "subtask_index": idx,
+                "subtask_of": parent["name"] if parent else "",
+                "label": ("subtask %s" % idx) if idx is not None else "subtask",
+            }
+            continue
+        if w["role"] == "aggregator":
+            total, done, miss, state = _fanin(cid)
+            view[name] = {
+                "kind": "aggregator",
+                "campaign_id": cid,
+                "children_total": total,
+                "children_done": done,
+                "missing_slices": miss,
+                "fanin_state": state,
+                "label": "merge %d/%d" % (done, total),
+            }
+            continue
+        has_kids = bool(kids.get(cid)) if cid else False
+        if has_kids:
+            total, done, miss, state = _fanin(cid)
+            view[name] = {
+                "kind": "parent",
+                "campaign_id": cid,
+                "children_total": total,
+                "children_done": done,
+                "missing_slices": miss,
+                "fanin_state": state,
+                "split_proposed_not_run": False,
+                "label": "split %d/%d" % (done, total),
+            }
+            continue
+        if fanout_ready(w["last"]):
+            view[name] = {
+                "kind": "stalled_parent",
+                "campaign_id": cid,
+                "children_total": 0,
+                "children_done": 0,
+                "missing_slices": [],
+                "fanin_state": "pending",
+                "split_proposed_not_run": True,
+                "label": "split proposed, no children ran",
+            }
+            continue
+        view[name] = {"kind": "solo", "campaign_id": cid, "label": ""}
+    return view
+
+
 __all__ = ["SUBTASKS_READY", "SPLIT_JOB", "MAX_CHILDREN", "MIN_CHILDREN", "MAX_DEPTH",
            "fanout_ready", "subtasks_from", "child_goals", "aggregation_prompt",
            "campaign_id_for",
     "missing_slices", "merge_acceptance_checks", "campaigns_from_ledger",
     "collapse_retries", "ready_to_aggregate", "aggregation_goal",
+    "fanout_family_view",
 ]

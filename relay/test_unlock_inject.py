@@ -80,6 +80,15 @@ def main():
     # attempts run out. The test passed throughout. Assert the hand-off itself.
     check("preflight_job_names_the_token", "unlock_token" in (w.job or ""))
     check("preflight_job_says_to_pass_it", "渡して" in (w.job or ""))
+    # THE PASSWORD IS ALREADY IN THIS PROMPT -- DO NOT HUNT FOR IT. Workers read .env (and
+    # .env.example / .env.defaults.json / .unlock_state.json) looking for a password that the
+    # prefix already embeds via %s. The server refuses .env every time, so the hunt never ends:
+    # on 2026-09-07 one worker burned 11 turns on it and STUCK. The prefix must say the password
+    # is already here, must name .env as the file not to read, and must say read-only work needs
+    # no unlock at all. Assert the injected job carries that guidance.
+    check("preflight_job_says_password_is_here", ("探さない" in (w.job or "")) or ("探しに行かない" in (w.job or "")))
+    check("preflight_job_says_not_dot_env", ".env" in (w.job or ""))
+    check("preflight_job_says_readonly_no_unlock", "読み取り" in (w.job or ""))
 
     # A later locked reply (for example after backend IP rotation) still injects a bounded retry.
     w._decide(LOCKED)

@@ -97,8 +97,29 @@ def test_gate_banner_cannot_starve_the_window_of_its_scroller():
     assert "_gateScroll.Content = _gateCardsPanel;" in SOURCE
     assert "_gateBanner.Child = _gateScroll;" in SOURCE
     # ...re-capped every tick, in the units the banner is actually measured in.
-    assert "_gateScroll.MaxHeight = Math.Max(150, usable * 0.45);" in SOURCE
+    assert "_gateScroll.MaxHeight = _gateExpanded ? Math.Max(150, usable * 0.25) : 72;" in SOURCE
     assert "(ActualHeight > 0 ? ActualHeight : 760) / zoom" in SOURCE
+
+
+def test_gate_banner_opens_collapsed():
+    """Capping the height was not enough. The cap is a FRACTION of the window, so it
+    scales with it: at 0.45 the run list under the banner measured a few dozen px on a
+    760-tall window once the header, health strip and composer took their share, and
+    three pending Skill gates -- each with a question, a path, a digest and an
+    Approve/Deny row -- filled the screen on their own. Count was never the trigger;
+    three was enough. So the banner opens as ONE summary line carrying the count, and
+    renders cards only after the owner asks for them."""
+    # Collapsed is the initial state, not something restored from settings.
+    assert "bool _gateExpanded = false;" in SOURCE
+    # The count is on the summary line, so a glance answers "how many" without expanding.
+    assert '("承認待ち " + gates.Count + " 件 / Approval needed")' in SOURCE
+    # Collapsed, the method returns before building any card.
+    assert "if (!_gateExpanded)" in SOURCE
+    # The expand state is part of the render signature: without it the toggle flips a
+    # bool and the sig check returns before anything is redrawn.
+    assert '_gateExpanded ? "|open" : "|shut"' in SOURCE
+    # The toggle repaints immediately instead of waiting out the 700ms tick.
+    assert "if (_gateRootCache != null) UpdateGateBanner(_gateRootCache);" in SOURCE
 
 
 def test_gate_banner_shows_a_context_preview_not_the_whole_manifest():

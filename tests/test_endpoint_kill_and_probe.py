@@ -121,3 +121,47 @@ def test_data_must_be_a_list():
 
 def test_non_json_is_rejected():
     assert rc._looks_like_models_payload(b"<html>503</html>") is False
+
+
+# ---- the selector must not depend on the host OS --------------------------
+
+def test_the_selector_never_resolves_an_already_absolute_venv_path():
+    """THE REGRESSION THESE FIVE TESTS SAT ON. The selector folded the venv path with
+    os.path.normcase(os.path.abspath(...)). Off Windows, abspath treats "C:\...\python.exe"
+    as relative and prepends the cwd, and normcase lowercases nothing -- so every comparison
+    failed and _endpoint_pids returned [] for every row. The five tests above were red on the
+    Linux CI runner for as long as that line stood, under a module docstring claiming they run
+    there exactly as on Windows.
+
+    Asserting the OUTPUT alone cannot catch it here (this suite runs on Windows, where both
+    calls happen to be harmless), so assert the behaviour instead: a drive-letter path is
+    already absolute and must never be resolved against the cwd."""
+    calls = []
+    real_abspath = os.path.abspath
+
+    def spy(p):
+        calls.append(p)
+        return real_abspath(p)
+
+    os.path.abspath = spy
+    try:
+        rows = [(600, VENV + " -m relay.openai_endpoint_server")]
+        assert _endpoint(rows) == [600]
+    finally:
+        os.path.abspath = real_abspath
+    assert calls == [], "an absolute venv path was resolved against the cwd: %s" % calls
+
+
+def test_separators_and_case_are_folded_the_windows_way():
+    """The command lines are Windows command lines whichever OS reads them, so the folding
+    must be explicit rather than borrowed from the host's os.path."""
+    assert rc._win_norm("C:/Proj/.Venv/Scripts/Python.exe") == r"c:\proj\.venv\scripts\python.exe"
+    assert rc._looks_absolute(r"c:\proj\x") is True
+    assert rc._looks_absolute("\\\\host\\share\\x") is True
+    assert rc._looks_absolute(r"proj\x") is False
+
+
+def test_a_forward_slash_venv_path_still_matches_a_backslash_command_line():
+    """Same interpreter, written two ways. Folding separators is what makes them one."""
+    rows = [(610, VENV + " -m relay.openai_endpoint_server")]
+    assert _endpoint(rows, venv=VENV.replace("\\", "/")) == [610]
