@@ -17,6 +17,7 @@
 # =============================================================================
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -512,10 +513,19 @@ class LoadDotenvOverrideTests(unittest.TestCase):
             self.assertEqual(bootstrap.os.environ["MCP_TEST_KEY"], "from_dotenv")
 
 
+@unittest.skipUnless(os.name == "nt", "gen_env protects the generated secrets with DPAPI, "
+                                      "which exists only on Windows")
 class GenEnvBackfillsMissingSecretsTests(unittest.TestCase):
     """An existing .env that has LOST its required secrets must be repaired by gen_env, not
     left for step_verify to fail on forever. gen_env stays append-only: a secret that is
-    already present (even blank/placeholder) is the user's value and is never overwritten."""
+    already present (even blank/placeholder) is the user's value and is never overwritten.
+
+    SKIPPED OFF WINDOWS, AND RUN ON THE WINDOWS JOB INSTEAD. gen_env calls
+    tools.secret_store.protect_secret, which raises "DPAPI protection is only available on
+    Windows" -- so on the ubuntu runner these were not a failing assertion but a capability
+    that cannot exist there, and they were red for that reason alone. A skip on its own would
+    have retired the coverage silently, so ci.yml's windows-install-smoke job now runs this
+    file: skipping here is only honest because it runs somewhere."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -582,9 +592,13 @@ class GenEnvBackfillsMissingSecretsTests(unittest.TestCase):
             bootstrap.step_verify()  # must not raise StepError on the key check
 
 
+@unittest.skipUnless(os.name == "nt", "gen_env protects the generated secrets with DPAPI, "
+                                      "which exists only on Windows")
 class GenEnvFreshStillWritesSecretsTests(unittest.TestCase):
     """Guard the original path: when NO .env exists, gen_env still writes a fresh one carrying
-    both secrets. The backfill branch must not have cannibalised the create branch."""
+    both secrets. The backfill branch must not have cannibalised the create branch.
+
+    Windows-only for the same DPAPI reason as the class above."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

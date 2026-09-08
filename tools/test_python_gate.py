@@ -67,6 +67,12 @@ def test_shell_still_works():
 def test_bypass_skips_ask_but_never_contract_stop(monkeypatch, tmp_path):
     contract_path = tmp_path / "active_contract.json"
     monkeypatch.setattr(contract_gate, "_CONTRACT_FILE", contract_path)
+    # Own the gate's process-global "seen an active contract" memory too: reading an active
+    # contract below sets _SEEN["active_contract"] in place, and monkeypatch restores only the
+    # FILE. Without this the flag would leak to later tests, whose absent real contract file
+    # would then read as tampering and gate every shell_destructive op.
+    monkeypatch.setattr(contract_gate, "_SEEN",
+                        {"active_contract": False, "retired_via_api": False})
     monkeypatch.setattr(approval_policy, "current_approval_mode", lambda default=None: "bypass")
     contract_path.write_text(json.dumps({
         "active": True,

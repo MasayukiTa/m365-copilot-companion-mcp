@@ -271,6 +271,14 @@ def release_worktrees(insts):
     """
     if os.environ.get("SWE_KEEP_RESOLVED_WT") == "1" or not insts:
         return
+    # BOTH IMPORT FORMS -- run as `python bench/swe_run_until_done.py` (sys.path[0] is bench/)
+    # and imported as `bench.swe_run_until_done` from tests.
+    try:
+        from tools import coding_ops
+    except ImportError:
+        sys.path.insert(0, REPO)
+        from tools import coding_ops
+    import pathlib
     freed = 0
     for inst in insts:
         wt = os.path.join(WORK, "wt_" + inst)
@@ -279,9 +287,20 @@ def release_worktrees(insts):
         main = os.path.join(WORK, repo_key(inst) + "-main")
         try:
             if os.path.isdir(os.path.join(main, ".git")):
-                # `git worktree remove` drops the checkout AND its registration in one step.
-                subprocess.run(["git", "-C", main, "worktree", "remove", wt, "--force"],
-                               capture_output=True, text=True)
+                # THE SAME TEARDOWN PATH pro_capture/pro_cycle use: `git worktree remove
+                # --force` first so git drops both the checkout and its registration, then a
+                # guarded rmtree fallback that runs ONLY for a proven linked worktree, then
+                # prune. Going straight to rmtree leaves a husk whose `.git` still points at the
+                # shared object store. Gate-free `_worktree_teardown` because this batch runs as
+                # its own process with no unlock/contract context; `shared` is computed the same
+                # way the gated path does and the fallback never runs unless it is False.
+                wt_p = pathlib.Path(wt)
+                main_p = pathlib.Path(main)
+                shared = coding_ops._resolves_into_common_dir(wt_p, main_p)
+                if shared is True:
+                    log("skip release %s: resolves to the shared working tree" % inst)
+                    continue
+                coding_ops._worktree_teardown(wt_p, main_p, shared, prune=True)
             if os.path.isdir(wt):  # fallback if not a registered worktree (or remove failed)
                 shutil.rmtree(wt, ignore_errors=True)
             if not os.path.isdir(wt):
