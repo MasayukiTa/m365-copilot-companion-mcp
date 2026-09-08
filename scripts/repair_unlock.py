@@ -18,7 +18,7 @@ another chance for it to be split or de-escaped.
 
 Output on stdout, one line, ASCII:
     noop:<reason>          nothing needed doing
-    repaired:<password>    a new password was established; this is it
+    repaired:<note>        a new password was established and written to .env
     failed:<reason>        it needed doing and could not be done
 """
 from __future__ import annotations
@@ -52,13 +52,17 @@ def main() -> int:
         print("noop:%s" % reason)
         return 0
 
-    password = str(result.get("password") or "")
-    if password:
-        print("repaired:%s" % password)
+    # DO NOT PRINT THE VALUE. repair_unlock_password() has already written the new password to
+    # .env in its protected form, so the cleartext does not need to travel back over stdout. This
+    # stream is captured by scripts/start_all.ps1 and can reach logs, and the repository is
+    # public. Emit only the non-secret fact that the repair happened, keeping the "repaired:"
+    # prefix so start_all.ps1's ^(noop|repaired|failed|error): match still holds.
+    if result.get("password"):
+        print("repaired:the new unlock password was written to .env")
     else:
-        # Acted but produced no password to hand over: report it rather than let the operator
-        # believe the value they brought with them still works.
-        print("failed:repaired but the new password was not returned")
+        # Acted but produced no password: the repair did not actually complete. Report it rather
+        # than let the operator believe the value they brought with them still works.
+        print("failed:repaired but the new password was not established")
     return 0
 
 
