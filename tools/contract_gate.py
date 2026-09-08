@@ -669,10 +669,19 @@ def check_op(op_class: str, detail: str = "") -> Optional[str]:
             _create_gate(token,
                          "契約状態が信用できないため、この操作の承認を求めます: %s" % suspect,
                          "op_class=%s detail=%s" % (op_class, detail[:400]))
+        # NAME THE WAY OUT. This said only "until the state recovers or a human approves"
+        # and never said how the state recovers, and the state is two files whose names
+        # appear nowhere the reader can see. Meanwhile every gated op opens its own approval,
+        # so a suspicion nobody knows how to clear becomes a queue nobody can drain: 308 of
+        # them accumulated behind exactly this message on 2026-09-08 and stalled the fleet
+        # for close to three hours.
         return ("[契約状態が不正 / policy state untrusted] %s。"
                 "危険と判定された操作は、状態が回復するか人が承認するまで実行されません。"
+                "状態を戻すには、契約ファイル %s を復元するか、正規に終了させて（deactivate_contract）"
+                "%s に終了記録を残してください。契約が二度と使われないなら %s を削除すれば"
+                "「有効な契約を見たことがある」という記録自体が消えます。"
                 " / The policy state could not be trusted, so this operation was NOT executed."
-                % suspect)
+                % (suspect, _CONTRACT_FILE, _retired_file(), _seen_file()))
 
     # ── INERT guard: no contract or not active ──────────────────────────────
     contract = load_contract()
