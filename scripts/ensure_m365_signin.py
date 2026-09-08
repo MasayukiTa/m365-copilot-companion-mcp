@@ -149,7 +149,34 @@ def main(argv=None):
     print("      remembered afterwards -- you will not be asked again on this machine.")
     print("")
 
-    deadline = time.time() + a.timeout
+    # EVERY surface() NEEDS A PAIRED REHIDE, and this one had none. relay/edge_auth.py states the
+    # rule and names where it was learned: bridge/copilot_bridge.py's surface() was
+    # fire-and-forget and left the window up. So was this one -- on success and on timeout alike
+    # it returned straight out, leaving a headed companion Edge on screen and in the taskbar
+    # until something else happened to hide it.
+    #
+    # That is what the operator sees as "an about:blank tab appears now and then": surface()
+    # kills a headless instance and relaunches it HEADED, which starts on about:blank before it
+    # navigates, and nothing put it back afterwards. It is rare because it fires only when the
+    # check reports a real sign-in wall (start_all.ps1 escalates on exit 1 and nothing else), so
+    # it will not reproduce on demand -- three hours of window-state sampling caught nothing.
+    #
+    # AFTER the wait, never during: hiding the window while somebody is typing an MFA code is
+    # the other way to get this wrong.
+    try:
+        return _wait_for_signin(a, edge_recover, deadline_s=a.timeout)
+    finally:
+        try:
+            edge_recover.rehide(port=a.port)
+        except Exception:
+            pass
+
+
+def _wait_for_signin(a, edge_recover, deadline_s):
+    """Poll until signed in, or until the deadline. Split out so the caller can guarantee the
+    window is put back on EVERY exit path -- including the early `return 0` on success, which is
+    the path that actually ran."""
+    deadline = time.time() + deadline_s
     last = ""
     while time.time() < deadline:
         # Keeps the background keeper backing off while the login page is up; its age check
