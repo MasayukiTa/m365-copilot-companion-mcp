@@ -58,6 +58,7 @@ makes the judge worth having. Recorded here rather than half-built.
 """
 from __future__ import annotations
 
+import json
 import os
 from typing import Callable, Optional
 
