@@ -70,6 +70,7 @@ from relay.relay_fleet import (  # noqa: E402
 )
 from relay.copilot_autopilot_relay import default_notify  # noqa: E402
 from relay.refuter import PANEL_LENSES  # noqa: E402
+from relay.fanout import fanout_family_view  # noqa: E402
 
 
 # ── COORDINATOR OUTPUT CAPTURE (TEE) ────────────────────────────────────────────
@@ -157,6 +158,83 @@ STATUS_PILL = {
     "fresh_replay": ("新規会話", "good"),
     "content_refused": ("内容拒否", "bad"),
 }
+
+def merge_conv_rows(existing, entries, now=None):
+    """Merge fleet conversation rows into the shared registry. PURE: list in, list out.
+
+    Lives at module level, not inside _register_convs, because the version that lived in the
+    closure could not be tested and was wrong in two ways for an unknown length of time:
+
+      (1) It registered a worker ONLY once `conv_url` was known (`if u and ...`), so a worker
+          whose url had not been captured yet produced no row at all -- while its transcript
+          was already on disk and growing. Measured 2026-09-08: two runs writing 71KB and 86KB
+          of transcript at 13:47-13:48, and the newest fleet row in the file was from 10:19.
+      (2) When a run reused a conversation url already present, `u not in urls` skipped it, so
+          the row kept the PREVIOUS run's transcript path. Transcripts are keyed
+          `<run_id>_<name>` exactly because w0 is reused across runs, so the stale pointer was
+          not an older version of the same conversation -- it was a different one. Opening the
+          row in the chat showed an empty conversation while the work was running.
+
+    `existing` -- rows read from conversations.json; non-dict items are dropped, foreign rows
+    (other sources, e.g. the bridge's "chat" rows) are preserved untouched.
+    `entries`  -- desired rows in the registry's shape. Matched to an existing row by "url"
+    first, then by "transcript"; a match is UPDATED IN PLACE, otherwise the row is appended.
+
+    On update only the pointer fields move (transcript / name / url-once-known). The title is
+    deliberately NOT recomputed: it is how the owner recognises the row in the sidebar, and
+    rewriting it on every tick would rename rows under the cursor. "ts" is stamped only when
+    something actually changed, for the same reason -- it orders the sidebar.
+
+    Returns (rows, changed) so the caller can skip the write when nothing moved."""
+    rows = [e for e in (existing or []) if isinstance(e, dict)]
+    changed = len(rows) != len(existing or [])   # dropping a corrupt row is itself a change
+    by_url, by_tr = {}, {}
+    for idx, e in enumerate(rows):
+        u0 = e.get("url") or ""
+        if u0:
+            by_url[u0] = idx
+        t0 = e.get("transcript") or ""
+        if t0:
+            by_tr[t0] = idx
+    for entry in (entries or []):
+        if not isinstance(entry, dict):
+            continue
+        u = entry.get("url") or ""
+        tr = entry.get("transcript") or ""
+        if not u and not tr:
+            continue   # nothing to point at yet; a later tick will carry one
+        hit = by_url.get(u) if u else None
+        if hit is None and tr:
+            hit = by_tr.get(tr)
+        if hit is not None:
+            row = rows[hit]
+            fresh = {}
+            if tr and row.get("transcript") != tr:
+                fresh["transcript"] = tr
+            nm = entry.get("name") or ""
+            if nm and row.get("name") != nm:
+                fresh["name"] = nm
+            if u and not row.get("url"):
+                fresh["url"] = u     # the url arrived after the row was made from a transcript
+            if fresh:
+                row.update(fresh)
+                row["ts"] = time.time() if now is None else now
+                if tr:
+                    by_tr[tr] = hit
+                if u:
+                    by_url[u] = hit
+                changed = True
+            continue
+        row = dict(entry)
+        row.setdefault("ts", time.time() if now is None else now)
+        rows.append(row)
+        if u:
+            by_url[u] = len(rows) - 1
+        if tr:
+            by_tr[tr] = len(rows) - 1
+        changed = True
+    return rows, changed
+
 
 def report_unused_steers(workers, reported=None, log=None):
     """Name every steering message a worker took to its grave.
@@ -896,7 +974,7 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
     # shows as up to 3 tabs. Falls back to the main-tab count if tab_load isn't available.
     open_tabs = sum((w.tab_load() if hasattr(w, "tab_load") else
                      (1 if getattr(w, "page", None) is not None else 0)) for w in workers)
-    return {
+    _snap = {
         "started": started,
         "updated": time.time(),
         "total": total,
@@ -980,6 +1058,7 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
             "campaign_id": getattr(getattr(w, "task_envelope", None), "campaign_id", ""),
             "role": getattr(getattr(w, "task_envelope", None), "role", ""),
             "depth": getattr(getattr(w, "task_envelope", None), "depth", 0),
+            "subtask_index": getattr(w, "subtask_index", None),
             "goal_hash": getattr(w, "original_goal_hash", ""),
             "fresh_replay_count": getattr(w, "fresh_replay_count", 0),
             "refusal_count": getattr(w, "refusal_count", 0),
@@ -998,6 +1077,12 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         # Set {"answered": true, "answer": "denied"}    to deny
         "pending_gates": _pending_gates(started=started),
     }
+    # Derived fan-out family markers (parent / child / aggregator / stalled) so the
+    # cockpit can render the split-and-merge structure the lineage already implies.
+    _fv = fanout_family_view(_snap["workers"])
+    for _w in _snap["workers"]:
+        _w["fanout"] = _fv.get(_w["name"], {"kind": "solo", "campaign_id": _w.get("campaign_id", ""), "label": ""})
+    return _snap
 
 
 def _write_atomic(path, payload):
@@ -1998,8 +2083,12 @@ def main():
     convs_path = os.path.join(args.state_dir, "conversations.json")
 
     def _register_convs(workers):
-        # session-shared conversation registry: every fleet conversation is added so the
-        # native chat can list/read/delete it too (and vice versa). Dedup by url.
+        """Keep the shared conversation registry pointing at THIS run's transcripts.
+
+        The merge itself is merge_conv_rows() at module level -- see the two defects recorded
+        there. This closure's only job is to turn live workers into registry rows: read the
+        file, build one entry per worker, merge, and write only when something moved.
+        Exception-swallowing on purpose: a registry hiccup must never stall the fleet."""
         try:
             existing = []
             if os.path.isfile(convs_path):
@@ -2007,43 +2096,45 @@ def main():
                     existing = json.load(open(convs_path, encoding="utf-8-sig"))  # tolerate C# BOM
                 except Exception:
                     existing = []
-            urls = set(e.get("url") for e in existing if isinstance(e, dict))
-            changed = False
+            entries = []
             for w in workers:
-                u = getattr(w, "conv_url", "")
-                if u and u not in urls:
-                    # THE GOAL, NOT COPILOT'S TITLE. This line preferred `conv_title` and fell
-                    # back to the goal, and Copilot names a conversation from the opening of the
-                    # first message it receives -- which is PROTOCOL, ~1,400 characters shared by
-                    # every task. Measured across 424 stored conversations: 174 named after a
-                    # prompt preamble, 48 "Microsoft Copilot", 39 after the output-discipline
-                    # block. 213 of 424 identical to rows they have nothing to do with, and the
-                    # goal that would have identified each one was sitting right here.
-                    #
-                    # Copilot's own title is kept beside it rather than discarded: it is the
-                    # source record, and a derived value should never overwrite one.
-                    _copilot = (getattr(w, "conv_title", "") or "")[:120]
-                    try:
-                        from relay import conv_title as _ct
-                        title = _ct.make_title(w.goal or "", existing=_copilot, key=u,
-                                               when=time.time())
-                        _tsrc = _ct.SOURCE
-                    except Exception:
-                        title = (w.goal or _copilot or "")[:60]
-                        _tsrc = "fallback"
-                    existing.append({"url": u, "title": title, "source": "fleet",
-                                     "title_source": _tsrc, "copilot_title": _copilot,
-                                     # carry the disk transcript path + worker name so the chat
-                                     # opens this conversation straight from the .jsonl -- no live
-                                     # re-scrape (which fails for any conv whose agent the bridge
-                                     # is not currently connected to).
-                                     "transcript": getattr(w, "transcript", "") or "",
-                                     "name": getattr(w, "name", ""), "ts": time.time()})
-                    urls.add(u); changed = True
+                u = getattr(w, "conv_url", "") or ""
+                tr = getattr(w, "transcript", "") or ""
+                if not u and not tr:
+                    continue
+                # THE GOAL, NOT COPILOT'S TITLE. This line preferred `conv_title` and fell
+                # back to the goal, and Copilot names a conversation from the opening of the
+                # first message it receives -- which is PROTOCOL, ~1,400 characters shared by
+                # every task. Measured across 424 stored conversations: 174 named after a
+                # prompt preamble, 48 "Microsoft Copilot", 39 after the output-discipline
+                # block. 213 of 424 identical to rows they have nothing to do with, and the
+                # goal that would have identified each one was sitting right here.
+                #
+                # Copilot's own title is kept beside it rather than discarded: it is the
+                # source record, and a derived value should never overwrite one.
+                _copilot = (getattr(w, "conv_title", "") or "")[:120]
+                try:
+                    from relay import conv_title as _ct
+                    title = _ct.make_title(w.goal or "", existing=_copilot, key=(u or tr),
+                                           when=time.time())
+                    _tsrc = _ct.SOURCE
+                except Exception:
+                    title = (w.goal or _copilot or "")[:60]
+                    _tsrc = "fallback"
+                entries.append({"url": u, "title": title, "source": "fleet",
+                                "title_source": _tsrc, "copilot_title": _copilot,
+                                # carry the disk transcript path + worker name so the chat
+                                # opens this conversation straight from the .jsonl -- no live
+                                # re-scrape (which fails for any conv whose agent the bridge
+                                # is not currently connected to).
+                                "transcript": tr,
+                                "name": getattr(w, "name", ""), "ts": time.time()})
+            merged, changed = merge_conv_rows(existing, entries)
             if changed:
-                _write_atomic(convs_path, existing)
+                _write_atomic(convs_path, merged)
         except Exception:
             pass
+
 
     _steer_reported = set()
 
@@ -2410,6 +2501,9 @@ def main():
              # FIX 3 (P2): also carry run_label / goal_count into the final snapshot.
              "run_label": run_label, "goal_count": goal_count,
              "workers": [_final_worker_entry(r, args.max_turns) for r in results]}
+    _ffv = fanout_family_view(final["workers"])
+    for _fw in final["workers"]:
+        _fw["fanout"] = _ffv.get(_fw["name"], {"kind": "solo", "campaign_id": _fw.get("campaign_id", ""), "label": ""})
     _write_atomic(status_path, final)
     # RUN-RESUME: write the FINAL completion map from the true per-goal outcomes (the
     # on_tick map may miss a worker that reached DONE on the very last sweep). A later
