@@ -88,6 +88,7 @@ jobs:
             tools/test_fleet_intake.py \
             tests/test_security_state_is_not_readable.py \
             tests/test_git_shared_guard.py \
+            tests/test_dedicated_root_guard.py \
             tests/test_unlock_token.py \
             tests/test_exec_via_gateway.py \
             tests/test_tool_map_pinning.py \
