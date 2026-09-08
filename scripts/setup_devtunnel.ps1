@@ -129,6 +129,55 @@ function Test-IdentifyingTunnelName([string]$name) {
 # instead of silently swallowed.
 $script:DtWarnings = @()
 
+# --- 0. a URL this machine did not mint must not survive a failed run -------------------------
+# A devtunnel URL is reachable only while a machine HOSTS that tunnel, so it is a fact about a
+# machine -- and .env is carried to the new PC, which is how a new machine is normally set up.
+# Sixteen `exit 1` paths lie between here and the block that rewrites .env, and the first ones
+# are "CLI not installed" and "not signed in", which is precisely the state a fresh PC is in.
+# So on that machine the inherited URL survived the failed run intact, quickstart's
+# `findstr MCP_TUNNEL_URL=..*` gate saw a non-empty value and let the operator continue, and
+# copilot_studio_values.ps1 printed the old machine's address to paste into Copilot Studio.
+# Reported from a real new-PC setup, 2026-09-08.
+#
+# It is COMMENTED OUT, not deleted: an install predating MCP_TUNNEL_HOST has no stamp and is
+# indistinguishable from an inherited one, and blanking a URL that machine legitimately owns
+# would cost it a working connector if this run then fails. The commented line keeps the value
+# readable while making the readiness gate correctly report "not ready".
+try {
+    $envPath1 = Join-Path $root ".env"
+    if (Test-Path $envPath1) {
+        $envLines1 = @(Get-Content $envPath1 -Encoding UTF8)
+        $urlLine   = $envLines1 | Where-Object { $_ -match '^MCP_TUNNEL_URL=..*' } | Select-Object -First 1
+        $hostLine  = $envLines1 | Where-Object { $_ -match '^MCP_TUNNEL_HOST=(.+)$' } | Select-Object -First 1
+        $recorded  = ""
+        if ($hostLine -match '^MCP_TUNNEL_HOST=(.+)$') { $recorded = $matches[1].Trim().ToLower() }
+        $me = ("$env:COMPUTERNAME").ToLower()
+        if ($urlLine -and $recorded -ne $me) {
+            if ($recorded) {
+                Write-Host "[0/4] .env holds a tunnel URL minted on '$recorded', not this machine ('$me')."
+            } else {
+                Write-Host "[0/4] .env holds a tunnel URL with no record of which machine minted it."
+            }
+            Write-Host "      That address is not reachable unless this machine hosts that tunnel, so it is"
+            Write-Host "      set aside (kept as a comment) until this run records one for this machine."
+            $rewritten = @()
+            foreach ($ln in $envLines1) {
+                if ($ln -match '^MCP_TUNNEL_URL=..*') {
+                    $rewritten += "# set aside by setup_devtunnel.ps1: minted elsewhere, not valid on this machine"
+                    $rewritten += ("# " + $ln)
+                } else {
+                    $rewritten += $ln
+                }
+            }
+            # No-BOM UTF-8: ASCII would drop non-ASCII lines to '?', and PS 5.1's -Encoding UTF8
+            # emits a BOM that breaks the .env parser.
+            [IO.File]::WriteAllLines($envPath1, $rewritten, (New-Object System.Text.UTF8Encoding($false)))
+        }
+    }
+} catch {
+    Write-Host "[0/4] WARN: could not check whether .env's tunnel URL belongs to this machine: $($_.Exception.Message)"
+}
+
 # --- 1. ensure the CLI is installed ----------------------------------------------------------
 if (-not (Get-Command devtunnel -ErrorAction SilentlyContinue)) {
     Write-Host "[1/4] devtunnel CLI not found."
