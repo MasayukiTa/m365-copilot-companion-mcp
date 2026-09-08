@@ -853,20 +853,19 @@ function Invoke-Startup {
                 } | Select-Object -Last 1)
             }
             if ($repair -like "repaired:*") {
-                # THE OPERATOR HAS TO BE TOLD. The repair generates a NEW password, so the one
-                # they wrote down on the machine that produced this .env no longer works here --
-                # and nothing used to say so. Printed to the console only, in the same place
-                # quickstart prints the other secrets; not written to any log.
-                $newPw = $repair.Substring("repaired:".Length)
+                # THE OPERATOR HAS TO BE TOLD, BUT NOT THE VALUE. The repair generates a NEW
+                # password and writes it to .env itself; repair_unlock.py deliberately no longer
+                # returns the cleartext, because this stdout is captured here and can reach logs,
+                # and the repo is public. So we announce that it changed and point at how to read
+                # it, rather than echoing a secret. $repair now carries only a non-secret note.
                 Write-Host ""
                 Write-Host "  ============================================================"
                 Write-Host "  The unlock password could not be decrypted by this Windows"
-                Write-Host "  account, so a NEW one was established for this machine:"
+                Write-Host "  account, so a NEW one was established and written to .env."
                 Write-Host ""
-                Write-Host ("      " + $newPw)
-                Write-Host ""
-                Write-Host "  Write this down. Any password you brought from another PC no"
-                Write-Host "  longer works here. (The fleet and bridge unlock themselves.)"
+                Write-Host "  Any password you brought from another PC no longer works here."
+                Write-Host "  Read the new value with: scripts\copilot_studio_values.ps1"
+                Write-Host "  (The fleet and bridge unlock themselves.)"
                 Write-Host "  ============================================================"
                 Write-Host ""
             } elseif ($repair -like "failed:*") {
