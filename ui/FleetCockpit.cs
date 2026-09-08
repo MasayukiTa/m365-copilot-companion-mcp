@@ -1496,7 +1496,7 @@ class CockpitWindow : Window
         _list = new ListBox();
         _list.BorderThickness = new Thickness(0);
         _list.Background = Brushes.Transparent;
-        _list.Padding = new Thickness(16, 6, 16, 18);  // bottom clears the composer DropShadow (BlurRadius 14 + ShadowDepth 2 ≈ 12px) so the last row is not overlapped by the shadow
+        _list.Padding = new Thickness(16, 6, 16, 20);  // bottom clears the composer DropShadow (BlurRadius 14 + ShadowDepth 2 ≈ 12px) so the last row is not overlapped by the shadow. 20, not 18: the spacing scale steps in fours above the optical range, and 18 was the only value off it.
         ScrollViewer.SetVerticalScrollBarVisibility(_list, ScrollBarVisibility.Auto);
         ScrollViewer.SetHorizontalScrollBarVisibility(_list, ScrollBarVisibility.Disabled);
         // Pixel scroll (not item scroll) so the list can SIZE TO CONTENT inside an Auto row and
@@ -7559,6 +7559,13 @@ class CockpitWindow : Window
     ScrollViewer _gateScroll;           // bounds the banner so it cannot starve the rest of the window
     StackPanel _gateCardsPanel;         // holds one card per pending gate (or first gate + count)
     string _gateSig = "";               // last rendered gate set (by token); rebuild only on change
+    // COLLAPSED BY DEFAULT. Expanded, three Skill cards -- each carrying a question, a path, a
+    // digest and an Approve/Deny row -- measured taller than the run list they sit above, so the
+    // window was mostly approval and the work underneath was unreadable. Capping the height was
+    // not enough: the cap is a fraction of the window, so it scales with it and still crowds out
+    // the list. The banner now opens as one summary line and shows cards only when asked.
+    bool _gateExpanded = false;
+    Dictionary<string, object> _gateRootCache;   // so the toggle can repaint without waiting a tick
 
     // RAM admission headroom (mirrors relay_fleet.auto_concurrency headroom_mb=2048): when free
     // physical RAM is around/under this the runner can't open another tab. We additionally surface
@@ -7870,6 +7877,7 @@ class CockpitWindow : Window
     void UpdateGateBanner(Dictionary<string, object> root)
     {
         if (_gateBanner == null || _gateCardsPanel == null) return;
+        _gateRootCache = root;
 
         // Read the durable gate directory directly.  This is deliberately independent of
         // status.json so Skill/import approvals remain visible before and after a fleet run.
@@ -7883,7 +7891,10 @@ class CockpitWindow : Window
         {
             double zoom = (_rootScale != null && _rootScale.ScaleY > 0.1) ? _rootScale.ScaleY : 1.0;
             double usable = (ActualHeight > 0 ? ActualHeight : 760) / zoom;
-            _gateScroll.MaxHeight = Math.Max(150, usable * 0.45);
+            // Collapsed the banner is a single summary line, so it needs no fraction of the
+            // window at all. Expanded, a quarter -- 0.45 left the run list at a few dozen px on
+            // a 760-tall window once the header, health strip and composer took their share.
+            _gateScroll.MaxHeight = _gateExpanded ? Math.Max(150, usable * 0.25) : 72;
         }
         if (_approvalCenterWindow != null && _approvalCenterWindow.IsVisible)
             RefreshApprovalCenter();
@@ -7891,6 +7902,9 @@ class CockpitWindow : Window
         // Build a signature from the current token set (order-insensitive for stability).
         var sb2 = new StringBuilder();
         foreach (var g in gates) sb2.Append(S(g, "token")).Append(';');
+        // The expand state is part of what is rendered, so it belongs in the signature -- without
+        // it the toggle changes a bool and the sig check returns before anything is redrawn.
+        sb2.Append(_gateExpanded ? "|open" : "|shut");
         string newSig = sb2.ToString();
         if (newSig == _gateSig) return;   // nothing changed; skip rebuild to avoid flicker
         _gateSig = newSig;
@@ -7903,17 +7917,64 @@ class CockpitWindow : Window
             return;
         }
 
-        // Heading row: "承認が必要です / Approval needed"  (amber/warning, not red/error)
+        // Heading row: a single line carrying the count and the expand toggle. Collapsed, this row
+        // IS the whole banner -- the count is what the owner needs at a glance, and the cards are
+        // one click away either here or in the Approval Center.
         bool ja3 = _lang == 0;
+        var headRow = new StackPanel();
+        headRow.Orientation = Orientation.Horizontal;
+        headRow.Margin = new Thickness(0, 0, 0, _gateExpanded ? 8 : 0);
+
         var headTb = new TextBlock();
         headTb.Text = ja3
-            ? "承認が必要です / Approval needed"
-            : "Approval needed / 承認が必要です";
+            ? ("承認待ち " + gates.Count + " 件 / Approval needed")
+            : ("Approval needed: " + gates.Count + " / 承認待ち");
         headTb.FontSize = 13;
         headTb.FontWeight = FontWeights.SemiBold;
         headTb.Foreground = Theme.Br(Theme.Warning(_dark));
-        headTb.Margin = new Thickness(0, 0, 0, 8);
-        _gateCardsPanel.Children.Add(headTb);
+        headTb.VerticalAlignment = VerticalAlignment.Center;
+        headRow.Children.Add(headTb);
+
+        var toggleBtn = new Button();
+        toggleBtn.Cursor = Cursors.Hand;
+        toggleBtn.FontSize = 11;
+        toggleBtn.BorderThickness = new Thickness(0);
+        toggleBtn.Background = Brushes.Transparent;
+        toggleBtn.Foreground = Theme.Br(Theme.Warning(_dark));
+        toggleBtn.Padding = new Thickness(0);
+        toggleBtn.Margin = new Thickness(12, 0, 0, 0);
+        toggleBtn.VerticalAlignment = VerticalAlignment.Center;
+        toggleBtn.Content = _gateExpanded ? (ja3 ? "たたむ" : "Collapse") : (ja3 ? "開く" : "Expand");
+        toggleBtn.Click += delegate (object s3, RoutedEventArgs e3)
+        {
+            e3.Handled = true;
+            _gateExpanded = !_gateExpanded;
+            // Repaint now rather than on the next 700ms tick, so the click feels like it did
+            // something. The cached root is the one this method was last called with.
+            if (_gateRootCache != null) UpdateGateBanner(_gateRootCache);
+        };
+        headRow.Children.Add(toggleBtn);
+
+        var centerBtn = new Button();
+        centerBtn.Cursor = Cursors.Hand;
+        centerBtn.FontSize = 11;
+        centerBtn.BorderThickness = new Thickness(0);
+        centerBtn.Background = Brushes.Transparent;
+        centerBtn.Foreground = Theme.Br(Theme.Muted(_dark));
+        centerBtn.Padding = new Thickness(0);
+        centerBtn.Margin = new Thickness(12, 0, 0, 0);
+        centerBtn.VerticalAlignment = VerticalAlignment.Center;
+        centerBtn.Content = ja3 ? "承認センター" : "Approval Center";
+        centerBtn.Click += delegate (object s3, RoutedEventArgs e3) { e3.Handled = true; ShowApprovalCenter(); };
+        headRow.Children.Add(centerBtn);
+
+        _gateCardsPanel.Children.Add(headRow);
+
+        if (!_gateExpanded)
+        {
+            _gateBanner.Visibility = Visibility.Visible;
+            return;
+        }
 
         // Show first gate (or all). If more than 1, show a count note below.
         int showCount = gates.Count > 3 ? 3 : gates.Count;
