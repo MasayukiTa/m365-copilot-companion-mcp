@@ -124,6 +124,38 @@ NON_IDENTIFYING_USERS = {"public", "default", "defaultuser", "example", "test", 
                          "<user>", "<home>", "<you>", "<name>",
                          "...", "\\...", "x", "me"}
 
+#: A GitHub noreply commit author, which is the SAFE form this repository standardises on:
+#: every commit is authored as <N>+<name>@users.noreply.github.com, so this address is the
+#: absence of a leak, not an instance of one. The employee-id shape starts with a letter and
+#: the home-path shape needs a Users/ path, so neither fires on the numeric id or the address
+#: on its own; but a configured name that happens to be a substring of the account handle would.
+#: A metadata string is cleared of any noreply address before the shaped/name checks run, so the
+#: canonical form is never the thing that trips the guard the commit metadata was added to feed.
+_NOREPLY = re.compile(r"\b[0-9]*\+?[A-Za-z0-9._-]+@users\.noreply\.github\.com\b", re.I)
+
+
+def scan_text(text, name_re=None):
+    """The one place the three checks are applied to a string, so a file LINE and a commit's
+    author/committer/message are judged by the same rules and no fourth rule is invented.
+
+    Returns the label of the first check that fires, or None. HOME_SHAPE is exempted for the
+    placeholder segments exactly as the file loop does, because the two callers must agree.
+    """
+    text = text or ""
+    for what, pattern in (("employee-id shape", ID_SHAPE),
+                          ("home directory path", HOME_SHAPE),
+                          ("configured name", name_re)):
+        if pattern is None:
+            continue
+        m = pattern.search(text)
+        if not m:
+            continue
+        if pattern is HOME_SHAPE and m.group(1).lower() in NON_IDENTIFYING_USERS:
+            continue
+        return what
+    return None
+
+
 #: This file, which describes the check, and .gitignore, which has to name what it ignores.
 ALLOWED = {".gitignore", "scripts/check_no_identifying_names.py"}
 
@@ -226,25 +258,79 @@ def offences(repo=".", names=None):
                                       "stopped after %d hits in this file"
                                       % MAX_HITS_PER_FILE))
                         break
-                    for what, pattern in (("employee-id shape", ID_SHAPE),
-                                          ("home directory path", HOME_SHAPE),
-                                          ("configured name", name_re)):
-                        if pattern is None:
-                            continue
-                        m = pattern.search(line)
-                        if not m:
-                            continue
-                        if (pattern is HOME_SHAPE
-                                and m.group(1).lower() in NON_IDENTIFYING_USERS):
-                            continue
-                        found.append((rel, what, n, line.strip()[:120]))
+                    label = scan_text(line, name_re)
+                    if label is not None:
+                        found.append((rel, label, n, line.strip()[:120]))
                         hits_here += 1
-                        break          # one label per LINE; the next line is still checked
         except OSError as exc:
             # NOT SKIPPED SILENTLY. A file the check could not read is a file it cannot
             # vouch for, and the whole point of this script is that "we did not look" must
             # never come out looking like "we looked and it was fine".
             found.append((rel, "unreadable, so unchecked", 0, str(exc)[:100]))
+    return found
+
+
+#: How far back to look when no range is given. A checker wired into CI runs on a push, so the
+#: commits at risk are the ones this push introduces over main; when that base cannot be found
+#: (a fresh clone, a detached run) the tip commit is still worth checking rather than nothing.
+def _commit_range(repo):
+    for base in ("origin/main", "main"):
+        rev = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "-q", base],
+                             capture_output=True, text=True)
+        if rev.returncode == 0:
+            head = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "-q", "HEAD"],
+                                  capture_output=True, text=True)
+            # HEAD may already BE the base (checked out main with nothing ahead). Comparing a
+            # ref to itself yields no commits, which is the honest answer, not an error.
+            if head.returncode == 0 and head.stdout.strip() == rev.stdout.strip():
+                return "HEAD~1..HEAD"
+            return "%s..HEAD" % base
+    return "HEAD"
+
+
+def commit_metadata_offences(repo=".", names=None, rev_range=None):
+    """[(rev, field, 0, value)] for every commit whose author/committer/message identifies
+    someone. A grep of tracked FILES cannot see this: the leak that prompted it rode in the
+    commit's author line, not in any file. The same three checks run here, via scan_text, with
+    no new rule -- the only addition is that the repository's own noreply address is stripped
+    first, so the safe canonical form is never the thing that fails.
+    """
+    names = configured_names(repo) if names is None else names
+    name_re = (re.compile("|".join(re.escape(n) for n in names), re.I)) if names else None
+    if rev_range is None:
+        # No commits yet (git init with nothing committed) means no metadata to leak. That is
+        # an empty result, not a failure -- HEAD does not resolve, and asking git to log it
+        # would raise, turning a benign state into CHECK COULD NOT RUN.
+        head = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "-q", "HEAD"],
+                              capture_output=True, text=True)
+        if head.returncode != 0:
+            return []
+        rng = _commit_range(repo)
+    else:
+        rng = rev_range
+    # A record separator no field can contain lets author name, email, committer name, email
+    # and subject be read back unambiguously even when a name legitimately contains spaces.
+    fmt = "%H%x1f%an%x1f%ae%x1f%cn%x1f%ce%x1f%s"
+    out = subprocess.run(["git", "-C", repo, "log", "--no-color", "--format=" + fmt, rng],
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        raise CheckFailed("git log failed for range %s in %s: %s"
+                          % (rng, repo, (out.stderr or "").strip()[:200]))
+    found = []
+    for row in out.stdout.splitlines():
+        if not row.strip():
+            continue
+        parts = row.split("\x1f")
+        if len(parts) != 6:
+            continue
+        rev, an, ae, cn, ce, subject = parts
+        for field, value in (("author name", an), ("author email", ae),
+                             ("committer name", cn), ("committer email", ce),
+                             ("commit message", subject)):
+            cleaned = _NOREPLY.sub(" ", value)
+            label = scan_text(cleaned, name_re)
+            if label is not None:
+                found.append((rev[:12], "%s: %s" % (field, label), 0, value[:120]))
     return found
 
 
@@ -257,6 +343,7 @@ def main(argv=None) -> int:
 
     try:
         found = offences(repo)
+        meta = commit_metadata_offences(repo, names=names)
     except CheckFailed as exc:
         print("CHECK COULD NOT RUN: %s" % exc)
         return 2
@@ -274,14 +361,19 @@ def main(argv=None) -> int:
                   "result.")
             return 2
 
-    if not found:
+    if not found and not meta:
         print("nothing identifying in %d tracked files (%d configured name(s))"
               % (len(tracked_files(repo)), len(names)))
         return 0
 
-    print("IDENTIFYING CONTENT IN TRACKED FILES (%d):" % len(found))
-    for rel, what, n, line in found:
-        print("  %s:%d  [%s]  %s" % (rel, n, what, line))
+    if found:
+        print("IDENTIFYING CONTENT IN TRACKED FILES (%d):" % len(found))
+        for rel, what, n, line in found:
+            print("  %s:%d  [%s]  %s" % (rel, n, what, line))
+    if meta:
+        print("IDENTIFYING CONTENT IN COMMIT METADATA (%d):" % len(meta))
+        for rev, what, _n, value in meta:
+            print("  %s  [%s]  %s" % (rev, what, value))
     print("")
     print("This repository is public and the rule has been broken twice. Remove these from the")
     print("working tree; if they were pushed, the history needs rewriting too, which is a")
