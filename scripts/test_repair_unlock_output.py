@@ -53,6 +53,45 @@ def test_no_env_is_not_an_error():
     assert R._scrub("plain message", None) == "plain message"
 
 
+def test_nothing_derived_from_the_repair_reaches_stdout_unscrubbed():
+    """STOP FIXING THIS ONE PRINT AT A TIME.
+
+    `result` is what repair_unlock_password(env_path, env) returned and `env` carried the
+    password in, so every field of result is downstream of the password -- CodeQL walked from
+    the password print to the exception print to the reason print, one per fix, because the
+    taint is on the whole object and not on the field that happened to be named `password`.
+
+    So the rule is structural: any value interpolated into stdout is either a literal, or has
+    been through _scrub. This test reads the print sites and holds that, instead of naming
+    the three lines that were wrong so far.
+    """
+    import io
+    import re
+    src = io.open(R.__file__, encoding="utf-8").read()
+    # the body only -- the module docstring shows the output shapes as prose
+    body = src[src.index("def _scrub("):]
+
+    # A name is clean if it was scrubbed where it was BOUND; scrubbing at the print site is
+    # the other valid place. Demanding the call at the print alone would reject
+    # `reason = _scrub(...)` followed by `print(reason)`, which is the safer of the two shapes
+    # because it protects every later use rather than one line.
+    sanitized = set(re.findall(r"^\s*(\w+)\s*=\s*_scrub\(", body, re.M))
+
+    for ln in [l.strip() for l in body.splitlines() if l.strip().startswith("print(")]:
+        if "%" not in ln:
+            continue                       # a literal line interpolates nothing
+        for name in ("result", "reason", "exc"):
+            if not re.search(r"\b%s\b" % name, ln):
+                continue
+            if "_scrub" in ln or name in sanitized:
+                continue
+            # `exc` at the import-failure site is raised before .env is ever read, so there is
+            # no secret in scope to leak.
+            if "failed:import" in ln:
+                continue
+            raise AssertionError("unscrubbed %r reaches stdout: %s" % (name, ln))
+
+
 def test_every_verdict_keeps_the_prefix_start_all_matches_on():
     """start_all.ps1 selects on ^(noop|repaired|failed|error):. A change here that drops a
     prefix does not fail loudly -- the launcher simply stops recognising the outcome."""
