@@ -27,6 +27,28 @@ import os
 import sys
 
 
+def _scrub(text: str, env: dict) -> str:
+    """Exception text with every .env VALUE removed, each replaced by its own key name.
+
+    The line below prints the exception raised by repair_unlock_password(env_path, env), and
+    `env` is the parsed .env -- it holds the unlock password. A Python exception routinely
+    carries the offending value in its message, so that print can put the password on stdout
+    even though nothing here asks it to. This stream is captured by scripts/start_all.ps1 and
+    can reach logs, and the repository is public.
+
+    Dropping the message would silence it and cost the only diagnosis this path emits, so
+    remove the values instead: they are known exactly, right here. Short values are left alone
+    because a two-character value matches everywhere and would redact the message into
+    uselessness -- and a secret that short is not one.
+    """
+    out = str(text)
+    for key, val in sorted((env or {}).items(), key=lambda kv: -len(str(kv[1] or ""))):
+        v = str(val or "")
+        if len(v) >= 6 and v in out:
+            out = out.replace(v, "<redacted:%s>" % key)
+    return out
+
+
 def main() -> int:
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     sys.path.insert(0, repo)
@@ -44,7 +66,7 @@ def main() -> int:
         env = dict(dotenv_values(env_path))
         result = repair_unlock_password(env_path, env)
     except Exception as exc:                       # noqa: BLE001
-        print("failed:%s: %s" % (type(exc).__name__, exc))
+        print("failed:%s: %s" % (type(exc).__name__, _scrub(exc, env)))
         return 0
 
     reason = str(result.get("reason") or "")
