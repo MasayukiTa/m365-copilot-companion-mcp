@@ -45,6 +45,7 @@ def test_sample_still_takes_a_separate_system_prompt():
     (None, True), ("", True), ("none", True), ("off", True),
     ("nonsense", True),          # asked for a judge we do not have -> no judge, not a bypass
     ("sampling", False),
+    ("bridge", False),           # the HTTP transport for clients with no sampling capability
 ])
 def test_backend_selection(monkeypatch, val, expect_none):
     if val is None:
@@ -227,3 +228,111 @@ def test_an_elicitation_that_throws_is_not_an_approval(monkeypatch):
         raise RuntimeError("client does not support elicitation")
     monkeypatch.setattr(B, "_run_async", _boom)
     assert B.ask_human("may I?") is None
+
+
+# ── the bridge backend ───────────────────────────────────────────────────────────────
+#
+# The bridge backend has no client Context to lean on -- it just calls a local HTTP server.
+# So these tests replace _bridge_get (the one function that touches the network) and assert on
+# the ORDER of endpoints, the fail-closed behaviour, and the SSE parsing. Nothing here opens a
+# socket.
+
+def test_bridge_is_selectable_and_is_bridge_judge(monkeypatch):
+    monkeypatch.setenv(B.BACKEND_ENV, "bridge")
+    assert B.get() is B.bridge_judge
+
+
+def test_bridge_judge_opens_a_fresh_conversation_before_streaming(monkeypatch):
+    """/new MUST come before /stream. A judging turn sent into the standing conversation would
+    inherit whatever it had been doing -- the exact contamination this backend exists to
+    avoid."""
+    calls = []
+
+    def fake_get(path, params, timeout):
+        calls.append(path)
+        if path == "/stream":
+            return 'data: {"replace": "{\\"decision\\": \\"ALLOW\\"}"}\nevent: done\n'
+        return ""
+
+    monkeypatch.setattr(B, "_bridge_get", fake_get)
+    out = B.bridge_judge('{"pending_command": "echo hi"}')
+    assert calls == ["/new", "/stream"]
+    assert "ALLOW" in out
+
+
+def test_bridge_judge_sends_the_request_as_the_stream_msg(monkeypatch):
+    """The request JSON must reach the bridge as the msg of /stream, wrapped by the prompt."""
+    seen = {}
+
+    def fake_get(path, params, timeout):
+        if path == "/stream":
+            seen["msg"] = params.get("msg")
+            return 'data: {"replace": "{\\"decision\\": \\"BLOCK_AND_RETRY\\"}"}\n'
+        return ""
+
+    monkeypatch.setattr(B, "_bridge_get", fake_get)
+    B.bridge_judge('{"pending_command": "rm -rf /"}')
+    assert '"pending_command": "rm -rf /"' in seen["msg"]
+    # the rules travel with it, ahead of the data (see bridge_judge_prompt)
+    from tools.command_judge import SYSTEM_PROMPT
+    assert seen["msg"].startswith(SYSTEM_PROMPT[:40])
+
+
+def test_bridge_judge_does_not_stream_if_new_fails(monkeypatch):
+    """If /new fails, /stream must NOT be called -- otherwise the judging turn lands in the
+    standing conversation. And the failure must raise, never return an answer."""
+    calls = []
+
+    def fake_get(path, params, timeout):
+        calls.append(path)
+        if path == "/new":
+            raise B.JudgeTransportError("bridge /new returned HTTP 500")
+        return 'data: {"replace": "{\\"decision\\": \\"ALLOW\\"}"}\n'
+
+    monkeypatch.setattr(B, "_bridge_get", fake_get)
+    with pytest.raises(B.JudgeTransportError):
+        B.bridge_judge('{"pending_command": "echo hi"}')
+    assert calls == ["/new"]
+
+
+def test_bridge_transport_failure_becomes_require_human():
+    """The whole point: a bridge that is not listening (or any transport error) is a refusal,
+    not a bypass. judge_command must turn the raise into REQUIRE_HUMAN."""
+    def unreachable(_request_json):
+        raise B.JudgeTransportError("connection refused")
+
+    out = J.judge_command({"pending_command": "echo hi"}, unreachable)
+    assert out["decision"] == J.REQUIRE_HUMAN
+    assert out["source"] == "unavailable"
+    assert J.outcome_blocks_execution(out, human_available=False) is True
+
+
+def test_parse_bridge_stream_prefers_the_last_replace():
+    body = (
+        'data: {"delta": "{\\"deci"}\n'
+        'data: {"delta": "sion\\": "}\n'
+        'data: {"replace": "{\\"decision\\": \\"ALLOW\\"}"}\n'
+        'event: done\n'
+    )
+    assert B.parse_bridge_stream(body) == '{"decision": "ALLOW"}'
+
+
+def test_parse_bridge_stream_falls_back_to_concatenated_deltas():
+    body = (
+        'data: {"delta": "{\\"decision\\": "}\n'
+        'data: {"delta": "\\"ALLOW\\"}"}\n'
+    )
+    assert B.parse_bridge_stream(body) == '{"decision": "ALLOW"}'
+
+
+def test_parse_bridge_stream_surfaces_a_bridge_error_as_transport_error():
+    """A '[bridge error: ...]' marker is the turn breaking, not the judge speaking. It must not
+    be handed on as if it were a verdict."""
+    body = 'data: {"replace": "[bridge error: page crashed]"}\n'
+    with pytest.raises(B.JudgeTransportError):
+        B.parse_bridge_stream(body)
+
+
+def test_bridge_url_is_loopback_and_uses_the_configured_port(monkeypatch):
+    monkeypatch.setenv(B.BRIDGE_PORT_ENV, "9999")
+    assert B.bridge_url("/stream") == "http://127.0.0.1:9999/stream"
