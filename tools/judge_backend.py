@@ -396,6 +396,49 @@ def _bridge_get(path: str, query: dict, timeout: float) -> dict:
         raise JudgeTransportError("bridge %s did not return JSON (%s)" % (path, exc))
 
 
+def parse_bridge_stream(body: str) -> str:
+    """Reduce the bridge's /stream SSE body to the final answer text. Pure; no network.
+
+    Split out of _bridge_stream so the two things that go wrong here can be tested without
+    standing up a server, and because both were wrong while they were tangled with the socket:
+
+      * `replaced or "".join(deltas)` treats an EMPTY replace as "no replace arrived" and falls
+        back to the deltas. An empty replace is the bridge settling on empty, which is a
+        different fact from never having settled; `is not None` keeps them apart.
+      * `[bridge error: ...]` is the bridge's own marker for a turn that broke. Returned as
+        text it becomes the judge's answer, and parse_verdict reads whatever it can out of it --
+        so "the transport failed" arrives dressed as "the judge said this". It is raised as a
+        transport error instead.
+
+    The bridge emits `data: {json}` lines carrying `delta` (append) or `replace` (supersede),
+    ending with a done event; `{"replace": final}` is emitted once, right before persistence.
+    """
+    import json as _json
+    replace_text = None
+    deltas = []
+    for raw in (body or "").splitlines():
+        line = raw.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:"):].strip()
+        if not payload:
+            continue
+        try:
+            obj = _json.loads(payload)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if isinstance(obj.get("replace"), str):
+            replace_text = obj["replace"]
+        elif isinstance(obj.get("delta"), str):
+            deltas.append(obj["delta"])
+    text = replace_text if replace_text is not None else "".join(deltas)
+    if "[bridge error:" in (text or ""):
+        raise JudgeTransportError("the bridge turn failed: %s" % text.strip()[:200])
+    return text or ""
+
+
 def _bridge_stream(msg: str, timeout: float) -> str:
     """POST-less GET to /stream, reassembling the SSE stream into the final answer text.
 
@@ -405,34 +448,19 @@ def _bridge_stream(msg: str, timeout: float) -> str:
     stream that never produced text is a transport failure, not an empty verdict -- parse_verdict
     would read empty text as REQUIRE_HUMAN, but reporting it here names the real problem.
     """
-    import json as _json
     import urllib.parse
     import urllib.request
     url = bridge_base_url() + "/stream?" + urllib.parse.urlencode({"msg": msg})
-    replaced = ""
-    deltas = []
     try:
         with urllib.request.urlopen(url, timeout=timeout) as resp:
-            for raw in resp:
-                line = raw.decode("utf-8", "replace").strip()
-                if not line or not line.startswith("data:"):
-                    continue
-                payload = line[len("data:"):].strip()
-                if not payload:
-                    continue
-                try:
-                    obj = _json.loads(payload)
-                except ValueError:
-                    continue
-                if isinstance(obj, dict):
-                    if isinstance(obj.get("replace"), str):
-                        replaced = obj["replace"]
-                    elif isinstance(obj.get("delta"), str):
-                        deltas.append(obj["delta"])
+            body = resp.read().decode("utf-8", "replace")
     except Exception as exc:
         raise JudgeTransportError("bridge /stream failed (%s: %s)"
                                   % (type(exc).__name__, str(exc)[:120]))
-    text = replaced or "".join(deltas)
+    # Reassembly lives in parse_bridge_stream, which also raises on the bridge's own
+    # turn-failure marker. Do not swallow that here: it is deliberately the same class of
+    # failure as the socket dying, because in both cases there is no verdict.
+    text = parse_bridge_stream(body)
     if not text.strip():
         raise JudgeTransportError("bridge /stream produced no answer text")
     return text
