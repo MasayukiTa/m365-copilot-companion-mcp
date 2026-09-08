@@ -70,6 +70,7 @@ from relay.relay_fleet import (  # noqa: E402
 )
 from relay.copilot_autopilot_relay import default_notify  # noqa: E402
 from relay.refuter import PANEL_LENSES  # noqa: E402
+from relay.fanout import fanout_family_view  # noqa: E402
 
 
 # ── COORDINATOR OUTPUT CAPTURE (TEE) ────────────────────────────────────────────
@@ -973,7 +974,7 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
     # shows as up to 3 tabs. Falls back to the main-tab count if tab_load isn't available.
     open_tabs = sum((w.tab_load() if hasattr(w, "tab_load") else
                      (1 if getattr(w, "page", None) is not None else 0)) for w in workers)
-    return {
+    _snap = {
         "started": started,
         "updated": time.time(),
         "total": total,
@@ -1057,6 +1058,7 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
             "campaign_id": getattr(getattr(w, "task_envelope", None), "campaign_id", ""),
             "role": getattr(getattr(w, "task_envelope", None), "role", ""),
             "depth": getattr(getattr(w, "task_envelope", None), "depth", 0),
+            "subtask_index": getattr(w, "subtask_index", None),
             "goal_hash": getattr(w, "original_goal_hash", ""),
             "fresh_replay_count": getattr(w, "fresh_replay_count", 0),
             "refusal_count": getattr(w, "refusal_count", 0),
@@ -1075,6 +1077,12 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         # Set {"answered": true, "answer": "denied"}    to deny
         "pending_gates": _pending_gates(started=started),
     }
+    # Derived fan-out family markers (parent / child / aggregator / stalled) so the
+    # cockpit can render the split-and-merge structure the lineage already implies.
+    _fv = fanout_family_view(_snap["workers"])
+    for _w in _snap["workers"]:
+        _w["fanout"] = _fv.get(_w["name"], {"kind": "solo", "campaign_id": _w.get("campaign_id", ""), "label": ""})
+    return _snap
 
 
 def _write_atomic(path, payload):
@@ -2493,6 +2501,9 @@ def main():
              # FIX 3 (P2): also carry run_label / goal_count into the final snapshot.
              "run_label": run_label, "goal_count": goal_count,
              "workers": [_final_worker_entry(r, args.max_turns) for r in results]}
+    _ffv = fanout_family_view(final["workers"])
+    for _fw in final["workers"]:
+        _fw["fanout"] = _ffv.get(_fw["name"], {"kind": "solo", "campaign_id": _fw.get("campaign_id", ""), "label": ""})
     _write_atomic(status_path, final)
     # RUN-RESUME: write the FINAL completion map from the true per-goal outcomes (the
     # on_tick map may miss a worker that reached DONE on the very last sweep). A later
