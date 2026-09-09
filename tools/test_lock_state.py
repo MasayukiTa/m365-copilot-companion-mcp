@@ -199,3 +199,39 @@ def test_a_log_that_cannot_be_written_does_not_refuse_a_call(tmp_path, monkeypat
     monkeypatch.setattr(lock_state, "_STATE_FILE", Path(str(tmp_path / "s.json")))
     lock_state.record_locked("203.0.113.7", "refused")      # 例外を出さないこと自体が要件
     assert lock_state.read_state()["client_ip"] == "203.0.113.7"
+
+
+# ── 2026-09-09: a diagnostic that survives detail's 200-char truncation ────────────────────
+
+def test_presented_digest_and_tokens_held_survive_a_long_detail(tmp_path, monkeypatch):
+    """The whole point: appending diagnostic text to the end of `detail` never worked -- it
+    is truncated to 200 chars and the fixed boilerplate sentence already uses most of them.
+    These two new fields must land in the record independent of `detail`'s length."""
+    _redirect(tmp_path, monkeypatch)
+    long_detail = "x" * 250
+    lock_state.record_locked("203.0.113.7", long_detail,
+                             presented_digest="ab12cd34ef56ab78", tokens_held=42)
+    row = _log_lines(tmp_path, monkeypatch)[-1]
+    assert len(row["detail"]) == 200, "detail truncation itself must be unchanged"
+    assert row["presented_digest"] == "ab12cd34ef56ab78"
+    assert row["tokens_held"] == 42
+
+
+def test_omitting_the_new_fields_keeps_the_old_callers_unaffected(tmp_path, monkeypatch):
+    """The three existing call sites in tools/security.py pass neither kwarg. Backward
+    compatibility means the payload shape they produce must not change."""
+    _redirect(tmp_path, monkeypatch)
+    lock_state.record_locked("203.0.113.7", "refused")
+    row = _log_lines(tmp_path, monkeypatch)[-1]
+    assert "presented_digest" not in row
+    assert "tokens_held" not in row
+
+
+def test_an_empty_presented_digest_is_still_recorded_distinctly(tmp_path, monkeypatch):
+    """"" (nothing presented) must be distinguishable from the field being absent -- a caller
+    that never attached a token needs to read differently from a caller this fix predates."""
+    _redirect(tmp_path, monkeypatch)
+    lock_state.record_locked("203.0.113.7", "refused", presented_digest="", tokens_held=3)
+    row = _log_lines(tmp_path, monkeypatch)[-1]
+    assert "presented_digest" in row and row["presented_digest"] == ""
+    assert row["tokens_held"] == 3
