@@ -174,7 +174,11 @@ def _run_id_of(worker, started) -> str:
     """
     path = str(getattr(worker, "transcript", "") or "")
     if path:
-        base = os.path.basename(path)
+        # NOT os.path.basename: it splits on the HOST's separator. These paths are recorded on
+        # Windows and read wherever the code runs -- a Linux CI runner sees no separator in
+        # `C:\x\...\r6a9f9ad6_a0_w0.jsonl` and hands back the whole string as the run id.
+        # The id is data that travels; it must not depend on who is parsing it.
+        base = path.replace("\\", "/").rsplit("/", 1)[-1]
         for suffix in (".jsonl.gz", ".jsonl", ".json"):
             if base.endswith(suffix):
                 base = base[: -len(suffix)]
