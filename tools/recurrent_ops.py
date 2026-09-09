@@ -61,6 +61,35 @@ def depth_band(iteration: int) -> int:
     return BAND_EXPLORE if int(iteration) <= SHALLOW_ROUNDS else BAND_REFINE
 
 
+#: codex-plan item 7 (2026-09-09): the depth-band -> instruction TEXT table this module's own
+#: docstring named as deliberately not built here. depth_band() decides WHICH regime a round is
+#: in; this decides WHAT the caller should do in it. Kept as a separate table (not folded into
+#: depth_band) for the same reason the module already gives: the wording can change without
+#: touching the band arithmetic, and a caller that only wants the number never has to parse text.
+_BAND_INSTRUCTIONS = {
+    BAND_EXPLORE: (
+        "EXPLORE (round <= %d): try a genuinely different approach from any prior round, not a "
+        "small tweak to the last one -- there is still budget to test more than one hypothesis "
+        "before committing to refine any single one. If a prior round already looked promising, "
+        "still vary something structural about it (a different mechanism, not just a different "
+        "constant or threshold) before narrowing to it." % SHALLOW_ROUNDS
+    ),
+    BAND_REFINE: (
+        "REFINE (round > %d): the explore budget is spent. Read `history` in the state, pick "
+        "the most promising direction seen so far, and make ONE targeted, minimal change toward "
+        "it. This is not the round to try something unrelated to what has already been tried -- "
+        "a new hypothesis here means the explore rounds bought nothing." % SHALLOW_ROUNDS
+    ),
+}
+
+
+def depth_instruction(band: int) -> str:
+    """The guidance text for depth band `band` (BAND_EXPLORE or BAND_REFINE). Returns "" for an
+    unknown band rather than raising -- a caller reading state for a settled run (where
+    depth_band is None) must not crash on this lookup."""
+    return _BAND_INSTRUCTIONS.get(int(band), "") if band is not None else ""
+
+
 def _records(run_id: str) -> list:
     try:
         path = _run_path(run_id)
@@ -117,6 +146,7 @@ def _progress(rounds: list):
 def _state(run_id: str, cfg: dict, rounds: list, stop: str = CONTINUE, reason: str = "") -> dict:
     best, flat = _progress(rounds)
     nxt = len(rounds) + 1
+    band = depth_band(nxt) if stop == CONTINUE else None
     return {
         "run_id": run_id,
         "goal": cfg.get("goal", ""),
@@ -125,7 +155,9 @@ def _state(run_id: str, cfg: dict, rounds: list, stop: str = CONTINUE, reason: s
         "iterations_done": len(rounds),
         "next_iteration": nxt if stop == CONTINUE else None,
         "max_iter": cfg.get("max_iter"),
-        "depth_band": depth_band(nxt) if stop == CONTINUE else None,
+        "depth_band": band,
+        # what to DO in that band -- read by the caller before it decides this round's edits.
+        "instruction": depth_instruction(band) if stop == CONTINUE else None,
         "best_failures": best,
         "rounds_without_improvement": flat,
         "patience": cfg.get("patience"),
