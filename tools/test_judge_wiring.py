@@ -216,3 +216,93 @@ def test_the_request_never_carries_agent_prose(monkeypatch):
     CE._judged("shell", "rm -rf x", None)
     assert set(seen) >= {"pending_command", "cwd", "deterministic_flags"}
     assert "assistant" not in json.dumps(seen)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# 2026-09-09 -- codex-plan item 4's own evidence bar, end to end rather than through
+# _judged() alone: "隔離環境で拒否対象が実行されず、許可対象は実行される。judge停止時にも
+# 安全なshell操作は動く". Everything above proves _judged() RETURNS the right thing; these
+# four call the real run_python/shell_exec and check a real side effect (a marker file
+# either exists or does not), because "the gating function returns a refusal string" and
+# "the caller actually never ran the command" are two different claims -- reading
+# run_python/shell_exec's own source shows `if _j is not None: return _j` sits before the
+# real subprocess call, but this repository's dominant failure class is exactly "wired
+# correctly in the code, never actually verified running" and this project's own discipline
+# is not to take source reading as a substitute for watching it happen.
+# ═══════════════════════════════════════════════════════════════════════════════════════
+
+@pytest.fixture
+def unlocked(monkeypatch):
+    monkeypatch.setattr(CE, "require_unlocked", lambda: None)
+
+
+def test_enforce_block_means_the_command_never_actually_runs(unlocked, monkeypatch, tmp_path):
+    monkeypatch.setenv(T.MODE_ENV, "enforce")
+    monkeypatch.setattr(CE, "_judge_backend",
+                        lambda: _backend('{"decision":"BLOCK_AND_RETRY","reason":"no"}'))
+    marker = tmp_path / "ran.txt"
+    out = CE.shell_exec('echo ran > "%s"' % marker, timeout=5)
+    assert "[refused by review]" in out
+    assert not marker.exists(), "the gate said BLOCK but the command ran anyway"
+
+
+def test_enforce_allow_means_the_command_actually_runs(unlocked, monkeypatch, tmp_path):
+    monkeypatch.setenv(T.MODE_ENV, "enforce")
+    monkeypatch.setattr(CE, "_judge_backend",
+                        lambda: _backend('{"decision":"ALLOW","reason":"fine"}'))
+    marker = tmp_path / "ran.txt"
+    out = CE.shell_exec('echo ran > "%s"' % marker, timeout=5)
+    assert "[refused by review]" not in out
+    assert marker.is_file(), "the gate said ALLOW but the command never ran"
+
+
+def test_enforce_block_stops_python_too_not_only_shell(unlocked, monkeypatch, tmp_path):
+    monkeypatch.setenv(T.MODE_ENV, "enforce")
+    monkeypatch.setattr(CE, "_judge_backend",
+                        lambda: _backend('{"decision":"BLOCK_AND_RETRY","reason":"no"}'))
+    marker = tmp_path / "ran.txt"
+    out = CE.run_python("open(r'%s', 'w').write('ran')" % marker, timeout=5)
+    assert "[refused by review]" in out
+    assert not marker.exists()
+
+
+def test_a_safe_command_still_runs_with_the_judge_completely_down(unlocked, monkeypatch, tmp_path):
+    """The third leg of the plan's evidence bar: 'judge停止時にも安全なshell操作は動く'.
+    Enforce mode, NO backend configured at all (the judge is as down as it can be) -- a
+    read-only command must still complete, because it never reaches the judge in the first
+    place. This is what stops 'the judge is unreachable' from meaning 'nothing runs'.
+
+    "echo" alone, not "echo something": is_read_only's own len(parts)==1 rule (command_
+    triage.py) exempts a bare head-word command, not an argument-bearing one -- multi-word
+    echo can carry a redirect-shaped payload, so it is deliberately judged. First draft of
+    this test used "echo hello-world" and got refused; that was this test being wrong about
+    the policy, not the policy being wrong."""
+    monkeypatch.setenv(T.MODE_ENV, "enforce")
+    monkeypatch.setattr(CE, "_judge_backend", lambda: None)
+    out = CE.shell_exec("pwd", timeout=5)
+    assert "[refused by review]" not in out
+    assert out.strip(), "the read-only command produced no output at all"
+
+
+def test_a_dangerous_command_with_the_judge_down_is_refused_not_run(unlocked, monkeypatch, tmp_path):
+    """The other half of 'no judge is not an allow', proven end to end: a NON-read-only
+    command, enforce mode, no backend -- must be refused, and must not run."""
+    monkeypatch.setenv(T.MODE_ENV, "enforce")
+    monkeypatch.setattr(CE, "_judge_backend", lambda: None)
+    marker = tmp_path / "ran.txt"
+    out = CE.shell_exec('echo ran > "%s"' % marker, timeout=5)
+    assert "[refused by review]" in out
+    assert not marker.exists()
+
+
+def test_shadow_never_stops_real_execution_either(unlocked, monkeypatch, tmp_path):
+    """The other direction of the same evidence bar: shadow mode must never prevent a
+    command from actually running, however the judge would have decided -- shadow's entire
+    point is measuring without changing behaviour."""
+    monkeypatch.setenv(T.MODE_ENV, "shadow")
+    monkeypatch.setattr(CE, "_judge_backend",
+                        lambda: _backend('{"decision":"BLOCK_AND_RETRY","reason":"no"}'))
+    marker = tmp_path / "ran.txt"
+    out = CE.shell_exec('echo ran > "%s"' % marker, timeout=5)
+    assert "[refused by review]" not in out
+    assert marker.is_file(), "shadow mode blocked a real command"
