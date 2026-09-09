@@ -774,7 +774,18 @@ class CockpitWindow : Window
     List<Dictionary<string, object>> _toolbarShown = new List<Dictionary<string, object>>();
     DispatcherTimer _timer;
     string _lastSig = "";
-    JavaScriptSerializer _js = new JavaScriptSerializer();
+    // MaxJsonLength IS NOT OPTIONAL HERE. JavaScriptSerializer defaults to 2,097,152 chars,
+    // and .fleet/status.json crosses that at roughly 266 workers (~7.5 KB each). The
+    // 2026-09-09 run wrote 900 workers = 6,774,180 bytes, so DeserializeObject threw on every
+    // tick from about a third of the way in. ReadStatus caught it and returned null, OnTick
+    // read null as "idle" and returned BEFORE ArchiveTerminal / ArchiveRunTailOnce /
+    // MaybeAutoArchive -- so SaveHistory never ran and .fleet/history.json was never even
+    // created. A full run of finished work accumulated nowhere, silently, for twenty hours.
+    //
+    // This is a ceiling, not a one-off: every run past ~266 workers hits it. The same
+    // instance also SERIALIZES history.json, which meets the identical limit from the other
+    // side once history itself grows past 2 MB, so raising it here covers both directions.
+    JavaScriptSerializer _js = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
 
     // Cached meta string for the directive-band row Sig (avoids per-tick rebuild when nothing changed).
     string _directiveBandMeta = "";
@@ -8891,7 +8902,36 @@ class CockpitWindow : Window
             if (string.IsNullOrEmpty(text)) return null;
             return (Dictionary<string, object>)_js.DeserializeObject(text);
         }
-        catch (Exception) { return null; }
+        catch (Exception ex) { NoteStatusReadFailure(ex); return null; }
+    }
+
+    bool _statusReadFailLogged;
+
+    // A SWALLOWED EXCEPTION WITH NO TRACE IS WHY THE BUG ABOVE TOOK TWENTY HOURS TO FIND.
+    // The catch itself has to stay -- a cockpit that dies on a half-written status.json is
+    // worse than one that skips a tick -- but "returns null on any failure" and "logs
+    // nothing on any failure" are separate decisions, and only the first one was wanted.
+    // Recording the FIRST failure per process is enough: the failure is structural, so the
+    // thousandth line would say what the first one says, and an unbounded log on a
+    // per-tick path is its own disk problem. Size is recorded because it is the field that
+    // identifies this failure at a glance.
+    void NoteStatusReadFailure(Exception ex)
+    {
+        if (_statusReadFailLogged) return;
+        _statusReadFailLogged = true;
+        try
+        {
+            long size = -1;
+            try { size = new FileInfo(_statusPath).Length; } catch (Exception) { }
+            string line = "{\"ts\":" + DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+                        + ",\"what\":\"status_read_failed\""
+                        + ",\"bytes\":" + size
+                        + ",\"type\":\"" + ex.GetType().Name + "\""
+                        + ",\"detail\":\"" + (ex.Message ?? "").Replace("\\", "/").Replace("\"", "'") + "\"}";
+            string path = Path.Combine(Path.GetDirectoryName(ResolvePath(null)), "ui_errors.jsonl");
+            File.AppendAllText(path, line + Environment.NewLine, Encoding.UTF8);
+        }
+        catch (Exception) { }   // a trace that can break the cockpit is worse than no trace
     }
 
     static string S(Dictionary<string, object> d, string k)
