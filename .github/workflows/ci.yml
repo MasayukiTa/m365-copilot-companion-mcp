@@ -321,6 +321,9 @@ jobs:
             tests/test_steer_followup.py \
             tests/test_launch_gate.py \
             relay/test_fanout_worker.py \
+            relay/test_splittability.py \
+            relay/test_wants_fanout.py \
+            relay/test_fanout_reevaluates_per_goal.py \
             tests/test_stack_guard.py \
             tests/test_reap_orphan_edge.py \
             tests/test_endpoint_kill_and_probe.py \
