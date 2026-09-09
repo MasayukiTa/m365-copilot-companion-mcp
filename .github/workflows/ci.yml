@@ -470,6 +470,7 @@ jobs:
             tools/test_judge_backend.py \
             tools/test_judge_wiring.py \
             tools/test_ledger_never_writes_a_secret.py \
+            tools/test_contract_activation.py \
             tools/test_pip_install_target.py \
             tools/test_policy_state_fails_closed.py \
             tools/test_procedural_memory_japanese.py \
