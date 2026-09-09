@@ -26,7 +26,9 @@ import re
 
 import pytest
 
-from relay.fleet_runner import _run_id_of
+from relay.fleet_runner import _run_id_of, goals_from_command, read_commands
+from relay.relay_fleet import RelayWorker
+from relay.task_router import add_goal_to_live_fleet
 
 
 class _W:
@@ -71,7 +73,7 @@ def test_the_snapshot_publishes_the_run_id(repo_root=None):
     assert '"run_id": _run_id_of(w, started)' in src, "the snapshot no longer names the run"
 
 
-@pytest.mark.parametrize("field", ["verified", "verify_attempts", "run_id"])
+@pytest.mark.parametrize("field", ["verified", "verify_attempts", "run_id", "jid"])
 def test_both_archive_sites_carry_the_field(field):
     """BOTH SITES. One archive path runs when a worker reaches a terminal state, the other when
     the operator retires it by hand. Fixing one and leaving the other would make the history
@@ -88,3 +90,98 @@ def test_verified_is_copied_as_a_tri_state_not_coerced():
     src = io.open("ui/FleetCockpit.cs", encoding="utf-8").read()
     assert 'e["verified"] = w.ContainsKey("verified") ? w["verified"] : null;' in src
     assert 'e["verified"] = S(w, "verified")' not in src, "the tri-state was flattened to a string"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# 2026-09-09 -- codex-plan item 1 ("実行から検証までの計測を、まず1件成立させる").
+#
+# run_id (above) names a fleet SWEEP, shared by every worker in it -- it was never meant to
+# answer "what happened to the goal I admitted". jid names the ADMITTED GOAL: minted once by
+# task_router.py at submission, and threaded here through add_goal_to_live_fleet ->
+# goals_from_command -> Worker.jid -> both snapshot builders -> both cockpit archive sites.
+# It is what lets .fleet/tasks/done/<jid>.json (admission), .fleet/acked/<jid>*.json
+# (delivery), and a history.json row's verified/verify_attempts (this file's own subject)
+# join on ONE id -- the plan's exact evidence bar.
+# ═══════════════════════════════════════════════════════════════════════════════════════
+
+def test_a_bare_goal_has_no_jid():
+    """Absence is meaningful, not a bug: a goal that never passed through admission (a bare
+    -g flag, an ad-hoc retry) has nothing to join to and must not be handed a minted one."""
+    w = RelayWorker("plain string goal", "w0")
+    assert w.jid is None
+
+
+def test_a_goal_dict_carries_its_jid_onto_the_worker():
+    w = RelayWorker({"text": "do the thing", "jid": "abc123def456"}, "w0")
+    assert w.jid == "abc123def456"
+
+
+def test_jid_survives_from_admission_through_to_the_worker(tmp_path, monkeypatch):
+    """The exact chain the plan's evidence bar names: add_goal_to_live_fleet (admission's
+    write) -> read_commands -> goals_from_command (the worker's read). No fleet is actually
+    started here -- this is the SEAM between the two halves, tested the way this project
+    tests seams after being burned twice by ones nothing covered (gate_verdict/verdict,
+    keep/kept)."""
+    import relay.task_router as tr
+    monkeypatch.setattr(tr, "FLEET_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(tr, "TASKS", str(tmp_path / "tasks"))
+    tr.ensure_dirs()
+    add_goal_to_live_fleet("do the thing", str(tmp_path), jid="jid-e2e-001")
+    goals = [g for c in read_commands(str(tmp_path)) for g in goals_from_command(c)]
+    assert len(goals) == 1
+    assert goals[0]["jid"] == "jid-e2e-001"
+    w = RelayWorker(goals[0], "w0")
+    assert w.jid == "jid-e2e-001"
+
+
+def test_the_snapshot_publishes_jid():
+    src = io.open("relay/fleet_runner.py", encoding="utf-8").read()
+    assert '"jid": getattr(w, "jid", None) or ""' in src, "the live snapshot no longer names the goal"
+
+
+def test_the_final_return_dict_also_carries_jid():
+    """Same defect class run_id already had: a dict built once after the sweep exits, read
+    only by the FINAL snapshot -- the one on disk exactly when the cockpit archives every
+    terminal worker at once. Missing here means a goal that finished right as the run ended
+    would carry jid in status.json but not in the archived history row."""
+    src = io.open("relay/relay_fleet.py", encoding="utf-8").read()
+    assert '"jid": getattr(w, "jid", None) or ""' in src
+    src2 = io.open("relay/fleet_runner.py", encoding="utf-8").read()
+    assert '"jid": r.get("jid", "")' in src2
+
+
+def test_no_checks_configured_is_not_the_same_as_verification_failed():
+    """The bug this fix closes: a DONE claim with no acceptance checks used to set
+    verified=False -- indistinguishable, in every downstream reader, from a check that
+    actually ran and failed. __init__'s own comment already declared the contract this
+    restores: 'None=not checked, True/False after a gate ran'. Measured 2026-09-09: 67 of 68
+    verified=False rows in history.json had verify_attempts=0 -- this exact branch, not a
+    failed gate, produced almost all of them."""
+    w = RelayWorker("no checks on this goal", "w0")
+    assert w.checks == []
+    assert w.verified is None                 # the documented initial state
+    w._on_done_claimed()
+    assert w.verified is None, (
+        "a DONE claim with no configured checks was recorded as a FAILED verification")
+    assert w.verify_attempts == 0, "no gate ran, so nothing should have been attempted"
+
+
+def test_a_real_verification_failure_is_still_false_not_none():
+    """The other half: this fix must not blur a genuine failure back into 'unknown'. A worker
+    WITH checks that actually fail must still read False after a poll cycle, distinctly from
+    both True and the no-checks None case above."""
+    w = RelayWorker({"text": "goal with a check", "checks": [{"kind": "python",
+                     "code": "assert False"}]}, "w0")
+    assert w.checks
+    w._on_done_claimed()
+    assert w.status == "verifying"
+    # _on_done_claimed -> _advance_check already started the first pending check, so
+    # _active_check is set. Replace it with a fake whose poll() reports a failure without
+    # actually running a subprocess -- _poll_verify is the real per-tick driver the round-
+    # robin loop calls; this is the same seam test_fleet_verify.py's own tests drive.
+    assert w._active_check is not None, "no check was started for a non-empty checks list"
+    w._active_check = type("FakeCheck", (), {
+        "poll": staticmethod(lambda: (False, "assert failed"))})()
+    w._poll_verify()
+    assert w.verify_attempts == 1
+    assert w.verified is False, "a check literally reporting failure was not recorded as False"
