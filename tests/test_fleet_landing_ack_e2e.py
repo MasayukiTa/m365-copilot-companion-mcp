@@ -55,7 +55,9 @@ def test_sender_writes_ack_path_the_receiver_reads(state):
         cmd = json.load(fh)
 
     assert cmd.get("ack") == tr._ack_path(jid, state)
-    assert fr.goals_from_command(cmd) == [{"text": "do the thing", "priority": False}]
+    # `jid` was added to the item 2026-09-09 (codex-plan item 1) so a goal's admission id
+    # survives into the worker that runs it -- deliberately present here, not a leak.
+    assert fr.goals_from_command(cmd) == [{"text": "do the thing", "priority": False, "jid": jid}]
 
 
 def test_landing_confirmed_only_after_the_runner_consumes_it(state):
