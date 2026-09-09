@@ -74,14 +74,36 @@ def _append_log(payload: dict) -> None:
         pass
 
 
-def record_locked(client_ip: str = "", detail: str = "", ts: Optional[float] = None) -> None:
-    """Note that require_unlocked() just refused a call. Never raises."""
+def record_locked(client_ip: str = "", detail: str = "", ts: Optional[float] = None,
+                  presented_digest: str = "", tokens_held: Optional[int] = None,
+                  session_state: str = "") -> None:
+    """Note that require_unlocked() just refused a call. Never raises.
+
+    `presented_digest`/`tokens_held`/`session_state` are OPTIONAL and separate from `detail`
+    on purpose: `detail` truncates to 200 chars, and a diagnostic appended to the end of the
+    fixed boilerplate sentence never survived that cut -- measured 2026-09-09, a token-state
+    suffix landed past char 200 in every one of 5 refusals and was silently discarded. These
+    fields cannot be pushed out by boilerplate length because they are never concatenated
+    into it. `presented_digest` is a short sha256[:16] of whatever presented_token() held (or
+    "" if nothing was presented) -- never the raw token -- so a later reader can tell "the
+    caller never attached one" from "attached one that does not match anything currently
+    held" without this file ever writing a credential to disk. `session_state` says why the
+    2026-09-09 session-authorization fallback did not save this particular call (no session
+    id available on the call, or one was available but not recognized/expired) -- added
+    alongside it so a refusal that still occurs after that fix is legible from this ledger
+    alone, the same reasoning presented_digest was added for.
+    """
     payload = {
         "ts": float(ts if ts is not None else time.time()),
         "client_ip": str(client_ip or "")[:64],
         "detail": str(detail or "")[:200],
         "site": _caller_site(),
     }
+    if presented_digest or tokens_held is not None:
+        payload["presented_digest"] = str(presented_digest or "")[:16]
+        payload["tokens_held"] = int(tokens_held) if tokens_held is not None else None
+    if session_state:
+        payload["session_state"] = str(session_state)[:64]
     _append_log(dict(payload, event="refused"))
     try:
         with _LOCK:
