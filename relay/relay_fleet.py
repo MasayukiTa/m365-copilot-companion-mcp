@@ -33,6 +33,7 @@ import threading
 import time
 
 from .acceptance import Check, normalize_checks, run_all_blocking
+from . import splittability as _splittability
 from .copilot_autopilot_relay import (
     CONTINUE_JOB, COPILOT_SELECTORS, ConversationClosed, CopilotWebDriver, FIX_JOB,
     GenerationInProgress, PROTOCOL, REFUTE_FIX_JOB, RETRY_JOB, VERIFY_FIX_JOB,
@@ -2270,7 +2271,28 @@ class RelayWorker:
         # runaway goal becomes an unbounded number of conversations, and the depth on the
         # envelope is what makes that structural rather than a promise.
         self._spawn_fn = spawn_fn
-        self.fanout = bool(fanout) and int(getattr(self.task_envelope, "depth", 0) or 0) == 0
+        # codex-plan item 6 (2026-09-09): `fanout` here is the run-wide launch-time switch
+        # (operator/--fanout/autostart's length-proxy decision on the BATCH) and depth==0 is
+        # purely structural (a child cannot re-split). Neither says anything about whether
+        # THIS goal's own text is actually independent/parallelizable work -- and because
+        # every worker, including ones added mid-run via add_box/add_goal_to_live_fleet, is
+        # built through this same constructor, a goal added after launch previously just
+        # inherited whatever the launch-time flag happened to be, never independently judged.
+        # `splittability.judge` is the real per-goal signal (see that module's docstring for
+        # what it is built from); it runs here so launch-time and mid-run goals get the same
+        # live judgment instead of one being a hand-me-down of the other. A judging failure
+        # must not grant fan-out it would otherwise have refused -- same "failure is not
+        # permission" rule tools/command_judge.py states for JudgeUnavailable -- so any
+        # exception here falls back to NOT wanting to split, never to the old length-only
+        # permissiveness.
+        _depth0 = int(getattr(self.task_envelope, "depth", 0) or 0) == 0
+        _goal_splittable = False
+        if fanout and _depth0:
+            try:
+                _goal_splittable = _splittability.judge(self.goal).should_split
+            except Exception:
+                _goal_splittable = False
+        self.fanout = bool(fanout) and _depth0 and _goal_splittable
         self._fanout_done = False
         if self.fanout:
             # Turn 1 asks for the split instead of the work. The goal still travels in full,
