@@ -249,6 +249,125 @@ def presented_token() -> str:
 _MAX_TOKENS_PER_IDENTITY = 128
 
 
+#: INCIDENT, 2026-09-09. Raising the cap above did not close the gate: a load test that
+#: exceeded the OLD cap (13 concurrent, cap was 128) still produced refusals, and the new
+#: presented_digest diagnostic (below) showed all of them EMPTY -- no token was attached to
+#: the call at all, not a stale or evicted one. Same shape as a measurement already on record
+#: from 2026-09-06: 318 refusals in 4 days, ~22% of which the agent silently answered by
+#: falling back to read-only tools and reporting the (unwritten) work as done.
+#:
+#: THE MODEL LOSES THE TOKEN. It is handed a random 32-character secret exactly once, in a
+#: tool result, and must carry it in its own context and re-attach it to every subsequent
+#: mutating call for the rest of a long turn. That is not a transport property; it is
+#: something a language model is asked to remember perfectly, indefinitely, and it does not.
+#: No amount of raising _MAX_TOKENS_PER_IDENTITY touches this -- capacity was never the cause
+#: of these refusals, and confirming that (70/128 held, 22 unlocks in a 20-minute window,
+#: still 5 empty-token refusals) is what forced this second, different fix.
+#:
+#: THE FIX MOVES THE CREDENTIAL OFF THE MODEL. `Mcp-Session-Id` is issued by THIS server, not
+#: stated by the caller: a forged id is refused with "Session terminated" before any request
+#: of ours ever sees it (measured 2026-09-06). It persists across turns and across an entire
+#: conversation without the model ever touching it -- FastMCP's transport carries it on every
+#: call automatically. Longest observed lifetime 29.4 minutes / 9 calls; expiry rule unknown
+#: (see reference_mcp_session_id_is_a_real_second_factor.md), which is why authorization here
+#: is a SLIDING window (refreshed on every successful call) rather than a one-time grant.
+#:
+#: SCOPE, DELIBERATELY NARROW. A session's authorization is recorded INSIDE that identity's
+#: OWN entry (state[ip]["sessions"]), never as a separate global table -- so even if the same
+#: session id were ever observed under two different forwarded IPs (nothing here assumes it
+#: cannot be), it would still have to pass the existing per-IP lookup first. This is additive
+#: to the existing IP+token gate, not a replacement of it: a session cannot authorize a call
+#: for an identity it has never been recorded against.
+#:
+#: KNOWN LIMIT, same one the design measurement already named: this is a TRANSPORT identity,
+#: not a principal. Two logical conversations sharing one pooled connection (and therefore one
+#: Mcp-Session-Id) under the SAME forwarded IP would inherit each other's authorization. For a
+#: single-operator deployment this is the same person; written down because it would not be in
+#: a multi-tenant one.
+_MAX_SESSIONS_PER_IDENTITY = 64
+
+
+def session_auth_enabled() -> bool:
+    """Kill switch, independent of enforce_unlock_token(). Default ON.
+
+    MCP_UNLOCK_SESSION_AUTH=0 drops straight back to the pre-incident behaviour (the model
+    must re-present the exact token on every call) in case Mcp-Session-Id ever proves less
+    stable than measured, or misbehaves in a deployment this was not tested against. Read live,
+    like enforce_unlock_token(), so it can be flipped without a restart.
+    """
+    return os.environ.get("MCP_UNLOCK_SESSION_AUTH", "1") != "0"
+
+
+def _session_ttl_s() -> float:
+    """How long a recorded session stays authorized without being seen again. Default 30
+    minutes -- comfortably above the 29.4-minute longest session observed 2026-09-06, since
+    the true expiry rule is not known and the sliding refresh (see _touch_session) means an
+    active conversation never actually needs the full window."""
+    try:
+        return float(os.environ.get("MCP_UNLOCK_SESSION_TTL_S", "1800"))
+    except (TypeError, ValueError):
+        return 1800.0
+
+
+def _current_session_fingerprint() -> str:
+    """This call's session fingerprint, or "" when none is available.
+
+    Lazy import: tool_ledger is not pulled in at module load so importing tools.security stays
+    cheap regardless of whether tool_ledger's own callers are in use. tool_ledger itself is
+    stdlib-only (see its header), so nothing heavy rides in on this.
+    """
+    try:
+        from tools.tool_ledger import session_fingerprint
+        return session_fingerprint()
+    except Exception:
+        return ""
+
+
+def _session_authorized(entry: dict, sess: str, now: float) -> bool:
+    """Whether `sess` was recorded for this identity recently enough to still count."""
+    if not sess:
+        return False
+    last = (entry.get("sessions") or {}).get(sess)
+    if not isinstance(last, (int, float)):
+        return False
+    return (now - last) < _session_ttl_s()
+
+
+def _touch_session(entry: dict, sess: str, now: float) -> dict:
+    """Record `sess` as authorized for this identity as of `now`. Bounded by recency, not
+    insertion order: a session used a minute ago must never be the one evicted to make room
+    for one that was merely recorded earlier and has been idle since."""
+    if not sess:
+        return entry
+    sessions = dict(entry.get("sessions") or {})
+    sessions[sess] = now
+    if len(sessions) > _MAX_SESSIONS_PER_IDENTITY:
+        sessions = dict(sorted(sessions.items(), key=lambda kv: kv[1])[-_MAX_SESSIONS_PER_IDENTITY:])
+    entry["sessions"] = sessions
+    return entry
+
+
+def _maybe_touch_session(ip: str, sess: str) -> None:
+    """Refresh `sess`'s authorization for `ip`, throttled so a hot path does not become a disk
+    write on every gated call. A session refreshed within the last quarter of its TTL is left
+    alone; anything older, or not yet recorded, gets one bounded write."""
+    if not sess:
+        return
+    now = time.time()
+    entry = (_load_state() or {}).get(ip) or {}
+    last = (entry.get("sessions") or {}).get(sess)
+    if isinstance(last, (int, float)) and (now - last) < (_session_ttl_s() / 4.0):
+        return
+
+    def _add(state):
+        e = dict(state.get(ip) or {})
+        e = _touch_session(e, sess, now)
+        state[ip] = e
+        return state
+
+    _update_state(_add)
+
+
 def _token_matches(entry: dict, presented: str) -> bool:
     """Whether `presented` is one of the tokens issued for this identity.
 
@@ -325,19 +444,62 @@ def require_unlocked() -> str | None:
         # nothing else. A token was issued to whoever supplied the password, and only its hash
         # was kept.
         entry = (_load_state() or {}).get(ip) or {}
-        ok = _token_matches(entry, presented_token())
+        presented = presented_token()
+        ok = _token_matches(entry, presented)
+        now = time.time()
+        # THE SESSION PATH. See _MAX_SESSIONS_PER_IDENTITY's header comment for the incident
+        # this closes: the model loses the per-call token on long turns (318 refusals / 4
+        # days measured 2026-09-06; confirmed again 2026-09-09 with capacity ruled out --
+        # every refusal presented no token at all, not a stale one). `sess` is fetched once
+        # and used for both the check below and the touch after, so a successful TOKEN-based
+        # call establishes the session for whichever later call in the same conversation
+        # arrives without one.
+        sess = _current_session_fingerprint() if session_auth_enabled() else ""
+        via_session = False
+        if not ok and sess:
+            via_session = _session_authorized(entry, sess, now)
+            if via_session:
+                ok = True
         if ok or not enforce_unlock_token():
             if not ok:
                 # Recorded, not enforced: this is the number that says whether enforcement can
                 # be switched on without an outage.
                 lock_state.record_token_gap(ip)
+            elif sess:
+                _maybe_touch_session(ip, sess)
             return None
+        # WHY THIS TOKEN FAILED, WITHOUT EVER LOGGING THE TOKEN. Neither this ledger nor
+        # tool_ledger's could previously say whether a refused call presented no token at all
+        # (an agent that dropped the argument) or a real-but-stale one (evicted, or garbled in
+        # transit) -- tool_ledger logs `_args` AFTER main.py has already popped unlock_token
+        # out of it, so the field reads absent on every call, success or failure alike, and
+        # settled nothing on 2026-09-09 when 5 of 314 gated calls failed this way for a cause
+        # capacity eviction had already been ruled out for (70/128 held, 22 unlocks in the
+        # window). Same digest shape tool_ledger already uses for other secrets, so the next
+        # occurrence is legible from this ledger alone: "empty" says the agent never sent one;
+        # a digest that matches nothing recently minted for this identity says something else
+        # is corrupting or delaying it.
+        # DIAGNOSTIC FIELDS, NOT PART OF THE MESSAGE. `msg` is what the caller/agent sees on
+        # every refusal, so it stays the short, unchanged sentence below -- growing it here
+        # would add tokens to every single refused turn for a fact only an operator reading
+        # the ledger needs. record_locked's separate presented_digest/tokens_held fields carry
+        # it instead, and are never truncated the way `detail` is.
+        presented_digest = (hashlib.sha256(presented.encode("utf-8")).hexdigest()[:16]
+                            if presented else "")
+        held = len(entry.get("token_hashes") or [])
+        # WHY THE SESSION PATH DID NOT SAVE THIS CALL, for the same reason presented_digest
+        # exists: a refusal that still happens after this fix ships must be legible from the
+        # ledger alone, not re-investigated from zero a second time. `via_session` cannot be
+        # True here -- it would already have returned None above -- so only two causes remain.
+        session_state = ("none (no Mcp-Session-Id available for this call)" if not sess
+                         else "unrecognized-or-expired")
         msg = (
             f"[locked: no valid unlock token for {ip!r}] The identity in the forwarding "
             "header is not sufficient on its own. Call unlock(password='<password>') and "
             "pass the returned `unlock_token` with the call."
         )
-        lock_state.record_locked(ip, msg)
+        lock_state.record_locked(ip, msg, presented_digest=presented_digest, tokens_held=held,
+                                 session_state=session_state)
         return msg
     msg = (
         f"[locked client IP: {ip!r}] Mutating and execution tools require an unlock. "
@@ -383,6 +545,11 @@ def unlock(password: str) -> str:
     # forever. The identity is a namespace; the tokens are the credentials in it.
     token = secrets.token_urlsafe(24)
     digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    # CAPTURED BEFORE THE WRITE, NOT INSIDE _add: session_fingerprint() reads the live HTTP
+    # request context, which _update_state's mutate callback should not depend on (the lock it
+    # runs under is meant to guard the state dict, not become a place a context lookup can
+    # stall or fail oddly). A plain local, closed over by _add below.
+    sess = _current_session_fingerprint() if session_auth_enabled() else ""
 
     def _add(state):
         entry = dict(state.get(ip) or {})
@@ -400,6 +567,12 @@ def unlock(password: str) -> str:
             "token_hashes": hashes[-_MAX_TOKENS_PER_IDENTITY:],
         })
         entry.pop("token_sha256", None)
+        # ESTABLISH THE SESSION HERE TOO, not only on a later token-matched call. A successful
+        # unlock() IS itself an authorization event (the password matched) -- if the model's
+        # very next call already omits the token, this is what saves it, instead of requiring
+        # one prior token-matched call to have happened first. See _MAX_SESSIONS_PER_IDENTITY.
+        if sess:
+            entry = _touch_session(entry, sess, time.time())
         state[ip] = entry
         return state
 
