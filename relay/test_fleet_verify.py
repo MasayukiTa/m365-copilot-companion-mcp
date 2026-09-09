@@ -50,10 +50,14 @@ FAIL_CHECK = {"type": "shell", "argv": [PY, "-c", "import sys;sys.stderr.write('
 
 
 def main():
-    # 1. no checks -> DONE trusted, verified=False
+    # 1. no checks -> DONE trusted (back-compat), verified=None -- NOT False.
+    # 2026-09-09 (codex-plan item 1): False here used to be indistinguishable from a check
+    # that actually ran and failed. __init__'s own contract says "None=not checked,
+    # True/False after a gate ran" -- no gate ran, so None is what makes "not yet verified"
+    # legible instead of reading as a false failure.
     w = RelayWorker("plain goal", "w0")
     w._decide("everything complete DONE")
-    check("nocheck_done_trusted", w.status == "done" and w.outcome == "DONE" and w.verified is False)
+    check("nocheck_done_trusted", w.status == "done" and w.outcome == "DONE" and w.verified is None)
 
     # 2. passing check -> verifying -> DONE verified
     w = RelayWorker({"text": "g", "checks": [PASS_CHECK]}, "w1")
