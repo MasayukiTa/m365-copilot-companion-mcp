@@ -785,6 +785,53 @@ def journal_probe_failure(ok: bool, kind: str, reply: Optional[str],
         pass
 
 
+#: Last successfully-read probe payload, keyed by the (mtime, size) it was read at.
+#:
+#: NO TIME-BASED STALENESS. A first attempt cached for five seconds without re-checking, which
+#: made a freshly written probe invisible for up to five seconds -- and that is not a test
+#: artefact, it is the metric being wrong. The stat stays on every call: it is one syscall
+#: against a file whose parse is what actually cost, and it keeps the answer exact.
+_SUMMARY_CACHE = {"raw": None, "key": None}
+
+
+def _probe_key():
+    """(mtime, size) of the probe file, or None when it cannot be stat'ed."""
+    try:
+        st = _PROBE_FILE.stat()
+        return (st.st_mtime, st.st_size)
+    except Exception:
+        return None
+
+
+def _summary_from_cache():
+    """The cached payload when the file has not changed, else None. Never raises.
+
+    A file that cannot be stat'ed is a CACHE MISS, not a reason to serve the last payload. The
+    documented contract is that a missing or corrupt probe file reads as the all-None shape --
+    "no evidence" -- and two tests hold it. Returning a remembered `tool_ok: true` for a probe
+    file that is gone would report health that nothing measured, which is a worse failure than
+    the one this cache exists to prevent."""
+    c = _SUMMARY_CACHE
+    if c["raw"] is None:
+        return None
+    key = _probe_key()
+    if key is None:
+        return None
+    return c["raw"] if key == c["key"] else None
+
+
+def _store_summary_cache(raw) -> None:
+    _SUMMARY_CACHE["key"] = _probe_key()
+    _SUMMARY_CACHE["raw"] = raw
+
+
+def _reset_summary_cache() -> None:
+    """Tests write the probe file repeatedly within one mtime tick; this drops the cache so a
+    test measures the reader rather than the clock."""
+    _SUMMARY_CACHE["raw"] = None
+    _SUMMARY_CACHE["key"] = None
+
+
 def get_summary(now: Optional[float] = None) -> dict:
     """Read the last-recorded probe outcome from .fleet/tool_probe.json and return
     {"tool_ok": bool|None, "tool_kind": str|None, "tool_ts": float|None,
@@ -803,9 +850,30 @@ def get_summary(now: Optional[float] = None) -> dict:
     time.time() -- deterministic for tests, real wallclock in production (e.g. /health)."""
     empty = {"tool_ok": None, "tool_kind": None, "tool_ts": None, "tool_age_s": None,
              "tool_alive": None, "tool_inbound": None}
+    # SERVED FROM A CACHE, BECAUSE /health CALLS THIS ON THE EVENT LOOP.
+    #
+    # main.py's /health says it "does no blocking I/O on purpose" and then calls this, which
+    # opened a file. Both docstrings were accurate about themselves and nobody read them
+    # together. On 2026-09-09 the disk filled to 0.51 GB, this read stalled, /health stopped
+    # answering while every other endpoint still worked, and the supervisor -- which judges the
+    # server on /health alone -- restarted a HEALTHY server every five minutes. Each restart cut
+    # the in-flight tool calls, which is what reached the operator as
+    # "tool did not respond with success" and starlette's ClientDisconnect in the log.
+    #
+    # The file is written once per probe, minutes apart, and /health is polled every ~15s, so
+    # re-reading it per request bought nothing. Cache on mtime: a stale-but-recent answer is
+    # exactly what a liveness probe wants, and the loop never waits on the disk.
+    cached = _summary_from_cache()
+    if cached is not None:
+        raw = cached
+    else:
+        try:
+            with open(_PROBE_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            _store_summary_cache(raw)
+        except Exception:
+            return dict(empty)
     try:
-        with open(_PROBE_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
         ts = raw.get("ts")
         if not isinstance(ts, (int, float)):
             return dict(empty)
