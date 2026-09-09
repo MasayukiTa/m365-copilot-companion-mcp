@@ -110,6 +110,45 @@ function Get-BareTunnelId([string]$id) {
     return (($id -split '\.')[0]).ToLowerInvariant()
 }
 
+function Test-LooksLikeExecutableSuffix([string]$suffix) {
+    # A real devtunnel cluster code (usw2, use2, jpe1, weu, asse, ...) is never a Windows
+    # executable or script extension. Invoke-DevTunnelBounded merges stderr into the text
+    # that gets parsed as data (`2>&1 | Out-String`), and PowerShell renders a native
+    # command's stderr as a line starting with the executable name, e.g.
+    # "devtunnel.exe : Error: ...". That line has the exact shape of a tunnel-id row
+    # ("word.word "), so the id/cluster regex alone cannot tell them apart -- this
+    # blacklist is the second, independent signal that rejects it.
+    if (-not $suffix) { return $false }
+    $exeSuffixes = @('exe', 'dll', 'com', 'bat', 'cmd', 'ps1', 'psm1', 'msi', 'vbs', 'scr', 'msc')
+    return $exeSuffixes -contains $suffix.ToLowerInvariant()
+}
+
+function Get-OwnedTunnelIdsFromListOutput([string]$listOut) {
+    # PURE parser for `devtunnel list` output AS RECEIVED FROM Invoke-DevTunnelBounded,
+    # i.e. already merged with stderr. A genuine tunnel-id row starts the line with
+    # "<id>.<cluster>" followed by whitespace and then further table columns (never a
+    # colon). PowerShell's rendering of a merged native-command error line matches the
+    # id/cluster SHAPE too ("devtunnel.exe : Error: ..." -> id "devtunnel", cluster "exe")
+    # so a captured candidate is only accepted once it also passes two independent,
+    # positive checks: the cluster segment must not be an executable/script suffix (see
+    # Test-LooksLikeExecutableSuffix), and the character immediately after the id must not
+    # be ":" -- a real listing column is separated by plain whitespace, the error line's
+    # separator is " : ".
+    if (-not $listOut) { return @() }
+    $ids = @()
+    foreach ($line in ($listOut -split "`r?`n")) {
+        if ($line -match '^\s*([a-z0-9][a-z0-9-]+)\.([a-z0-9]+)(\s+)(\S)') {
+            $bareId = $matches[1]
+            $cluster = $matches[2]
+            $nextChar = $matches[4]
+            if (Test-LooksLikeExecutableSuffix $cluster) { continue }
+            if ($nextChar -eq ':') { continue }
+            $ids += "$bareId.$cluster"
+        }
+    }
+    return $ids
+}
+
 function Test-TunnelNameOwned([string]$name, [array]$ownedIds) {
     # $ownedIds may hold bare or full ("name.cluster") ids -- comparison is
     # always done on the bare form on both sides, so either shape works.
@@ -309,9 +348,7 @@ function Invoke-TunnelHeal([switch]$DryRunMode) {
             Write-Host "[heal_tunnel] 'devtunnel list' failed/timed out -- no-op"
             return
         }
-        $rawIds = @($listOut -split "`r?`n" | ForEach-Object {
-            if ($_ -match '^\s*([a-z0-9][a-z0-9-]+\.[a-z0-9]+)\s') { $matches[1] }
-        } | Where-Object { $_ })
+        $rawIds = @(Get-OwnedTunnelIdsFromListOutput $listOut)
         if ($rawIds.Count -eq 0 -and ($listOut -notmatch 'Found 0 tunnels')) {
             # No ids parsed AND the output did not clearly say "0 tunnels" --
             # treat as an unparseable/failed listing, not a genuinely empty

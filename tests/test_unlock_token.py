@@ -219,6 +219,26 @@ def test_the_token_list_is_bounded(monkeypatch):
     assert len(entry["token_hashes"]) == S._MAX_TOKENS_PER_IDENTITY
 
 
+def test_a_shared_identity_survives_the_observed_production_unlock_rate(monkeypatch):
+    """MEASURED 2026-09-09. One identity (the M365 Copilot Studio connector's shared egress
+    IP) issued 56 successful unlock() calls within about an hour -- every fleet worker sharing
+    that address is a different client landing on the same identity. With the old cap (8) the
+    9th of those unlocks silently evicted the 1st worker's still-in-use token, and every
+    following call from that worker was refused for a token that WAS correctly presented and
+    HAD been issued, just no longer kept -- ~4,900 refusals/hour, all "is_unlocked=True, token
+    does not match". This pins the fix at the measured rate: the token from position 0 of a
+    56-unlock run must still be live at the end of it."""
+    tokens = []
+    for _ in range(56):
+        out = _unlock_with(monkeypatch)
+        tokens.append(
+            [l.split(": ", 1)[1] for l in out.splitlines() if l.startswith("unlock_token: ")][0])
+    monkeypatch.setenv("MCP_REQUIRE_UNLOCK_TOKEN", "1")
+    S.set_presented_token(tokens[0])
+    assert S.require_unlocked() is None, \
+        "the first worker's token was evicted before its job could finish"
+
+
 def test_an_entry_written_before_multi_token_still_works(monkeypatch):
     """移行中の状態を壊さない -- 古い形の1件も照合対象に含める。"""
     tok = "legacy-token-value"

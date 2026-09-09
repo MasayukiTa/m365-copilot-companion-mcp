@@ -230,7 +230,23 @@ def presented_token() -> str:
 #: one NAT, one tenant egress -- and a single slot means each new unlock evicts the last, so
 #: two legitimate clients lock each other out in a loop. Bounded because the list is walked on
 #: every gated call and an unbounded one is a slow leak in a hot path.
-_MAX_TOKENS_PER_IDENTITY = 8
+#:
+#: RAISED FROM 8, 2026-09-09. MCP_REQUIRE_UNLOCK_TOKEN=1 in production turned this from a
+#: recorded gap into ~4,900 refusals/hour, ALL from one identity (20.210.146.129 -- the M365
+#: Copilot Studio connector's egress; .fleet/lock_refusals.jsonl shows every refusing IP field
+#: identical) and ALL of the form "is_unlocked=True, presented token does not match" (site
+#: security.py:require_unlocked, the is_unlocked branch -- never the "never unlocked" branch).
+#: .unlock_state.json showed that identity's token_hashes at exactly 8 -- the old cap -- while
+#: 56 unlock() calls succeeded for it within about an hour. Every fleet worker sharing that one
+#: connector IP is a DIFFERENT client under the SAME identity; with cap 8 the 9th concurrent/
+#: sequential worker's unlock silently evicted the 1st worker's still-in-use token, and that
+#: worker's every following call was refused for a token that was correctly presented and had,
+#: in fact, been issued -- just no longer kept. This is not a weaker gate: the password check
+#: unlock() performs is unchanged, and a caller still cannot use a token nobody issued. It only
+#: enlarges how many concurrently-valid, correctly-issued tokens one shared-egress identity may
+#: hold before the oldest is dropped. See test_a_shared_identity_survives_the_observed_
+#: production_unlock_rate in tests/test_unlock_token.py, sized off the measured 56/hour.
+_MAX_TOKENS_PER_IDENTITY = 128
 
 
 def _token_matches(entry: dict, presented: str) -> bool:

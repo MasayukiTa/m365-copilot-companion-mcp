@@ -508,6 +508,50 @@ while ($true) {
     # so a URL-only .env rewrite of the SAME tunnel never causes a needless churn.
     $freshTn = Get-EnvTunnelName
     if ($freshTn -and ((Get-BareTunnelName $freshTn) -ne (Get-BareTunnelName $TunnelName))) {
+        # A NEW NAME IS A CLAIM, AND IT USED TO BE BELIEVED WITHOUT CHECKING.
+        #
+        # Measured 2026-09-09: .env changed from 'resonac-mcp' to 'devtunnel' at 07:36. This
+        # branch stopped a WORKING host and switched to a tunnel that does not exist, so hosting
+        # failed every ~35s for twelve minutes until something rewrote the name back. The switch
+        # was the outage: leaving the old host alone would have cost nothing.
+        #
+        # Every script in this repository that writes MCP_TUNNEL_NAME was audited and none can
+        # produce that value; the writer is still unidentified, and the instrument that would
+        # have named it (MCP_TRACE_TOOLCALLS) was off. tools/file_ops.py refuses .env to the file
+        # tools but says in its own comment that run_python and shell_exec are not covered -- so
+        # a stray same-user subprocess writing .env is a live possibility that no producer-side
+        # guard can close.
+        #
+        # THE CONSUMER IS THE PLACE TO CHECK. Guarding each writer means guessing the whole set
+        # of writers; guarding here covers every one of them, known or not. The claim is cheap
+        # to test -- ask the CLI whether this account owns the tunnel -- and the failure mode is
+        # asymmetric: refusing a real rename costs a log line and a retry next cycle, while
+        # accepting a bad one costs the tunnel.
+        $ownsIt = $null
+        try {
+            $lst = & $DevTunnel list 2>&1 | Out-String
+            if ($LASTEXITCODE -eq 0 -and $lst) {
+                $bare = Get-BareTunnelName $freshTn
+                foreach ($ln in ($lst -split "`r?`n")) {
+                    if ($ln -match '^\s*([a-z0-9][a-z0-9-]+\.[a-z0-9]+)\s') {
+                        if ((Get-BareTunnelName $matches[1]) -eq $bare) { $ownsIt = $true; break }
+                    }
+                }
+                if ($null -eq $ownsIt) { $ownsIt = $false }
+            }
+        } catch { }
+        # $null means the listing itself failed (offline, signed out, CLI missing). That is NOT
+        # evidence the name is bad, so it must not be treated as a refusal -- fall through and
+        # switch, exactly as before. Only a listing that SUCCEEDED and did not contain the name
+        # is grounds to refuse.
+        if ($ownsIt -eq $false) {
+            Write-Log ("tunnel name in .env changed to '$freshTn', which this account does not own" +
+                       " -- KEEPING '$TunnelName' and not switching. Fix MCP_TUNNEL_NAME in .env;" +
+                       " retrying the check next cycle.")
+            $freshTn = ""
+        }
+    }
+    if ($freshTn -and ((Get-BareTunnelName $freshTn) -ne (Get-BareTunnelName $TunnelName))) {
         Write-Log "tunnel name changed in .env ('$TunnelName' -> '$freshTn') -- stopping the old host and switching"
         # Stop only OUR stale host process(es) for the OLD name -- the exact same
         # targeted match Start-TunnelHost uses below. NEVER `Get-Process devtunnel |
