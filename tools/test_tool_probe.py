@@ -19,6 +19,20 @@ import pytest
 from tools import tool_probe
 
 
+@pytest.fixture(autouse=True)
+def _clear_probe_summary_cache():
+    """get_summary() now caches its last-read payload keyed on (mtime, size) in a MODULE-LEVEL
+    dict (tool_probe._SUMMARY_CACHE), not per-test-file state. Two tests in this file that
+    happen to write same-sized probe JSON at a coincident mtime (plausible: fast tests, whole-
+    second mtime resolution on some filesystems, near-identical payload sizes) would otherwise
+    let one test's cached payload leak into the next test's assertions -- a false pass or a
+    flaky failure with no connection to what the failing test actually wrote. Reset before AND
+    after so a test that reads via the real cache path never contaminates its neighbours."""
+    tool_probe._reset_summary_cache()
+    yield
+    tool_probe._reset_summary_cache()
+
+
 # ===========================================================================
 # 1. classify_probe_reply: pure classifier, every branch
 # ===========================================================================
@@ -762,3 +776,79 @@ def test_the_readme_is_not_mistaken_for_a_challenge_token(tmp_path):
     _, token = tool_probe.new_probe_challenge(base_dir=tmp_path)
     assert tool_probe._find_challenge_tokens(str(tmp_path / "README.txt")) == []
     assert tool_probe._find_challenge_tokens(str(tmp_path / ("probe_%s" % token))) == [token]
+
+
+# ===========================================================================
+# 8. get_summary() must not block the /health event loop when disk I/O stalls
+#    (2026-09-09 incident: disk filled to 0.51 GB, this read stalled, /health alone
+#    stopped answering, and the supervisor -- which judges liveness on /health alone --
+#    restarted a HEALTHY server every five minutes, cutting in-flight tool calls).
+#
+# A disk floor is legitimate for deciding whether to ADMIT NEW WORK (relay_fleet.
+# disk_admission_ok / relay.fleet_runner.settings_disk_floor / bench/pro_cycle.py's
+# DISK_FLOOR_GB -- see relay/test_admission.py::test_disk_floor_predicate). It must never be
+# a reason the server, tunnel, supervisor, or bridge stop answering. The two tests below pin
+# that distinction from the tool_probe side: liveness (get_summary, feeding /health) survives
+# a stalled/failing disk read; admission (disk_admission_ok) still correctly refuses new work
+# at the same near-zero free space.
+# ===========================================================================
+
+
+def test_get_summary_repeat_call_does_no_file_io_once_cached(monkeypatch, tmp_path):
+    """The actual fix in fe1616e: once a probe has been read for a given (mtime, size), a
+    second /health arriving before the NEXT probe write must not touch the filesystem at all --
+    that is what makes it safe on a disk whose reads are stalling. Proven here by making a
+    second open() call raise, the way a wedged/near-full disk would hang or fail: if the cached
+    path were bypassed, this test would raise instead of asserting."""
+    probe_file = tmp_path / "tool_probe.json"
+    monkeypatch.setattr(tool_probe, "_PROBE_FILE", probe_file)
+    tool_probe.record_probe(True, "answer", ts=500.0)
+
+    first = tool_probe.get_summary(now=500.0)
+    assert first["tool_ok"] is True
+
+    real_open = open
+
+    def _no_more_opens(*a, **k):
+        raise AssertionError("get_summary() re-opened the probe file on an unchanged "
+                              "(mtime, size) -- this is the blocking read /health cannot afford")
+
+    monkeypatch.setattr("builtins.open", _no_more_opens)
+    try:
+        second = tool_probe.get_summary(now=530.0)   # different `now`, SAME on-disk file
+    finally:
+        monkeypatch.setattr("builtins.open", real_open)
+    assert second["tool_ok"] is True
+    assert second["tool_age_s"] == 30.0   # cache serves the payload; `now` still recomputes age
+
+
+def test_get_summary_survives_a_disk_read_that_raises_mid_call(monkeypatch, tmp_path):
+    """A near-full disk does not politely return "file missing" -- it can make the read raise
+    (OSError: no space left on device, or any other I/O failure). get_summary() must degrade to
+    the documented all-None "no evidence" shape, exactly like the missing/corrupt-file paths it
+    already handles, and never propagate the exception into /health."""
+    probe_file = tmp_path / "tool_probe.json"
+    monkeypatch.setattr(tool_probe, "_PROBE_FILE", probe_file)
+    tool_probe.record_probe(True, "answer", ts=500.0)
+    tool_probe._reset_summary_cache()   # force the next call to actually read
+
+    def _raise_open(*a, **k):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("builtins.open", _raise_open)
+    summary = tool_probe.get_summary(now=500.0)   # must not raise
+    assert summary == {"tool_ok": None, "tool_kind": None, "tool_ts": None, "tool_age_s": None,
+                       "tool_alive": None, "tool_inbound": None}
+
+
+def test_disk_admission_still_refuses_new_work_at_near_zero_free_space():
+    """The other half of the distinction: unlike liveness (above), fleet-work ADMISSION is
+    supposed to refuse when the disk is this tight. Pinned here at the exact figure from the
+    2026-09-09 incident (0.51 GB free) plus an even tighter 0.1 GB, so a future change cannot
+    quietly turn the liveness fix above into an admission fix too."""
+    from relay.relay_fleet import disk_admission_ok
+    assert disk_admission_ok(floor_gb=6, free_gb=0.51) is False
+    assert disk_admission_ok(floor_gb=6, free_gb=0.1) is False
+    # ...and the gate can be explicitly disabled for non-bench use (0 = no reserve), which is
+    # a deliberate opt-out, not a liveness bug -- see relay_fleet.disk_admission_ok docstring.
+    assert disk_admission_ok(floor_gb=0, free_gb=0.1) is True
