@@ -121,11 +121,10 @@ jobs:
             relay/test_verification_survives_the_archive.py \
             relay/test_fleet_autostart.py \
             relay/test_refute_resend.py \
-            relay/test_fleet_delivery_ack.py \
             relay/test_fleet_landing_ack.py \
             relay/test_fleet_landing_reconcile.py \
-            tests/test_fleet_landing_ack.py \
-            tests/test_fleet_landing_reconcile.py \
+            tests/test_fleet_landing_ack_e2e.py \
+            tests/test_fleet_landing_reconcile_e2e.py \
             tests/test_sensitive_paths_untracked.py \
             tests/test_unlock_redaction.py \
             tests/test_edge_keeper_coverage.py \
