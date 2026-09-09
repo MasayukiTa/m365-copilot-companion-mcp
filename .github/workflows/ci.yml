@@ -121,12 +121,13 @@ jobs:
             relay/test_verification_survives_the_archive.py \
             relay/test_fleet_autostart.py \
             relay/test_refute_resend.py \
+            relay/test_for_fleet_is_not_a_dead_end.py \
             relay/test_fleet_landing_ack.py \
             relay/test_fleet_landing_reconcile.py \
             tests/test_fleet_landing_ack_e2e.py \
             tests/test_fleet_landing_reconcile_e2e.py \
-            tests/test_fleet_landing_ack.py \
-            tests/test_fleet_landing_reconcile.py \
+            tests/test_fleet_landing_ack_seam.py \
+            tests/test_fleet_landing_reconcile_seam.py \
             tests/test_sensitive_paths_untracked.py \
             tests/test_unlock_redaction.py \
             tests/test_edge_keeper_coverage.py \
@@ -541,6 +542,14 @@ jobs:
       - name: Run heal_tunnel unit tests
         shell: powershell
         run: |
+          # PIN THE ENGINE. Invoke-Pester takes the newest Pester present, and this runner
+          # carries both 3.4.0 and 5.x while the developer machine has only 3.4.0 -- so the
+          # same file ran under two engines and only one was ever verified. Under 5 it is not
+          # a matter of a different failure: `Should Be` is rejected outright and `Should -Be`
+          # does not exist in 3.4.0, so no single syntax satisfies both. Measured: 13/13 under
+          # 3.4.0, 0/13 under 5.6.1. ErrorAction Stop so a runner image that drops 3.4.0 fails
+          # here with a clear reason instead of silently running the wrong engine again.
+          Import-Module Pester -RequiredVersion 3.4.0 -ErrorAction Stop
           $result = Invoke-Pester .\scripts\heal_tunnel.Tests.ps1 -PassThru
           if ($result.FailedCount -gt 0) {
             exit 1
