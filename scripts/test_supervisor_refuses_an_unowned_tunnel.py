@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """The supervisor must not abandon a working tunnel for a name nobody owns.
 
-WHAT HAPPENED (2026-09-09). `.env`'s MCP_TUNNEL_NAME changed from 'resonac-mcp' to 'devtunnel'
+WHAT HAPPENED (2026-09-09). `.env`'s MCP_TUNNEL_NAME changed from the configured name to 'devtunnel'
 at 07:36. The supervisor's live self-correction saw the change, stopped the WORKING host, and
 switched to a tunnel that does not exist. Hosting then failed every ~35 seconds until something
 rewrote the name back at 07:48. The switch WAS the outage: leaving the old host alone would have

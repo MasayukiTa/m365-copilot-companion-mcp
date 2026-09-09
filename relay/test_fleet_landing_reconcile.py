@@ -1,8 +1,10 @@
 
 import os, sys, json, time, tempfile, shutil, importlib
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) if "__file__" in globals() else "C:/Users/M118A8586/resonac-mcp"
-REPO = "C:/Users/M118A8586/resonac-mcp"
+# Computed, never written down. The literal that used to sit here carried the owner's
+# home path into a PUBLIC repository, and a second line then overwrote the computed
+# value with it -- so the correct expression was already present and being discarded.
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO); sys.path.insert(0, os.path.join(REPO, "relay"))
 
 import relay.task_router as tr
