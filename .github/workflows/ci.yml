@@ -205,6 +205,7 @@ jobs:
             ui/test_copilot_chat_p2c.py \
             bridge/test_bridge_unlock.py \
             ui/test_copilot_chat_conv_lifecycle.py \
+            ui/test_sync_registry_accepts_socket_workers.py \
             ui/test_fleet_cockpit_approval_center.py \
             bench/companionbench/test_agents.py \
             bench/companionbench/test_companionbench.py \
