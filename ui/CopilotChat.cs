@@ -963,16 +963,34 @@ class ChatWindow : Window
                 var d = o as Dictionary<string, object>;
                 if (d == null) continue;
                 string url = SS(d, "url");
-                if (string.IsNullOrEmpty(url)) continue;
+                string transcript = SS(d, "transcript");
+                // A socket-driven fleet worker never gets a conv_url: relay_fleet.py's
+                // _capture_url only ever fires when the worker holds a browser `page`, and a
+                // socket worker's page is None by construction (MCP_FLEET_SOCKET has defaulted
+                // on since 2026-08-21). Requiring url here silently dropped every such worker
+                // from the ONLY live-update path -- DiscoverTranscripts only runs once, at
+                // startup, capped at 80 -- so the fleet section froze at whatever that one scan
+                // found and never grew again. transcript alone is already a valid identity for
+                // opening a conversation: the click handler tries c.Transcript's on-disk read
+                // BEFORE it ever needs ConvUrl (see the "a registry/fleet conversation we
+                // haven't loaded yet" branch below), so a transcript-only row is not degraded,
+                // just openable a different way. A row with neither is still skipped -- there
+                // is nothing to show or open for it either way.
+                if (string.IsNullOrEmpty(url) && string.IsNullOrEmpty(transcript)) continue;
                 bool exists = false;
-                foreach (var c in _all) if (c.ConvUrl == url) { exists = true; break; }
+                foreach (var c in _all)
+                {
+                    if (!string.IsNullOrEmpty(url) && c.ConvUrl == url) { exists = true; break; }
+                    if (string.IsNullOrEmpty(url) && !string.IsNullOrEmpty(transcript)
+                        && c.Transcript == transcript) { exists = true; break; }
+                }
                 if (!exists)
                 {
                     var c = new Conversation();
                     c.ConvUrl = url;
                     c.Title = SS(d, "title");
                     c.Source = SS(d, "source");
-                    c.Transcript = SS(d, "transcript");   // disk jsonl -> open from disk, no scrape
+                    c.Transcript = transcript;   // disk jsonl -> open from disk, no scrape
                     c.Name = SS(d, "name");
                     try { c.Ts = (d.ContainsKey("ts") && d["ts"] != null) ? Convert.ToDouble(d["ts"]) : 0; }
                     catch { c.Ts = 0; }
