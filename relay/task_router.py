@@ -1380,17 +1380,36 @@ def _deliver_waiting_goals(now_ts=None, state_dir=None):
     The status was the only thing waiting. Six such records had built up, each naming a goal
     that would never be delivered however long a fleet ran afterwards.
 
-    Runs on every drain pass. With no fleet in flight it does nothing and costs one status
-    read, which is the same check fleet_handoff already makes.
+    WHY THIS NO LONGER RETURNS EARLY WHEN NOTHING IS LIVE. It used to open with
+    `if not fleet_is_live(state_dir): return out` -- the function whose stated job is to
+    deliver goals that arrived while no fleet was running gave up precisely when no fleet was
+    running. That made for_fleet/ a one-way door. A goal parked here by a FRESH submission had
+    already passed through fleet_handoff and could reach autostart, but a goal parked by
+    _reconcile_landings' requeue path is written straight into the directory, so once it
+    landed here with nothing live, nothing ever looked at it again. Measured 2026-09-09: one
+    goal sat in for_fleet/ while the supervisor ran this pass every 15s for 47 minutes and
+    logged nothing at all -- silence, not an error, because dispatch_once kept returning [].
+    The guard was the very condition it existed to fix.
+
+    fleet_handoff already makes the same liveness check itself, and falls through to AUTOSTART
+    when it fails, so the guard bought nothing except the dead end.
+
+    ONE COLD HANDOFF PER PASS. Removing the guard alone would let N waiting files each attempt
+    an autostart within a single pass, and autostart_status cannot deduplicate them: a launch
+    takes seconds to become live, so every file in the same pass still reads "nothing in
+    flight". N goals would mean N fleets -- trading a stall for an amplification. So when
+    nothing is live, exactly one goal is offered per pass; if it starts a fleet, the next pass
+    finds it live and delivers the whole backlog by the normal path. AUTOSTART_BACKOFF_S stays
+    the outer bound; this only stops one pass from racing itself.
     """
     out = []
     ensure_dirs()
-    if not fleet_is_live(state_dir):
-        return out
     try:
         names = sorted(os.listdir(_p("for_fleet", "")))
     except OSError:
         return out
+    live = fleet_is_live(state_dir)
+    offered_cold = False
     for name in names:
         if not name.endswith(".txt"):
             continue
@@ -1409,6 +1428,10 @@ def _deliver_waiting_goals(now_ts=None, state_dir=None):
             except OSError:
                 pass
             continue
+        if not live:
+            if offered_cold:
+                continue                   # one cold start per pass -- see the docstring
+            offered_cold = True
         status, result = fleet_handoff(goal, jid, state_dir)
         if status != "dispatched":
             continue                       # still no run; leave it waiting
