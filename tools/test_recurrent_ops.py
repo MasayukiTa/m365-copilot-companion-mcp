@@ -87,6 +87,52 @@ def test_the_band_changes_with_depth(monkeypatch):
     assert step()["depth_band"] == R.BAND_REFINE
 
 
+# -- codex-plan item 7: the depth-band -> instruction table, previously not built -------------
+
+def test_depth_instruction_differs_by_band():
+    """The separate mapping test_the_band_changes_with_depth's docstring anticipated: the TEXT
+    a caller reads to decide this round's edits, not just the band number."""
+    explore = R.depth_instruction(R.BAND_EXPLORE)
+    refine = R.depth_instruction(R.BAND_REFINE)
+    assert explore and refine
+    assert explore != refine
+    assert "EXPLORE" in explore
+    assert "REFINE" in refine
+
+
+def test_depth_instruction_is_blank_for_an_unknown_or_absent_band():
+    """A settled run's state carries depth_band=None -- looking up an instruction for it must
+    not raise, since a caller reading a settled run's state should not have to special-case
+    this field separately from depth_band."""
+    assert R.depth_instruction(None) == ""
+    assert R.depth_instruction(99) == ""
+
+
+def test_the_state_carries_the_instruction_for_the_upcoming_round(monkeypatch):
+    """The whole point of wiring this into _state: a caller reading recurrent_state (or a
+    step's return value) sees not just WHICH band the next round is in, but WHAT to do -- it
+    should not need to import depth_instruction itself and re-derive the mapping."""
+    cell(monkeypatch, [counted(5), counted(4), counted(3)])
+    st = begin(max_iter=5, patience=9)
+    assert st["depth_band"] == R.BAND_EXPLORE
+    assert "EXPLORE" in st["instruction"]
+    step()   # round 1 done; round 2 is still EXPLORE (rounds 1-2 both are)
+    st = step()   # round 2 done; round 3 is the first REFINE round
+    assert st["depth_band"] == R.BAND_REFINE
+    assert "REFINE" in st["instruction"]
+
+
+def test_a_settled_runs_state_carries_no_instruction(monkeypatch):
+    """Once stopped there is no upcoming round to instruct -- depth_band is already None for a
+    settled run; instruction must be None too, not the last band's leftover text."""
+    cell(monkeypatch, [PASS])
+    begin(max_iter=5)
+    st = step()
+    assert st["stop"] == "converged"
+    assert st["depth_band"] is None
+    assert st["instruction"] is None
+
+
 # -- the state survives the caller, because the log is the state ------------------------------
 
 def test_progress_is_recomputed_from_the_log_not_carried_in_memory(monkeypatch):
