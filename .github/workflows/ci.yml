@@ -125,6 +125,8 @@ jobs:
             relay/test_fleet_landing_reconcile.py \
             tests/test_fleet_landing_ack_e2e.py \
             tests/test_fleet_landing_reconcile_e2e.py \
+            tests/test_fleet_landing_ack.py \
+            tests/test_fleet_landing_reconcile.py \
             tests/test_sensitive_paths_untracked.py \
             tests/test_unlock_redaction.py \
             tests/test_edge_keeper_coverage.py \
@@ -166,6 +168,7 @@ jobs:
             scripts/test_bootstrap.py \
             scripts/test_bootstrap_p2c.py \
             scripts/test_repair_unlock_output.py \
+            scripts/test_supervisor_refuses_an_unowned_tunnel.py \
             scripts/test_operational_resilience.py \
             scripts/test_bridge_startup_reporting.py \
             scripts/test_start_companion_edge_headless.py \
@@ -527,6 +530,18 @@ jobs:
         shell: powershell
         run: |
           $result = Invoke-Pester .\scripts\update_recovery.Tests.ps1 -PassThru
+          if ($result.FailedCount -gt 0) {
+            exit 1
+          }
+
+      # heal_tunnel.ps1's tunnel-id extraction over 'devtunnel list' output merged with
+      # stderr (see Get-OwnedTunnelIdsFromListOutput's own comment) -- this Pester file
+      # previously existed but was never wired into CI, so its coverage of the pure
+      # decision function was never actually exercised by a run that could fail the build.
+      - name: Run heal_tunnel unit tests
+        shell: powershell
+        run: |
+          $result = Invoke-Pester .\scripts\heal_tunnel.Tests.ps1 -PassThru
           if ($result.FailedCount -gt 0) {
             exit 1
           }
