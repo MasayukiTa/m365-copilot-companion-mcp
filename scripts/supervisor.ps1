@@ -510,7 +510,7 @@ while ($true) {
     if ($freshTn -and ((Get-BareTunnelName $freshTn) -ne (Get-BareTunnelName $TunnelName))) {
         # A NEW NAME IS A CLAIM, AND IT USED TO BE BELIEVED WITHOUT CHECKING.
         #
-        # Measured 2026-09-09: .env changed from 'resonac-mcp' to 'devtunnel' at 07:36. This
+        # Measured 2026-09-09: .env's MCP_TUNNEL_NAME changed from the configured name to
         # branch stopped a WORKING host and switched to a tunnel that does not exist, so hosting
         # failed every ~35s for twelve minutes until something rewrote the name back. The switch
         # was the outage: leaving the old host alone would have cost nothing.
