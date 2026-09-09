@@ -1,4 +1,4 @@
-// FleetCockpit.cs -- native Windows (WPF) LIVE cockpit for parallel execution.
+﻿// FleetCockpit.cs -- native Windows (WPF) LIVE cockpit for parallel execution.
 //
 // relay/fleet_runner.py drives N autonomous Copilot conversations at once and writes a
 // live snapshot to .fleet/status.json after every round-robin sweep. This window tails
@@ -1015,6 +1015,7 @@ class CockpitWindow : Window
         if (k == "retry") return ja ? "再試行" : "Retry";
         if (k == "retry_all") return ja ? "停止を一括再試行" : "Retry all stopped";
         if (k == "retry_note") return ja ? "停止中のため、このゴール用にフリートを再起動しました" : "No run live — relaunched a fleet for this goal";
+        if (k == "retry_capped") return ja ? "再試行上限に達したゴールを除外" : "at retry cap, skipped";
         if (k == "autoretry") return ja ? "自動再試行" : "Auto-retry";
         if (k == "cap") return ja ? "上限" : "cap";
         if (k == "to_history") return ja ? "履歴へ" : "To history";
@@ -10222,8 +10223,20 @@ class CockpitWindow : Window
             List<Dictionary<string, object>> shownCap = shown;
             retryAll.Click += delegate
             {
-                RetryAllShown(shownCap);
-                if (_toolbarNote != null) _toolbarNote.Text = RunIsLive() ? "" : T("retry_note");
+                int skipped;
+                int queued = RetryAllShown(shownCap, out skipped);
+                if (_toolbarNote != null)
+                {
+                    string note = RunIsLive() ? "" : T("retry_note");
+                    if (skipped > 0)
+                    {
+                        // Say how many of the shown targets were refused and why. Without this
+                        // the press looks like a no-op and gets repeated.
+                        string cap = skipped + "/" + (queued + skipped) + " " + T("retry_capped");
+                        note = string.IsNullOrEmpty(note) ? cap : cap + " — " + note;
+                    }
+                    _toolbarNote.Text = note;
+                }
             };
             rightCl.Children.Add(retryAll);
         }
@@ -12241,8 +12254,18 @@ class CockpitWindow : Window
     // Feature C bulk: re-run EVERY currently-shown terminal non-DONE worker (respecting the active
     // filter). LIVE -> one merged add_goal list; FINISHED/stale -> ONE relaunched fleet carrying
     // all the retried goal texts (mirrors RetryGoal's live/finished split).
-    void RetryAllShown(List<Dictionary<string, object>> shown)
+    // THE RETRY BUDGET IS SHARED WITH AutoRetryScan, DELIBERATELY. This button had no cap of
+    // any kind, so _autoRetryMax bounded only the automatic path. One submitted goal reached
+    // 891 workers, 575 of them stuck: each press re-queued every still-stuck goal again, and
+    // nothing on screen said the press had done anything -- so it was pressed again.
+    //
+    // Counting against the same per-goal counter stops the amplification. RETURNING the
+    // skipped count is what stops the re-pressing, and matters just as much: a skip nobody
+    // can see is indistinguishable from a button that did not work, which is the behaviour
+    // that produced the pile in the first place.
+    int RetryAllShown(List<Dictionary<string, object>> shown, out int skippedAtCap)
     {
+        skippedAtCap = 0;
         bool live = RunIsLive();
         var cmd = ReadCommands();
         var adds = new List<object>();
@@ -12257,12 +12280,21 @@ class CockpitWindow : Window
             // mean "everything that is not DONE", which swept up fan-out parents and threw
             // away the merged answers they carried.
             if (!IsRetryableOutcome(S(w, "outcome"))) continue;
-            adds.Add(RetryEntry(w));
             string g = S(w, "goal");
+            // Same counter, same key (goal text), same ceiling as AutoRetryScan, so the auto
+            // and manual paths cannot each spend a full allowance on the same goal.
+            if (!string.IsNullOrEmpty(g))
+            {
+                int used = 0;
+                if (_autoRetryCount.ContainsKey(g)) used = _autoRetryCount[g];
+                if (used >= _autoRetryMax) { skippedAtCap++; continue; }
+                _autoRetryCount[g] = used + 1;   // count BEFORE queueing, as AutoRetryScan does
+            }
+            adds.Add(RetryEntry(w));
             if (!string.IsNullOrEmpty(g)) goalTexts.Add(g);
             n++;
         }
-        if (n == 0) return;
+        if (n == 0) return 0;
         if (live)
         {
             cmd["add_goal"] = adds;
@@ -12272,6 +12304,7 @@ class CockpitWindow : Window
         {
             try { SpawnFleet(goalTexts, "retry_input.txt"); _lastSig = ""; } catch (Exception) { }
         }
+        return n;
     }
 
     // MIRRORS relay/outcomes.py RETRYABLE. A copy, and copies drift -- so a test fails if
