@@ -634,15 +634,22 @@ def add_goal_to_live_fleet(goal: str, state_dir=None, priority: bool = False,
     `entry` lets a caller supply the whole command dict -- code_task adds `cwd` and `checks` --
     so it can share this path instead of keeping its own copy of it.
 
-    `jid`, when given, adds an `ack` path to the command so the fleet leaves a receipt when it
-    reads it. `add_goal` readers (goals_from_command) ignore the extra key, so this is safe for
-    every existing consumer; it only gives the sender a way to check the goal actually landed.
+    `jid`, when given, adds an `ack` path to the COMMAND (so the fleet leaves a receipt when
+    it reads it) AND an `jid` key on the ITEM itself, so this admission-time id survives into
+    the worker goals_from_command builds and, from there, into every snapshot row and
+    history.json entry that worker ever produces. Without the second half, `jid` never
+    reached the item goals_from_command reads, and nothing downstream of admission could join
+    back to `.fleet/tasks/done/<jid>.json` -- the codex-plan item-1 gap (2026-09-09): run_id
+    identifies a fleet SWEEP, jid identifies a GOAL, and until now no field carried the
+    latter past this function. `add_goal` readers ignore keys they do not recognise, so
+    adding this one is safe for every existing consumer that predates it.
     """
     sd = state_dir or FLEET_STATE_DIR
     item = dict(entry) if entry else {"text": goal, "priority": bool(priority)}
     patch = {"add_goal": [item]}
     if jid:
         patch["ack"] = _ack_path(jid, sd)
+        item["jid"] = jid
     write_command(sd, patch)
 
 
@@ -1117,7 +1124,11 @@ def fleet_handoff(goal: str, jid: str, state_dir=None):
     if AUTOSTART:
         may, why = autostart_status(state_dir)
         if may:
-            out = autostart_fleet([{"text": goal}], state_dir)
+            # jid carried into the goal dict, same as add_goal_to_live_fleet's live path
+            # above -- _read_goals_file() keeps a JSON-object goal line verbatim, so this
+            # survives into the cold-started fleet's Worker unchanged. Without it, a goal
+            # delivered via autostart could never be joined back to its admission record.
+            out = autostart_fleet([{"text": goal, "jid": jid}], state_dir)
             if out.get("ok"):
                 return "dispatched", {"handoff": "for_fleet/%s.txt" % jid,
                                       "delivered": "autostart",

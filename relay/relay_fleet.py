@@ -2023,6 +2023,15 @@ class RelayWorker:
         #: Which slice of a split this worker owns, so the merge can label its report. Read
         #: from the goal because that is where child_goals put it; absent for ordinary goals.
         self.subtask_index = goal.get("subtask_index") if isinstance(goal, dict) else None
+        #: THE ADMISSION-TIME ID (codex-plan item 1, 2026-09-09), NOT the same thing as
+        #: `run_id` above -- run_id names the fleet SWEEP this worker happens to run inside
+        #: and is shared by every worker in it; jid names the ADMITTED GOAL and is unique per
+        #: goal, minted once by task_router.py at submission time. Neither can stand in for
+        #: the other: a run_id join finds every worker of one sweep, a jid join finds the one
+        #: worker (across however many retries/reconciles) that answers one admitted request.
+        #: Empty for goals that never passed through admission (a bare -g flag, an interactive
+        #: retry) -- absence here is meaningful, not a bug to paper over with a minted value.
+        self.jid = goal.get("jid") if isinstance(goal, dict) else None
         text, checks, cwd = goal_fields(goal)
         self.goal = text
         self.checks = checks
@@ -4125,7 +4134,16 @@ class RelayWorker:
         verification gate first."""
         self._continue_count = 0   # a DONE claim is real progress -> the continue streak resets
         if not self.checks:
-            self.verified = False
+            # NOT self.verified = False. __init__'s own comment declares the contract:
+            # "None=not checked, True/False after a gate ran" -- and no gate ran here, only
+            # DONE was trusted (back-compat). Setting False made "nothing was configured to
+            # verify" indistinguishable from "a check ran and failed", which is exactly the
+            # distinction the codex-plan item-1 evidence bar calls for ("未検証と検証失敗を
+            # 区別する"). Measured 2026-09-09: 67 of 68 verified=False rows in history.json
+            # had verify_attempts=0 -- this branch, not a failed gate, produced almost all of
+            # them, and every self-improvement rate computed over "verified" was reading
+            # unconfigured workers as failures.
+            self.verified = None
             self._candidate_done()
             return
         self._pending_checks = list(self.checks)
@@ -6202,6 +6220,10 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     return [{"name": w.name, "goal": w.goal, "outcome": w.outcome,
              "turns": w.turn, "reason": w.reason,
              "verified": w.verified, "verify_attempts": w.verify_attempts,
+             # THE ADMISSION-TIME ID, carried into the final snapshot for the same reason
+             # run_id is just below: this dict is built once, after the sweep exits, and a
+             # worker archived from THIS snapshot (not the live one) needs the field too.
+             "jid": getattr(w, "jid", None) or "",
              # THE RUN IDENTITY, CARRIED INTO THE FINAL SNAPSHOT TOO.
              #
              # `run_id` is a parameter of this call (fleet_runner.py passes
