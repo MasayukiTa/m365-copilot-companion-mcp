@@ -161,14 +161,24 @@ def test_the_real_archive_stops_repeating(tmp_path):
     if len(rows) < 50:
         pytest.skip("archive too small to say anything")
 
+    # Mirror fleet_runner._register_convs's own key precedence (url, then the transcript
+    # path, and only then the title) -- not reinvent it. Every row in this archive has an
+    # empty "url" (these are local `source: "fleet"` workers, not Copilot-URL conversations),
+    # so falling back straight to "title" collapses the key for every row sharing one of the
+    # three mass-produced titles (732/172/153 rows) down to that one identical string, which
+    # made neutral_title()'s hash tag identical across all of them too -- the fallback that
+    # exists specifically to give indistinguishable rows something unique ended up giving them
+    # nothing of the kind. "transcript" is the one field this archive does carry unique per
+    # row (1083 distinct paths, one per session), same as production's `tr`.
     first = [CT.make_title((r.get("title") or "").strip(),
                            existing=(r.get("title") or "").strip(),
-                           key=(r.get("url") or r.get("title") or ""), when=r.get("ts"))
+                           key=(r.get("url") or r.get("transcript") or r.get("title") or ""),
+                           when=r.get("ts"))
              for r in rows]
     counts = Counter(first)
     final = []
     for r, d in zip(rows, first):
-        key = r.get("url") or (r.get("title") or "")
+        key = r.get("url") or r.get("transcript") or (r.get("title") or "")
         n = counts[d]
         if n < 3:
             final.append(d)
