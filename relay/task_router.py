@@ -144,6 +144,11 @@ except Exception:
         return False
 
 try:
+    from relay import splittability as _splittability
+except Exception:
+    _splittability = None
+
+try:
     from relay.autonomy_gate import _STOP_PATTERNS, _ASK_PATTERNS, _matches as _autonomy_matches
 except Exception:
     _STOP_PATTERNS = ()
@@ -696,19 +701,37 @@ def _wants_fanout(goals) -> bool:
     """Should this launch pass --fanout?
 
     An explicit FLEET_INTAKE_AUTOSTART_FANOUT wins in both directions. Otherwise fan out when
-    ANY goal is long enough to be worth a split -- one oversized goal in the batch is reason
-    enough, and the runner still decides per goal (short ones skip the split turn at depth 0,
-    subtasks_from refuses a split that came back too small or too large). With the size
-    heuristic disabled (threshold <= 0) and no override, the answer is False, which is the
-    old behaviour exactly.
+    ANY goal actually looks independent/parallelizable (relay.splittability.judge), not merely
+    long -- codex-plan item 6 (2026-09-09): the length-only proxy this used to be
+    (len(text) >= AUTOSTART_FANOUT_MIN_CHARS) was measured against the real fleet transcript
+    corpus (1214 real goal occurrences, .fleet/**/transcripts/*.jsonl(.gz)) to call SPLIT on
+    60.8% of them by length alone, while the actual independence-based judgment calls SPLIT on
+    0.7% -- most of the long ones are one email/SharePoint investigation with several numbered
+    sub-questions about the SAME case, a shape already measured in production (campaign
+    c7e01b58b1956) to over-split (4 of 7 subtasks refused, starved of the context the others
+    held). RelayWorker re-runs this same judgment per goal (see relay_fleet.py), including for
+    goals added mid-run -- this function only decides whether the RUN is fan-out-CAPABLE at
+    all, same as before.
+
+    If splittability failed to import, or every goal fails to judge cleanly, this falls back
+    to the OLD length proxy rather than refusing fan-out outright: unlike a per-goal decision
+    (where a judging failure must default to "don't split", see relay_fleet.py), refusing the
+    whole run's --fanout CAPABILITY on an import hiccup would silently disable a feature this
+    function existed to enable; the length proxy is the documented, already-shipped fallback
+    behaviour it is replacing, not a new permissive default.
     """
     override = _truthy_env("FLEET_INTAKE_AUTOSTART_FANOUT")
     if override is not None:
         return override
     if AUTOSTART_FANOUT_MIN_CHARS <= 0:
         return False
-    return any(len((g or {}).get("text") or "") >= AUTOSTART_FANOUT_MIN_CHARS
-               for g in (goals or []))
+    texts = [(g or {}).get("text") or "" for g in (goals or [])]
+    if _splittability is not None:
+        try:
+            return any(_splittability.judge(t).should_split for t in texts)
+        except Exception:
+            pass
+    return any(len(t) >= AUTOSTART_FANOUT_MIN_CHARS for t in texts)
 
 
 def launch_creationflags() -> int:
