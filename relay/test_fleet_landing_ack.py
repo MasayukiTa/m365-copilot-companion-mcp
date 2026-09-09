@@ -82,8 +82,12 @@ def test_a_stale_receipt_from_a_previous_run_does_not_count(state):
 
 
 def test_the_ack_key_does_not_disturb_what_the_reader_extracts(state):
+    """The `ack` key sits on the COMMAND, not the item -- it must never leak into what
+    goals_from_command extracts. `jid`, added 2026-09-09 (codex-plan item 1), is different:
+    it is deliberately placed ON the item by add_goal_to_live_fleet so the goal's admission
+    id survives into the worker that runs it, so it belongs in the expected shape here."""
     _live(state)
     TR.fleet_handoff("内容は不変", "jrt", str(state))
     goals = [g for c in FR.read_commands(str(state)) for g in FR.goals_from_command(c)]
-    assert goals == [{"text": "内容は不変", "priority": False}], (
+    assert goals == [{"text": "内容は不変", "priority": False, "jid": "jrt"}], (
         "the ack path leaked into the goal the reader extracted: %r" % (goals,))

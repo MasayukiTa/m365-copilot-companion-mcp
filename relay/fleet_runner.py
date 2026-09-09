@@ -1064,6 +1064,15 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
             "conv_title": getattr(w, "conv_title", ""),
             "verified": getattr(w, "verified", None),
             "verify_attempts": getattr(w, "verify_attempts", 0),
+            # THE ADMISSION-TIME ID (codex-plan item 1, 2026-09-09) -- NOT run_id below.
+            # run_id names the fleet SWEEP; jid names the ADMITTED GOAL, minted once by
+            # task_router.py at submission and carried through add_goal_to_live_fleet /
+            # goals_from_command / autostart_fleet into Worker.jid. This is what lets
+            # .fleet/tasks/done/<jid>.json (admission), .fleet/acked/<jid>*.json (delivery),
+            # and this worker's own verified/verify_attempts above be joined on ONE id, which
+            # is exactly the evidence bar the plan named: "同一run IDで受付・発火・実行・
+            # 検証・終了を結ぶ". Empty for goals that never passed through admission.
+            "jid": getattr(w, "jid", None) or "",
             # THE NAME OF THE RUN THIS WORKER BELONGS TO, stated rather than left implicit.
             #
             # Four notions of "run" exist in the ledgers and none of them join: ownership.jsonl
@@ -1535,6 +1544,12 @@ def goals_from_command(cmd) -> list:
                     g["checks"] = it["checks"]
                 if it.get("cwd"):
                     g["cwd"] = it["cwd"]
+                # THE ADMISSION-TIME ID, carried through same as checks/cwd. task_router's
+                # add_goal_to_live_fleet puts it on the item when the sender wants a receipt;
+                # without threading it here it dead-ends at this function exactly the way the
+                # module docstring above already warns a writer/reader mismatch can happen.
+                if it.get("jid"):
+                    g["jid"] = it["jid"]
                 out.append(g)
             elif isinstance(it, str) and it:
                 out.append({"text": it, "priority": False})
@@ -2487,6 +2502,10 @@ def main():
             # ArchiveTerminal sees every worker terminal at once -- did not. Same defect class as
             # `verified`/`verify_attempts` above, just in the OTHER snapshot builder.
             "run_id": r.get("run_id", ""),
+            # THE ADMISSION-TIME ID (see _snapshot()'s matching field for the full story).
+            # Same "final snapshot never got what the live one had" gap as run_id above --
+            # relay_fleet.py's return dict now carries jid too, so this just has to read it.
+            "jid": r.get("jid", ""),
             "conv_url": r.get("conv_url", ""),
             "conv_title": r.get("conv_title", ""),
             "transcript": r.get("transcript", ""),

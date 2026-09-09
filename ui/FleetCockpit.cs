@@ -13073,6 +13073,11 @@ class CockpitWindow : Window
             e["verified"] = w.ContainsKey("verified") ? w["verified"] : null;
             e["verify_attempts"] = I(w, "verify_attempts");
             e["run_id"] = S(w, "run_id");
+            // THE ADMISSION-TIME ID (codex-plan item 1, 2026-09-09). Not the same thing as
+            // run_id just above -- run_id names the SWEEP this worker ran in, jid names the
+            // ADMITTED GOAL, unique per submission. BOTH ARCHIVE SITES GET THIS, same rule
+            // as run_id's own comment: fixing one and leaving the other repeats the miss.
+            e["jid"] = S(w, "jid");
             e["turn"] = I(w, "turn"); e["seq"] = _history.Count;
             e["ts"] = NowUnix();   // P2: archived-at timestamp -> date-group subheaders in History
             CarryTimeline(e, w, started);
@@ -13132,6 +13137,11 @@ class CockpitWindow : Window
             e["verified"] = w.ContainsKey("verified") ? w["verified"] : null;
             e["verify_attempts"] = I(w, "verify_attempts");
             e["run_id"] = S(w, "run_id");
+            // THE ADMISSION-TIME ID (codex-plan item 1, 2026-09-09). Not the same thing as
+            // run_id just above -- run_id names the SWEEP this worker ran in, jid names the
+            // ADMITTED GOAL, unique per submission. BOTH ARCHIVE SITES GET THIS, same rule
+            // as run_id's own comment: fixing one and leaving the other repeats the miss.
+            e["jid"] = S(w, "jid");
             e["turn"] = I(w, "turn"); e["seq"] = _history.Count;
             e["ts"] = NowUnix();   // P2: archived-at timestamp -> date-group subheaders in History
             CarryTimeline(e, w, started);
