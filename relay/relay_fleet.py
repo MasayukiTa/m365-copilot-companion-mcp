@@ -464,16 +464,57 @@ CANNED_NONANSWER_MARKERS = (
 _PROCESS_START = time.time()
 
 
-def connector_proven():
-    """True once a tool call has reached this machine's MCP server during this run."""
+#: A SECOND WAY TO BE PROVEN, because process scope has a hole in it. "One process per run, so
+#: process scope is run scope" holds only while a run has SIBLINGS. A single-goal run has one
+#: worker, and that worker is the only possible witness -- so if its first reply is the canned
+#: non-answer, no tool call can ever land in this process and connector_proven() is False by
+#: construction, whatever the truth is. Measured 2026-09-09: an autostarted single-goal run was
+#: filed INFRA_STUCK at 11:34 while .fleet/probe_inbound.json recorded a real list_directory
+#: call arriving at 11:47 -- the connector was demonstrably alive on both sides of the run.
+#: A 900-worker run never shows this: one sibling proves it within seconds and every worker in
+#: the process inherits the proof. So the classification was reliable exactly where it was not
+#: needed, and structurally wrong for the runs autostart produces.
+#:
+#: The bridge's liveness probe stamps that file every MCP_TOOL_PROBE_SEC, independently of any
+#: fleet. It is the SAME kind of evidence -- a tool call actually arriving at this machine's
+#: server, which only the custom agent can cause -- just not one this process caused. Recency
+#: is what makes it mean anything, so the window is derived from the probe interval rather than
+#: picked: shorter than one interval and a healthy machine still reads as unproven.
+CONNECTOR_PROOF_WINDOW_S = float(os.environ.get(
+    "MCP_CONNECTOR_PROOF_S",
+    str(2.0 * float(os.environ.get("MCP_TOOL_PROBE_SEC", "600") or 0.0))))
+
+
+def connector_proof_source(now=None):
+    """WHY the connector counts as proven: "run", "probe", or "" for not proven.
+
+    The caller needs the reason, not just the verdict: the REFUSED message used to say a
+    sibling worker had answered, which is true for "run" and false for "probe". Reporting the
+    wrong evidence is its own defect even when the verdict is right.
+    """
     try:
         from tools import tool_probe
-        return float(tool_probe.last_inbound_ts() or 0.0) > _PROCESS_START
+        ts = float(tool_probe.last_inbound_ts() or 0.0)
     except Exception:
-        # Unknowable is not the same as proven. Saying False keeps the old diagnosis, which is
+        # Unknowable is not the same as proven. Saying "" keeps the old diagnosis, which is
         # the conservative direction: it tells the operator to check the browser, which wastes
         # time, rather than telling them a broken connector is fine, which loses the run.
-        return False
+        return ""
+    if ts > _PROCESS_START:
+        return "run"
+    if ts > 0.0 and CONNECTOR_PROOF_WINDOW_S > 0:
+        now = time.time() if now is None else now
+        age = now - ts
+        # A stamp from the FUTURE is a clock problem, not proof. Bounding below costs nothing
+        # and stops a skewed clock reading as permanently proven.
+        if 0.0 <= age <= CONNECTOR_PROOF_WINDOW_S:
+            return "probe"
+    return ""
+
+
+def connector_proven(now=None):
+    """True once a tool call has reached this machine's MCP server recently enough to count."""
+    return connector_proof_source(now) != ""
 # How long (wall clock) to keep riding out a login-wall canned-non-answer streak before giving up
 # as INFRA_STUCK (sign-in required). Mirrors the AGENT_ERR_WINDOW_S style of bounded-but-generous
 # infra windows. Env-tunable.
@@ -3712,17 +3753,34 @@ class RelayWorker:
                 # canned reply is about this prompt, so telling the operator to relaunch Edge
                 # sends them after a fault that is not there.
                 self.status = "stuck"
-                if connector_proven():
+                _proof = connector_proof_source()
+                if _proof == "run":
                     self.outcome = "REFUSED"
                     self.reason = ("⚠ 定型の無回答が継続。ただし本走行の別ワーカーにはカスタム"
                                    "エージェントが応答しており、MCPコネクタは生きている。"
                                    "→ 接続の問題ではなく**この指示に対する拒否**。"
                                    "再ナビもヘッドフル復旧も効かない。指示の言い換えが要る。")
+                elif _proof == "probe":
+                    # SAME VERDICT, DIFFERENT EVIDENCE. Saying "a sibling answered" here would
+                    # be false -- this run may have had no sibling at all.
+                    self.outcome = "REFUSED"
+                    self.reason = ("⚠ 定型の無回答が継続。ただし直近%.0f分以内に本機のMCP"
+                                   "サーバへ実際のツール呼び出しが着弾しており(死活プローブ)、"
+                                   "コネクタ自体は生きている。→ 接続の問題ではなく"
+                                   "**この指示に対する拒否**の可能性が高い。指示の言い換えから試せ。"
+                                   % (CONNECTOR_PROOF_WINDOW_S / 60.0))
                 else:
                     self.outcome = "INFRA_STUCK"
-                    self.reason = ("⚠ 定型の無回答が継続。headless の ?titleId= 解決失敗で既定Copilot"
-                                   "(MCPコネクタ無し)にフォールバックしている疑い。再ナビ/ヘッドフル復旧でも"
-                                   "解消せず。**タスク失敗でなくインフラ(接続/エージェント未確立)**=再投入対象。")
+                    # WHAT IS MEASURED, THEN WHAT IS GUESSED, LABELLED AS SUCH. The old wording
+                    # asserted the headless/?titleId= fallback as the cause. Nothing here
+                    # measures that -- this branch only knows no tool call has arrived. A reader
+                    # took the old sentence for a finding and reported it as the root cause.
+                    self.reason = ("⚠ 定型の無回答が継続し、再ナビ/ヘッドフル復旧でも解消せず。"
+                                   "**測定されたのは「直近%.0f分、本機のMCPサーバにツール呼び出しが1件も"
+                                   "着弾していない」ことだけ**。原因は未特定。headless の ?titleId= 解決失敗で"
+                                   "既定Copilot(コネクタ無し)に落ちているのが有力な**仮説**だが、確認済みの"
+                                   "事実ではない。=再投入対象。"
+                                   % (CONNECTOR_PROOF_WINDOW_S / 60.0))
                 return
             except Exception:
                 # NEVER raise out of _decide: on any unexpected error, fall through to the normal
