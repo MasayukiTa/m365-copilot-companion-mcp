@@ -218,6 +218,59 @@ def load_contract() -> Optional[dict]:
     return data
 
 
+#: The only op_class values check_op() recognises (see its own docstring / the module
+#: header). Not otherwise enforced anywhere in this file until activate_contract() below --
+#: a contract naming "delet" instead of "delete" would previously write successfully and
+#: gate nothing, silently, forever. Kept as a tuple rather than duplicated as a set literal
+#: in two places.
+KNOWN_OP_CLASSES = ("delete", "outbound", "shell_destructive")
+
+
+def activate_contract(scope: str = "", ask_before=(), stop_when=()) -> dict:
+    """Write .fleet/active_contract.json with active=true. The missing half of
+    deactivate_contract() (codex-plan item 3, 2026-09-09): nothing in this codebase could
+    turn a contract ON before this, only off.
+
+    REFUSES rather than clobbers when a contract is ALREADY active -- two activations in a
+    row would mean the second one's `started` (its identity) silently replaces the first's,
+    and whoever is relying on the first contract's identity for their own retirement record
+    would then retire a contract that is no longer the one enforcing anything. Call
+    deactivate_contract() first if replacing an active contract is genuinely intended.
+
+    Validates ask_before/stop_when against KNOWN_OP_CLASSES for the same reason check_op's
+    own docstring enumerates them: an op_class this file does not recognise gates nothing,
+    silently, and a contract that silently gates nothing is worse than no contract -- it
+    reads as protection that was never there.
+
+    `scope` is accepted and stored for the operator's own reference (it appears in the
+    written file) but is NOT enforced anywhere in this module -- see the module docstring's
+    own "// informational folder scope". Once active, ask_before/stop_when apply to every
+    call to a gated tool on this machine, regardless of what path it touches. Callers who
+    need a narrow blast radius get it by choosing a narrow op_class list, not a narrow scope.
+
+    Returns {"ok": True, "contract": <dict written>} or {"ok": False, "detail": <why>}.
+    """
+    state, _ = contract_state()
+    if state == "active":
+        return {"ok": False, "detail": "a contract is already active; "
+                                       "call deactivate_contract() first"}
+    bad = [c for c in list(ask_before) + list(stop_when) if c not in KNOWN_OP_CLASSES]
+    if bad:
+        return {"ok": False, "detail": "unknown op_class %r; known: %r" % (bad, KNOWN_OP_CLASSES)}
+    data = {
+        "active": True,
+        "scope": str(scope or ""),
+        "ask_before": list(ask_before),
+        "stop_when": list(stop_when),
+        "started": time.time(),
+    }
+    try:
+        _atomic_write_json(_CONTRACT_FILE, data)
+    except Exception as e:
+        return {"ok": False, "detail": "write failed: %s" % e}
+    return {"ok": True, "contract": data}
+
+
 def deactivate_contract() -> None:
     """Set active=false in the contract file (called by fleet_runner on exit).
 
