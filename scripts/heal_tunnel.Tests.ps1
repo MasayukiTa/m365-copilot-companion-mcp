@@ -12,6 +12,19 @@ $scriptPath = Join-Path $PSScriptRoot "heal_tunnel.ps1"
 . $scriptPath
 
 Describe "Get-TunnelHealAction" {
+# PESTER 5 RUNS FILE-SCOPE CODE DURING DISCOVERY, NOT DURING THE RUN. The dot-source above
+# is enough for Pester 3.4.0 (what this machine has) and useless on the CI runner (which picks
+# Pester 5): there, these functions are defined while tests are being FOUND and are gone by the
+# time any It executes -- "Discovery found 13 tests" and then 13 identical
+# CommandNotFoundException failures. Repeating the dot-source in a BeforeAll inside each
+# Describe puts them in the run phase as well; 3.4.0 honours BeforeAll too, so one file works
+# on both and neither version needs pinning.
+    # $scriptPath is a FILE-SCOPE variable, so under Pester 5 it belongs to the discovery
+    # phase and is null by the time this runs -- `. $null` fails with "the expression after
+    # '.' ... must result in a command name". Rebuild the path here, where $PSScriptRoot is
+    # available in both phases.
+    BeforeAll { . (Join-Path $PSScriptRoot "heal_tunnel.ps1") }
+
 
     It "owned name + matching URL -> noop" {
         $owned = @([PSCustomObject]@{ Id = "mytunnel.usw2"; Url = "https://mytunnel-abcd.usw2.devtunnels.ms/" })
@@ -65,6 +78,19 @@ Describe "Get-TunnelHealAction" {
 }
 
 Describe "Get-OwnedTunnelIdsFromListOutput" {
+# PESTER 5 RUNS FILE-SCOPE CODE DURING DISCOVERY, NOT DURING THE RUN. The dot-source above
+# is enough for Pester 3.4.0 (what this machine has) and useless on the CI runner (which picks
+# Pester 5): there, these functions are defined while tests are being FOUND and are gone by the
+# time any It executes -- "Discovery found 13 tests" and then 13 identical
+# CommandNotFoundException failures. Repeating the dot-source in a BeforeAll inside each
+# Describe puts them in the run phase as well; 3.4.0 honours BeforeAll too, so one file works
+# on both and neither version needs pinning.
+    # $scriptPath is a FILE-SCOPE variable, so under Pester 5 it belongs to the discovery
+    # phase and is null by the time this runs -- `. $null` fails with "the expression after
+    # '.' ... must result in a command name". Rebuild the path here, where $PSScriptRoot is
+    # available in both phases.
+    BeforeAll { . (Join-Path $PSScriptRoot "heal_tunnel.ps1") }
+
 
     # MEASURED 2026-09-09: heal_tunnel.ps1's Invoke-DevTunnelBounded runs the CLI as
     # `& $exe @a 2>&1 | Out-String`, merging stderr into the text that gets parsed as
@@ -125,6 +151,19 @@ Describe "Get-OwnedTunnelIdsFromListOutput" {
 }
 
 Describe "Test-LooksLikeExecutableSuffix" {
+# PESTER 5 RUNS FILE-SCOPE CODE DURING DISCOVERY, NOT DURING THE RUN. The dot-source above
+# is enough for Pester 3.4.0 (what this machine has) and useless on the CI runner (which picks
+# Pester 5): there, these functions are defined while tests are being FOUND and are gone by the
+# time any It executes -- "Discovery found 13 tests" and then 13 identical
+# CommandNotFoundException failures. Repeating the dot-source in a BeforeAll inside each
+# Describe puts them in the run phase as well; 3.4.0 honours BeforeAll too, so one file works
+# on both and neither version needs pinning.
+    # $scriptPath is a FILE-SCOPE variable, so under Pester 5 it belongs to the discovery
+    # phase and is null by the time this runs -- `. $null` fails with "the expression after
+    # '.' ... must result in a command name". Rebuild the path here, where $PSScriptRoot is
+    # available in both phases.
+    BeforeAll { . (Join-Path $PSScriptRoot "heal_tunnel.ps1") }
+
 
     It "flags .exe and sibling executable/script suffixes" {
         Test-LooksLikeExecutableSuffix "exe" | Should Be $true
