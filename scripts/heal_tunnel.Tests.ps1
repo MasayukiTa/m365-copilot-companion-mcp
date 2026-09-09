@@ -98,11 +98,11 @@ Describe "Get-OwnedTunnelIdsFromListOutput" {
     # 07:35-07:36 in .setup/logs/server.err.history.log), PowerShell renders the merged
     # native-command stderr as a line starting with the executable name -- confirmed
     # against the real regex: "devtunnel.exe : Error: ..." matches
-    # '^\s*([a-z0-9][a-z0-9-]+\.[a-z0-9]+)\s' the same way "resonac-mcp.jpe1 " does, and
+    # '^\s*([a-z0-9][a-z0-9-]+\.[a-z0-9]+)\s' the same way "mytunnel.jpe1 " does, and
     # the old (pre-fix) extraction reduced it via Get-BareTunnelId to the bare id
     # "devtunnel" -- an id nobody owns, believed anyway because parsing SUCCEEDED (Count
     # -eq 1), so the "could not parse" guard never fired. This is the mechanism behind
-    # the 2026-09-09 07:36 corruption of MCP_TUNNEL_NAME from 'resonac-mcp' to
+    # the 2026-09-09 07:36 corruption of MCP_TUNNEL_NAME from the configured name to
     # 'devtunnel'.
 
     It "parses a real tunnel row" {
@@ -111,10 +111,10 @@ Describe "Get-OwnedTunnelIdsFromListOutput" {
             ""
             "ID                Description  Host Connections  Client Connections  Ports"
             "----------------  -----------  ----------------  ------------------  -----"
-            "resonac-mcp.jpe1                          1                    0        8000"
+            "mytunnel.jpe1                          1                    0        8000"
         ) -join "`r`n"
         $ids = Get-OwnedTunnelIdsFromListOutput $listOut
-        $ids | Should Be @("resonac-mcp.jpe1")
+        $ids | Should Be @("mytunnel.jpe1")
     }
 
     It "does NOT parse a merged PowerShell native-command error line as a tunnel id (THE BUG)" {
@@ -136,11 +136,11 @@ Describe "Get-OwnedTunnelIdsFromListOutput" {
         # hiccup would produce: a good row plus a merged stderr line in the same
         # Invoke-DevTunnelBounded output.
         $listOut = @(
-            "resonac-mcp.jpe1                          1                    0        8000"
+            "mytunnel.jpe1                          1                    0        8000"
             "devtunnel.exe : Error: unable to refresh token: 401 invalid_token"
         ) -join "`r`n"
         $ids = Get-OwnedTunnelIdsFromListOutput $listOut
-        $ids | Should Be @("resonac-mcp.jpe1")
+        $ids | Should Be @("mytunnel.jpe1")
         ($ids -contains "devtunnel") | Should Be $false
     }
 
