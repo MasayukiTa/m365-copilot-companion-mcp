@@ -94,14 +94,57 @@ def main():
         log("scp runner failed"); return
 
     # 2) launch ONE swebench batch eval, detached (survives SSH drops; long build+run)
-    inner = ("systemctl reset-failed " + runid + " 2>/dev/null; rm -f /tmp/gb_" + runid + ".log; "
-             "systemd-run --no-block --unit=" + runid + " bash -lc "
-             "'python3 " + runner_wsl + " " + preds_wsl + " " + runid + " " + str(a.max_workers)
-             + " " + a.dataset_name
-             + " > /tmp/gb_" + runid + ".log 2>&1'")
-    launch = ("$j = Start-Job { (wsl.exe -d " + R.DISTRO + " -u root -- bash -lc \"" + inner + "\" 2>$null)"
-              " -join '' }; if(Wait-Job $j -Timeout 30){ Receive-Job $j } else { 'TO' }; Remove-Job $j -Force")
-    R._ssh_ps(launch, 55)
+    #
+    # THE sleep 3 AT THE END IS NOT DECORATION. `systemd-run --no-block` returns as soon as the
+    # unit is HANDED to the manager, before it has finished detaching from the invoking session.
+    # This whole line runs as the last thing inside `wsl.exe ... bash -lc "..."`, launched from a
+    # PowerShell Start-Job that exits the moment this bash process exits -- and when that exit
+    # follows systemd-run by only microseconds, the transient unit gets torn down with the
+    # session that spawned it, never runs, and never writes its log. Measured directly
+    # (2026-09-09): the exact same launch line with no pause afterward left the unit's own
+    # `systemctl status <runid>` reporting "could not be found" and no /tmp/gb_<runid>.log ever
+    # created. The Wait-Job timeout below was widened alongside the sleep for the same reason: a
+    # timed-out Wait-Job still runs Remove-Job -Force, which can kill the wrapping job (and the
+    # wsl.exe process it holds) before the sleep inside it has even had a chance to run on a
+    # slow SSH/WSL cold start.
+    #
+    # THE VERIFY-AND-RETRY LOOP BELOW IS A SEPARATE, SECOND DEFECT, not a restatement of the
+    # first. Even with the pause above, three consecutive real runs (2026-09-09) still returned
+    # from `_ssh_ps(launch, ...)` with the normal empty "success" output, yet /tmp/gb_<runid> was
+    # never created and the eval never ran -- the poll loop then found a stray, empty, valid-
+    # looking .batchresult.json and reported a false EVALERR rather than timing out honestly.
+    # `_ssh_ps` cannot distinguish this from a real success: `--no-block` legitimately returns
+    # empty stdout too, so its own tries-loop (which only retries on EMPTY output) never fires.
+    # The eval host's own sshd has a documented very-low MaxStartups (see the scp retry helper
+    # just above this function), and this launch call follows two scp calls in quick succession
+    # -- a connection silently degraded by that pressure is indistinguishable, from here, from a
+    # clean detached launch. So the ONLY reliable signal is to check the remote side directly:
+    # does the workdir this run's own script creates as its very first statement actually exist
+    # a few seconds later? If not, the launch did not really happen and must be retried.
+    def _launch_once():
+        inner = ("systemctl reset-failed " + runid + " 2>/dev/null; rm -f /tmp/gb_" + runid + ".log; "
+                 "systemd-run --no-block --unit=" + runid + " bash -lc "
+                 "'python3 " + runner_wsl + " " + preds_wsl + " " + runid + " " + str(a.max_workers)
+                 + " " + a.dataset_name
+                 + " > /tmp/gb_" + runid + ".log 2>&1'; sleep 3")
+        launch = ("$j = Start-Job { (wsl.exe -d " + R.DISTRO + " -u root -- bash -lc \"" + inner + "\" 2>$null)"
+                  " -join '' }; if(Wait-Job $j -Timeout 45){ Receive-Job $j } else { 'TO' }; Remove-Job $j -Force")
+        R._ssh_ps(launch, 75)
+
+    launched = False
+    for attempt in range(1, 4):
+        _launch_once()
+        time.sleep(4)
+        seen = R._wsl_token("test -d /tmp/gb_" + runid + " && echo Y || echo N")
+        if seen == "Y":
+            launched = True
+            break
+        log("launch attempt %d/3 did not create the remote workdir (SSH connection pressure or "
+            "a similar transient fault); retrying" % attempt)
+    if not launched:
+        log("launch never took (3 attempts, workdir never appeared) -- refusing to poll for a "
+            "result that was never asked for. This is an infra fault, not a graded outcome.")
+        return
     log("launched swebench batch (runid=%s). polling for result..." % runid)
 
     # 3) poll for the .done marker, then pull the result json
@@ -127,6 +170,13 @@ def main():
     if result is None:
         log("TIMEOUT after %d min -- no batch result. Check /tmp/gb_%s.log on the eval host." % (a.max_wait_min, runid))
         return
+    if result.get("stderr_tail"):
+        # evalhost_batch_grade.py only sets this when it produced zero real verdicts -- the run
+        # completed (a result WAS written) but swebench itself never resolved anything, and this
+        # is swebench's own reason why, not a guess. Surfaced here so the caller does not have to
+        # go fetch %s.run.out by hand to find out the batch ran but failed for a real reason.
+        log("swebench produced 0 real verdicts (returncode=%s). stderr tail:\n%s"
+            % (result.get("returncode"), result["stderr_tail"]))
 
     resolved = set(result.get("resolved", []))
     unresolved = set(result.get("unresolved", []))

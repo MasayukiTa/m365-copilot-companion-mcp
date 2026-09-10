@@ -93,12 +93,18 @@ def launch_grade(inst, diff, runid):
     if not R._scp(lp, remote_win):
         return False
     # fresh unit (nonce in runid) -> never collides; reset-failed is belt-and-suspenders.
+    #
+    # THE sleep 3 AND THE 45s Wait-Job CEILING ARE NOT DECORATION -- see the identical comment
+    # in swe_grade_swebench.py, where this exact race (systemd-run --no-block torn down along
+    # with the invoking wsl.exe session before it finishes detaching -- and a timed-out Wait-Job
+    # still Remove-Job -Force'ing the wrapper, killing a launch that just needed a bit more time)
+    # was measured and fixed 2026-09-09. Same launch shape, same fix, all three call sites.
     launch = ("$j = Start-Job { (wsl.exe -d " + R.DISTRO + " -u root -- bash -lc "
               "'systemctl reset-failed " + runid + " 2>/dev/null; rm -f /tmp/grade_" + runid + ".log; "
               "systemd-run --no-block --unit=" + runid + " bash " + R.RUNNER_WSL
-              + " " + inst + " " + remote_wsl + " " + runid + "' 2>$null) -join '' }; "
-              "if(Wait-Job $j -Timeout 25){ Receive-Job $j } else { 'TO' }; Remove-Job $j -Force")
-    R._ssh_ps(launch, 55)
+              + " " + inst + " " + remote_wsl + " " + runid + "; sleep 3' 2>$null) -join '' }; "
+              "if(Wait-Job $j -Timeout 45){ Receive-Job $j } else { 'TO' }; Remove-Job $j -Force")
+    R._ssh_ps(launch, 75)
     return True
 
 
