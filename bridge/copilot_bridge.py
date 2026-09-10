@@ -1528,6 +1528,43 @@ def return_page(borrowed):
     return True
 
 
+def _release_resident_page_locked(reason=""):
+    """PAGE-OWNER THREAD ONLY. Close the resident agent tab, keeping a blank page behind.
+
+    Same three steps as the startup release, and for the same measured reasons: Edge exits with
+    its LAST page (closing the agent tab took the whole browser down and CDP with it), a
+    restart that opens a keep-alive without reusing an existing blank accumulates about:blank
+    tabs, and a PAGE without its DRIVER is the state ensure_page_alive exists to repair. If any
+    step fails the page simply stays -- the saving is not worth risking the browser for.
+    """
+    global PAGE, DRIVER
+    if PAGE is None or CTX is None:
+        return False
+    try:
+        if not any((pg.url or "") in ("about:blank", "")
+                   for pg in CTX.pages if pg is not PAGE):
+            CTX.new_page()
+        doomed, PAGE = PAGE, None
+        if not getattr(DRIVER, "IS_SOCKET", False):
+            DRIVER = None
+        doomed.close()
+        print("bridge: resident page released (%s); a blank page holds the browser open"
+              % (reason or "no longer needed"), flush=True)
+        return True
+    except Exception as exc:
+        print("bridge: keeping the resident page (%s: %s)"
+              % (type(exc).__name__, str(exc)[:120]), flush=True)
+        return False
+
+
+def release_resident_page(reason=""):
+    """Release the resident agent tab from any thread. Never raises."""
+    try:
+        return bool(run_on_page_thread(_release_resident_page_locked, reason))
+    except Exception:
+        return False
+
+
 def ensure_driver():
     """The driver for the CONVERSATION: a socket when one can be had, else the page.
 
@@ -1560,6 +1597,11 @@ def ensure_driver():
         # a channel that does not exist. Every other operational line here is a print for the
         # same reason.
         print("bridge: conversation is on a SOCKET (no tab needed for turns)", flush=True)
+        # AND THE TAB GOES. "No tab needed for turns" was printed while a Copilot tab stayed
+        # open and resident, because the only release lived in startup and nothing revisited it
+        # once a socket arrived later. The DOM endpoints reopen one on demand (borrow_page), so
+        # nothing is lost but the memory.
+        release_resident_page("the conversation moved to a socket")
         return DRIVER
     if DRIVER is not None and not _on_socket():
         print("bridge: conversation stays on the PAGE (no socket available)", flush=True)
@@ -5681,11 +5723,21 @@ def _do_tool_probe_turn(instruction):
     composer check above it already passed, so verify_probe_reply naturally resolves this to
     kind="error" rather than the misleading "agent_unreachable" (which is reserved for the
     composer never having rendered at all)."""
-    agent_loaded = False
-    try:
-        agent_loaded = PAGE is not None and PAGE.locator(COPILOT_SELECTORS["composer"]).count() > 0
-    except Exception:
+    # A SOCKET TURN DOES NOT NEED A DOM COMPOSER, and requiring one is what kept a Copilot tab
+    # resident for the life of the process. The probe borrowed a page every MCP_TOOL_PROBE_SEC
+    # purely to satisfy this gate, then held it -- measured 2026-09-10: transport=socket with
+    # has_resident_page=True and a 380 MB Copilot tab on the bridge's Edge, while every turn was
+    # going over the socket and touching nothing on that tab. The composer check is the right
+    # question for the page transport, and the wrong one to ask of a transport that has no page.
+    if _on_socket():
+        agent_loaded = True
+    else:
         agent_loaded = False
+        try:
+            agent_loaded = (PAGE is not None
+                            and PAGE.locator(COPILOT_SELECTORS["composer"]).count() > 0)
+        except Exception:
+            agent_loaded = False
     if not agent_loaded:
         return False, "", False
     try:

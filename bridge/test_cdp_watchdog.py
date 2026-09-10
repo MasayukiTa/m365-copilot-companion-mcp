@@ -220,3 +220,43 @@ def test_the_capture_declares_itself_and_always_clears_the_declaration():
 
 def test_the_capture_budget_is_never_shorter_than_the_wedge_limit():
     assert bridge.CAPTURE_DECLARED_S >= bridge.PAGE_THREAD_WEDGE_LIMIT_S
+
+
+# -- a socket conversation must not hold a Copilot tab -----------------------------------------
+#
+# MEASURED 2026-09-10: transport=socket with has_resident_page=True and a 380 MB Copilot tab on
+# the bridge's Edge, while every turn went over the socket and touched nothing on that tab. Two
+# causes, both here: the tool probe's gate required a DOM composer even for a socket turn (so it
+# borrowed a page every MCP_TOOL_PROBE_SEC and held it), and the only page release lived in
+# startup, so nothing revisited it when a socket arrived later.
+
+def test_the_probe_does_not_require_a_composer_when_the_turn_goes_over_a_socket():
+    source = bridge.Path(bridge.__file__).read_text(encoding="utf-8")
+    i = source.index("def _do_tool_probe_turn")
+    body = source[i:i + 1800]
+    assert "if _on_socket():" in body and "agent_loaded = True" in body, (
+        "the probe gates a socket turn on a DOM composer again; it will borrow and hold a "
+        "Copilot tab for the life of the process")
+    assert 'COPILOT_SELECTORS["composer"]' in body, (
+        "the composer check is still the right question for the PAGE transport and must stay")
+
+
+def test_a_socket_driver_releases_the_resident_page():
+    source = bridge.Path(bridge.__file__).read_text(encoding="utf-8")
+    i = source.index("conversation is on a SOCKET")
+    assert "release_resident_page(" in source[i:i + 700], (
+        '"no tab needed for turns" is printed again without releasing the tab')
+
+
+def test_releasing_the_page_keeps_a_blank_one_and_does_not_clear_a_socket_driver():
+    """Edge exits with its last page -- closing the agent tab without leaving a blank behind
+    took the whole browser down and CDP with it. And the socket DRIVER must survive: it is the
+    thing that made the page releasable in the first place."""
+    source = bridge.Path(bridge.__file__).read_text(encoding="utf-8")
+    i = source.index("def _release_resident_page_locked")
+    body = source[i:i + 1400]
+    assert "CTX.new_page()" in body and 'in ("about:blank", "")' in body, (
+        "the release no longer guarantees a blank page survives it")
+    assert 'if not getattr(DRIVER, "IS_SOCKET", False):' in body, (
+        "the release clears the socket driver it was triggered by")
+    assert "except Exception" in body, "a failed release must leave the page, not raise"
