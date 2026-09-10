@@ -179,12 +179,18 @@ def main():
 
     # 3) launch grade.py detached as a transient systemd unit (survives SSH drops; the eval
     #    can take many minutes on the first per-repo Docker image build).
+    #
+    # THE sleep 3 AND THE 45s Wait-Job CEILING ARE NOT DECORATION -- see the identical comment
+    # in swe_grade_swebench.py, where this exact race (systemd-run --no-block torn down along
+    # with the invoking wsl.exe session before it finishes detaching -- and a timed-out Wait-Job
+    # still Remove-Job -Force'ing the wrapper, killing a launch that just needed a bit more time)
+    # was measured and fixed 2026-09-09. Same launch shape, same fix, all call sites.
     launch = ("$j = Start-Job { (wsl.exe -d " + DISTRO + " -u root -- bash -lc "
               "'systemctl reset-failed " + runid + " 2>/dev/null; rm -f /tmp/grade_" + runid + ".log; "
               "systemd-run --no-block --unit=" + runid + " bash " + RUNNER_WSL
-              + " " + inst + " " + remote_patch_wsl + " " + runid + "' 2>$null) -join '' }; "
-              "if(Wait-Job $j -Timeout 25){ Receive-Job $j } else { 'TO' }; Remove-Job $j -Force")
-    _ssh_ps(launch, 55)
+              + " " + inst + " " + remote_patch_wsl + " " + runid + "; sleep 3' 2>$null) -join '' }; "
+              "if(Wait-Job $j -Timeout 45){ Receive-Job $j } else { 'TO' }; Remove-Job $j -Force")
+    _ssh_ps(launch, 75)
 
     # 4) poll for the verdict FILE (grade_runner.sh writes VERDICT=.. + RUNNER_DONE to a
     #    Windows-side file). scp it back each tick -- reliable, unlike grep-over-SSH which
