@@ -9,6 +9,7 @@ compact result + a .done marker to the Windows-shared verdicts dir for the calle
 import glob
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -20,13 +21,38 @@ dataset_name = sys.argv[4] if len(sys.argv) > 4 else "princeton-nlp/SWE-bench_Li
 workdir = "/tmp/gb_" + run_id
 os.makedirs(workdir, exist_ok=True)
 
+#: ASK THE HARNESS WHAT IT TAKES, rather than assuming the flags of the version this was
+#: written against. Measured 2026-09-10: a freshly installed swebench rejected the whole run
+#: with `error: unrecognized arguments: --cache_level instance` and returncode 2 -- the flag
+#: was removed upstream. The failure surfaced in 77 seconds only because this file had just
+#: learned to carry swebench's stderr back; before that the same class of fault read as
+#: EVALERR and cost days.
+#:
+#: This file is in FROZEN_MANIFEST, so every edit here costs a specified operator decision to
+#: re-sign the baseline. That is the argument for discovering the flag instead of deleting it:
+#: the next upstream rename should cost a run, not a ceremony.
+def _supported_flags():
+    """The long options this installed harness accepts, from its own --help. Empty on any
+    failure, which makes the caller fall back to the minimal, always-supported set."""
+    try:
+        h = subprocess.run([sys.executable, "-m", "swebench.harness.run_evaluation", "--help"],
+                           capture_output=True, text=True, timeout=120)
+        return set(re.findall(r"--[A-Za-z][A-Za-z0-9_-]*", (h.stdout or "") + (h.stderr or "")))
+    except Exception:
+        return set()
+
+
+_flags = _supported_flags()
 cmd = [sys.executable, "-m", "swebench.harness.run_evaluation",
        "--dataset_name", dataset_name,
        "--predictions_path", preds_path,
        "--max_workers", str(max_workers),
        "--run_id", run_id,
-       "--cache_level", "instance",
        "--timeout", "1800"]
+if "--cache_level" in _flags:
+    # Instance-level caching is why grading a second time is minutes rather than an hour on a
+    # host with the disk for it. Kept when the harness still offers it.
+    cmd += ["--cache_level", "instance"]
 r = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True)
 run_out_text = (r.stdout or "") + "\n---ERR---\n" + (r.stderr or "")
 with open(os.path.join(workdir, "run.out"), "w") as f:
