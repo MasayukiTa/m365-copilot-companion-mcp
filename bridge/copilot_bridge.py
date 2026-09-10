@@ -5271,6 +5271,56 @@ def _agent_tab_matches(pg, base_url):
     return True
 
 
+def _agent_tab_url_matches(pg, base_url):
+    """True if `pg` is PARKED ON the agent surface, whether or not it still works.
+
+    THE CLEANER MUST NOT ASK WHETHER THE TAB IS USABLE. _agent_tab_matches answers "can I hand
+    this tab to a conversation", so it requires a live composer -- correct for REUSE and exactly
+    wrong for CLEANUP. Measured 2026-09-10: 69 orphaned tabs sat on this very URL for hours on
+    the bridge's headless Edge, and _close_duplicate_agent_tabs closed none of them, because a
+    headless browser holding scores of tabs discards their renderers and a discarded page
+    answers 0 to locator().count(). The tabs most in need of closing were the only ones the
+    cleaner could not see, and each one made the next renderer likelier to be discarded.
+    """
+    try:
+        u = pg.url or ""
+    except Exception:
+        # A handle that cannot even be asked for its url is a dead tab, which is a tab to close
+        # -- but only if it is not somebody's claim, which the caller checks separately.
+        return False
+    return ("m365.cloud.microsoft/chat" in u) or ("/chat/agent/" in u)
+
+
+def _page_claimed_by_a_live_owner(pg):
+    """Whether some live process has claimed this page (relay.ownership).
+
+    A URL-only cleaner would otherwise close a page a capture is mid-way through: the light
+    token capture claims its page before it navigates, precisely so another run does not take
+    it away (see relay/relay_fleet.py's _claim_page). Unknown answers count as CLAIMED -- when
+    the ledger cannot be read, not closing is the safe direction.
+    """
+    try:
+        from relay import ownership
+        from relay.relay_fleet import _page_target_id
+        tid = _page_target_id(pg)
+        if not tid:
+            return False
+        def _alive(pid):
+            if not pid:
+                return False
+            try:
+                os.kill(int(pid), 0)
+                return True
+            except OSError:
+                return False
+            except Exception:
+                return True
+        return ("page", tid) in {(k[0], k[1]) if isinstance(k, tuple) else ("page", k)
+                                 for k in ownership.live_claims(_alive).keys()}
+    except Exception:
+        return True          # cannot tell -> treat as claimed and leave it alone
+
+
 def _close_duplicate_agent_tabs(ctx, keep_pg, base_url):
     """BUG 4c self-healing: close every OTHER tab already on this same agent surface, keeping
     only `keep_pg`. Guards against closing non-agent tabs (only closes pages that
@@ -5281,18 +5331,24 @@ def _close_duplicate_agent_tabs(ctx, keep_pg, base_url):
     except Exception:
         return
     closed = 0
+    skipped_claimed = 0
     for pg in pages:
         if pg is keep_pg:
             continue
         try:
-            if _agent_tab_matches(pg, base_url):
-                pg.close()
-                closed += 1
+            # URL, NOT USABILITY. See _agent_tab_url_matches for the 69 tabs this cost.
+            if not _agent_tab_url_matches(pg, base_url):
+                continue
+            if _page_claimed_by_a_live_owner(pg):
+                skipped_claimed += 1
+                continue
+            pg.close()
+            closed += 1
         except Exception:
             continue
-    if closed:
-        logger.info("_find_or_open_agent: closed %d duplicate agent tab(s) left over from "
-                    "prior restart(s)", closed)
+    if closed or skipped_claimed:
+        logger.info("_find_or_open_agent: closed %d duplicate agent tab(s); left %d claimed by "
+                    "a live owner", closed, skipped_claimed)
 
 
 def _find_or_open_agent(ctx):
@@ -5307,6 +5363,7 @@ def _find_or_open_agent(ctx):
             if _agent_tab_matches(pg, url):
                 reused = pg
                 break
+        opened_here = False
         if reused is not None:
             pg = reused
             try:
@@ -5317,14 +5374,37 @@ def _find_or_open_agent(ctx):
             logger.info("_find_or_open_agent: reused existing agent tab instead of opening a new one")
         else:
             pg = ctx.new_page()
-            pg.goto(url, wait_until="domcontentloaded")
-            logger.info("_find_or_open_agent: no reusable agent tab found -- opened a new one")
-        for _ in range(40):
-            pg.wait_for_timeout(1000)
-            if pg.locator(COPILOT_SELECTORS["composer"]).count() > 0:
-                break
-        _close_duplicate_agent_tabs(ctx, pg, url)   # self-heal any tabs left over from before
-        return pg
+            opened_here = True
+        # WHOEVER OPENS A TAB CLOSES IT IF IT DOES NOT WORK OUT.
+        #
+        # MEASURED 2026-09-10. Everything from the navigation to the composer wait can raise,
+        # and the only caller, ensure_page_alive, catches that and logs "agent page had closed
+        # and could not be reopened" -- keeping no reference, so the tab this function had
+        # already created stayed open with nobody holding it. bridge.log recorded that line 76
+        # times in 2.6 hours and CDP :9223 was found holding 69 pages on this exact URL, on a
+        # HEADLESS browser nobody can click. One orphan per failed reopen.
+        #
+        # A REUSED tab is never closed here: it may be somebody's live conversation, and the
+        # failure that brought us here says nothing about who else is holding it.
+        try:
+            if opened_here:
+                pg.goto(url, wait_until="domcontentloaded")
+                logger.info("_find_or_open_agent: no reusable agent tab found -- opened a new one")
+            for _ in range(40):
+                pg.wait_for_timeout(1000)
+                if pg.locator(COPILOT_SELECTORS["composer"]).count() > 0:
+                    break
+            _close_duplicate_agent_tabs(ctx, pg, url)   # self-heal any tabs left over from before
+            return pg
+        except Exception:
+            if opened_here:
+                try:
+                    pg.close()
+                except Exception:
+                    pass
+                logger.info("_find_or_open_agent: closed the tab this attempt had just opened, "
+                            "because the attempt failed")
+            raise
     for pg in ctx.pages:                       # fall back to any open agent tab
         if "/chat/agent/" in (pg.url or "") and pg.locator(COPILOT_SELECTORS["composer"]).count() > 0:
             _close_duplicate_agent_tabs(ctx, pg, url)
