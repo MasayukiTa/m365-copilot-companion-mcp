@@ -226,7 +226,7 @@ def load_contract() -> Optional[dict]:
 KNOWN_OP_CLASSES = ("delete", "outbound", "shell_destructive")
 
 
-def activate_contract(scope: str = "", ask_before=(), stop_when=()) -> dict:
+def activate_contract(scope: str = "", ask_before=(), stop_when=(), budget_turns=None) -> dict:
     """Write .fleet/active_contract.json with active=true. The missing half of
     deactivate_contract() (codex-plan item 3, 2026-09-09): nothing in this codebase could
     turn a contract ON before this, only off.
@@ -248,6 +248,14 @@ def activate_contract(scope: str = "", ask_before=(), stop_when=()) -> dict:
     call to a gated tool on this machine, regardless of what path it touches. Callers who
     need a narrow blast radius get it by choosing a narrow op_class list, not a narrow scope.
 
+    `budget_turns` IS enforced, and not by this module. relay/relay_fleet.py reads it once at
+    fleet launch and tightens every worker's cap to min(max_turns, budget_turns), with its own
+    stop reason for the case. That branch existed before this parameter did: `budget_turns`
+    appeared nowhere in this file, so the only function able to write a contract could never set
+    it, and the launcher's tightening was unreachable however carefully it had been written.
+    None leaves it out of the file entirely, which is what keeps `effective_max_turns ==
+    max_turns` the untouched default rather than a value this function chose.
+
     Returns {"ok": True, "contract": <dict written>} or {"ok": False, "detail": <why>}.
     """
     state, _ = contract_state()
@@ -257,6 +265,22 @@ def activate_contract(scope: str = "", ask_before=(), stop_when=()) -> dict:
     bad = [c for c in list(ask_before) + list(stop_when) if c not in KNOWN_OP_CLASSES]
     if bad:
         return {"ok": False, "detail": "unknown op_class %r; known: %r" % (bad, KNOWN_OP_CLASSES)}
+    # VALIDATED HERE, BECAUSE THE READER CANNOT COMPLAIN. relay_fleet's check is
+    # `isinstance(..., int) and > 0`; anything else is silently ignored there, so a contract
+    # written with budget_turns="3" or 0 would read as a budget that was set and enforce
+    # nothing -- the same silent-no-op the op_class validation above exists to prevent.
+    # A bool is refused for the reason it is refused elsewhere in this repo: isinstance(True,
+    # int) is True, and a budget of "one turn" is not what anyone meant by passing True.
+    if budget_turns is not None:
+        if isinstance(budget_turns, bool) or not isinstance(budget_turns, int):
+            return {"ok": False,
+                    "detail": "budget_turns must be a positive int or None, not %r"
+                              % (budget_turns,)}
+        if budget_turns <= 0:
+            return {"ok": False,
+                    "detail": "budget_turns must be > 0; the launcher ignores anything else, so "
+                              "writing %r would look like a budget and enforce nothing"
+                              % (budget_turns,)}
     data = {
         "active": True,
         "scope": str(scope or ""),
@@ -264,6 +288,8 @@ def activate_contract(scope: str = "", ask_before=(), stop_when=()) -> dict:
         "stop_when": list(stop_when),
         "started": time.time(),
     }
+    if budget_turns is not None:
+        data["budget_turns"] = int(budget_turns)
     try:
         _atomic_write_json(_CONTRACT_FILE, data)
     except Exception as e:
