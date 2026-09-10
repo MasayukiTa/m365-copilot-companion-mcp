@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import uuid
 
@@ -51,6 +52,27 @@ MAX_GOAL_CHARS = 4000
 #: mailbox: if nothing is draining it, the honest answer is to say so rather than to keep
 #: accepting work that will never run.
 MAX_PENDING = 50
+
+
+#: AN ADDRESS IN THE PROVENANCE LINE IS THE AGENT TALKING ABOUT THE PERSON, and it is the one
+#: field here the agent composes rather than relays. Measured 2026-09-10: asked over a plain
+#: conversation to write a file, the agent could not unlock, handed the work to this door as
+#: designed -- and filled `source` in with the owner's own work address. That string lands in
+#: .fleet/tasks/*/<id>.json and travels with the job into done/, so one ordinary handoff wrote
+#: both an employee identifier and the employer's domain into the repository tree. .fleet is
+#: gitignored, so this was not a publication; it is still the exact two-word class this project
+#: rewrote its history to remove, arriving by a route nobody had looked at.
+#:
+#: Redacted at the door rather than at the reader, because there are several readers (the
+#: router's done/ record, the cockpit, fleet_queue) and only one writer. The goal and note are
+#: the PERSON's own words and are left alone -- an instruction that names someone is the
+#: instruction, and rewriting it would change the work.
+_ADDRESS_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+def _clean(text, limit: int) -> str:
+    """Collapse whitespace, drop any address, and cap. Never raises."""
+    return " ".join(_ADDRESS_RE.sub("<address redacted>", str(text or "")).split())[:limit]
 
 
 def _pending_count() -> int:
@@ -103,13 +125,13 @@ def fleet_submit(goal: str, note: str = "", source: str = "") -> str:
     job = {
         "id": jid,
         "type": "fleet_goal",
-        "payload": {"goal": text, "note": " ".join(str(note or "").split())[:500]},
+        "payload": {"goal": text, "note": _clean(note, 500)},
         "created": time.time(),
         # PROVENANCE TRAVELS WITH THE JOB. This arrived over a tunnel from an agent, which is
         # not the same authority as a person typing into the cockpit, and the consumer is
         # entitled to treat it differently. Recording it here means the difference survives
         # into the queue instead of being lost at the door.
-        "origin": {"via": "mcp", "source": " ".join(str(source or "agent").split())[:60]},
+        "origin": {"via": "mcp", "source": _clean(source or "agent", 60)},
     }
     try:
         TR.ensure_dirs()
