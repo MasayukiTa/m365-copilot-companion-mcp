@@ -405,6 +405,27 @@ def enforce_unlock_token() -> bool:
     return os.environ.get("MCP_REQUIRE_UNLOCK_TOKEN") == "1"
 
 
+#: THE EXIT FOR A CALLER THAT CANNOT UNLOCK, which both refusals below were missing.
+#:
+#: Every lock refusal said the same one thing -- "call unlock(password='<password>')" -- and for
+#: the caller this fires on most, that is a dead end: the M365-side agent does not hold the
+#: password and is told, in as many words, not to go looking for it (the relay injects it into a
+#: fleet worker's first turn; a conversation the owner types into by hand has no such injection).
+#: Measured 2026-09-10: 489 of 492 refusals in two days were this branch, and the conversations
+#: that hit it did not unlock, did not hand the work anywhere, and answered read-only instead.
+#:
+#: fleet_submit is the door built for exactly that situation (tools/fleet_intake.py) and it is
+#: NOT behind this gate. Naming it here is what turns a refusal into a route: the work reaches
+#: the queue, task_router drains it, and it runs as an ordinary fleet worker. Without this
+#: sentence the whole chat->fleet handoff -- intake, drain, autostart, all of it already built
+#: and switched on -- is never reached, because nothing tells the refused caller it exists.
+#:
+#: Kept to one sentence on purpose. Both messages must stay under relay_fleet's
+#: LOCKED_DOMINANCE_MAX_CHARS (400) or the relay stops classifying them as lock errors at all.
+_HANDOFF_HINT = ("If you do not have the password, do not stop: hand the whole instruction to "
+                 "fleet_submit(goal=..., source=...), which needs no unlock.")
+
+
 def require_unlocked() -> str | None:
     """Return None when the caller can use mutating tools, otherwise an error string."""
     try:
@@ -496,7 +517,7 @@ def require_unlocked() -> str | None:
         msg = (
             f"[locked: no valid unlock token for {ip!r}] The identity in the forwarding "
             "header is not sufficient on its own. Call unlock(password='<password>') and "
-            "pass the returned `unlock_token` with the call."
+            "pass the returned `unlock_token` with the call. " + _HANDOFF_HINT
         )
         lock_state.record_locked(ip, msg, presented_digest=presented_digest, tokens_held=held,
                                  session_state=session_state)
@@ -504,7 +525,7 @@ def require_unlocked() -> str | None:
     msg = (
         f"[locked client IP: {ip!r}] Mutating and execution tools require an unlock. "
         "Call unlock(password='<password>') first. The unlock is stored per client IP "
-        "for MCP_UNLOCK_TTL_DAYS days."
+        "for MCP_UNLOCK_TTL_DAYS days. " + _HANDOFF_HINT
     )
     lock_state.record_locked(ip, msg)
     return msg
