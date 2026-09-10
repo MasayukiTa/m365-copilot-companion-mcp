@@ -34,15 +34,26 @@ system: the tool would stop being listed, therefore never be called, therefore s
 """
 import inspect
 
-# Ordered by measured calls, descending, from .fleet/tool_events.jsonl at 11,391 calls
-# (2026-09-04). Covers 96.4% of calls and 97.2% of argument-name failures. Membership is
-# recomputed by tools/test_tool_catalogue.py when the ledger is present; that test skips in
-# CI, where the ledger is not committed.
+# Ordered by measured calls, descending, from .fleet/tool_events.jsonl at 31,447 calls
+# (2026-09-10; previously derived at 11,391 calls on 2026-09-04, and drifted below its own
+# thresholds as usage moved -- the head had fallen to 86.8% coverage and Kendall tau 0.69).
+# Covers 91.6% of calls and 98.8% of argument-name failures.
+#
+# THE CEILING IS 93.5%, NOT 100%. call_tool.catalogue / .unknown / .signature are gateway
+# pseudo-entries, not tools: they have no signature to show, so they cannot be in a head whose
+# whole purpose is "parameter names given, so these can be called without a lookup" -- yet they
+# are 2,057 of the 31,447 counted calls and therefore sit in the denominator. A future
+# re-derivation that chases 96% by admitting them would be reporting a number rather than
+# improving the head.
+#
+# Membership is recomputed by tools/test_tool_catalogue.py when the ledger is present; that
+# test skips in CI, where the ledger is not committed.
 HOT = (
-    "grep", "read_file", "run_python", "shell_exec", "list_directory", "replace_in_file",
-    "find_files", "unlock", "web_search", "skill_match", "multi_edit", "write_file",
-    "restore_point", "github_file", "web_fetch", "git_diff", "git_status", "job_wait",
-    "git_log", "verify_file_contains",
+    "read_file", "grep", "run_python", "list_directory", "shell_exec", "find_files",
+    "unlock", "replace_in_file", "job_wait", "skill_match", "write_file", "git_status",
+    "process_info", "web_search", "git_log", "file_metadata", "multi_edit", "edit_and_verify",
+    "restore_point", "read_json", "list_my_tools", "job_status", "run_in_background", "git_diff",
+    "github_file", "git_branch", "web_fetch", "glob", "verify_file_contains", "job_output",
 )
 
 _HEAD_NOTE = ("MOST USED -- parameter names given, so these can be called without a lookup:")
