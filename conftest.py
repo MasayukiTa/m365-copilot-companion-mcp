@@ -80,6 +80,12 @@ LIVE_RECORD_REDIRECTS = {
     # list where a stray test write would touch live credentials material.
     "relay.profile_token": {"TEMPLATE_DIR": "templates"},
     "bridge.copilot_bridge": {"DELETE_LOG": "delete_log.jsonl",
+                              # The page-count instrument, appended from the CDP watchdog every
+                              # 60s. It exists to answer "was the browser accumulating tabs?"
+                              # after the fact, which is a question only the operator's real
+                              # history can answer -- a test's synthetic counts mixed into it
+                              # would corrupt the one record the tab-leak incident left behind.
+                              "PAGE_COUNT_LOG": "page_counts.jsonl",
                               "FLEET_CONVS_PATH": "fleet_convs.json",
                               "RECYCLE_SAMPLES_PATH": "recycle_samples.jsonl",
                               "_SETTLE_RESET_TRACE_PATH": "settle_reset_trace.jsonl"},
