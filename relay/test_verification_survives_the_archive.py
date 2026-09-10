@@ -99,8 +99,9 @@ def test_verified_is_copied_as_a_tri_state_not_coerced():
 # answer "what happened to the goal I admitted". jid names the ADMITTED GOAL: minted once by
 # task_router.py at submission, and threaded here through add_goal_to_live_fleet ->
 # goals_from_command -> Worker.jid -> both snapshot builders -> both cockpit archive sites.
-# It is what lets .fleet/tasks/done/<jid>.json (admission), .fleet/acked/<jid>*.json
-# (delivery), and a history.json row's verified/verify_attempts (this file's own subject)
+# It is what lets .fleet/tasks/done/<jid>.json (admission), .fleet/acks/<jid>.ack
+# (delivery -- NOT .fleet/acked/, which this comment used to name and which has no writer
+# anywhere in the tree), and a history.json row's verified/verify_attempts (this file's subject)
 # join on ONE id -- the plan's exact evidence bar.
 # ═══════════════════════════════════════════════════════════════════════════════════════
 
