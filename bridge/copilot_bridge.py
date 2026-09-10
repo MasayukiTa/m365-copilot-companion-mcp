@@ -787,6 +787,17 @@ class PageExecutor:
         self._q: "queue.Queue" = queue.Queue()
         self._thread = None
 
+    def alive(self) -> bool:
+        """Whether the owner thread exists and is running.
+
+        submit() waits on its queue with NO timeout, which is correct while the thread is
+        there -- a real turn legitimately holds it for minutes. It is a trap when the thread
+        was never started or has died: the wait can then never succeed, and the caller blocks
+        for the life of the process.
+        """
+        t = self._thread
+        return bool(t is not None and t.is_alive())
+
     def start(self, target):
         """Start the owner thread running `target()` (main()'s page-setup-then-serve
         function). `target` is responsible for calling drain_once()/run_forever() itself once
@@ -809,6 +820,16 @@ class PageExecutor:
             finally:
                 done.set()
 
+        # FAIL FAST WHEN NOBODY WILL EVER RUN IT. Measured 2026-09-10: a call added to
+        # ensure_driver() reached run_on_page_thread from an ordinary thread in a process
+        # where the owner thread had never been started (the hermetic test suite), and
+        # done.wait() blocked forever -- CI's `test` job ran for two and a half hours against
+        # a seven-minute norm, and six queued runs behind it never started. Waiting cannot
+        # succeed when there is no servicer, so waiting is the wrong answer: say so instead.
+        if not self.alive():
+            raise RuntimeError(
+                "the page-owner thread is not running, so this job would never be serviced "
+                "(callers on a non-page thread must handle this rather than block forever)")
         self._q.put(_job)
         done.wait()
         if "error" in box:
@@ -1558,7 +1579,15 @@ def _release_resident_page_locked(reason=""):
 
 
 def release_resident_page(reason=""):
-    """Release the resident agent tab from any thread. Never raises."""
+    """Release the resident agent tab from any thread. Never raises, never blocks.
+
+    Asking the page thread to do nothing is still asking it, and the ask is what blocks: this
+    is called from ensure_driver(), which runs wherever a turn is sent. The two guards below
+    are the difference between "there is no tab, carry on" and a caller parked forever on a
+    queue nobody is servicing.
+    """
+    if PAGE is None or not PAGE_EXECUTOR.alive():
+        return False
     try:
         return bool(run_on_page_thread(_release_resident_page_locked, reason))
     except Exception:
