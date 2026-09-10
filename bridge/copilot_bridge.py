@@ -6189,6 +6189,24 @@ _PAGE_SERVING = threading.Event()
 PAGE_THREAD_WEDGE_WARN_AFTER_S = PAGE_THREAD_WEDGE_LIMIT_S / 2.0
 
 
+def mark_serving() -> None:
+    """The owner thread has finished setting up and is about to service the queue.
+
+    FROM HERE A MISSED PROBE MEANS THE QUEUE IS BLOCKED -- and, just as importantly, the clock
+    STARTS FROM ZERO. Widening the startup budget alone did not break the restart loop, because
+    the wedge clock kept accumulating ACROSS this transition: startup legitimately holds the
+    thread and misses probes for a couple of minutes, so the instant the serving limit took over
+    `wedged_for` was already past it and the process was handed back immediately. Measured
+    2026-09-10: "the page-owner thread has not answered for 121s; exiting for keepalive
+    recovery", three seconds after the startup page was released. The clock measures how long
+    the QUEUE has been blocked, and the queue does not exist until run_forever(), so nothing
+    before this point is a wedge.
+    """
+    global _PAGE_THREAD_WEDGED
+    _PAGE_THREAD_WEDGED = None
+    _PAGE_SERVING.set()
+
+
 def page_thread_wedged_for_s():
     """Seconds the owner thread has been failing its liveness probe, or None if it is not."""
     return None if _PAGE_THREAD_WEDGED is None else max(0.0, time.time() - _PAGE_THREAD_WEDGED)
@@ -6571,9 +6589,9 @@ def _page_main(cdp, fresh):
         # run_on_page_thread(...) call from any HTTP request thread executes here, inside the
         # SAME `with sync_playwright()` context that created PAGE/DRIVER above. This call
         # blocks for the lifetime of the process (mirrors the old srv.serve_forever()).
-        # SETUP IS OVER; FROM HERE A MISSED PROBE MEANS THE QUEUE IS BLOCKED. Set before
-        # run_forever() because that call never returns.
-        _PAGE_SERVING.set()
+        # Setup is over; see mark_serving(). Called before run_forever() because that call
+        # never returns.
+        mark_serving()
         PAGE_EXECUTOR.run_forever()
 
 
