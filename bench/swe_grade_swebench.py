@@ -23,6 +23,15 @@ SWEDIR = os.path.join(REPO, ".fleet", "swe")
 PREDS = os.path.join(SWEDIR, "preds_solve")
 RESULTS = os.path.join(SWEDIR, "grade_results.jsonl")
 RUNNER_LOCAL = os.path.join(REPO, "bench", "evalhost_batch_grade.py")
+
+#: THE INTERPRETER THAT ACTUALLY HAS swebench, which the eval host's system python does not and
+#: cannot easily be given. `pip install --break-system-packages swebench` gets past PEP 668 and
+#: then aborts anyway: it must replace `click 8.1.8`, which Debian installed with no RECORD
+#: file, so pip refuses to uninstall it and the whole transaction rolls back (measured
+#: 2026-09-10). Forcing it with --ignore-installed would shadow an OS package and move the
+#: breakage somewhere later. A dedicated venv stops the eval environment competing with the
+#: OS package manager at all.
+EVAL_PY = os.environ.get("SWE_EVAL_PYTHON", "/opt/swebench-venv/bin/python")
 TMP = os.path.join(SWEDIR, "_grade_batch")
 
 
@@ -124,12 +133,29 @@ def main():
     def _launch_once():
         inner = ("systemctl reset-failed " + runid + " 2>/dev/null; rm -f /tmp/gb_" + runid + ".log; "
                  "systemd-run --no-block --unit=" + runid + " bash -lc "
-                 "'python3 " + runner_wsl + " " + preds_wsl + " " + runid + " " + str(a.max_workers)
+                 "'" + EVAL_PY + " " + runner_wsl + " " + preds_wsl + " " + runid + " " + str(a.max_workers)
                  + " " + a.dataset_name
                  + " > /tmp/gb_" + runid + ".log 2>&1'; sleep 3")
         launch = ("$j = Start-Job { (wsl.exe -d " + R.DISTRO + " -u root -- bash -lc \"" + inner + "\" 2>$null)"
                   " -join '' }; if(Wait-Job $j -Timeout 45){ Receive-Job $j } else { 'TO' }; Remove-Job $j -Force")
         R._ssh_ps(launch, 75)
+
+    # ASK WHETHER THE GRADER CAN RUN BEFORE SPENDING A LAUNCH ON IT. Every A/B grade on
+    # 2026-09-09 came back EVALERR, and the reason was one import: swebench was not installed
+    # on the interpreter the runner used. That took three separate fixes to even become
+    # visible, because a run that cannot import its grader looks exactly like a run whose
+    # instances all failed. One cheap question here names it instead, and naming it is the
+    # difference between "the eval host is broken" and "install the package".
+    probe = R._wsl_token("%s -c 'import swebench.harness.run_evaluation' >/dev/null 2>&1 "
+                         "&& echo Y || echo N" % EVAL_PY)
+    if probe != "Y":
+        log("%s cannot import swebench.harness.run_evaluation (probe=%r). Nothing was "
+            "launched and no verdict was written -- this is an eval-host setup fault, not a "
+            "graded outcome. Fix: python3 -m venv %s && %s/bin/pip install swebench (or point "
+            "SWE_EVAL_PYTHON at an interpreter that has it)."
+            % (EVAL_PY, probe, os.path.dirname(os.path.dirname(EVAL_PY)),
+               os.path.dirname(os.path.dirname(EVAL_PY))))
+        return
 
     launched = False
     for attempt in range(1, 4):
