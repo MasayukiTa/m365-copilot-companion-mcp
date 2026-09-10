@@ -245,6 +245,69 @@ def test_parse_request_delegates_to_derive_identity():
     _check("parse_request_matches_derive_identity", via_parse_request == via_direct_call)
 
 
+# ── the refusal must name an exit the caller can actually take ────────────────
+#
+# THESE USE PLAIN asserts, NOT _check(). _check records a boolean and prints it; it never
+# raises, so under pytest every test in this file passes whatever the code does. A check that
+# cannot fail is not a test, and these two are load-bearing.
+#
+# WHAT THEY PIN. Both refusals used to offer exactly one way out -- "call unlock(password=...)"
+# -- and the caller this fires on most does not hold the password and is instructed not to hunt
+# for it. Measured 2026-09-10: 489 of 492 refusals in two days were the token branch, and those
+# conversations answered read-only instead of handing the work anywhere. fleet_submit is not
+# behind this gate and exists for precisely that case, so naming it is what makes the refusal a
+# route into the fleet rather than a dead end.
+
+def _refused_for_token(monkeyenv: dict) -> str:
+    """The 'unlocked identity, no valid token' refusal, produced by the real code path."""
+    ip = "20.210.146.129"
+    state = {ip: {"expires_at": time.time() + 86400, "unlocked_at": time.time(),
+                  "token_hashes": ["deadbeef"]}}
+    req = _make_req(peer_host="127.0.0.1", xff=ip)
+    with patch.dict(os.environ, monkeyenv):
+        with patch.object(sec, "_load_state", return_value=state):
+            with patch.object(sec.lock_state, "record_locked", MagicMock()):
+                with patch("tools.security.get_http_request", return_value=req):
+                    return sec.require_unlocked()
+
+
+def _refused_for_never_unlocked() -> str:
+    """The 'this identity was never unlocked' refusal, produced by the real code path."""
+    req = _make_req(peer_host="127.0.0.1", xff="1.2.3.4")
+    with patch.object(sec, "_load_state", return_value={}):
+        with patch.object(sec.lock_state, "record_locked", MagicMock()):
+            with patch("tools.security.get_http_request", return_value=req):
+                return sec.require_unlocked()
+
+
+def test_both_refusals_name_the_handoff_a_caller_without_the_password_can_use():
+    token_msg = _refused_for_token({"MCP_REQUIRE_UNLOCK_TOKEN": "1",
+                                    "MCP_UNLOCK_SESSION_AUTH": "0"})
+    never_msg = _refused_for_never_unlocked()
+    for label, msg in (("no-valid-token", token_msg), ("never-unlocked", never_msg)):
+        assert msg, "%s branch did not refuse at all" % label
+        assert "fleet_submit" in msg, (
+            "the %s refusal offers only unlock(password=...), which a caller without the "
+            "password cannot do -- it must also name fleet_submit: %r" % (label, msg))
+
+
+def test_neither_refusal_grows_past_the_length_the_relay_classifies_on():
+    """relay_fleet decides "this is a lock error" by marker AND shortness. Past
+    LOCKED_DOMINANCE_MAX_CHARS it reads as prose that merely mentions unlock, the auto-unlock
+    injection never fires, and the run STUCKs asking a human for a password the machine has."""
+    from relay import relay_fleet as RF
+
+    for label, msg in (("no-valid-token",
+                        _refused_for_token({"MCP_REQUIRE_UNLOCK_TOKEN": "1",
+                                            "MCP_UNLOCK_SESSION_AUTH": "0"})),
+                       ("never-unlocked", _refused_for_never_unlocked())):
+        assert len(msg) < RF.LOCKED_DOMINANCE_MAX_CHARS, (
+            "the %s refusal is %d chars, at or past the %d ceiling the relay classifies on"
+            % (label, len(msg), RF.LOCKED_DOMINANCE_MAX_CHARS))
+        assert any(m in msg.lower() for m in RF.LOCKED_MARKERS), (
+            "the %s refusal lost the marker the relay keys on: %r" % (label, msg))
+
+
 # ── Standalone runner ──────────────────────────────────────────────────────────
 
 def _run_all():
