@@ -1068,7 +1068,11 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
             # run_id names the fleet SWEEP; jid names the ADMITTED GOAL, minted once by
             # task_router.py at submission and carried through add_goal_to_live_fleet /
             # goals_from_command / autostart_fleet into Worker.jid. This is what lets
-            # .fleet/tasks/done/<jid>.json (admission), .fleet/acked/<jid>*.json (delivery),
+            # .fleet/tasks/done/<jid>.json (admission), .fleet/acks/<jid>.ack (delivery --
+            # written by read_commands below and read by task_router.fleet_landing_confirmed;
+            # NOT .fleet/acked/, which this comment used to name and which nothing in the tree
+            # writes: its 18 files are 32-hex names from before 2026-09-08, a different id
+            # shape from jid's 12, and a reader sent there finds a dead end),
             # and this worker's own verified/verify_attempts above be joined on ONE id, which
             # is exactly the evidence bar the plan named: "同一run IDで受付・発火・実行・
             # 検証・終了を結ぶ". Empty for goals that never passed through admission.
