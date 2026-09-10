@@ -118,10 +118,44 @@ def test_the_startup_budget_can_never_be_stricter_than_the_serving_one():
     assert bridge.PAGE_STARTUP_WEDGE_LIMIT_S >= bridge.PAGE_THREAD_WEDGE_LIMIT_S
 
 
-def test_the_owner_thread_announces_it_is_serving_before_it_blocks_forever():
-    """run_forever() never returns, so the flag has to be set on the line before it."""
+def test_marking_serving_raises_the_flag_the_limit_is_chosen_by():
+    """Without the flag the startup budget would apply for the life of the process, and a real
+    wedge would never be handed back at all."""
+    was_set = bridge._PAGE_SERVING.is_set()
+    try:
+        bridge._PAGE_SERVING.clear()
+        bridge.mark_serving()
+        assert bridge._PAGE_SERVING.is_set()
+    finally:
+        if not was_set:
+            bridge._PAGE_SERVING.clear()
+
+
+def test_the_wedge_clock_does_not_carry_startup_time_into_serving(monkeypatch):
+    """THE HOLE IN THE FIRST FIX. A wider startup budget is useless if the clock is carried
+    over: startup misses probes for ~120s by design, so the moment the serving limit took over
+    the process was handed back at once. Measured as "still wedged (121s)" three seconds after
+    the startup page was released."""
+    monkeypatch.setattr(bridge, "_PAGE_THREAD_WEDGED",
+                        __import__("time").time() - (bridge.PAGE_THREAD_WEDGE_LIMIT_S + 60),
+                        raising=False)
+    assert bridge.page_thread_wedged_for_s() > bridge.PAGE_THREAD_WEDGE_LIMIT_S, (
+        "the fixture did not actually put a stale wedge on the clock")
+    was_set = bridge._PAGE_SERVING.is_set()
+    try:
+        bridge.mark_serving()
+        assert bridge.page_thread_wedged_for_s() is None, (
+            "the startup wedge survived into serving; the next probe escalates immediately")
+        assert bridge._PAGE_SERVING.is_set()
+    finally:
+        if not was_set:
+            bridge._PAGE_SERVING.clear()
+        bridge._PAGE_THREAD_WEDGED = None
+
+
+def test_the_owner_thread_marks_serving_rather_than_setting_the_flag_by_hand():
+    """Two statements that must not drift apart: the flag and the clock reset."""
     source = bridge.Path(bridge.__file__).read_text(encoding="utf-8")
     i = source.index("PAGE_EXECUTOR.run_forever()")
-    assert "_PAGE_SERVING.set()" in source[max(0, i - 400):i], (
-        "nothing sets _PAGE_SERVING before run_forever(); the startup budget would then apply "
-        "for the whole life of the process and a real wedge would never be handed back")
+    assert "mark_serving()" in source[max(0, i - 400):i], (
+        "the owner thread no longer calls mark_serving() before run_forever()")
