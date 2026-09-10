@@ -177,39 +177,38 @@ def main():
     except Exception:
         pass
 
-    # 3) launch grade.py detached as a transient systemd unit (survives SSH drops; the eval
-    #    can take many minutes on the first per-repo Docker image build).
+    # 3) RUN THE GRADE INSIDE A HELD SESSION. Not detached: on this host detachment does not
+    # survive. Measured 2026-09-10 -- the identical batch command completes in 107s when run
+    # synchronously inside the invoking wsl session, and is STOPPED after 44-51s when handed to
+    # `systemd-run --no-block` ("Stopping ... Deactivated successfully", no error, no OOM, no
+    # timeout; dmesg shows journald re-initialising, i.e. the distro's systemd being torn down
+    # once no session holds it). `setsid nohup` dies identically, and touching the distro every
+    # 20s does not rescue it, because a new session brings up a new systemd rather than
+    # re-adopting the old one's units. Three days of EVALERR verdicts were this fact.
     #
-    # THE sleep 3 AND THE 45s Wait-Job CEILING ARE NOT DECORATION -- see the identical comment
-    # in swe_grade_swebench.py, where this exact race (systemd-run --no-block torn down along
-    # with the invoking wsl.exe session before it finishes detaching -- and a timed-out Wait-Job
-    # still Remove-Job -Force'ing the wrapper, killing a launch that just needed a bit more time)
-    # was measured and fixed 2026-09-09. Same launch shape, same fix, all call sites.
-    launch = ("$j = Start-Job { (wsl.exe -d " + DISTRO + " -u root -- bash -lc "
-              "'systemctl reset-failed " + runid + " 2>/dev/null; rm -f /tmp/grade_" + runid + ".log; "
-              "systemd-run --no-block --unit=" + runid + " bash " + RUNNER_WSL
-              + " " + inst + " " + remote_patch_wsl + " " + runid + "; sleep 3' 2>$null) -join '' }; "
-              "if(Wait-Job $j -Timeout 45){ Receive-Job $j } else { 'TO' }; Remove-Job $j -Force")
-    _ssh_ps(launch, 75)
+    # So the session is held for the length of the grade, bounded by the same ceiling the poll
+    # loop used to have (POLL_SECONDS * POLL_MAX), and the verdict is read once afterwards.
+    hold_s = max(120, int(POLL_SECONDS * POLL_MAX))
+    body = ("bash " + RUNNER_WSL + " " + inst + " " + remote_patch_wsl + " " + runid)
+    run_ps = ("$j = Start-Job { (wsl.exe -d " + DISTRO + " -u root -- bash -lc \"" + body + "\" 2>$null)"
+              " -join '' }; if(Wait-Job $j -Timeout " + str(hold_s) + "){ Receive-Job $j } else { 'TIMEOUT' };"
+              " Remove-Job $j -Force")
+    _ssh_ps(run_ps, hold_s + 60)
 
-    # 4) poll for the verdict FILE (grade_runner.sh writes VERDICT=.. + RUNNER_DONE to a
-    #    Windows-side file). scp it back each tick -- reliable, unlike grep-over-SSH which
-    #    drops multi-line output on this tunnel.
+    # 4) read the verdict FILE the runner wrote. scp is reliable where grep-over-SSH silently
+    #    drops output, so the verdict is read back as a file rather than parsed from a remote grep.
     remote_verdict = "%s/verdicts/%s.verdict" % (REMOTE_DIR, runid)
     lv = tempfile.NamedTemporaryFile(suffix=".verdict", delete=False)
     lv.close()
     verdict = ""
-    for _ in range(POLL_MAX):
-        time.sleep(POLL_SECONDS)
-        if _scp_from(remote_verdict, lv.name):
-            try:
-                content = open(lv.name, encoding="utf-8", errors="replace").read()
-            except Exception:
-                content = ""
-            if "RUNNER_DONE" in content:
-                m = re.search(r"VERDICT=([A-Za-z]+)", content)
-                verdict = m.group(1) if m else ""
-                break
+    if _scp_from(remote_verdict, lv.name):
+        try:
+            content = open(lv.name, encoding="utf-8", errors="replace").read()
+        except Exception:
+            content = ""
+        if "RUNNER_DONE" in content:
+            m = re.search(r"VERDICT=([A-Za-z]+)", content)
+            verdict = m.group(1) if m else ""
     try:
         os.unlink(lv.name)
     except Exception:

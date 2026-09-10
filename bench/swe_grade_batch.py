@@ -92,19 +92,20 @@ def launch_grade(inst, diff, runid):
     remote_wsl = "%s/%s.patch" % (R.REMOTE_DIFFS_WSL, runid)
     if not R._scp(lp, remote_win):
         return False
-    # fresh unit (nonce in runid) -> never collides; reset-failed is belt-and-suspenders.
-    #
-    # THE sleep 3 AND THE 45s Wait-Job CEILING ARE NOT DECORATION -- see the identical comment
-    # in swe_grade_swebench.py, where this exact race (systemd-run --no-block torn down along
-    # with the invoking wsl.exe session before it finishes detaching -- and a timed-out Wait-Job
-    # still Remove-Job -Force'ing the wrapper, killing a launch that just needed a bit more time)
-    # was measured and fixed 2026-09-09. Same launch shape, same fix, all three call sites.
-    launch = ("$j = Start-Job { (wsl.exe -d " + R.DISTRO + " -u root -- bash -lc "
-              "'systemctl reset-failed " + runid + " 2>/dev/null; rm -f /tmp/grade_" + runid + ".log; "
-              "systemd-run --no-block --unit=" + runid + " bash " + R.RUNNER_WSL
-              + " " + inst + " " + remote_wsl + " " + runid + "; sleep 3' 2>$null) -join '' }; "
-              "if(Wait-Job $j -Timeout 45){ Receive-Job $j } else { 'TO' }; Remove-Job $j -Force")
-    R._ssh_ps(launch, 75)
+    # RUN IT INSIDE A HELD SESSION, NOT DETACHED. Measured 2026-09-10: on this eval host
+    # `systemd-run --no-block` work is STOPPED after 44-51s having produced nothing (journal:
+    # "Stopping ... Deactivated successfully", no error, no OOM, no timeout; dmesg shows
+    # journald re-initialising as the distro's systemd is torn down once no wsl session holds
+    # it). `setsid nohup` dies the same way and periodic touches do not rescue it. The identical
+    # command run synchronously inside the session finished in 107s with a real verdict. Swept
+    # here too even though this module has no callers, because leaving one copy of a fixed
+    # failure class behind is how it comes back wearing a different name.
+    hold_s = max(120, int(R.POLL_SECONDS * R.POLL_MAX))
+    body = "bash " + R.RUNNER_WSL + " " + inst + " " + remote_wsl + " " + runid
+    run_ps = ("$j = Start-Job { (wsl.exe -d " + R.DISTRO + " -u root -- bash -lc \"" + body + "\" 2>$null)"
+              " -join '' }; if(Wait-Job $j -Timeout " + str(hold_s) + "){ Receive-Job $j } else { 'TIMEOUT' };"
+              " Remove-Job $j -Force")
+    R._ssh_ps(run_ps, hold_s + 60)
     return True
 
 

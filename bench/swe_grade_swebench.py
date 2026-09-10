@@ -102,99 +102,81 @@ def main():
     if not _scp_retry(RUNNER_LOCAL, runner_win):
         log("scp runner failed"); return
 
-    # 2) launch ONE swebench batch eval, detached (survives SSH drops; long build+run)
+    # 2) RUN THE BATCH INSIDE A HELD SESSION. Not detached -- detachment does not survive on
+    # this host, and three days of EVALERR were that fact refusing to be noticed.
     #
-    # THE sleep 3 AT THE END IS NOT DECORATION. `systemd-run --no-block` returns as soon as the
-    # unit is HANDED to the manager, before it has finished detaching from the invoking session.
-    # This whole line runs as the last thing inside `wsl.exe ... bash -lc "..."`, launched from a
-    # PowerShell Start-Job that exits the moment this bash process exits -- and when that exit
-    # follows systemd-run by only microseconds, the transient unit gets torn down with the
-    # session that spawned it, never runs, and never writes its log. Measured directly
-    # (2026-09-09): the exact same launch line with no pause afterward left the unit's own
-    # `systemctl status <runid>` reporting "could not be found" and no /tmp/gb_<runid>.log ever
-    # created. The Wait-Job timeout below was widened alongside the sleep for the same reason: a
-    # timed-out Wait-Job still runs Remove-Job -Force, which can kill the wrapping job (and the
-    # wsl.exe process it holds) before the sleep inside it has even had a chance to run on a
-    # slow SSH/WSL cold start.
+    # MEASURED 2026-09-10, after the grader itself was finally proven correct (a synchronous
+    # run of the identical command finished in 107 seconds and returned a real verdict,
+    # resolved=1). Handed to `systemd-run --no-block` the same command is STOPPED after 44 and
+    # 51 seconds: the journal says "Stopping ... Deactivated successfully" with no error, no
+    # OOM and no timeout, and dmesg shows journald flushing its runtime journal -- the distro's
+    # systemd is re-initialised once no wsl.exe session is holding it, and every unit that
+    # belonged to the previous one goes with it. `setsid nohup` dies the same way. Touching the
+    # distro every 20 seconds does NOT rescue it (measured: two arms, held and unheld, both
+    # died at ~2 heartbeats), because a new session brings up a new systemd rather than
+    # re-adopting the old one's units. dockerd survives here only because a scheduled task
+    # holds a session for it.
     #
-    # THE VERIFY-AND-RETRY LOOP BELOW IS A SEPARATE, SECOND DEFECT, not a restatement of the
-    # first. Even with the pause above, three consecutive real runs (2026-09-09) still returned
-    # from `_ssh_ps(launch, ...)` with the normal empty "success" output, yet /tmp/gb_<runid> was
-    # never created and the eval never ran -- the poll loop then found a stray, empty, valid-
-    # looking .batchresult.json and reported a false EVALERR rather than timing out honestly.
-    # `_ssh_ps` cannot distinguish this from a real success: `--no-block` legitimately returns
-    # empty stdout too, so its own tries-loop (which only retries on EMPTY output) never fires.
-    # The eval host's own sshd has a documented very-low MaxStartups (see the scp retry helper
-    # just above this function), and this launch call follows two scp calls in quick succession
-    # -- a connection silently degraded by that pressure is indistinguishable, from here, from a
-    # clean detached launch. So the ONLY reliable signal is to check the remote side directly:
-    # does the workdir this run's own script creates as its very first statement actually exist
-    # a few seconds later? If not, the launch did not really happen and must be retried.
-    def _launch_once():
-        inner = ("systemctl reset-failed " + runid + " 2>/dev/null; rm -f /tmp/gb_" + runid + ".log; "
-                 "systemd-run --no-block --unit=" + runid + " bash -lc "
-                 "'" + EVAL_PY + " " + runner_wsl + " " + preds_wsl + " " + runid + " " + str(a.max_workers)
-                 + " " + a.dataset_name
-                 + " > /tmp/gb_" + runid + ".log 2>&1'; sleep 3")
-        launch = ("$j = Start-Job { (wsl.exe -d " + R.DISTRO + " -u root -- bash -lc \"" + inner + "\" 2>$null)"
-                  " -join '' }; if(Wait-Job $j -Timeout 45){ Receive-Job $j } else { 'TO' }; Remove-Job $j -Force")
-        R._ssh_ps(launch, 75)
-
-    # ASK WHETHER THE GRADER CAN RUN BEFORE SPENDING A LAUNCH ON IT. Every A/B grade on
-    # 2026-09-09 came back EVALERR, and the reason was one import: swebench was not installed
-    # on the interpreter the runner used. That took three separate fixes to even become
-    # visible, because a run that cannot import its grader looks exactly like a run whose
-    # instances all failed. One cheap question here names it instead, and naming it is the
-    # difference between "the eval host is broken" and "install the package".
+    # So the work has to run inside a session that stays open for its whole length. The SSH
+    # call therefore blocks for the duration, with --max-wait-min as its ceiling, and the
+    # runner's log goes to the Windows-shared mount rather than /tmp so a run that dies is
+    # still readable afterwards (/tmp here is cleaned within minutes -- the workdir was gone
+    # while the run was still being polled).
+    # ASK WHETHER THE GRADER CAN RUN BEFORE SPENDING A RUN ON IT. Every A/B grade on
+    # 2026-09-09 came back EVALERR, and one of the causes was a single import: swebench was not
+    # installed on the interpreter the runner used. A run that cannot import its grader looks
+    # exactly like a run whose instances all failed, which is why that took days to see. One
+    # cheap question here names it instead.
     probe = R._wsl_token("%s -c 'import swebench.harness.run_evaluation' >/dev/null 2>&1 "
                          "&& echo Y || echo N" % EVAL_PY)
     if probe != "Y":
-        log("%s cannot import swebench.harness.run_evaluation (probe=%r). Nothing was "
-            "launched and no verdict was written -- this is an eval-host setup fault, not a "
-            "graded outcome. Fix: python3 -m venv %s && %s/bin/pip install swebench (or point "
-            "SWE_EVAL_PYTHON at an interpreter that has it)."
+        log("%s cannot import swebench.harness.run_evaluation (probe=%r). Nothing was run and "
+            "no verdict was written -- this is an eval-host setup fault, not a graded outcome. "
+            "Fix: python3 -m venv %s && %s/bin/pip install swebench (or point SWE_EVAL_PYTHON "
+            "at an interpreter that has it)."
             % (EVAL_PY, probe, os.path.dirname(os.path.dirname(EVAL_PY)),
                os.path.dirname(os.path.dirname(EVAL_PY))))
         return
 
-    launched = False
-    for attempt in range(1, 4):
-        _launch_once()
-        time.sleep(4)
-        seen = R._wsl_token("test -d /tmp/gb_" + runid + " && echo Y || echo N")
-        if seen == "Y":
-            launched = True
-            break
-        log("launch attempt %d/3 did not create the remote workdir (SSH connection pressure or "
-            "a similar transient fault); retrying" % attempt)
-    if not launched:
-        log("launch never took (3 attempts, workdir never appeared) -- refusing to poll for a "
-            "result that was never asked for. This is an infra fault, not a graded outcome.")
-        return
-    log("launched swebench batch (runid=%s). polling for result..." % runid)
+    log_wsl = "/mnt/c/wsl-setup/%s.log" % runid
+    log_win = "%s/%s.log" % (R.REMOTE_DIR, runid)
+    body = (EVAL_PY + " " + runner_wsl + " " + preds_wsl + " " + runid + " " + str(a.max_workers)
+            + " " + a.dataset_name + " > " + log_wsl + " 2>&1")
+    hold_s = max(120, int(a.max_wait_min * 60))
+    run_ps = ("$j = Start-Job { (wsl.exe -d " + R.DISTRO + " -u root -- bash -lc \"" + body + "\" 2>$null)"
+              " -join '' }; if(Wait-Job $j -Timeout " + str(hold_s) + "){ Receive-Job $j } else { 'TIMEOUT' };"
+              " Remove-Job $j -Force")
+    log("grading inside a held session (runid=%s, ceiling %d min). This blocks until it finishes."
+        % (runid, hold_s // 60))
+    t0 = time.time()
+    R._ssh_ps(run_ps, hold_s + 60)
+    log("session returned after %.0fs" % (time.time() - t0))
 
-    # 3) poll for the .done marker, then pull the result json
+    # 3) read the result the runner wrote (same durable location it has always used)
     remote_done = "%s/verdicts/%s.batchresult.json.done" % (R.REMOTE_DIR, runid)
     remote_res = "%s/verdicts/%s.batchresult.json" % (R.REMOTE_DIR, runid)
-    local_done = os.path.join(TMP, runid + ".done")
     local_res = os.path.join(TMP, runid + ".batchresult.json")
-    deadline = time.time() + a.max_wait_min * 60
+    local_done = os.path.join(TMP, runid + ".done")
     result = None
-    while time.time() < deadline:
-        time.sleep(a.poll_s)
-        if R._scp_from(remote_done, local_done):
-            if R._scp_from(remote_res, local_res):
-                try:
-                    result = json.load(open(local_res, encoding="utf-8"))
-                    break
-                except Exception:
-                    pass
-        # progress heartbeat from the the eval host eval log
-        tail = R._wsl_token("tail -1 /tmp/gb_" + runid + ".log 2>/dev/null | tr -cd 'A-Za-z0-9:%=/ .' | tail -c 80")
-        if tail:
-            log("  ...the eval host: %s" % tail)
+    if R._scp_from(remote_done, local_done) and R._scp_from(remote_res, local_res):
+        try:
+            result = json.load(open(local_res, encoding="utf-8"))
+        except Exception:
+            result = None
     if result is None:
-        log("TIMEOUT after %d min -- no batch result. Check /tmp/gb_%s.log on the eval host." % (a.max_wait_min, runid))
+        # The run did not produce a result. Say what the remote log says instead of guessing,
+        # and write NO row: an infra fault is not a graded outcome (loop.py reads zero rows as
+        # INFRA_ABORT, which is the honest reading).
+        local_log = os.path.join(TMP, runid + ".log")
+        tail = ""
+        if R._scp_from(log_win, local_log):
+            try:
+                tail = open(local_log, encoding="utf-8", errors="replace").read()[-3000:]
+            except Exception:
+                tail = ""
+        log("no batch result for %s. Nothing was written to the ledger. Remote log tail:"
+            % runid)
+        log(tail or "(the log itself could not be read)")
         return
     if result.get("stderr_tail"):
         # evalhost_batch_grade.py only sets this when it produced zero real verdicts -- the run
