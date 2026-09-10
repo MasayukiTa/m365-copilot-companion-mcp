@@ -6159,6 +6159,28 @@ _PAGE_THREAD_WEDGED = None
 #: 600s but the probe is submitted with its own short timeout and only its REPEATED failure counts.
 PAGE_THREAD_WEDGE_LIMIT_S = max(30.0, float(os.environ.get("MCP_PAGE_WEDGE_LIMIT_SEC", "120")))
 
+#: THE SAME LIMIT KILLED THE PROCESS BEFORE IT HAD FINISHED STARTING, every time, for over an
+#: hour. Measured 2026-09-10: `_page_main` opens the agent tab, runs proactive auto-consent and
+#: startup auto-resume, and all of that is ONE job on the owner thread -- so the 10s liveness
+#: probe cannot be serviced while it runs, `_PAGE_THREAD_WEDGED` starts ticking at ~11s, and at
+#: 120s wedge_escalation_step() exits the process. The keepalive restarts it, `_find_or_open_agent`
+#: opens ANOTHER agent tab, and the same 120s runs out again. The log shows the thread was never
+#: stuck at all: "startup proactive auto-consent: no consent card handled" printed at 11:50:02,
+#: while the watchdog was reporting "still wedged (20s)". Every cycle leaked a tab and an Edge
+#: process tree; the machine reached 40 msedge processes holding 4.3 GB.
+#:
+#: A busy thread and a stuck thread look identical from outside, so the only honest fix is to
+#: stop asking the question before the answer can mean anything. Until the owner thread reaches
+#: run_forever() -- the point from which a missed probe really does mean the queue is blocked --
+#: startup gets its own, much larger budget. Still bounded: a startup that genuinely hangs is
+#: still handed back, just not on a deadline shorter than startup itself.
+PAGE_STARTUP_WEDGE_LIMIT_S = max(PAGE_THREAD_WEDGE_LIMIT_S,
+                                 float(os.environ.get("MCP_PAGE_STARTUP_LIMIT_SEC", "600")))
+
+#: Set by the owner thread when it stops setting up and starts serving the queue. Before that,
+#: a missed liveness probe says "still starting", not "wedged".
+_PAGE_SERVING = threading.Event()
+
 #: How long a wedge must last before it is logged at WARNING rather than INFO. A missed probe is
 #: the normal state of a thread inside a long job, so severity is decided by duration, not by the
 #: miss (see the emit site in probe_connection for the measurement that forced this). Half
@@ -6181,7 +6203,11 @@ def wedge_escalation_step(exiter=None, wedged_for=None) -> bool:
     """
     if wedged_for is None:
         wedged_for = page_thread_wedged_for_s()
-    if wedged_for is None or wedged_for < PAGE_THREAD_WEDGE_LIMIT_S:
+    # See PAGE_STARTUP_WEDGE_LIMIT_S: before the thread is serving, the probe is competing with
+    # startup rather than reporting on a blocked queue.
+    limit = (PAGE_THREAD_WEDGE_LIMIT_S if _PAGE_SERVING.is_set()
+             else PAGE_STARTUP_WEDGE_LIMIT_S)
+    if wedged_for is None or wedged_for < limit:
         return False
     try:
         tool_probe.record_probe(False, "starting",
@@ -6545,6 +6571,9 @@ def _page_main(cdp, fresh):
         # run_on_page_thread(...) call from any HTTP request thread executes here, inside the
         # SAME `with sync_playwright()` context that created PAGE/DRIVER above. This call
         # blocks for the lifetime of the process (mirrors the old srv.serve_forever()).
+        # SETUP IS OVER; FROM HERE A MISSED PROBE MEANS THE QUEUE IS BLOCKED. Set before
+        # run_forever() because that call never returns.
+        _PAGE_SERVING.set()
         PAGE_EXECUTOR.run_forever()
 
 
