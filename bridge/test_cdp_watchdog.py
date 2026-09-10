@@ -1,6 +1,8 @@
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 
+import pytest
+
 from bridge import copilot_bridge as bridge
 
 
@@ -260,3 +262,50 @@ def test_releasing_the_page_keeps_a_blank_one_and_does_not_clear_a_socket_driver
     assert 'if not getattr(DRIVER, "IS_SOCKET", False):' in body, (
         "the release clears the socket driver it was triggered by")
     assert "except Exception" in body, "a failed release must leave the page, not raise"
+
+
+# -- a job nobody will service must fail, not wait ----------------------------------------------
+#
+# MEASURED 2026-09-10, and it cost the whole CI queue. A call added to ensure_driver() reached
+# run_on_page_thread() from an ordinary thread in a process where the owner thread had never
+# been started -- the hermetic test suite -- and PageExecutor.submit's done.wait() blocked
+# forever. CI's `test` job ran two and a half hours against a seven-minute norm and six queued
+# runs behind it never started. Waiting cannot succeed when there is no servicer.
+
+def test_submitting_to_an_unstarted_owner_thread_raises_instead_of_hanging():
+    ex = bridge.PageExecutor()
+    assert ex.alive() is False
+    with pytest.raises(RuntimeError) as e:
+        ex.submit(lambda: "never runs")
+    assert "page-owner thread is not running" in str(e.value)
+
+
+def test_a_started_owner_thread_reports_alive_and_runs_the_job():
+    """The guard must not refuse the normal case."""
+    import threading
+    ex = bridge.PageExecutor()
+    ready = threading.Event()
+
+    def target():
+        ready.set()
+        ex.run_forever()
+
+    ex.start(target)
+    assert ready.wait(timeout=5), "the owner thread never started"
+    try:
+        assert ex.alive() is True
+        assert ex.submit(lambda x: x + 1, 41) == 42
+    finally:
+        pass    # daemon thread; the process exit reaps it
+
+
+def test_releasing_a_page_that_is_not_there_costs_no_wait(monkeypatch):
+    """release_resident_page is called from ensure_driver, i.e. wherever a turn is sent. With
+    no page and no owner thread it must return, not park the caller on a queue."""
+    monkeypatch.setattr(bridge, "PAGE", None, raising=False)
+
+    def boom(*a, **k):
+        raise AssertionError("it asked the page thread to do nothing, and that ask is the hang")
+    monkeypatch.setattr(bridge, "run_on_page_thread", boom)
+
+    assert bridge.release_resident_page("test") is False
