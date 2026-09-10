@@ -24,6 +24,31 @@ _DEFAULT_STATUS = os.path.join(_REPO_ROOT, ".fleet", "status.json")
 # A run "completed" iff it reached done. Everything else is a non-completion the user felt as friction.
 _DONE = "done"
 
+#: Outcomes that mean "the claim was checked and the record spoke against it". A row carrying
+#: one of these reached status "done" -- relay_fleet._settle_done sets the status first and asks
+#: for the verdict second -- so status alone cannot tell a completion from a refuted claim.
+#:
+#: MEASURED, NOT ANTICIPATED. On the live archive (215 rows, 2026-09-11) the done bucket was 94:
+#: 91 DONE and 3 EVIDENCE_CONTRADICTED. Three real tasks claimed done, had their tool ledger
+#: contradict them, were recorded as contradicted, and were counted as completions anyway.
+#:
+#: A CLOSED LIST OF POSITIVE FINDINGS, and nothing else. "no acceptance checks", "no ledger",
+#: "nothing ran" and an unrecognised outcome all keep counting exactly as they did -- the same
+#: rule relay_fleet._claim_verdict applies to itself: only a positive contradiction changes an
+#: outcome, because an absence of evidence is not evidence.
+CONTRADICTED_OUTCOMES = frozenset({"EVIDENCE_CONTRADICTED", "VERIFY_FAILED"})
+
+
+def _is_completion(row) -> bool:
+    """Whether one archived row counts toward the completion rate.
+
+    Reached done AND its own record does not contradict the claim. This is the whole of the
+    change: every other reading of a row is unchanged.
+    """
+    if (row.get("status") or "").strip() != _DONE:
+        return False
+    return (row.get("outcome") or "").strip().upper() not in CONTRADICTED_OUTCOMES
+
 
 def _read_json(path):
     try:
@@ -72,12 +97,22 @@ def usage_section(history_path=None, status_path=None, segments=6):
 
     n = len(items)
     status_mix = {}
+    # BESIDE THE STATUS MIX, NOT INSTEAD OF IT. status_mix is what the run's machinery did;
+    # outcome_mix is what was concluded about the claim, and the two disagree exactly where this
+    # section used to be blind. Both are emitted so any rate here can be recomputed from the
+    # archive by hand -- which is codex-plan item 1's evidence bar, not a convenience.
+    outcome_mix = {}
     done_turns = []
     completed = 0
+    contradicted_done = 0
     for h in items:
         st = (h.get("status") or "").strip() or "unknown"
         status_mix[st] = status_mix.get(st, 0) + 1
-        if st == _DONE:
+        oc = (h.get("outcome") or "").strip() or "unknown"
+        outcome_mix[oc] = outcome_mix.get(oc, 0) + 1
+        if st == _DONE and not _is_completion(h):
+            contradicted_done += 1
+        if _is_completion(h):
             completed += 1
             t = _as_int(h.get("turn"))
             if t is not None:
@@ -95,7 +130,7 @@ def usage_section(history_path=None, status_path=None, segments=6):
             hi = int(round((i + 1) * size))
             chunk = items[lo:hi]
             if chunk:
-                c = sum(1 for h in chunk if (h.get("status") or "") == _DONE)
+                c = sum(1 for h in chunk if _is_completion(h))
                 trend.append(round(c / len(chunk), 4))
 
     # verify_rate over the ARCHIVE, falling back to the live snapshot.
@@ -133,7 +168,8 @@ def usage_section(history_path=None, status_path=None, segments=6):
     # recent window = last min(50, n//3) tasks, so "lately" is visible vs the all-time rate
     win = min(50, max(1, n // 3)) if n else 0
     recent = items[-win:] if win else []
-    recent_rate = round(sum(1 for h in recent if (h.get("status") or "") == _DONE) / len(recent), 4) if recent else None
+    recent_rate = round(sum(1 for h in recent if _is_completion(h)) / len(recent), 4) \
+        if recent else None
 
     # Persona-leak lens (the QUALITY half of the general-user lens): of the runs whose body we can
     # resolve, how many leaked an unsolicited advisor/lecture/ego persona. Reuses the SAME time-ordered
@@ -174,6 +210,12 @@ def usage_section(history_path=None, status_path=None, segments=6):
         "verify_n": verify_n,
         "verify_source": verify_source,
         "status_mix": status_mix,
+        "outcome_mix": outcome_mix,
+        # HOW MANY COMPLETIONS THE RECORD TOOK BACK. Without this the corrected rate is simply
+        # a different number from the one printed yesterday, with nothing to explain the gap;
+        # with it, status_mix["done"] - contradicted_done == completed, and a reader can check
+        # the arithmetic against the archive.
+        "contradicted_done": contradicted_done,
         "trend": trend,
         "persona_leak_rate": persona_leak_rate,
         "quality_scored": quality_scored,
