@@ -190,3 +190,41 @@ def test_a_goal_already_handed_to_the_fleet_still_counts_as_waiting():
         _io.open(os.path.join(handed, "earlier%d.txt" % i), "w", encoding="utf-8").write("x")
     out = FI.fleet_submit("the fourth goal")
     assert "4 job(s) waiting" in out, out
+
+
+# -- provenance must not carry the person -------------------------------------------------------
+#
+# MEASURED 2026-09-10. Asked over a plain conversation to write a file, the agent could not
+# unlock, handed the work to this door exactly as designed -- and filled `source` in with the
+# owner's own work address. One ordinary handoff wrote an employee identifier and the employer's
+# domain into .fleet/tasks/done/<id>.json. .fleet is gitignored so nothing was published, and it
+# is still the two-word class this project rewrote its history to remove, arriving by a route
+# nobody had looked at. `source` is the one field here the AGENT composes about the PERSON.
+
+def test_an_address_in_the_provenance_is_not_recorded():
+    FI.fleet_submit("do a thing", source="user request via someone@example.com")
+    origin = _jobs()[0]["origin"]
+    assert "@" not in origin["source"], origin
+    assert "example.com" not in origin["source"], origin
+    assert "user request via" in origin["source"], (
+        "the whole provenance was thrown away; only the address had to go: %r" % (origin,))
+
+
+def test_an_address_in_the_note_is_not_recorded():
+    FI.fleet_submit("do a thing", note="asked by someone@example.com in chat")
+    note = _jobs()[0]["payload"]["note"]
+    assert "@" not in note and "example.com" not in note, note
+    assert "asked by" in note and "in chat" in note, note
+
+
+def test_the_goal_itself_is_left_alone():
+    """The goal is the PERSON's own words. An instruction that names someone IS the
+    instruction, and rewriting it would change the work that runs."""
+    FI.fleet_submit("mail the report to someone@example.com and confirm")
+    assert _jobs()[0]["payload"]["goal"] == "mail the report to someone@example.com and confirm"
+
+
+def test_redaction_happens_before_the_cap_not_after():
+    """Capping first would let a long prefix push the address past the cut and 'pass'."""
+    FI.fleet_submit("do a thing", source="x" * 55 + " someone@example.com")
+    assert "@" not in _jobs()[0]["origin"]["source"]
