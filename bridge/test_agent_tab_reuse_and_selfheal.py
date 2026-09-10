@@ -279,3 +279,101 @@ def test_the_probe_still_borrows_a_page_on_the_page_transport(monkeypatch):
         pass
     assert "borrow_page" in ex.submitted, (
         "the page transport has no page and did not ask for one; the probe cannot work")
+
+
+# -- the instrument this incident was missing --------------------------------------------------
+#
+# Nothing on this machine had ever recorded a page count over time, so when 69 orphaned tabs were
+# found, the onset could not be dated -- only "no record shows it before today". Process counts
+# had been sampled repeatedly and were useless by construction: the pages were same-origin, so
+# Chromium shared ~7 renderers between all 70 and the process count sat flat at 17 throughout.
+
+class _FakeResp:
+    def __init__(self, status, body):
+        self.status = status
+        self._body = body
+
+    def read(self):
+        return self._body
+
+
+class _FakeConn:
+    def __init__(self, status, body):
+        self._status = status
+        self._body = body
+        self.requested = None
+
+    def request(self, _method, path):
+        self.requested = path
+
+    def getresponse(self):
+        return _FakeResp(self._status, self._body)
+
+    def close(self):
+        pass
+
+
+def _targets(n_agent, n_blank=1):
+    import json as _json
+    rows = [{"type": "page", "url": AGENT_URL} for _ in range(n_agent)]
+    rows += [{"type": "page", "url": "about:blank"} for _ in range(n_blank)]
+    rows += [{"type": "service_worker", "url": "sw.js"}]     # must not be counted as a page
+    return _json.dumps(rows).encode("utf-8")
+
+
+def test_the_page_count_counts_pages_not_targets(monkeypatch):
+    conn = _FakeConn(200, _targets(69))
+    monkeypatch.setattr(B.http.client, "HTTPConnection", lambda *a, **k: conn)
+    total, agent = B.count_pages("http://127.0.0.1:9223")
+    assert (total, agent) == (70, 69), (total, agent)
+    assert conn.requested == "/json/list"
+
+
+def test_an_unreadable_endpoint_reports_nothing_rather_than_zero(monkeypatch):
+    """Zero pages and 'could not ask' must never be the same answer: a browser that has gone
+    away would otherwise read as a browser holding no tabs, which is the shape of every
+    green-by-omission failure in this project."""
+    def _boom(*_a, **_k):
+        raise OSError("connection refused")
+    monkeypatch.setattr(B.http.client, "HTTPConnection", _boom)
+    assert B.count_pages("http://127.0.0.1:9223") == (None, None)
+
+
+def test_a_climbing_page_count_warns_once_per_new_high(monkeypatch, tmp_path):
+    """It must shout, and it must not shout every minute forever -- a bridge legitimately
+    holding a few pages would drown the log and the next real warning with it."""
+    seen = []
+    monkeypatch.setattr(B.logger, "warning", lambda m, *a: seen.append(m % a if a else m))
+    monkeypatch.setattr(B, "PAGE_COUNT_LOG", str(tmp_path / "page_counts.jsonl"), raising=False)
+    monkeypatch.setattr(B, "PAGE_COUNT_SAMPLE_SEC", 0.0, raising=False)
+    monkeypatch.setattr(B, "PAGE_COUNT_WARN_AT", 8, raising=False)
+    monkeypatch.setattr(B, "_PAGE_COUNT_LAST_SAMPLE", 0.0, raising=False)
+    monkeypatch.setattr(B, "_PAGE_COUNT_LAST_WARNED", 0, raising=False)
+
+    counts = [4, 12, 12, 40, 2]
+    def _count(_cdp, timeout=4.0):
+        n = counts.pop(0)
+        return n, n - 1
+    monkeypatch.setattr(B, "count_pages", _count)
+
+    for _ in range(5):
+        B.sample_page_count("http://127.0.0.1:9223")
+
+    assert len(seen) == 2, ("expected a warning for 12 and for the new high 40, got: %s" % seen)
+    assert "12 pages" in seen[0] and "40 pages" in seen[1]
+
+    rows = [l for l in open(str(tmp_path / "page_counts.jsonl"), encoding="utf-8") if l.strip()]
+    assert len(rows) == 5, "every sample must be persisted, warned about or not -- that history "
+    import json as _json
+    assert _json.loads(rows[3])["pages"] == 40
+
+
+def test_the_history_is_bounded(monkeypatch, tmp_path):
+    log = tmp_path / "page_counts.jsonl"
+    log.write_text("\n".join(['{"ts": %d}' % i for i in range(50)]) + "\n", encoding="utf-8")
+    monkeypatch.setattr(B, "PAGE_COUNT_LOG", str(log), raising=False)
+    monkeypatch.setattr(B, "PAGE_COUNT_LOG_MAX_LINES", 10, raising=False)
+    B._trim_page_count_log()
+    rows = [l for l in open(str(log), encoding="utf-8") if l.strip()]
+    assert len(rows) == 10, len(rows)
+    assert '"ts": 49' in rows[-1], "trimming kept the wrong end; the newest samples must survive"

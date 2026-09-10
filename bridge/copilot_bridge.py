@@ -6319,6 +6319,103 @@ CONNECTION_DEAD_GRACE_S = max(5.0, float(os.environ.get("MCP_CONN_DEAD_GRACE_SEC
 CONNECTION_RECONNECT_TRIES = max(1, int(os.environ.get("MCP_CONN_RECONNECT_TRIES", "3")))
 
 
+#: How often the watchdog records how many PAGES the browser is holding, and the count above
+#: which it stops being routine.
+#:
+#: THE INSTRUMENT THIS INCIDENT WAS MISSING. On 2026-09-10 the bridge's headless Edge was found
+#: holding 71 pages, 69 of them orphans on one URL. Nothing noticed for hours, and afterwards
+#: the onset could not even be dated, because no log on this machine had ever recorded a page
+#: count over time. Process counts had been sampled repeatedly and were useless by construction:
+#: the pages were same-origin, so Chromium shared ~7 renderers between all 70 and the process
+#: count sat flat at 17 the whole time. Only a PAGE count can see this class, and only a
+#: persisted one can date it. See docs/incidents/20260910_bridge_agent_tab_leak.md.
+PAGE_COUNT_SAMPLE_SEC = max(15.0, float(os.environ.get("MCP_PAGE_COUNT_SAMPLE_SEC", "60")))
+PAGE_COUNT_WARN_AT = max(3, int(os.environ.get("MCP_PAGE_COUNT_WARN_AT", "8")))
+PAGE_COUNT_LOG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              ".fleet", "page_counts.jsonl")
+#: Keep the history bounded without losing the shape of an onset: one line a minute is ~1440/day.
+PAGE_COUNT_LOG_MAX_LINES = max(2000, int(os.environ.get("MCP_PAGE_COUNT_LOG_MAX", "20000")))
+
+_PAGE_COUNT_LAST_SAMPLE = 0.0
+_PAGE_COUNT_LAST_WARNED = 0
+
+
+def count_pages(cdp, timeout=4.0):
+    """How many PAGE targets the browser holds, and how many are on the agent surface.
+
+    Returns (total, agent) or (None, None) when the endpoint cannot be read. Plain HTTP against
+    /json/list -- no Playwright, so this is safe to call from the watchdog thread and can never
+    queue work behind the page-owner thread it is watching.
+    """
+    try:
+        parsed = urllib.parse.urlparse(cdp)
+        conn = http.client.HTTPConnection(parsed.hostname or "127.0.0.1",
+                                          parsed.port or 80, timeout=timeout)
+        conn.request("GET", "/json/list")
+        resp = conn.getresponse()
+        raw = resp.read()
+        conn.close()
+        if resp.status != 200:
+            return None, None
+        targets = json.loads(raw.decode("utf-8", "replace"))
+        pages = [t for t in targets if (t or {}).get("type") == "page"]
+        agent = [t for t in pages if "m365.cloud.microsoft/chat" in ((t or {}).get("url") or "")]
+        return len(pages), len(agent)
+    except Exception:
+        return None, None
+
+
+def sample_page_count(cdp, now=None):
+    """Record the page count, and say so out loud once it stops being routine. Never raises.
+
+    Returns the (total, agent) it recorded, or (None, None) when it did not sample -- either
+    because the interval has not elapsed or because the endpoint could not be read.
+
+    WARNS ON A RISING EDGE ONLY. A bridge that legitimately holds several pages must not print a
+    warning every minute forever; the line that matters is the one that says the count has grown
+    past where it was last complained about.
+    """
+    global _PAGE_COUNT_LAST_SAMPLE, _PAGE_COUNT_LAST_WARNED
+    now = time.time() if now is None else now
+    if now - _PAGE_COUNT_LAST_SAMPLE < PAGE_COUNT_SAMPLE_SEC:
+        return None, None
+    _PAGE_COUNT_LAST_SAMPLE = now
+    total, agent = count_pages(cdp)
+    if total is None:
+        return None, None
+    try:
+        os.makedirs(os.path.dirname(PAGE_COUNT_LOG), exist_ok=True)
+        with open(PAGE_COUNT_LOG, "a", encoding="utf-8") as fh:
+            print(json.dumps({"ts": round(now, 3), "cdp": cdp,
+                              "pages": total, "agent": agent}), file=fh)
+        _trim_page_count_log()
+    except Exception:
+        pass
+    if total > PAGE_COUNT_WARN_AT and total > _PAGE_COUNT_LAST_WARNED:
+        _PAGE_COUNT_LAST_WARNED = total
+        logger.warning("the browser is holding %d pages (%d on the agent surface); a page count "
+                       "that climbs on its own is a tab leak, and process counts cannot see it "
+                       "because same-origin pages share renderers", total, agent)
+    elif total <= PAGE_COUNT_WARN_AT:
+        _PAGE_COUNT_LAST_WARNED = 0
+    return total, agent
+
+
+def _trim_page_count_log():
+    """Bounded history: keep the newest PAGE_COUNT_LOG_MAX_LINES lines. Never raises."""
+    try:
+        if not os.path.isfile(PAGE_COUNT_LOG):
+            return
+        with open(PAGE_COUNT_LOG, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+        if len(lines) <= PAGE_COUNT_LOG_MAX_LINES:
+            return
+        with open(PAGE_COUNT_LOG, "w", encoding="utf-8") as fh:
+            fh.writelines(lines[-PAGE_COUNT_LOG_MAX_LINES:])
+    except Exception:
+        pass
+
+
 def _cdp_healthy(cdp, timeout=2.0):
     try:
         parsed = urllib.parse.urlparse(cdp)
@@ -6639,6 +6736,11 @@ def _start_cdp_watchdog(cdp):
         reconnects = 0
         while True:
             time.sleep(CDP_WATCHDOG_SEC)
+            # Cheap, HTTP-only, and on this thread on purpose: see PAGE_COUNT_SAMPLE_SEC.
+            try:
+                sample_page_count(cdp)
+            except Exception:
+                pass
             if _cdp_healthy(cdp):
                 if failures:
                     logger.info("CDP watchdog: recovered after %d failed check(s)", failures)
