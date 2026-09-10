@@ -242,3 +242,132 @@ def test_no_evidence_anywhere_is_null_not_zero(tmp_path):
     u = U.usage_section(history_path=history, status_path=status)
     assert u["verify_rate"] is None
     assert u["verify_source"] == "none"
+
+
+# ---------------------------------------------------------------------------------------------
+# The completion rate used to count claims the record had already refuted (codex-plan item 1).
+#
+# relay_fleet._settle_done sets status="done" FIRST and asks _claim_verdict() second, so a
+# worker whose tool ledger contradicts its own DONE claim keeps status "done" and only its
+# OUTCOME carries what was found. This section read status and never outcome.
+#
+# MEASURED ON THE LIVE ARCHIVE before the fix (215 rows, 2026-09-11):
+#     status "done" = 94 = 91 DONE + 3 EVIDENCE_CONTRADICTED
+# Three real tasks were refuted by their own record and counted as completions anyway --
+# 0.4372 where the recomputable figure is 0.4233.
+# ---------------------------------------------------------------------------------------------
+
+def test_a_refuted_claim_is_not_a_completion(tmp_path):
+    """The shape measured live: status done, outcome EVIDENCE_CONTRADICTED."""
+    d = str(tmp_path)
+    history = os.path.join(d, "history.json")
+    _write_json(history, [
+        {"key": "a", "status": "done", "outcome": "DONE", "turn": 2, "seq": 1},
+        {"key": "b", "status": "done", "outcome": "DONE", "turn": 4, "seq": 2},
+        {"key": "c", "status": "done", "outcome": "EVIDENCE_CONTRADICTED", "turn": 9, "seq": 3},
+        {"key": "d", "status": "stuck", "outcome": "STUCK", "turn": 5, "seq": 4},
+    ])
+
+    u = U.usage_section(history_path=history, status_path=os.path.join(d, "absent.json"))
+
+    assert u["completion_rate"] == round(2 / 4, 4), "the refuted claim was counted"
+    assert u["contradicted_done"] == 1
+    # status_mix is untouched: it reports what the machinery did, which really was three "done".
+    assert u["status_mix"]["done"] == 3
+    # ...and the two can be reconciled by hand, which is the whole point of the item-1 bar:
+    # "実行履歴と検証結果が対応し、ダッシュボードの値を元ログから再計算できる".
+    assert u["status_mix"]["done"] - u["contradicted_done"] == round(
+        u["completion_rate"] * u["n_tasks"])
+    # A refuted round is not a completion, so its turn count is not "how long a completion takes".
+    assert u["median_turns"] == 3
+
+
+def test_a_verify_failure_is_not_a_completion_either(tmp_path):
+    """VERIFY_FAILED means a gate ran and the work did not pass it. relay_fleet pairs it with
+    status "stuck" today, but the exclusion must not depend on that pairing holding -- the
+    outcome is the positive finding, and a future status change must not silently re-admit it."""
+    d = str(tmp_path)
+    history = os.path.join(d, "history.json")
+    _write_json(history, [
+        {"key": "a", "status": "done", "outcome": "DONE", "seq": 1},
+        {"key": "b", "status": "done", "outcome": "VERIFY_FAILED", "seq": 2},
+    ])
+    u = U.usage_section(history_path=history, status_path=os.path.join(d, "absent.json"))
+    assert u["completion_rate"] == round(1 / 2, 4)
+    assert u["contradicted_done"] == 1
+
+
+def test_only_a_positive_contradiction_excludes(tmp_path):
+    """AN ABSENCE OF EVIDENCE IS NOT EVIDENCE -- the same rule _claim_verdict applies to itself.
+
+    A row with no outcome, an empty one, or an outcome nothing here recognises must keep
+    counting exactly as it did. Most real work has no mechanical oracle at all, and demoting
+    it for that would invent a failure rate out of unconfigured tasks -- the mistake already
+    made once here, when 67 of 68 verified=False rows turned out to be workers nothing was
+    ever configured to check.
+    """
+    d = str(tmp_path)
+    history = os.path.join(d, "history.json")
+    _write_json(history, [
+        {"key": "a", "status": "done", "seq": 1},                        # no outcome key
+        {"key": "b", "status": "done", "outcome": "", "seq": 2},         # empty
+        {"key": "c", "status": "done", "outcome": "SOMETHING_NEW", "seq": 3},
+        {"key": "d", "status": "done", "outcome": "DONE", "seq": 4},
+    ])
+    u = U.usage_section(history_path=history, status_path=os.path.join(d, "absent.json"))
+    assert u["completion_rate"] == 1.0, "an unrecognised or absent outcome was treated as a refusal"
+    assert u["contradicted_done"] == 0
+
+
+def test_the_outcome_is_matched_case_insensitively_and_untrimmed(tmp_path):
+    """The archive is written by a second program; a stray space or case must not decide this."""
+    d = str(tmp_path)
+    history = os.path.join(d, "history.json")
+    _write_json(history, [
+        {"key": "a", "status": "done", "outcome": " evidence_contradicted ", "seq": 1},
+        {"key": "b", "status": "done", "outcome": "DONE", "seq": 2},
+    ])
+    u = U.usage_section(history_path=history, status_path=os.path.join(d, "absent.json"))
+    assert u["contradicted_done"] == 1
+    assert u["completion_rate"] == round(1 / 2, 4)
+
+
+def test_the_trend_and_the_recent_rate_use_the_same_rule_as_the_headline(tmp_path):
+    """A sparkline that counts refuted claims while the headline does not is two answers to one
+    question, and the reader cannot tell which is which."""
+    d = str(tmp_path)
+    history = os.path.join(d, "history.json")
+    rows = []
+    for i in range(1, 13):
+        # every third row is a refuted claim
+        oc = "EVIDENCE_CONTRADICTED" if i % 3 == 0 else "DONE"
+        rows.append({"key": "k%d" % i, "status": "done", "outcome": oc, "seq": i})
+    _write_json(history, rows)
+
+    u = U.usage_section(history_path=history, status_path=os.path.join(d, "absent.json"),
+                        segments=4)
+    assert u["completion_rate"] == round(8 / 12, 4)
+    assert u["contradicted_done"] == 4
+    # four buckets of three, each holding exactly one refuted row
+    assert u["trend"] == [round(2 / 3, 4)] * 4
+    # The recent window is min(50, max(1, n//3)) = 4, so it covers seq 9..12 -- which holds two
+    # refuted rows (9 and 12), not one. Asserting the headline here would have been asserting
+    # the window size, and the window is deliberately a different question from the all-time rate.
+    assert u["recent_window"] == 4
+    assert u["recent_completion_rate"] == round(2 / 4, 4)
+
+
+def test_the_outcome_mix_is_emitted_so_the_rate_can_be_rebuilt_from_the_archive(tmp_path):
+    """The bar is not "the number is right", it is "a reader can rebuild it". status_mix alone
+    could not: it cannot see the outcome the exclusion turns on."""
+    d = str(tmp_path)
+    history = os.path.join(d, "history.json")
+    _write_json(history, [
+        {"key": "a", "status": "done", "outcome": "DONE", "seq": 1},
+        {"key": "b", "status": "done", "outcome": "EVIDENCE_CONTRADICTED", "seq": 2},
+        {"key": "c", "status": "stuck", "outcome": "REFUSED", "seq": 3},
+    ])
+    u = U.usage_section(history_path=history, status_path=os.path.join(d, "absent.json"))
+    assert u["outcome_mix"] == {"DONE": 1, "EVIDENCE_CONTRADICTED": 1, "REFUSED": 1}
+    rebuilt = (u["status_mix"]["done"] - u["contradicted_done"]) / u["n_tasks"]
+    assert round(rebuilt, 4) == u["completion_rate"]
