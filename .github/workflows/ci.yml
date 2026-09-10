@@ -424,6 +424,7 @@ jobs:
             bridge/test_conversation_selection.py \
             bridge/test_tool_probe_borrows_a_page.py \
             bridge/test_connection_recovery.py \
+            bridge/test_agent_tab_reuse_and_selfheal.py \
             relay/selfimprove/test_frozen_surfaces.py \
             relay/selfimprove/test_reliability.py \
             relay/test_claim_verdict.py \
