@@ -80,7 +80,13 @@ def test_usage_arithmetic_and_persona_fields():
         ])
 
         status = os.path.join(d, "status.json")
-        _write_json(status, {"workers": [{"verified": "True"}, {"verified": "False"}]})
+        # verify_attempts is carried because a verified=False with ZERO attempts cannot come
+        # from a gate at all -- _poll_verify increments it before setting False -- and is no
+        # longer counted as a verification. Both snapshot builders always write the field, so
+        # this is the shape a real worker has; omitting it made this fixture describe a row the
+        # fleet cannot produce.
+        _write_json(status, {"workers": [{"verified": "True", "verify_attempts": 1},
+                                         {"verified": "False", "verify_attempts": 2}]})
 
         u = U.usage_section(history_path=history, status_path=status)
 
@@ -190,8 +196,11 @@ def test_verify_rate_prefers_the_archive_over_the_live_run(tmp_path):
     status = os.path.join(d, "status.json")
     # archive: 3 verifiable, 2 of them true
     with open(history, "w", encoding="utf-8") as fh:
-        json.dump([{"status": "done", "verified": True}, {"status": "done", "verified": True},
-                   {"status": "stuck", "verified": False}, {"status": "done"}], fh)
+        json.dump([{"status": "done", "verified": True, "verify_attempts": 1},
+                   {"status": "done", "verified": True, "verify_attempts": 1},
+                   # a REAL failure: the gate ran and did not pass, so it has attempts
+                   {"status": "stuck", "verified": False, "verify_attempts": 3},
+                   {"status": "done"}], fh)
     # live: a single unverified worker -- the shape that produced the misleading 0.0
     with open(status, "w", encoding="utf-8") as fh:
         json.dump({"workers": [{"verified": "False"}]}, fh)
@@ -216,7 +225,8 @@ def test_it_falls_back_to_the_live_run_when_nothing_archived_carries_the_field(t
     with open(history, "w", encoding="utf-8") as fh:
         json.dump([{"status": "done"}, {"status": "stuck"}], fh)      # no `verified` anywhere
     with open(status, "w", encoding="utf-8") as fh:
-        json.dump({"workers": [{"verified": "True"}, {"verified": "False"}]}, fh)
+        json.dump({"workers": [{"verified": "True", "verify_attempts": 1},
+                               {"verified": "False", "verify_attempts": 2}]}, fh)
 
     u = U.usage_section(history_path=history, status_path=status)
     assert u["verify_rate"] == 0.5
@@ -371,3 +381,53 @@ def test_the_outcome_mix_is_emitted_so_the_rate_can_be_rebuilt_from_the_archive(
     assert u["outcome_mix"] == {"DONE": 1, "EVIDENCE_CONTRADICTED": 1, "REFUSED": 1}
     rebuilt = (u["status_mix"]["done"] - u["contradicted_done"]) / u["n_tasks"]
     assert round(rebuilt, 4) == u["completion_rate"]
+
+
+# ---------------------------------------------------------------------------------------------
+# verify_rate counted 67 workers nobody had configured a check for (codex-plan item 1).
+#
+# The tri-state fix (relay_fleet.py:4168, 2026-09-09) stopped NEW rows recording verified=False
+# for "no checks configured". It could not touch the archive, and this rate is computed over the
+# archive: denominator 72 = 4 True + 68 False, of which 67 carried verify_attempts == 0.
+# ---------------------------------------------------------------------------------------------
+
+def test_a_false_with_no_attempts_is_not_a_failed_verification(tmp_path):
+    """_poll_verify increments verify_attempts on the failing branch BEFORE setting
+    verified=False, so a real failure can never carry zero. A False with no attempts is the old
+    no-checks branch, and it belongs with the None rows rather than in the denominator."""
+    d = str(tmp_path)
+    history = os.path.join(d, "history.json")
+    _write_json(history, [
+        {"key": "a", "status": "done", "verified": True, "verify_attempts": 1, "seq": 1},
+        {"key": "b", "status": "stuck", "verified": False, "verify_attempts": 3, "seq": 2},
+        # the shape that polluted the live denominator, 67 times over
+        {"key": "c", "status": "done", "verified": False, "verify_attempts": 0, "seq": 3},
+        {"key": "d", "status": "done", "verified": False, "seq": 4},   # field absent entirely
+    ])
+    u = U.usage_section(history_path=history, status_path=os.path.join(d, "absent.json"))
+    assert u["verify_n"] == 2, "an unconfigured worker was counted as a verification"
+    assert u["verify_rate"] == 0.5
+
+
+def test_a_none_row_is_still_excluded(tmp_path):
+    """The tri-state's whole point: None means no gate ran, and it never enters the rate."""
+    d = str(tmp_path)
+    history = os.path.join(d, "history.json")
+    _write_json(history, [
+        {"key": "a", "status": "done", "verified": None, "seq": 1},
+        {"key": "b", "status": "done", "verified": True, "verify_attempts": 2, "seq": 2},
+    ])
+    u = U.usage_section(history_path=history, status_path=os.path.join(d, "absent.json"))
+    assert u["verify_n"] == 1
+    assert u["verify_rate"] == 1.0
+
+
+def test_nothing_gated_at_all_is_still_null_not_zero(tmp_path):
+    """Tightening the denominator must not turn 'nothing to measure' into 0%."""
+    d = str(tmp_path)
+    history = os.path.join(d, "history.json")
+    _write_json(history, [{"key": "a", "status": "done", "verified": False,
+                           "verify_attempts": 0, "seq": 1}])
+    u = U.usage_section(history_path=history, status_path=os.path.join(d, "absent.json"))
+    assert u["verify_rate"] is None
+    assert u["verify_source"] == "none"

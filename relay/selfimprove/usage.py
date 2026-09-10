@@ -148,8 +148,36 @@ def usage_section(history_path=None, status_path=None, segments=6):
     # Only workers where verification ACTUALLY ran are counted; otherwise the metric is null,
     # not a misleading 0% (SWE-bench workers, for instance, never set verified).
     def _rate(rows):
-        verifiable = [w for w in rows
-                      if isinstance(w, dict) and str(w.get("verified")) in ("True", "False")]
+        # A `False` FROM BEFORE THE TRI-STATE FIX IS NOT A FAILED VERIFICATION.
+        #
+        # relay_fleet's _on_done_claimed used to set verified=False when a task had NO
+        # acceptance checks configured, which is "nobody asked", not "it was asked and failed".
+        # That was corrected on 2026-09-09 (relay_fleet.py:4168 now sets None) -- but the fix
+        # only changes NEW rows, and this rate is computed over an archive full of old ones.
+        #
+        # MEASURED (215-row archive, 2026-09-11): the denominator was 72 -- 4 True and 68 False
+        # -- and 67 of those 68 carried verify_attempts == 0. So the published "verify_rate
+        # 0.0556" was 4 passes against 1 real failure and 67 workers nothing was ever
+        # configured to check, and it reads as "5.6% of gated tasks passed".
+        #
+        # verify_attempts IS THE DISCRIMINATOR, and it is exact rather than a heuristic:
+        # _poll_verify increments it on the failing branch BEFORE verified is set to False
+        # (relay_fleet.py:4500), so a genuine failure can never carry zero. A False with no
+        # attempts can only have come from the old no-checks branch.
+        #
+        # Excluded rather than counted as a pass: it belongs with the None rows, which already
+        # mean "not verifiable, and never was".
+        def _gate_actually_ran(w):
+            if not isinstance(w, dict):
+                return False
+            v = str(w.get("verified"))
+            if v == "True":
+                return True
+            if v != "False":
+                return False
+            return bool(_as_int(w.get("verify_attempts")))
+
+        verifiable = [w for w in rows if _gate_actually_ran(w)]
         if not verifiable:
             return None, 0
         ver = sum(1 for w in verifiable if str(w.get("verified")) == "True")
