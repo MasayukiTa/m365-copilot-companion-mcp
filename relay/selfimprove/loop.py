@@ -37,9 +37,15 @@ GRADE_RESULTS = os.path.join(SWEDIR, "grade_results.jsonl")
 sys.path.insert(0, REPO)
 from relay.selfimprove import guards as G
 
+#: THE ORG MOVED, AND THE OLD NAME NOW FAILS OUTRIGHT. swebench's newer harness expects each
+#: instance to carry an `image` field, which the relocated datasets have and the princeton-nlp
+#: copies do not: grading against the old name dies with `KeyError: 'image'` inside
+#: make_test_spec, after the images have been pulled -- measured 2026-09-10, one of six causes
+#: behind three days of EVALERR verdicts. The harness's own --help now defaults to
+#: SWE-bench/SWE-bench_Lite, which is the upstream telling the same story.
 DATASETS = {
-    "Verified": "princeton-nlp/SWE-bench_Verified",
-    "Lite": "princeton-nlp/SWE-bench_Lite",
+    "Verified": "SWE-bench/SWE-bench_Verified",
+    "Lite": "SWE-bench/SWE-bench_Lite",
 }
 
 
