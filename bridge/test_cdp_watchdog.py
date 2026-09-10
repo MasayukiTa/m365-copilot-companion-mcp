@@ -159,3 +159,64 @@ def test_the_owner_thread_marks_serving_rather_than_setting_the_flag_by_hand():
     i = source.index("PAGE_EXECUTOR.run_forever()")
     assert "mark_serving()" in source[max(0, i - 400):i], (
         "the owner thread no longer calls mark_serving() before run_forever()")
+
+
+# -- a declared long job is not a wedge ---------------------------------------------------------
+#
+# THE FAULT THAT PINNED THE BRIDGE ON THE PAGE TRANSPORT. Getting onto a socket requires a token
+# capture, the capture runs on the owner thread, and the default capture sends a real Copilot
+# turn -- so the thread stopped answering the 10s probe, hit the 120s wedge limit, and the
+# process was handed back mid-capture. Every attempt to leave the page transport was killed by
+# the watchdog. Measured 2026-09-10 across an hour of restarts: transport stayed "page" with a
+# resident Copilot tab, and each cycle leaked an Edge tree.
+
+def test_a_declared_long_job_holds_off_the_hand_back(monkeypatch):
+    monkeypatch.setattr(bridge._PAGE_SERVING, "is_set", lambda: True)
+    calls = []
+    bridge.declare_long_job(300, "socket token capture")
+    try:
+        bridge.wedge_escalation_step(exiter=lambda code: calls.append(code),
+                                     wedged_for=bridge.PAGE_THREAD_WEDGE_LIMIT_S + 60)
+    finally:
+        bridge.end_long_job()
+    assert calls == [], "the capture was killed by the watchdog it was declared to"
+
+
+def test_a_long_job_that_overruns_its_declaration_is_a_wedge_again(monkeypatch):
+    """Declared, not exempt. A capture that never returns must still reach the supervisor."""
+    monkeypatch.setattr(bridge._PAGE_SERVING, "is_set", lambda: True)
+    calls = []
+    bridge.declare_long_job(0.0, "socket token capture")   # already expired
+    try:
+        bridge.wedge_escalation_step(exiter=lambda code: calls.append(code),
+                                     wedged_for=bridge.PAGE_THREAD_WEDGE_LIMIT_S + 60)
+    finally:
+        bridge.end_long_job()
+    assert calls == [70]
+
+
+def test_ending_a_long_job_restores_the_ordinary_rules(monkeypatch):
+    monkeypatch.setattr(bridge._PAGE_SERVING, "is_set", lambda: True)
+    bridge.declare_long_job(300, "socket token capture")
+    bridge.end_long_job()
+    assert bridge.long_job_remaining_s() == 0.0
+    calls = []
+    bridge.wedge_escalation_step(exiter=lambda code: calls.append(code),
+                                 wedged_for=bridge.PAGE_THREAD_WEDGE_LIMIT_S + 60)
+    assert calls == [70]
+
+
+def test_the_capture_declares_itself_and_always_clears_the_declaration():
+    """A declaration left standing after a failed capture would mute the watchdog for good."""
+    source = bridge.Path(bridge.__file__).read_text(encoding="utf-8")
+    i = source.index("route.refresh")
+    window = source[max(0, i - 700):i + 700]
+    assert "declare_long_job(CAPTURE_DECLARED_S" in window, (
+        "the token capture no longer declares itself; the watchdog will kill it again")
+    assert "finally:" in window and "end_long_job()" in window, (
+        "the declaration is not cleared in a finally; a failed capture would silence the "
+        "wedge watchdog for the rest of the process's life")
+
+
+def test_the_capture_budget_is_never_shorter_than_the_wedge_limit():
+    assert bridge.CAPTURE_DECLARED_S >= bridge.PAGE_THREAD_WEDGE_LIMIT_S

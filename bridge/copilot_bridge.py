@@ -1333,8 +1333,17 @@ def _bridge_socket_driver():
     if not url:
         return None
     try:
-        if route.needs_refresh(url) and not run_on_page_thread(route.refresh, CTX, url):
-            return None
+        if route.needs_refresh(url):
+            # THE CAPTURE IS THE LONG JOB. Declared before it starts so the watchdog does not
+            # hand the process back mid-capture -- which is what pinned this bridge on the page
+            # transport for an hour. CAPTURE_DECLARED_S covers the default capture_via_tab path,
+            # which sends a real turn; the light path finishes in about a minute.
+            declare_long_job(CAPTURE_DECLARED_S, "socket token capture")
+            try:
+                if not run_on_page_thread(route.refresh, CTX, url):
+                    return None
+            finally:
+                end_long_job()
         # S.load, NOT S.get -- session_store has never had a `get`. This read was written
         # as S.get, so it raised AttributeError on EVERY call, the bare except below turned
         # that into an empty conversation id, and socket_route reads an empty id as `start a
@@ -6177,6 +6186,13 @@ PAGE_THREAD_WEDGE_LIMIT_S = max(30.0, float(os.environ.get("MCP_PAGE_WEDGE_LIMIT
 PAGE_STARTUP_WEDGE_LIMIT_S = max(PAGE_THREAD_WEDGE_LIMIT_S,
                                  float(os.environ.get("MCP_PAGE_STARTUP_LIMIT_SEC", "600")))
 
+#: How long a token capture may hold the owner thread before it counts as a wedge again. The
+#: default capture sends a real Copilot turn, whose own budget is minutes; the light path
+#: (MCP_CAPTURE_LIGHT=1) measured 53.9s with no turn sent. Generous enough for the slow path,
+#: finite so a capture that never returns is still handed back.
+CAPTURE_DECLARED_S = max(PAGE_THREAD_WEDGE_LIMIT_S,
+                         float(os.environ.get("MCP_PAGE_CAPTURE_LIMIT_SEC", "420")))
+
 #: Set by the owner thread when it stops setting up and starts serving the queue. Before that,
 #: a missed liveness probe says "still starting", not "wedged".
 _PAGE_SERVING = threading.Event()
@@ -6187,6 +6203,44 @@ _PAGE_SERVING = threading.Event()
 #: the escalation limit: far enough in that "just busy" is no longer the likely reading, early
 #: enough to precede the hand-back rather than coincide with it.
 PAGE_THREAD_WEDGE_WARN_AFTER_S = PAGE_THREAD_WEDGE_LIMIT_S / 2.0
+
+
+#: A DECLARED LONG JOB IS NOT A WEDGE. Deadline (epoch seconds) until which the owner thread is
+#: known to be inside work that legitimately outlasts the liveness probe.
+#:
+#: THE JOB THIS EXISTS FOR IS THE TOKEN CAPTURE, and without this the bridge could never get
+#: onto a socket at all. Measured 2026-09-10: the tool probe borrows a page, _send_counted ->
+#: ensure_driver -> _bridge_socket_driver runs route.refresh on the owner thread, and the
+#: default capture (capture_via_tab, since MCP_CAPTURE_LIGHT is off) sends a REAL turn -- so the
+#: thread stops answering the 10s probe, hits the 120s wedge limit, and the process is handed
+#: back before the capture can finish. Every attempt to leave the page transport was killed by
+#: the watchdog, which is why transport stayed "page" with a resident Copilot tab through an
+#: hour of restarts.
+#:
+#: Bounded, and by the job's own numbers rather than a new guess: the capture's declared budget.
+#: A job that overruns its own declaration is a wedge again, so a capture that really hangs is
+#: still handed back.
+_PAGE_LONG_JOB_UNTIL = 0.0
+_PAGE_LONG_JOB_NAME = ""
+
+
+def declare_long_job(seconds, name="") -> None:
+    """Tell the wedge watchdog the owner thread is inside known-long work for `seconds`."""
+    global _PAGE_LONG_JOB_UNTIL, _PAGE_LONG_JOB_NAME
+    _PAGE_LONG_JOB_UNTIL = time.time() + max(0.0, float(seconds))
+    _PAGE_LONG_JOB_NAME = str(name or "")
+
+
+def end_long_job() -> None:
+    """The declared work finished (or failed); ordinary wedge rules apply again."""
+    global _PAGE_LONG_JOB_UNTIL, _PAGE_LONG_JOB_NAME
+    _PAGE_LONG_JOB_UNTIL = 0.0
+    _PAGE_LONG_JOB_NAME = ""
+
+
+def long_job_remaining_s(now=None):
+    """Seconds left on the declared long job, or 0.0 when none is in flight."""
+    return max(0.0, _PAGE_LONG_JOB_UNTIL - float(now if now is not None else time.time()))
 
 
 def mark_serving() -> None:
@@ -6226,6 +6280,15 @@ def wedge_escalation_step(exiter=None, wedged_for=None) -> bool:
     limit = (PAGE_THREAD_WEDGE_LIMIT_S if _PAGE_SERVING.is_set()
              else PAGE_STARTUP_WEDGE_LIMIT_S)
     if wedged_for is None or wedged_for < limit:
+        return False
+    # A declared long job (see declare_long_job) is known work, not a blocked queue. Checked
+    # here rather than folded into `limit` so the wait is against the JOB's own remaining
+    # budget: an overrunning job becomes a wedge again the moment its declaration expires.
+    remaining = long_job_remaining_s()
+    if remaining > 0.0:
+        logger.info("the page-owner thread has not answered for %.0fs, but %r is declared for "
+                    "another %.0fs; not handing the process back yet",
+                    wedged_for, _PAGE_LONG_JOB_NAME or "a long job", remaining)
         return False
     try:
         tool_probe.record_probe(False, "starting",
