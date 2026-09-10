@@ -1,19 +1,28 @@
 # -*- coding: utf-8 -*-
-"""A launch that never took must not come back as a graded verdict.
+"""Grading must run inside a held session, and an infra fault must never become a verdict.
 
-THE DEFECT THIS PINS, measured 2026-09-09. `systemd-run --no-block` legitimately returns empty
-stdout on success, so `_ssh_ps` cannot tell a clean detached launch from a connection that was
-silently degraded (the eval host's sshd has a very low MaxStartups and this call follows two scp
-calls in quick succession). Three consecutive real runs returned from the launch call looking
-exactly like success while /tmp/gb_<runid> was never created and the eval never ran -- and the
-poll loop then found a stray, empty, valid-looking .batchresult.json and wrote EVALERR rows for
-every instance. An infra fault was recorded as a graded outcome, which is the one thing a
-benchmark ledger must never do: loop.py reads zero rows as INFRA_ABORT and a row of EVALERR as
-a measurement.
+THE HISTORY THIS PINS. Three days of A/B grades came back EVALERR. Five separate causes were
+removed before the grader itself was proven correct, and the sixth had been producing the
+symptom all along: the batch was handed to `systemd-run --no-block`, and on this eval host
+detached work does not survive. Measured 2026-09-10:
 
-These tests drive the REAL main() with the transport injected, so they exercise the retry loop
-and the abort path rather than asserting that some source line exists. Nothing here touches the
-network or the eval host.
+  * the identical command run synchronously inside the invoking session finished in 107s and
+    returned a real verdict (resolved=1);
+  * handed to a transient unit it was STOPPED after 44s and 51s -- the journal says
+    "Stopping ... Deactivated successfully", with no error, no OOM and no timeout -- and dmesg
+    shows journald flushing its runtime journal, i.e. the distro's systemd being
+    re-initialised once no wsl.exe session held it;
+  * `setsid nohup` died the same way;
+  * touching the distro every 20 seconds did NOT rescue it (two arms, held and unheld, both
+    stopped at ~2 heartbeats), because a new session brings up a new systemd rather than
+    re-adopting the previous one's units.
+
+So the shape of the call IS the fix, and these tests hold that shape. They also hold the other
+half: a run that produces nothing writes NOTHING to the ledger, because loop.py reads zero rows
+as INFRA_ABORT and a row of EVALERR as a measurement -- and that difference decides whether a
+fresh slice gets burned.
+
+These drive the real main() with the transport injected. Nothing here touches the network.
 """
 from __future__ import annotations
 
@@ -32,13 +41,8 @@ import swe_check_remote as R          # noqa: E402
 import swe_grade_swebench as G        # noqa: E402
 
 
-#: THE PRE-LAUNCH PROBE HAS TO BE ANSWERED, or main() returns before the launch loop and every
-#: assertion below reads "verified 0 time(s)". swe_grade_swebench asks whether the eval host's
-#: interpreter can import swebench before it spends a launch on it (added after these tests were
-#: written, which is exactly how they went red in CI while passing here: the fake transport
-#: answered "" to the new question and the early return looked like a launch that never
-#: happened).
-def _grader_present(cmd):
+def _is_grader_probe(cmd):
+    """The pre-run probe main() asks before spending a run on the eval host."""
     return "import swebench" in cmd
 
 
@@ -50,17 +54,22 @@ def wired(tmp_path, monkeypatch):
     with io.open(str(preds / "some__repo-1.json"), "w", encoding="utf-8") as fh:
         json.dump([{"model_patch": "diff --git a/x b/x\n"}], fh)
 
-    calls = {"launch": 0, "marker": 0, "scp_from": 0}
+    calls = {"ssh": [], "scp_from": [], "probe": 0}
 
     monkeypatch.setattr(R, "_scp", lambda *a, **k: True)
-    monkeypatch.setattr(R, "_ssh_ps", lambda *a, **k: "")
-    # No real waiting: the retry pause and the poll interval are both time.sleep in main().
     monkeypatch.setattr(G.time, "sleep", lambda *_a, **_k: None)
 
-    def _scp_from(*_a, **_k):
-        calls["scp_from"] += 1
-        return False
-    monkeypatch.setattr(R, "_scp_from", _scp_from)
+    def _ssh_ps(script, *a, **k):
+        calls["ssh"].append(script)
+        return ""
+    monkeypatch.setattr(R, "_ssh_ps", _ssh_ps)
+
+    def _wsl_token(cmd, *a, **k):
+        if _is_grader_probe(cmd):
+            calls["probe"] += 1
+            return "Y"
+        return ""
+    monkeypatch.setattr(R, "_wsl_token", _wsl_token)
 
     monkeypatch.setattr(G, "TMP", str(tmp_path / "_grade_batch"))
     return {"preds": str(preds), "results": str(tmp_path / "grade_results.jsonl"),
@@ -70,7 +79,7 @@ def wired(tmp_path, monkeypatch):
 def _run(wired, argv_extra=()):
     argv = ["swe_grade_swebench.py", "--preds-dir", wired["preds"],
             "--results", wired["results"], "--run-id", "testrun",
-            "--max-wait-min", "1", "--poll-s", "1"] + list(argv_extra)
+            "--max-wait-min", "2"] + list(argv_extra)
     wired["monkeypatch"].setattr(sys, "argv", argv)
     G.main()
 
@@ -81,118 +90,97 @@ def _rows(path):
     return [json.loads(l) for l in io.open(path, encoding="utf-8") if l.strip()]
 
 
-def test_a_launch_that_never_created_the_workdir_is_retried_and_then_abandoned(wired):
-    """The workdir is the run's own first act, so its absence is the only honest signal."""
+def _serve(wired, payload, done=True):
+    """Make the result fetch behave: `done` controls whether the marker is there at all."""
     calls = wired["calls"]
 
-    def _wsl_token(cmd, *a, **k):
-        if _grader_present(cmd):
-            return "Y"
-        if "test -d" in cmd:
-            calls["marker"] += 1
-            return "N"          # the launch never took, every time
-        return ""
-    wired["monkeypatch"].setattr(R, "_wsl_token", _wsl_token)
+    def _scp_from(remote, local, *a, **k):
+        calls["scp_from"].append(remote)
+        if remote.endswith(".done"):
+            if not done:
+                return False
+            body = "DONE\n"
+        elif remote.endswith(".batchresult.json"):
+            body = json.dumps(payload)
+        else:
+            body = "remote log contents"
+        with io.open(local, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        return True
+    wired["monkeypatch"].setattr(R, "_scp_from", _scp_from)
 
+
+# -- the shape of the call ----------------------------------------------------------------------
+
+def test_the_batch_is_not_detached(wired):
+    """THE CAUSE THAT COST THREE DAYS. Detached work is stopped on this host within a minute,
+    having produced nothing, and that failure is indistinguishable from a graded miss."""
+    _serve(wired, {"resolved": ["some__repo-1"], "unresolved": [], "error": [], "empty": []})
     _run(wired)
+    sent = "\n".join(wired["calls"]["ssh"])
+    assert "systemd-run" not in sent, "the batch was detached again; it will be stopped mid-run"
+    assert "--no-block" not in sent, "the batch was detached again"
+    assert "Wait-Job" in sent, "the session is not held for the duration of the run"
 
-    assert calls["marker"] == 3, (
-        "the launch was verified %d time(s); it must be retried up to 3 before giving up"
-        % calls["marker"])
-    assert calls["scp_from"] == 0, (
-        "it polled for a result after a launch that never happened -- that poll is how a "
-        "stray .batchresult.json became a false EVALERR")
+
+def test_the_hold_is_at_least_as_long_as_the_caller_asked_for(wired):
+    """--max-wait-min is the ceiling on the work, so it must also be the ceiling on the wait:
+    a hold shorter than the work turns a slow grade into a silent infra abort."""
+    _serve(wired, {"resolved": [], "unresolved": ["some__repo-1"], "error": [], "empty": []})
+    _run(wired, ["--max-wait-min", "7"])
+    sent = "\n".join(wired["calls"]["ssh"])
+    assert "-Timeout 420" in sent, sent[-400:]
+
+
+def test_the_runner_log_goes_somewhere_that_survives(wired):
+    """/tmp on this host is cleaned within minutes -- measured, the workdir was gone while the
+    run was still being polled -- so a log written there cannot explain a failure afterwards."""
+    _serve(wired, {"resolved": ["some__repo-1"], "unresolved": [], "error": [], "empty": []})
+    _run(wired)
+    sent = "\n".join(wired["calls"]["ssh"])
+    assert "/mnt/c/wsl-setup/testrun.log" in sent, sent[-400:]
+
+
+# -- what reaches the ledger --------------------------------------------------------------------
+
+def test_a_real_verdict_reaches_the_ledger(wired):
+    _serve(wired, {"resolved": ["some__repo-1"], "unresolved": [], "error": [], "empty": []})
+    _run(wired)
+    assert [r["verdict"] for r in _rows(wired["results"])] == ["RESOLVED"]
+
+
+def test_a_run_that_produced_nothing_writes_no_row(wired):
+    _serve(wired, {}, done=False)
+    _run(wired)
     assert _rows(wired["results"]) == [], (
         "an infra fault was written into the grade ledger as a verdict: %r"
         % (_rows(wired["results"]),))
 
 
-def _serve_a_result(wired, resolved=("some__repo-1",)):
-    """Make the result fetch succeed, so the poll loop ends on its first tick.
-
-    NOT COSMETIC: time.sleep is a no-op in these tests, so a poll that never finds anything
-    spins on wallclock until --max-wait-min really elapses. Serving the result is also what the
-    assertion wants -- that a confirmed launch is followed through, not merely attempted.
-    """
-    calls = wired["calls"]
-
-    def _scp_from(remote, local, *a, **k):
-        calls["scp_from"] += 1
-        payload = ("DONE\n" if remote.endswith(".done")
-                   else json.dumps({"resolved": list(resolved), "unresolved": [],
-                                    "error": [], "empty": [], "report": "r.json"}))
-        with io.open(local, "w", encoding="utf-8") as fh:
-            fh.write(payload)
-        return True
-    wired["monkeypatch"].setattr(R, "_scp_from", _scp_from)
-
-
-def test_a_launch_that_takes_on_the_second_attempt_goes_on_to_poll(wired):
-    """The retry must not be a disguised abort: a launch that comes up late is a real run."""
-    calls = wired["calls"]
-
-    def _wsl_token(cmd, *a, **k):
-        if _grader_present(cmd):
-            return "Y"
-        if "test -d" in cmd:
-            calls["marker"] += 1
-            return "N" if calls["marker"] < 2 else "Y"
-        return ""
-    wired["monkeypatch"].setattr(R, "_wsl_token", _wsl_token)
-    _serve_a_result(wired)
-
+def test_a_run_that_produced_nothing_fetches_the_remote_log(wired):
+    """Saying "no result" without saying why is what made five causes take days each."""
+    _serve(wired, {}, done=False)
     _run(wired)
-
-    assert calls["marker"] == 2, "it did not stop verifying once the workdir appeared"
-    assert calls["scp_from"] > 0, "a confirmed launch was never polled for its result"
-    assert [r["verdict"] for r in _rows(wired["results"])] == ["RESOLVED"], (
-        "the late-but-real launch lost its verdict")
+    assert any(r.endswith(".log") for r in wired["calls"]["scp_from"]), (
+        "it gave up without reading the log it had just written: %r"
+        % (wired["calls"]["scp_from"],))
 
 
-def test_a_confirmed_run_still_records_the_verdict_it_was_given(wired):
-    """The abort path must not have cost the normal path its output."""
+def test_a_missing_grader_is_named_and_costs_no_run(wired):
+    """The probe's own contract: no grader on the far end means nothing is run, nothing is
+    fetched, and above all no verdict row is written."""
     calls = wired["calls"]
 
     def _wsl_token(cmd, *a, **k):
-        if _grader_present(cmd):
-            return "Y"
-        if "test -d" in cmd:
-            calls["marker"] += 1
-            return "Y"
-        return ""
-    wired["monkeypatch"].setattr(R, "_wsl_token", _wsl_token)
-    _serve_a_result(wired)
-
-    _run(wired)
-
-    assert calls["marker"] == 1, "a launch confirmed first time was verified twice"
-    rows = _rows(wired["results"])
-    assert [r["verdict"] for r in rows] == ["RESOLVED"], (
-        "a real graded result did not reach the ledger: %r" % (rows,))
-
-
-def test_a_missing_grader_is_named_and_costs_no_launch(wired):
-    """THE CHECK THAT WOULD HAVE CAUGHT THE ABOVE GOING RED. The pre-launch probe was added
-    without a test of its own, so the only thing that noticed it was three unrelated
-    assertions turning into "verified 0 time(s)" in CI. This pins the probe's own contract:
-    when the eval host's interpreter cannot import swebench, nothing is launched, nothing is
-    polled, and -- above all -- no verdict row is written, because a missing grader is an
-    eval-host setup fault and not a graded outcome."""
-    calls = wired["calls"]
-
-    def _wsl_token(cmd, *a, **k):
-        if _grader_present(cmd):
+        if _is_grader_probe(cmd):
+            calls["probe"] += 1
             return "N"
-        if "test -d" in cmd:
-            calls["marker"] += 1
-            return "Y"
         return ""
     wired["monkeypatch"].setattr(R, "_wsl_token", _wsl_token)
+    _serve(wired, {"resolved": ["some__repo-1"], "unresolved": [], "error": [], "empty": []})
 
     _run(wired)
 
-    assert calls["marker"] == 0, "it went on to launch with no grader on the far end"
-    assert calls["scp_from"] == 0, "it polled for a result it never asked for"
-    assert _rows(wired["results"]) == [], (
-        "a setup fault was written into the grade ledger as a verdict: %r"
-        % (_rows(wired["results"]),))
+    assert calls["probe"] == 1
+    assert calls["scp_from"] == [], "it went looking for a result it never asked for"
+    assert _rows(wired["results"]) == []
