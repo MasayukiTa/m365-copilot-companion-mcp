@@ -5957,7 +5957,22 @@ def _run_tool_probe():
             # Under the default MCP_BRIDGE_RELEASE_PAGE=1 -- a resident tab costs about half a
             # gigabyte -- PAGE is None whenever the bridge is idle, and idle is the only time
             # this probe runs. Borrowing is not an edge case here; it is every cycle.
-            if PAGE is None:
+            # A SOCKET TURN NEEDS NO PAGE, SO IT BORROWS NONE.
+            #
+            # MEASURED 2026-09-10. With transport=socket and no resident page, this probe still
+            # borrowed one every MCP_TOOL_PROBE_SEC -- 10-minute cadence, 37 "opened a new one"
+            # lines in a day, and page counts on :9223 visibly oscillating 1 -> 2 -> 1 while
+            # every turn went over the socket and touched nothing on that tab. The composer gate
+            # in _do_tool_probe_turn had already been taught that a socket turn does not need a
+            # DOM; the BORROW was left behind, so the page was opened to satisfy nothing.
+            #
+            # It also mattered beyond waste: each borrow runs _find_or_open_agent, and a failure
+            # in there is what orphaned 69 tabs on this very port (see
+            # docs/incidents/20260910_bridge_agent_tab_leak.md). Not opening a page is the only
+            # way not to leak one.
+            #
+            # The page transport still borrows: there, the page IS the conversation.
+            if PAGE is None and not _on_socket():
                 try:
                     _ok_borrow, _probe_borrowed = PAGE_EXECUTOR.submit_bounded(30.0, borrow_page)
                 except Exception:

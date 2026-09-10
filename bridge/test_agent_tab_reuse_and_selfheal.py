@@ -207,3 +207,75 @@ def test_repeated_failures_accumulate_nothing(monkeypatch):
     assert [p.closed for p in ctx.created] == [True] * 10, (
         "one orphan per failed reopen is exactly the leak that filled a headless browser with "
         "69 identical tabs; every attempt must clean up after itself")
+
+
+# -- the probe must not borrow a page it does not need ----------------------------------------
+#
+# MEASURED 2026-09-10. With transport=socket and no resident page, _run_tool_probe still
+# borrowed a page every MCP_TOOL_PROBE_SEC: 37 "opened a new one" lines in one day, and page
+# counts on :9223 oscillating 1 -> 2 -> 1 across the 32-minute verification window, while every
+# turn went over the socket and touched nothing on that tab. The composer gate in
+# _do_tool_probe_turn had already been taught that a socket turn needs no DOM; the BORROW was
+# left behind, so a page was opened to satisfy nothing.
+#
+# It is not only waste: every borrow runs _find_or_open_agent, and a failure in there is exactly
+# what orphaned 69 tabs on this port. Not opening a page is the only way not to leak one.
+
+class _RecordingExecutor:
+    """Stands in for PAGE_EXECUTOR and records what the probe asked it to run."""
+
+    def __init__(self):
+        self.submitted = []
+
+    def submit_bounded(self, _timeout, fn, *a, **k):
+        self.submitted.append(getattr(fn, "__name__", repr(fn)))
+        return (False, None)
+
+    def submit(self, fn, *a, **k):
+        self.submitted.append(getattr(fn, "__name__", repr(fn)))
+        return None
+
+
+class _SocketDriver:
+    IS_SOCKET = True
+    failed = ""
+
+    def send(self, *_a, **_k):
+        raise RuntimeError("stop here: the probe's turn is not what this test is about")
+
+
+def _arm_probe(monkeypatch, on_socket):
+    """Get _run_tool_probe past its idle guards with a recording executor in place."""
+    ex = _RecordingExecutor()
+    monkeypatch.setattr(B, "PAGE_EXECUTOR", ex, raising=False)
+    monkeypatch.setattr(B, "PAGE", None, raising=False)
+    monkeypatch.setattr(B, "DRIVER", _SocketDriver() if on_socket else None, raising=False)
+    monkeypatch.setattr(B, "_on_socket", lambda: on_socket, raising=False)
+    monkeypatch.setattr(B, "MCP_TOOL_PROBE_SEC", 600.0, raising=False)
+    monkeypatch.setattr(B, "_LAST_USER_TURN_TS", 0.0, raising=False)
+    monkeypatch.setattr(B.tool_probe, "record_probe", lambda *a, **k: None, raising=False)
+    return ex
+
+
+def test_the_probe_borrows_no_page_while_the_conversation_is_on_a_socket(monkeypatch):
+    ex = _arm_probe(monkeypatch, on_socket=True)
+    try:
+        B._run_tool_probe()
+    except Exception:
+        pass                    # a later step failing is fine; the borrow is the subject
+    assert "borrow_page" not in ex.submitted, (
+        "the probe borrowed a page on the socket transport again; that is a tab opened to "
+        "satisfy nothing, and every borrow runs _find_or_open_agent, which is what orphaned "
+        "69 tabs")
+
+
+def test_the_probe_still_borrows_a_page_on_the_page_transport(monkeypatch):
+    """The other half: on the page transport the page IS the conversation, so it must borrow.
+    Without this, the fix above would read as 'never borrow' and quietly break page mode."""
+    ex = _arm_probe(monkeypatch, on_socket=False)
+    try:
+        B._run_tool_probe()
+    except Exception:
+        pass
+    assert "borrow_page" in ex.submitted, (
+        "the page transport has no page and did not ask for one; the probe cannot work")
