@@ -188,6 +188,30 @@ function Reset-CompanionSession {
     if (Test-Path $sess) { Remove-Item $sess -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
+function Test-CompanionCdp {
+    # THE SAME QUESTION THE WATCHDOG ASKS, because the two readers of this port's health
+    # disagreed and the disagreement was a perpetual-motion machine.
+    #
+    # MEASURED 2026-09-10. The gate below decided "the companion Edge is up" from a TCP
+    # listener alone. The bridge's own watchdog (_cdp_healthy in bridge/copilot_bridge.py)
+    # decides it from GET /json/version returning 200. A half-dead Edge keeps LISTENING while
+    # its debugging endpoint stops answering -- and in that state the watchdog said "dead",
+    # exited the bridge for keepalive recovery, the keepalive called this script, this script
+    # said "already reachable ... Nothing to do", and the watchdog said "dead" again. The
+    # cycle ran for over an hour and left 37 msedge processes holding 3.5 GB.
+    #
+    # relay/test_fleet_handoff.py already pins this exact class for the fleet status file
+    # ("If the two readers disagree, one of them starts the second fleet"). Same rule, and it
+    # was missing here: whoever decides "is it up" must ask what the other reader asks.
+    param([int]$ProbePort = $Port, [int]$TimeoutSec = 3)
+    try {
+        $r = Invoke-WebRequest -UseBasicParsing ("http://127.0.0.1:" + $ProbePort + "/json/version") -TimeoutSec $TimeoutSec
+        return ($r.StatusCode -eq 200)
+    } catch {
+        return $false
+    }
+}
+
 if ($Surface) {
     $h = Get-CompanionWindow
     if ($h -ne [IntPtr]::Zero) {
@@ -207,12 +231,60 @@ if ($HardReset) {
     Write-Host "HardReset: session state cleared."
 }
 
-# Idempotent: if something is already listening on the port, assume the companion
-# Edge is up and do nothing (avoid spawning a second instance / fighting for the port).
+# Idempotent: if the companion Edge is already up, do nothing (avoid spawning a second
+# instance / fighting for the port). "Up" means CDP ANSWERS, not merely that something holds
+# the port -- see Test-CompanionCdp for the loop that distinction cost.
 $listening = $false
 try {
     $listening = [bool](Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
 } catch { }
+if ($listening -and -not (Test-CompanionCdp)) {
+    # THE STATE THAT USED TO BE READ AS HEALTH. Something holds the port and does not answer
+    # CDP, which is precisely the condition the caller is recovering FROM. Doing nothing here
+    # is what made recovery a loop.
+    Write-Host "Companion Edge on port $Port holds the port but does not answer CDP (/json/version)."
+    $ourPids = @(Get-CompanionPids)
+    if ($ourPids.Count -eq 0) {
+        # Killing this profile's Edge cannot free a port this profile does not hold. Say so and
+        # fail, rather than relaunching into a bind failure once every keepalive cycle forever.
+        $owner = ""
+        try {
+            $owner = (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop |
+                      Select-Object -First 1 -ExpandProperty OwningProcess)
+        } catch { }
+        Write-Host "No msedge process for this profile holds it; owning pid = '$owner'. Refusing to"
+        Write-Host "relaunch into a port held by something else -- free it, then re-run."
+        exit 3
+    }
+    Write-Host "Killing this profile's stale Edge ($($ourPids.Count) process(es)) and relaunching ..."
+    Reset-CompanionSession
+    # WAIT FOR THE PORT, DO NOT ASK ONCE. Reset-CompanionSession sleeps 2s after Stop-Process,
+    # and a listening socket is not always gone by then -- measured 2026-09-10, this branch
+    # reported "still held by something else" and refused to relaunch on a port that was merely
+    # mid-release, so every keepalive cycle logged a false conflict and the Edge never came back.
+    # A wrong "somebody else owns it" is worse than a slow answer: it is indistinguishable, from
+    # the log, from the real conflict this check exists to name.
+    $freed = $false
+    for ($i = 0; $i -lt 15; $i++) {
+        $held = $false
+        try {
+            $held = [bool](Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+        } catch { }
+        if (-not $held) { $freed = $true; break }
+        Start-Sleep -Seconds 1
+    }
+    if (-not $freed) {
+        $owner = ""
+        try {
+            $owner = (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop |
+                      Select-Object -First 1 -ExpandProperty OwningProcess)
+        } catch { }
+        Write-Host "Port $Port is still held 15s after killing this profile's Edge (owning pid ="
+        Write-Host "'$owner'); not relaunching into a port somebody else owns."
+        exit 3
+    }
+    $listening = $false
+}
 if ($listening) {
     # SPECIAL CASE (headless -> headed sign-in swap): -Foreground is a request to make a
     # window visible for interactive sign-in. A HEADLESS Edge holds the port but has NO
