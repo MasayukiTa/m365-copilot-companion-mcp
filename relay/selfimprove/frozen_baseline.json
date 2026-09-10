@@ -8,7 +8,7 @@
     "bench/companionbench/pools.py": "53e9759fa105c59f3e5b2c413cb9621fba17450422c459961a0c33addfbc549b",
     "bench/companionbench/runner.py": "e14f81439d6905e28f6d0493023e16c114a85fa8e76d1c589ee92e14d6f13b97",
     "bench/evalhost_batch_grade.py": "1b1403f8346cf6aaba8f31f5bfd99111e1a093e02558865b98ffff75af4e9457",
-    "bench/swe_grade_swebench.py": "6fb04d8dab62ada933831028a2fa9f5b4a26a580672b84f0798fd216e676bfac",
+    "bench/swe_grade_swebench.py": "c37bfb68be6166e5fa3ce4fff7884a85e50b168a60ab504801c46a686cca2724",
     "docs/SECURITY.md": "cc35a60b69133f7d0a446bdea46381b65fb33df68a02f47c7cf603f050d9db74",
     "relay/selfimprove/authority_ledger.py": "82c365a34fc13c7e910724859be7819ce9fcd48a276e2d4fa4c8688555c95621",
     "relay/selfimprove/decision.py": "a92fc06ca9f5ea51f5aac47c2aeaf93ed7cf66d2bf8068e2b39df976894c3f5c",
