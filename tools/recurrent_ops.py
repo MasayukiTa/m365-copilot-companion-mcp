@@ -23,10 +23,25 @@ Deliberately reused rather than rebuilt:
     where per-iteration records belong, so the loop's history and its audit trail are one thing
     instead of two that can disagree.
 
-Not implemented here, on purpose: the depth-band -> instruction table (this returns the band,
-not the template) and any keep-best/rollback rule. Both are being built separately, and a
-rollback rule cannot be written yet anyway -- see `failure_signal`: on a verifier that reports
-pass/fail without a count, no round can be "better than" another.
+Both things this file once deferred are now here. The depth-band -> instruction table came in
+item 7 (`_BAND_INSTRUCTIONS`). keep-best/rollback is item A, and the reason it had to wait is
+worth keeping, because it did not go away -- it got a boundary:
+
+    "on a verifier that reports pass/fail without a count, no round can be better than another"
+
+That is still true, and it is not a shortcoming to be fixed. `bench/eval_one.py` prints OK or
+HIDDEN_TESTS_FAILED and withholds the count ON PURPOSE, so that a solver cannot hill-climb
+hidden tests. So keep-best does not ask for a gradient it might not get; it asks whether one
+exists, and declines to rank when it does not. A round whose failure count is None is never the
+best round, however promising it looks otherwise -- see `_best_round`. Ranking there would be
+exactly the benchmark overfitting this project forbids, dressed as an optimisation.
+
+Where a count IS available -- ordinary pytest output, "3 failed" -- a round that lowers it is
+real progress, and reverting it because verification has not fully passed yet throws that
+progress away. With keep_best on, such a round is KEPT and becomes the baseline the next round
+edits; a round that does not lower the count is restored from its own pre-images. Off by
+default: it changes what the tree looks like when the loop ends, and that is not a default this
+module gets to change silently.
 """
 from __future__ import annotations
 
@@ -54,6 +69,12 @@ CONTINUE = "continue"
 SHALLOW_ROUNDS = 2
 BAND_EXPLORE = 1
 BAND_REFINE = 2
+
+#: With keep_best on, a round that lowered the failure count is not reverted -- so when the loop
+#: ends the tree carries that round's edits and NOT the state it started in. Callers are told
+#: which round they are standing on rather than having to infer it, because "the loop reverts
+#: everything" was true before this and is the assumption most likely to be carried forward.
+STANDING_ON_START = 0
 
 
 def depth_band(iteration: int) -> int:
@@ -143,6 +164,81 @@ def _progress(rounds: list):
     return best, flat
 
 
+def _countable(rec) -> bool:
+    """Whether this round produced a failure COUNT that may be compared with another round's.
+
+    A bool is not a count (isinstance(True, int) is True in Python, and a round recorded as
+    fails=True would otherwise rank as one failure). None is not a count either, and that case
+    is the important one: `bench/eval_one.py` withholds the number so a solver cannot hill-climb
+    hidden tests, so a None here is a verifier keeping a secret on purpose, not a parse failure
+    to be worked around.
+    """
+    f = rec.get("fails")
+    return isinstance(f, int) and not isinstance(f, bool)
+
+
+def _best_round(rounds: list):
+    """The round with the fewest failures, or None when no round can be ranked.
+
+    TIES GO TO THE EARLIER ROUND. Two rounds at the same count are not equally good to keep: the
+    earlier one is the one whose progress is already banked, and preferring the later one would
+    churn the tree for nothing.
+
+    Rounds with no count are not candidates. That is the whole guard -- see the module docstring.
+    """
+    ranked = [r for r in rounds if _countable(r)]
+    if not ranked:
+        return None
+    return min(ranked, key=lambda r: (int(r["fails"]), int(r.get("iteration") or 0)))
+
+
+def _standing_on(rounds: list) -> int:
+    """Which round's edits the tree currently carries, or STANDING_ON_START for none.
+
+    Read from the log rather than tracked, like everything else here: the caller is a different
+    process each round and there is nowhere to keep it.
+    """
+    standing = STANDING_ON_START
+    for r in rounds:
+        if r.get("kept"):
+            standing = int(r.get("iteration") or standing)
+        elif r.get("ok"):
+            standing = int(r.get("iteration") or standing)
+    return standing
+
+
+def _pre_images(edits, repo: str):
+    """({absolute path: bytes or None}, [paths that could not be read]) for this round's files.
+
+    Its own pre-images, not a repo snapshot. restore_point() cannot serve here: its git mode
+    REFUSES a dirty tree, and keep_best deliberately leaves the tree dirty between rounds, while
+    its zip mode's roll_back declines to unzip over a live tree on purpose. A round only ever
+    needs to undo ITS OWN writes, and undoing exactly that is what leaves an earlier kept round
+    intact underneath.
+
+    Bytes, and the same dict shape autoloop._restore consumes, so the undo path is theirs rather
+    than a second implementation that can drift from it.
+
+    UNREADABLE FILES ARE RETURNED, NOT ENCODED AS A SENTINEL. A round whose pre-image cannot be
+    captured cannot be undone, and edit_and_verify already shows what to do about that: return
+    before the first write. The caller refuses the round.
+    """
+    out = {}
+    unreadable = []
+    for e in (edits or []):
+        try:
+            p = autoloop._abs(repo, e["path"])
+        except Exception:
+            continue
+        if p in out or p in unreadable:
+            continue
+        try:
+            out[p] = autoloop._read(p) if autoloop.os.path.exists(p) else None
+        except OSError:
+            unreadable.append(p)
+    return out, unreadable
+
+
 def _state(run_id: str, cfg: dict, rounds: list, stop: str = CONTINUE, reason: str = "") -> dict:
     best, flat = _progress(rounds)
     nxt = len(rounds) + 1
@@ -161,8 +257,17 @@ def _state(run_id: str, cfg: dict, rounds: list, stop: str = CONTINUE, reason: s
         "best_failures": best,
         "rounds_without_improvement": flat,
         "patience": cfg.get("patience"),
+        "keep_best": bool(cfg.get("keep_best")),
+        # WHICH ROUND THE TREE IS STANDING ON. 0 means the state the loop started in. Reported
+        # even when keep_best is off (where it stays 0 until a round passes), because a caller
+        # that has to infer this will infer it wrong exactly once.
+        "standing_on": _standing_on(rounds),
+        "best_iteration": (_best_round(rounds) or {}).get("iteration"),
+        # Stated so a caller can tell "no round was better" from "no round could be compared".
+        "rankable_rounds": sum(1 for r in rounds if _countable(r)),
         "history": [
-            {k: r.get(k) for k in ("iteration", "ok", "stage", "fails", "signal", "reverted")}
+            {k: r.get(k) for k in ("iteration", "ok", "stage", "fails", "signal", "reverted",
+                                   "kept", "restore_failed")}
             for r in rounds
         ],
     }
@@ -174,7 +279,7 @@ def _dump(obj) -> str:
 
 def recurrent_begin(goal: str, verify_command: str = "", repo: str = ".", run_id: str = "",
                     max_iter: int = 5, quality_threshold: int = 0, patience: int = 2,
-                    binary_patience: bool = False) -> str:
+                    binary_patience: bool = False, keep_best: bool = False) -> str:
     """Open a recurrent loop whose rounds are generated one at a time.
 
     Unlike `loop_until_verified`, no edits are supplied here. Each round's edits are produced
@@ -195,6 +300,10 @@ def recurrent_begin(goal: str, verify_command: str = "", repo: str = ".", run_id
         patience: rounds without improvement before the loop calls it.
         binary_patience: count a reported-but-uncounted failure as no improvement. Off by
             default for the same reason it is off in loop_runner.
+        keep_best: keep a round whose failure COUNT is lower than every prior round, instead of
+            reverting it, and make it the baseline the next round edits. A round with no count
+            is never kept -- see the module docstring for why that boundary is deliberate. OFF
+            by default: it changes what the tree holds when the loop ends.
     """
     locked = require_unlocked()
     if locked:
@@ -215,7 +324,8 @@ def recurrent_begin(goal: str, verify_command: str = "", repo: str = ".", run_id
         max_iter = max(1, int(max_iter))
         cfg = {"kind": KIND_BEGIN, "goal": goal, "verify": verify_command or "", "repo": repo,
                "max_iter": max_iter, "quality_threshold": int(quality_threshold),
-               "patience": int(patience), "binary_patience": bool(binary_patience)}
+               "patience": int(patience), "binary_patience": bool(binary_patience),
+               "keep_best": bool(keep_best)}
         runlog_append_local(run_id, cfg)
     except Exception as exc:
         return "[recurrent_begin error: %s: %s]" % (type(exc).__name__, exc)
@@ -281,10 +391,36 @@ def recurrent_step(run_id: str, edits: list) -> str:
         runlog_append_local(run_id, rec)
         return _dump(_state(run_id, cfg, rounds + [rec], L.STUCK, rec["reason"]))
 
+    keep_best = bool(cfg.get("keep_best"))
+    repo = cfg.get("repo") or "."
+    # THE BEST COUNT AS IT STANDS BEFORE THIS ROUND. Read now: after edit_and_verify the log
+    # will contain this round too, and "better than every prior round" must not include itself.
+    best_before = _best_round(rounds)
+    pre = {}
+    if keep_best:
+        pre, unreadable = _pre_images(edits, repo)
+        if unreadable:
+            # BEFORE THE FIRST WRITE, as in edit_and_verify. Keeping a round means this function
+            # owns the undo, and it will not start a round it could not undo.
+            rec = {"kind": KIND_ROUND, "iteration": i, "stop": L.STOPPED,
+                   "reason": ("cannot read the pre-image of %d file(s), so this round could not "
+                              "be undone if it were not kept: %s"
+                              % (len(unreadable), ", ".join(unreadable[:3]))),
+                   "ok": False, "stage": "pre-image", "fails": None,
+                   "signal": autoloop.SIGNAL_UNKNOWN, "reverted": False, "ts": time.time()}
+            runlog_append_local(run_id, rec)
+            return _dump(_state(run_id, cfg, rounds + [rec], L.STOPPED, rec["reason"]))
+
     try:
+        # With keep_best the decision to keep cannot be made until the count is in hand, so the
+        # edits stay for now and this function reverts them itself when the round did not earn
+        # its place. Without it, edit_and_verify's own revert is unchanged.
         result = autoloop.edit_and_verify(edits, verify=cfg.get("verify") or None,
-                                          repo=cfg.get("repo") or ".", run_id=run_id)
+                                          repo=repo, run_id=run_id,
+                                          revert_on_fail=not keep_best)
     except Exception as exc:
+        if keep_best and pre:
+            autoloop._restore(pre)   # an exception mid-round must not leave half a round applied
         return "[recurrent_step error: %s: %s]" % (type(exc).__name__, exc)
 
     fails = autoloop.count_failures(result.get("output") or "")
@@ -293,6 +429,31 @@ def recurrent_step(run_id: str, edits: list) -> str:
            "stage": result.get("stage"), "fails": fails, "signal": signal,
            "reverted": bool(result.get("reverted")),
            "binary_patience": bool(cfg.get("binary_patience")), "ts": time.time()}
+
+    if keep_best and not result.get("ok") and not result.get("stopped"):
+        # KEEP ONLY ON A LOWER COUNT. Not on a hunch, not on "it looks closer", and never when
+        # the count is None -- a verifier that withholds the number is doing so on purpose.
+        countable = isinstance(fails, int) and not isinstance(fails, bool)
+        improved = countable and (best_before is None or int(fails) < int(best_before["fails"]))
+        if improved:
+            rec["kept"] = True
+            rec["baseline_from"] = int((best_before or {}).get("iteration") or STANDING_ON_START)
+        else:
+            failed_paths = autoloop._restore(pre)
+            rec["kept"] = False
+            rec["reverted"] = True
+            rec["restore_failed"] = failed_paths
+            rec["not_kept_because"] = ("no comparable failure count" if not countable
+                                       else "did not lower the failure count")
+            if failed_paths:
+                # SAY IT IN THE RECORD, not only in a log line: a partially restored round means
+                # the tree is in a state no round describes, and the next round must not be
+                # generated against a state nobody can name.
+                rec["stop"] = L.STOPPED
+                rec["reason"] = ("could not restore %d file(s) after an unkept round; the tree "
+                                 "is in a state no round describes" % len(failed_paths))
+                runlog_append_local(run_id, rec)
+                return _dump(_state(run_id, cfg, rounds + [rec], rec["stop"], rec["reason"]))
 
     stop, reason = CONTINUE, ""
     if result.get("stopped"):
