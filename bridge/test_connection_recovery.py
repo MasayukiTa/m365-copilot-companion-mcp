@@ -323,7 +323,11 @@ def test_a_brief_wedge_is_tolerated():
                                    wedged_for=B.PAGE_THREAD_WEDGE_LIMIT_S - 1) is False
 
 
-def test_a_thread_that_stops_answering_hands_the_process_back():
+def test_a_thread_that_stops_answering_hands_the_process_back(monkeypatch):
+    """SERVING, not starting. The limit now depends on which of the two the thread is doing:
+    before run_forever() a missed probe is startup competing with the probe, not a blocked
+    queue (see mark_serving). This test is about the blocked queue, so it says so."""
+    monkeypatch.setattr(B._PAGE_SERVING, "is_set", lambda: True)
     exits = []
     assert B.wedge_escalation_step(exiter=exits.append,
                                    wedged_for=B.PAGE_THREAD_WEDGE_LIMIT_S + 1) is True
@@ -371,6 +375,7 @@ def test_the_first_missed_probe_is_not_logged_as_an_established_wedge(monkeypatc
 def test_the_escalation_is_still_an_error(monkeypatch):
     """The level moved down for the observation, not for the fault."""
     seen = _spy_logger(monkeypatch)
+    monkeypatch.setattr(B._PAGE_SERVING, "is_set", lambda: True)
     assert B.wedge_escalation_step(exiter=lambda c: None,
                                    wedged_for=B.PAGE_THREAD_WEDGE_LIMIT_S + 1) is True
     assert [lv for lv, _ in seen if lv == "error"], (

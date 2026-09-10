@@ -32,6 +32,16 @@ import swe_check_remote as R          # noqa: E402
 import swe_grade_swebench as G        # noqa: E402
 
 
+#: THE PRE-LAUNCH PROBE HAS TO BE ANSWERED, or main() returns before the launch loop and every
+#: assertion below reads "verified 0 time(s)". swe_grade_swebench asks whether the eval host's
+#: interpreter can import swebench before it spends a launch on it (added after these tests were
+#: written, which is exactly how they went red in CI while passing here: the fake transport
+#: answered "" to the new question and the early return looked like a launch that never
+#: happened).
+def _grader_present(cmd):
+    return "import swebench" in cmd
+
+
 @pytest.fixture
 def wired(tmp_path, monkeypatch):
     """main() with every remote call replaced, and a real prediction on disk to grade."""
@@ -76,6 +86,8 @@ def test_a_launch_that_never_created_the_workdir_is_retried_and_then_abandoned(w
     calls = wired["calls"]
 
     def _wsl_token(cmd, *a, **k):
+        if _grader_present(cmd):
+            return "Y"
         if "test -d" in cmd:
             calls["marker"] += 1
             return "N"          # the launch never took, every time
@@ -120,6 +132,8 @@ def test_a_launch_that_takes_on_the_second_attempt_goes_on_to_poll(wired):
     calls = wired["calls"]
 
     def _wsl_token(cmd, *a, **k):
+        if _grader_present(cmd):
+            return "Y"
         if "test -d" in cmd:
             calls["marker"] += 1
             return "N" if calls["marker"] < 2 else "Y"
@@ -140,6 +154,8 @@ def test_a_confirmed_run_still_records_the_verdict_it_was_given(wired):
     calls = wired["calls"]
 
     def _wsl_token(cmd, *a, **k):
+        if _grader_present(cmd):
+            return "Y"
         if "test -d" in cmd:
             calls["marker"] += 1
             return "Y"
@@ -153,3 +169,30 @@ def test_a_confirmed_run_still_records_the_verdict_it_was_given(wired):
     rows = _rows(wired["results"])
     assert [r["verdict"] for r in rows] == ["RESOLVED"], (
         "a real graded result did not reach the ledger: %r" % (rows,))
+
+
+def test_a_missing_grader_is_named_and_costs_no_launch(wired):
+    """THE CHECK THAT WOULD HAVE CAUGHT THE ABOVE GOING RED. The pre-launch probe was added
+    without a test of its own, so the only thing that noticed it was three unrelated
+    assertions turning into "verified 0 time(s)" in CI. This pins the probe's own contract:
+    when the eval host's interpreter cannot import swebench, nothing is launched, nothing is
+    polled, and -- above all -- no verdict row is written, because a missing grader is an
+    eval-host setup fault and not a graded outcome."""
+    calls = wired["calls"]
+
+    def _wsl_token(cmd, *a, **k):
+        if _grader_present(cmd):
+            return "N"
+        if "test -d" in cmd:
+            calls["marker"] += 1
+            return "Y"
+        return ""
+    wired["monkeypatch"].setattr(R, "_wsl_token", _wsl_token)
+
+    _run(wired)
+
+    assert calls["marker"] == 0, "it went on to launch with no grader on the far end"
+    assert calls["scp_from"] == 0, "it polled for a result it never asked for"
+    assert _rows(wired["results"]) == [], (
+        "a setup fault was written into the grade ledger as a verdict: %r"
+        % (_rows(wired["results"]),))
