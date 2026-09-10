@@ -64,6 +64,35 @@ def _caller_site() -> str:
         return ""
 
 
+def _session() -> str:
+    """The MCP session this refusal arrived on, or "" outside an HTTP request.
+
+    WHY IT IS FETCHED HERE, AND NOT PASSED IN. The refusal sites live in tools/security.py,
+    which is in FROZEN_MANIFEST as the unlock boundary -- adding a parameter there would make a
+    diagnostic that changes no authorisation cost a re-signing of the baseline. tool_ledger's
+    session_fingerprint() is in the request context already and answers the same question from
+    here, which is the same reasoning that put session_fingerprint in tool_ledger rather than
+    beside the unlock ContextVar in the first place.
+    
+    WHAT IT MAKES ANSWERABLE. This ledger records `client_ip` and, since 2026-09-09,
+    `session_state` -- but never WHICH session, so a refusal could not be joined to the unlock
+    that preceded it. Measured 2026-09-10 across three days: of 759 lock refusals, 595 happen
+    before any successful unlock in the same session (the designed first-call refusal) and 164
+    happen AFTER one, spread p50 461s / p90 1359s / max 2710s from that unlock. The max exceeds
+    the 30-minute session TTL and is explained; the median is well inside it and is not. The
+    leading hypothesis is that the forwarded IP changes under a stable session -- authorisation
+    is recorded in state[ip]["sessions"], so an identity change loses it -- and this field is
+    what would confirm or kill that, since the two are then in one row.
+
+    OBSERVATION ONLY. Nothing branches on it.
+    """
+    try:
+        from tools.tool_ledger import session_fingerprint
+        return session_fingerprint()
+    except Exception:
+        return ""
+
+
 def _append_log(payload: dict) -> None:
     """One line per refusal. Best effort; a log that cannot be written must not refuse a call."""
     try:
@@ -99,6 +128,15 @@ def record_locked(client_ip: str = "", detail: str = "", ts: Optional[float] = N
         "detail": str(detail or "")[:200],
         "site": _caller_site(),
     }
+    # record_locked's contract is "Never raises" -- a ledger that can fail a request is worse
+    # than a ledger. _session() guards itself, and this guards against _session ITSELF being
+    # the thing that breaks (a swapped implementation, an import that starts raising).
+    try:
+        sess = _session()
+    except Exception:
+        sess = ""
+    if sess:
+        payload["session"] = sess
     if presented_digest or tokens_held is not None:
         payload["presented_digest"] = str(presented_digest or "")[:16]
         payload["tokens_held"] = int(tokens_held) if tokens_held is not None else None

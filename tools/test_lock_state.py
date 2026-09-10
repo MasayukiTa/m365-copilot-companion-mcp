@@ -235,3 +235,51 @@ def test_an_empty_presented_digest_is_still_recorded_distinctly(tmp_path, monkey
     row = _log_lines(tmp_path, monkeypatch)[-1]
     assert "presented_digest" in row and row["presented_digest"] == ""
     assert row["tokens_held"] == 3
+
+
+# -- which session the refusal arrived on -------------------------------------------------------
+#
+# This ledger recorded client_ip and, since 2026-09-09, session_state -- but never WHICH
+# session, so a refusal could not be joined to the unlock that preceded it. Measured 2026-09-10
+# over three days: of 759 refusals, 595 precede any successful unlock in the same session (the
+# designed first-call refusal) and 164 FOLLOW one, p50 461s / p90 1359s / max 2710s after it.
+# The max exceeds the 30-minute session TTL and is explained; the median is well inside it and
+# is not. Joining the two needs the session id in the same row as the ip.
+
+def _rows(path):
+    return [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+
+def test_a_refusal_records_the_session_it_arrived_on(tmp_path, monkeypatch):
+    monkeypatch.setattr(lock_state, "_LOG_FILE", tmp_path / "refusals.jsonl")
+    monkeypatch.setattr(lock_state, "_session", lambda: "abc123def456")
+    lock_state.record_locked("20.0.0.1", "[locked client IP: '20.0.0.1'] ...")
+    rows = [r for r in _rows(tmp_path / "refusals.jsonl") if r.get("event") == "refused"]
+    assert len(rows) == 1
+    assert rows[0]["session"] == "abc123def456"
+    assert rows[0]["client_ip"] == "20.0.0.1", (
+        "the join needs BOTH halves in one row -- the ip is the key the authorization is "
+        "recorded under, the session is what may have outlived it")
+
+
+def test_no_session_means_no_field_rather_than_an_empty_one(tmp_path, monkeypatch):
+    """Outside an HTTP request there is no session to name. An empty string would read, to a
+    later reader counting rows by session, as a session whose id happens to be blank -- which
+    is exactly how the earlier blank-ip records made an incident unreconstructable."""
+    monkeypatch.setattr(lock_state, "_LOG_FILE", tmp_path / "refusals.jsonl")
+    monkeypatch.setattr(lock_state, "_session", lambda: "")
+    lock_state.record_locked("", "[locked: no HTTP request context] ...")
+    rows = [r for r in _rows(tmp_path / "refusals.jsonl") if r.get("event") == "refused"]
+    assert "session" not in rows[0], rows[0]
+
+
+def test_a_session_lookup_that_raises_cannot_refuse_the_call(tmp_path, monkeypatch):
+    """A diagnostic that can fail a request is worse than no diagnostic."""
+    monkeypatch.setattr(lock_state, "_LOG_FILE", tmp_path / "refusals.jsonl")
+
+    def boom():
+        raise RuntimeError("no context")
+    monkeypatch.setattr(lock_state, "_session", boom)
+    with pytest.raises(RuntimeError):
+        boom()
+    lock_state.record_locked("20.0.0.1", "detail")     # must not raise
