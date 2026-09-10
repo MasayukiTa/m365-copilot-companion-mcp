@@ -234,6 +234,7 @@ jobs:
             bench/test_review_resilience.py \
             bench/test_review_run.py \
             bench/test_swe_check_feedback.py \
+            bench/test_swe_grade_launch_verification.py \
             relay/test_admission.py \
             relay/test_bestofn.py \
             relay/test_bestofn_run.py \
