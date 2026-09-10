@@ -2333,6 +2333,10 @@ class RelayWorker:
         # is run-unique (run_id includes the fleet start time) so reused worker names
         # (w0/w1) across rounds never share a file. Path is exposed via .transcript so
         # the snapshot can hand it to the UI. None when no dir was passed (back-compat).
+        # KEPT, NOT ONLY CONSUMED. This was folded straight into _tx_base_key and dropped,
+        # so the two mechanism records this class writes had no run to name and went into
+        # .fleet/mechanisms.jsonl blank -- 2981 of 4386 rows.
+        self.run_id = run_id or ""
         self._tx_base_key = ((run_id + "_") if run_id else "") + name
         self._tx_key = (self._tx_base_key + "_a0"
                         if self.resilience_profile != "off" else self._tx_base_key)
@@ -4230,7 +4234,8 @@ class RelayWorker:
             self.reason = (self.reason or "") + (" | " if self.reason else "") + _sk
             try:
                 from relay import mechanism_telemetry as _mt
-                _mt.record("refuter", configured=True, config_source="skip-when-settled",
+                _mt.record("refuter", run_id=self.run_id,
+                           configured=True, config_source="skip-when-settled",
                            eligible=True, triggered=False,
                            not_triggered_reason=_sk, executed=False, changed_decision=False)
             except Exception:
@@ -4383,6 +4388,7 @@ class RelayWorker:
             _agg = record.get("aggregate")
             _veto = record.get("veto_shadow")
             _mt.record("panel" if len(_lenses) > 1 else "refuter",
+                       run_id=getattr(self, "run_id", ""),
                        instance=str(getattr(self, "cwd", "") or "")[-8:],
                        goal_hash=str(getattr(self, "goal_hash", "") or "")[:24],
                        turn=getattr(self, "turn", None),
@@ -4393,6 +4399,7 @@ class RelayWorker:
                        extra={"lenses": _lenses})
             if len(_lenses) > 1:
                 _mt.record("veto",
+                           run_id=getattr(self, "run_id", ""),
                            goal_hash=str(getattr(self, "goal_hash", "") or "")[:24],
                            turn=getattr(self, "turn", None),
                            configured=("security" in _lenses), eligible=("security" in _lenses),
@@ -5433,7 +5440,12 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     # can never fail a run.
     try:
         from relay import mechanism_telemetry as _mt
-        _run_id = "%s" % int(time.time())
+        # THE RUN'S OWN ID, NOT A FRESH EPOCH. This read `"%s" % int(time.time())` while
+        # `run_id` -- the parameter of this very function, resolved above and used to key every
+        # transcript file -- sat in scope. The result was a field shaped like an id that joined
+        # to nothing: of 4386 rows in .fleet/mechanisms.jsonl, 1405 carried an epoch and not one
+        # carried a value any other ledger could be matched on.
+        _run_id = run_id
         # A PANEL IS MORE THAN ONE LENS. Recording `configured` as "any lenses at all" made a
         # single-reviewer run look like a configured panel -- caught by reading this
         # instrument's own first output, where review_lenses came back as ["rootcause"]
@@ -5723,7 +5735,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 # "did not trigger" with the reason attached, on every goal it declines.
                 try:
                     from relay import mechanism_telemetry as _mt
-                    _mt.record("retry",
+                    _mt.record("retry", run_id=run_id,
                                goal_hash=str(getattr(_w, "goal_hash", "") or "")[:24],
                                turn=getattr(_w, "turn", None),
                                configured=True, config_source="run",
@@ -5756,7 +5768,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 if _unverified_done:
                     try:
                         from relay import mechanism_telemetry as _mt
-                        _mt.record("retry",
+                        _mt.record("retry", run_id=run_id,
                                    goal_hash=str(getattr(_w, "goal_hash", "") or "")[:24],
                                    turn=getattr(_w, "turn", None),
                                    configured=True, config_source="MCP_RETRY_UNVERIFIED_DONE",
@@ -5810,7 +5822,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 # changed nothing" had a rung of its own ladder unset.
                 try:
                     from relay import mechanism_telemetry as _mt
-                    _mt.record("retry",
+                    _mt.record("retry", run_id=run_id,
                                goal_hash=str(getattr(_w, "goal_hash", "") or "")[:24],
                                turn=getattr(_w, "turn", None),
                                configured=True, config_source="run",

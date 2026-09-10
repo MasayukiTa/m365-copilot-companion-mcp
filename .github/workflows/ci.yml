@@ -441,6 +441,7 @@ jobs:
             relay/test_lens_selection.py \
             relay/test_live_record_isolation.py \
             relay/test_mechanism_telemetry.py \
+            relay/test_mechanism_records_name_their_run.py \
             relay/test_memory_dedupe.py \
             relay/test_fleet_reconcile.py \
             relay/test_frame_side_skill.py \
