@@ -222,3 +222,38 @@ def test_nothing_was_acted_on_and_the_record_says_so(tmp_path, monkeypatch):
     (tmp_path / "a.py").write_text("x = 2", encoding="utf-8")
     w._record_tree_stability()
     assert rows[-1][1]["executed"] is False
+
+
+def test_the_hash_declares_its_own_measured_bound_not_the_acceptance_ceiling(tmp_path):
+    """It used to declare _eval_ceiling_s() -- at least 1500s -- for an operation measured at
+    7.3s idle and 29.8s under load. A window fifty times the work is not a declaration, it is
+    a blank cheque: if the hash ever wedged, the watchdog would vouch for the browser for
+    twenty-five minutes before the failsafe caught up."""
+    import time as _t
+    (tmp_path / "a.py").write_text("x = 1", encoding="utf-8")
+    w = _worker(tmp_path)
+    seen = {}
+
+    def _spy(seconds):
+        seen["s"] = seconds
+        w.eval_busy_until = _t.time() + seconds
+    w._declare_blocking = _spy
+
+    w._tree_hash_now()
+
+    assert seen.get("s") == RF.TREE_HASH_CEILING_S
+    assert RF.TREE_HASH_CEILING_S < RF.EVAL_STALL_CEILING_S, (
+        "the tree hash declares a window as wide as a full acceptance eval")
+    assert RF.TREE_HASH_CEILING_S >= 30, (
+        "the bound is under the 29.8s this was measured to take under load, so a normal hash "
+        "would look like a wedge")
+
+
+def test_the_window_closes_even_when_hashing_raises(tmp_path, monkeypatch):
+    """A window left open would make this worker vouch for a browser it stopped watching."""
+    def _boom(*a, **k):
+        raise RuntimeError("hashing exploded")
+    monkeypatch.setattr(SV, "tree_hash", _boom)
+    w = _worker(tmp_path)
+    w._tree_hash_now()
+    assert w.eval_busy_until == 0.0
