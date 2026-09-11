@@ -98,9 +98,33 @@ on `d13dbd7`.
 
 ## Not fixed here
 
-`ChatHubError: frame budget exhausted before completion` is what *triggers* the fallback. That is
-a separate defect about socket turns, it is untouched, and fallbacks will keep happening at
-roughly 2.4%. What must no longer happen is a stall following one.
+Whatever makes a socket turn give up is untouched, so fallbacks will keep happening at roughly
+2.4%. What must no longer happen is a stall following one.
+
+**An earlier draft of this section named `ChatHubError: frame budget exhausted before completion`
+as "what triggers the fallback".** That was generalising from the two lines this run happened to
+show. Counted across all 86 fallbacks in `.fleet/socket_route.jsonl`:
+
+| count | reason |
+|---|---|
+| 33 | `could not open the socket: InvalidProxyStatus` |
+| 19 | `ConnectionClosedError: no close frame received or sent` |
+| 13 | unknown |
+| 11 | `turn deadline exceeded before a completion frame` |
+| 4 | `the backend declined the request: InternalError` |
+| **2** | **`frame budget exhausted before completion`** |
+
+The frame budget is 2 of 86. The dominant cause is the socket failing to open or dropping
+(52 of 86, 60%). The fix in `d13dbd7` is unaffected either way — it is about what the fleet does
+*during* a fallback, not about why one started — but the cause named here was wrong and a reader
+would have gone looking in the wrong place.
+
+**And the frame budget cannot currently be judged at all.** `chathub.py:506` sets
+`max_frames=2000` and raises the moment a turn exceeds it, but the frame count of a turn is
+recorded nowhere — not on the fallback record, not anywhere in the repository. There is no
+denominator, so nobody can say whether 2000 is generous or tight. Adding `seen` to the record on
+both the passing and failing paths is the prerequisite for touching that number; changing it
+without one would be guessing.
 
 ## Two attribution errors made while diagnosing this
 
