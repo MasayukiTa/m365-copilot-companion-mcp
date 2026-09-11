@@ -200,6 +200,23 @@ def validate(toggle, spec_path, n, seed, dataset_key, alpha, min_n, min_pp,
                 pass
         return n
 
+    def _present(pred_dir, instances):
+        """How many of THESE instances already have a prediction, whenever it was written.
+
+        _captured above answers "did this process just write files", which is the right
+        question for "did the solve do work" and the WRONG one for "is there anything to
+        grade". On a resume of a complete arm the solver correctly writes nothing, and reading
+        that as an infrastructure fault makes the resume path -- the one the chunk-skip logic
+        depends on -- impossible to finish.
+        """
+        if not os.path.isdir(pred_dir):
+            return 0
+        n = 0
+        for inst in (instances or []):
+            if os.path.isfile(os.path.join(pred_dir, str(inst) + ".json")):
+                n += 1
+        return n
+
     # ON arm (blocking child; resumable so a transient blip just re-runs the uncaptured chunk)
     # ONE TIMESTAMP FOR BOTH ARMS was not enough: a file touched in the OFF directory while
     # the ON arm was still running predates the OFF arm and still counted as an OFF capture.
@@ -215,10 +232,16 @@ def validate(toggle, spec_path, n, seed, dataset_key, alpha, min_n, min_pp,
     # a slice that was never solved would silently consume fresh instances; cf. the disk-floor
     # incident that wrongly burned 200). Return an infra_abort status so the caller retries later.
     on_cap = _captured(on_dir, on_started_at)
-    if on_cap == 0:
-        log("ON solve captured 0 predictions -> INFRA ABORT (disk floor / wedge); NOT burning, NOT gating")
+    # NOTHING NEW **AND** NOTHING THERE. A resume of a complete arm writes nothing and is not a
+    # wedge; measured 2026-09-12, where `0/100 remaining (captured 100)` aborted as infra.
+    on_have = _present(on_dir, fresh)
+    if on_cap == 0 and on_have == 0:
+        log("ON solve captured 0 predictions and none exist for the slice -> INFRA ABORT "
+            "(disk floor / wedge); NOT burning, NOT gating")
         return {"status": "infra_abort", "arm": "ON", "reason": "ON solve produced no predictions (infra)",
                 "burned": False, "report": None}
+    log("ON arm has %d/%d predictions for the slice (%d written by this run)"
+        % (on_have, len(fresh), on_cap))
     on_resolved, on_graded, on_failed, on_infra = _grade_arm(
         on_dir, targets_file, dataset, "sion" + time.strftime("%m%d%H%M"))
     log("ON resolved: %d/%d (graded %d)" % (len(on_resolved), len(fresh), on_graded))
@@ -238,10 +261,14 @@ def validate(toggle, spec_path, n, seed, dataset_key, alpha, min_n, min_pp,
     if not done:
         log("OFF solve did not reach its done marker (rc=%s); aborting" % rc); return None
     off_cap = _captured(off_dir, off_started_at)
-    if off_cap == 0:
-        log("OFF solve captured 0 predictions -> INFRA ABORT; NOT burning, NOT gating")
+    off_have = _present(off_dir, fresh)
+    if off_cap == 0 and off_have == 0:
+        log("OFF solve captured 0 predictions and none exist for the slice -> INFRA ABORT; "
+            "NOT burning, NOT gating")
         return {"status": "infra_abort", "arm": "OFF", "reason": "OFF solve produced no predictions (infra)",
                 "burned": False, "report": None}
+    log("OFF arm has %d/%d predictions for the slice (%d written by this run)"
+        % (off_have, len(fresh), off_cap))
     off_resolved, off_graded, off_failed, off_infra = _grade_arm(
         off_dir, targets_file, dataset, "sioff" + time.strftime("%m%d%H%M"))
     log("OFF resolved: %d/%d (graded %d)" % (len(off_resolved), len(fresh), off_graded))
