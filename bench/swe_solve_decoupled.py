@@ -140,8 +140,19 @@ def run_fleet(goals_path, max_concurrent, max_turns, max_transient, effort):
 def capture(insts):
     os.makedirs(PREDS, exist_ok=True)
     nonempty = 0
+    captured_n = 0
     for inst in insts:
         wt = os.path.join(WORK, "wt_" + inst)
+        # NO WORKTREE MEANS IT WAS NEVER ATTEMPTED, WHICH IS NOT AN EMPTY PATCH.
+        #
+        # This wrote a prediction for every instance in the chunk, using "" when the worktree
+        # was missing. The grader reads that as a patch that changed nothing and returns `not
+        # resolved`, so an instance the harness never staged enters McNemar as evidence about
+        # the change under test. Leaving it uncaptured keeps it out of the pair AND keeps it in
+        # `remaining`, which is what lets a later run actually solve it.
+        if not os.path.isdir(wt):
+            log("  skip capture (never staged, stays in remaining): %s" % inst)
+            continue
         diff = ""
         if os.path.isdir(wt):
             try:
@@ -165,7 +176,8 @@ def capture(insts):
         # path out of .strip().
         if (diff or "").strip():
             nonempty += 1
-    return nonempty
+        captured_n += 1
+    return nonempty, captured_n
 
 
 def _decode_child(raw):
@@ -284,16 +296,29 @@ def main():
         log("--- chunk %d/%d: %d inst (repos: %s) | C: free %.1f GB ---"
             % (ci, len(chunks(remaining, a.chunk)), len(ch), ",".join(repos), fg))
         if not stage(ch, a.spec, a.floor_gb):
-            log("  stage failed for chunk %d; skipping (will retry on resume)" % ci)
-            continue
+            # NOT A REASON TO DISCARD THE CHUNK. Measured 2026-09-12: "19 prepared, 1 failed"
+            # threw away nineteen ready worktrees, left the arm at 80/100, and the gate then
+            # burned a hundred fresh instances for an `underpowered` verdict.
+            #
+            # write_goals already skips an instance with no worktree, and the `ng == 0` check
+            # below already covers a stage that produced nothing at all -- so the honest
+            # behaviour was one line away the whole time: carry on with what is ready, and
+            # leave the rest to be picked up as `remaining` on the next run.
+            log("  stage incomplete for chunk %d; continuing with whatever prepared "
+                "(the rest stay in `remaining`)" % ci)
         goals_path = os.path.join(SWEDIR, "goals_solve_chunk.jsonl")
         ng = write_goals(ch, spec, goals_path)
         if ng == 0:
             log("  no goals written for chunk %d; skipping" % ci)
             continue
+        if ng < len(ch):
+            log("  chunk %d: %d of %d instances staged; %d deferred to a later run"
+                % (ci, ng, len(ch), len(ch) - ng))
         run_fleet(goals_path, a.max_concurrent, a.max_turns, a.max_transient, a.effort)
-        ne = capture(ch)
-        log("  captured %d/%d (non-empty diffs: %d)" % (len(ch), len(ch), ne))
+        ne, nc = capture(ch)
+        # WHAT WAS ACTUALLY CAPTURED, not the chunk size twice. The old line printed
+        # "captured 20/20" whether or not every instance had a worktree.
+        log("  captured %d/%d (non-empty diffs: %d)" % (nc, len(ch), ne))
         if not a.keep_worktrees:
             release(ch)
 
