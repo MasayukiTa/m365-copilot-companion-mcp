@@ -459,6 +459,7 @@ jobs:
             relay/test_settings_round_trip.py \
             relay/test_supervisor_verify.py \
             relay/test_tree_moved_after_verify.py \
+            relay/test_tab_fallback_is_not_a_wedge.py \
             relay/test_turn_outcome.py \
             relay/test_turn_class_is_recorded.py \
             relay/test_upstream_throttle.py \
