@@ -187,7 +187,33 @@ def test_the_real_archive_stops_repeating(tmp_path):
         else:
             final.append(CT.neutral_title(key, r.get("ts")))
 
-    before = len({(r.get("title") or "").strip() for r in rows})
-    assert len(set(final)) > before * 3, "titles are still collapsing onto each other"
+    raw = [(r.get("title") or "").strip() for r in rows]
+    before = len(set(raw))
+    after = len(set(final))
+
+    # `after > before * 3` USED TO BE THE ASSERTION, AND IT WAS UNSATISFIABLE HERE.
+    #
+    # That multiplier encoded ONE archive's shape -- the comment above describes 1083 rows
+    # whose three mass-produced titles covered 732/172/153 of them, where `before` was tiny and
+    # `after` was nearly the row count. It is not a property of the rule under test.
+    #
+    # Measured 2026-09-11 on this machine: 85 rows, 34 distinct raw titles. `after` can never
+    # exceed the ROW COUNT, so the bar was 102 against a ceiling of 85 -- no implementation,
+    # however correct, could pass it. And it had been invisible because the archive sat under
+    # the 50-row skip above until a day's fleet runs pushed it over, so the first time this
+    # test ever really ran, it failed for arithmetic rather than for a defect.
+    #
+    # What the rule actually promises is stated directly instead: disambiguation may never make
+    # the archive LESS distinguishable, and the collapse it exists to break must actually be
+    # broken. Both hold whatever shape the archive happens to have.
+    assert after >= before, (
+        "disambiguation made titles less distinct than the raw archive (%d -> %d)"
+        % (before, after))
+    worst_before = Counter(raw).most_common(1)[0][1]
+    worst_after = Counter(final).most_common(1)[0][1]
+    if worst_before >= 3:
+        assert worst_after < worst_before, (
+            "the biggest pile of identical titles (%d rows) came through unchanged"
+            % worst_before)
     assert not CT.repeated(final, 3), "something is still shared by three or more rows"
     assert all(f.strip() for f in final), "a title came out empty"
