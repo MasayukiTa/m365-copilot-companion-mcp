@@ -340,6 +340,7 @@ jobs:
             tests/test_skill_match_japanese.py \
             relay/test_chathub_capture.py \
             relay/selfimprove/test_guards.py \
+            relay/selfimprove/test_resume_is_not_a_wedge.py \
             relay/selfimprove/test_harness_feedback.py \
             relay/selfimprove/test_qd.py \
             relay/selfimprove/test_l2.py \
