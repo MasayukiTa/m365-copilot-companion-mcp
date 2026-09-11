@@ -77,6 +77,27 @@ _SSH_BASE = ["ssh", "-o", "ConnectTimeout=30", "-o", "BatchMode=yes",
              "-o", "ServerAliveInterval=20", SSH_HOST]
 
 
+def _decode_child(raw):
+    """Decode child output without ever raising.
+
+    Delegates to tools.code_exec._decode -- UTF-8 first, then the local codepage with
+    errors="replace" -- so there is one implementation of this and not two. Falls back to a
+    local equivalent only if that import is unavailable, because this module is run as a script
+    from the bench harness and must not fail to start over a decoding helper.
+    """
+    if not raw:
+        return ""
+    try:
+        from tools.code_exec import _decode
+        return _decode(raw)
+    except Exception:
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            import locale
+            return raw.decode(locale.getpreferredencoding(False) or "utf-8", errors="replace")
+
+
 def _ssh_ps(ps_script, timeout=60, tries=3):
     """Run a PowerShell snippet on the eval host via -EncodedCommand. Returns stdout (NULs
     stripped). Retries on the flaky tunnel; returns '' if every attempt is empty."""
@@ -89,9 +110,15 @@ def _ssh_ps(ps_script, timeout=60, tries=3):
     b64 = base64.b64encode(full.encode("utf-16-le")).decode()
     for _ in range(tries):
         try:
+            # BYTES, THEN DECODE. `text=True` with no encoding decodes with the local
+            # codepage (cp932 here), and the eval host's output is not ours to constrain -- a
+            # test name or a traceback can carry anything. The `or ""` below means a decode
+            # failure would NOT crash: it returns empty, retries, gives up, and the caller
+            # reports ZERO REAL VERDICTS, which loop.py logs as "the eval host unreachable".
+            # A host that answered correctly would be recorded as down, and an arm thrown away.
             r = subprocess.run(_SSH_BASE + ["powershell", "-NoProfile", "-EncodedCommand", b64],
-                               capture_output=True, text=True, timeout=timeout)
-            out = (r.stdout or "").replace("\x00", "")
+                               capture_output=True, timeout=timeout)
+            out = _decode_child(r.stdout).replace("\x00", "")
             if out.strip():
                 return out
         except Exception:
@@ -115,7 +142,7 @@ def _scp(local_path, remote_win_path):
     try:
         r = subprocess.run(["scp", "-o", "ConnectTimeout=30", "-o", "BatchMode=yes",
                             local_path, "%s:%s" % (SSH_HOST, remote_win_path)],
-                           capture_output=True, text=True, timeout=120)
+                           capture_output=True, text=True, errors="replace", timeout=120)
         return r.returncode == 0
     except Exception:
         return False
@@ -129,7 +156,7 @@ def _scp_from(remote_win_path, local_path):
     try:
         r = subprocess.run(["scp", "-o", "ConnectTimeout=30", "-o", "BatchMode=yes",
                             "%s:%s" % (SSH_HOST, remote_win_path), local_path],
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, text=True, errors="replace", timeout=60)
         return r.returncode == 0 and os.path.exists(local_path) and os.path.getsize(local_path) > 0
     except Exception:
         return False
@@ -144,8 +171,10 @@ def main():
 
     # 1) capture the candidate diff from the worktree (BEFORE building run_id, which hashes it)
     try:
-        diff = subprocess.run(["git", "-C", wt, "diff"], capture_output=True, text=True,
-                              timeout=60).stdout
+        # A patch is arbitrary bytes; see bench/swe_solve_decoupled.py, where this exact
+        # line cost a 100-instance arm after 60 were already solved.
+        diff = _decode_child(subprocess.run(["git", "-C", wt, "diff"],
+                                            capture_output=True, timeout=60).stdout)
     except Exception as e:
         print("REMOTE_GRADE diff failed: %s" % e, file=sys.stderr)
         return 2

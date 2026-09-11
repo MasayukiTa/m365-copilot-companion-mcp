@@ -134,3 +134,51 @@ def test_the_old_way_really_did_lose_everything(tmp_path):
                        text=True, encoding="cp932", timeout=60)
     assert r.stdout is None or "diff --git" not in (r.stdout or ""), (
         "the old path did not lose the output, so the incident is not reproduced here")
+
+
+# ── the same defect in the grade path ─────────────────────────────────────────────────────
+#
+# Fixing only the solve caller would have left the identical line where the run goes next.
+# bench/swe_check_remote.py:147 was the SAME call on the SAME data, and _ssh_ps (line 92) is
+# worse in a different way: it already guarded with `(r.stdout or "")`, so a decode failure
+# did not crash -- it returned "", retried, gave up, and the caller reported ZERO REAL
+# VERDICTS, which loop.py logs as "the eval host unreachable". A host answering perfectly
+# would be recorded as down and an entire arm thrown away.
+
+def _remote_decode():
+    from bench import swe_check_remote as R
+    return R._decode_child
+
+
+def test_the_grade_path_has_the_same_decoder():
+    assert "diff --git" in _remote_decode()(KILLER)
+    assert _remote_decode()(b"") == "" and _remote_decode()(None) == ""
+
+
+def test_the_grade_path_keeps_utf8_intact():
+    """The eval host's output carries test names and tracebacks. Mangling them into the local
+    codepage would corrupt the verdicts this run is trying to produce."""
+    assert _remote_decode()("検査 148 件".encode("utf-8")) == "検査 148 件"
+
+
+@pytest.mark.parametrize("needle", ["_ssh_ps", "diff"])
+def test_the_grade_path_no_longer_decodes_with_the_platform_codepage(needle):
+    """Comments stripped first -- the fix's own comments name text=True to explain what they
+    replaced, and matching those would pass for the wrong reason."""
+    src = open(os.path.join(REPO, "bench", "swe_check_remote.py"), encoding="utf-8").read()
+    body = "\n".join(l.split("#", 1)[0] for l in src.splitlines())
+    if needle == "_ssh_ps":
+        m = re.search(r"r = subprocess\.run\(_SSH_BASE.*?\)\n", body, re.S)
+    else:
+        m = re.search(r'subprocess\.run\(\["git", "-C", wt, "diff"\].*?\)', body, re.S)
+    assert m, "the %s call is gone; this test no longer guards anything" % needle
+    assert "text=True" not in m.group(0), (
+        "%s decodes with the platform codepage again" % needle)
+
+
+def test_a_silent_empty_is_the_failure_mode_worth_naming():
+    """Pins WHY _ssh_ps mattered more than the crash: its guard turns a decode failure into an
+    empty string, and an empty string there is indistinguishable from an unreachable host."""
+    src = open(os.path.join(REPO, "bench", "swe_check_remote.py"), encoding="utf-8").read()
+    assert '_decode_child(r.stdout)' in src, (
+        "_ssh_ps no longer decodes tolerantly; a bad byte would read as an unreachable host")
