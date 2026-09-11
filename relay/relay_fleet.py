@@ -1008,6 +1008,25 @@ VERIFY_STATUSES = ("verifying",)
 # is still eventually recovered. Beyond this, a non-advancing status is treated as wedged.
 EVAL_STALL_CEILING_S = 1500
 
+# How long the socket->tab fallback may block the sweep before it is fair to call the browser
+# wedged. NOT a guess and NOT a round number: _open_fresh allows three navigation attempts of
+# 45s plus a 25s composer wait each (210s), and its own comment allows "up to ~300s" once a
+# sign-in page has been surfaced, because a person may be mid-MFA.
+#
+# It exists because the watchdog reset a HEALTHY Edge four times in one run: the fallback is
+# synchronous on the single-threaded round-robin, so status.json stops advancing while it runs,
+# and 150s of no progress with nothing declared is the watchdog's definition of a wedge. Each
+# reset threw away every unfinished goal's progress (16, then 11, then 4), and the run captured
+# nothing in 102 minutes.
+FALLBACK_OPEN_CEILING_S = float(os.environ.get("MCP_FALLBACK_OPEN_CEILING_S", "300") or 300)
+
+# The settle-time tree hash, bounded by what it was MEASURED to cost rather than by the
+# acceptance ceiling. supervisor_verify.tree_hash took 7.3s on an idle astropy worktree and
+# 29.8s on the same tree under a loaded run. It was declaring _eval_ceiling_s() -- at least
+# 1500s -- which is fifty times the operation and would leave the watchdog vouching for a
+# browser for twenty-five minutes if the hash ever wedged.
+TREE_HASH_CEILING_S = float(os.environ.get("MCP_TREE_HASH_CEILING_S", "120") or 120)
+
 
 class FleetContextLost(Exception):
     """Raised when the underlying Edge/CDP context died mid-run (wedged or hard-reset).
@@ -3074,6 +3093,43 @@ class RelayWorker:
             except Exception:
                 pass
 
+    def _declare_blocking(self, seconds):
+        """Tell the watchdog this worker is about to block the sweep on purpose, for `seconds`.
+
+        SEPARATE FROM _mark_eval_busy, on purpose. That one also sets status to "verifying" and
+        declares the ACCEPTANCE ceiling (>= 1500s). Both are wrong for a tab open: the card
+        would claim a verification that is not running, and the window would be five times the
+        operation's own bound, which is exactly the blindness the failsafe exists to avoid.
+
+        THE FLUSH IS THE POINT, not the field. The watchdog reads status.json, and the sweep is
+        about to stop writing it -- so the marker has to reach the file BEFORE the freeze, which
+        is the same reason _mark_eval_busy flushes.
+        """
+        try:
+            self.eval_busy_until = time.time() + float(seconds or 0)
+        except Exception:
+            return
+        if self._busy_writer is not None:
+            try:
+                self._busy_writer()
+            except Exception:
+                pass
+
+    def _end_blocking(self):
+        """Close the window, and publish that it closed.
+
+        _clear_eval_busy does not flush, which is right where the sweep resumes ticking
+        immediately. Here it matters: a snapshot still claiming a blocking call that already
+        finished is a worker vouching for a browser it is no longer watching, and that blinds
+        the watchdog to a genuine wedge for the rest of the declared window.
+        """
+        self.eval_busy_until = 0.0
+        if self._busy_writer is not None:
+            try:
+                self._busy_writer()
+            except Exception:
+                pass
+
     def _clear_eval_busy(self):
         """Leave a blocking acceptance eval (always, even on failure/exception)."""
         self.eval_busy_until = 0.0
@@ -4387,7 +4443,7 @@ class RelayWorker:
         try:
             from relay import supervisor_verify as _sv
             try:
-                self._mark_eval_busy()
+                self._declare_blocking(TREE_HASH_CEILING_S)
                 busy = True
             except Exception:
                 busy = False
@@ -4397,7 +4453,7 @@ class RelayWorker:
         finally:
             if busy:
                 try:
-                    self._clear_eval_busy()
+                    self._end_blocking()
                 except Exception:
                     pass
 
@@ -4956,6 +5012,11 @@ class RelayWorker:
         except Exception:
             pass
         self.socket, self.drv = False, None
+        # DECLARED BEFORE THE BLOCKING CALL, because after it there is no sweep left to declare
+        # anything with. _open_fresh can hold this thread for 210s (three 45s navigations with a
+        # 25s composer wait each) and up to ~300s behind a sign-in page, all of it with
+        # status.json frozen -- which the watchdog read as a wedged Edge four times in one run.
+        self._declare_blocking(FALLBACK_OPEN_CEILING_S)
         try:
             self.page = _open_fresh(self._context, self._agent_url)
             self.drv = CopilotWebDriver(self.page)
@@ -4964,6 +5025,10 @@ class RelayWorker:
             self.reason = "socket fell back but the tab would not open: %s: %s" % (
                 type(e).__name__, e)
             return False
+        finally:
+            # ALWAYS, including the failure path above: a window left open on a worker that has
+            # already given up would vouch for the browser for another five minutes.
+            self._end_blocking()
         try:
             # The commonest reason a socket turn carries no text is a card only a tab can
             # show. Now there is a tab, so click it before re-sending into the same wall.
