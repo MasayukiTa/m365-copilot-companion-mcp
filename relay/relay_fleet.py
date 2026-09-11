@@ -2093,6 +2093,11 @@ class RelayWorker:
         self._goal_resends = 0
         self._cooldown_until = 0.0
         self.verified = None          # None=not checked, True/False after a gate ran
+        #: The tree digest at the moment every acceptance check passed, and whether it still
+        #: matched when the worker settled. None on both = the question was never asked, which
+        #: is the same tri-state discipline `verified` above is built on.
+        self._verified_tree = ""
+        self.tree_stable = None
         self.last_verify_detail = ""
         self._pending_checks = []     # acceptance.Check specs left to run this gate
         self._active_check = None     # the Check currently running (non-blocking)
@@ -3354,6 +3359,33 @@ class RelayWorker:
                                 recycles=self._recycles)
         except Exception:
             pass
+        # WHAT CLASS OF TURN THIS WAS, RECORDED BESIDE THE HEAP NUMBER ABOVE.
+        #
+        # relay/turn_outcome.py partitions one assistant reply by the STRUCTURED error code
+        # Copilot prints, and until now had zero callers -- so the taxonomy it was built from
+        # (8,205 turns) could only ever be recomputed offline, never watched.
+        #
+        # MEASUREMENT, NOT CONTROL, AND THE EVIDENCE SAYS SO. Re-measured over 1741 stored
+        # transcripts / 4468 assistant turns: rate 227 (THROTTLE_MARKERS handles it), context
+        # 165 (conversation_exhausted recycles it), system 29 (TRANSIENT handles it), and only
+        # SIX turns reach no handler at all -- AsyncResponsePayloadTooLarge x5 and
+        # RequestBodyTooLarge x1. Following those six workers: FIVE recovered on their own and
+        # finished real work; one ended on the error. A terminal branch for this would have
+        # killed five workers that recovered in order to rescue one, so none is added here.
+        # Recording the class is what turns "six, probably harmless" into something a later
+        # decision can be made from.
+        #
+        # ROLE IS PASSED EXPLICITLY: classify() treats anything that is not the assistant's own
+        # reply as ok by definition, which is what keeps our own prompt text out of the
+        # taxonomy -- the contamination that once turned a task ABOUT HTTP 429 into fifteen
+        # phantom rate limits.
+        try:
+            from relay import turn_outcome as _to
+            _klass, _code = _to.classify(resp, "assistant")
+            if _klass != _to.OK:
+                self._tx.metric(self.turn, "turn_class", _klass, code=_code)
+        except Exception:
+            pass
         # Parse optional NEXT/CONFIDENCE turn markers (informational only, no gating).
         from relay.copilot_autopilot_relay import extract_next, extract_confidence
         self.next_step = extract_next(resp)
@@ -4182,6 +4214,14 @@ class RelayWorker:
         if not self._pending_checks:
             self.verified = True
             self.reason = "acceptance verified (%d check(s))" % len(self.checks)
+            # WHICH TREE THE GREEN DESCRIBES. supervisor_verify's step 4 -- the step the live
+            # path never had -- is to notice when the tree moves after the checks passed, and
+            # that needs the "before" taken HERE, at the moment they did.
+            #
+            # NOT HYPOTHETICAL HERE: fanout children inherit the parent's cwd (fanout.py:140),
+            # so siblings edit one tree concurrently and a sibling's write can invalidate this
+            # worker's green while this worker does nothing at all.
+            self._verified_tree = self._tree_hash_now()
             self._candidate_done()
             return
         self._active_check = Check(self._pending_checks[0], cwd=self.cwd).start()
@@ -4312,7 +4352,98 @@ class RelayWorker:
         on one branch while every other path walked past.
         """
         self.status = "done"
+        # BEFORE THE VERDICT, because it is about the tree the verdict is about. It cannot
+        # change the verdict yet, by design.
+        try:
+            self._record_tree_stability()
+        except Exception:
+            pass
         self.outcome = self._claim_verdict()
+
+    def _tree_hash_now(self) -> str:
+        """supervisor_verify.tree_hash over this worker's cwd, or "" when there is nothing to
+        hash. Never raises: a measurement must not be able to fail the work it measures.
+
+        WHAT THIS COSTS, MEASURED RATHER THAN ASSUMED. On a staged astropy worktree (1,896
+        files) it took 7.3s and 3.1s on two samples -- it reads file CONTENT, which is the
+        whole reason it can detect a change at all.
+
+        THAT COST FALLS ONLY WHERE IT IS PROPORTIONATE. It runs at most twice per worker, and
+        only for a worker that has both `checks` and a `cwd` -- a bench or code task, whose
+        single acceptance command is itself capped near 1300s, so this is well under a percent
+        of what that worker already spends. An ordinary Copilot fleet goal carries no cwd
+        (task_router hands the fleet a bare string), returns on the line above, and pays
+        nothing.
+
+        THE SWEEP IS TOLD, because it is single-threaded and this blocks it. Seven seconds is
+        far inside the watchdog's tolerance, but a frozen status.json with no marker is exactly
+        what a wedge looks like from outside, and this file already has the vocabulary for
+        "about to block on purpose".
+        """
+        root = (getattr(self, "cwd", "") or "").strip()
+        if not root:
+            return ""
+        busy = False
+        try:
+            from relay import supervisor_verify as _sv
+            try:
+                self._mark_eval_busy()
+                busy = True
+            except Exception:
+                busy = False
+            return _sv.tree_hash(root)
+        except Exception:
+            return ""
+        finally:
+            if busy:
+                try:
+                    self._clear_eval_busy()
+                except Exception:
+                    pass
+
+    def _record_tree_stability(self):
+        """Did the tree move between the checks going green and the worker settling?
+
+        RECORDED, NOT ACTED ON -- see this file's item-1 note and evidence_manifest's own
+        "SHADOW FIRST" rule. The number this produces is what a later decision to gate on it
+        would have to be made from; there are currently zero measurements of how often a live
+        tree moves under a finished worker.
+        """
+        before = getattr(self, "_verified_tree", "") or ""
+        if not before:
+            return
+        after = self._tree_hash_now()
+        self.tree_stable = (after == before) if after else None
+        # RECORDED EVERY TIME, NOT ONLY WHEN IT MOVED. The question this instrument exists to
+        # answer is "how OFTEN does a live tree move under a finished worker", and a log that
+        # holds only the positive cases has no denominator -- it can say a thing happened and
+        # never what share of the time. That is the same distinction the staircase fields are
+        # for: `eligible` is how often the question could be asked, `triggered` how often the
+        # answer was yes, and this repository already paid for collapsing them once, when "the
+        # panel ran 155 times" could not be turned into a rate.
+        try:
+            from relay import mechanism_telemetry as _mt
+            _mt.record("tree_moved_after_verify", run_id=getattr(self, "run_id", ""),
+                       goal_hash=str(getattr(self, "goal_hash", "") or "")[:24],
+                       turn=getattr(self, "turn", None),
+                       configured=True, config_source="supervisor_verify.tree_hash",
+                       # None, not False, when the tree could not be re-read: the question was
+                       # asked and could not be answered, which is neither yes nor no.
+                       eligible=(self.tree_stable is not None),
+                       ineligible_reason=("" if self.tree_stable is not None
+                                          else "the tree could not be re-hashed at settle"),
+                       triggered=(self.tree_stable is False),
+                       not_triggered_reason=("" if self.tree_stable is not True
+                                             else "unchanged since the checks passed"),
+                       # NOTHING WAS DONE ABOUT IT, and the record says so rather than leaving
+                       # a reader to assume the finding was acted on. See this file's item-1
+                       # note: shadow first.
+                       executed=False,
+                       self_report_outcome="DONE",
+                       extra={"tree_before": before, "tree_after": after,
+                              "cwd": (getattr(self, "cwd", "") or "")[-60:]})
+        except Exception:
+            pass
 
     def _claim_verdict(self):
         """"DONE", or a weaker outcome when the RECORD contradicts the claim. Never raises.

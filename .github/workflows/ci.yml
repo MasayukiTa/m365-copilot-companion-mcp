@@ -458,7 +458,9 @@ jobs:
             relay/test_unverifiable_turn_cap.py \
             relay/test_settings_round_trip.py \
             relay/test_supervisor_verify.py \
+            relay/test_tree_moved_after_verify.py \
             relay/test_turn_outcome.py \
+            relay/test_turn_class_is_recorded.py \
             relay/test_upstream_throttle.py \
             relay/test_veto_measurement_is_honest.py \
             tools/auto/test_autoloop.py \

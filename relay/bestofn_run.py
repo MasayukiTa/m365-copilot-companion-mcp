@@ -134,6 +134,15 @@ def decide(pred_records, *, weights=None) -> dict:
     try:
         from relay import mechanism_telemetry as _mt
         _distinct = len({(c or {}).get("diff") for c in cands})
+        # NO run_id, DELIBERATELY. Every path into this module is either an offline bench
+        # analysis script (bench/bestofn_on_ab.py, bench/bestofn_on_samples.py) or
+        # relay/solve_policy.py, which has no caller outside its own test -- so there is no
+        # fleet sweep to name. Threading a parameter here would create a field nobody could
+        # fill, which is the same structurally-unreachable shape as a reader with no writer.
+        # Blank is the honest answer to "which run was this"; a fabricated id is worse than
+        # an absent one because it looks like an answer. See
+        # relay/test_mechanism_records_name_their_run.py, which holds this as an explicit
+        # exemption so a NEW blank site is caught instead of joining these silently.
         _mt.record("bestofn", configured=True, config_source="caller",
                    config_value={"candidates": len(cands)},
                    eligible=(_distinct > 1),
@@ -200,6 +209,15 @@ def decide(pred_records, *, weights=None) -> dict:
         from relay import mechanism_telemetry as _mt
         _d = _tel_ctx.get("distinct")
         if _d and _d > 1:
+            # NO run_id, DELIBERATELY. Every path into this module is either an offline bench
+            # analysis script (bench/bestofn_on_ab.py, bench/bestofn_on_samples.py) or
+            # relay/solve_policy.py, which has no caller outside its own test -- so there is no
+            # fleet sweep to name. Threading a parameter here would create a field nobody could
+            # fill, which is the same structurally-unreachable shape as a reader with no writer.
+            # Blank is the honest answer to "which run was this"; a fabricated id is worse than
+            # an absent one because it looks like an answer. See
+            # relay/test_mechanism_records_name_their_run.py, which holds this as an explicit
+            # exemption so a NEW blank site is caught instead of joining these silently.
             _mt.record("bestofn", configured=True, config_source="caller",
                        eligible=True, triggered=True, executed=True,
                        changed_decision=(winner_idx not in (None, 0)),
