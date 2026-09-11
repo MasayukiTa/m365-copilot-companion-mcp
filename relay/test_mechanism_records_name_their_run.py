@@ -180,3 +180,101 @@ def test_the_run_level_records_bind_the_parameter_and_not_a_clock():
         assert rhs.strip() == "run_id", (
             "_run_id should be the run's own id, which is this function's parameter; found %r"
             % rhs.strip())
+
+
+#: Mechanism records that carry NO run_id, each with the reason. Being on this list is a claim
+#: that a blank id is the honest answer there -- so it is short, and each entry has to be
+#: defensible. Same shape as conftest.DELIBERATELY_NOT_REDIRECTED and for the same purpose: the
+#: silence becomes a decision, and a NEW blank site fails the sweep below until somebody decides
+#: which it is.
+BLANK_BY_DESIGN = {
+    ("relay/bestofn_run.py", "bestofn"):
+        "every path in is an offline bench analysis script or relay/solve_policy.py, which has "
+        "no caller outside its own test; there is no fleet sweep to name, and a parameter here "
+        "would be a field nobody could fill",
+    ("tools/skill_ops.py", "skill"):
+        "runs in the MCP SERVER process; no worker identity crosses the gateway, which is the "
+        "same gap tool_ledger records by leaving `task` empty and attributing by path instead",
+}
+
+_MECH_NAME = re.compile(r'_mt\.record\(\s*"([a-z_]+)"')
+
+
+def _record_calls(path):
+    """Every _mt.record(...) in a file, with its full argument list.
+
+    Parenthesis matching, not a regex over the arguments: the first version of the sweep used
+    a non-greedy match up to the first ")" and stopped inside `len(_lenses)`, reporting a call
+    that does pass run_id as one that does not.
+    """
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        src = fh.read()
+    out, needle = [], "_mt.record("
+    i = src.find(needle)
+    while i != -1:
+        depth, j = 0, i + len(needle) - 1
+        while j < len(src):
+            if src[j] == "(":
+                depth += 1
+            elif src[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        out.append(src[i:j + 1])
+        i = src.find(needle, j)
+    return out
+
+
+def _all_record_sites():
+    """(relative path, mechanism name, call text) for every non-test module in the repo."""
+    for root in ("relay", "tools", "bench"):
+        base = os.path.join(REPO, root)
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = [d for d in dirnames if d not in ("__pycache__", "archive")]
+            for name in filenames:
+                if not name.endswith(".py") or name.startswith("test_"):
+                    continue
+                path = os.path.join(dirpath, name)
+                rel = os.path.relpath(path, REPO).replace(os.sep, "/")
+                for call in _record_calls(path):
+                    m = _MECH_NAME.search(call)
+                    yield rel, (m.group(1) if m else "?"), call
+
+
+def test_every_mechanism_record_in_the_repo_names_a_run_or_is_listed():
+    """THE SWEEP, WIDENED PAST ONE FILE.
+
+    The earlier version walked relay_fleet.py alone, because that is where the epoch was. But
+    the failure class is "a mechanism record that cannot be attributed to a run", and a class
+    does not stop at a file boundary -- the same reasoning that made the six relay_fleet sites
+    a sweep rather than a line. Three records live outside relay_fleet.py; all three are blank,
+    and both of those facts are now stated instead of being rediscovered later.
+    """
+    sites = list(_all_record_sites())
+    assert sites, "no _mt.record call sites found at all; this sweep has stopped sweeping"
+    offenders = []
+    for rel, mech, call in sites:
+        if "run_id=" in call:
+            continue
+        if (rel, mech) in BLANK_BY_DESIGN:
+            continue
+        offenders.append("%s [%s]" % (rel, mech))
+    assert not offenders, (
+        "%d mechanism record(s) name no run and are not listed as blank-by-design: %s\n"
+        "Either pass run_id=, or add an entry to BLANK_BY_DESIGN saying why a blank id is the "
+        "honest answer there." % (len(offenders), sorted(set(offenders))))
+
+
+def test_the_exemption_list_is_not_stale():
+    """An entry matching no real call site is a claim about nothing, and it would go on
+    excusing some future record that happens to reuse the name."""
+    sites = list(_all_record_sites())
+    for (rel, mech), reason in BLANK_BY_DESIGN.items():
+        matching = [c for r, m, c in sites if r == rel and m == mech]
+        assert matching, (
+            "BLANK_BY_DESIGN names %s in %s, which has no such record any more" % (mech, rel))
+        assert all("run_id=" not in c for c in matching), (
+            "%s in %s passes run_id now -- remove the exemption rather than leaving a claim "
+            "that contradicts the code" % (mech, rel))
+        assert len(reason) > 40, "an exemption needs a reason somebody can check"
