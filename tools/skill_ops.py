@@ -93,6 +93,13 @@ def _record_skill_use(kind, query, matched):
             _n = len(_store().list_metadata() or [])
         except Exception:
             _n = 0
+        # NO run_id, DELIBERATELY -- same exemption as relay/bestofn_run.py, different
+        # reason. This runs inside the MCP SERVER process, answering a skill lookup for
+        # whichever caller asked; the fleet run id lives in the fleet coordinator process
+        # and no worker identity crosses the gateway (tool_ledger records the same gap: its
+        # `task` field is empty on essentially every call, which is why attribution there is
+        # by path). Blank is the honest answer until a caller identity actually crosses that
+        # boundary.
         _mt.record("skill", configured=True, config_source="server rule",
                    config_value={"trusted_skills": _n},
                    eligible=(_n > 0),

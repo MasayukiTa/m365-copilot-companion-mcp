@@ -42,7 +42,13 @@ LOG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 
 #: Every mechanism that claims to improve accuracy. Named here so a mechanism that never
 #: reports is visible as a gap rather than as an absence nobody noticed.
-MECHANISMS = ("fanout", "refuter", "panel", "veto", "retry", "bestofn", "skill", "effort")
+MECHANISMS = ("fanout", "refuter", "panel", "veto", "retry", "bestofn", "skill", "effort",
+              # supervisor_verify's step 4, wired live 2026-09-11: did the working tree
+              # move between the acceptance checks passing and the worker settling.
+              # REGISTERED, because summarise() walks this tuple -- an unregistered
+              # mechanism still gets written (record() says so deliberately) but never
+              # appears in any summary, which is an instrument with no reader.
+              "tree_moved_after_verify")
 
 
 def patch_hash(text):
