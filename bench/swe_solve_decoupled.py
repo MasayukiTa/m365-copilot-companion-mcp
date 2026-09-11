@@ -64,7 +64,10 @@ def acquire_lock():
         except Exception:
             old = ""
         if old:
-            chk = subprocess.run(["tasklist", "/FI", "PID eq " + old], capture_output=True, text=True)
+            # errors="replace": tasklist prints localised headers, and a decode error here
+            # would abort the orchestrator before it started over a PID check.
+            chk = subprocess.run(["tasklist", "/FI", "PID eq " + old],
+                                 capture_output=True, text=True, errors="replace")
             if old in (chk.stdout or ""):
                 log("another solve orchestrator (pid %s) running; exiting" % old)
                 sys.exit(0)
@@ -142,16 +145,47 @@ def capture(insts):
         diff = ""
         if os.path.isdir(wt):
             try:
-                diff = subprocess.run(["git", "-C", wt, "diff"], capture_output=True, text=True,
-                                      timeout=60).stdout
+                # BYTES, THEN tools.code_exec._decode. `text=True` with no encoding decodes
+                # with locale.getpreferredencoding() -- cp932 here -- and a patch is arbitrary
+                # bytes. On 2026-09-11 one byte (0x9c) killed subprocess's reader thread, left
+                # .stdout as None, and took an entire 100-instance arm with it after 60 had
+                # already been solved. _decode tries UTF-8 first, falls back to the local
+                # codepage with errors="replace", and cannot raise.
+                raw = subprocess.run(["git", "-C", wt, "diff"],
+                                     capture_output=True, timeout=60).stdout
+                diff = _decode_child(raw)
             except Exception as e:
                 log("  capture error %s: %s" % (inst, e))
         pred = [{"instance_id": inst, "model_patch": diff, "model_name_or_path": "companion"}]
         with open(os.path.join(PREDS, inst + ".json"), "w", encoding="utf-8", newline="\n") as f:
             json.dump(pred, f, ensure_ascii=False)
-        if diff.strip():
+        # `or ""` BECAUSE THE PARENT NEVER SEES THE READER THREAD'S EXCEPTION. subprocess.run
+        # returns normally with .stdout set to None, so the try/except above cannot catch it.
+        # Decoding correctly is the fix; this is the guard that keeps a None from any other
+        # path out of .strip().
+        if (diff or "").strip():
             nonempty += 1
     return nonempty
+
+
+def _decode_child(raw):
+    """Decode child output without ever raising. Delegates to tools.code_exec._decode, which
+    is where this repository already solved this, so there is one implementation and not two.
+
+    Falls back to a local equivalent only if that import is unavailable -- this file is run as
+    a script from several places and must not fail to start over a decoding helper.
+    """
+    if not raw:
+        return ""
+    try:
+        from tools.code_exec import _decode
+        return _decode(raw)
+    except Exception:
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            import locale
+            return raw.decode(locale.getpreferredencoding(False) or "utf-8", errors="replace")
 
 
 def release(insts):
@@ -166,8 +200,10 @@ def release(insts):
         clone = os.path.join(WORK, repo_key(inst) + "-main")
         try:
             if os.path.isdir(os.path.join(clone, ".git")):
+                # errors="replace": the output is not read, but a decode error would still
+                # raise out of the reader thread during cleanup.
                 subprocess.run(["git", "-C", clone, "worktree", "remove", wt, "--force"],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, errors="replace")
             if os.path.isdir(wt):
                 subprocess.run(["cmd", "/c", "rmdir", "/s", "/q", wt], capture_output=True)
             if not os.path.isdir(wt):
