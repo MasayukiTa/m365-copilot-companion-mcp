@@ -416,8 +416,15 @@ class ApprovalPromptWindow : Window
             FontSize = Theme.FsSection, FontWeight = FontWeights.SemiBold });
         _policy = new ComboBox { Margin = new Thickness(0, 8, 0, 0), MinWidth = 220,
             HorizontalAlignment = HorizontalAlignment.Left, Background = Surface, Foreground = Fg };
-        AddPolicyItem(L("確認（推奨）", "Confirm (recommended)"), "default");
-        AddPolicyItem(L("自動", "Auto"), "auto"); AddPolicyItem(L("バイパス", "Bypass"), "bypass");
+        // ORDER AND LABELS FOLLOW WHAT IS ACTUALLY RECOMMENDED. "Confirm" was first and was
+        // labelled 推奨 / recommended; it is the mode that asks about every first-seen class
+        // and keeps asking, which is how an approval queue becomes something nobody reads.
+        // Auto refuses a prohibited pattern outright -- stricter than Confirm, which puts the
+        // same operation to a person who can approve it -- and differs only on operations the
+        // deterministic classifier finds clean.
+        AddPolicyItem(L("自動（推奨）", "Auto (recommended)"), "auto");
+        AddPolicyItem(L("バイパス", "Bypass"), "bypass");
+        AddPolicyItem(L("毎回確認（非推奨）", "Confirm every time (not recommended)"), "default");
         _policy.SelectionChanged += PolicyChanged; policyCol.Children.Add(_policy);
         _policyHelp = new TextBlock { Foreground = Muted, FontSize = Theme.FsMeta, TextWrapping = TextWrapping.Wrap,
             Margin = new Thickness(0, 7, 0, 0) }; policyCol.Children.Add(_policyHelp);
@@ -435,7 +442,7 @@ class ApprovalPromptWindow : Window
     { _policy.Items.Add(new ComboBoxItem { Content = label, Tag = value, Foreground = Fg, Background = Surface }); }
 
     string SelectedPolicy()
-    { var item = _policy.SelectedItem as ComboBoxItem; return item == null ? "default" : (string)item.Tag; }
+    { var item = _policy.SelectedItem as ComboBoxItem; return item == null ? "auto" : (string)item.Tag; }
 
     void SelectPolicy(string mode)
     {
@@ -472,14 +479,17 @@ class ApprovalPromptWindow : Window
             "Safe operations run automatically; risky ones ask here; prohibited ones are denied.");
         else if (mode == "bypass") _policyHelp.Text = L("手動確認を省略します。STOP条件・パス制限・外部Skillのハッシュ承認は解除しません。",
             "Skip manual confirmation. STOP rules, path limits, and external-Skill hash approval remain.");
-        else _policyHelp.Text = L("初回の操作クラスを確認し、承認済みでも危険な内容は毎回確認します。",
-            "Confirm first-seen operation classes; risky payloads still ask every time.");
+        else _policyHelp.Text = L("初回の操作クラスを毎回確認します。非推奨: 確認が多すぎると内容が読まれなくなります。",
+            "Asks about every first-seen operation class. Not recommended: an approval that is always there stops being read.");
     }
 
     public static string ReadPolicy()
     {
-        string fallback = (Environment.GetEnvironmentVariable("TASK_JOB_APPROVAL_MODE") ?? "default").Trim().ToLowerInvariant();
-        if (fallback != "auto" && fallback != "bypass") fallback = "default";
+        // Matches tools/approval_policy.FALLBACK_APPROVAL_MODE. Two readers of one setting
+        // that disagree about its default would show the operator a mode the relay is not
+        // using.
+        string fallback = (Environment.GetEnvironmentVariable("TASK_JOB_APPROVAL_MODE") ?? "auto").Trim().ToLowerInvariant();
+        if (fallback != "auto" && fallback != "bypass" && fallback != "default") fallback = "auto";
         try
         {
             if (!File.Exists(SettingsFile)) return fallback;
@@ -8204,10 +8214,14 @@ class CockpitWindow : Window
 
         var selector = new ComboBox(); selector.MinWidth = 230; selector.HorizontalAlignment = HorizontalAlignment.Left;
         selector.Margin = new Thickness(0, 12, 0, 0); selector.Background = CardBg; selector.Foreground = Fg;
+        // SAME ORDER AND SAME LABELS AS ApprovalPromptWindow's list. This is the second
+        // selector for one setting, each with its own hard-coded array, and a test caught the
+        // two disagreeing about which mode is recommended after only one was changed -- on
+        // the surface an operator actually opens to change it.
         var labels = _lang == 0
-            ? new string[] { "確認（推奨）", "自動", "バイパス" }
-            : new string[] { "Confirm (recommended)", "Auto", "Bypass" };
-        var values = new string[] { "default", "auto", "bypass" };
+            ? new string[] { "自動（推奨）", "バイパス", "毎回確認（非推奨）" }
+            : new string[] { "Auto (recommended)", "Bypass", "Confirm every time (not recommended)" };
+        var values = new string[] { "auto", "bypass", "default" };
         string current = ApprovalPromptWindow.ReadPolicy();
         for (int i = 0; i < values.Length; i++)
         {
@@ -8221,7 +8235,7 @@ class CockpitWindow : Window
         Action updateHelp = delegate
         {
             var selected = selector.SelectedItem as ComboBoxItem;
-            string mode = selected == null ? "default" : selected.Tag as string;
+            string mode = selected == null ? "auto" : selected.Tag as string;
             if (mode == "auto") help.Text = _lang == 0
                 ? "安全な操作は自動実行、要確認は承認待ち、禁止判定は拒否。"
                 : "Safe operations run automatically; risky ones ask; prohibited ones are denied.";
@@ -8229,8 +8243,8 @@ class CockpitWindow : Window
                 ? "手動確認を省略。常時有効な安全境界は解除しません。"
                 : "Skip manual confirmations. Always-on safety boundaries remain.";
             else help.Text = _lang == 0
-                ? "初回クラスを確認し、承認後も危険な内容は毎回確認。"
-                : "Confirm first-seen classes; risky payloads still ask every time.";
+                ? "初回クラスを毎回確認。非推奨: 確認が多すぎると内容が読まれなくなります。"
+                : "Asks about every first-seen class. Not recommended: an approval that is always there stops being read.";
         };
         updateHelp();
         bool reverting = false;

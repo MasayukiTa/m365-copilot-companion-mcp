@@ -11,6 +11,9 @@ import os
 from pathlib import Path
 
 
+#: "default" is the MANUAL mode and is kept for the operator who wants it, not recommended:
+#: it asks about every first-seen job class and keeps asking, which is how an approval queue
+#: becomes something nobody reads.
 VALID_APPROVAL_MODES = ("default", "auto", "bypass")
 
 
@@ -21,10 +24,24 @@ def settings_path() -> Path:
     return Path.home() / ".copilot-bridge" / "settings.txt"
 
 
+#: WHAT AN INSTALLATION GETS WITH NO SETTING AND NO ENV VAR.
+#:
+#: This was "default" -- ask a human about every first-seen job class, forever. The owner's
+#: reason for changing it is the one that decides it: a design that asks every time is a design
+#: nobody reads, and an approval that is always there is not an approval.
+#:
+#: "auto" is not the permissive choice. Under "default" a STOP-pattern operation is put to a
+#: person, who can approve it; under "auto" it is refused outright and cannot be approved. The
+#: two differ only on operations the deterministic classifier finds clean.
+FALLBACK_APPROVAL_MODE = "auto"
+
+
 def current_approval_mode(default: str | None = None) -> str:
-    fallback = (default or os.environ.get("TASK_JOB_APPROVAL_MODE", "default")).strip().lower()
+    fallback = (default
+                or os.environ.get("TASK_JOB_APPROVAL_MODE", FALLBACK_APPROVAL_MODE)
+                ).strip().lower()
     if fallback not in VALID_APPROVAL_MODES:
-        fallback = "default"
+        fallback = FALLBACK_APPROVAL_MODE
 
     # Tests explicitly set their module-level mode and must never inherit the
     # developer workstation's persistent UI preference.

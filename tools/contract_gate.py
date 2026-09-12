@@ -701,6 +701,33 @@ def _create_gate(token: str, question: str, context: str) -> None:
 # Main gate entry point
 # ---------------------------------------------------------------------------
 
+def _auto_verdict(detail: str) -> str:
+    """"stop" | "ask" | "clean" for `detail`, under the `auto` approval mode.
+
+    REUSES THE VOCABULARY THAT IS ALREADY LIVE rather than inventing a second one:
+    relay.autonomy_gate's _STOP_PATTERNS/_ASK_PATTERNS are what task_router._static_risk
+    already classifies local shell and python payloads with. Two lists that are supposed to
+    mean the same thing and are maintained separately is how a gate ends up refusing here and
+    allowing there.
+
+    FAILS CLOSED TO "ask". If the vocabulary cannot be imported there is no classifier, and a
+    mode that silently became "allow everything" would be `bypass` wearing another name.
+    """
+    text = str(detail or "")
+    try:
+        from relay.autonomy_gate import _STOP_PATTERNS, _ASK_PATTERNS, _matches
+    except Exception:
+        return "ask"
+    try:
+        if _matches(text, _STOP_PATTERNS):
+            return "stop"
+        if _matches(text, _ASK_PATTERNS):
+            return "ask"
+    except Exception:
+        return "ask"
+    return "clean"
+
+
 def check_op(op_class: str, detail: str = "") -> Optional[str]:
     """Gate a dangerous operation under the active autonomy contract.
 
@@ -800,17 +827,49 @@ def check_op(op_class: str, detail: str = "") -> Optional[str]:
                        "走り続けます。 / WARNING: the fleet-wide kill-switch is NOT engaged%s"
                        " -- other workers keep running." % (detail_msg, detail_msg))
 
-    # ── ask_before: HITL approval gate ─────────────────────────────────────
+    # ── ask_before: decided by the operator's approval mode ────────────────
     if op_class in ask_before:
-        # Bypass suppresses only human confirmation. The stop_when branch above
-        # remains an always-on hard stop, and external Skill trust uses its own
-        # exact-digest approval path.
+        # THREE MODES, NOT TWO. `auto` has been a valid, selectable setting since
+        # approval_policy was written and this function read only `bypass`, so an operator who
+        # chose it got the manual gate regardless -- a capability with no caller, inside the
+        # safety machinery, where nothing looks wrong because the gate still appears.
+        #
+        # The semantics are task_router.job_gate's, deliberately, so one word means one thing
+        # on both paths:
+        #
+        #   bypass   proceed; ask nobody
+        #   auto     the deterministic classifier decides -- a STOP pattern is REFUSED
+        #            outright (stricter than asking), an ASK pattern still goes to a human,
+        #            anything else proceeds
+        #   default  every occurrence asks a human
+        #
+        # `auto` is therefore not a relaxation at the dangerous end: under `default` a
+        # STOP-pattern operation is put to a person who can approve it, and under `auto` it
+        # cannot be approved at all.
+        #
+        # NEITHER MODE TOUCHES THE STOP_WHEN BRANCH ABOVE, which is an always-on hard stop
+        # that engages the fleet kill-switch, and external Skill trust keeps its own
+        # exact-digest path.
+        mode = "default"
         try:
             from tools.approval_policy import current_approval_mode
-            if current_approval_mode() == "bypass":
-                return None
+            mode = current_approval_mode()
         except Exception:
-            pass
+            mode = "default"
+        if mode == "bypass":
+            return None
+        if mode == "auto":
+            verdict = _auto_verdict(detail)
+            if verdict == "stop":
+                return (
+                    f"[自動判定で拒否 / Refused by the automatic classifier] op_class={op_class!r} "
+                    f"の内容が禁止パターンに一致したため実行しません。承認モードを『確認』に"
+                    f"変更すれば人間が判断できます。"
+                    f" / op_class={op_class!r} matched a prohibited pattern and was not executed. "
+                    f"Switch the approval mode to manual confirmation to have a human decide."
+                )
+            if verdict != "ask":
+                return None
         token = _stable_token(op_class, detail)
         existing = _find_existing_gate(token)
 
