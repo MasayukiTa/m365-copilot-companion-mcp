@@ -142,9 +142,56 @@ Applied 2026-09-12 to all 3 surviving transcripts (retention had pruned the rest
 original line preserved byte-for-byte, and a second run is a no-op. Covered by
 `tools/test_a_backfilled_conversation_is_the_right_one.py`.
 
+## Verified end to end on a live run, 2026-09-12
+
+Two goals were run through the real stack and the answer settles it by arithmetic rather than
+by inspection.
+
+**First**, a goal asking for `17 × 23`. Its worker was on the socket, and for the first time
+recorded what it was in:
+
+```
+status.json          conv_url = sess:101d7163-31dd-418a-8535-40c72bd25d34
+transcript           {"guid": "101d7163-..."} at line index 2   (inside the window the chat
+                                                                 window scans)
+conversations.json   newest fleet row carries the same ref
+```
+
+All three were empty for every socket worker before this change.
+
+**Then** the command the chat window writes was written by hand into `.fleet/commands.json` --
+`{"add_goal": [{"text": "…", "follow_up_to": "<the 17×23 goal>", "priority": true}]}` -- and a
+fleet was started. The `follow_up_to` text was read out of `socket_route.jsonl` rather than
+retyped: `fleet_submit` normalises newlines to spaces before recording, so a hand-copied key
+would have failed to match and the run would have looked like a broken mechanism instead of a
+mistyped string.
+
+The archive shows the result, with its own control:
+
+```
+11:10:07  w0  DONE  conv sess:101d7163-…   17 × 23
+11:30:01  w1  DONE  conv sess:101d7163-…   【ユーザーからの追加指示】… +1     <- resumed
+11:30:04  w0  DONE  conv sess:b0e3c3f2-…   5 と 6                             <- fresh
+```
+
+Same run, two workers: the follow-up carries the ORIGINAL conversation's id and the unrelated
+goal gets its own. And the three rows immediately before these carry an empty `conv`, which is
+the defect visible in the record.
+
+**What makes it proof rather than a matching id**: the follow-up worker answered
+
+```
+392
+DONE
+```
+
+17 × 23 is 391. Nothing in the follow-up goal contains 391 — the worker read its own earlier
+turn. An identity can be coincidence or a mislabelled row; that number can only come from the
+conversation actually being continued.
+
 ## Still open
 
-End to end — typing into a fleet conversation in the running chat window and watching the
-fleet pick it up — has not been exercised. Every layer is verified separately (relay recording
-with a negative control, the command channel, the chat window's source and its deployed
-binary), but the seam between them will be crossed for the first time by real use.
+The chat window's own keystroke path -- selecting a fleet conversation in the running window
+and typing into it -- has not been exercised by a human. Its source and its deployed binary
+are pinned (`ui/test_a_fleet_conversation_can_be_answered.py`), and everything it hands to is
+now verified above, so what remains untested is the UI event wiring itself.
