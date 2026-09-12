@@ -102,9 +102,10 @@ def pull_logs(misses):
     remote_dir = OUT / "_remote"
     remote_dir.mkdir(parents=True, exist_ok=True)
     local_tar = remote_dir / "miss300_logs.tgz"
-    r = subprocess.run(["scp", "-q", "-o", "ConnectTimeout=30",
-                        os.environ.get("EVAL_SSH_HOST", "") + ":/C:/wsl-setup/miss300_logs.tgz", str(local_tar)],
-                       cwd=str(REPO), capture_output=True, text=True, timeout=240)
+    from tools.childproc import run as _run_child
+    r = _run_child(["scp", "-q", "-o", "ConnectTimeout=30",
+                    os.environ.get("EVAL_SSH_HOST", "") + ":/C:/wsl-setup/miss300_logs.tgz", str(local_tar)],
+                   cwd=str(REPO), timeout=240)
     if r.returncode != 0:
         raise SystemExit("scp log tar failed: %s" % (r.stderr or r.stdout))
     subprocess.run(["tar", "-xzf", str(local_tar), "-C", str(remote_dir)],

@@ -6,15 +6,16 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DISTRO = "MiasmaLab"
 
 def wsl(script, timeout=120):
-    return subprocess.run(["wsl.exe", "-d", DISTRO, "sh", "-c", script],
-                          capture_output=True, text=True, timeout=timeout)
+    from tools.childproc import run as _run_child
+    return _run_child(["wsl.exe", "-d", DISTRO, "sh", "-c", script], timeout=timeout)
 
 for inst in ["astropy__astropy-14182", "astropy__astropy-14365"]:
     wt = os.path.join(REPO, ".fleet", "swe", "work", "wt_" + inst)
     print("#" * 78)
     print("#", inst)
     print("#" * 78)
-    g = subprocess.run(["git", "-C", wt, "diff"], capture_output=True, text=True)
+    from tools.childproc import run as _run_child
+    g = _run_child(["git", "-C", wt, "diff"])
     print("----- AGENT DIFF -----")
     print(g.stdout)
     run_id = "agent_" + inst.replace("__", "_")

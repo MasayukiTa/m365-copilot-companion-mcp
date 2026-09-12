@@ -21,7 +21,8 @@ with open(pf, "w", encoding="utf-8", newline="\n") as f:
 # clean first, then apply gold
 subprocess.run(["git", "-C", wt, "checkout", "--", "."])
 subprocess.run(["git", "-C", wt, "clean", "-fd"], capture_output=True)
-ap = subprocess.run(["git", "-C", wt, "apply", pf], capture_output=True, text=True)
+from tools.childproc import run as _run_child
+ap = _run_child(["git", "-C", wt, "apply", pf])
 if ap.returncode != 0:
     print("GOLD APPLY FAILED:", ap.stderr[:300])
     sys.exit(2)

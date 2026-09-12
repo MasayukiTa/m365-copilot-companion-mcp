@@ -223,7 +223,8 @@ class JobAuthority:
     def __enter__(self):
         self._proc = subprocess.Popen(
             [self.python, "-c", _server_source()],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            encoding="utf-8", errors="replace")
         self._proc.stdin.write(json.dumps({
             "repo": REPO, "db": self.db, "agent_token": self.agent_token,
             "judge_token": self.judge_token, "secret": self._secret}) + "\n")

@@ -401,7 +401,14 @@ def dashboard_state(*, archive_path=None, burned_path=None, grade_results_path=N
         from relay.selfimprove.usage import usage_section
         usage = usage_section()
     except Exception:
+        # The default carries every key the UI reads, `workload` included: a reader that has
+        # to test for the key would show the blend on exactly the runs where the summariser
+        # failed, which is the worst time to fall back to the misleading number.
         usage = {"n_tasks": 0, "completion_rate": None, "status_mix": {}, "trend": [],
+                 "workload": {"ordinary": {"n": 0, "completion_rate": None, "recent_n": 0,
+                                           "recent_completion_rate": None},
+                              "bench": {"n": 0, "completion_rate": None, "recent_n": 0,
+                                        "recent_completion_rate": None}},
                  "persona_leak_rate": None, "quality_scored": 0, "persona_flagged": []}
 
     # RELIABILITY BESIDE CAPABILITY. pass@1 asks what fraction of attempts succeed; pass^k

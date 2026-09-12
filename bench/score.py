@@ -32,8 +32,8 @@ def main():
     for safe in folders:
         folder = os.path.join(out_root, safe)
         try:
-            r = subprocess.run([sys.executable, eval_py, safe, folder],
-                               capture_output=True, text=True, timeout=args.timeout)
+            from tools.childproc import run as _run_child
+            r = _run_child([sys.executable, eval_py, safe, folder], timeout=args.timeout)
             ok = r.returncode == 0
             tag = (r.stdout or "").strip().splitlines()[-1] if r.stdout.strip() else "NO_OUTPUT"
         except subprocess.TimeoutExpired:

@@ -89,7 +89,8 @@ def main():
     wt = sys.argv[2] if len(sys.argv) > 2 else os.path.join(REPO, ".fleet", "swe", "work", "wt_" + inst)
 
     # 1. the agent's patch = git diff in its worktree
-    g = subprocess.run(["git", "-C", wt, "diff"], capture_output=True, text=True)
+    from tools.childproc import run as _run_child
+    g = _run_child(["git", "-C", wt, "diff"])
     diff = g.stdout
     if not diff.strip():
         print("NO_PATCH_YET: you have not edited any files in the repository at %s. "
