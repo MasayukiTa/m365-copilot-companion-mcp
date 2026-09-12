@@ -144,6 +144,7 @@ jobs:
             relay/selfimprove/test_one_rate_over_two_populations.py \
             relay/selfimprove/test_a_slice_that_cannot_decide_is_not_burned.py \
             tools/test_child_output_is_not_decoded_by_luck.py \
+            tools/test_nothing_new_is_built_without_a_caller.py \
             tools/test_a_backfilled_conversation_is_the_right_one.py \
             tools/test_folder_policy.py \
             tools/test_security.py \
