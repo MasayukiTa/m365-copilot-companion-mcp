@@ -185,6 +185,14 @@ def test_dry_run_prints_exact_fleet_cmd(repo, monkeypatch, capsys):
 # --- fleet_cmd(): the verified launch contract, byte for byte ------------------------------
 
 def test_fleet_cmd_shape():
+    """--no-fanout is part of the shape, not an extra.
+
+    A benchmark goal is the unit being scored, and a split replaces it with children the
+    grader never reads plus a merge that arrives after scoring -- so the parent's row comes
+    back empty and is recorded as a miss. It is named here because fan-out became ON by
+    default on 2026-09-13: this command used to inherit "off" by saying nothing, and saying
+    nothing now means on.
+    """
     cmd = fleet_cmd("C:/x/goals.jsonl", 4, "auto")
     assert cmd == [
         review_run.VENVPY, "-m", "relay.fleet_runner",
@@ -192,6 +200,7 @@ def test_fleet_cmd_shape():
         "--max-concurrent", "4",
         "--max-turns", "40",
         "--disk-floor-gb", "0",
+        "--no-fanout",
         "--effort", "auto",
     ]
 

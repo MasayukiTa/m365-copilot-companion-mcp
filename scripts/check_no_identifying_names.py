@@ -201,6 +201,38 @@ class CheckFailed(RuntimeError):
     """The check could not be performed. Never the same thing as finding nothing."""
 
 
+def _git_lines(repo, args):
+    """Lines from one git command, or [] when git has nothing to say. Never raises.
+
+    Used for the two ADVISORY reaches below. The tracked list keeps its own hard failure --
+    a guard that cannot enumerate what it guards must not report a pass.
+    """
+    try:
+        from tools.childproc import run as _run_child
+        out = _run_child(["git", "-C", repo] + list(args))
+    except OSError:
+        return []
+    if out.returncode != 0:
+        return []
+    return [p for p in out.stdout.splitlines() if p.strip()]
+
+
+def staged_files(repo="."):
+    """Paths about to become tracked.
+
+    THE GUARD STOOD IN THE WRONG PLACE. It enumerated `git ls-files`, so the only moment it
+    could speak was after a commit had been pushed and CI ran -- which on 2026-09-13 meant an
+    employee id was already public and the fix was a history rewrite. A staged file is the last
+    moment before that, and in CI nothing is staged, so CI is unaffected.
+    """
+    return _git_lines(repo, ["diff", "--cached", "--name-only"])
+
+
+def untracked_files(repo="."):
+    """Paths that are neither tracked nor ignored -- one `git add` from being public."""
+    return _git_lines(repo, ["ls-files", "--others", "--exclude-standard"])
+
+
 def tracked_files(repo="."):
     """Every tracked path, or raise. A failed git call used to yield an empty list, and an
     empty list reads as "nothing identifying in 0 tracked files" -- a pass."""
@@ -221,7 +253,7 @@ def tracked_files(repo="."):
 MAX_HITS_PER_FILE = 20
 
 
-def offences(repo=".", names=None):
+def offences(repo=".", names=None, files=None):
     """[(path, what, line_number, line)] for every tracked text file that identifies someone."""
     # THE REPO UNDER CHECK, not the current directory. The .env fallback read whichever
     # directory the process happened to start in, so checking a temp repository picked up
@@ -230,7 +262,11 @@ def offences(repo=".", names=None):
     names = configured_names(repo) if names is None else names
     name_re = (re.compile("|".join(re.escape(n) for n in names), re.I)) if names else None
     found = []
-    for rel in tracked_files(repo):
+    # WHICH FILES, PASSED IN. The scanner used to call tracked_files() itself, which made the
+    # question it answers ("is anything public?") the only question it could answer. The same
+    # scan is now reusable for files that are about to become public -- staged -- and for ones
+    # that are one `git add` away.
+    for rel in (files if files is not None else tracked_files(repo)):
         if rel in ALLOWED:
             continue
         # THE PATH ITSELF. A file called after a person or a project discloses it without any
@@ -348,6 +384,15 @@ def main(argv=None) -> int:
     try:
         found = offences(repo)
         meta = commit_metadata_offences(repo, names=names)
+        # ABOUT TO BE PUBLIC. Staged files are the last moment before a commit, which is where
+        # this check belongs: on 2026-09-13 it stood only on tracked files, so the earliest it
+        # could speak was CI -- after a push, when the fix is a history rewrite. Nothing is
+        # staged in CI, so CI behaviour is unchanged.
+        staged = [p for p in staged_files(repo) if os.path.isfile(os.path.join(repo, p))]
+        found_staged = offences(repo, names=names, files=staged) if staged else []
+        # ONE `git add` AWAY. Advisory only -- see below.
+        loose = [p for p in untracked_files(repo) if os.path.isfile(os.path.join(repo, p))]
+        found_loose = offences(repo, names=names, files=loose) if loose else []
     except CheckFailed as exc:
         print("CHECK COULD NOT RUN: %s" % exc)
         return 2
@@ -364,6 +409,27 @@ def main(argv=None) -> int:
                   "branch this protects, a missing secret is a missing check, not a clean "
                   "result.")
             return 2
+
+    # ADVISORY, NOT A FAILURE. The rule this protects is about what becomes PUBLIC, and an
+    # untracked file is not public. Failing on scratch files would train people to silence the
+    # check, which is how a guard stops being read -- the same way an approval that is always
+    # there stops being read. Printed first so it is seen even on a pass.
+    if found_loose:
+        print("WARNING -- untracked files carry identifying content (%d). They are not public, "
+              "and they are one `git add` from being so:" % len(found_loose))
+        for rel, what, n, line in found_loose[:12]:
+            print("  %s:%d  [%s]" % (rel, n, what))
+        print("")
+
+    if found_staged:
+        print("IDENTIFYING CONTENT IN STAGED FILES (%d) -- this is about to be committed:"
+              % len(found_staged))
+        for rel, what, n, line in found_staged:
+            print("  %s:%d  [%s]  %s" % (rel, n, what, line))
+        print("")
+        print("Unstage or scrub these. Caught here, the fix is an edit; caught in CI, the fix "
+              "is a history rewrite.")
+        return 1
 
     if not found and not meta:
         print("nothing identifying in %d tracked files (%d configured name(s))"

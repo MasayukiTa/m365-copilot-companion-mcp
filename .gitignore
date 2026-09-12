@@ -121,6 +121,10 @@ ui/_buildcheck/
 !/docs/SECURITY.md
 !/docs/TROUBLESHOOTING.md
 !/docs/ADVANCED.md
+# the fan-out contract: who decides a split, what the merge verifies, where the work goes.
+# Tracked because it is the answer to questions that were re-investigated from source three
+# times; a copy that lives only on one machine is not an answer to that.
+!/docs/fanout_contract.md
 /docs/validation/
 # scratch probes / b64 dumps / one-off data created during eval sessions
 /bench/_k*.py

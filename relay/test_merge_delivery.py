@@ -166,8 +166,23 @@ def test_gaps_become_acceptance_checks():
             {"subtask_index": 4, "outcome": "STUCK"}]
     assert missing_slices(recs) == [2, 4]
     checks = merge_acceptance_checks(recs)
-    assert len(checks) == 1
-    assert "2, 4" in checks[0], "検査条件が欠落番号を名指ししていない: %r" % checks
+
+    # 検査は**dict**でなければならない。以前は素の文字列で、`normalize_checks` が
+    # 「dict 以外は黙って捨てる」ため、ワーカーに届く時点で [] になっていた。
+    # 計測(2026-09-13): aggregation_goal は文字列を載せ、goal_fields は [] を返した。
+    # その結果ワーカーは `if not self.checks` 分岐（検査なし=DONEをそのまま信用）に入り、
+    # 欠落を隠した統合を止める唯一のゲートが一度も走っていなかった。
+    assert all(isinstance(c, dict) for c in checks), "文字列は normalize_checks に捨てられる"
+    assert all(c.get("type") == "reply_contains" for c in checks)
+
+    named = [c for c in checks if c.get("all_of")]
+    assert named and named[0]["all_of"] == ["2", "4"], (
+        "検査条件が欠落番号を名指ししていない: %r" % checks)
+
+    # 記録された失敗は「書かなかった」ではなく「**間違って書いた**」 --
+    # 欠落があるのに「欠落なし」と書いた統合が2件。肯定形の検査では捕まらない。
+    forbidden = [c for c in checks if c.get("expect") is False]
+    assert forbidden and forbidden[0]["needle"] == "欠落なし"
 
 
 def test_a_complete_sweep_has_nothing_to_check():

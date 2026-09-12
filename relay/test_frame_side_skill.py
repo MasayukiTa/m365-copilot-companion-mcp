@@ -213,14 +213,25 @@ def test_the_split_marker_is_inert_outside_fanout_mode():
     so an ordinary worker writing SUBTASKS_READY reaches no branch at all. If that gate is
     ever removed, this fails and the guard question comes back.
     """
-    w = F.RelayWorker(MAIL_GOAL, "w0")
+    w = F.RelayWorker(MAIL_GOAL, "w0", fanout=False)
     assert w.fanout is False, "an ordinary worker is not in fanout mode"
     src = inspect.getsource(F.RelayWorker._decide)
+
+    # ANCHORED ON THE GATE, NOT ON A DISTANCE TO IT. This measured the characters between the
+    # gate and the first `fanout_ready`, which said nothing about nesting and broke the moment
+    # a second branch (the agent's NO_SPLIT decline) went inside the same gate. What matters is
+    # that every reader of the marker sits under the gate.
+    gate = "if self.fanout and not self._fanout_done:"
+    g = src.find(gate)
+    assert g != -1, "the split branch is no longer gated on fanout mode; re-derive this"
     i = src.find("fanout_ready")
     assert i != -1, "fanout_ready is no longer consulted here; re-derive this"
-    assert "self.fanout" in src[max(0, i - 400):i], (
+    assert g < i, (
         "the split branch is no longer gated on fanout mode; the marker is live for every "
         "worker again and a procedure that names it must be refused")
+
+    # And nothing reads it OUTSIDE the gate: every occurrence follows the gate line.
+    assert src.find("fanout_ready", 0, g) == -1
 
 
 def test_a_worker_that_is_in_fanout_mode_was_given_the_marker_anyway():

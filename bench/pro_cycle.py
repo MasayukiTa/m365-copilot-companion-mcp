@@ -879,7 +879,9 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
         # the shared tool-planner limiter more likely to refuse -- measured, median 35
         # concurrent replies at a refusal against 5 at a recovery.
         fleet_ok, fleet_tail = run(
-            [PY, "-m", "relay.fleet_runner", "--goals-file", GOALS,
+            # --no-fanout: one scored goal per conversation. See bench/review_run.py's
+            # fleet_cmd for the reasoning; fan-out defaults ON since 2026-09-13.
+            [PY, "-m", "relay.fleet_runner", "--no-fanout", "--goals-file", GOALS,
              "--effort", effort, "--max-concurrent", str(len(group))],
             BATCH_TIMEOUT_S, "fleet")
 

@@ -326,6 +326,12 @@ def fleet_cmd(goals_path, max_concurrent, effort, state_dir=None,
            "--max-concurrent", str(max_concurrent),
            "--max-turns", str(max_turns if max_turns is not None else FLEET_MAX_TURNS),
            "--disk-floor-gb", "0",
+           # A BENCHMARK GOAL IS NOT SPLIT. The goals file is the unit being scored: a split
+           # replaces one scored goal with children the grader never reads and a merge that
+           # arrives after scoring, so the parent's row comes back empty. Named here rather
+           # than inherited -- fan-out became ON by default on 2026-09-13, and what a benchmark
+           # measures must not change because a default did.
+           "--no-fanout",
            "--effort", effort]
     if state_dir:
         cmd += ["--state-dir", state_dir]
