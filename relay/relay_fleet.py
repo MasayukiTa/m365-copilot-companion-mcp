@@ -32,7 +32,9 @@ import re
 import threading
 import time
 
-from .acceptance import Check, normalize_checks, run_all_blocking
+from .acceptance import (
+    Check, MalformedCheck as AcceptanceError, normalize_checks, run_all_blocking,
+)
 from . import splittability as _splittability
 from .copilot_autopilot_relay import (
     CONTINUE_JOB, COPILOT_SELECTORS, ConversationClosed, CopilotWebDriver, FIX_JOB,
@@ -6499,7 +6501,24 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             while add_box:
                 item = add_box.pop(0)
                 # item may carry checks/cwd too; goal_fields reads them (priority ignored)
-                nw = _worker_for(len(workers), item)
+                #
+                # A REJECTED INJECTION COSTS THE INJECTED GOAL AND NOTHING ELSE. `goal_fields`
+                # raises MalformedCheck on a bad acceptance spec (since 2026-09-13, and
+                # deliberately -- a dropped check is indistinguishable from no check). Raising
+                # HERE, though, escapes run_relay_fleet into fleet_runner's generic handler,
+                # which diagnoses it as a connection failure, burns the recovery budget and can
+                # hard-reset the browser out from under every worker that was running fine. One
+                # typo in a goal the cockpit added mid-run would take the whole fleet with it.
+                try:
+                    nw = _worker_for(len(workers), item)
+                except AcceptanceError as _exc:
+                    print("[fleet] refusing an injected goal: %s" % _exc, flush=True)
+                    try:
+                        notify("追加されたゴールを受け付けませんでした（受入検査の指定が不正）: %s"
+                               % str(_exc)[:300])
+                    except Exception:
+                        pass
+                    continue
                 workers.append(nw)
                 if item.get("priority"):
                     pending.insert(0, nw)
