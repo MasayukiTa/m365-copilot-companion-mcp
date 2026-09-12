@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 TEST_ROOTS = ("bench", "bridge", "relay", "scripts", "tests", "tools", "ui")
 
@@ -53,10 +56,9 @@ EXCLUDED = {
 
 
 def _git(*args) -> set[str] | None:
-    import subprocess
+    from tools.childproc import run as _run_child
     try:
-        out = subprocess.run(["git", *args], cwd=ROOT, capture_output=True,
-                             text=True, timeout=30)
+        out = _run_child(["git", *args], cwd=ROOT, timeout=30)
     except Exception:
         return None
     if out.returncode != 0:

@@ -28,6 +28,8 @@ import time
 import urllib.request
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
 ROUTE_LOG = os.path.join(REPO, ".fleet", "socket_route.jsonl")
 BRIDGE = "http://127.0.0.1:8765"
 
@@ -87,8 +89,8 @@ def mcp_started():
         "Sort-Object CreationDate | Select-Object -First 1; "
         "if ($p) { Get-Date $p.CreationDate -Format o }")
     try:
-        out = subprocess.run(["powershell", "-NoProfile", "-Command", script],
-                             capture_output=True, text=True, timeout=25).stdout.strip()
+        from tools.childproc import run as _run_child
+        out = _run_child(["powershell", "-NoProfile", "-Command", script], timeout=25).stdout.strip()
         if not out:
             return 0.0
         import datetime
@@ -146,8 +148,8 @@ def _active_marker():
     pid = data.get("pid")
     script = ("@(Get-CimInstance Win32_Process -Filter \"ProcessId=%s\").Count" % pid)
     try:
-        out = subprocess.run(["powershell", "-NoProfile", "-Command", script],
-                             capture_output=True, text=True, timeout=25).stdout.strip()
+        from tools.childproc import run as _run_child
+        out = _run_child(["powershell", "-NoProfile", "-Command", script], timeout=25).stdout.strip()
         alive = out.isdigit() and int(out) > 0
     except Exception:
         alive = True            # cannot tell -> never accuse a run of being dead
@@ -169,8 +171,8 @@ def fleet_runs_active():
               "Where-Object { $_.CommandLine -match 'fleet_runner' } | "
               "ForEach-Object { $_.ProcessId }")
     try:
-        out = subprocess.run(["powershell", "-NoProfile", "-Command", script],
-                             capture_output=True, text=True, timeout=25).stdout
+        from tools.childproc import run as _run_child
+        out = _run_child(["powershell", "-NoProfile", "-Command", script], timeout=25).stdout
         return [int(x) for x in out.split() if x.strip().isdigit()]
     except Exception:
         return []
@@ -199,8 +201,8 @@ def _mine_pids():
             walk = ("$p=%d; while($p -and $p -ne 0){ $p; "
                     "$q=(Get-CimInstance Win32_Process -Filter \"ProcessId=$p\"); "
                     "if($q){ $p=$q.ParentProcessId } else { break } }" % os.getpid())
-            out = subprocess.run(["powershell", "-NoProfile", "-Command", walk],
-                                 capture_output=True, text=True, timeout=20).stdout
+            from tools.childproc import run as _run_child
+            out = _run_child(["powershell", "-NoProfile", "-Command", walk], timeout=20).stdout
             for x in out.split():
                 if x.strip().isdigit():
                     mine.add(int(x))
@@ -232,14 +234,13 @@ def stop_and_wait(match, label, timeout_s=120):
     count = ("(Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
              "Where-Object { %s } | Measure-Object).Count" % pred)
     print("     stopping %s and waiting for its launcher..." % label)
-    subprocess.run(["powershell", "-NoProfile", "-Command", kill],
-                   capture_output=True, text=True, timeout=60)
+    from tools.childproc import run as _run_child
+    _run_child(["powershell", "-NoProfile", "-Command", kill], timeout=60)
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         time.sleep(3)
         try:
-            out = subprocess.run(["powershell", "-NoProfile", "-Command", count],
-                                 capture_output=True, text=True, timeout=25).stdout.strip()
+            out = _run_child(["powershell", "-NoProfile", "-Command", count], timeout=25).stdout.strip()
             if out.isdigit() and int(out) > 0:
                 print("     %s is back" % label)
                 return True

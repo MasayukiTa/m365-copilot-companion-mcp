@@ -260,10 +260,9 @@ if (-not $shown) {{
 }}
 if ($shown) {{ Write-Output 'OK' }} else {{ throw 'notification: no method succeeded' }}
 """
-        r = subprocess.run(
+        from tools.childproc import run as _run_child
+        r = _run_child(
             [powershell, "-NoProfile", "-NonInteractive", "-Command", ps_script],
-            capture_output=True,
-            text=True,
             timeout=POWERSHELL_TIMEOUT,
         )
         if r.returncode != 0:

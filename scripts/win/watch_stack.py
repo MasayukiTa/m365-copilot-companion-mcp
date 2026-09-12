@@ -38,6 +38,8 @@ import time
 import urllib.request
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
 ROUTE_LOG = os.path.join(REPO, ".fleet", "socket_route.jsonl")
 
 #: CDP ports and what lives on them. Kept here rather than discovered so an unexpected
@@ -58,8 +60,8 @@ Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe' O
 
 def _powershell(script: str) -> str:
     try:
-        out = subprocess.run(["powershell", "-NoProfile", "-Command", script],
-                             capture_output=True, text=True, timeout=30)
+        from tools.childproc import run as _run_child
+        out = _run_child(["powershell", "-NoProfile", "-Command", script], timeout=30)
         return out.stdout or ""
     except Exception:
         return ""

@@ -33,6 +33,7 @@ from __future__ import annotations
 import io
 import os
 import re
+import subprocess
 
 import pytest
 
@@ -46,7 +47,9 @@ _NAMED = re.compile(r"(?:encoding|errors)\s*=")
 
 #: Files that still decode child output with the local code page, with how many sites each.
 #: Taken 2026-09-12: 53 files, 93 sites (swept down from 59/100 the same day), then swept down
-#: to 39 files, 73 sites the same day (the bench/ non-test sweep -- 15 files fixed, 20 sites).
+#: to 39 files, 73 sites the same day (the bench/ non-test sweep -- 15 files fixed, 20 sites),
+#: then to 23 files, 42 sites the same day (the scripts/ and tools/auto|coding_ops|notify_ops
+#: non-test sweep -- 16 files fixed, 31 sites).
 #: THIS NUMBER IS A DEBT, NOT A SETTING -- every entry is a place where one byte can still
 #: delete an entire command's output.
 #:
@@ -67,23 +70,9 @@ BASELINE = {
     # reads as "no problem" -- but it must ship with a re-freeze and its own record, not as a
     # line in a sweep, and least of all with an A/B queued.
     "relay/selfimprove/guards.py": 1,
-    "tools/auto/autoloop.py": 1,
-    "tools/coding_ops.py": 1,
-    "tools/notify_ops.py": 1,
     # ── setup and maintenance, with a person watching ──────────────────
-    "scripts/bootstrap.py": 6,
-    "scripts/check_ci_test_manifest.py": 1,
-    "scripts/check_no_identifying_names.py": 5,
-    "scripts/diag_warmup_bias.py": 1,
-    "scripts/run_route_campaign.py": 2,
-    "scripts/run_transport_series.py": 1,
-    "scripts/win/_mem_strata.py": 1,
-    "scripts/win/checkpoint.py": 1,
-    "scripts/win/edge_memory.py": 1,
-    "scripts/win/reap_orphan_edge.py": 1,
-    "scripts/win/resume_interrupted_fleet.py": 1,
-    "scripts/win/verify_stack.py": 6,
-    "scripts/win/watch_stack.py": 1,
+    # (empty: the scripts/ and tools/auto|coding_ops|notify_ops non-test sweep removed every
+    # entry that was here -- 16 files fixed, 31 sites)
     # ── tests, reading output produced by python over this repo's own ASCII paths ───
     "bench/companionbench/test_job_authority.py": 3,
     "bench/test_capture_survives_a_non_cp932_patch.py": 1,
@@ -128,8 +117,34 @@ def _call_text(src: str, start: int) -> str:
     return src[start:start + 4000]
 
 
+def _tracked():
+    """Paths git actually has, or None when git cannot answer.
+
+    THE INVENTORY IS OF THE REPOSITORY, NOT OF THIS WORKING TREE, and the difference broke CI
+    in both directions on 2026-09-12:
+
+      * `scripts/win/_mem_strata.py` is listed in .git/info/exclude, so it exists on this
+        machine and NOT in CI. The inventory named a file CI cannot see, and the ratchet's
+        "a clean file must be removed" check fired on its absence.
+      * `bench/swe_diffgate.py` had an uncommitted fix here, so the seed recorded 0 sites
+        where HEAD has 1, and CI -- which reads HEAD -- found an unlisted file.
+
+    One defect, two shapes. Restricting the scan to tracked paths removes both: what CI sees
+    and what the inventory counts become the same set of files.
+    """
+    try:
+        out = subprocess.run(["git", "-C", REPO, "ls-files"], capture_output=True, timeout=60)
+    except OSError:
+        return None
+    if out.returncode != 0:
+        return None
+    return {p.strip().replace("\\", "/") for p in
+            out.stdout.decode("utf-8", "replace").splitlines() if p.strip()}
+
+
 def risky_sites():
-    """{relative path: count} for every locale-decoded subprocess call in the tree."""
+    """{relative path: count} for every locale-decoded subprocess call the repository tracks."""
+    tracked = _tracked()
     found = {}
     for root in ROOTS:
         base = os.path.join(REPO, root)
@@ -142,6 +157,9 @@ def risky_sites():
                 if not name.endswith(".py"):
                     continue
                 path = os.path.join(dirpath, name)
+                rel = os.path.relpath(path, REPO).replace(os.sep, "/")
+                if tracked is not None and rel not in tracked:
+                    continue          # locally-excluded or untracked: CI does not have it
                 try:
                     src = io.open(path, encoding="utf-8").read()
                 except (OSError, UnicodeDecodeError):
@@ -152,7 +170,7 @@ def risky_sites():
                     if _TEXT.search(call) and not _NAMED.search(call):
                         n += 1
                 if n:
-                    found[os.path.relpath(path, REPO).replace(os.sep, "/")] = n
+                    found[rel] = n
     return found
 
 
@@ -184,6 +202,19 @@ def test_a_file_that_is_clean_is_removed_from_the_list():
     assert not stale, (
         "these entries overstate the debt -- lower or delete them (file: allowed, actual "
         "now %r): %r" % ({p: now.get(p, 0) for p in stale}, stale))
+
+
+def test_every_entry_is_a_file_the_repository_actually_has():
+    """CI only ever sees tracked files. An entry for anything else is a debt CI cannot find,
+    and the ratchet then fails on its absence -- which is exactly what happened on 2026-09-12
+    with a path listed in .git/info/exclude."""
+    tracked = _tracked()
+    if tracked is None:
+        pytest.skip("git could not list the tracked files here")
+    untracked = sorted(p for p in BASELINE if p not in tracked)
+    assert not untracked, (
+        "the inventory names files git does not track, so CI cannot see them: %s"
+        % ", ".join(untracked))
 
 
 def test_the_inventory_is_not_silently_empty():

@@ -89,6 +89,10 @@ LIVE_RECORD_REDIRECTS = {
                               "FLEET_CONVS_PATH": "fleet_convs.json",
                               "RECYCLE_SAMPLES_PATH": "recycle_samples.jsonl",
                               "_SETTLE_RESET_TRACE_PATH": "settle_reset_trace.jsonl"},
+    # THE BACK-FILL REWRITES TRANSCRIPTS IN PLACE, which is the most destructive shape on this
+    # list: it does not append, it replaces the file with the same lines plus one. A test
+    # exercising it against the live .fleet would rewrite the operator's real fleet history.
+    "tools.backfill_transcript_conv_ids": {"DEFAULT_STATE": "."},
     "bridge.session_store": {"SESS_DIR": "sessions"},
     "tools.tool_probe": {"_PROBE_FILE": "tool_probe.json",
                          "PROBE_FAILURE_JOURNAL": "tool_probe_failures.jsonl",

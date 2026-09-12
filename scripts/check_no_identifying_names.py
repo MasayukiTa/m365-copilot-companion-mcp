@@ -33,6 +33,10 @@ import re
 import subprocess
 import sys
 
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
+
 #: Where the unshaped names come from. A comma-separated list; never a default in this file.
 NAMES_ENV = "IDENTITY_NAMES"
 
@@ -200,7 +204,8 @@ class CheckFailed(RuntimeError):
 def tracked_files(repo="."):
     """Every tracked path, or raise. A failed git call used to yield an empty list, and an
     empty list reads as "nothing identifying in 0 tracked files" -- a pass."""
-    out = subprocess.run(["git", "-C", repo, "ls-files"], capture_output=True, text=True)
+    from tools.childproc import run as _run_child
+    out = _run_child(["git", "-C", repo, "ls-files"])
     if out.returncode != 0:
         raise CheckFailed("git ls-files failed in %s: %s"
                           % (repo, (out.stderr or "").strip()[:200]))
@@ -274,12 +279,11 @@ def offences(repo=".", names=None):
 #: commits at risk are the ones this push introduces over main; when that base cannot be found
 #: (a fresh clone, a detached run) the tip commit is still worth checking rather than nothing.
 def _commit_range(repo):
+    from tools.childproc import run as _run_child
     for base in ("origin/main", "main"):
-        rev = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "-q", base],
-                             capture_output=True, text=True)
+        rev = _run_child(["git", "-C", repo, "rev-parse", "--verify", "-q", base])
         if rev.returncode == 0:
-            head = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "-q", "HEAD"],
-                                  capture_output=True, text=True)
+            head = _run_child(["git", "-C", repo, "rev-parse", "--verify", "-q", "HEAD"])
             # HEAD may already BE the base (checked out main with nothing ahead). Comparing a
             # ref to itself yields no commits, which is the honest answer, not an error.
             if head.returncode == 0 and head.stdout.strip() == rev.stdout.strip():
@@ -301,8 +305,8 @@ def commit_metadata_offences(repo=".", names=None, rev_range=None):
         # No commits yet (git init with nothing committed) means no metadata to leak. That is
         # an empty result, not a failure -- HEAD does not resolve, and asking git to log it
         # would raise, turning a benign state into CHECK COULD NOT RUN.
-        head = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "-q", "HEAD"],
-                              capture_output=True, text=True)
+        from tools.childproc import run as _run_child
+        head = _run_child(["git", "-C", repo, "rev-parse", "--verify", "-q", "HEAD"])
         if head.returncode != 0:
             return []
         rng = _commit_range(repo)
@@ -311,8 +315,8 @@ def commit_metadata_offences(repo=".", names=None, rev_range=None):
     # A record separator no field can contain lets author name, email, committer name, email
     # and subject be read back unambiguously even when a name legitimately contains spaces.
     fmt = "%H%x1f%an%x1f%ae%x1f%cn%x1f%ce%x1f%s"
-    out = subprocess.run(["git", "-C", repo, "log", "--no-color", "--format=" + fmt, rng],
-                         capture_output=True, text=True)
+    from tools.childproc import run as _run_child
+    out = _run_child(["git", "-C", repo, "log", "--no-color", "--format=" + fmt, rng])
     if out.returncode != 0:
         raise CheckFailed("git log failed for range %s in %s: %s"
                           % (rng, repo, (out.stderr or "").strip()[:200]))

@@ -266,8 +266,8 @@ def _venv_runs() -> bool:
     if not VENV_PYTHON.exists():
         return False
     try:
-        res = subprocess.run([str(VENV_PYTHON), "-c", "import sys"],
-                             capture_output=True, text=True, timeout=60)
+        from tools.childproc import run as _run_child
+        res = _run_child([str(VENV_PYTHON), "-c", "import sys"], timeout=60)
     except (OSError, subprocess.SubprocessError):
         return False
     return res.returncode == 0
@@ -277,8 +277,8 @@ def _venv_has_pip() -> bool:
     if not VENV_PYTHON.exists():
         return False
     try:
-        res = subprocess.run([str(VENV_PYTHON), "-m", "pip", "--version"],
-                             capture_output=True, text=True, timeout=60)
+        from tools.childproc import run as _run_child
+        res = _run_child([str(VENV_PYTHON), "-m", "pip", "--version"], timeout=60)
     except (OSError, subprocess.SubprocessError):
         return False
     return res.returncode == 0
@@ -409,10 +409,8 @@ def step_install_deps() -> None:
     # catches unusually stripped Python distributions. If any import fails to
     # import, the environment is not usable; raise a novice-readable StepError.
     sentinels = ["fastmcp", "httpx", "dotenv", "playwright", "psutil", "sqlite3"]
-    check = subprocess.run(
-        [py, "-c", "import " + ", ".join(sentinels)],
-        capture_output=True, text=True,
-    )
+    from tools.childproc import run as _run_child
+    check = _run_child([py, "-c", "import " + ", ".join(sentinels)])
     if check.returncode != 0:
         detail = (check.stderr or check.stdout or "").strip().splitlines()
         last = detail[-1] if detail else "(no error text)"
@@ -835,10 +833,8 @@ def _dt_run(dt: str, *args: str) -> subprocess.CompletedProcess:
     """Run a devtunnel subcommand, capturing output, never raising. Returns the
     CompletedProcess (rc 124-style sentinel on timeout/spawn failure)."""
     try:
-        return subprocess.run(
-            [dt, *args],
-            capture_output=True, text=True, timeout=60,
-        )
+        from tools.childproc import run as _run_child
+        return _run_child([dt, *args], timeout=60)
     except (OSError, subprocess.SubprocessError):
         return subprocess.CompletedProcess(args=[dt, *args], returncode=124, stdout="", stderr="")
 
@@ -929,10 +925,8 @@ def _devtunnel_logged_in(dt: str) -> bool:
     """Best-effort: returns True only if 'devtunnel user show' clearly reports a
     logged-in account. Any error / 'not logged in' text -> False (we pause)."""
     try:
-        out = subprocess.run(
-            [dt, "user", "show"],
-            capture_output=True, text=True, timeout=20,
-        )
+        from tools.childproc import run as _run_child
+        out = _run_child([dt, "user", "show"], timeout=20)
     except (OSError, subprocess.SubprocessError):
         return False
     text = (out.stdout + out.stderr).lower()
@@ -1085,10 +1079,8 @@ def _count_tools_via_subprocess() -> int | None:
     )
     env = dict(os.environ)
     try:
-        res = subprocess.run(
-            [py, "-c", code],
-            capture_output=True, text=True, cwd=str(ROOT), env=env, timeout=120,
-        )
+        from tools.childproc import run as _run_child
+        res = _run_child([py, "-c", code], cwd=str(ROOT), env=env, timeout=120)
     except (OSError, subprocess.SubprocessError):
         return None
     if res.returncode != 0:
