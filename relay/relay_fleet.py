@@ -2650,6 +2650,30 @@ class RelayWorker:
         self.reason = "手動で停止・タブ解放しました"
         self.close()
 
+    def _note_timeout(self, origin, elapsed_s, treatment):
+        """Record one timeout WE measured, with the clock that fired and what we then did.
+
+        CAUSE AND TREATMENT ARE SEPARATE. `timeout` is the fact; retrying, salvaging or giving
+        up is the choice that followed. Collapsing them loses that a retry which worked and a
+        retry which gave up began identically -- and encourages "timeout therefore retry",
+        which is a reflex rather than a policy.
+
+        `origin` names the clock: `per_turn` is this branch's own budget
+        (`per_turn_timeout_s`, 240s by default); `socket_turn` is the driver's much longer
+        bound (SOCKET_TURN_TIMEOUT_S, 1200s). Without it an inner overrun reads as an outer
+        one, which is the distinction deepseek-harness's timeout-policy scopes its inner timer
+        for.
+
+        Never raises: this is telemetry beside a failure path, and a failure path that can
+        fail again is worse than no record.
+        """
+        try:
+            self._tx.metric(self.turn, "timeout", elapsed_s, origin=origin,
+                            budget_s=self.per_turn_timeout_s, treatment=treatment,
+                            transient=getattr(self, "transient", 0), observed=True)
+        except Exception:
+            pass
+
     def _capture_url(self):
         # A SOCKET WORKER HAS NO PAGE, AND USED TO LEAVE NO WAY BACK.
         #
@@ -5183,14 +5207,23 @@ class RelayWorker:
         if self.status == "waiting":
             self._capture_url()
             if time.time() - self._t_send > self.per_turn_timeout_s:
+                # A MEASUREMENT, NOT A GUESS -- and recorded apart from the guesses.
+                # turn_outcome classifies THROTTLE/RECYCLE/TRANSIENT from what the upstream
+                # SAID; this is our own clock passing our own budget. A rate computed over
+                # both cannot say whether the upstream is degrading or our budget is wrong.
+                _elapsed = round(time.time() - self._t_send, 1)
+                _origin = ("socket_turn" if getattr(self, "socket", False) else "per_turn")
                 # a turn that never finished is a transient stall -- retry before STUCK
                 if self._retry_transient():
+                    self._note_timeout(_origin, _elapsed, "retry")
                     self.reason = "turn timeout -> retry %d/%d" % (self.transient, self.max_transient)
                     return False
                 # retries exhausted: don't give up on an already-correct artifact -- if the
                 # workspace already passes the acceptance checks, salvage it as DONE+verified.
                 if self._salvage_via_checks():
+                    self._note_timeout(_origin, _elapsed, "salvaged")
                     return True
+                self._note_timeout(_origin, _elapsed, "stuck")
                 self.status, self.outcome, self.reason = "stuck", "STUCK", \
                     "turn timeout (after %d retries)" % self.transient
                 return True
