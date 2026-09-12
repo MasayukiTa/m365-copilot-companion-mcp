@@ -254,7 +254,7 @@ def _summary(results_path, insts):
     d = load_results(results_path)
     sub = {i: d[i] for i in insts if i in d}
     n = len(sub)
-    resolved = sum(1 for r in sub.values() if r.get("verdict") == "RESOLVED")
+    resolved = sum(1 for r in sub.values() if _V.is_resolved(r.get("verdict")))
     notr = sum(1 for r in sub.values() if r.get("verdict") == "not")
     # EVERY non-measurement, named. Counting only EVALERR left NOPATCH invisible: the rows
     # were correctly kept out of `graded`, and a reader had no way to see they existed.
