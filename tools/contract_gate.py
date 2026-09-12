@@ -837,15 +837,26 @@ def check_op(op_class: str, detail: str = "") -> Optional[str]:
         # The semantics are task_router.job_gate's, deliberately, so one word means one thing
         # on both paths:
         #
-        #   bypass   proceed; ask nobody
-        #   auto     the deterministic classifier decides -- a STOP pattern is REFUSED
-        #            outright (stricter than asking), an ASK pattern still goes to a human,
-        #            anything else proceeds
+        #   bypass   proceed; ask nobody -- the mode for discarding the list entirely
+        #   auto     ESCALATE ONLY: a STOP-pattern detail is refused outright instead of being
+        #            put to a human who could approve it; everything else on the list still
+        #            asks
         #   default  every occurrence asks a human
         #
-        # `auto` is therefore not a relaxation at the dangerous end: under `default` a
-        # STOP-pattern operation is put to a person who can approve it, and under `auto` it
-        # cannot be approved at all.
+        # `auto` DOES NOT DROP THE ask_before LIST, and the first version of it did. CI caught
+        # that: `activate_contract(ask_before=["delete"])` then `check_op("delete", "demo
+        # scratch file")` returned None, because the classifier read the detail text, found it
+        # innocuous, and allowed an operation the operator had explicitly asked to be shown.
+        #
+        # Approval fatigue -- the reason this mode exists -- lives in task_router's `default`,
+        # where EVERY first-seen job class asks, forever, with no list and no end. A contract's
+        # ask_before fires only while a contract is active and only for the handful of classes
+        # a person wrote down; it is short and deliberate. Fixing the first by discarding the
+        # second leaves no mode meaning "decide the routine things for me but keep the promises
+        # I made explicitly" -- and `bypass` already exists for those who want the list gone.
+        #
+        # So here `auto` is strictly at least as strict as `default`: it can refuse where
+        # `default` would have asked, and it never allows where `default` would have asked.
         #
         # NEITHER MODE TOUCHES THE STOP_WHEN BRANCH ABOVE, which is an always-on hard stop
         # that engages the fleet kill-switch, and external Skill trust keeps its own
@@ -858,18 +869,14 @@ def check_op(op_class: str, detail: str = "") -> Optional[str]:
             mode = "default"
         if mode == "bypass":
             return None
-        if mode == "auto":
-            verdict = _auto_verdict(detail)
-            if verdict == "stop":
-                return (
-                    f"[自動判定で拒否 / Refused by the automatic classifier] op_class={op_class!r} "
-                    f"の内容が禁止パターンに一致したため実行しません。承認モードを『確認』に"
-                    f"変更すれば人間が判断できます。"
-                    f" / op_class={op_class!r} matched a prohibited pattern and was not executed. "
-                    f"Switch the approval mode to manual confirmation to have a human decide."
-                )
-            if verdict != "ask":
-                return None
+        if mode == "auto" and _auto_verdict(detail) == "stop":
+            return (
+                f"[自動判定で拒否 / Refused by the automatic classifier] op_class={op_class!r} "
+                f"の内容が禁止パターンに一致したため実行しません。承認モードを『毎回確認』に"
+                f"変更すれば人間が判断できます。"
+                f" / op_class={op_class!r} matched a prohibited pattern and was not executed. "
+                f"Switch the approval mode to manual confirmation to have a human decide."
+            )
         token = _stable_token(op_class, detail)
         existing = _find_existing_gate(token)
 
