@@ -47,6 +47,8 @@ import sys
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
 OUT = os.path.join(REPO, ".fleet", "diag")
 CDP = os.environ.get("SERIES_CDP_URL", "http://127.0.0.1:9224")
 
@@ -60,9 +62,10 @@ def rebuild(events):
     """A fresh browser, or the reason there is not one. Cold means cold."""
     script = os.path.join(REPO, "scripts", "start_eval_edge.ps1")
     port = CDP.rsplit(":", 1)[-1].split("/")[0]
-    p = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                        "-File", script, "-Port", str(port)],
-                       cwd=REPO, capture_output=True, text=True, timeout=180)
+    from tools.childproc import run as _run_child
+    p = _run_child(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                    "-File", script, "-Port", str(port)],
+                   cwd=REPO, timeout=180)
     if p.returncode != 0:
         return "rebuild exited %d: %s" % (p.returncode, (p.stdout or "").strip()[-160:])
     _stamp(events, "browser_rebuilt")

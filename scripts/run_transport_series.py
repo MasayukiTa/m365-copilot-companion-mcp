@@ -322,10 +322,11 @@ def rebuild_browser() -> str:
         return "start_eval_edge.ps1 is missing"
     port = CONFIG["cdp_url"].rsplit(":", 1)[-1].split("/")[0]
     try:
-        proc = subprocess.run(
+        from tools.childproc import run as _run_child
+        proc = _run_child(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script,
              "-Port", str(port)],
-            cwd=REPO, capture_output=True, text=True, timeout=120)
+            cwd=REPO, timeout=120)
     except Exception as exc:
         return "rebuild raised %s" % type(exc).__name__
     if proc.returncode != 0:

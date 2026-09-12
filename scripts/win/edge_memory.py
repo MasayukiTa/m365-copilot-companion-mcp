@@ -28,7 +28,13 @@ figure, and it joins to Win32_Process on IDProcess so each byte can be attribute
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
+
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
 
 #: One PowerShell call for both classes, joined on the process id. Two calls would sample the
 #: machine at two different moments and attribute a process that started in between to nothing.
@@ -54,8 +60,8 @@ $out | ConvertTo-Json -Compress -Depth 3
 
 def _rows(timeout=60):
     try:
-        raw = subprocess.run(["powershell", "-NoProfile", "-Command", _PS],
-                             capture_output=True, text=True, timeout=timeout).stdout
+        from tools.childproc import run as _run_child
+        raw = _run_child(["powershell", "-NoProfile", "-Command", _PS], timeout=timeout).stdout
         data = json.loads(raw) if (raw or "").strip() else []
     except Exception:
         return []

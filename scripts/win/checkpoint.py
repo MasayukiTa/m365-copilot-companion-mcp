@@ -28,8 +28,10 @@ MANAGED = ("copilot-companion-edge", "copilot-bridge-edge", "copilot-eval-edge")
 
 def _ps(script, timeout=40):
     try:
-        return subprocess.run(["powershell", "-NoProfile", "-Command", script],
-                              capture_output=True, text=True, timeout=timeout).stdout
+        sys.path.insert(0, REPO)
+        from tools.childproc import run as _run_child
+        return _run_child(["powershell", "-NoProfile", "-Command", script],
+                          timeout=timeout).stdout
     except Exception:
         return ""
 

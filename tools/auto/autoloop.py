@@ -324,8 +324,8 @@ def _read_runlog(run_id, root=None):
 
 def _git(args, repo):
     try:
-        out = subprocess.run(["git"] + args, cwd=repo, capture_output=True, text=True,
-                             timeout=120)
+        from tools.childproc import run as _run_child
+        out = _run_child(["git"] + args, cwd=repo, timeout=120)
         return out.returncode, (out.stdout or "") + (out.stderr or "")
     except Exception as exc:
         return 1, str(exc)

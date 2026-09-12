@@ -89,16 +89,16 @@ GOALS = [
 #: goal set nobody could look at.
 def _code_revision():
     """HEAD's short hash plus a dirty marker, or "" if git cannot answer. Never raises."""
-    import subprocess
+    from tools.childproc import run as _run_child
     try:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        rev = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=root,
-                             capture_output=True, text=True, timeout=15)
+        rev = _run_child(["git", "rev-parse", "--short", "HEAD"], cwd=root, timeout=15)
         if rev.returncode != 0:
             return ""
         head = (rev.stdout or "").strip()
-        st = subprocess.run(["git", "status", "--porcelain"], cwd=root,
-                            capture_output=True, text=True, timeout=20)
+        # A dirty path with a Japanese name is ordinary here; losing the whole listing
+        # to the code page would read as "clean" and mislabel a dirty run as reproducible.
+        st = _run_child(["git", "status", "--porcelain"], cwd=root, timeout=20)
         dirty = bool((st.stdout or "").strip()) if st.returncode == 0 else True
         return head + ("+dirty" if dirty else "")
     except Exception:
