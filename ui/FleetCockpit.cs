@@ -715,7 +715,10 @@ class CockpitWindow : Window
     // For work whose SIZE is the problem: a goal that cannot fit in one conversation fails at
     // the conversation, not at the work. Off by default -- a goal that fits should not pay for
     // a split turn and a merge turn. Toggled with /fanout on|off, like /effort and /approval.
-    bool _fanout = false;      // -> settings.txt fanout=
+    // ON, matching relay.fleet_runner's own default since 2026-09-13. Every goal is still
+    // judged separately (offline triage, then the agent, which may answer NO_SPLIT), so a goal
+    // that fits costs nothing; this only decides whether the question is ever asked.
+    bool _fanout = true;       // -> settings.txt fanout=
     string _approval = "run";  // approval mode run|plan|auto -> settings.txt approval=
     bool _paused = false;      // local fleet pause/resume toggle state (NEW)
     // FIX B: optimistic "stopping" state set the instant Stop is clicked (dims non-terminal cards +
@@ -4677,7 +4680,11 @@ class CockpitWindow : Window
         psi.Arguments = "-m relay.fleet_runner --goals-file \"" + goalsFile + "\""
                         + " --state-dir \"" + stateDir + "\" --effort " + _effort;
         if (planMode) psi.Arguments += " --plan";
-        if (_fanout) psi.Arguments += " --fanout";
+        // BOTH VALUES ARE SAID OUT LOUD. This used to append "--fanout" when on and nothing
+        // when off -- and once the runner's default became true, saying nothing meant ON, so
+        // a person who typed /fanout off got fan-out anyway while the cockpit reported OFF.
+        // A boolean expressed by the presence of a flag can only state one of its two values.
+        psi.Arguments += _fanout ? " --fanout" : " --no-fanout";
         psi.WorkingDirectory = repo;
         psi.UseShellExecute = false;
         psi.CreateNoWindow = true;
@@ -4738,7 +4745,12 @@ class CockpitWindow : Window
         var psi = new System.Diagnostics.ProcessStartInfo();
         psi.FileName = py;
         psi.Arguments = "-m relay.fleet_runner --resume"
-                        + " --state-dir \"" + stateDir + "\" --effort " + _effort;
+                        + " --state-dir \"" + stateDir + "\" --effort " + _effort
+                        // RESUME NEVER CARRIED THIS AT ALL, so the setting was ignored on the
+                        // resume path in BOTH directions -- off before the runner's default
+                        // flipped, on after. A resumed run is the same run; it gets the same
+                        // answer the operator gave, said explicitly for the reason above.
+                        + (_fanout ? " --fanout" : " --no-fanout");
         psi.WorkingDirectory = repo;
         psi.UseShellExecute = false;
         psi.CreateNoWindow = true;

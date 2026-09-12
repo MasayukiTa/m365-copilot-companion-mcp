@@ -93,8 +93,14 @@ def test_the_procedure_comes_before_the_instruction_to_split():
 
 
 def test_an_ordinary_worker_is_unchanged():
-    """The non-fan-out path already carried the procedure and must keep doing so."""
-    w = F.RelayWorker(MAIL_GOAL, "w0")
+    """The non-fan-out path already carried the procedure and must keep doing so.
+
+    `fanout=False` IS NOW SAID OUT LOUD. It used to be the parameter's default, so omitting it
+    meant "ordinary"; since 2026-09-13 the capability defaults on and omitting it means
+    "capable, ask the judge". The test is about the worker that is NOT splitting, so it has to
+    name that now.
+    """
+    w = F.RelayWorker(MAIL_GOAL, "w0", fanout=False)
     assert w.fanout is False
     assert "MARKER-SLICING-RULE" in w.job
 

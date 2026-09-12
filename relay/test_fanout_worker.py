@@ -69,7 +69,7 @@ def test_a_split_spawns_the_children_and_ENDS_the_parent():
     """The parent must let go of its slot. Parked until its children finish, with a
     concurrency cap below the number of children, it waits for children that cannot start."""
     got = []
-    w = _worker(spawn=lambda goal, kids: got.append((goal, kids)))
+    w = _worker(spawn=lambda goal, kids, parent_checks=None, parent_partial='': got.append((goal, kids)))
     w._decide(SPLIT_REPLY)
 
     assert len(got) == 1
@@ -83,7 +83,7 @@ def test_a_split_spawns_the_children_and_ENDS_the_parent():
 
 def test_the_children_carry_the_parents_goal_and_their_own_slice():
     got = []
-    w = _worker(spawn=lambda goal, kids: got.append(kids))
+    w = _worker(spawn=lambda goal, kids, parent_checks=None, parent_partial='': got.append(kids))
     w._decide(SPLIT_REPLY)
     kids = got[0]
     assert all(w.goal in k["text"] for k in kids)
@@ -97,7 +97,7 @@ def test_a_split_reply_is_not_accepted_as_a_finished_task():
     the work would be filed as the work."""
     reply = SPLIT_REPLY + "\nDONE"
     got = []
-    w = _worker(spawn=lambda goal, kids: got.append(kids))
+    w = _worker(spawn=lambda goal, kids, parent_checks=None, parent_partial='': got.append(kids))
     w._decide(reply)
     assert w.outcome == "FANOUT"
     assert len(got) == 1
@@ -105,7 +105,7 @@ def test_a_split_reply_is_not_accepted_as_a_finished_task():
 
 def test_an_unusable_split_falls_back_to_doing_the_work_here():
     """Refusing to proceed would strand the goal because the agent divided it badly."""
-    w = _worker(spawn=lambda goal, kids: pytest.fail("must not spawn"))
+    w = _worker(spawn=lambda goal, kids, parent_checks=None, parent_partial='': pytest.fail("must not spawn"))
     w._decide("1. 全部やる\n%s" % fo.SUBTASKS_READY)
     assert w.status not in rf.TERMINAL
     assert w.fanout is False
@@ -114,7 +114,7 @@ def test_an_unusable_split_falls_back_to_doing_the_work_here():
 
 def test_a_reply_without_the_marker_is_asked_for_the_marker():
     """Without it there is nothing to tell a finished list from a half-written one."""
-    w = _worker(spawn=lambda goal, kids: pytest.fail("must not spawn"))
+    w = _worker(spawn=lambda goal, kids, parent_checks=None, parent_partial='': pytest.fail("must not spawn"))
     w._decide("分割案を検討しています。1. 1月分\n2. 2月分")
     assert w.status == "ready"
     assert fo.SUBTASKS_READY in w.job
@@ -123,7 +123,7 @@ def test_a_reply_without_the_marker_is_asked_for_the_marker():
 def test_the_split_happens_once():
     """A second split reply must not produce a second family."""
     got = []
-    w = _worker(spawn=lambda goal, kids: got.append(kids))
+    w = _worker(spawn=lambda goal, kids, parent_checks=None, parent_partial='': got.append(kids))
     w._decide(SPLIT_REPLY)
     w.status = "waiting"          # pretend the fleet revived it
     w._decide(SPLIT_REPLY)

@@ -2030,7 +2030,7 @@ class RelayWorker:
                  max_transient=10, transcript_dir=None, run_id="", busy_writer=None,
                  max_research=3, contract_budget=None, max_continue=6,
                  resilience_profile="off", max_fresh_replays=0,
-                 fanout=False, spawn_fn=None):
+                 fanout=True, spawn_fn=None):
         self.page = None
         self.drv = None
         #: True while this worker is talking over a socket instead of holding a tab. It still
@@ -2326,9 +2326,16 @@ class RelayWorker:
         if fanout and _depth0:
             try:
                 _v = _splittability.judge(self.goal)
-                _goal_splittable = _v.should_split
-                self._split_reason = "%s: %s" % (getattr(_v, "decision", "?"),
-                                                 (getattr(_v, "reason", "") or "")[:200])
+                # TRIAGE, NOT VERDICT. The offline rules decide whether one turn is worth
+                # spending on the question; the agent -- which can read the goal -- decides
+                # whether to split, and may answer NO_SPLIT. UNCERTAIN means the rules say
+                # they cannot tell, and `should_split` used to resolve that silently to "no":
+                # a regex heuristic settling a question it documents itself as unable to
+                # settle. It is asked now. NO_SPLIT still costs nothing, which is what keeps
+                # the default-on capability free for goals that fit.
+                _d = getattr(_v, "decision", "?")
+                _goal_splittable = bool(_v.should_split) or _d == _splittability.UNCERTAIN
+                self._split_reason = "%s: %s" % (_d, (getattr(_v, "reason", "") or "")[:200])
             except Exception as _exc:
                 _goal_splittable = False
                 self._split_reason = "judge failed (%s); failure is not permission" % type(_exc).__name__
@@ -2337,7 +2344,17 @@ class RelayWorker:
         else:
             self._split_reason = "the run was not launched fan-out-capable"
         self.fanout = bool(fanout) and _depth0 and _goal_splittable
+        # KEPT SEPARATELY FROM THE VERDICT. `self.fanout` is the answer to "should this goal
+        # split", taken before the work started; this is the answer to "is splitting even
+        # possible here", which no later evidence can change. A mid-run split needs the second
+        # and must not be blocked by the first -- the whole point is that the first was made
+        # when nothing was known.
+        self._fanout_capable = bool(fanout) and _depth0 and self._spawn_fn is not None
         self._fanout_done = False
+        #: A mid-run split is offered ONCE. A second refusal is the agent telling us the
+        #: same thing twice, and asking again would spend the remaining turns on the question
+        #: instead of on the work.
+        self._midrun_split_asked = False
         if self.fanout:
             # Turn 1 asks for the split instead of the work. The goal still travels in full,
             # because the split has to be made against the real instructions -- an agent
@@ -4088,6 +4105,20 @@ class RelayWorker:
         norm = _norm_for_progress(resp)
         self.no_progress = self.no_progress + 1 if norm and norm == self.last_norm else 0
         self.last_norm = norm
+        # A CONTROL INPUT THAT LEFT NO RECORD. This counter ends a dead endpoint early
+        # (NET_RETRY_NOPROGRESS_MAX, below) and nothing in .fleet ever said how often it rose
+        # or how far -- so "does this signal see the stalls that happen" could only be answered
+        # by reprocessing transcripts, and not at all once retention has pruned them.
+        #
+        # Recorded only on a repeat, not every turn: a row per turn saying "no repeat" is the
+        # denominator of a question nobody asked, and the turn count is already in the
+        # transcript.
+        if self.no_progress:
+            try:
+                self._tx.metric(self.turn, "reply_repeat", self.no_progress,
+                                chars=len(resp or ""), observed=True)
+            except Exception:
+                pass
         up = resp.upper()
         last_line = (resp.strip().splitlines() or [""])[-1].upper()
         # GOAL-DELIVERY recovery (additive, exception-safe): if the agent says it never
@@ -4222,16 +4253,50 @@ class RelayWorker:
         # ends in SUBTASKS_READY and describes work rather than reporting it, and letting the
         # DONE branch see it first would accept a list of intentions as a finished task.
         if self.fanout and not self._fanout_done:
+            if fanout_mod.declined_split(resp):
+                # THE AGENT IS THE JUDGE FOR THIS BAND AND IT SAID NO. Read as a malformed
+                # split (which is what happened before the marker existed -- a decline has no
+                # numbered list, so `subtasks_from` returns []) this would be recorded as
+                # 「分割案が使えなかった」: the same work, the opposite meaning, and a
+                # deliberate refusal counted as a parse failure in the telemetry.
+                self._fanout_done = True
+                self.fanout = False
+                self.job = self._task_anchor(
+                    "分割しない判断を受け取りました。上記の目標をこの会話で直接実行してください。"
+                    "完了したら DONE、無理なら FAIL と理由を書いてください。")
+                self.status = "ready"
+                self.reason = "エージェントが分割不要と判断（単独実行）"
+                try:
+                    self._tx.metric(self.turn, "fanout_declined", 1,
+                                    triage=self._split_reason, observed=True)
+                except Exception:
+                    pass
+                return
             if fanout_mod.fanout_ready(resp):
                 self._fanout_done = True
                 steps = fanout_mod.subtasks_from(resp)
                 kids = (fanout_mod.child_goals(
                     self.goal, steps,
                     parent_task_id=getattr(self.task_envelope, "task_id", "") or "",
-                    checks=getattr(self, "checks", None) or None,
                     cwd=getattr(self, "cwd", None)) if steps else [])
                 if kids and self._spawn_fn:
-                    self._spawn_fn(self.goal, kids)
+                    # THE PARENT'S CHECK GOES TO THE MERGE, NOT ONTO EVERY CHILD. It used to
+                    # ride in child_goals(checks=...) and land identically on all of them, so
+                    # each slice was gated on the whole goal while being told not to touch the
+                    # other slices. The merge is the parent goal finishing, in the parent's
+                    # cwd; that is the worker the question belongs to.
+                    # A MID-RUN SPLIT HAS A PARENT THAT ALREADY DID WORK, and ending it
+                    # FANOUT drops everything it produced: the merge reads child records
+                    # only. Carried so the mechanism meant to rescue a long-running goal does
+                    # not destroy the part of it that was finished. Empty for a turn-1 split,
+                    # where there is nothing yet.
+                    _partial = ""
+                    if self._midrun_split_asked:
+                        _partial = (getattr(self, "display_result", "")
+                                    or self.last_response or "")[:4000]
+                    self._spawn_fn(self.goal, kids,
+                                   parent_checks=getattr(self, "checks", None) or None,
+                                   parent_partial=_partial)
                     # SPLITTING ENDS THIS WORKER. A parent parked until its children finish
                     # holds an admission slot the whole time, and with a concurrency cap
                     # below the number of children that is a deadlock -- the parent waits
@@ -4268,7 +4333,7 @@ class RelayWorker:
             self.status = "ready"
             return
         if "DONE" in up and "FAIL" not in last_line:
-            self._on_done_claimed()
+            self._on_done_claimed(resp)
             return
         if self.no_progress >= self.max_no_progress:
             if self._salvage_via_checks():
@@ -4317,6 +4382,15 @@ class RelayWorker:
             if self._continue_count >= self.max_continue:
                 if self._salvage_via_checks():
                     return
+                # SIX REPLIES THAT KEPT GOING AND NEVER FINISHED. That is not a stalled
+                # worker -- `no_progress` is the counter for repetition, and it is separate --
+                # it is a goal that does not fit in one conversation, which is the condition
+                # fan-out exists for, arriving as evidence instead of as a guess about the
+                # goal's text. The split decision was previously fixed in __init__ from an
+                # offline reading of that text and could never be revised by the one party
+                # doing the work.
+                if self._ask_for_a_midrun_split():
+                    return
                 self.status, self.outcome = "stuck", "STUCK"
                 self.reason = ("no DONE after %d continue nudges (stopped to avoid degrading "
                                "the model)" % self._continue_count)
@@ -4324,11 +4398,56 @@ class RelayWorker:
             self.job = self._task_anchor(_continue_nudge(self._continue_count))
         self.status = "ready"
 
-    def _on_done_claimed(self):
+    def _ask_for_a_midrun_split(self) -> bool:
+        """Offer a split to a worker that has run long without finishing. True if asked.
+
+        Returns False -- leaving the caller's STUCK path exactly as it was -- whenever any
+        precondition is missing, so this can only ever add a rescue, never remove the
+        existing ending.
+
+        WHY THIS AND NOT `no_progress`: no_progress trips on a VERBATIM-identical reply,
+        which is a stuck conversation and a split will not help it. `max_continue` trips on
+        replies that are each different and each still going. Only the second is the shape
+        fan-out addresses.
+        """
+        if self._midrun_split_asked or self._fanout_done:
+            return False
+        if not getattr(self, "_fanout_capable", False):
+            # Either the run is not fan-out-capable, or this worker IS a child. A child that
+            # splits makes grandchildren, and MAX_DEPTH forbids that for good reason.
+            return False
+        self._midrun_split_asked = True
+        # The __init__ verdict is deliberately overridden: it was made before the work began,
+        # and six unfinished turns is better evidence than the goal's length. The agent can
+        # still decline -- `declined_split` is checked on the way back -- and a decline lands
+        # in the normal "carry on in this conversation" path.
+        self.fanout = True
+        self._fanout_done = False
+        self._continue_count = 0
+        self.job = self._task_anchor(fanout_mod.midrun_split_job(self.max_continue))
+        self.status = "ready"
+        self.reason = "%d ターン完了せず -> 残作業の分割を打診" % self.max_continue
+        try:
+            self._tx.metric(self.turn, "fanout_midrun_offer", 1,
+                            continues=self.max_continue,
+                            initial_verdict=self._split_reason, observed=True)
+        except Exception:
+            pass
+        return True
+
+    def _on_done_claimed(self, resp=None):
         """Copilot reported DONE. With no acceptance checks, go straight to the candidate-
         done step (back-compat trust, unless a refuter is on). With checks, run the
-        verification gate first."""
+        verification gate first.
+
+        `resp` IS THE CLAIM ITSELF, and a reply_contains check is a question about it -- "does
+        this report name the slices it could not get". It was a local variable in the caller
+        and went out of scope here, so the gate had nothing to read. Default None keeps every
+        other caller working and means "no reply captured", which _eval_reply fails on rather
+        than passing: not asking is not the same as being answered.
+        """
         self._continue_count = 0   # a DONE claim is real progress -> the continue streak resets
+        self._done_reply = resp or ""
         if not self.checks:
             # NOT self.verified = False. __init__'s own comment declares the contract:
             # "None=not checked, True/False after a gate ran" -- and no gate ran here, only
@@ -4362,7 +4481,8 @@ class RelayWorker:
             self._verified_tree = self._tree_hash_now()
             self._candidate_done()
             return
-        self._active_check = Check(self._pending_checks[0], cwd=self.cwd).start()
+        self._active_check = Check(self._pending_checks[0], cwd=self.cwd,
+                                   reply=getattr(self, "_done_reply", None)).start()
 
     #: Skip the refuter when the machine checks already settled it. OFF by default: while the
     #: shadow numbers are being collected, "we stopped asking" and "there was nothing to ask
@@ -5619,6 +5739,52 @@ def _resolve_review_lenses(review_lenses):
     return list(PANEL_LENSES[:n])
 
 
+def _campaigns_from_disk(transcript_dir):
+    """Families split by an earlier run, so a restart can still assemble them.
+
+    THE CASE THE LEDGER WAS WRITTEN FOR, AND THE ONE IT DID NOT COVER. On FleetContextLost the
+    fleet re-enters run_relay_fleet in a fresh process; `_unfinished()` rebuilds individual
+    goals, never families. A campaign split before the crash therefore lost its parent goal,
+    its child count, its cwd -- and now its acceptance checks and the parent's pre-split work,
+    which exist nowhere else once the process is gone. Its children could all finish and the
+    answer they were collected for would never be assembled, silently.
+
+    `fanout.campaigns_from_ledger` was written for exactly this and nothing called it: the
+    repository's unreached inventory has listed it as tested-but-unreached since 2026-08-28.
+
+    Families already merged are dropped here rather than in the merge loop, so a rehydrated run
+    does not re-deliver an answer the operator already has. A family whose children are not in
+    this run is harmless either way -- `_recs` comes out empty and `ready_to_aggregate` answers
+    False for empty on purpose -- but it is carried, because those children may be re-queued by
+    `_unfinished()` in this very run and then it IS the family they belong to.
+
+    Never raises. A ledger that cannot be read leaves the fleet exactly as it was before this
+    function existed, which is a bad state to be in but not a worse one.
+    """
+    if not transcript_dir:
+        return {}
+    path = os.path.join(os.path.dirname(transcript_dir), "campaigns.jsonl")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            fams = fanout_mod.campaigns_from_ledger(fh)
+    except OSError:
+        return {}
+    out = {}
+    for cid, fam in (fams or {}).items():
+        if fam.get("merged"):
+            continue
+        out[cid] = {"goal": fam.get("goal") or "", "n": int(fam.get("n") or 0),
+                    "merged": False, "cwd": fam.get("cwd"),
+                    "checks": list(fam.get("checks") or []),
+                    "partial": fam.get("partial") or ""}
+    if out:
+        print("[fanout] rehydrated %d unmerged campaign(s) from the ledger" % len(out),
+              flush=True)
+    return out
+
+
 def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     notify=default_notify, on_tick=None, max_concurrent=None,
                     mc_box=None, add_box=None, refuter=False, max_refute=None,
@@ -5630,7 +5796,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     ram_box=None,
                     transcript_dir=None, run_id="", busy_writer=None,
                      pause_box=None, stop_box=None, resilience_profile="off",
-                     max_fresh_replays=0, fanout=False):
+                     max_fresh_replays=0, fanout=True):
     """Drive len(goals) autonomous relays in parallel to completion, but never with
     more than `max_concurrent` tabs open at once (defaults to what free RAM allows).
     A goal's tab is opened only when a slot frees and CLOSED the moment it finishes.
@@ -5769,17 +5935,131 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
 
     # FAN-OUT bookkeeping. campaigns[cid] remembers the parent goal a family was split from,
     # which is the one thing the merge needs that the children do not carry themselves.
-    campaigns = {}
+    campaigns = _campaigns_from_disk(transcript_dir)
 
-    def _spawn_children(parent_goal, kids):
-        """Queue a split parent's children and remember the family."""
+    def _note_merged(cid):
+        """Record on disk that this family has been assembled.
+
+        The counterpart of the header line. Without it the ledger can say a campaign was split
+        but not that it was finished, so a run rebuilt from the file would queue every past
+        merge again. Best-effort: failing to write it costs a duplicate merge after a crash,
+        while refusing to merge because the note could not be written costs the answer itself.
+        """
+        if not transcript_dir:
+            return
+        try:
+            with open(os.path.join(os.path.dirname(transcript_dir), "campaigns.jsonl"),
+                      "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"kind": "merged", "campaign_id": cid},
+                                    ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+
+    def _campaign_already_on_disk(cid):
+        """Whether this campaign was split by an EARLIER run.
+
+        `campaigns` above is per-process and starts empty, so it cannot answer this -- and a
+        resumed goal hashes to the same id, reaches _spawn_children, finds nothing in the dict
+        and splits again. The ledger is the only thing that outlives the run.
+
+        Reads the header lines only: a child row proves children were queued, while the header
+        proves a FAMILY was declared, which is what "already split" means here.
+
+        A MERGED FAMILY DOES NOT COUNT, and that is not a detail. `campaign_id_for` hashes the
+        goal TEXT, which is an input and not an execution identity -- yesterday's "update the
+        dependencies and run the tests" and today's are the same id. Without this, the guard
+        written to stop a duplicate split would instead adopt the FINISHED family and queue
+        nothing, so a deliberate re-run of a completed goal would silently do nothing at all.
+        A campaign that has been merged is over; only an unfinished one can be resumed.
+
+        STILL OPEN, RECORDED RATHER THAN PAPERED OVER: an UNMERGED abandoned campaign does
+        suppress a fresh run of the same text. Telling "resume this execution" from "run this
+        goal again" needs a persisted execution id, which a content hash is not.
+
+        Never raises. A ledger that cannot be read is not permission to duplicate, so an
+        unreadable one answers True -- refusing to split twice is recoverable (a person
+        re-queues), splitting twice is what this exists to stop.
+        """
+        if not transcript_dir:
+            return False
+        path = os.path.join(os.path.dirname(transcript_dir), "campaigns.jsonl")
+        if not os.path.isfile(path):
+            return False
+        seen = False
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or '"kind"' not in line or cid not in line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    if not isinstance(row, dict) or row.get("campaign_id") != cid:
+                        continue
+                    if row.get("kind") == "campaign":
+                        seen = True
+                    elif row.get("kind") == "merged":
+                        # Finished, so this id describes a past execution and not one to join.
+                        # Scanned to the end rather than returned from early: the note can be
+                        # written before the header when two runs append concurrently.
+                        return False
+        except OSError:
+            return True
+        return seen
+
+    def _spawn_children(parent_goal, kids, parent_checks=None, parent_partial=""):
+        """Queue a split parent's children and remember the family. Idempotent per campaign.
+
+        THE ID WAS ALREADY STABLE AND NOTHING USED THAT. `campaign_id_for` hashes the parent
+        goal precisely so a resumed goal lands in the same family -- and this function then
+        overwrote `campaigns[cid]` and re-queued every child, so landing in the same family
+        meant re-creating it rather than joining it.
+
+        Measured 2026-09-13 in `.fleet/campaigns.jsonl`: ten campaigns had their header written
+        more than once, fifteen carry a repeated `subtask_index`, and c7e01b58b1956 holds 22
+        headers and 128 children for a seven-way split.
+
+        `self._fanout_done` does not cover this. It stops ONE WORKER splitting twice; it says
+        nothing about a second worker, a resumed run, or a retried goal, because `campaigns` is
+        local to this call of run_relay_fleet and starts empty each time.
+        """
         cid = kids[0].get("campaign_id") or fanout_mod.campaign_id_for(parent_goal)
+        if cid in campaigns:
+            # ALREADY SPLIT IN THIS RUN. Re-queueing would duplicate the children and move the
+            # merge's denominator, so the merge would wait for a family larger than the one
+            # that exists.
+            print("[fanout] %s: already split in this run (%d children); not re-queueing"
+                  % (cid, campaigns[cid].get("n", 0)), flush=True)
+            return
+        if _campaign_already_on_disk(cid):
+            # ALREADY SPLIT IN AN EARLIER RUN. The ledger outlives the process, and a resumed
+            # or retried goal reaches here with an empty `campaigns` dict -- which is how the
+            # same split came to be recorded twenty-two times. Adopt the family instead of
+            # minting it again: the children are already queued or already done, and the merge
+            # reads the ledger, not this dict.
+            campaigns[cid] = {"goal": parent_goal, "n": len(kids), "merged": False,
+                              "cwd": (kids[0] or {}).get("cwd"),
+                              "checks": list(parent_checks or []),
+                              "partial": parent_partial or ""}
+            print("[fanout] %s: already split in an earlier run; adopting, not re-queueing"
+                  % cid, flush=True)
+            return
         # THE CHILDREN ALREADY CARRY THE PARENT'S cwd (child_goals puts it there), so the
         # merge takes it from them rather than from a second field that could drift. Without
         # it the merge starts wherever the fleet happens to be, while being asked to write a
         # combined file and report its path.
         campaigns[cid] = {"goal": parent_goal, "n": len(kids), "merged": False,
-                          "cwd": (kids[0] or {}).get("cwd")}
+                          "cwd": (kids[0] or {}).get("cwd"),
+                          # THE WHOLE GOAL'S ACCEPTANCE CHECK, PARKED UNTIL THE MERGE. The
+                          # children are each responsible for one slice and cannot answer it;
+                          # the merge can, and runs in the same tree.
+                          "checks": list(parent_checks or []),
+                          # WHAT THE PARENT HAD ALREADY FINISHED, when the split was decided
+                          # mid-run. Empty for a turn-1 split. Without it the rescue throws
+                          # away the work it was rescuing.
+                          "partial": parent_partial or ""}
         add_box.extend(kids)
         # WRITTEN DOWN, NOT ONLY QUEUED. add_box lives in memory: if the run dies here the
         # children vanish while the parent is already recorded finished, so the work would
@@ -5794,7 +6074,14 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     # cannot rebuild the thing it exists to preserve.
                     fh.write(json.dumps(
                         {"kind": "campaign", "campaign_id": cid, "goal": parent_goal,
-                         "n": len(kids), "cwd": (kids[0] or {}).get("cwd")},
+                         "n": len(kids), "cwd": (kids[0] or {}).get("cwd"),
+                         # ON DISK FOR THE SAME REASON THE GOAL IS. This file exists for the
+                         # run that dies after splitting; a family rebuilt from it without the
+                         # parent's check merges with nothing verifying it, and nothing says so.
+                         # The partial is here for the harder version of that: rebuilt without
+                         # it, work the parent actually finished is gone permanently.
+                         "checks": list(parent_checks or []),
+                         "partial": parent_partial or ""},
                         ensure_ascii=False) + "\n")
                     for k in kids:
                         fh.write(json.dumps(
@@ -5850,12 +6137,15 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             if len(_recs) < _camp.get("n", 0):
                 continue
             _camp["merged"] = True
+            _note_merged(_cid)
             # THE PARENT'S WORKING DIRECTORY GOES WITH IT. The children get it from
             # child_goals; the merge was starting wherever the fleet happened to be, while
             # being asked to write a combined file and report its path.
             add_box.append(fanout_mod.aggregation_goal(_camp["goal"], _recs,
                                                        campaign_id=_cid,
-                                                       cwd=_camp.get("cwd")))
+                                                       cwd=_camp.get("cwd"),
+                                                       parent_checks=_camp.get("checks"),
+                                                       parent_partial=_camp.get("partial")))
             queued += 1
             print("[fanout] %s: %d/%d subtask(s) done -> merging"
                   % (_cid, sum(1 for r in _recs if (r["outcome"] or "").upper() == "DONE"),
