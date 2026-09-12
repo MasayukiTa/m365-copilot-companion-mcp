@@ -1728,12 +1728,19 @@ def main():
                     help="per-goal retries for TRANSIENT failures (send/timeout/likely-"
                          "transient STUCK) before giving up, with backoff (default 10, "
                          "like Claude Code retrying a failed network request)")
-    ap.add_argument("--fanout", action="store_true",
-                    help="split each goal into independent sub-goals, run them in parallel, "
-                         "and merge the answers. For work whose SIZE is the problem: a goal "
-                         "that cannot fit in one conversation fails at the conversation, not "
-                         "at the work. Off by default -- a goal that fits should not pay for "
-                         "a split turn and a merge turn.")
+    # ON BY DEFAULT, AND THE OLD HELP TEXT CARRIED THE REASON IT WAS NOT. "a goal that fits
+    # should not pay for a split turn and a merge turn" was true while this flag WAS the
+    # decision. It is not any more: RelayWorker judges every goal separately
+    # (`self.fanout = bool(fanout) and _depth0 and _goal_splittable`), so a goal that fits is
+    # judged NO_SPLIT and pays nothing. The flag only decides whether the question is ever
+    # asked -- and off by default meant it was asked for nobody who did not know to opt in.
+    ap.add_argument("--fanout", action=argparse.BooleanOptionalAction, default=True,
+                    help="split a goal into independent sub-goals, run them in parallel, and "
+                         "merge the answers -- for work whose SIZE is the problem: a goal that "
+                         "cannot fit in one conversation fails at the conversation, not at the "
+                         "work. ON by default; each goal is still judged separately (offline "
+                         "triage, then the agent itself, which may answer NO_SPLIT), so a goal "
+                         "that fits costs nothing. --no-fanout disables the capability.")
     ap.add_argument("--refuter", action="store_true",
                     help="operator B: after a candidate DONE, an INDEPENDENT reviewer "
                          "(non-blocking side chat) tries to refute it before accepting. "

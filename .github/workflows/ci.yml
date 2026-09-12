@@ -100,6 +100,7 @@ jobs:
             scripts/test_check_no_identifying_names_metadata.py \
             scripts/test_check_integration_evidence.py \
             scripts/test_stale_server_check.py \
+            scripts/test_the_identity_guard_speaks_before_the_push.py \
             scripts/test_run_script_style_tests.py \
             tests/test_scroll_transcript.py \
             tests/test_golden.py \
@@ -107,6 +108,7 @@ jobs:
             tests/test_child_output_decoding.py \
             bench/test_capture_survives_a_non_cp932_patch.py \
             bench/test_a_partial_stage_is_not_a_lost_chunk.py \
+            bench/test_a_benchmark_episode_is_not_split.py \
             tests/test_grep_memory_bound.py \
             tests/test_bridge_answer_source.py \
             relay/test_sibling_edge_reset.py \
@@ -138,6 +140,7 @@ jobs:
             ui/test_deployed_cockpit_matches_its_source.py \
             ui/test_an_approval_button_always_moves_the_queue.py \
             ui/test_a_fleet_conversation_can_be_answered.py \
+            ui/test_a_setting_that_is_off_is_said_out_loud.py \
             ui/test_fleet_cockpit_health.py \
             ui/test_fleet_cockpit_card_menu.py \
             ui/test_fleet_cockpit_advanced_settings.py \
@@ -454,6 +457,11 @@ jobs:
             relay/test_live_record_isolation.py \
             relay/test_mechanism_telemetry.py \
             relay/test_a_measured_timeout_is_not_a_guess.py \
+            relay/test_the_repeat_signal_leaves_a_record.py \
+            relay/test_one_goal_splits_once.py \
+            relay/test_a_slice_is_not_judged_by_the_whole_goal.py \
+            relay/test_the_split_decision_can_be_revised.py \
+            relay/test_a_family_survives_the_process_that_split_it.py \
             relay/test_mechanism_records_name_their_run.py \
             relay/test_memory_dedupe.py \
             relay/test_fleet_reconcile.py \

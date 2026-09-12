@@ -112,11 +112,27 @@ def test_children_do_not_split_again():
                           depth=fo.MAX_DEPTH) == []
 
 
-def test_a_child_inherits_acceptance_checks_and_cwd():
-    kids = fo.child_goals("親", ["範囲A を取得する", "範囲B を取得する"],
-                          checks=[{"kind": "file"}], cwd="C:/x")
-    assert kids[0]["checks"] == [{"kind": "file"}]
+def test_a_child_inherits_the_cwd_but_NOT_the_whole_goals_check():
+    """子は作業ディレクトリを継ぐが、**親の受入検査は継がない**。
+
+    以前はこの検査が「継ぐこと」を要求していた。それが欠陥だった。計測(2026-09-13):
+    親の検査 `{"type":"pytest","args":"-q tests/"}` を3分割すると3子とも同一の検査を持ち、
+    一方で子のプロンプトは「他の範囲は別の会話が並行して担当しているので、手を出さないこと」
+    と指示している。厳しい検査なら兄弟が終わるまで永久に通らず、緩い検査(file_exists 等)なら
+    兄弟が作った成果物で**何もしていない子まで通る**（さらに `_salvage_via_checks` が
+    それを salvaged DONE に昇格させる）。
+
+    親の検査は「目標全体が成功したか」を問うもので、それに答えられるのは統合ワーカーだけ。
+    そこへ回す (aggregation_goal の parent_checks)。引数は残さず削除した -- 黙って無視すると
+    既存の呼び出し側は子が検証され続けていると思い込む。
+    """
+    kids = fo.child_goals("親", ["範囲A を取得する", "範囲B を取得する"], cwd="C:/x")
     assert kids[0]["cwd"] == "C:/x"
+    assert not kids[0].get("checks"), "子が全体目標の検査を背負っている"
+
+    with pytest.raises(TypeError):
+        fo.child_goals("親", ["範囲A を取得する", "範囲B を取得する"],
+                       checks=[{"type": "pytest"}])
 
 
 # ---- putting the answers back together ----------------------------------------------------

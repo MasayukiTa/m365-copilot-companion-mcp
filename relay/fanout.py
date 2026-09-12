@@ -55,6 +55,18 @@ MAX_DEPTH = 1
 #: fresh conversation -- which will not have seen the parent's reasoning -- could act on.
 MIN_STEP_CHARS = 8
 
+#: The agent's way of saying the goal should not be split at all.
+#:
+#: THE PROMPT USED TO DEMAND A SPLIT. It asked for 2〜12 subtasks and offered no other answer,
+#: so an agent handed one indivisible investigation had to invent a division or stall -- and
+#: both were observed. A judge with only one permitted verdict is not a judge.
+#:
+#: This is the live half of the splittability decision. relay/splittability.py is offline by
+#: construction ("It makes NO live model call") and returns UNCERTAIN when its rules cannot
+#: tell; `should_split` then read UNCERTAIN as "no". Now UNCERTAIN spends one turn asking the
+#: agent, which can read the goal, and this is how it answers.
+NO_SPLIT_MARKER = "NO_SPLIT"
+
 SPLIT_JOB = (
     "【この依頼は分割して並列実行します】\n"
     "上記の目標を、**互いに独立して実行できる**サブタスクに分割してください。実行はまだしないでください。\n"
@@ -65,8 +77,73 @@ SPLIT_JOB = (
     "「残りを続ける」のような相対的な指示は不可 — 実行する側は今の会話を見ていません）\n"
     "  4. サブタスク同士で重複も抜けも無いこと\n"
     "%d〜%d 個に分割し、番号付きの箇条書きで列挙してください。"
-    "最後の行に %s と書いてください。" % (MIN_CHILDREN, MAX_CHILDREN, SUBTASKS_READY)
+    "最後の行に %s と書いてください。\n"
+    "ただし、**分割すべきでないと判断したら分割しないでください。** 1つの調査を無理に割ると、"
+    "どの断片も全体の文脈を失って answerable でなくなります。分割しない場合は、理由を1行書いて"
+    "最後の行に %s とだけ書いてください（その場合はこの会話でそのまま実行してもらいます）。"
+    % (MIN_CHILDREN, MAX_CHILDREN, SUBTASKS_READY, NO_SPLIT_MARKER)
 )
+
+
+def declined_split(resp) -> bool:
+    """Did the agent answer that this goal should not be split?
+
+    Checked BEFORE `fanout_ready`, because a reply may mention both markers -- the prompt
+    names them together -- and a decline that is read as a ready split becomes an empty
+    subtask list, which is handled as a MALFORMED split rather than as the answer it is.
+    """
+    up = (resp or "").upper()
+    if NO_SPLIT_MARKER not in up:
+        return False
+    # `SUBTASKS_READY` does not contain `NO_SPLIT`, so there is no substring collision to
+    # unpick; what matters is only which marker the agent ENDED on. Last line wins, and a
+    # reply that names neither at the end falls back to "mentioned it at all".
+    for line in reversed([l.strip() for l in (resp or "").splitlines() if l.strip()]):
+        u = line.upper()
+        if SUBTASKS_READY in u:
+            return False
+        if NO_SPLIT_MARKER in u:
+            return True
+    return True
+
+
+#: The same request, asked after the work has started instead of before it.
+#:
+#: SEPARATE TEXT BECAUSE THE SITUATION IS DIFFERENT, not for variety. SPLIT_JOB opens with
+#: 「実行はまだしないでください」, which is wrong for an agent that has been executing for six
+#: turns, and it says nothing about what is already finished -- an agent told only "divide
+#: this goal" re-divides the part it has already done, and the children redo it.
+#:
+#: It also has to be honest that declining is still allowed. The trigger is evidence, not
+#: proof: a goal can run long for reasons a split does not fix, and an agent forced to split
+#: one indivisible investigation produces the shape measured in campaign c7e01b58b1956, where
+#: subtasks refused for want of the context the others held.
+MIDRUN_SPLIT_JOB = (
+    "【この作業を分割して並列実行に切り替えます】\n"
+    "この会話は %d 回続けて『作業中』のまま完了に届いていません。1つの会話に収まらない"
+    "分量である可能性が高いので、**残っている作業**を、互いに独立して実行できるサブタスクに"
+    "分割してください。ここから先の実行はまだしないでください。\n"
+    "重要:\n"
+    "  1. **すでに完了した分は含めないこと。** 何がどこまで終わったかを1〜2行で先に書いてから、"
+    "残りだけを分割してください（終わった分をもう一度やらせないため）\n"
+    "  2. 各サブタスクは、この会話を見ていない別の会話が単独で実行できること"
+    "（対象・期間・出力先を具体的に書く。「残りを続ける」は不可）\n"
+    "  3. サブタスク同士で重複も抜けも無いこと\n"
+    "%d〜%d 個に分割し、番号付きの箇条書きで列挙して、最後の行に %s と書いてください。\n"
+    "分割しても解決しない性質の作業だと判断した場合は、理由を1行書いて最後の行に %s と"
+    "だけ書いてください（その場合はこの会話でそのまま続行してもらいます）。"
+)
+
+
+def midrun_split_job(continues):
+    """MIDRUN_SPLIT_JOB with the observed continue count filled in.
+
+    The number is in the prompt because it is the EVIDENCE. "You have been going for six
+    turns without finishing" is a fact the agent can weigh against what it knows about the
+    remaining work; "please split this" is an instruction it can only obey.
+    """
+    return MIDRUN_SPLIT_JOB % (int(continues), MIN_CHILDREN, MAX_CHILDREN,
+                               SUBTASKS_READY, NO_SPLIT_MARKER)
 
 
 def fanout_ready(resp) -> bool:
@@ -112,8 +189,21 @@ def subtasks_from(resp):
 
 
 def child_goals(parent_goal, steps, *, parent_task_id="", campaign_id="", depth=0,
-                checks=None, cwd=None):
+                cwd=None):
     """Turn the accepted steps into goal items the fleet can admit.
+
+    NO `checks` PARAMETER, AND ITS REMOVAL IS THE POINT. It used to take the parent's
+    acceptance checks and put the SAME object on every child -- measured 2026-09-13, three
+    children of one pytest-gated goal all carried `{"type": "pytest", "args": "-q tests/"}`
+    -- so each child's completion condition was a question about the whole goal while its
+    own prompt forbade it to touch the other slices. A strict check then never passes until
+    the siblings finish; a loose one passes for free the moment a sibling satisfies it, and
+    `_salvage_via_checks` turns that into a salvaged DONE for a child that did nothing.
+
+    The parameter is GONE rather than ignored: a caller that still has a whole-goal check
+    must be made to say where it goes, and the answer is the merge (aggregation_goal takes
+    `parent_checks`), not the children. Ignoring it silently would leave every existing
+    caller believing its children are still verified.
 
     Each child carries the PARENT'S goal as context, not just its own step. A child runs in a
     conversation that has never seen the parent's: handed only "2月分を取得する" it does not
@@ -136,7 +226,6 @@ def child_goals(parent_goal, steps, *, parent_task_id="", campaign_id="", depth=
         )
         out.append({
             "text": text,
-            "checks": checks,
             "cwd": cwd,
             "campaign_id": cid,
             "task_id": "%s-%d" % (cid, i),
@@ -206,7 +295,7 @@ def ready_to_aggregate(records):
 
 
 def campaigns_from_ledger(lines):
-    """Rebuild {campaign_id: {goal, n, cwd}} from the campaigns ledger.
+    """Rebuild {campaign_id: {goal, n, cwd, checks, partial, merged, children}} from the ledger.
 
     THE LEDGER HAD NO READER. relay_fleet wrote one line per child so that a run dying
     mid-split would leave a trace of work already queued -- and nothing anywhere opened the
@@ -237,13 +326,30 @@ def campaigns_from_ledger(lines):
         cid = rec.get("campaign_id")
         if not cid:
             continue
+        if rec.get("kind") == "merged":
+            # ALREADY ASSEMBLED. Written when the merge is queued, because `merged` used to
+            # live only in memory -- so a run rebuilt from this file would queue the merge
+            # again for every campaign it had ever finished, and the operator would get the
+            # same combined answer a second time with no way to tell which was current.
+            out.setdefault(cid, {"goal": "", "n": 0, "cwd": None, "checks": [],
+                                 "partial": "", "children": []})["merged"] = True
+            continue
         if rec.get("kind") == "campaign":
             out[cid] = {"goal": rec.get("goal") or "",
                         "n": int(rec.get("n") or 0),
                         "cwd": rec.get("cwd"),
+                        # A "merged" line may arrive before OR after the header when two runs
+                        # append concurrently, so it is carried across rather than reset.
+                        "merged": bool(out.get(cid, {}).get("merged")),
+                        # SAME REASON AS cwd. A run that dies after the split is rebuilt from
+                        # this file, and a merge rebuilt without the parent's check is a merge
+                        # nothing verifies -- silently, and only on the crash path.
+                        "checks": rec.get("checks") or [],
+                        "partial": rec.get("partial") or "",
                         "children": out.get(cid, {}).get("children", [])}
             continue
-        entry = out.setdefault(cid, {"goal": "", "n": 0, "cwd": None, "children": []})
+        entry = out.setdefault(cid, {"goal": "", "n": 0, "cwd": None, "checks": [],
+                                     "partial": "", "merged": False, "children": []})
         entry["children"].append(rec)
     # A FAMILY WITHOUT ITS HEADER CANNOT BE MERGED, and saying so is better than returning
     # a campaign whose parent goal is the empty string -- which would merge into nothing.
@@ -278,16 +384,43 @@ def merge_acceptance_checks(records):
     and the account has to mention the gaps by number. When the sweep was complete there
     is nothing to check -- an empty list, not a check that passes trivially, so a reader
     can tell the difference between 'checked and clean' and 'nothing to check'.
+
+    CHECK DICTS, NOT SENTENCES, AND THAT IS THE WHOLE FIX. This returned bare strings, and
+    `acceptance.normalize_checks` "silently drops non-dict members" -- so the list arrived at
+    the worker as [], the worker took its `if not self.checks` branch ("no checks -> DONE
+    accepted as before"), and the one gate standing between a merge and a confident report of
+    an incomplete sweep never ran once. Measured 2026-09-13: aggregation_goal carried the
+    string, goal_fields returned []. Four tests asserted the goal CARRIED it; none asked
+    whether anything READ it.
+
+    Three checks, because the recorded failure has three faces. The incident is two merges
+    that ended DONE having written 「欠落なし」 with slices missing:
+
+      * the gap numbers must appear -- what the old sentence asked for;
+      * 「未取得」 must appear -- the word the merge prompt itself demands;
+      * 「欠落なし」 must NOT appear -- the sentence actually observed, which no positive
+        check can catch, since a reply can contain both.
+
+    The number check is LENIENT by construction: a bare "2" also matches inside "2026", so it
+    can pass on a coincidence. It cannot fail on one, which is the direction that matters --
+    it never blocks a correct report, and the other two carry the strictness.
     """
     gaps = missing_slices(records)
     if not gaps:
         return []
-    return ["未取得または未完了のサブタスク %s について、回答本文でその番号に触れていること"
-            % ", ".join(str(g) for g in gaps)]
+    names = ", ".join(str(g) for g in gaps)
+    return [
+        {"type": "reply_contains", "all_of": [str(g) for g in gaps],
+         "why": "未完了のサブタスク %s の番号に触れていない" % names},
+        {"type": "reply_contains", "needle": "未取得",
+         "why": "未完了があるのに『未取得』として明示していない"},
+        {"type": "reply_contains", "needle": "欠落なし", "expect": False,
+         "why": "未完了があるのに『欠落なし』と書いている"},
+    ]
 
 
 def aggregation_goal(parent_goal, records, *, campaign_id="", parent_task_id="",
-                     limit_each=1200, cwd=None):
+                     limit_each=1200, cwd=None, parent_checks=None, parent_partial=""):
     """The goal item that merges a finished campaign.
 
     A goal rather than a turn on the parent, because a parent parked waiting for its own
@@ -299,7 +432,8 @@ def aggregation_goal(parent_goal, records, *, campaign_id="", parent_task_id="",
     """
     cid = campaign_id or campaign_id_for(parent_goal)
     item = {
-        "text": aggregation_prompt(parent_goal, records, limit_each=limit_each),
+        "text": aggregation_prompt(parent_goal, records, limit_each=limit_each,
+                                   parent_partial=parent_partial),
         "campaign_id": cid,
         "task_id": "%s-merge" % cid,
         "role": "aggregator",
@@ -312,13 +446,18 @@ def aggregation_goal(parent_goal, records, *, campaign_id="", parent_task_id="",
     # whatever directory it happened to start in.
     if cwd:
         item["cwd"] = cwd
-    checks = merge_acceptance_checks(records)
+    # THE PARENT'S OWN CHECK LANDS HERE, NOT ON THE CHILDREN. It is a question about the
+    # whole goal, and this is the worker for which that is the right question: the merge runs
+    # in the parent's cwd and is the parent goal finishing. Copied onto each child instead
+    # (which is what used to happen) it asked every slice about work it was told not to do.
+    checks = [c for c in (parent_checks or []) if isinstance(c, dict)]
+    checks.extend(merge_acceptance_checks(records))
     if checks:
         item["checks"] = checks
     return item
 
 
-def aggregation_prompt(parent_goal, results, limit_each=1200):
+def aggregation_prompt(parent_goal, results, limit_each=1200, parent_partial=""):
     """What the parent is asked once its children are finished.
 
     The children's answers are given as material, and the parent is told which of them
@@ -334,6 +473,25 @@ def aggregation_prompt(parent_goal, results, limit_each=1200):
              "この目標は %d 個のサブタスクに分割して並列実行しました。"
              "以下は各サブタスクの報告です。これらを統合して、最終的な回答を作成してください。"
              % len(results)]
+
+    # A MID-RUN SPLIT HAS A PARENT THAT DID WORK, and ending it drops all of it -- the merge
+    # reads child records only. Carried so the mechanism meant to rescue a long-running goal
+    # does not destroy the part of it that was finished.
+    #
+    # ITS OWN BLOCK, NOT A RECORD, AND NOT MARKED DONE. It was briefly recorded as
+    # `{"subtask_index": 0, "outcome": "DONE"}` -- chosen so it would not move the gap check,
+    # which is choosing a convenient falsehood in the one mechanism built to stop a report
+    # reading complete because its gaps were never named. The parent did NOT finish; that is
+    # why it was split. So it is material, labelled unverified, and it is not a slice: nothing
+    # can count it as one, and `missing_slices` never sees it.
+    if parent_partial:
+        parts.append(
+            "\n【分割前に、この目標の会話が終えていた分（未検証・途中経過）】\n"
+            "この会話は完了に至らず分割されました。以下はその時点までの報告で、"
+            "完了の証明ではありません。内容が下のサブタスク報告と重複する場合は"
+            "サブタスク側を採用し、食い違う場合はその旨を明記してください。\n"
+            + (parent_partial[:limit_each] if len(parent_partial) > limit_each
+               else parent_partial))
     for r in results:
         head = "--- サブタスク %s / %s ---" % (r.get("subtask_index", "?"),
                                               (r.get("outcome") or "?"))
@@ -530,6 +688,7 @@ def fanout_family_view(workers):
 __all__ = ["SUBTASKS_READY", "SPLIT_JOB", "MAX_CHILDREN", "MIN_CHILDREN", "MAX_DEPTH",
            "fanout_ready", "subtasks_from", "child_goals", "aggregation_prompt",
            "campaign_id_for",
+    "NO_SPLIT_MARKER", "declined_split", "MIDRUN_SPLIT_JOB", "midrun_split_job",
     "missing_slices", "merge_acceptance_checks", "campaigns_from_ledger",
     "collapse_retries", "ready_to_aggregate", "aggregation_goal",
     "fanout_family_view",

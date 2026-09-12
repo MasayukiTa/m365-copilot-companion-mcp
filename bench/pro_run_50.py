@@ -136,7 +136,9 @@ def main():
         # RAM-balloon crash. Lets the cap (e.g. 4) run 4 workers instead of one 3-tab worker.
         env = dict(os.environ, PYTHONIOENCODING="utf-8", SWE_SIDEPAGE_RESERVE="0")
         flog = open(os.path.join(SW, "pro_fleet_batch.log"), "w", encoding="utf-8")
-        subprocess.Popen([PY, "-m", "relay.fleet_runner", "--goals-file", bgoals,
+        # --no-fanout: one scored goal per conversation. See bench/review_run.py's
+        # fleet_cmd for the reasoning; fan-out defaults ON since 2026-09-13.
+        subprocess.Popen([PY, "-m", "relay.fleet_runner", "--no-fanout", "--goals-file", bgoals,
                           "--state-dir", os.path.join(REPO, ".fleet"), "--effort", EFFORT],
                          cwd=REPO, env=env, stdout=flog, stderr=subprocess.STDOUT,
                          creationflags=0x08000000)  # CREATE_NO_WINDOW

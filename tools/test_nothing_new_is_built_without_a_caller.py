@@ -88,7 +88,6 @@ NO_CALLER_BUT_TESTED = {
     "bench/companionbench/baseline.py::why_they_flip",           # 54 lines
     "relay/selfimprove/autonomy.py::raise_to",                   # 48 lines
     "relay/selfimprove/runtime_config.py::revert_active",        # 48 lines
-    "relay/fanout.py::campaigns_from_ledger",                    # 43 lines
     "relay/bestofn_run.py::load_candidate_dir",                  # 39 lines
     "relay/selfimprove/apply.py::safe_commit",                   # 39 lines
     "bench/companionbench/baseline.py::repeat_suite",            # 36 lines

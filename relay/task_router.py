@@ -698,40 +698,40 @@ def _truthy_env(name):
 
 
 def _wants_fanout(goals) -> bool:
-    """Should this launch pass --fanout?
+    """Should this launch be fan-out-CAPABLE? Yes, unless an operator said otherwise.
 
-    An explicit FLEET_INTAKE_AUTOSTART_FANOUT wins in both directions. Otherwise fan out when
-    ANY goal actually looks independent/parallelizable (relay.splittability.judge), not merely
-    long -- codex-plan item 6 (2026-09-09): the length-only proxy this used to be
-    (len(text) >= AUTOSTART_FANOUT_MIN_CHARS) was measured against the real fleet transcript
-    corpus (1214 real goal occurrences, .fleet/**/transcripts/*.jsonl(.gz)) to call SPLIT on
-    60.8% of them by length alone, while the actual independence-based judgment calls SPLIT on
-    0.7% -- most of the long ones are one email/SharePoint investigation with several numbered
-    sub-questions about the SAME case, a shape already measured in production (campaign
-    c7e01b58b1956) to over-split (4 of 7 subtasks refused, starved of the context the others
-    held). RelayWorker re-runs this same judgment per goal (see relay_fleet.py), including for
-    goals added mid-run -- this function only decides whether the RUN is fan-out-CAPABLE at
-    all, same as before.
+    CAPABILITY, NOT DECISION, AND IT NO LONGER JUDGES ANYTHING. This used to run
+    `splittability.judge` over the goals and answer "no" when none looked splittable. That was
+    the same judgement RelayWorker makes per goal, run earlier and with less information, and
+    its only possible effect was to take the question away from the real judge -- for every
+    goal in the run, including goals added mid-run that nobody has seen yet. Answering "no"
+    here is the one answer that cannot be revisited later, which is why it now requires an
+    operator to say it.
 
-    If splittability failed to import, or every goal fails to judge cleanly, this falls back
-    to the OLD length proxy rather than refusing fan-out outright: unlike a per-goal decision
-    (where a judging failure must default to "don't split", see relay_fleet.py), refusing the
-    whole run's --fanout CAPABILITY on an import hiccup would silently disable a feature this
-    function existed to enable; the length proxy is the documented, already-shipped fallback
-    behaviour it is replacing, not a new permissive default.
+    Nothing is spent by saying yes. RelayWorker computes
+    `self.fanout = bool(fanout) and _depth0 and _goal_splittable`, so a goal judged NO_SPLIT
+    costs no turn at all; only a SPLIT or an UNCERTAIN triage spends one asking the agent,
+    which may itself answer NO_SPLIT. See docs/fanout_contract.md for the whole staircase.
+
+    WHERE THE OLD MEASUREMENT WENT. The corpus study that replaced the length proxy (1214 real
+    goal occurrences; 60.8% called SPLIT by length alone against 0.7% by independence) is the
+    reason `splittability` exists and is still what RelayWorker consults. It was never a reason
+    to gate the capability -- the judge it justifies runs downstream of this function.
+
+    The two off switches: FLEET_INTAKE_AUTOSTART_FANOUT (explicit, wins outright) and
+    AUTOSTART_FANOUT_MIN_CHARS <= 0 (kept as the documented kill switch it already was).
     """
     override = _truthy_env("FLEET_INTAKE_AUTOSTART_FANOUT")
     if override is not None:
         return override
     if AUTOSTART_FANOUT_MIN_CHARS <= 0:
         return False
-    texts = [(g or {}).get("text") or "" for g in (goals or [])]
-    if _splittability is not None:
-        try:
-            return any(_splittability.judge(t).should_split for t in texts)
-        except Exception:
-            pass
-    return any(len(t) >= AUTOSTART_FANOUT_MIN_CHARS for t in texts)
+    # CAPABILITY, NOT DECISION -- so it is on. This function chooses whether the RUN can fan
+    # out at all; RelayWorker then judges each goal on its own (offline triage, then the agent,
+    # which may answer NO_SPLIT), and a goal judged NO_SPLIT costs nothing. Answering "no" here
+    # is the only answer that cannot be revisited: it takes the question away from the judge
+    # for every goal in the run, including goals added mid-run that nobody has seen yet.
+    return True
 
 
 def launch_creationflags() -> int:

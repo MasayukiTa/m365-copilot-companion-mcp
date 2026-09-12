@@ -20,6 +20,9 @@ A check spec is a plain dict (so it can travel inside a goals-file JSON line):
     {"type": "py_compile",   "path": "pkg/mod.py"}
     {"type": "file_exists",  "path": "out/report.csv"}
     {"type": "file_contains","path": "out/log.txt", "needle": "PASS", "regex": false}
+    {"type": "reply_contains","needle": "未取得"}                  # the ANSWER, not the tree
+    {"type": "reply_contains","all_of": ["2", "4"], "expect": true}
+    {"type": "reply_contains","needle": "欠落なし", "expect": false}  # must NOT say this
 
 TRUST MODEL: a check is run with the same authority as the goal it rides on. Both come
 from the local operator (the goals file / folder_coder / the cockpit), never from the
@@ -46,7 +49,12 @@ MAX_DETAIL = 1500
 # Process-backed check types vs. instant (filesystem) check types.
 _PROC_TYPES = frozenset({"shell", "pytest", "python", "py_compile", "import_smoke"})
 _FILE_TYPES = frozenset({"file_exists", "file_contains"})
-VALID_TYPES = _PROC_TYPES | _FILE_TYPES
+# Asks the AGENT'S REPLY a question instead of the workspace. Some completion conditions have
+# no filesystem footprint at all -- "the merge report names the slices it could not get" is
+# true or false in the text and nowhere else -- and expressing them as a shell check meant
+# expressing them not at all: they were written as bare strings, which normalize_checks drops.
+_TEXT_TYPES = frozenset({"reply_contains"})
+VALID_TYPES = _PROC_TYPES | _FILE_TYPES | _TEXT_TYPES
 
 # Check types whose failure output is a TEST-RUNNER log (pytest / unittest / sympy). For these
 # we distill the raw output into a structured summary (failing tests + error + file:line) via
@@ -81,14 +89,17 @@ class Check:
     Lifecycle:  c = Check(spec, cwd).start();  while c.poll() is None: ...; passed, detail = c.poll()
 
     poll() returns None while a process-backed check is still running, otherwise a
-    (passed: bool, detail: str) tuple. File checks resolve at start() and poll()
+    (passed: bool, detail: str) tuple. File and reply checks resolve at start() and poll()
     returns their result immediately. Never raises; a setup error becomes a failed
     result with the exception in `detail`.
     """
 
-    def __init__(self, spec, cwd=None, default_timeout=180):
+    def __init__(self, spec, cwd=None, default_timeout=180, reply=None):
         self.spec = dict(spec or {})
         self.type = str(self.spec.get("type", "shell")).lower()
+        # THE TEXT A reply_contains CHECK IS ABOUT. None means no reply was captured, which
+        # is NOT the same as an empty reply and is not treated as one: see _eval_reply.
+        self.reply = reply
         # per-check cwd wins; else the goal's cwd; else the current dir
         self.cwd = self.spec.get("cwd") or cwd or None
         try:
@@ -118,7 +129,62 @@ class Check:
             return "file_exists " + str(s.get("path", ""))[:80]
         if self.type == "file_contains":
             return "file_contains %s ~ %r" % (s.get("path", ""), str(s.get("needle", ""))[:40])
+        if self.type == "reply_contains":
+            return "reply %s %r" % ("contains" if self._expect() else "must NOT contain",
+                                    ", ".join(self._needles())[:60])
         return "check(%s)" % self.type
+
+    # -- reply checks --------------------------------------------------------
+    def _needles(self):
+        """The strings this check looks for. `all_of` is a list; `needle` is one."""
+        s = self.spec
+        raw = s.get("all_of")
+        if raw is None:
+            raw = [] if s.get("needle") is None else [s.get("needle")]
+        if isinstance(raw, (str, bytes)):
+            raw = [raw]
+        return [str(n) for n in (raw or []) if str(n)]
+
+    def _expect(self):
+        """True: every needle must be present. False: none of them may be.
+
+        THE NEGATIVE IS NOT DECORATION. The recorded merge failure is not a missing sentence,
+        it is a WRONG one -- two merges that ended DONE having written 「欠落なし」 while
+        slices were missing -- and only `expect: false` states that.
+        """
+        v = self.spec.get("expect", True)
+        if isinstance(v, str):
+            return v.strip().lower() not in ("0", "false", "no", "off")
+        return bool(v)
+
+    def _eval_reply(self):
+        needles = self._needles()
+        if not needles:
+            # An empty needle list would pass vacuously, and a check that cannot fail reads
+            # in a log exactly like one that ran and was satisfied.
+            return (False, "[acceptance: reply_contains has no needle to look for]")
+        if self.reply is None:
+            # FAILURE IS NOT PERMISSION. No captured reply means the question was never
+            # asked; answering "passed" would accept the claim this check exists to test.
+            return (False, "[acceptance: no reply text was captured for %s]" % self.describe())
+        text = self.reply if isinstance(self.reply, str) else str(self.reply)
+        want = self._expect()
+        use_re = bool(self.spec.get("regex"))
+        bad = []
+        for n in needles:
+            try:
+                hit = bool(re.search(n, text)) if use_re else (n in text)
+            except re.error as e:
+                return (False, "[acceptance: bad regex %r: %s]" % (n, e))
+            if hit != want:
+                bad.append(n)
+        if not bad:
+            return (True, "%s -- ok" % self.describe())
+        if want:
+            return (False, "回答に次が含まれていません: %s\n%s"
+                    % ("、".join(bad), _tail(text, 600)))
+        return (False, "回答に書いてはいけない語が含まれています: %s\n%s"
+                % ("、".join(bad), _tail(text, 600)))
 
     # -- argv construction for process-backed checks -------------------------
     def _build(self):
@@ -162,6 +228,8 @@ class Check:
         try:
             if self.type in _FILE_TYPES:
                 self._instant = self._eval_file()
+            elif self.type in _TEXT_TYPES:
+                self._instant = self._eval_reply()
             elif self.type in _PROC_TYPES:
                 target, shell = self._build()
                 self._out = tempfile.TemporaryFile()

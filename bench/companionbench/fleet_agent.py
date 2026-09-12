@@ -136,6 +136,13 @@ try:
             # Episodes run side by side by running several of these children at once, which
             # is the runner's business; see `max_concurrent_episodes` on the class below.
             max_concurrent=1, refuter=payload.get("refuter", False),
+            # NO FAN-OUT IN A BENCHMARK EPISODE. One goal in one conversation is what this
+            # measures -- see the max_concurrent note directly above. A split ends this worker
+            # with outcome=FANOUT and no answer of its own, so the `last_response` read below
+            # would come back empty and the grader would score a miss for a goal that was
+            # merely divided. Explicit because the library default moved to True on
+            # 2026-09-13; a benchmark must not inherit a decision like that.
+            fanout=False,
             # max_transient / max_refute are LEFT UNSET on purpose: run_relay_fleet takes
             # them from the active manifest when they are None, and passing them here would
             # silence the very fields under test.
