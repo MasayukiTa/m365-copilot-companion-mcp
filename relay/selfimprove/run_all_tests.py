@@ -53,8 +53,8 @@ _SUITES = [
 def _run_suite(modname: str) -> tuple[bool, str]:
     """Run one suite as `python -m <module>`; pass iff exit 0 AND output contains 'PASSED'."""
     try:
-        r = subprocess.run([sys.executable, "-m", modname], cwd=REPO,
-                           capture_output=True, text=True, timeout=300)
+        from tools.childproc import run as _run_child
+        r = _run_child([sys.executable, "-m", modname], cwd=REPO, timeout=300)
     except Exception as e:
         return False, "launch error: %s" % e
     out = (r.stdout or "") + "\n" + (r.stderr or "")
