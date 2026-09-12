@@ -10,7 +10,6 @@
 (パス比較は tmp_path と realpath の相対的な性質で書く)。作った worktree は必ず消す。
 """
 import os
-import subprocess
 
 import pytest
 
@@ -18,8 +17,13 @@ from tools import coding_ops as C
 
 
 def _git(cwd, *args):
-    subprocess.run(["git", *args], cwd=str(cwd), check=True,
-                   capture_output=True, text=True)
+    from tools.childproc import run as _run_child
+    _run_child(["git", *args], cwd=str(cwd), check=True)
+
+
+def _head(cwd):
+    from tools.childproc import run as _run_child
+    return _run_child(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=str(cwd)).stdout.strip()
 
 
 @pytest.fixture(autouse=True)
@@ -52,10 +56,9 @@ def dedicated_worktree(shared_repo, tmp_path):
         yield wt
     finally:
         # クリーンアップ: 登録を外し、ディレクトリも残さない。
-        subprocess.run(["git", "worktree", "remove", "--force", str(wt)],
-                       cwd=str(shared_repo), capture_output=True, text=True)
-        subprocess.run(["git", "worktree", "prune"],
-                       cwd=str(shared_repo), capture_output=True, text=True)
+        from tools.childproc import run as _run_child
+        _run_child(["git", "worktree", "remove", "--force", str(wt)], cwd=str(shared_repo))
+        _run_child(["git", "worktree", "prune"], cwd=str(shared_repo))
 
 
 # ---- _dedicated_root_ok 本体 --------------------------------------------
@@ -132,8 +135,7 @@ def test_git_checkout_switch_refused_in_shared_tree(shared_repo):
     _git(shared_repo, "branch", "other")
     out = C.git_checkout("other", repo_path=str(shared_repo))
     assert "refused" in out
-    cur = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                         cwd=str(shared_repo), capture_output=True, text=True).stdout.strip()
+    cur = _head(shared_repo)
     assert cur == "main"
 
 
@@ -141,8 +143,7 @@ def test_git_checkout_create_allowed_in_shared_tree(shared_repo):
     # create=True (-b) は何も破棄しないので共有ツリーでも許可される。
     out = C.git_checkout("brand-new", repo_path=str(shared_repo), create=True)
     assert "refused" not in out
-    cur = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                         cwd=str(shared_repo), capture_output=True, text=True).stdout.strip()
+    cur = _head(shared_repo)
     assert cur == "brand-new"
 
 
@@ -153,6 +154,5 @@ def test_git_checkout_switch_allowed_in_dedicated_worktree(dedicated_worktree):
     _git(dedicated_worktree, "branch", "feat2")
     out = C.git_checkout("feat2", repo_path=str(dedicated_worktree))
     assert "refused" not in out
-    cur = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                         cwd=str(dedicated_worktree), capture_output=True, text=True).stdout.strip()
+    cur = _head(dedicated_worktree)
     assert cur == "feat2"

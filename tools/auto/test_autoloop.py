@@ -253,8 +253,8 @@ def test_an_in_process_edit_actually_reaches_the_disk(tmp_path, monkeypatch):
 # -- the restore point -------------------------------------------------------------------
 
 def git(tmp, *args):
-    import subprocess
-    return subprocess.run(["git"] + list(args), cwd=str(tmp), capture_output=True, text=True)
+    from tools.childproc import run as _run_child
+    return _run_child(["git"] + list(args), cwd=str(tmp))
 
 
 @pytest.fixture

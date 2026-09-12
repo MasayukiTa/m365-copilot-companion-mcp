@@ -17,21 +17,19 @@ worktree という**証明できる二つ**を押さえている。どちらも 
 拒否する。ブランチ作成(-b)は HEAD の付け替えでファイルを差し替えないので、確証できなくても
 通す。両方を一律に拒否すると、判定不能な場所で新しいブランチすら切れなくなる。
 """
-import subprocess
-
 import pytest
 
 from tools import coding_ops as C
 
 
 def _git(cwd, *args):
-    subprocess.run(["git", *args], cwd=str(cwd), check=True,
-                   capture_output=True, text=True)
+    from tools.childproc import run as _run_child
+    _run_child(["git", *args], cwd=str(cwd), check=True)
 
 
 def _head(cwd):
-    return subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                          cwd=str(cwd), capture_output=True, text=True).stdout.strip()
+    from tools.childproc import run as _run_child
+    return _run_child(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=str(cwd)).stdout.strip()
 
 
 @pytest.fixture(autouse=True)

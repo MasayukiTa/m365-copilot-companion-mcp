@@ -11,7 +11,6 @@
 契約が INERT(既定)のときは素通りする -- それを実リポジトリで動かして示す。
 """
 import pathlib
-import subprocess
 
 import pytest
 
@@ -19,13 +18,14 @@ from tools import coding_ops as C
 
 
 def _git(cwd, *args):
-    subprocess.run(["git", *args], cwd=str(cwd), check=True,
-                   capture_output=True, text=True)
+    from tools.childproc import run as _run_child
+    _run_child(["git", *args], cwd=str(cwd), check=True)
 
 
 def _worktrees(repo):
-    out = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=str(repo),
-                         check=True, capture_output=True, text=True).stdout
+    from tools.childproc import run as _run_child
+    out = _run_child(["git", "worktree", "list", "--porcelain"], cwd=str(repo),
+                      check=True).stdout
     # git は porcelain で '/' 区切りを返す。比較のため resolve して揃える。
     return [str(pathlib.Path(line[len("worktree "):]).resolve())
             for line in out.splitlines() if line.startswith("worktree ")]
