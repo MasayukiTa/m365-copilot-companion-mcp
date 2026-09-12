@@ -102,9 +102,49 @@ is safe to write at any time.
   addressing, goal-text follow-up, command-file merge, and a check that the deployed
   `CopilotChat.exe` is not behind its source (a source assertion cannot see a stale build).
 
-## Still open
+## The back-fill, and what it nearly got wrong
 
 Transcripts written before this change carry no guid line, so conversations from earlier runs
-remain unresumable — the identity was never written and cannot be recovered from the
-transcript. `.fleet/socket_route.jsonl` still holds `conv_client` keyed by goal text for many
-of them, so a back-fill is possible; it has not been done.
+would have stayed unaddressable. The identity was not lost, only unrecorded where it is read:
+`.fleet/socket_route.jsonl` holds `worker_done` rows carrying `conv_client`. `tools/backfill
+_transcript_conv_ids.py` hands each transcript its own id back, inserting the line where
+`_tx.note_guid` would have put it (after the meta line — the chat window scans a bounded
+window of leading lines, so an appended line would be one nothing reads).
+
+**The first version of the resolver was wrong, and the dry run is what caught it.** It reused
+`conversation_for_goal`'s rule, "newest wins", and two different transcripts came back with the
+same id:
+
+```
+r6aa4920b_a0_w0.jsonl -> 1a2c4e8d-89bf-4877-9876-cb1ea0f2a184
+r6aa492d6_a0_w0.jsonl -> 1a2c4e8d-89bf-4877-9876-cb1ea0f2a184
+```
+
+"Newest wins" is correct for the question that function asks — a follow-up should continue the
+LATEST run of a goal. It is wrong for the question a back-fill asks: which conversation did
+THIS transcript run in. Listing the candidates gave the real answer:
+
+```
+r6aa4920b  last line 1789170372   worker_done 08:46:12  gap    +0  conv d3710cc2...
+                                  worker_done 09:06:33  gap +1221  conv 1a2c4e8d...
+r6aa492d6  last line 1789171511   worker_done 08:46:12  gap  -1139  conv d3710cc2...
+                                  worker_done 09:06:33  gap   +82  conv 1a2c4e8d...
+```
+
+`worker_done` is written when the worker finishes, so the right row is the one with the same
+goal and worker name whose timestamp falls just *after* the transcript's last line. Smallest
+non-negative gap wins; beyond `MATCH_WINDOW_S`, or with nothing after it at all, the transcript
+is left alone. A wrong id is worse than none: with none the chat window says it cannot continue
+this conversation, while with a wrong one it opens a real conversation that is not this one and
+looks correct doing it.
+
+Applied 2026-09-12 to all 3 surviving transcripts (retention had pruned the rest); every
+original line preserved byte-for-byte, and a second run is a no-op. Covered by
+`tools/test_a_backfilled_conversation_is_the_right_one.py`.
+
+## Still open
+
+End to end — typing into a fleet conversation in the running chat window and watching the
+fleet pick it up — has not been exercised. Every layer is verified separately (relay recording
+with a negative control, the command channel, the chat window's source and its deployed
+binary), but the seam between them will be crossed for the first time by real use.
