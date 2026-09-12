@@ -31,7 +31,7 @@ from __future__ import annotations
 import locale
 import subprocess
 
-__all__ = ["decode", "run", "run_ok"]
+__all__ = ["decode", "run"]
 
 
 def decode(raw) -> str:
@@ -80,17 +80,3 @@ def run(cmd, **kw):
     except AttributeError:          # capture_output=False -> both are None already
         pass
     return proc
-
-
-def run_ok(cmd, **kw):
-    """(ok, stdout, stderr) for the common "did it work, and what did it say" shape.
-
-    A command that cannot be started at all (missing executable, bad cwd) answers False with
-    the reason in `stderr`, rather than raising -- the same contract as a non-zero exit, since
-    from the caller's side both mean "this did not produce an answer".
-    """
-    try:
-        p = run(cmd, **kw)
-    except OSError as exc:
-        return False, "", "%s: %s" % (type(exc).__name__, exc)
-    return p.returncode == 0, p.stdout, p.stderr
