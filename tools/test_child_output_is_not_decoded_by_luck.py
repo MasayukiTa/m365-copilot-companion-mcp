@@ -32,6 +32,7 @@ written inline -- but the helper is preferred because it states which policy, in
 from __future__ import annotations
 
 import ast
+import hashlib
 import io
 import os
 import subprocess
@@ -58,9 +59,28 @@ _CALLS = frozenset({"run", "Popen", "check_output", "check_call", "call"})
 #: the code page returns 0, which reads as "no problem" -- and it ships with a DELIBERATE
 #: RE-FREEZE and its own record, not as a line in a sweep, and least of all with an A/B queued.
 BASELINE = {
-    "bench/evalhost_batch_grade.py": 2,
-    "relay/selfimprove/guards.py": 1,
+    "bench/evalhost_batch_grade.py": {"c60b6befb5f2", "e326dcedd6f9"},
+    "relay/selfimprove/guards.py": {"6581ea26a400"},
 }
+
+
+def _fingerprint(src: str, node) -> str:
+    """A stable id for one call site: its own source, whitespace collapsed, hashed.
+
+    NOT A LINE NUMBER. Every edit above a site would rewrite its identity and turn the
+    inventory into noise. NOT A COUNT either -- that was the defect this replaced: a per-file
+    count is satisfied by any N sites, so repairing one call and adding another cancels out and
+    the ratchet stays green.
+
+    Changing the call changes the fingerprint, which is the intended behaviour: a modified
+    dangerous call is a site a human should look at again, not one that inherits the old
+    entry's permission.
+    """
+    try:
+        text = ast.get_source_segment(src, node) or ""
+    except Exception:
+        text = ""
+    return hashlib.sha1(" ".join(text.split()).encode("utf-8")).hexdigest()[:12]
 
 
 def _risky_calls(src: str) -> int:
@@ -76,11 +96,16 @@ def _risky_calls(src: str) -> int:
     comment, and an `encoding=` belonging to a DIFFERENT call nested in the same argument list.
     A window of text cannot tell which keyword belongs to which call; this can.
     """
+    return len(_risky_sites_in(src))
+
+
+def _risky_sites_in(src: str) -> set:
+    """{fingerprint} for every locale-decoded subprocess call in `src`."""
     try:
         tree = ast.parse(src)
     except SyntaxError:
-        return 0
-    n = 0
+        return set()
+    found = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -94,9 +119,9 @@ def _risky_calls(src: str) -> int:
         for name in ("text", "universal_newlines"):
             v = kw.get(name)
             if isinstance(v, ast.Constant) and v.value is True:
-                n += 1
+                found.add(_fingerprint(src, node))
                 break
-    return n
+    return found
 
 
 def _tracked():
@@ -146,40 +171,52 @@ def risky_sites():
                     src = io.open(path, encoding="utf-8").read()
                 except (OSError, UnicodeDecodeError):
                     continue
-                n = _risky_calls(src)
-                if n:
-                    found[rel] = n
+                sites = _risky_sites_in(src)
+                if sites:
+                    found[rel] = sites
     return found
 
 
 # ── the ratchet ───────────────────────────────────────────────────────────────────────────
 
-def test_no_new_file_decodes_child_output_by_luck():
-    """A file that is not already carrying this debt may not start carrying it."""
-    new = sorted(set(risky_sites()) - set(BASELINE))
+def test_no_new_call_decodes_child_output_by_luck():
+    """No new SITE, not merely no new file.
+
+    This compared `set(risky_sites()) - set(BASELINE)` -- the FILES. Combined with a per-file
+    count, a file already on the list could repair one call and introduce another and stay
+    green, which is the one thing this file exists to prevent. Sites are identified by a
+    fingerprint of the call's own source, so a swap shows up as an unlisted fingerprint.
+    """
+    now = risky_sites()
+    new = sorted("%s::%s" % (p, f) for p, fps in now.items()
+                 for f in (fps - BASELINE.get(p, frozenset())))
     assert not new, (
-        "these files decode child output with the local code page (cp932 here), which loses the "
-        "WHOLE output on one bad byte -- use tools.childproc.run, or decode with "
+        "these calls decode child output with the local code page (cp932 here), which loses "
+        "the WHOLE output on one bad byte -- use tools.childproc.run, or decode with "
         "tools.childproc.decode: %s" % ", ".join(new))
 
 
-def test_no_file_grows_its_debt():
-    grew = {p: (n, BASELINE[p]) for p, n in risky_sites().items()
-            if p in BASELINE and n > BASELINE[p]}
-    assert not grew, (
-        "more locale-decoded subprocess calls than the 2026-09-12 inventory allows "
-        "(file: now vs allowed): %r" % grew)
+def test_a_listed_file_cannot_swap_one_violation_for_another():
+    """THE HOLE A REVIEW FOUND IN THIS FILE, 2026-09-13: "BASELINEが件数だけなら、既存違反の
+    削除と新規違反の追加が相殺される". A count of 2 is satisfied by any two sites. Identity is
+    not."""
+    now = risky_sites()
+    for path, fps in now.items():
+        allowed = BASELINE.get(path, frozenset())
+        unlisted = sorted(fps - allowed)
+        assert not unlisted, (
+            "%s carries call site(s) the inventory does not list: %s" % (path, unlisted))
 
 
-def test_a_file_that_is_clean_is_removed_from_the_list():
+def test_a_site_that_is_clean_is_removed_from_the_list():
     """THE HALF THAT MAKES IT A RATCHET. Without this the inventory is a permanent excuse: a
-    file could be fixed and its entry would sit there forever, and the next reader would take
+    site could be fixed and its entry would sit there forever, and the next reader would take
     the list as the current state when it is a historical one."""
     now = risky_sites()
-    stale = {p: n for p, n in BASELINE.items() if now.get(p, 0) < n}
+    stale = {p: sorted(fps - now.get(p, frozenset())) for p, fps in BASELINE.items()}
+    stale = {p: v for p, v in stale.items() if v}
     assert not stale, (
-        "these entries overstate the debt -- lower or delete them (file: allowed, actual "
-        "now %r): %r" % ({p: now.get(p, 0) for p in stale}, stale))
+        "these entries name call sites that no longer exist -- delete them: %r" % stale)
 
 
 def test_every_entry_is_a_file_the_repository_actually_has():
@@ -193,6 +230,43 @@ def test_every_entry_is_a_file_the_repository_actually_has():
     assert not untracked, (
         "the inventory names files git does not track, so CI cannot see them: %s"
         % ", ".join(untracked))
+
+
+def test_a_swap_inside_one_file_is_visible():
+    """THE MECHANISM, EXERCISED -- not asserted about.
+
+    Two sources with the SAME NUMBER of violations in one file, differing only in which call
+    is dangerous. Under the old per-file count these were indistinguishable; under site
+    identity the fingerprints differ, which is what makes a repair-plus-new-violation visible.
+    """
+    before = (
+        "import subprocess\n"
+        "def a(): subprocess.run(['git', 'diff'], text=True)\n"
+        "def b(): subprocess.run(['git', 'log'], encoding='utf-8')\n")
+    after = (
+        "import subprocess\n"
+        "def a(): subprocess.run(['git', 'diff'], encoding='utf-8')\n"
+        "def b(): subprocess.run(['git', 'log'], text=True)\n")
+
+    fa, fb = _risky_sites_in(before), _risky_sites_in(after)
+    assert len(fa) == len(fb) == 1, "the sample is not one violation each: %r %r" % (fa, fb)
+    assert fa != fb, (
+        "a repaired call and a new one produced the same identity -- the offsetting hole is "
+        "open again")
+
+
+def test_a_site_keeps_its_identity_when_the_file_moves_around_it():
+    """The identity must survive edits that do not touch the call, or the inventory becomes
+    noise on every unrelated change. This is why it is the call's own source and not a line
+    number."""
+    one = ("import subprocess\n"
+           "def a(): subprocess.run(['git', 'diff'], text=True)\n")
+    two = ("import subprocess\n"
+           "# a comment added above\n"
+           "def zzz(): pass\n"
+           "def a(): subprocess.run(['git',   'diff'], text=True)\n")
+    assert _risky_sites_in(one) == _risky_sites_in(two), (
+        "reformatting or moving code above a site changed its identity")
 
 
 def test_the_inventory_is_not_silently_empty():
