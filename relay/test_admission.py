@@ -33,9 +33,35 @@ from relay.relay_fleet import (
 results = []
 
 
+class AdmissionCheckFailed(AssertionError):
+    """A named admission property did not hold.
+
+    AN AssertionError SUBCLASS so pytest reports it as an ordinary failing assertion, with the
+    file and line of the `check` that failed.
+    """
+
+
 def check(name, cond):
+    """Record a named property, and RAISE if it does not hold.
+
+    IT USED TO ONLY RECORD, and `results` is read in exactly one place: `main()`, for the
+    `python relay\test_admission.py` invocation at the bottom of this file. pytest never calls
+    `main()`, and pytest collects 19 test functions from here (ci.yml:253). So a failing check
+    printed FAIL, the test function returned normally, and CI recorded PASS.
+
+    Measured 2026-09-13 by replacing `disk_admission_ok` with `lambda **k: True` -- the
+    admission predicate broken outright: 5 of 20 checks printed FAIL and
+    `test_disk_floor_predicate()` returned normally. Under CI that is a green run, for the
+    floor that stops a fleet filling C:.
+
+    Raising fixes both callers rather than either: pytest gets a real failure at the real line,
+    and `main()` keeps its run-everything-report-all behaviour by catching per test function
+    below -- explicitly now, where before it was implicit and was the defect.
+    """
     results.append(bool(cond))
     print("[%s] %s" % ("PASS" if cond else "FAIL", name))
+    if not cond:
+        raise AdmissionCheckFailed(name)
 
 
 class FakeContext:
@@ -201,13 +227,26 @@ def test_continuous_admission_no_barrier():
         # must complete (continuous re-admission as slots free, not "batch of 2 barrier").
         goals = ["g0", "g1", "g2", "g3", "g4"]
         max_open_seen = {"v": 0}
-        sweeps = {"n": 0}
+        # TRANSITIONS OF THE OPEN SET, NOT POLLING ITERATIONS. This counted `on_tick` calls
+        # against a limit of 12, and on_tick fires once per POLL -- with poll_s=0 that measures
+        # how fast the CPU span the loop. Measured 2026-09-13: 12304 iterations at 0908531 and
+        # 13455 after that day's changes, for the same five goals. Three orders of magnitude
+        # out, in both trees, and invisible because `check` only recorded.
+        #
+        # What the original wanted is in its own comment -- "a continuous flow finishes in ~5-7
+        # sweeps", i.e. no batch barrier -- and five goals at a cap of two is five admissions
+        # and five completions. Counting changes to the set of open tabs says exactly that, and
+        # says it independently of poll_s and of how fast the machine is.
+        opens = {"seen": frozenset(), "transitions": 0}
 
         def on_tick(workers):
-            open_now = sum(1 for w in workers
-                           if getattr(w, "page", None) is not None and w.status not in TERMINAL)
-            max_open_seen["v"] = max(max_open_seen["v"], open_now)
-            sweeps["n"] += 1
+            open_names = frozenset(w.name for w in workers
+                                   if getattr(w, "page", None) is not None
+                                   and w.status not in TERMINAL)
+            max_open_seen["v"] = max(max_open_seen["v"], len(open_names))
+            if open_names != opens["seen"]:
+                opens["transitions"] += 1
+                opens["seen"] = open_names
             # complete the OLDEST currently-open worker each sweep so a slot frees and the
             # next queued goal must be admitted on the following sweep (the continuous flow).
             for w in workers:
@@ -220,9 +259,12 @@ def test_continuous_admission_no_barrier():
         all_done = all(r["outcome"] == "DONE" for r in res)
         check("continuous_all_complete", len(res) == 5 and all_done)
         check("continuous_cap_never_exceeded", max_open_seen["v"] <= 2)
-        # if there were a "finish all then next batch" barrier with 5 goals / cap 2, we'd need
-        # far more idle sweeps; a continuous flow finishes in ~5-7 sweeps. Just assert progress.
-        check("continuous_made_progress", sweeps["n"] <= 12)
+        # A "finish all, then the next batch" barrier would show up here: five goals at a cap
+        # of two is five admissions and five completions, so ten changes to the open set plus
+        # the final empty one. A batched flow performs the same admissions but cannot interleave
+        # them, so the bound is what distinguishes the two -- and unlike a sweep count it does
+        # not move with poll_s or with the speed of the machine.
+        check("continuous_made_progress", opens["transitions"] <= 12)
     finally:
         _restore_worker(orig)
 
@@ -841,9 +883,20 @@ def test_lock_detector_ignores_security_review_prose():
     rf2._unlock_password = lambda: "test-password-123"
     try:
         w = RelayWorker("do the thing", "wlock")
+        # THE DELTA, NOT THE ABSOLUTE. This asserted `== 1` and measured 2, because
+        # `_initial_job_with_unlock` does a PROACTIVE unlock whenever a local password exists
+        # and the constructor charges it to the same budget on purpose ("Count the proactive
+        # attempt against the same bounded budget used by reactive re-unlocks"). So the counter
+        # starts at 1 and the reactive injection takes it to 2.
+        #
+        # Which also made the check ENVIRONMENT-DEPENDENT: CI has no password file, so there is
+        # no preflight, the counter starts at 0, and `== 1` held on the runner while failing on
+        # a developer's machine -- for a reason having nothing to do with the property named.
+        # One reactive injection is the property; the baseline is not.
+        _before = w._unlock_attempts
         w._decide(real_err_ip)
         check("real_lock_error_triggers_unlock_injection",
-              w._unlock_attempts == 1 and "unlock" in (w.job or "").lower()
+              w._unlock_attempts == _before + 1 and "unlock" in (w.job or "").lower()
               and w.status != "stuck")
     finally:
         rf2._unlock_password = orig_pw
@@ -874,9 +927,18 @@ def test_lock_detector_ignores_security_review_prose():
     rf2._unlock_password = lambda: calls.__setitem__("n", calls["n"] + 1) or "test-password-123"
     try:
         w2 = RelayWorker("review the security module", "wreview")
+        # THE DELTA ACROSS `_decide`, for the same reason as the positive check above:
+        # constructing a worker performs the PROACTIVE unlock when a local password exists,
+        # which calls `_unlock_password` once and sets `_unlock_attempts` to 1 before this
+        # reply is seen at all. Measured 2026-09-13: calls=1, _unlock_attempts=1 straight out
+        # of the constructor. Asserting 0 tested the preflight, not the false positive this
+        # test is named for -- and passed on CI, which has no password file, while failing on
+        # any machine that does.
+        _before_attempts, _before_calls = w2._unlock_attempts, calls["n"]
         w2._decide(review)
         check("review_prose_does_not_trigger_unlock",
-              w2._unlock_attempts == 0 and calls["n"] == 0 and w2.status != "stuck")
+              w2._unlock_attempts == _before_attempts and calls["n"] == _before_calls
+              and w2.status != "stuck")
     finally:
         rf2._unlock_password = orig_pw2
 
@@ -1105,25 +1167,36 @@ def test_stuck_noprogress_early_exit():
 
 
 def main():
-    test_disk_floor_predicate()
-    test_tab_load_accounting()
-    test_tab_budget_admission()
-    test_hysteresis_no_thrash()
-    test_continuous_admission_no_barrier()
-    test_verifying_counts_in_cap()
-    test_disk_floor_blocks_in_loop()
-    test_stop_cancels_running_fleet()
-    test_pause_freezes_then_resumes()
-    test_fleet_research_nonblocking()
-    test_research_session_ram_gated_open()
-    test_dead_agent_detector()
-    test_tool_unreachable_infra()
-    test_transient_outage_window()
-    test_consent_detector()
-    test_lock_detector_ignores_security_review_prose()
-    test_renav_first_on_consent_and_dead_agent()
-    test_unfinished_excludes_stuck_keeps_infra_stuck()
-    test_stuck_noprogress_early_exit()
+    """Run every check and report them all, as the script invocation always did.
+
+    EXPLICITLY CATCHING NOW. `check` raises, so an unguarded call list would stop at the first
+    failing property and the script would no longer say which of the others hold -- which is
+    the whole reason this file has a `results` list. The failure is still recorded by `check`
+    before it raises, so the tally below is unchanged.
+    """
+    for _fn in (test_disk_floor_predicate,
+                test_tab_load_accounting,
+                test_tab_budget_admission,
+                test_hysteresis_no_thrash,
+                test_continuous_admission_no_barrier,
+                test_verifying_counts_in_cap,
+                test_disk_floor_blocks_in_loop,
+                test_stop_cancels_running_fleet,
+                test_pause_freezes_then_resumes,
+                test_fleet_research_nonblocking,
+                test_research_session_ram_gated_open,
+                test_dead_agent_detector,
+                test_tool_unreachable_infra,
+                test_transient_outage_window,
+                test_consent_detector,
+                test_lock_detector_ignores_security_review_prose,
+                test_renav_first_on_consent_and_dead_agent,
+                test_unfinished_excludes_stuck_keeps_infra_stuck,
+                test_stuck_noprogress_early_exit):
+        try:
+            _fn()
+        except AdmissionCheckFailed:
+            pass          # already recorded by `check`; keep going so the tally is complete
     print("\n=== %d/%d admission checks passed ===" % (sum(results), len(results)))
     return 0 if all(results) else 1
 

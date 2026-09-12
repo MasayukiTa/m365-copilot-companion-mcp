@@ -462,6 +462,8 @@ jobs:
             relay/test_a_slice_is_not_judged_by_the_whole_goal.py \
             relay/test_the_split_decision_can_be_revised.py \
             relay/test_a_family_survives_the_process_that_split_it.py \
+            relay/test_the_recovered_family_reaches_a_merge.py \
+            relay/test_a_steer_starts_a_new_chain.py \
             relay/test_mechanism_records_name_their_run.py \
             relay/test_memory_dedupe.py \
             relay/test_fleet_reconcile.py \
