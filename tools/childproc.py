@@ -73,6 +73,15 @@ def run(cmd, **kw):
                 "childproc.run decodes for you; %r would put the locale codec back in the "
                 "path this exists to keep it out of" % bad)
     kw.setdefault("capture_output", True)
+    # BINARY IN, BINARY OUT -- BUT NOT AT THE CALLER'S EXPENSE. Running without text=True is
+    # what keeps the locale codec out of the OUTPUT path, and it also makes stdin binary, so a
+    # caller that passed a str to subprocess.run and switched to this got
+    # "TypeError: a bytes-like object is required, not 'str'" from inside Popen._stdin_write.
+    # Measured 2026-09-12 while converting scripts/test_stale_server_check.py. Encoding it here
+    # in UTF-8 -- the same direction `decode` takes on the way back -- is the whole fix.
+    # Making every call site remember instead is the version of this that keeps biting.
+    if isinstance(kw.get("input"), str):
+        kw["input"] = kw["input"].encode("utf-8")
     proc = subprocess.run(cmd, **kw)
     try:
         proc.stdout = decode(proc.stdout)

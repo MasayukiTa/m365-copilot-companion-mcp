@@ -28,9 +28,9 @@ def _main_catalog(tmp_path, tool_map="0"):
     # Widened rather than removed: an import that genuinely hangs should still end the test.
     started = time.time()
     try:
-        proc = subprocess.run(
-            [sys.executable, "-c", code], cwd=os.getcwd(), env=env,
-            text=True, capture_output=True, timeout=180,
+        from tools.childproc import run as _run_child
+        proc = _run_child(
+            [sys.executable, "-c", code], cwd=os.getcwd(), env=env, timeout=180,
         )
     except subprocess.TimeoutExpired:
         raise AssertionError(

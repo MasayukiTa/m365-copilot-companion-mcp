@@ -17,7 +17,6 @@ subprocess so that "what doctor runs" is what the tests check.
 
 from __future__ import annotations
 
-import subprocess
 import sys
 from pathlib import Path
 
@@ -131,9 +130,9 @@ def test_any_live_marker_counts():
 # ------------------------------------------------------------------------------- the CLI
 
 def _run_cli(*args):
-    proc = subprocess.run(
-        [sys.executable, str(MODULE_PATH), *args],
-        capture_output=True, text=True, timeout=30,
+    from tools.childproc import run as _run_child
+    proc = _run_child(
+        [sys.executable, str(MODULE_PATH), *args], timeout=30,
     )
     return proc.returncode, proc.stdout.strip()
 
@@ -188,10 +187,10 @@ def test_cli_pyside_no_for_ui_only_args():
 
 
 def test_cli_pyside_reads_stdin_when_no_paths_follow_flag():
-    proc = subprocess.run(
+    from tools.childproc import run as _run_child
+    proc = _run_child(
         [sys.executable, str(MODULE_PATH), "--pyside"],
-        input="ui/x.cs\nrelay/fleet_runner.py\n",
-        capture_output=True, text=True, timeout=30,
+        input=b"ui/x.cs\nrelay/fleet_runner.py\n", timeout=30,
     )
     assert proc.returncode == 0
     assert proc.stdout.strip() == "yes"

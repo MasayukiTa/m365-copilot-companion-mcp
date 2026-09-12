@@ -1,5 +1,4 @@
 import os
-import subprocess
 import sys
 
 from tools.local_loop_ops import (
@@ -35,9 +34,9 @@ def test_feature_flag_registers_protocol_tools_ahead_of_map_limit(tmp_path):
         "MCP_LOCAL_JOB_DB": str(tmp_path / "jobs.sqlite3"),
     })
     code = "import main; print(','.join(f.__name__ for f in main.TOOLS))"
-    proc = subprocess.run(
-        [sys.executable, "-c", code], cwd=os.getcwd(), env=env,
-        text=True, capture_output=True, timeout=30,
+    from tools.childproc import run as _run_child
+    proc = _run_child(
+        [sys.executable, "-c", code], cwd=os.getcwd(), env=env, timeout=30,
     )
     assert proc.returncode == 0, proc.stderr
     names = proc.stdout.strip().split(",")
@@ -57,9 +56,9 @@ def test_feature_flag_off_hides_protocol_tools(tmp_path):
         "MCP_LOCAL_JOB_DB": str(tmp_path / "jobs.sqlite3"),
     })
     code = "import main; print(','.join(f.__name__ for f in main.TOOLS))"
-    proc = subprocess.run(
-        [sys.executable, "-c", code], cwd=os.getcwd(), env=env,
-        text=True, capture_output=True, timeout=30,
+    from tools.childproc import run as _run_child
+    proc = _run_child(
+        [sys.executable, "-c", code], cwd=os.getcwd(), env=env, timeout=30,
     )
     assert proc.returncode == 0, proc.stderr
     names = proc.stdout.strip().split(",")

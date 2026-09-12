@@ -41,8 +41,8 @@ def test_the_setting_that_exposed_it_now_reaches_the_constant(tmp_path, monkeypa
     サブプロセスで確かめる。この試験プロセスは既に relay_fleet を import 済みで、
     モジュール定数は再評価されないため、同じプロセス内では**何を書いても通ってしまう**。
     """
-    import subprocess
     import sys
+    from tools.childproc import run as _run_child
 
     env_file = tmp_path / ".env"
     env_file.write_text("MCP_FLEET_SOCKET_RETRIES=7\n", encoding="utf-8")
@@ -55,8 +55,7 @@ def test_the_setting_that_exposed_it_now_reaches_the_constant(tmp_path, monkeypa
     )
     env = dict(os.environ)
     env.pop("MCP_FLEET_SOCKET_RETRIES", None)
-    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
-                         cwd=REPO, env=env, timeout=180)
+    out = _run_child([sys.executable, "-c", code], cwd=REPO, env=env, timeout=180)
     assert out.returncode == 0, out.stderr[-800:]
     assert out.stdout.strip().splitlines()[-1] == "7", (
         ".env の値が定数に届いていない: %r" % out.stdout[-200:])
