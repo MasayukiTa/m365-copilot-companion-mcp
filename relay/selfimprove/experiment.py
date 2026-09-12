@@ -88,8 +88,8 @@ def _git_commit() -> str:
     "unknown" the reader can see.
     """
     try:
-        out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO,
-                             capture_output=True, text=True, timeout=15)
+        from tools.childproc import run as _run_child
+        out = _run_child(["git", "rev-parse", "HEAD"], cwd=REPO, timeout=15)
         if out.returncode == 0:
             return (out.stdout or "").strip() or "unknown"
     except Exception:
@@ -104,8 +104,10 @@ def _git_dirty() -> bool | None:
     experiment recorded as reproducible would not be. Worth one subprocess.
     """
     try:
-        out = subprocess.run(["git", "status", "--porcelain"], cwd=REPO,
-                             capture_output=True, text=True, timeout=15)
+        # A dirty path with a Japanese name is the ordinary case on this machine, and
+        # losing the whole listing would read as "clean".
+        from tools.childproc import run as _run_child
+        out = _run_child(["git", "status", "--porcelain"], cwd=REPO, timeout=15)
         if out.returncode == 0:
             return bool((out.stdout or "").strip())
     except Exception:

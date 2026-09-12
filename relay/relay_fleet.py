@@ -4820,9 +4820,17 @@ class RelayWorker:
                 return CHECK_UNKNOWN
             try:
                 import subprocess
-                out = subprocess.run(
-                    ["git", "-C", repo, "log", "-n", "40", "--format=%s"],
-                    capture_output=True, text=True, timeout=20)
+                # UTF-8 FIRST, NOT THE CODE PAGE. `text=True` decodes with cp932 here.
+                # Measured over this repository's own history: 48 of 1582 commit subjects
+                # carry non-ASCII, and decoding the whole log with cp932 raises (byte 0x84 at
+                # position 9037). This call reads a 40-subject window over that population, so
+                # it fails when one of the 48 lands in the window -- INTERMITTENTLY, which is
+                # the worse shape: the `except` below swallows it and the check degrades to
+                # CHECK_UNKNOWN without saying anything, so it looks like a quiet repo rather
+                # than a broken read. Same class as the two bench incidents (4ef0d31, 1c83939).
+                from tools.childproc import run as _run_child
+                out = _run_child(
+                    ["git", "-C", repo, "log", "-n", "40", "--format=%s"], timeout=20)
             except Exception:
                 return CHECK_UNKNOWN
             if out.returncode != 0:
