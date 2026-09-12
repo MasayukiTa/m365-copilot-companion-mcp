@@ -136,11 +136,13 @@ jobs:
             tests/test_edge_taskbar_hygiene.py \
             ui/test_history_is_not_destroyed_by_a_failed_load.py \
             ui/test_deployed_cockpit_matches_its_source.py \
+            ui/test_an_approval_button_always_moves_the_queue.py \
             ui/test_a_fleet_conversation_can_be_answered.py \
             ui/test_fleet_cockpit_health.py \
             ui/test_fleet_cockpit_card_menu.py \
             ui/test_fleet_cockpit_advanced_settings.py \
             tools/test_gate_stop.py \
+            tools/test_one_override_isolates_every_gate_writer.py \
             tools/test_auto_is_a_mode_not_a_label.py \
             relay/selfimprove/test_one_rate_over_two_populations.py \
             relay/selfimprove/test_a_slice_that_cannot_decide_is_not_burned.py \

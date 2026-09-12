@@ -134,18 +134,34 @@ def test_load_contract_still_answers_the_old_question():
     assert CG.load_contract() is None
 
 
-def test_the_fail_closed_path_writes_its_gate_inside_the_test_directory(tmp_path):
-    """The fixture's isolation is itself asserted, because it silently failed once.
+def test_the_fail_closed_path_writes_its_gate_away_from_the_operator(tmp_path):
+    """The gate goes where the CODE resolves it, and that is not the operator's live directory.
 
-    Without this, the only signal that the gate directory was still the real one was a human
-    finding `rm -rf /` waiting for approval.
+    THIS GUARD ALREADY EXISTED FOR THIS EXACT INCIDENT and was green while it happened again.
+    It used to redirect `tools.file_ops.ALLOWED_BASE` in its own fixture and assert the gate
+    landed under it -- true, and true only of this file. Every other test raises its gate
+    through the same writer with the real ALLOWED_BASE, and this assertion said nothing about
+    them: a per-file guard against a repo-wide leak. Measured 2026-09-12: seven approval gates
+    from this repository's own tests reached the operator's screen, and he pressed 承認 on one.
+
+    The repo-wide guard was already there -- conftest sets MCP_GATE_DIR at module scope, before
+    tools.gate_ops is imported -- and contract_gate built its path by hand and never read it.
+
+    BOTH HALVES ARE NEEDED. "It went where the resolver said" is vacuous if the resolver points
+    at the real directory, and "it is not the real directory" is vacuous if nothing checks the
+    gate arrived at all.
     """
-    import tools.file_ops as FO
+    import os
     _write("{ not json")
     assert CG.check_op("shell_destructive", "rm -rf /") is not None
-    gate_dir = FO.ALLOWED_BASE / ".companion_gates"
-    assert gate_dir.is_dir(), "the gate was not written where the fixture pointed"
-    written = list(gate_dir.glob("*.json"))
-    assert written, "the fail-closed path did not create a gate at all"
-    for g in written:
-        assert str(g).startswith(str(FO.ALLOWED_BASE)), "a gate escaped the test directory: %s" % g
+
+    gate_dir = CG._gate_dir()
+    assert gate_dir.is_dir(), "the fail-closed path did not create a gate directory"
+    token = CG._stable_token("shell_destructive", "rm -rf /")
+    assert (gate_dir / ("%s.json" % token)).is_file(), (
+        "the fail-closed path did not create a gate at all")
+
+    live = os.path.realpath(os.path.join(os.path.expanduser("~"), ".companion_gates"))
+    assert os.path.realpath(str(gate_dir)) != live, (
+        "a test wrote an approval gate into the operator's live directory (%s) -- this is the "
+        "leak that put `rm -rf /` on his screen" % gate_dir)

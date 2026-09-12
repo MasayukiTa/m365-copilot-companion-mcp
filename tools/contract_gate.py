@@ -59,8 +59,30 @@ _REPO = _THIS.parent.parent              # repo root
 _FLEET_DIR = _REPO / ".fleet"
 _CONTRACT_FILE = _FLEET_DIR / "active_contract.json"
 
-# ── Gate directory (mirrors gate_ops.py / GATE_DIR) ──
-# Imported lazily inside functions to avoid circular imports at module load.
+# ── Gate directory ──
+# RESOLVED THROUGH gate_ops, NOT MIRRORED. This comment used to say the directory "mirrors
+# gate_ops.py / GATE_DIR", and the two copies below built `ALLOWED_BASE / ".companion_gates"`
+# by hand -- so `MCP_GATE_DIR`, which gate_ops honours, isolated gate_ops' writes and not
+# these. Measured 2026-09-12: an isolated run set the variable, and its approval gate still
+# landed in the operator's live directory (1433 -> 1434) while the sandbox stayed empty.
+# Partial isolation is worse than none: the variable existing tells a caller the writes are
+# contained, and half of them are.
+# Imported lazily inside the functions to avoid circular imports at module load.
+
+
+def _gate_dir():
+    """Where gate files live, as gate_ops decides it.
+
+    Falls back to the old hand-built path if gate_ops cannot be imported: a gate written in
+    the default place is recoverable, and a gate that cannot be written at all silently turns
+    an approval into an allow.
+    """
+    try:
+        from tools.gate_ops import GATE_DIR
+        return GATE_DIR
+    except Exception:
+        from tools.file_ops import ALLOWED_BASE
+        return ALLOWED_BASE / ".companion_gates"
 
 
 # ---------------------------------------------------------------------------
@@ -660,9 +682,7 @@ def _stable_token(op_class: str, detail: str) -> str:
 def _find_existing_gate(token: str) -> Optional[dict]:
     """Return the gate file data for `token` if it exists, else None."""
     try:
-        from tools.file_ops import ALLOWED_BASE
-        gate_dir = ALLOWED_BASE / ".companion_gates"
-        gate_file = gate_dir / f"{token}.json"
+        gate_file = _gate_dir() / f"{token}.json"
         if not gate_file.is_file():
             return None
         return json.loads(gate_file.read_text(encoding="utf-8"))
@@ -673,9 +693,8 @@ def _find_existing_gate(token: str) -> Optional[dict]:
 def _create_gate(token: str, question: str, context: str) -> None:
     """Write a gate file for the given token (used instead of gate_ask to supply our own token)."""
     try:
-        from tools.file_ops import ALLOWED_BASE
         from tools.notify_ops import notify_approval_gate
-        gate_dir = ALLOWED_BASE / ".companion_gates"
+        gate_dir = _gate_dir()
         gate_dir.mkdir(parents=True, exist_ok=True)
         gate_file = gate_dir / f"{token}.json"
         if gate_file.is_file():
