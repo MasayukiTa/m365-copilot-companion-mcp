@@ -52,8 +52,8 @@ def pid_alive(pid) -> bool:
     """
     script = "@(Get-CimInstance Win32_Process -Filter \"ProcessId=%s\").Count" % int(pid)
     try:
-        out = subprocess.run(["powershell", "-NoProfile", "-Command", script],
-                             capture_output=True, text=True, timeout=25).stdout.strip()
+        from tools.childproc import run as _run_child
+        out = _run_child(["powershell", "-NoProfile", "-Command", script], timeout=25).stdout.strip()
         return not (out.isdigit() and int(out) == 0)
     except Exception:
         return True

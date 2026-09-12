@@ -35,9 +35,14 @@ supervisor itself is gone).
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
+
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
 
 #: profile -> (human name, regex matching the command line of a process that owns it)
 OWNERS = {
@@ -89,8 +94,8 @@ def _ps(script, timeout=40):
     "unknown" and fall back to the safe (do-not-reap) answer.
     """
     try:
-        out = subprocess.run(["powershell", "-NoProfile", "-Command", script],
-                             capture_output=True, text=True, timeout=timeout)
+        from tools.childproc import run as _run_child
+        out = _run_child(["powershell", "-NoProfile", "-Command", script], timeout=timeout)
     except Exception:
         return _PS_FAILED
     if out.returncode != 0:

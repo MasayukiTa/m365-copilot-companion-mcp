@@ -21,8 +21,12 @@ def main() -> int:
         return 1
     wt = sys.argv[1]
     try:
-        diff = subprocess.run(["git", "-C", wt, "diff"], capture_output=True, text=True,
-                              timeout=60).stdout
+        # UTF-8 FIRST, THEN THE CODE PAGE, NEVER RAISING. `text=True` here decoded a PATCH
+        # with cp932 and one byte deleted the whole diff -- the incident that cost 60 solved
+        # instances (4ef0d31). Routed through the shared policy so this file cannot drift
+        # from the rest of the sweep.
+        from tools.childproc import run as _run_child
+        diff = _run_child(["git", "-C", wt, "diff"], timeout=60).stdout
     except Exception as e:
         print("DIFFGATE_ERROR: could not read git diff at %s: %s" % (wt, e), file=sys.stderr)
         return 1

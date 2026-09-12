@@ -21,10 +21,9 @@ _GREP_MAX_FILE_BYTES = int(float(os.environ.get("MCP_GREP_MAX_FILE_MB", "8")) * 
 
 
 def _run(args: list[str], cwd: Optional[Path], timeout: int) -> str:
-    result = subprocess.run(
+    from tools.childproc import run as _run_child
+    result = _run_child(
         args,
-        capture_output=True,
-        text=True,
         timeout=timeout,
         cwd=str(cwd) if cwd else os.getcwd(),
         shell=False,

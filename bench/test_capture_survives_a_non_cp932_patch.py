@@ -119,8 +119,14 @@ def test_the_old_way_really_did_lose_everything(tmp_path):
     """Guards against the reproduction being theatre: with text=True and the cp932 codepage,
     the same bytes lose the ENTIRE output rather than one character.
 
-    Skipped where cp932 is not available (CI runs on Linux), because the point is about a
-    codepage that cannot represent the byte, not about Windows.
+    THE LOSS HAS TWO SHAPES AND ONLY ONE WAS WRITTEN DOWN. cp932 is a PYTHON CODEC, not a
+    Windows codepage, so it is present on Linux too and the LookupError skip below never fires
+    in CI. There the UnicodeDecodeError propagates out of subprocess.run and the test errors;
+    on Windows the same exception dies inside the reader thread (pytest reports
+    PytestUnhandledThreadExceptionWarning), `.stdout` comes back None, and the assertion
+    passes. Both are "the entire output is gone", which is the claim -- an exception is simply
+    its strongest form. Measured in CI 2026-09-12: "UnicodeDecodeError: 'cp932' codec can't
+    decode byte 0x9c in position 20".
     """
     try:
         KILLER.decode("cp932")
@@ -130,8 +136,11 @@ def test_the_old_way_really_did_lose_everything(tmp_path):
             pytest.skip("cp932 is not available in this environment")
     script = tmp_path / "emit.py"
     script.write_text("import sys\nsys.stdout.buffer.write(%r)\n" % KILLER, encoding="utf-8")
-    r = subprocess.run([sys.executable, str(script)], capture_output=True,
-                       text=True, encoding="cp932", timeout=60)
+    try:
+        r = subprocess.run([sys.executable, str(script)], capture_output=True,
+                           text=True, encoding="cp932", timeout=60)
+    except UnicodeDecodeError:
+        return              # the loudest form of the same loss: nothing came back at all
     assert r.stdout is None or "diff --git" not in (r.stdout or ""), (
         "the old path did not lose the output, so the incident is not reproduced here")
 
