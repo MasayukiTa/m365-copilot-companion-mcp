@@ -2819,6 +2819,22 @@ class RelayWorker:
                         + "\n上記を最優先で踏まえて作業を続行してください。"
                         "完了なら DONE、無理なら FAIL と理由を書いてください。")
             self._last_was_steer = True
+            # A PERSON INTERVENED, SO THE CHAIN BEFORE THEM IS NOT EVIDENCE ABOUT WHAT COMES
+            # AFTER. `_continue_count` has had this rule in three places since it was written
+            # ("a steer is real progress"); `no_progress` -- the counter that actually
+            # TERMINATES a worker -- had it nowhere, so a worker sitting at max-1 could be
+            # steered and still be declared stuck on the very next reply, compared against a
+            # key from before the intervention. The person's message is in the transcript and
+            # the worker is recorded as having made no progress through it.
+            #
+            # BOTH, because either alone is not enough: zeroing the count while keeping the
+            # key means the next reply matches that stale key and the count is back to 1
+            # immediately.
+            #
+            # Reset HERE, where the steer is actually delivered, not where it was queued -- a
+            # message sitting in the queue has not reached anyone yet.
+            self.no_progress = 0
+            self.last_norm = None
         else:
             self._last_was_steer = False
         # A DEFERRED SEND LEAVES self.job INTACT, SO THE NEXT SWEEP RE-SENDS IT VERBATIM.
@@ -6265,6 +6281,27 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     _retry_seen, _retry_used = set(), {}
     if add_box is None:
         _retry_on = False        # nowhere to put a re-queued goal
+        # A SPLIT HAS NOWHERE TO PUT ITS CHILDREN EITHER -- and unlike a retry, that is not a
+        # reason to decline. A retry re-queues the CALLER'S goal, so an absent box means the
+        # caller does not want more goals back. A split is internal: the caller asked for one
+        # goal and still wants one answer, and the merge IS that answer.
+        #
+        # Unreachable until 2026-09-13, when `fanout` began defaulting True: before that a
+        # caller enabling it was also wiring a box. Measured the same day by the first test to
+        # enter here with fan-out live and no box --
+        #   AttributeError: 'NoneType' object has no attribute 'extend'   (_spawn_children)
+        #   AttributeError: 'NoneType' object has no attribute 'append'   (_queue_ready_merges)
+        #
+        # The loop below drains this list itself, so children and the merge run here just as
+        # they do for the fleet runner; the caller is simply not handed a list it never asked
+        # for, and gets the merge back among its results.
+        #
+        # NOT GATED ON `fanout`, and the first attempt at this was. A family SPLIT BY AN
+        # EARLIER RUN is rehydrated from the ledger and merged by this one whether or not this
+        # run is itself fan-out-capable -- which is right, the answer is owed either way, and
+        # means the box is needed either way. Gating it on the flag left the crash in place
+        # for exactly the recovery path the ledger exists for.
+        add_box = []
 
     _reap_counter = 0
     while (any(w.status not in TERMINAL for w in workers)

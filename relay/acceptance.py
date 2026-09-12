@@ -64,15 +64,62 @@ VALID_TYPES = _PROC_TYPES | _FILE_TYPES | _TEXT_TYPES
 _TEST_RUNNER_TYPES = frozenset({"pytest", "python"})
 
 
+class MalformedCheck(ValueError):
+    """A goal's acceptance spec could not be read as checks.
+
+    ITS OWN TYPE so a caller can tell "your check is wrong" from "your check failed". Those
+    are opposite situations -- one is a configuration error the person can fix in the goal in
+    front of them, the other is the tool doing its job.
+    """
+
+
+#: Restore the old behaviour of silently dropping malformed entries. OFF by default.
+#:
+#: The escape exists for an operator holding a goals file they cannot edit right now -- the
+#: alternative is that an overnight run dies at 2am on a stale file and the lesson learned is
+#: to stop writing checks at all. It still PRINTS what it dropped, so leniency is visible in
+#: the log rather than being the same silence it replaced.
+LENIENT = os.environ.get("MCP_ACCEPTANCE_LENIENT", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def normalize_checks(spec):
-    """Coerce a goal's check spec into a list[dict]. Accepts None, a single dict, or a
-    list of dicts; silently drops non-dict members. Returns []."""
+    """Coerce a goal's check spec into a list[dict]. Accepts None, a single dict, or a list
+    of dicts. Raises MalformedCheck on anything else.
+
+    IT USED TO DROP WHAT IT COULD NOT READ, and dropping is indistinguishable from "no check
+    was wanted" -- which is the branch the worker then takes ("no checks -> DONE accepted as
+    before"). Measured 2026-09-13: `merge_acceptance_checks` returned sentences, they were
+    dropped here, and the one gate between a merge and a confident report of an incomplete
+    sweep had never run. Nothing said a check had been discarded.
+
+    A MIXED LIST IS THE DANGEROUS ONE. `[{"type": "pytest"}, "and also check X"]` came back
+    with one check and looked verified, having quietly stopped testing half of what was asked.
+
+    A string is REFUSED, not reinterpreted as a shell command. Guessing what someone meant is
+    how a check comes to test something other than what was asked for.
+    """
     if spec is None:
         return []
     if isinstance(spec, dict):
         return [spec]
     if isinstance(spec, (list, tuple)):
+        bad = [c for c in spec if not isinstance(c, dict)]
+        if bad:
+            if not LENIENT:
+                raise MalformedCheck(
+                    "acceptance check %d of %d is %s, not a check spec: %r. A check is a dict "
+                    "like {\"type\": \"pytest\", \"args\": \"-q\"}; see acceptance.py for the "
+                    "types. (MCP_ACCEPTANCE_LENIENT=1 drops it instead.)"
+                    % (list(spec).index(bad[0]) + 1, len(spec), type(bad[0]).__name__, bad[0]))
+            print("[acceptance] dropping %d malformed check(s) (MCP_ACCEPTANCE_LENIENT): %r"
+                  % (len(bad), bad[:3]), flush=True)
         return [c for c in spec if isinstance(c, dict)]
+    if not LENIENT:
+        raise MalformedCheck(
+            "acceptance checks must be a dict or a list of dicts, got %s: %r"
+            % (type(spec).__name__, spec))
+    print("[acceptance] dropping a malformed check spec (MCP_ACCEPTANCE_LENIENT): %r"
+          % (spec,), flush=True)
     return []
 
 
@@ -102,10 +149,20 @@ class Check:
         self.reply = reply
         # per-check cwd wins; else the goal's cwd; else the current dir
         self.cwd = self.spec.get("cwd") or cwd or None
+        # A TIMEOUT THAT CANNOT BE READ IS A CONFIGURATION ERROR, NOT A DEFAULT. Measured
+        # 2026-09-13: "soon" silently became 180s (the guard is now a different length than
+        # anyone asked for), -5 put the deadline in the past so the check was killed the
+        # instant it started and reported a timeout that never happened, and NaN made
+        # `time.time() > deadline` False forever -- a process-backed check that NEVER times
+        # out, i.e. one typo turns the timeout guard off and the worker waits until the run
+        # ends. Silently substituting a number for an unreadable one hides all three.
+        _t = self.spec.get("timeout", default_timeout)
         try:
-            self.timeout = float(self.spec.get("timeout", default_timeout))
+            self.timeout = float(_t)
         except (TypeError, ValueError):
-            self.timeout = float(default_timeout)
+            raise MalformedCheck("check timeout must be a positive number, got %r" % (_t,))
+        if not (self.timeout > 0) or self.timeout != self.timeout:   # <=0, or NaN
+            raise MalformedCheck("check timeout must be a positive number, got %r" % (_t,))
         self._proc = None
         self._out = None          # TemporaryFile for stdout
         self._err = None          # TemporaryFile for stderr
