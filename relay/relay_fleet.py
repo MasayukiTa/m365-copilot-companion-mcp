@@ -2317,11 +2317,25 @@ class RelayWorker:
         # permissiveness.
         _depth0 = int(getattr(self.task_envelope, "depth", 0) or 0) == 0
         _goal_splittable = False
+        # WHY THE VERDICT IS KEPT RATHER THAN RECORDED HERE: `self.run_id` is assigned further
+        # down this constructor, so a telemetry call beside the judgement would raise
+        # AttributeError on exactly the path that has something to report. This file has paid
+        # for that ordering once already -- see the `follow_up_to` block above, whose only
+        # informative branch raised because `self.name` was assigned later.
+        self._split_reason = ""
         if fanout and _depth0:
             try:
-                _goal_splittable = _splittability.judge(self.goal).should_split
-            except Exception:
+                _v = _splittability.judge(self.goal)
+                _goal_splittable = _v.should_split
+                self._split_reason = "%s: %s" % (getattr(_v, "decision", "?"),
+                                                 (getattr(_v, "reason", "") or "")[:200])
+            except Exception as _exc:
                 _goal_splittable = False
+                self._split_reason = "judge failed (%s); failure is not permission" % type(_exc).__name__
+        elif not _depth0:
+            self._split_reason = "a child may not split again (depth > 0)"
+        else:
+            self._split_reason = "the run was not launched fan-out-capable"
         self.fanout = bool(fanout) and _depth0 and _goal_splittable
         self._fanout_done = False
         if self.fanout:
@@ -2367,6 +2381,16 @@ class RelayWorker:
         # so the two mechanism records this class writes had no run to name and went into
         # .fleet/mechanisms.jsonl blank -- 2981 of 4386 rows.
         self.run_id = run_id or ""
+        # STEP TWO OF THE STAIRCASE, per worker. `configured` is written once per run at
+        # launch; this is the per-goal answer, and it is per worker because that is where the
+        # decision is made -- including for goals added mid-run, which run the same judge.
+        try:
+            _mt.record("fanout", run_id=self.run_id, goal_hash=getattr(self, "original_goal_hash", ""),
+                       configured=bool(fanout), config_source="per-goal judge",
+                       eligible=bool(self.fanout),
+                       ineligible_reason=("" if self.fanout else (self._split_reason or "")))
+        except Exception:
+            pass
         self._tx_base_key = ((run_id + "_") if run_id else "") + name
         self._tx_key = (self._tx_base_key + "_a0"
                         if self.resilience_profile != "off" else self._tx_base_key)
@@ -5745,6 +5769,16 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                              "subtask_index": k.get("subtask_index"),
                              "text": (k.get("text") or "")[:4000]},
                             ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+        # STEP THREE. Written HERE, where the split actually happens, because everything
+        # else in this function is a record of the family rather than of the mechanism: the
+        # campaigns ledger held 105 of these while the telemetry reported `triggered` zero
+        # times, and a reader trusting the telemetry would have concluded fan-out had never
+        # run in production.
+        try:
+            _mt.record("fanout", run_id=run_id, configured=True, config_source="split", eligible=True, triggered=True,
+                       extra={"campaign_id": cid, "children": len(kids)})
         except Exception:
             pass
         print("[fanout] %s -> %d subtask(s)" % (cid, len(kids)), flush=True)
