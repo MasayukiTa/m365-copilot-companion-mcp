@@ -53,6 +53,22 @@ def log(m):
     print("[%s] %s" % (time.strftime("%H:%M:%S"), m), flush=True)
 
 
+def _spec_ids(spec_path):
+    """Every instance id the spec names, whatever shape it is stored in.
+
+    Split out of select_fresh_slice so the pool can be reported without drawing from it --
+    asking "how much is left" must not have the side effect of taking some.
+    """
+    with open(spec_path, encoding="utf-8") as fh:
+        d = json.load(fh)
+    if isinstance(d, list):
+        return [x if isinstance(x, str) else (x or {}).get("instance_id") for x in d]
+    for key in ("instance_ids", "instances", "ids"):
+        if isinstance(d.get(key), list):
+            return list(d[key])
+    return []
+
+
 def select_fresh_slice(spec_path, n, burned, seed):
     """Pick n instance ids from the spec that are NOT burned. Deterministic (seeded)."""
     import random
@@ -166,6 +182,39 @@ def validate(toggle, spec_path, n, seed, dataset_key, alpha, min_n, min_pp,
     with open(targets_file, "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(fresh) + "\n")
     log("fresh slice: %d instances (burned excluded: %d) -> %s" % (len(fresh), len(burned), targets_file))
+
+    # WHAT THIS CONFIGURATION CAN AND CANNOT PRODUCE, said BEFORE anything is burned.
+    #
+    # `burned.add(fresh)` runs after grading whatever the verdict was, and that is correct --
+    # the instances have been seen by the system under test, so they are contaminated even by a
+    # run that concluded nothing. The defect was that a configuration which could not reach a
+    # verdict stayed silent until the slice was already gone. Measured 2026-09-11/12: `--n 100`
+    # against `min_n=100`, one chunk of twenty lost to a staging failure, N=80, verdict
+    # `underpowered`, 100 instances burned for nothing.
+    margin = len(fresh) - int(min_n)
+    if margin < 0:
+        log("REFUSING: %d fresh instances cannot reach min_n=%d even if nothing is lost; "
+            "this would burn the slice for a guaranteed `underpowered` verdict. Raise --n, "
+            "lower --min-n, or retire burned instances."
+            % (len(fresh), min_n))
+        return {"status": "refused_underpowered_by_construction", "n": len(fresh),
+                "min_n": min_n, "burned": False, "report": None}
+    if margin == 0:
+        log("WARNING: n == min_n (%d), so a verdict needs ZERO attrition. The run of "
+            "2026-09-11 lost 20 of 100 to one staging failure and burned the slice for an "
+            "`underpowered` verdict. The default --n is 200 for this reason." % min_n)
+
+    # HOW MUCH POOL IS LEFT, in runs rather than in instances. SWE-bench Verified is 500
+    # instances and there is no more of it; "we ran out" should be a number the operator can
+    # plan against before choosing --n, not a discovery made at the end of a night.
+    try:
+        remaining = len(burned.filter_fresh(_spec_ids(spec_path)))
+    except Exception:
+        remaining = None
+    if remaining is not None:
+        log("pool: %d fresh remain after this slice is drawn; at n=%d that is %d more run(s)"
+            % (max(0, remaining - len(fresh)), len(fresh),
+               (remaining - len(fresh)) // max(1, len(fresh))))
 
     plan = {"toggle": toggle, "n": len(fresh), "dataset": dataset_key, "alpha": alpha,
             "min_n": min_n, "min_pp": min_pp, "targets_file": targets_file}
