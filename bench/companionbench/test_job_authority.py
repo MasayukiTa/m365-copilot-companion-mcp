@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
 
 import pytest
@@ -98,18 +97,16 @@ def test_the_two_operation_lists_do_not_overlap():
 def test_no_secret_is_visible_in_the_child_command_line(authority):
     """DBパス・両トークン・HMAC鍵が argv にあった。同一OSユーザのプロセスは
     プロセス一覧を読むだけでそれを全部得られる -- 境界と呼べるものではない。"""
+    from tools.childproc import run as _run_child
     if sys.platform != "win32":
-        cmdlines = subprocess.run(["ps", "-ww", "-o", "args="], capture_output=True,
-                                  text=True).stdout
+        cmdlines = _run_child(["ps", "-ww", "-o", "args="]).stdout
     else:
-        cmdlines = subprocess.run(
-            ["wmic", "process", "get", "commandline"],
-            capture_output=True, text=True).stdout or ""
+        cmdlines = _run_child(
+            ["wmic", "process", "get", "commandline"]).stdout or ""
         if not cmdlines.strip():
-            cmdlines = subprocess.run(
+            cmdlines = _run_child(
                 ["powershell", "-NoProfile", "-Command",
-                 "Get-CimInstance Win32_Process | Select-Object -ExpandProperty CommandLine"],
-                capture_output=True, text=True).stdout or ""
+                 "Get-CimInstance Win32_Process | Select-Object -ExpandProperty CommandLine"]).stdout or ""
     if not cmdlines.strip():
         pytest.skip("cannot read the process table on this host")
     for secret in (authority.agent_token, authority.judge_token,

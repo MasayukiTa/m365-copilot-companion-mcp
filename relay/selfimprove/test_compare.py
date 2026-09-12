@@ -555,9 +555,9 @@ def test_every_public_name_is_defined_before_the_entry_point():
 
 def test_the_cli_runs_as_a_module_not_only_as_an_import():
     """import 経由でしか確かめないと、この種の欠陥は最後まで見えない。"""
-    import subprocess
     import sys
-    out = subprocess.run([sys.executable, "-m", "relay.selfimprove.compare", "--help"],
-                         capture_output=True, text=True, timeout=120)
+    from tools.childproc import run as _run_child
+    out = _run_child([sys.executable, "-m", "relay.selfimprove.compare", "--help"],
+                      timeout=120)
     assert out.returncode == 0, out.stderr[-400:]
     assert "branches" in out.stdout and "history" in out.stdout

@@ -10,7 +10,6 @@ three times.
 The tests are grouped by the property they defend, not by the report's numbering, because the
 properties are what has to survive the next edit.
 """
-import subprocess
 import sys
 
 import pytest
@@ -52,14 +51,13 @@ def test_both_powershell_spawn_sites_pass_a_sanitised_environment():
 def test_a_child_that_inherits_would_have_seen_them(monkeypatch):
     """The counterexample, so the test above is anchored to a real consequence."""
     monkeypatch.setenv("MCP_API_KEY", "CANARY-key")
-    r = subprocess.run([sys.executable, "-c",
-                        "import os;print(os.environ.get('MCP_API_KEY','<absent>'))"],
-                       capture_output=True, text=True, timeout=60)
+    from tools.childproc import run as _run_child
+    r = _run_child([sys.executable, "-c",
+                    "import os;print(os.environ.get('MCP_API_KEY','<absent>'))"], timeout=60)
     assert "CANARY-key" in r.stdout, "inheritance is what the fix prevents"
-    r2 = subprocess.run([sys.executable, "-c",
-                         "import os;print(os.environ.get('MCP_API_KEY','<absent>'))"],
-                        capture_output=True, text=True, timeout=60,
-                        env=sanitized_child_env())
+    r2 = _run_child([sys.executable, "-c",
+                     "import os;print(os.environ.get('MCP_API_KEY','<absent>'))"], timeout=60,
+                    env=sanitized_child_env())
     assert "<absent>" in r2.stdout
 
 

@@ -142,14 +142,12 @@ def test_the_checker_is_handed_the_goal():
 # because "call the function and confirm" means the git-backed path too, not only the stub.
 # Linux-safe: only `git init/add/commit/log`, no OS-specific paths.
 
-import subprocess  # noqa: E402
-
 from relay import relay_fleet as rf  # noqa: E402
 
 
 def _git(repo, *args):
-    subprocess.run(["git", "-C", str(repo), *args],
-                   check=True, capture_output=True, text=True)
+    from tools.childproc import run as _run_child
+    _run_child(["git", "-C", str(repo), *args], check=True)
 
 
 def _repo_with_commit(tmp_path, subject):
