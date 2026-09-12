@@ -632,16 +632,47 @@ class ApprovalPromptWindow : Window
             L("影響の大きい操作です。対象を確認したうえで本当に承認しますか？\n\n",
               "This is a high-impact operation. Approve after reviewing the exact scope?\n\n") + S(_current, "question"),
             L("最終確認", "Final confirmation"), MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) != MessageBoxResult.Yes) return;
+        // EVERY PATH OUT OF HERE ENDS AT LoadNext(). This used to `return` twice without it --
+        // once when the gate file was missing and once when the write threw -- leaving
+        // _current set and the same request on screen. Reported 2026-09-12: 承認 pressed
+        // repeatedly on a gate whose file had been removed elsewhere, and nothing ever
+        // happened. A button that does nothing teaches people the window is broken, and after
+        // that they stop reading what it says, which is the whole failure an approval queue
+        // exists to avoid.
+        var gate = ReadGate(_currentPath);
+        if (gate == null)
+        {
+            // GONE IS RESOLVED, NOT BROKEN. The file is removed when a request is answered
+            // from the console, from another window, or by a cleanup -- so there is nothing
+            // to decide here any more. Move on quietly; saying "it vanished" about something
+            // the operator did themselves is noise.
+            _current = null; _currentPath = null; LoadNext(); return;
+        }
         try
         {
-            var gate = ReadGate(_currentPath); if (gate == null) return;
             gate.Remove("path"); gate["answered"] = true; gate["answer"] = verdict; gate["answered_at"] = NowUnix();
             string tmp = _currentPath + ".tmp";
             File.WriteAllText(tmp, _js.Serialize(gate), new UTF8Encoding(false));
             try { File.Replace(tmp, _currentPath, null); }
             catch { File.Copy(tmp, _currentPath, true); try { File.Delete(tmp); } catch { } }
         }
-        catch { return; }
+        catch (Exception ex)
+        {
+            // A WRITE THAT FAILED IS NOT THE SAME AS A GATE THAT VANISHED, and the operator
+            // has to hear about this one: the operation they just approved will NOT proceed,
+            // because the thing that reads the answer never sees it.
+            try
+            {
+                MessageBox.Show(this,
+                    L("この承認を記録できませんでした。操作は実行されません。\n\n",
+                      "This answer could not be recorded, so the operation will not proceed.\n\n")
+                    + ex.Message,
+                    L("承認の記録に失敗", "Could not record the answer"),
+                    MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+            catch { }
+            _current = null; _currentPath = null; LoadNext(); return;
+        }
         _current = null; _currentPath = null; LoadNext();
     }
 }
