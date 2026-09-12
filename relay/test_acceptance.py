@@ -16,7 +16,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from relay.acceptance import Check, normalize_checks, run_all_blocking, run_check_blocking
+from relay.acceptance import Check, normalize_checks, run_all_blocking, run_check_blocking, MalformedCheck
 
 PY = sys.executable
 results = []
@@ -116,7 +116,35 @@ def main():
     check("run_all_pass", p)
     check("normalize_none", normalize_checks(None) == [])
     check("normalize_dict", normalize_checks({"type": "shell"}) == [{"type": "shell"}])
-    check("normalize_list", len(normalize_checks([{"a": 1}, "junk", {"b": 2}])) == 2)
+    check("normalize_list", normalize_checks([{"a": 1}, {"b": 2}]) == [{"a": 1}, {"b": 2}])
+
+    # 13. a malformed check is REFUSED, not dropped.
+    #
+    # This asserted `len(...) == 2` for `[{"a":1}, "junk", {"b":2}]` -- i.e. that the junk
+    # entry was silently discarded and the goal carried on with two checks. That behaviour is
+    # what let `merge_acceptance_checks` return sentences, have them all dropped here, and
+    # leave the merge on its "no checks -> trust the DONE" branch: the one gate between a merge
+    # and a confident report of an incomplete sweep never ran once. The mixed list is the
+    # dangerous shape -- a goal comes back "verified" having quietly stopped testing half of
+    # what was asked.
+    try:
+        normalize_checks([{"a": 1}, "junk", {"b": 2}])
+        check("malformed_is_refused", False)
+    except MalformedCheck as _e:
+        # It must NAME the offending entry: the person fixing it is looking at their own
+        # goals file, and "invalid spec" sends them to read all of it.
+        check("malformed_is_refused", "junk" in str(_e) and "2 of 3" in str(_e))
+
+    # A bad TIMEOUT is refused too, and that one is worse than silent: -5 puts the deadline in
+    # the past (killed the instant it starts, reporting a timeout that never happened) and NaN
+    # makes `time.time() > deadline` False forever -- a check that NEVER times out.
+    for _bad in ("soon", -5, float("nan")):
+        try:
+            Check({"type": "shell", "cmd": "x", "timeout": _bad})
+            check("timeout_%r_refused" % (_bad,), False)
+        except MalformedCheck:
+            check("timeout_%r_refused" % (_bad,), True)
+    check("timeout_good_kept", Check({"type": "shell", "cmd": "x", "timeout": 30}).timeout == 30.0)
 
     print("\n=== %d/%d acceptance checks passed ===" % (sum(results), len(results)))
     return 0 if all(results) else 1
