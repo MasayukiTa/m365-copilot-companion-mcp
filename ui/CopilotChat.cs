@@ -39,6 +39,10 @@ class Conversation
     public double Ts = 0;
     public string Transcript = "";   // disk jsonl path (fleet convs) -> open from disk, no scrape
     public string Name = "";         // worker name (fallback to resolve the transcript by name)
+    public string Goal = "";         // fleet: the FULL goal text -- what identifies this
+                                     // conversation to socket_route.conversation_for_goal,
+                                     // so a follow-up can continue it. Title is truncated
+                                     // for display and must never be used for this.
     public List<Msg> Messages = new List<Msg>();
     public bool Untitled() { return string.IsNullOrEmpty(Title); }
 }
@@ -189,6 +193,12 @@ class ChatWindow : Window
         // ── send-target pinning / reachability fallback errors (nothing was sent) ────
         if (k == "send_wrong_page")  return ja ? "送信先の会話に接続できませんでした — 送信は行われていません" : "Could not connect to the target conversation — nothing was sent.";
         if (k == "send_unknown_conv") return ja ? "この会話の送信先を特定できません。会話を開き直してください。" : "Can't identify where to send this — please reopen the conversation.";
+        // ── fleet conversations: the message goes to the fleet, not to the bridge page ──
+        if (k == "fleet_steer_sent")  return ja ? "実行中のワーカーに追加指示を渡しました。次のターンから反映されます。" : "Handed to the running worker -- it takes effect on its next turn.";
+        if (k == "fleet_follow_sent") return ja ? "この会話の続きとして、新しいワーカーに引き継ぎました（同じ会話を継続します）。" : "Queued as a follow-up: a new worker will continue this same conversation.";
+        if (k == "fleet_follow_idle") return ja ? "フリートが起動していないため、次の走行で拾われます（同じ会話の続きとして投入済み）。" : "No fleet is running, so this waits for the next one -- queued as a continuation of this conversation.";
+        if (k == "fleet_no_goal")     return ja ? "この会話を識別するゴール本文が記録されていないため、続きを投入できません。" : "This conversation has no recorded goal text to identify it, so it can't be continued.";
+        if (k == "fleet_send_failed") return ja ? "フリートへの受け渡しに失敗しました。送信は行われていません。" : "Could not hand this to the fleet -- nothing was sent.";
         if (k == "send_offline") return ja ? "ブリッジに接続できません。送信していません。" : "Can't reach the bridge. Nothing was sent.";
         if (k == "retry_start_stack") return ja ? "スタックを起動して再試行" : "Start the stack and retry";
         if (k == "reload_transcript") return ja ? "再読み込み" : "Reload";
@@ -4063,6 +4073,17 @@ class ChatWindow : Window
         // a fleet-card open landing mid-send must not be able to redirect this reply elsewhere.
         Conversation target = _conv;
 
+        // A FLEET CONVERSATION IS NOT ON THE PAGE, so none of the page-pinning doors below can
+        // open it and it used to fall through all three to send_unknown_conv. It belongs to a
+        // worker on a socket, and the fleet already accepts messages for one -- as a steer
+        // while it is live, as a follow-up goal once it is not.
+        if (target.Source == "fleet")
+        {
+            _input.Clear(); HideRouter();
+            SendToFleetConversation(target, text);
+            return;
+        }
+
         // ── page pinning: make sure the bridge page actually shows `target` before we send ──
         if (!ReferenceEquals(target, _pageConv))
         {
@@ -4123,6 +4144,104 @@ class ChatWindow : Window
 
     // ── #3 fleet-aware routing ───────────────────────────────────────────────────
     // returns [running(0/1), openTabs, maxConcurrent]
+    // The live worker for this conversation, or "" -- matched on the TRANSCRIPT PATH, which
+    // is unique per worker per run. Matching on the worker name instead would be wrong in the
+    // ordinary case: "w0" exists in every run there has ever been, and a steer addressed to a
+    // name is delivered by name, so an old conversation would steer a stranger.
+    string LiveWorkerFor(Conversation c)
+    {
+        try
+        {
+            if (c == null || string.IsNullOrEmpty(c.Transcript)) return "";
+            string sp = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", ".fleet", "status.json"));
+            if (!File.Exists(sp)) return "";
+            string txt;
+            using (var fsr = new FileStream(sp, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var sr = new StreamReader(fsr, Encoding.UTF8)) txt = sr.ReadToEnd();
+            var d = _cjs.DeserializeObject(txt) as Dictionary<string, object>;
+            if (d == null) return "";
+            if (!(d.ContainsKey("running") && Convert.ToBoolean(d["running"]))) return "";
+            if (!(d.ContainsKey("workers") && d["workers"] is object[])) return "";
+            foreach (object o in (object[])d["workers"])
+            {
+                var w = o as Dictionary<string, object>;
+                if (w == null) continue;
+                if (!string.Equals(SS(w, "transcript"), c.Transcript, StringComparison.OrdinalIgnoreCase)) continue;
+                string st = SS(w, "status");
+                // Terminal statuses mirror ReadActiveFleetWorkerCount's list; "pending" is
+                // queued-not-started, which cannot take a steer either.
+                if (st == "done" || st == "resolved" || st == "failed" || st == "error"
+                    || st == "cancelled" || st == "stopped" || st == "stuck" || st == "pending") return "";
+                return SS(w, "name");
+            }
+        }
+        catch { }
+        return "";
+    }
+
+    // Merge one key into .fleet/commands.json without dropping what is already queued there.
+    // The fleet consumes the whole file, so a blind overwrite would eat another writer's
+    // pending commands -- EnqueueToFleet already reads-then-appends for the same reason.
+    bool AppendCommand(string key, object item)
+    {
+        try
+        {
+            string cp = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", ".fleet", "commands.json"));
+            var cmd = new Dictionary<string, object>();
+            if (File.Exists(cp))
+            {
+                try { var ex = _cjs.DeserializeObject(File.ReadAllText(cp, Encoding.UTF8)) as Dictionary<string, object>; if (ex != null) cmd = ex; } catch { }
+            }
+            var items = new List<object>();
+            if (cmd.ContainsKey(key) && cmd[key] is object[]) foreach (var o in (object[])cmd[key]) items.Add(o);
+            items.Add(item);
+            cmd[key] = items;
+            File.WriteAllText(cp, _cjs.Serialize(cmd), new System.Text.UTF8Encoding(false));  // no BOM (Python reads this)
+            return true;
+        }
+        catch { return false; }
+    }
+
+    // Put `text` to the fleet conversation `c`. Live worker -> a steer on its next turn.
+    // Otherwise -> a goal carrying follow_up_to, which RelayWorker.__init__ resolves through
+    // socket_route.conversation_for_goal into the conversation that goal ran in, so the new
+    // worker continues THIS conversation instead of starting one that never heard it.
+    void SendToFleetConversation(Conversation c, string text)
+    {
+        AddUser(text);
+        c.Messages.Add(new Msg("U", text));
+        string live = LiveWorkerFor(c);
+        if (live.Length > 0)
+        {
+            var it = new Dictionary<string, object>(); it["worker"] = live; it["text"] = text;
+            AddAssistant(AppendCommand("steer", it) ? T("fleet_steer_sent") : T("fleet_send_failed"));
+            RefreshConvList();
+            StickToEnd();
+            return;
+        }
+        // NO GOAL TEXT MEANS NO WAY TO NAME THE CONVERSATION, and guessing is the failure
+        // being fixed: a follow-up that silently becomes a fresh chat answers plausibly and
+        // is indistinguishable from a real continuation.
+        string goal = (c.Goal ?? "").Trim();
+        if (goal.Length == 0)
+        {
+            AddAssistant(T("fleet_no_goal"));
+            StickToEnd();
+            return;
+        }
+        var g = new Dictionary<string, object>();
+        g["text"] = (_lang == 0
+            ? "【ユーザーからの追加指示】" + text + "\n直前までの作業内容を踏まえ、この追加指示に対してだけ答えてください。最初からやり直す必要はありません。完了なら DONE、無理なら FAIL と理由を書いてください。"
+            : "[follow-up from the user] " + text + "\nAnswer only this follow-up, building on the work so far. Do not start over. Write DONE when finished, or FAIL and why.");
+        g["follow_up_to"] = goal;
+        g["priority"] = true;
+        bool ok = AppendCommand("add_goal", g);
+        if (!ok) { AddAssistant(T("fleet_send_failed")); StickToEnd(); return; }
+        AddAssistant(FleetState()[0] == 1 ? T("fleet_follow_sent") : T("fleet_follow_idle"));
+        RefreshConvList();
+        StickToEnd();
+    }
+
     int[] FleetState()
     {
         try
@@ -4500,7 +4619,7 @@ class ChatWindow : Window
                 bool exists = false;
                 foreach (var c in _all) if (c.Transcript == f) { exists = true; break; }
                 if (exists) continue;
-                string goal = "", name = "";
+                string goal = "", name = "", guid = "";
                 try
                 {
                     using (var sr = new StreamReader(f, Encoding.UTF8))
@@ -4511,6 +4630,20 @@ class ChatWindow : Window
                             var meta = _cjs.DeserializeObject(first) as Dictionary<string, object>;
                             if (meta != null) { goal = SS(meta, "goal"); name = SS(meta, "name"); }
                         }
+                        // THE CONVERSATION'S OWN IDENTITY, written by _tx.note_guid on the
+                        // first poll after the worker's first turn. Without it ConvUrl stays
+                        // empty and _activeFleetUrl never arms, so neither steer mode nor the
+                        // live snapshot refresh can recognise the open conversation.
+                        // Bounded: the guid line lands within the first turn or not at all,
+                        // and this runs for up to 80 transcripts at startup.
+                        for (int li = 0; li < 40 && guid.Length == 0; li++)
+                        {
+                            string ln2 = sr.ReadLine();
+                            if (ln2 == null) break;
+                            if (ln2.IndexOf("\"guid\"", StringComparison.Ordinal) < 0) continue;
+                            var gd = _cjs.DeserializeObject(ln2) as Dictionary<string, object>;
+                            if (gd != null) guid = SS(gd, "guid");
+                        }
                     }
                 }
                 catch { }
@@ -4519,7 +4652,13 @@ class ChatWindow : Window
                 double ts = 0;
                 try { ts = (File.GetLastWriteTimeUtc(f) - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds; }
                 catch { }
-                _all.Add(new Conversation { Transcript = f, Name = name, Title = title, Source = "fleet", Ts = ts });
+                _all.Add(new Conversation { Transcript = f, Name = name, Title = title, Source = "fleet",
+                                            Ts = ts, Goal = goal,
+                                            // "sess:<guid>" -- the bridge's own shape for a
+                                            // conversation with no navigable URL. NOT a url:
+                                            // calling it one is how a resume silently becomes
+                                            // a fresh chat.
+                                            ConvUrl = guid.Length > 0 ? "sess:" + guid : "" });
             }
         }
         catch { }

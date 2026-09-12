@@ -742,6 +742,12 @@ def _unlock_password():
 #: Named apart from _CONV_GUID_RE below, which pulls a guid OUT of a URL. The first version of
 #: this reused that name and was silently overwritten by it, so every id classified as a URL
 #: and every resume fell back to a tab -- working, slower, and with no symptom.
+#: The synthetic reference for a conversation that has no navigable URL. Defined by the
+#: bridge (copilot_bridge.SESSREF_PREFIX) and repeated here rather than imported, because the
+#: relay must not pull in the bridge module -- `_conversation_id_or_empty` below already
+#: hard-codes the same five characters, so this names what that literal meant.
+SESSREF_PREFIX = "sess:"
+
 _BARE_CONV_GUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
@@ -754,8 +760,8 @@ def _conversation_id_or_empty(resume_conv) -> str:
     and looks identical when it works.
     """
     text = str(resume_conv or "").strip()
-    if text.startswith("sess:"):
-        text = text[5:].strip()
+    if text.startswith(SESSREF_PREFIX):
+        text = text[len(SESSREF_PREFIX):].strip()
     return text if _BARE_CONV_GUID_RE.match(text) else ""
 
 
@@ -2621,6 +2627,34 @@ class RelayWorker:
         self.close()
 
     def _capture_url(self):
+        # A SOCKET WORKER HAS NO PAGE, AND USED TO LEAVE NO WAY BACK.
+        #
+        # Everything below is page-only, so for the socket path -- which is the ordinary path
+        # now -- conv_url stayed "" for the worker's whole life and the transcript never got
+        # its `guid` line. Measured 2026-09-12: status.json conv_url "", all 267 fleet rows in
+        # conversations.json url "", and the transcript carrying only goal/key/meta/name/turn.
+        # Meanwhile socket_route.jsonl had the id the whole time.
+        #
+        # The consequence was not cosmetic. conv_url is the single field the chat window keys
+        # its send target, its steer mode and its live snapshot refresh on, so an empty one
+        # made a fleet conversation unaddressable: typing a follow-up into it answered "この会
+        # 話の送信先を特定できません。会話を開き直してください", advice that cannot work because
+        # reopening supplies nothing.
+        #
+        # Stored as "sess:<guid>" -- the shape the bridge already defines (SESSREF_PREFIX) and
+        # already knows how to resume -- NOT as a URL, because a socket conversation has no
+        # navigable one and calling it a url is how a resume silently becomes a fresh chat.
+        try:
+            if self.page is None and self.drv is not None and getattr(self, "socket", False):
+                ids = self.drv.conversation_ids() or {}
+                # CLIENT FIRST: it is the id that appears in the page URL, so it is the one a
+                # resume can actually open, and it is what conversation_for_goal matches on.
+                cid = str(ids.get("client") or ids.get("server") or "").strip()
+                if cid and not self.conv_url:
+                    self.conv_url = SESSREF_PREFIX + cid
+                    self._tx.note_guid(cid)
+        except Exception:
+            pass
         try:
             if self.page is not None:
                 u = self.page.url
