@@ -18,10 +18,28 @@ AND THE DISCOURAGED MODE WAS THE DEFAULT in both readers, with the cockpit label
 asks every time is a design nobody reads, and an approval that is always there is not an
 approval.
 
+`auto` MEANS SOMETHING DIFFERENT ON THE TWO PATHS, on purpose, because the fatigue is only on
+one of them:
+
+  task_router (local jobs)   the classifier DECIDES: stop -> DENY, ask -> CONFIRM, else ALLOW.
+                             `default` here asks about EVERY first-seen job class, forever,
+                             with no list and no end -- this is the unbounded queue nobody
+                             reads, and this is what `auto` is for.
+  contract_gate (ask_before) the classifier only ESCALATES: a STOP-pattern detail is refused
+                             outright instead of being put to a human who could approve it.
+                             Everything the operator listed still asks. That list is short,
+                             deliberate, and active only while a contract is; discarding it is
+                             what `bypass` is for.
+
+The first version made the contract gate decide too, and CI caught it: a delete described as
+"demo scratch file" was allowed past an `ask_before=["delete"]` contract. A mode that drops an
+instruction a person wrote down is `bypass` under another name, and then no mode means "decide
+the routine things for me, keep the promises I made explicitly".
+
 `auto` IS NOT A RELAXATION AT THE DANGEROUS END, which is what makes it defensible as the
-default rather than merely convenient. Under `default` a STOP-pattern operation is put to a
-human, who CAN approve it. Under `auto` it is refused outright and cannot be approved at all.
-The modes differ only on operations the deterministic classifier finds clean.
+default rather than merely convenient. On both paths it is at least as strict as `default`:
+it can refuse where `default` would have asked, and it never allows what `default` would have
+put to a person.
 """
 from __future__ import annotations
 
@@ -88,26 +106,38 @@ def test_auto_refuses_a_prohibited_operation_without_asking(gate, monkeypatch):
     assert "拒否" in out or "Refused" in out
 
 
-def test_auto_lets_a_clean_operation_through(gate, monkeypatch):
+def test_auto_does_not_drop_the_operators_own_list(gate, monkeypatch):
+    """THE OVER-REACH CI CAUGHT, and the reason this mode is escalation-only.
+
+    The first version classified the DETAIL text and allowed anything that looked innocuous --
+    so `activate_contract(ask_before=["delete"])` followed by a delete whose description read
+    "demo scratch file" was waved through, silently dropping an instruction a person wrote
+    down.
+
+    Approval fatigue lives in task_router's `default`, where EVERY first-seen job class asks
+    forever with no list and no end. A contract's ask_before is a handful of classes an
+    operator chose while a contract is active. Discarding it is what `bypass` is for; a mode
+    that also did it would leave nothing meaning "decide the routine things, keep the promises
+    I made explicitly"."""
     _mode(monkeypatch, "auto")
-    assert gate.check_op("outbound", "read the report and summarise it") is None
+    out = gate.check_op("outbound", "read the report and summarise it")
+    assert out is not None, (
+        "auto allowed an op the operator had explicitly put on ask_before")
+    assert "承認待ち" in out or "Awaiting approval" in out
 
 
-def test_auto_still_asks_about_a_flagged_operation(gate, monkeypatch):
-    """The classifier's middle answer is "a human decides" -- `auto` does not collapse ask into
-    allow, or the ask_before list would mean nothing."""
-    _mode(monkeypatch, "auto")
-    flagged = None
-    from relay.autonomy_gate import _ASK_PATTERNS
-    for pat in _ASK_PATTERNS:
-        sample = pat.replace(r"\b", "").replace("\\s+", " ").replace("\\", "")
-        if contract_gate._auto_verdict(sample) == "ask":
-            flagged = sample
-            break
-    if flagged is None:
-        pytest.skip("no ASK pattern reduced to a literal sample here")
-    out = gate.check_op("outbound", flagged)
-    assert out is not None and ("承認待ち" in out or "Awaiting approval" in out)
+def test_auto_is_never_looser_than_asking(gate, monkeypatch):
+    """The property that makes it safe as the default: for anything on ask_before, `auto`
+    either asks (as `default` would) or refuses (which `default` would not). It never allows
+    what `default` would have put to a person."""
+    for detail in ("rm -rf /data", "read the report", "send the summary outside", ""):
+        _mode(monkeypatch, "default")
+        manual = gate.check_op("outbound", detail)
+        _mode(monkeypatch, "auto")
+        auto = gate.check_op("outbound", detail)
+        if manual is not None:
+            assert auto is not None, (
+                "auto allowed %r where the manual mode would have asked" % detail)
 
 
 def test_bypass_is_unchanged(gate, monkeypatch):
