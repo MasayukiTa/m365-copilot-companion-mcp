@@ -91,27 +91,40 @@ def test_activate_then_approve_then_pass_is_the_full_hitl_cycle():
         assert first is not None
 
         # find the gate file check_op just created and answer it the way a human would.
-        # _create_gate resolves it as ALLOWED_BASE/.companion_gates -- the fixture points
-        # tools.file_ops.ALLOWED_BASE at tmp_path/"base", so the path is deterministic.
-        import tools.file_ops as FO
-        gates_dir = FO.ALLOWED_BASE / ".companion_gates"
+        # ASK THE CODE WHERE IT PUT IT. This rebuilt ALLOWED_BASE/".companion_gates" itself,
+        # which was true of _create_gate at the time and was exactly the defect: conftest sets
+        # MCP_GATE_DIR at module scope so that no test can write into the operator's live gate
+        # directory, and contract_gate built its path by hand and never read it. Measured
+        # 2026-09-12: seven approval gates from this repository's own tests reached the
+        # operator's screen.
+        gates_dir = CG._gate_dir()
         assert gates_dir.is_dir(), "check_op did not create a gate directory"
-        gate_files = list(gates_dir.glob("*.json"))
-        assert len(gate_files) == 1, gate_files
-        gate = json.loads(gate_files[0].read_text(encoding="utf-8"))
+
+        # BY TOKEN, NOT BY COUNT. MCP_GATE_DIR is set once per pytest process and shared by
+        # every test in the run, so `len(...) == 1` passed only while this was the sole test
+        # raising a gate -- and then failed in this file when another one did. Gates are keyed
+        # by token exactly so a caller can find its own among others'; this does what
+        # check_op's caller does.
+        token = CG._stable_token("delete", "demo scratch file")
+        gate_file = gates_dir / ("%s.json" % token)
+        assert gate_file.is_file(), (
+            "check_op did not create the gate for its own token (%s)" % token)
+        gate = json.loads(gate_file.read_text(encoding="utf-8"))
         gate["answered"] = True
         gate["answer"] = "approved"
-        gate_files[0].write_text(json.dumps(gate, ensure_ascii=False), encoding="utf-8")
+        gate_file.write_text(json.dumps(gate, ensure_ascii=False), encoding="utf-8")
 
         # (ii) the SAME op, now approved -> passes
         second = CG.check_op("delete", "demo scratch file")
         assert second is None, "an approved operation was still refused"
 
-        # (iii) an op_class never listed in ask_before -> never gated, no new gate file
-        before_count = len(list(gates_dir.glob("*.json")))
+        # (iii) an op_class never listed in ask_before -> never gated, and no gate of ITS
+        # own appears. Asked by token for the same reason as above: a count over a shared
+        # directory answers a question about the whole run, not about this call.
+        unlisted = CG._stable_token("outbound", "demo email nobody approved")
         third = CG.check_op("outbound", "demo email nobody approved")
         assert third is None, "an unlisted op_class was gated anyway"
-        assert len(list(gates_dir.glob("*.json"))) == before_count, (
+        assert not (gates_dir / ("%s.json" % unlisted)).is_file(), (
             "an unlisted op_class created a gate file")
     finally:
         CG.deactivate_contract()
