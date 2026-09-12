@@ -45,8 +45,10 @@ _NAMED = re.compile(r"(?:encoding|errors)\s*=")
 
 
 #: Files that still decode child output with the local code page, with how many sites each.
-#: Taken 2026-09-12: 53 files, 93 sites (swept down from 59/100 the same day). THIS NUMBER IS A DEBT, NOT A SETTING -- every entry
-#: is a place where one byte can still delete an entire command's output.
+#: Taken 2026-09-12: 53 files, 93 sites (swept down from 59/100 the same day), then swept down
+#: to 39 files, 73 sites the same day (the bench/ non-test sweep -- 15 files fixed, 20 sites).
+#: THIS NUMBER IS A DEBT, NOT A SETTING -- every entry is a place where one byte can still
+#: delete an entire command's output.
 #:
 #: Ordered by what it would cost when it fires:
 #:   * relay/ and bench/ non-test files run unattended over real data, including paths under
@@ -57,22 +59,7 @@ _NAMED = re.compile(r"(?:encoding|errors)\s*=")
 #:     are equally likely.
 BASELINE = {
     # ── runs unattended, over real data ───────────────────────────────────
-    "bench/companionbench/job_authority.py": 1,
     "bench/evalhost_batch_grade.py": 2,
-    "bench/gaia/retry_controller.py": 2,
-    "bench/gaia/run_pipeline.py": 2,
-    "bench/pro_grade_remote.py": 3,
-    "bench/rebuild_resume.py": 1,
-    "bench/review_fix.py": 1,
-    "bench/score.py": 1,
-    "bench/swe_batch_setup.py": 1,
-    "bench/swe_check.py": 1,
-    "bench/swe_check_selftest.py": 1,
-    "bench/swe_diag.py": 2,
-    "bench/swe_diag2.py": 2,
-    "bench/swe_lite300_miss_bundle.py": 1,
-    "bench/swe_miss_bundle.py": 1,
-    "bench/swe_rerun_setup.py": 1,
     # STAYS UNTIL A DELIBERATE RE-FREEZE. This file is in the self-improvement frozen set,
     # and test_frozen.py rejects any edit to it: "a run whose judge changed produces numbers
     # nobody can trust, and unattended they look like any other row". The decode fix is

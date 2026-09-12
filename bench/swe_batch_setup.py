@@ -148,7 +148,8 @@ def main():
         if not args.no_reset:
             subprocess.run(["git", "-C", wt, "checkout", "--", "."], capture_output=True)
             subprocess.run(["git", "-C", wt, "clean", "-fd"], capture_output=True)
-            d = subprocess.run(["git", "-C", wt, "diff"], capture_output=True, text=True)
+            from tools.childproc import run as _run_child
+            d = _run_child(["git", "-C", wt, "diff"])
             print("reset %-42s diff_chars=%d" % (inst, len(d.stdout)))
         lib = s["repo"].split("/")[-1]
         check_cmd = '"%s" "%s" %s "%s"' % (VENVPY, CHECK, inst, wt)

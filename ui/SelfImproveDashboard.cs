@@ -304,8 +304,9 @@ class SelfImproveDashboardWindow : Window
             : "Adopted genomes (scaffold variants) and what each measured. QD cells = slots by problem type.";
 
         // metric labels
-        if (k == "u_completion")  return ja ? "完了率" : "Completion";
-        if (k == "u_recent")      return ja ? "直近完了率" : "Recent";
+        if (k == "u_completion")  return ja ? "完了率(通常)" : "Completion (ordinary)";
+        if (k == "u_recent")      return ja ? "直近完了率(通常)" : "Recent (ordinary)";
+        if (k == "u_split")       return ja ? "ベンチは別母集団（基底率が約10倍違うため分けて表示）" : "Benchmarks are a separate population (their base rate differs about tenfold)";
         if (k == "u_turns")       return ja ? "中央ターン数" : "Median turns";
         if (k == "u_tasks")       return ja ? "タスク数" : "Tasks";
         if (k == "u_trend")       return ja ? "完了率の推移（古い→新しい）" : "Completion trend (old → new)";
@@ -1401,12 +1402,33 @@ class SelfImproveDashboardWindow : Window
         for (int i = 0; i < 4; i++)
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         var goodBrush = new SolidColorBrush(StatusColorFor("good", _dark));
-        grid.Children.Add(MetricCell(T("u_completion"), Pct(u, "completion_rate"),  goodBrush, 0));
-        grid.Children.Add(MetricCell(T("u_recent"),     Pct(u, "recent_completion_rate"), Fg, 1));
+        // ORDINARY WORK IS THE HEADLINE, because that is what "how is the fleet doing" means.
+        // These cells used to show the blend of ordinary goals and benchmark workers, whose
+        // completion rates differ by about ten times -- so the number moved with whatever bulk
+        // job was queued. Measured 2026-09-12: this row read 0.39 / 0.20 while ordinary work
+        // stood at 0.45 / 0.89 and a SWE-bench arm filled 41 of the last 50 rows.
+        var wl   = Obj(u, "workload");
+        var ord_ = Obj(wl, "ordinary");
+        var bch  = Obj(wl, "bench");
+        grid.Children.Add(MetricCell(T("u_completion"), Pct(ord_, "completion_rate"),  goodBrush, 0));
+        grid.Children.Add(MetricCell(T("u_recent"),     Pct(ord_, "recent_completion_rate"), Fg, 1));
         grid.Children.Add(MetricCell(T("u_turns"),
             Num(u.ContainsKey("median_turns") ? u["median_turns"] : null, "0.#"), Fg, 2));
         grid.Children.Add(MetricCell(T("u_tasks"), I(u, "n_tasks").ToString(), Fg, 3));
         col.Children.Add(grid);
+
+        // EVERY RATE WITH ITS OWN DENOMINATOR, and the blend still visible. A rate over nine
+        // rows and a rate over forty-one must not be read as the same kind of thing, and a
+        // number that is hidden is one the next person re-derives wrongly.
+        var split = new TextBlock {
+            Text = string.Format("{0}  —  n={1} / {2}   ·   bench {3} (n={4} / {5})   ·   blended {6} / {7}",
+                                 T("u_split"),
+                                 I(ord_, "n"), I(ord_, "recent_n"),
+                                 Pct(bch, "completion_rate"), I(bch, "n"), I(bch, "recent_n"),
+                                 Pct(u, "completion_rate"), Pct(u, "recent_completion_rate")),
+            TextWrapping = TextWrapping.Wrap, FontSize = 11.5, Margin = new Thickness(2, 6, 2, 0) };
+        split.Foreground = Muted;
+        col.Children.Add(split);
 
         // status mix (counts by outcome)
         var mix = Obj(u, "status_mix");

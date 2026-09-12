@@ -16,6 +16,7 @@ This is READ-ONLY and defensive: a missing/short history yields an empty-but-val
 """
 import json
 import os
+import re
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _DEFAULT_HISTORY = os.path.join(_REPO_ROOT, ".fleet", "history.json")
@@ -83,6 +84,31 @@ def _history_items(history):
     return []
 
 
+#: A SWE-bench (or any harness) instance names itself: `sympy__sympy-12345`. Matched against
+#: the goal text and the transcript key, because a row carries whichever it has.
+#:
+#: NOT the Japanese prompt text, which was the first thing to hand and would stop working the
+#: day a harness prompt is written in English. Validated over the live 267-row archive: this
+#: regex and the prose marker selected the SAME 44 rows, with no disagreement in either
+#: direction.
+_INSTANCE_ID = re.compile(r"[A-Za-z0-9_.-]+__[A-Za-z0-9_.-]+-\d+")
+
+
+def is_bench_row(row) -> bool:
+    """Whether this history row is a benchmark worker rather than ordinary work.
+
+    The two populations have base rates that differ by an order of magnitude (measured
+    2026-09-12: 0.4529 ordinary against 0.0455 bench), so any rate computed across both answers
+    a question nobody asked.
+    """
+    if not isinstance(row, dict):
+        return False
+    for field in ("goal", "key"):
+        if _INSTANCE_ID.search(str(row.get(field) or "")):
+            return True
+    return False
+
+
 def usage_section(history_path=None, status_path=None, segments=6):
     """Aggregate live usage metrics into one JSON-safe dict. All args optional (repo-root defaults)."""
     history = _read_json(_DEFAULT_HISTORY if history_path is None else history_path)
@@ -120,6 +146,28 @@ def usage_section(history_path=None, status_path=None, segments=6):
 
     completion_rate = round(completed / n, 4) if n else None
     median_turns = _median(done_turns)
+
+    # SPLIT BY WORKLOAD, because one rate over two populations answers nothing.
+    #
+    # Measured 2026-09-12 on the live archive: ordinary 0.4529 (101/223) against bench 0.0455
+    # (2/44). The blend above is 0.3858 and moves with whatever bulk job last ran rather than
+    # with how the work went -- on 09-11/09-12 the recent window held 41 bench workers against
+    # 11 ordinary ones, so a published 0.20 was largely a SWE-bench resolve rate, while the
+    # ordinary goals over those same days completed 8/8 and 2/3.
+    #
+    # `completion_rate` above is left exactly as it was. Redefining a published number in place
+    # makes a dashboard plot a different quantity against its own history without saying so,
+    # which is the same defect facing the other way.
+    bench_rows = [h for h in items if is_bench_row(h)]
+    ordinary_rows = [h for h in items if not is_bench_row(h)]
+
+    def _completion(rows):
+        if not rows:
+            return None
+        return round(sum(1 for h in rows if _is_completion(h)) / len(rows), 4)
+
+    completion_rate_ordinary = _completion(ordinary_rows)
+    completion_rate_bench = _completion(bench_rows)
 
     # Trend: completion rate over `segments` equal, time-ordered buckets (a sparkline of improvement).
     trend = []
@@ -199,6 +247,20 @@ def usage_section(history_path=None, status_path=None, segments=6):
     recent_rate = round(sum(1 for h in recent if _is_completion(h)) / len(recent), 4) \
         if recent else None
 
+    # THE RECENT WINDOW IS THE WORST PLACE TO BLEND, because it is the smallest and is therefore
+    # the most completely taken over by whatever bulk job last ran. Measured 2026-09-12: the
+    # last 50 rows held 41 bench workers and 11 ordinary ones, so the published 0.20 was mostly
+    # a SWE-bench resolve rate -- while ordinary goals over the same two days completed 8/8 and
+    # 2/3. The split is reported with its own denominator so a thin arm cannot pose as a trend.
+    recent_ordinary = [h for h in recent if not is_bench_row(h)]
+    recent_bench = [h for h in recent if is_bench_row(h)]
+    recent_rate_ordinary = (
+        round(sum(1 for h in recent_ordinary if _is_completion(h)) / len(recent_ordinary), 4)
+        if recent_ordinary else None)
+    recent_rate_bench = (
+        round(sum(1 for h in recent_bench if _is_completion(h)) / len(recent_bench), 4)
+        if recent_bench else None)
+
     # Persona-leak lens (the QUALITY half of the general-user lens): of the runs whose body we can
     # resolve, how many leaked an unsolicited advisor/lecture/ego persona. Reuses the SAME time-ordered
     # `items` list (each carries a transcript path, so score_history can resolve the real body).
@@ -227,9 +289,23 @@ def usage_section(history_path=None, status_path=None, segments=6):
 
     return {
         "n_tasks": n,
+        # BLENDED, AND KEPT THAT WAY ON PURPOSE. Its meaning is unchanged so nothing that has
+        # been plotting it starts plotting a different quantity against its own history. Read
+        # it with `workload` beside it: over two populations whose base rates differ tenfold it
+        # answers a question nobody asked.
         "completion_rate": completion_rate,
         "recent_completion_rate": recent_rate,
         "recent_window": win,
+        # THE SAME NUMBERS, ASKED OF ONE POPULATION AT A TIME. Each carries its own
+        # denominator: a rate over three rows and a rate over two hundred must not look alike.
+        "workload": {
+            "ordinary": {"n": len(ordinary_rows), "completion_rate": completion_rate_ordinary,
+                         "recent_n": len(recent_ordinary),
+                         "recent_completion_rate": recent_rate_ordinary},
+            "bench": {"n": len(bench_rows), "completion_rate": completion_rate_bench,
+                      "recent_n": len(recent_bench),
+                      "recent_completion_rate": recent_rate_bench},
+        },
         "median_turns": median_turns,
         "verify_rate": verify_rate,
         # WHAT THE RATE WAS COMPUTED OVER. A rate with no denominator beside it cannot be told
@@ -244,7 +320,12 @@ def usage_section(history_path=None, status_path=None, segments=6):
         # with it, status_mix["done"] - contradicted_done == completed, and a reader can check
         # the arithmetic against the archive.
         "contradicted_done": contradicted_done,
+        # A SPARKLINE OF WHAT WAS QUEUED, NOT OF HOW WELL IT WENT. Each bucket is whatever
+        # workload was running then, so the published series (0.36 0.58 0.42 0.20 0.64 0.11 on
+        # 2026-09-12) tracks the schedule. Left in place, and named, rather than removed: it is
+        # still the only per-period series here, and a reader who knows what it is can use it.
         "trend": trend,
+        "trend_is_blended": True,
         "persona_leak_rate": persona_leak_rate,
         "quality_scored": quality_scored,
         "persona_flagged": persona_flagged,

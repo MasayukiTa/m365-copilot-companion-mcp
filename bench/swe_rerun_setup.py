@@ -18,7 +18,8 @@ for inst in INSTS:
     # reset to clean base_commit
     subprocess.run(["git", "-C", wt, "checkout", "--", "."])
     subprocess.run(["git", "-C", wt, "clean", "-fd"], capture_output=True)
-    d = subprocess.run(["git", "-C", wt, "diff"], capture_output=True, text=True)
+    from tools.childproc import run as _run_child
+    d = _run_child(["git", "-C", wt, "diff"])
     print("reset", inst, "-> diff_chars now", len(d.stdout))
     ps = spec[inst]["problem_statement"]
     if len(ps) > 6000:

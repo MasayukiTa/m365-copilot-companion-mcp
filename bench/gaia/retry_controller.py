@@ -180,8 +180,8 @@ def kill_8011():
         "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
         "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
     )
-    out = subprocess.run(["powershell.exe", "-NoProfile", "-Command", ps],
-                         capture_output=True, text=True).stdout
+    from tools.childproc import run as _run_child
+    out = _run_child(["powershell.exe", "-NoProfile", "-Command", ps]).stdout
     rows = []
     try:
         data = json.loads(out) if out.strip() else []
@@ -196,9 +196,9 @@ def kill_8011():
             continue
         rows.append((pid, item.get("CommandLine") or ""))
     my_ancestors = _ancestor_pids()
+    from tools.childproc import run as _run_child
     for pid in _endpoint_pids(rows, my_ancestors, str(PY_VENV)):
-        subprocess.run(["taskkill", "/PID", str(pid), "/F"],
-                       capture_output=True, text=True)
+        _run_child(["taskkill", "/PID", str(pid), "/F"])
     time.sleep(2)
 
 
