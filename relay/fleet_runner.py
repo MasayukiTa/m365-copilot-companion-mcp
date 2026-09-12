@@ -64,6 +64,7 @@ try:
 except Exception:
     pass
 
+from relay.acceptance import MalformedCheck  # noqa: E402
 from relay.relay_fleet import (  # noqa: E402
     EVAL_STALL_CEILING_S, TERMINAL, VERIFY_STATUSES, auto_concurrency, avail_phys_mb,
     goal_fields, run_relay_fleet,
@@ -1917,7 +1918,23 @@ def main():
         ap.error("no agent URL -- pass --agent-url or set MCP_FLEET_AGENT_URL in .env")
     # a goal may be a plain string or a dict carrying acceptance checks; gtexts is the
     # display/keying text for each, so dict goals don't break snapshots or result lookup.
-    gtexts = [goal_fields(g)[0] for g in goals]
+    # NAMED, NOT A TRACEBACK. This is the first thing that reads a goal's acceptance spec,
+    # and it runs long before Playwright -- so a malformed check fails here with no browser
+    # open and nothing to reset, which is right. The person who has to fix it is looking at
+    # their own goals file, so say which goal and what is wrong with it rather than unwinding
+    # the stack at them.
+    try:
+        gtexts = [goal_fields(g)[0] for g in goals]
+    except MalformedCheck as _bad:
+        for _i, _g in enumerate(goals, 1):
+            try:
+                goal_fields(_g)
+            except MalformedCheck:
+                _t = (_g.get("text") or _g.get("goal") or "") if isinstance(_g, dict) else str(_g)
+                print("goal %d of %d has an unusable acceptance check:\n  %s\n  goal: %s"
+                      % (_i, len(goals), _bad, _t[:200]))
+                break
+        sys.exit(2)
     nverify = sum(1 for g in goals if goal_fields(g)[1])
     # Fleet-level directive (Bucket B): the single authoritative task description when this
     # run was started from exactly ONE goal. With multiple independent goals there is no single
@@ -2476,6 +2493,16 @@ def main():
                 break
             if not cdp_alive(args.cdp_url):
                 hard_reset(port)
+        except MalformedCheck as e:
+            # A CONFIGURATION ERROR IS NOT A CONNECTION ERROR, whatever route it arrives by.
+            # The generic handler below answers every exception with a browser hard reset and
+            # `max_recover` retries; for a deterministic bad check that is a wrong diagnosis
+            # printed to the operator, a wasted recovery budget, and possibly an Edge reset
+            # that costs every worker currently running. Stop, say what is wrong, change
+            # nothing.
+            print("\n[config] unusable acceptance check -- not a connection problem, so no "
+                  "reset and no retry:\n  %s" % e)
+            raise SystemExit(2)
         except Exception as e:
             attempt += 1
             print("\n[recover] %s while connecting; hard reset + retry (attempt %d/%d)"
