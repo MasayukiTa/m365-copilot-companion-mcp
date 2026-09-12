@@ -159,8 +159,9 @@ def ssh(host: str, command: str, timeout: float = 300):
     import base64
     b64 = base64.b64encode(("$ProgressPreference='SilentlyContinue';" + command)
                            .encode("utf-16-le")).decode()
-    r = subprocess.run(_ssh_base(host) + ["powershell", "-NoProfile", "-EncodedCommand", b64],
-                       capture_output=True, text=True, timeout=timeout)
+    from tools.childproc import run as _run_child
+    r = _run_child(_ssh_base(host) + ["powershell", "-NoProfile", "-EncodedCommand", b64],
+                    timeout=timeout)
     return r.returncode, (r.stdout or "") + (r.stderr or "")
 
 
@@ -170,9 +171,10 @@ def scp_to(host: str, local: str, remote_win: str, timeout: float = 600) -> bool
                        "System32", "OpenSSH", "scp.exe")
     if not os.path.isfile(exe):
         exe = "scp"
-    r = subprocess.run([exe, "-o", "ConnectTimeout=45", "-o", "BatchMode=yes",
-                        local, "%s:%s" % (host, remote_win)],
-                       capture_output=True, text=True, timeout=timeout)
+    from tools.childproc import run as _run_child
+    r = _run_child([exe, "-o", "ConnectTimeout=45", "-o", "BatchMode=yes",
+                     local, "%s:%s" % (host, remote_win)],
+                    timeout=timeout)
     return r.returncode == 0
 
 
@@ -182,9 +184,10 @@ def scp_from(host: str, remote_win: str, local: str, timeout: float = 600) -> bo
                        "System32", "OpenSSH", "scp.exe")
     if not os.path.isfile(exe):
         exe = "scp"
-    r = subprocess.run([exe, "-o", "ConnectTimeout=45", "-o", "BatchMode=yes",
-                        "%s:%s" % (host, remote_win), local],
-                       capture_output=True, text=True, timeout=timeout)
+    from tools.childproc import run as _run_child
+    r = _run_child([exe, "-o", "ConnectTimeout=45", "-o", "BatchMode=yes",
+                     "%s:%s" % (host, remote_win), local],
+                    timeout=timeout)
     return r.returncode == 0 and os.path.exists(local) and os.path.getsize(local) > 0
 
 

@@ -97,10 +97,10 @@ def kill_relay():
     if not targets:
         log("  no matching endpoint processes found")
         return
+    from tools.childproc import run as _run_child
     for pid in targets:
         log(f"  killing endpoint pid {pid}")
-        subprocess.run(["taskkill", "/PID", str(pid), "/F"],
-                       capture_output=True, text=True)
+        _run_child(["taskkill", "/PID", str(pid), "/F"])
     time.sleep(2)
 
 
@@ -136,9 +136,10 @@ def _relay_proc_rows_powershell():
         "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
     )
     try:
-        result = subprocess.run(
+        from tools.childproc import run as _run_child
+        result = _run_child(
             ["powershell", "-NonInteractive", "-NoProfile", "-Command", ps_cmd],
-            capture_output=True, text=True, timeout=20,
+            timeout=20,
         )
     except Exception as exc:
         log(f"  WARNING: relay enumeration via powershell failed (ignored): {exc}")

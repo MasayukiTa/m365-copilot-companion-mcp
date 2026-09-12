@@ -141,6 +141,7 @@ jobs:
             ui/test_fleet_cockpit_card_menu.py \
             ui/test_fleet_cockpit_advanced_settings.py \
             tools/test_gate_stop.py \
+            relay/selfimprove/test_one_rate_over_two_populations.py \
             tools/test_child_output_is_not_decoded_by_luck.py \
             tools/test_a_backfilled_conversation_is_the_right_one.py \
             tools/test_folder_policy.py \
