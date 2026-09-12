@@ -44,6 +44,7 @@ LEDGER = os.path.join(REPO, ".fleet", "swe", "pro_cycle_results.json")
 #: was the previous plan and it was already false when written -- the same rule had five copies
 #: and adding NOPATCH broke four of them, one of which silently discarded real verdicts.
 from bench.verdicts import NOT_A_MEASUREMENT  # noqa: E402,F401
+from bench import verdicts as _V
 
 _INSTANCE = re.compile(r"^instance_(?P<owner>.+?)__(?P<repo>.+?)-[0-9a-f]{40}")
 
@@ -89,8 +90,8 @@ def tally(rows: dict) -> dict:
     """Split the ledger into the three populations. Returns counts plus the ids of each."""
     resolved, failed, unevaluated, nopatch, other = [], [], [], [], []
     for inst, row in rows.items():
-        v = str(row.get("verdict") or "").upper()
-        if v == "RESOLVED":
+        v = _V.normalise(row.get("verdict"))
+        if _V.is_resolved(v):
             resolved.append(inst)
         elif v == "NOT":
             failed.append(inst)

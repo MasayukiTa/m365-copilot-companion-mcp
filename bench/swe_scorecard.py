@@ -65,6 +65,10 @@ import json
 import os
 import re
 import sys
+try:                       # bench/ on sys.path (how the swe_* scripts import siblings)
+    import verdicts as _V
+except ImportError:        # repo root on sys.path
+    from bench import verdicts as _V
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SWEDIR = os.path.join(REPO, ".fleet", "swe")
@@ -370,7 +374,7 @@ def main():
 
     # Restart-proof first-pass reconstruction from per-worker transcripts (computed once;
     # used both in the per-instance table and the PASS RATES section below).
-    resolved_insts = [i for i, d, _ in disp if d == "RESOLVED"]
+    resolved_insts = [i for i, d, _ in disp if _V.is_resolved(d)]
     tx_agg = scan_transcripts(batch, a.transcripts)
     tfp_insts, tloop_insts, tundet_insts = transcript_first_pass(resolved_insts, tx_agg)
     tfp_set, tloop_set, tundet_set = set(tfp_insts), set(tloop_insts), set(tundet_insts)
@@ -402,7 +406,7 @@ def main():
     for inst, d, detail in disp:
         fn = "  [KNOWN FALSE-NEG]" if inst in KNOWN_FALSE_NEGATIVES else ""
         tx = ""
-        if d == "RESOLVED":
+        if _V.is_resolved(d):
             if inst in tfp_set:
                 tx = "  {tx:first-pass}"
             elif inst in tloop_set:
@@ -519,7 +523,7 @@ def main():
             d = dmap.get(inst, "?")
             e = tx_agg.get(inst, {})
             note = ""
-            if d != "RESOLVED" and e.get("total_done", 0) >= 1:
+            if not _V.is_resolved(d) and e.get("total_done", 0) >= 1:
                 note = ("  (agent reached DONE %dx in transcripts but eval never resolved"
                         " -- likely offline-network fail)" % e["total_done"])
             line("  %-42s %-13s%s" % (inst, d, note))
@@ -533,7 +537,7 @@ def main():
         r = repo_map.get(inst, "?")
         e = repos.setdefault(r, {"total": 0, "att": 0, "res": 0, "ip": 0, "stuck": 0, "na": 0})
         e["total"] += 1
-        if d == "RESOLVED":
+        if _V.is_resolved(d):
             e["res"] += 1; e["att"] += 1
         elif d == "IN-PROGRESS":
             e["ip"] += 1; e["att"] += 1

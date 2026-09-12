@@ -23,6 +23,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SW = os.path.join(REPO, ".fleet", "swe")
 
 from bench import pro_ledger_report as PR   # noqa: E402
+from bench import verdicts as _V
 
 
 def verdicts(path, want):
@@ -31,8 +32,8 @@ def verdicts(path, want):
     for inst, row in PR.latest_rows(path).items():
         if want and inst not in want:
             continue
-        v = str(row.get("verdict") or "").upper()
-        if v == "RESOLVED":
+        v = _V.normalise(row.get("verdict"))
+        if _V.is_resolved(v):
             out[inst] = True
         elif v == "NOT":
             out[inst] = False

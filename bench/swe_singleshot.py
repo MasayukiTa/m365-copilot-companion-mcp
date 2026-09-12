@@ -92,7 +92,7 @@ def main():
             # nobody measured and stops the instance being attempted again.
             if not _V.is_measurement(v):
                 continue   # not a final verdict -> re-attempt this instance
-            done[i] = (v == "RESOLVED")
+            done[i] = _V.is_resolved(v)
 
     res = dict(done)
     n = 0

@@ -23,6 +23,27 @@ param([int]$Port = 9222,
 
 $ErrorActionPreference = "SilentlyContinue"
 
+# SINGLE SOURCE OF THE PROFILE LIST. The default above is a hand-written copy of
+# relay/edge_recover.py's MANAGED_EDGE_PROFILES, and the comment above it asks a person to
+# keep the two in step. That promise has already been broken once: copilot-eval-edge (:9224)
+# was added on the Python side and not here, and the symptom was the one this loop exists to
+# prevent. keeper_profile_marker() exists to end that, and nothing was calling it.
+#
+# The literal stays as the FALLBACK on purpose: a keeper that stops watching because Python
+# was unavailable is a worse failure than the drift. tests/test_edge_keeper_coverage.py
+# asserts the fallback equals keeper_profile_marker(), so a stale fallback fails CI.
+#
+# Only when the caller did not pass one -- an explicit -ProfileMarker is an operator's choice
+# and is not second-guessed.
+if (-not $PSBoundParameters.ContainsKey('ProfileMarker')) {
+    $py = Join-Path $repoRootForMarker ".venv\Scripts\python.exe"
+    if (-not (Test-Path $py)) { $py = "python" }
+    $fromPython = & $py -c "from relay.edge_recover import keeper_profile_marker as k; print(k())" 2>$null
+    if ($LASTEXITCODE -eq 0 -and $fromPython) {
+        $ProfileMarker = ($fromPython | Select-Object -First 1).Trim()
+    }
+}
+
 # The pause file lives at <repo-root>\.fleet\edge_keep_pause, written by
 # edge_recover.surface()/touch_pause(). This script is at <repo-root>\scripts\win,
 # so resolve the repo root by walking TWO directories up from $PSScriptRoot.

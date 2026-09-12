@@ -27,6 +27,10 @@ import subprocess
 import sys
 import tempfile
 import time
+try:                       # bench/ on sys.path (how the swe_* scripts import siblings)
+    import verdicts as _V
+except ImportError:        # repo root on sys.path
+    from bench import verdicts as _V
 
 # THE HOST COMES FROM THE ENVIRONMENT, WITH NO DEFAULT. It used to default to the machine's
 # actual name, which put an operator's hostname in a public repository -- and a wrong default
@@ -244,7 +248,7 @@ def main():
         pass
 
     print("REMOTE_GRADE %s -> %s" % (inst, verdict or "EVALERR"))
-    if verdict == "RESOLVED":
+    if _V.is_resolved(verdict):
         return 0
     if verdict == "not":
         return 1
