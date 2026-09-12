@@ -29,7 +29,7 @@ import json
 import hashlib
 import re
 
-from relay.planner import extract_plan
+from relay.planner import _clean_step, extract_plan
 
 #: The agent writes this when its split is ready, mirroring PLAN_READY. A distinct marker,
 #: because a split and a plan are different things: a plan is steps for ONE conversation to
@@ -174,14 +174,74 @@ def _dedupe(steps):
     return out
 
 
+#: A numbered line, with the number kept. `planner._STEP_RE` throws the number away, which is
+#: exactly the information needed to tell one list from two.
+_NUMBERED = re.compile(
+    r"^\s*(?:(?:step|ステップ)\s*)?([0-9]+|[０-９]+)[\.\)、：．:]\s*(.+?)\s*$", re.IGNORECASE)
+
+#: Full-width digits, so 「１.」 counts the same as "1.".
+_ZEN = {ord(c): ord("0") + i for i, c in enumerate("０１２３４５６７８９")}
+
+
+def last_numbered_run(resp):
+    """The FINAL numbered list in the reply, or [] if there is no numbered list at all.
+
+    WHY THIS EXISTS. Measured on run r6aa597a8_a0: the agent answered the split prompt with
+    two numbered lists -- 「共通の前提」 as items 1-6, then the seven actual subtasks numbered
+    from 1 again -- and `extract_plan`, which collects every numbered line in a reply,
+    returned thirteen. Thirteen is over MAX_CHILDREN, so `subtasks_from` returned [] and a
+    correct seven-way split was discarded. The whole 50-minute run then did the work in one
+    conversation instead.
+
+    A NUMBER THAT GOES DOWN STARTS A NEW LIST. That is structural rather than a guess about
+    wording: a line numbered 1 following a line numbered 6 cannot be the seventh element of
+    the list that preceded it.
+
+    AND THE LAST RUN IS THE ANSWER, also not a guess: SPLIT_JOB asks for the subtasks and then
+    for `SUBTASKS_READY` on the final line, so the run nearest the marker is the one replying
+    to the question. Anything before it is what the agent wrote on the way there.
+    """
+    runs, prev = [], None
+    for line in (resp or "").splitlines():
+        if SUBTASKS_READY.upper() in line.upper():
+            continue
+        m = _NUMBERED.match(line)
+        if not m:
+            continue
+        try:
+            n = int(m.group(1).translate(_ZEN))
+        except ValueError:
+            continue
+        body = _clean_step(m.group(2))
+        if not body:
+            continue
+        if prev is None or n <= prev:
+            runs.append([])          # first list, or the numbering restarted
+        runs[-1].append(body)
+        prev = n
+    return runs[-1] if runs else []
+
+
 def subtasks_from(resp):
     """The sub-task list in an agent's split reply, or [] if it is not usable as one.
 
     Returning [] rather than a partial list is deliberate: a split that came back as one item,
     or as forty, is not a split this can act on, and guessing which half of it to believe is
-    how a fan-out quietly runs the wrong work.
+    how a fan-out quietly runs the wrong work. That bound is unchanged -- it was not the
+    defect. What was, was a parse that turned a seven-item list into thirteen by concatenating
+    a numbered preamble onto it; see `last_numbered_run`.
+
+    `extract_plan` remains the fallback for a reply with no numbered list at all (an agent
+    writing one step per line under a header), which is a shape it already handles and this
+    does not.
     """
-    steps = [s.strip() for s in extract_plan(resp or "")]
+    steps = [s.strip() for s in (last_numbered_run(resp) or extract_plan(resp or ""))]
+    # THE TERMINATOR IS NOT A SUBTASK. `extract_plan`'s header-fallback stops at PLAN_READY --
+    # the PLAN marker -- and has never known about this one, so on that path the literal
+    # `SUBTASKS_READY` line came back as a step and would have been queued as a child whose
+    # entire instruction is the word SUBTASKS_READY. `last_numbered_run` skips it directly;
+    # this covers the fallback, where the line is not numbered and so is not skipped there.
+    steps = [s for s in steps if SUBTASKS_READY.upper() not in s.upper()]
     steps = _dedupe([s for s in steps if len(s) >= MIN_STEP_CHARS])
     if len(steps) < MIN_CHILDREN or len(steps) > MAX_CHILDREN:
         return []

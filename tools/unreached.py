@@ -124,11 +124,44 @@ def scan(files=None):
     test_refs = defaultdict(int)
     for rel, tree in trees.items():
         bucket = test_refs if is_test(rel) else prod_refs
+        # A CALL MADE UNDER AN ALIAS IS STILL A CALL, and this walk could not see one.
+        # References are counted as `ast.Name` / `ast.Attribute`, and an aliased import is
+        # neither -- it is `ast.alias(name=..., asname=...)`. So
+        #     from relay.selfimprove.diversify import diversify as _diversify
+        #     genomes = _diversify(base, n)
+        # recorded the Name `_diversify` and credited `diversify` with nothing. Measured
+        # 2026-09-13: that exact function sat in this repository's unreached BASELINE, frozen
+        # as known-dead, while relay/solve_policy.py:56 called it in production. An inventory
+        # with false entries cannot justify deleting anything.
+        #
+        # AN IMPORT IS STILL NOT A CALL. Only a USE of the alias credits the original name;
+        # `from M import f as g` with `g` never used credits nothing. Counting the import
+        # itself would hide the very defect this tool exists to find -- a function imported by
+        # its tests and called by no one, which is what campaigns_from_ledger was.
+        # CREDITED ONLY WHERE THE ALIAS IS CALLED, not merely referenced -- and the first
+        # version of this fix got that wrong, which is why the rule is spelled out. Crediting
+        # every reference hid `relay/selfimprove/harness_tree.py::branches`, because
+        # `from relay.selfimprove import branches as BR` imports a MODULE that happens to
+        # share the function's name. `from X import y as z` cannot be told from a module
+        # import syntactically -- both are ast.alias -- so the discriminator is USE: a
+        # function alias gets called (`_diversify(base, n)`), a module alias gets attributed
+        # (`BR.something()`). Widening a blind spot into a blind eye is the worse trade: a
+        # false negative here is a live unreached function that never appears at all.
+        aliased = {}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for al in node.names:
+                    if al.asname and al.name:
+                        aliased[al.asname] = al.name.rsplit(".", 1)[-1]
         for node in ast.walk(tree):
             if isinstance(node, ast.Name):
                 bucket[node.id] += 1
             elif isinstance(node, ast.Attribute):
                 bucket[node.attr] += 1
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                orig = aliased.get(node.func.id)
+                if orig:
+                    bucket[orig] += 1
 
     rows = []
     for name, places in defs.items():

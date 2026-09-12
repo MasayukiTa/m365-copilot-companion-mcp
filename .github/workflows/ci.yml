@@ -109,6 +109,7 @@ jobs:
             bench/test_capture_survives_a_non_cp932_patch.py \
             bench/test_a_partial_stage_is_not_a_lost_chunk.py \
             bench/test_a_benchmark_episode_is_not_split.py \
+            bench/test_resolved_has_one_home.py \
             tests/test_grep_memory_bound.py \
             tests/test_bridge_answer_source.py \
             relay/test_sibling_edge_reset.py \
@@ -151,6 +152,7 @@ jobs:
             relay/selfimprove/test_a_slice_that_cannot_decide_is_not_burned.py \
             tools/test_child_output_is_not_decoded_by_luck.py \
             tools/test_nothing_new_is_built_without_a_caller.py \
+            tools/test_a_call_under_an_alias_is_a_call.py \
             tools/test_a_backfilled_conversation_is_the_right_one.py \
             tools/test_folder_policy.py \
             tools/test_security.py \
@@ -465,6 +467,7 @@ jobs:
             relay/test_the_recovered_family_reaches_a_merge.py \
             relay/test_a_steer_starts_a_new_chain.py \
             relay/test_a_bad_check_costs_only_its_own_goal.py \
+            relay/test_a_preamble_is_not_a_subtask.py \
             relay/test_mechanism_records_name_their_run.py \
             relay/test_memory_dedupe.py \
             relay/test_fleet_reconcile.py \

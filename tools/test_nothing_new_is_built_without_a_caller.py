@@ -53,7 +53,6 @@ NO_CALLER_NO_TEST = {
     "tools/golden.py::run_trajectory",                           # 64 lines
     "relay/autonomy_gate.py::judge_autonomy",                    # 54 lines
     "bench/skill_use_log.py::compare_runs",                      # 23 lines
-    "bench/routing_switch.py::broker",                           # 22 lines
     "scripts/win/capture_budget.py::acknowledge",                # 19 lines
     "main.py::health",                                           # 18 lines
     "tools/judge_backend.py::ask_human_async",                   # 18 lines
@@ -84,7 +83,6 @@ NO_CALLER_BUT_TESTED = {
     "tools/contract_gate.py::activate_contract",                 # 69 lines
     "relay/selfimprove/propose.py::propose_candidates",          # 68 lines
     "relay/selfimprove/routing.py::held_out_advantage",          # 65 lines
-    "relay/selfimprove/diversify.py::diversify",                 # 62 lines
     "bench/companionbench/baseline.py::why_they_flip",           # 54 lines
     "relay/selfimprove/autonomy.py::raise_to",                   # 48 lines
     "relay/selfimprove/runtime_config.py::revert_active",        # 48 lines
@@ -145,7 +143,6 @@ NO_CALLER_BUT_TESTED = {
     "relay/transport_policy.py::duplicate_risk",                 # 3 lines
     "relay/transport_policy.py::evolvable_fields",               # 3 lines
     "bench/remote/broker_client.py::ping",                       # 2 lines
-    "bench/verdicts.py::is_resolved",                            # 2 lines
     "relay/selfimprove/runtime_config.py::active_harness_id",    # 2 lines
     "tools/security.py::clear_presented_token",                  # 2 lines
 }
