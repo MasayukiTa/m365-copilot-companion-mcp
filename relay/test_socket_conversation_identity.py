@@ -299,3 +299,126 @@ def test_the_writer_and_the_reader_key_a_goal_the_same_way():
     import inspect
     lookup = inspect.getsource(SR.SocketRoute.conversation_for_goal)
     assert 'want = (goal or "").strip()[:600]' in lookup
+
+
+# ── the worker writes the identity down, which is what nothing did ─────────────────────────
+
+class _FakeTx:
+    def __init__(self):
+        self.guids = []
+
+    def note_guid(self, guid):
+        self.guids.append(guid)
+
+
+class _FakeDrv:
+    def __init__(self, ids):
+        self._ids = ids
+
+    def conversation_ids(self):
+        return dict(self._ids)
+
+
+def _socket_worker(monkeypatch, ids):
+    """A worker on the socket path: no page, a driver that can be asked, a transcript."""
+    import relay.relay_fleet as RF
+    monkeypatch.setattr(RF, "_socket_route",
+                        lambda: type("R", (), {"conversation_for_goal": lambda self, g: ""})())
+    w = RF.RelayWorker({"text": "x"}, "w1")
+    w.page, w.socket, w.drv, w._tx = None, True, _FakeDrv(ids), _FakeTx()
+    return w
+
+
+def test_a_socket_worker_records_the_conversation_it_is_in(monkeypatch):
+    """THE ONE THAT MADE A FLEET CONVERSATION UNANSWERABLE.
+
+    _capture_url's whole body sat under `if self.page is not None`, and a socket worker has no
+    page -- so conv_url stayed "" for its entire life and the transcript never got its guid
+    line. Measured 2026-09-12 on the live machine: status.json conv_url "", all 267 fleet rows
+    in .fleet/conversations.json url "", transcripts carrying only goal/key/meta/name/turn --
+    while socket_route.jsonl held the id the whole time.
+    """
+    w = _socket_worker(monkeypatch, {"client": "c-111", "server": "s-222"})
+    w._capture_url()
+    assert w.conv_url == "sess:c-111", "the socket worker still leaves no way back"
+    assert w._tx.guids == ["c-111"], "the transcript was not told which conversation this is"
+
+
+def test_the_client_id_is_preferred(monkeypatch):
+    """The client id is the one that appears in the page URL, so it is the one a resume can
+    open, and it is what conversation_for_goal already matches on."""
+    w = _socket_worker(monkeypatch, {"client": "", "server": "s-222"})
+    w._capture_url()
+    assert w.conv_url == "sess:s-222", "a server-only id must still be recorded"
+
+
+def test_recording_is_idempotent_and_does_not_overwrite(monkeypatch):
+    """_capture_url runs on every poll. A second id must not replace the first, or a
+    reconnect would silently repoint the conversation this worker is said to be in."""
+    w = _socket_worker(monkeypatch, {"client": "c-111"})
+    w._capture_url()
+    w.drv = _FakeDrv({"client": "c-999"})
+    w._capture_url()
+    assert w.conv_url == "sess:c-111"
+
+
+def test_no_identity_yet_is_not_an_error(monkeypatch):
+    w = _socket_worker(monkeypatch, {"client": "", "server": ""})
+    w._capture_url()
+    assert w.conv_url == "" and w._tx.guids == []
+
+
+def test_a_driver_that_raises_does_not_cost_the_poll(monkeypatch):
+    """_capture_url is called from the sweep on every poll of every worker. Nothing it does
+    may be able to stop one."""
+    class _Boom:
+        def conversation_ids(self):
+            raise OSError("socket gone")
+
+    w = _socket_worker(monkeypatch, {})
+    w.drv = _Boom()
+    w._capture_url()          # must not raise
+    assert w.conv_url == ""
+
+
+def test_a_tab_worker_is_untouched_by_this(monkeypatch):
+    """The page branch is the one that already worked; the socket branch must not pre-empt it
+    or a tab worker would store a sess: ref in place of its real, navigable URL."""
+    w = _socket_worker(monkeypatch, {"client": "c-111"})
+    w.socket = False
+    w._capture_url()
+    assert w.conv_url == "", "a non-socket worker took the socket branch"
+
+
+def test_the_stored_shape_is_the_one_the_resume_path_understands(monkeypatch):
+    """Round-trip: what _capture_url stores must be what _conversation_id_or_empty accepts.
+    Storing a bare guid, or a made-up URL, would each parse as the other thing."""
+    import relay.relay_fleet as RF
+    w = _socket_worker(monkeypatch, {"client": "9374821f-6bff-4050-b6fd-4a4338013664"})
+    w._capture_url()
+    assert RF._conversation_id_or_empty(w.conv_url) == "9374821f-6bff-4050-b6fd-4a4338013664"
+
+
+# ── and the command channel can say which conversation to continue ─────────────────────────
+
+def test_a_follow_up_survives_the_command_channel():
+    """`follow_up_to` had one producer (fleet_runner._follow_up) and one consumer
+    (RelayWorker.__init__), and the only path between them ran inside a single live run.
+    goals_from_command dropped the field, so nothing outside a run -- the chat window, the
+    task router's `entry`, an operator writing the file -- could ask for a continuation. It
+    was accepted and silently became a fresh conversation, which answers plausibly.
+    """
+    from relay.fleet_runner import goals_from_command
+    out = goals_from_command({"add_goal": [{"text": "and the sources?",
+                                            "follow_up_to": "the earlier goal",
+                                            "priority": True}]})
+    assert out and out[0].get("follow_up_to") == "the earlier goal", (
+        "the command channel still cannot name the conversation to continue")
+
+
+def test_a_goal_without_one_does_not_grow_the_key():
+    """An absent follow_up_to must stay absent: an empty string would look to
+    RelayWorker.__init__ like a request to continue, and resolve to nothing."""
+    from relay.fleet_runner import goals_from_command
+    out = goals_from_command({"add_goal": [{"text": "a fresh task"}]})
+    assert out and "follow_up_to" not in out[0]

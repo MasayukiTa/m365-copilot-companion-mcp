@@ -1554,6 +1554,15 @@ def goals_from_command(cmd) -> list:
                 # module docstring above already warns a writer/reader mismatch can happen.
                 if it.get("jid"):
                     g["jid"] = it["jid"]
+                # WHICH CONVERSATION TO CONTINUE, carried through for the same reason as the
+                # three above it. _follow_up builds this field and RelayWorker.__init__ reads
+                # it, but until now the only path between them ran inside one live run: a
+                # steer delivered to a worker that had already finished. Anything arriving
+                # through the command channel -- the chat window's fleet rows, task_router's
+                # `entry`, an operator writing the file by hand -- had the field dropped here
+                # and quietly started a fresh conversation instead.
+                if it.get("follow_up_to"):
+                    g["follow_up_to"] = it["follow_up_to"]
                 out.append(g)
             elif isinstance(it, str) and it:
                 out.append({"text": it, "priority": False})
