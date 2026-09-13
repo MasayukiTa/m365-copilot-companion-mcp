@@ -483,3 +483,40 @@ def test_a_short_token_no_longer_loops_even_if_the_margin_is_unsatisfiable(tmp_p
     for _ in range(20):
         PT.capture_via_profile(object(), "agent-1", directory=str(tmp_path))
     assert len(calls) == 1, "twenty asks opened %d pages" % len(calls)
+
+
+def test_a_template_past_its_cap_is_evicted_not_re_read_forever(tmp_path):
+    """THE DEFECT, and the reason `discard_template` had no caller.
+
+    `ts` only moves further away, so a template past TEMPLATE_MAX_AGE_S can never become valid
+    again -- yet it was re-opened, parsed and discarded on every capture. Measured 2026-09-14:
+    one of the two cached templates was 150.6 hours old against a 24-hour cap, 8 KB of JSON read
+    and thrown away on each attempt since 2026-09-07.
+    """
+    PT.save_template(_Template(), "agent-1", str(tmp_path))
+    path = PT.template_path("agent-1", str(tmp_path))
+    assert os.path.exists(path)
+
+    # Past the cap: the read refuses it AND the file goes.
+    assert PT.load_template("agent-1", str(tmp_path), max_age_s=1,
+                            now=time.time() + 10) is None
+    assert not os.path.exists(path), "an expired template stayed on disk to be re-read"
+
+
+def test_a_template_inside_its_cap_is_left_alone(tmp_path):
+    """Eviction is for what can never be valid again, not for what is merely unused."""
+    PT.save_template(_Template(), "agent-1", str(tmp_path))
+    path = PT.template_path("agent-1", str(tmp_path))
+    assert PT.load_template("agent-1", str(tmp_path)) is not None
+    assert os.path.exists(path)
+
+
+def test_an_unusable_template_is_not_evicted_on_a_guess(tmp_path):
+    """A template the BACKEND rejects is the other half of this, and the decline reason on
+    record ("the backend declined the request: InternalError", 8 occurrences) does not say
+    whether the request shape or the backend was at fault. Nothing guesses: only the certain
+    case evicts."""
+    PT.save_template(_Template(), "agent-1", str(tmp_path))
+    path = PT.template_path("agent-1", str(tmp_path))
+    PT.load_template("agent-1", str(tmp_path))
+    assert os.path.exists(path)
