@@ -1,6 +1,6 @@
 # Burning down the unreached baseline
 
-Started 2026-09-13. **93 → 68** so far. The scan and the baseline now agree at 68: the two names the
+Started 2026-09-13. **93 → 68 fixed, and the inventory GREW to 86** when the instrument stopped skipping names it could not attribute. The scan and the baseline agree at 86: the two names the
 scanner had never printed at all are in the frozen list with their reason, so a gap between the two
 numbers is once again a signal rather than a known discrepancy. This file exists so they do not have
 to be triaged a third time.
@@ -86,7 +86,7 @@ The ratchet noticed `is_resolved` on its own: the moment it gained callers the t
 keep it listed. That is the mechanism working in the direction it was built for. It did the same
 for `evolvable_fields` on 2026-09-14, refusing to keep it listed within seconds of the wiring.
 
-## The remaining 68
+## The remaining 86
 
 Classified 2026-09-13 by three parallel surveys, each required to give grep-level evidence and
 to answer "could not determine" rather than guess. **These verdicts are triage, not proof** —
@@ -202,7 +202,7 @@ them) — pinned by a test that asserts the disagreement is legible rather than 
 
 ### The pattern under half the list: a decision surface with no decider
 
-Counted 2026-09-14 over the 68. These are not scattered leftovers. **34 of them belong to six
+Counted 2026-09-14 over the 68 that were visible then. These are not scattered leftovers. **34 of them belong to six
 subsystems that were each built complete — logic, documentation, tests — and are consulted by
 nothing.** They are unreached because their *callers* were never written, so triaging them one at
 a time cannot terminate: every answer is "the caller does not exist", and the decision that would
@@ -349,6 +349,86 @@ machine**: routing is off here (`bench/.fleet/BROKER_ON` absent, `SWE_BROKER` un
 no broker to ping and no way to see the change work or fail. An unverifiable change to a live
 path is the thing this burn-down keeps finding, not something to add to it.
 
+### The instrument's largest blind spot, measured and closed
+
+`tools/unreached.py` skipped a name defined in more than one module whenever ANY definition was
+referenced. The 2026-09-13 fix got half of it -- a ZERO reference count resolves the ambiguity
+without resolving the name, so every place is reported -- and left the other half:
+
+    if len(places) != 1 and prod_refs[name]:
+        continue                  # some definition IS reached; a name count cannot say which
+
+Measured 2026-09-14 over tracked non-test modules: **106 public names are defined in more than
+one module, and 421 definitions sat behind that `continue`** (122 of them `main()` beside an
+`__main__` guard). Against a visible baseline of 68.
+
+**THE DESIGN WAS MEASURED BEFORE IT WAS WRITTEN, and the obvious version was nearly worthless:**
+
+| rule | still ambiguous | newly reportable |
+|---|---:|---:|
+| attribute by import, count every `Name`/`Attribute` | 411 | **3** |
+| …count only CALL positions | 401 | 11 |
+| …+ `self.x()` / `cls.x()` cannot reach a module-level function | 401 | 11 |
+| …+ a bare call resolves to a definition in the SAME module | 103 | **28** |
+
+The rule that did the work is not a heuristic — it is ordinary Python scoping. A bare
+`summarise(...)` inside a file that defines `summarise` reaches THAT one and says nothing about
+`relay/turn_outcome.py`; five of the six files calling a bare `summarise` define their own.
+
+**AND CREDITING ONLY CALLS WAS WRONG IN THE OTHER DIRECTION.** `main.py` does
+`from tools.data_ops import read_json` and then lists `read_json` in the `TOOLS` tuple — the
+gateway calls it later, by dispatch. The first working version reported `read_json`,
+`write_json`, `restore_point`, `roll_back`, `edit_and_verify` and `diff_files` as unreached:
+six tools the server registers. A registration is a use and it is not a call. So any reference
+the AST can ATTRIBUTE now credits its definition, while the AMBIGUITY bucket stays call-only —
+credit widely, doubt narrowly, which can only produce a false "reached", the error this file
+already prefers to make loudly.
+
+**AND THE FIRST ATTEMPT WAS A NO-OP.** It filtered the candidate places and then fell through
+to `if prod_refs[name]: continue`, which is true by construction for every name reaching that
+branch. The scan reported the same 68 and the whole attribution was discarded one line later.
+It looked like the rule had simply found nothing.
+
+#### The eighteen, each checked against its own module's importers
+
+Reported by the fixed scan and then verified by hand: for each, an independent pass asked
+whether any module that imports the owning module actually uses the name. All eighteen: no.
+
+| entry | lines | what shares the name |
+|---|---:|---|
+| `bench/retry_floor.py::report` | 67 | `report` is defined in nine modules |
+| `bench/skill_probe.py::compare` | 51 | `compare` in several |
+| `bench/companionbench/shadow_rules.py::compare` | 41 | the same `compare` |
+| `relay/selfimprove/planner_evaluator.py::preflight` | 39 | `preflight` also names a script |
+| `relay/outcomes.py::tally` | 35 | `tally` in three modules — `pro_ledger_report`'s is the live one |
+| `relay/selfimprove/solver_feedback.py::tally` | 27 | the same `tally`; its consumer was never built |
+| `relay/selfimprove/authority_ledger.py::verify` | 25 | `verify` is a common name |
+| `relay/selfimprove/decision.py::summarise` | 21 | `summarise` in eight modules |
+| `relay/selfimprove/apply.py::apply_genome` | 20 | shares with the manifest's validator |
+| `relay/quota_meter.py::prune` | 13 | `prune` in four modules |
+| `relay/turn_outcome.py::summarise` | 13 | `relay_fleet` calls only `classify` from this module |
+| `tools/auth_stats.py::get_summary` | 13 | `get_summary` elsewhere |
+| `relay/acceptance_contract.py::intact` | 11 | `intact` in the companionbench episodes |
+| `relay/selfimprove/harness_feedback.py::report` | 11 | the same `report` |
+| `relay/lean_capture.py::capture_fn` | 10 | `capture_fn` is defined twice, here and in profile_token |
+| `relay/profile_token.py::capture_fn` | 9 | the other one |
+| `relay/selfimprove/coreset.py::summarise` | 8 | the same `summarise` |
+| `scripts/win/checkpoint.py::pages` | 4 | `pages` is a browser word, used everywhere |
+
+Ten of the eighteen are in `relay/selfimprove/`, which is the subsystem with no driver — so the
+"decision surface with no decider" row above understates itself by that much again.
+
+**WHAT IS STILL HIDDEN, AND IS NOW SAID OUT LOUD.** 24 names -- 81 definitions between them --
+remain genuinely ambiguous: a bare call the AST cannot attribute, or a star import. The scan now
+PRINTS them (`defined in more than one module and not attributable`) instead of skipping them in
+silence, so a reader can see what the tool declined to judge. Two of the 24 are `check` and
+`mode`, both confirmed dead by hand in this same batch -- which is what the line is for. Separately, a dead SUBGRAPH still shows only its entry point: a function called only by
+another unreached function counts as reached, because a reference count is not a reachability
+analysis. Three confirmed instances — `compare.py::versions_differ` behind
+`transport_versions_differ`, `fleet_toolset::mode` behind `check`, and `coding_ops::worktree_add`
+/ `worktree_remove` behind `worktree_scope`. Iterating the scan to a fixed point was measured at
+**+15%** (78 → 90 under a cruder probe) and is the next instrument change, not this one.
+
 ### Deliberately unwired — do not "fix"
 
 `relay/selfimprove/autonomy.py::raise_to` — its docstring says so, and
@@ -358,7 +438,7 @@ control. Leave it.
 
 ### The self-improvement subsystem has no driver
 
-24 of the 68 are in `relay/selfimprove/` — the share has GROWN as the rest came down (24/75 → 24/68;
+24 of the 86 are in `relay/selfimprove/` — the share has GROWN as the rest came down (24/75 → 24/86, and ten of the eighteen newly revealed names are in there too;
 not one of them has moved), and one of the two names the scanner had never printed is in there too.
 `scripts/run_nightly_real.py` — the script meant to
 run the loop for real — opens with *"It has never been run at all."* No CI job, scheduler,

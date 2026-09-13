@@ -159,6 +159,7 @@ jobs:
             tools/test_a_counter_that_gates_a_switch_is_read.py \
             tools/test_a_declared_field_is_a_written_field.py \
             tools/test_a_name_defined_twice_is_still_reported.py \
+            tools/test_a_name_defined_twice_can_still_be_attributed.py \
             tools/test_a_lost_archive_can_be_rebuilt.py \
             tools/test_the_diagnostic_three_functions_were_kept_for.py \
             tools/test_a_backslash_in_a_literal_means_what_it_says.py \
