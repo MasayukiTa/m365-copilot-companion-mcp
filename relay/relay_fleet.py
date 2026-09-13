@@ -5448,29 +5448,32 @@ class RelayWorker:
             return self.status in TERMINAL
         if self.status == "waiting":
             self._capture_url()
-            # THE DEADLINE THAT ACTUALLY APPLIES, which is the same correction _defer_generation
-            # already carries (see its `_bound` above): "a socket turn is bounded by its own
-            # turn_timeout_s and _defer_generation deliberately skips this tab-era budget for
-            # it". This branch did not skip it. It compared every worker against the 240s
-            # tab-era budget and then labelled the row `socket_turn` because the WORKER was a
-            # socket worker -- so the origin named the transport, never the clock, and the
-            # field whose whole purpose is that "an inner overrun reads as an outer one" read
-            # as an outer one every time.
+            # THE LABEL NAMES THE CLOCK THAT FIRED, AND THE BUDGET IS THE ONE COMPARED. This
+            # branch compares against per_turn_timeout_s for every worker, and then chose
+            # `origin` from the worker's TRANSPORT -- so a socket worker's row said
+            # `origin=socket_turn budget_s=240` while SOCKET_TURN_TIMEOUT_S is 1200: a 1200s
+            # clock reported as having expired at 240, which is the single reading the origin
+            # field was added to prevent ("without it an inner overrun reads as an outer one").
             #
-            # MEASURED on run r6aa597a8_a0. Five turns timed out at 240.5-241.3s against
-            # SOCKET_TURN_TIMEOUT_S=1200, burning 1,204s of a 48-minute run, and every row said
-            # `origin=socket_turn budget_s=240` -- a 1200s clock reported as having expired at
-            # 240. Turn 3 is the cost: its reply arrived 70s in, the turn was declared timed out
-            # at 240s anyway, and the full 7,890-character goal was re-sent three more times.
-            _bound = (SOCKET_TURN_TIMEOUT_S if getattr(self, "socket", False)
-                      else self.per_turn_timeout_s)
+            # THE BUDGET ITSELF IS LEFT ALONE, DELIBERATELY, and this is the second version of
+            # this comment. Raising it to SOCKET_TURN_TIMEOUT_S looked right -- _defer_generation
+            # says a socket turn is bounded by its own clock -- until the per-turn timings of
+            # run r6aa597a8_a0 were read: every reply that arrived came in 22-164s, well inside
+            # 240, and turn 3 replied at +70s and was declared timed out at +240s ANYWAY. A
+            # longer budget does not save that turn; it makes it wait 1200s for an answer it
+            # already had. The defect in turn 3 is that the poll did not see a reply it had,
+            # and why is NOT DETERMINED. Widening a clock to cover for that would hide it.
+            _bound = self.per_turn_timeout_s
             if time.time() - self._t_send > _bound:
                 # A MEASUREMENT, NOT A GUESS -- and recorded apart from the guesses.
                 # turn_outcome classifies THROTTLE/RECYCLE/TRANSIENT from what the upstream
                 # SAID; this is our own clock passing our own budget. A rate computed over
                 # both cannot say whether the upstream is degrading or our budget is wrong.
                 _elapsed = round(time.time() - self._t_send, 1)
-                _origin = ("socket_turn" if getattr(self, "socket", False) else "per_turn")
+                # `per_turn` because per_turn_timeout_s is what was compared. The
+                # `socket_turn` origin belongs to the driver's own bound, which is enforced
+                # where SOCKET_TURN_TIMEOUT_S is passed to it -- not here.
+                _origin = "per_turn"
                 # a turn that never finished is a transient stall -- retry before STUCK
                 if self._retry_transient():
                     self._note_timeout(_origin, _elapsed, "retry", budget_s=_bound)
