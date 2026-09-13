@@ -74,7 +74,6 @@ NO_CALLER_NO_TEST = {
 #: Called by nothing outside tests. Tests referencing a function say it was worth writing; they
 #: do not say anything reaches it in production.
 NO_CALLER_BUT_TESTED = {
-    "bench/retry_floor.py::report",                                # 67 lines, revealed 2026-09-14
     "bench/skill_probe.py::compare",                               # 51 lines, revealed 2026-09-14
     "bench/companionbench/shadow_rules.py::compare",               # 41 lines, revealed 2026-09-14
     "relay/selfimprove/planner_evaluator.py::preflight",           # 39 lines, revealed 2026-09-14
@@ -185,8 +184,6 @@ REASONS: dict[str, tuple[str, str]] = {
     # the 2026-09-13 fix that was left. 421 definitions sat behind that skip. Attributing a
     # reference to the module the AST names reports these eighteen; each was checked against
     # the owning module's own importers before being listed.
-    "bench/retry_floor.py::report":
-        ("revealed", "docs/unreached_burndown.md"),
     "bench/skill_probe.py::compare":
         ("revealed", "docs/unreached_burndown.md"),
     "bench/companionbench/shadow_rules.py::compare":
