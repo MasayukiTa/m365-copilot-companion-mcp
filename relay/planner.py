@@ -42,8 +42,37 @@ _STEP_RE = re.compile(
 
 
 def _clean_step(s):
-    """Drop leading markdown emphasis / colons so '**calc.py を読む**:' -> 'calc.py を読む'."""
-    return s.strip().strip("*").strip().rstrip(":：").strip()
+    """Drop leading markdown emphasis / colons so '**calc.py を読む**:' -> 'calc.py を読む'.
+
+    A HORIZONTAL RULE IS NOT A STEP. `_STEP_RE` accepts a `-` bullet, so a markdown rule
+    matches it: `---` cleaned to `--` and `--` to `-`, both non-empty, both surviving the
+    caller's `if step:` guard as a step whose entire text is punctuation. `***` was dropped
+    only because `.strip("*")` happens to empty it -- an accident, not a rule.
+
+    MEASURED on run r6aa597a8_a0. The agent's seven-way split reply opened with a `---`
+    separator, and extract_plan returned FOURTEEN steps: the rule, six shared constraints, and
+    the seven real subtasks. Fourteen is over MAX_CHILDREN (12), so the whole split was
+    refused and the fleet fell back to one conversation. The rule was not the only surplus
+    there -- but on a reply with twelve real steps it would be the entire difference, and on a
+    short one it dispatches a child whose goal is `--`.
+
+    Returning "" rather than raising, because both callers already drop a falsy step and
+    neither should learn a new failure mode from a separator.
+    """
+    # UNTIL IT STOPS CHANGING, because one pass does not do what the line above says. The
+    # emphasis was stripped BEFORE the colon, so `**calc.py を読む**:` kept its trailing `**`:
+    # strip("*") saw a string ending in `:`, removed only the leading pair, and the colon came
+    # off afterwards with nothing left to re-strip. The documented example was wrong about the
+    # function it documents. Three passes is past the fixpoint for every shape seen here.
+    s = (s or "").strip()
+    for _ in range(3):
+        t = s.strip("*").strip().rstrip(":：").strip()
+        if t == s:
+            break
+        s = t
+    # `isalnum()` is true for CJK as well as Latin, so this asks "is there any content at
+    # all", not "is this English".
+    return s if any(ch.isalnum() for ch in s) else ""
 
 
 def plan_ready(resp: str) -> bool:
