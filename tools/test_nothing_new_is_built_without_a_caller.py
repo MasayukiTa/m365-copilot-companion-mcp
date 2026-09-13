@@ -115,7 +115,6 @@ NO_CALLER_BUT_TESTED = {
     "relay/provenance.py::resolved_value",                       # 12 lines
     "relay/selfimprove/record_summary.py::summary_for",          # 12 lines
     "relay/execution_profiles.py::validate_runtime",             # 11 lines
-    "relay/quota_meter.py::sustainable_workers",                 # 11 lines
     "relay/selfimprove/guards.py::partition_outcomes",           # 11 lines
     "relay/fleet_toolset.py::unknown_tools",                     # 10 lines
     "relay/turn_outcome.py::is_capacity_signal",                 # 10 lines
