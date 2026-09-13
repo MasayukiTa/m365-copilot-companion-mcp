@@ -103,7 +103,13 @@ def finalize(pred_records, *, weights=None) -> dict:
 
 
 def plan_and_explain(instance_id, report=None, *, n=4, grade_results_path=None) -> str:
-    """One-line human summary of the plan (for a cockpit / log). Never raises."""
+    """One-line human summary of the plan. Never raises.
+
+    IT HAS NO CALLER. Written for a cockpit or a log, and neither asks for it -- zero
+    references across `git ls-files` on 2026-09-14, tests included. The parenthesis naming two
+    plausible consumers is why nobody asked; it is listed in docs/unreached_burndown.md now
+    instead, which is a question rather than an answer.
+    """
     try:
         p = plan_solve(instance_id, report, n=n, grade_results_path=grade_results_path)
         if p["mode"] == "best-of-N":

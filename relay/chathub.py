@@ -451,8 +451,14 @@ def collect_final(frame) -> str:
 def collect_text(frame) -> str:
     """The visible text this frame carries -- its delta if it has one, else its snapshot.
 
-    Kept for callers that look at a single frame. A whole turn must NOT be assembled by
-    concatenating this: see `collect_final`.
+    NO PRODUCTION CALLER. Written for callers that look at a single frame and there are
+    none, checked across `git ls-files` on 2026-09-14; `relay/test_chathub.py` asserts through
+    it (a `Metrics` target contributes no text; a chain-of-thought frame yields none), which is
+    why it is still here. The previous wording -- "kept for callers that look at a single
+    frame" -- named a consumer that does not exist and so closed the question of who it should
+    be. Listed in docs/unreached_burndown.md instead.
+
+    A whole turn must NOT be assembled by concatenating this: see `collect_final`.
     """
     return collect_delta(frame) or collect_final(frame)
 

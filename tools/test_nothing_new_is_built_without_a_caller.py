@@ -54,7 +54,6 @@ NO_CALLER_NO_TEST = {
     "tools/golden.py::run_trajectory",                           # 64 lines
     "relay/autonomy_gate.py::judge_autonomy",                    # 54 lines
     "bench/skill_use_log.py::compare_runs",                      # 23 lines
-    "scripts/win/capture_budget.py::acknowledge",                # 19 lines
     "tools/judge_backend.py::ask_human_async",                   # 18 lines
     "relay/selfimprove/guards.py::launch_detached",              # 16 lines
     "relay/selfimprove/run_archive.py::revisions",               # 14 lines

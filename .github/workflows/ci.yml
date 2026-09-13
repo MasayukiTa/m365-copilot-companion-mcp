@@ -163,6 +163,7 @@ jobs:
             tools/test_the_diagnostic_three_functions_were_kept_for.py \
             tools/test_a_backslash_in_a_literal_means_what_it_says.py \
             relay/test_a_declared_knob_changes_something.py \
+            relay/test_a_kept_for_claim_names_a_real_consumer.py \
             scripts/test_the_audit_sees_the_tree_that_will_be_pushed.py \
             scripts/test_a_script_suite_writes_where_a_test_writes.py \
             scripts/test_change_scope_keeps_the_four_apart.py \

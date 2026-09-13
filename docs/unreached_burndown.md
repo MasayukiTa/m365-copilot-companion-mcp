@@ -1,6 +1,6 @@
 # Burning down the unreached baseline
 
-Started 2026-09-13. **93 → 69** so far. The scan and the baseline now agree at 69: the two names the
+Started 2026-09-13. **93 → 68** so far. The scan and the baseline now agree at 68: the two names the
 scanner had never printed at all are in the frozen list with their reason, so a gap between the two
 numbers is once again a signal rather than a known discrepancy. This file exists so they do not have
 to be triaged a third time.
@@ -80,12 +80,13 @@ flagged unwired by an adversarial review hours earlier, nearly hidden behind an 
 | `relay/profile_token.py::discard_template` | **fixed** — `load_template` rejected a template older than the age cap and then *left it on disk*, so the same expired template was re-read and re-rejected on every capture, forever. Measured on the live store: one of the two cached templates was **150.6h old against a 24h cap**. The rejection now discards it |
 | `tools/lock_state.py::locked_recently` / `locked_since` / `matching_record` | **fixed** — all three docstrings said they were "kept for the CLI", and `_cli` had `show` and `token-gap` and called none of them. A justification resting on a surface nobody built is worse than none, because it reads as settled. `recent [seconds]` is that surface. **Not `matching_records`** (plural), which is live in three modules and answers a different question — "which refusals could have been mine", a decision — where these answer "what happened" |
 | `relay/transport_policy.py::evolvable_fields` | **fixed** — it declared `transport_explore_rate`, and a scan over `git ls-files` found that name in exactly one place: that return tuple. Nothing read it — the fifth instance of the defect the version table twelve lines above says this repository "has now found in four separate components", sitting inside the fix for the first four. The remaining knob is spelled once and read through its name, and `choose()` now records a genome knob no policy reads, because an undeclared knob is an A/B arm identical to its control |
+| `scripts/win/capture_budget.py::acknowledge` | **fixed** — `verdict()` has always READ the acknowledgement file, and nothing could write one, so the first red was unclearable except by hand-editing JSON. Its own docstring says what that costs: *"without this, the first red produces a culture of forcing past the gate, and the gate dies."* The reason it exists is the reason nobody noticed it was unreachable. `ack "<reason>"` (with `--log PATH` for a specific run) now exists, with the reason REQUIRED — "a recorded decision with a reason, not a switch" |
 
 The ratchet noticed `is_resolved` on its own: the moment it gained callers the test refused to
 keep it listed. That is the mechanism working in the direction it was built for. It did the same
 for `evolvable_fields` on 2026-09-14, refusing to keep it listed within seconds of the wiring.
 
-## The remaining 69
+## The remaining 68
 
 Classified 2026-09-13 by three parallel surveys, each required to give grep-level evidence and
 to answer "could not determine" rather than guess. **These verdicts are triage, not proof** —
@@ -201,7 +202,7 @@ them) — pinned by a test that asserts the disagreement is legible rather than 
 
 ### The pattern under half the list: a decision surface with no decider
 
-Counted 2026-09-14 over the 69. These are not scattered leftovers. **34 of them belong to six
+Counted 2026-09-14 over the 68. These are not scattered leftovers. **34 of them belong to six
 subsystems that were each built complete — logic, documentation, tests — and are consulted by
 nothing.** They are unreached because their *callers* were never written, so triaging them one at
 a time cannot terminate: every answer is "the caller does not exist", and the decision that would
@@ -217,7 +218,7 @@ create one is above the level of this burn-down.
 | `relay/turn_outcome.py` | 1 | `is_capacity_signal` | a controller. Nothing in the fleet reduces concurrency on a rate class — checked across every non-test file |
 
 **Why this is one row and not six.** The burn-down's procedure — take an entry, find the caller
-that should exist, write it — works on the other 35 and cannot work on these. What they need is a
+that should exist, write it — works on the other 34 and cannot work on these. What they need is a
 decision per *subsystem*: run it, wire it, or retire it. Until that is made, every pass over the
 list re-derives the same six answers, which is what the first two surveys did.
 
@@ -280,6 +281,74 @@ genome path that would has no driver), and wrapping the comparison would hide th
 instead of settling it. Settling it means deciding whether transport knobs belong in the
 manifest, which is the same subsystem decision as the table above.
 
+### "Kept for X" is a claim, and five of five checked were false
+
+The most useful thing found on 2026-09-14 was not any single entry. It was that the docstrings of
+unreached functions *say who they are for*, and that saying so is what stops anybody asking:
+
+| entry | what it claimed | what was there |
+|---|---|---|
+| `tools/lock_state.py::locked_since` | "Kept for the CLI and for diagnostics" | `_cli` had `show` and `token-gap` |
+| `tools/lock_state.py::matching_record` | "Kept for callers that only want to name one record (the CLI, diagnostics)" | same CLI, same two subcommands |
+| `relay/project_memory.py::list_themes` | "For the cockpit and for tests" | tests yes; the cockpit has no project-memory panel at all, its only "theme" is light/dark |
+| `relay/solve_policy.py::plan_and_explain` | "(for a cockpit / log)" | zero references anywhere, tests included |
+| `relay/chathub.py::collect_text` | "Kept for callers that look at a single frame" | no production caller; `test_chathub.py` asserts through it three times — see the near-miss below |
+
+**An entry that says nothing invites the next reader to ask who should call it. An entry that
+says "kept for the CLI" reads as settled, and the question stops.** That is why this is worse
+than no justification at all, and why it is now a test rather than a note:
+`relay/test_a_kept_for_claim_names_a_real_consumer.py` refuses a baseline entry whose docstring
+names a present-tense consumer, because membership in the baseline *is* the finding that none
+exists. The two cannot both be true. Wire the consumer — the ratchet then drops the entry by
+itself — or write down that it was never built.
+
+**The first matcher was too wide, and the miss is the useful half.** A case-insensitive
+`kept for` flagged `relay/selfimprove/harness_tree.py::justified`, whose docstring says *"a
+branch earns its place when a change was KEPT for that class"* — the other "kept", in a sentence
+about decisions rather than callers. A justification is written as its own sentence, so the
+phrase is anchored to one. Matching a spelling rather than a shape is the same mistake the file
+is about.
+
+**One outstanding, and it needs an operator.** `tools/security.py::get_client_ip` says "Kept for
+backward-compat with callers that just need the IP string", and there are none — but
+`tools/security.py` is in the frozen set, where any edit means re-signing the baseline with a
+stated reason. Correcting prose is not worth a re-signing, so it is reported rather than failed,
+and pinned exactly: a *new* frozen-file claim still fails the test.
+
+### The deletion that was nearly made on a filtered grep
+
+`relay/chathub.py::collect_text` was about to be removed as "no caller and no test" — three
+lines, `collect_delta(frame) or collect_final(frame)`, and a docstring naming a consumer that
+does not exist. The verdict came from
+
+    git grep -n "collect_text" -- . | grep -v "chathub.py:\|unreached_frozen\|test_nothing_new"
+
+and `grep -v "chathub.py:"` excludes **`test_chathub.py`** as well. It has three assertions
+that run through this function — that a `Metrics` target contributes no text, and that a
+chain-of-thought frame yields none — and they are real properties of the frame parser.
+
+It stays; only the false claim in its docstring goes. **A filter that hides the evidence is
+worse than no filter, because the result reads as thorough** — the same shape as the
+`fleet_toolset` scan that answered `['main.py']` off a comment, one section above, on the same
+day.
+
+### Triaged, not wired: `bench/remote/broker_client.py::ping`
+
+The liveness verb exists on **both** ends of the protocol — `broker.sh` answers it with
+`{"ok":true,"pong":true,...}` and `broker_parse.VERBS` lists it — and no client asks it.
+`routing_switch.broker()` establishes that the module imports and that `enabled()` is true (an
+env var or a marker file); it never establishes that the broker answers. So a run with routing
+switched on against a down host proceeds, and fails one `create` at a time across forty
+instances — which is precisely what that function's own docstring exists to prevent: *"doing it
+silently is how a routed run comes to look like an ordinary one that went badly."*
+
+**Not wired here, and the reason is not doubt about the design.** `broker()` is called
+repeatedly, so the check has to be cached per process rather than a 60-second ping per call, and
+the whole thing is a change to a live benchmark routing path that **cannot be verified from this
+machine**: routing is off here (`bench/.fleet/BROKER_ON` absent, `SWE_BROKER` unset), so there is
+no broker to ping and no way to see the change work or fail. An unverifiable change to a live
+path is the thing this burn-down keeps finding, not something to add to it.
+
 ### Deliberately unwired — do not "fix"
 
 `relay/selfimprove/autonomy.py::raise_to` — its docstring says so, and
@@ -289,7 +358,7 @@ control. Leave it.
 
 ### The self-improvement subsystem has no driver
 
-24 of the 69 are in `relay/selfimprove/` — the share has GROWN as the rest came down (24/75 → 24/69;
+24 of the 68 are in `relay/selfimprove/` — the share has GROWN as the rest came down (24/75 → 24/68;
 not one of them has moved), and one of the two names the scanner had never printed is in there too.
 `scripts/run_nightly_real.py` — the script meant to
 run the loop for real — opens with *"It has never been run at all."* No CI job, scheduler,

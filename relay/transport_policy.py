@@ -142,6 +142,13 @@ def classify_fallback(reason: str) -> str:
     return "unknown"
 
 
+#: The one knob a genome may move here, spelled once. `_policy_v2` reads through this name
+#: rather than repeating the string, because "written twice, these drift" -- the argument
+#: mechanism_telemetry.patch_hash makes about itself, and the reason it now has one
+#: implementation instead of two.
+ELIGIBLE_KINDS = "transport_eligible_kinds"
+
+
 def _policy_v1(goal: str, *, kind="", knobs=None, explore=False) -> str:
     """Whatever the route offers. THE BEHAVIOUR THAT WAS ALREADY THERE.
 
@@ -199,13 +206,6 @@ try:
 except Exception:                                  # pragma: no cover - import-order safety
     _invariants = None
     _KNOB_INVARIANT = ""
-
-
-#: The one knob a genome may move here, spelled once. `_policy_v2` reads through this name
-#: rather than repeating the string, because "written twice, these drift" -- the argument
-#: mechanism_telemetry.patch_hash makes about itself, and the reason it now has one
-#: implementation instead of two.
-ELIGIBLE_KINDS = "transport_eligible_kinds"
 
 
 def evolvable_fields() -> tuple:

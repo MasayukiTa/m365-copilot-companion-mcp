@@ -217,6 +217,51 @@ def verdict(log_path=None, ledger=None, acked_path=None, now=None, elapsed_s=Non
     return True, detail
 
 
-if __name__ == "__main__":
+def _cli(argv=None):
+    """`python -m scripts.win.capture_budget [ack [--log PATH] <reason>]`.
+
+    THE SURFACE `acknowledge` WAS WRITTEN FOR AND NEVER GOT. `verdict()` has always read the
+    acknowledgement file; nothing could write to it, so a red could only be cleared by editing
+    `.fleet/capture_budget_acked.json` by hand -- and a gate whose escape hatch is a text editor
+    is the "culture of forcing past the gate" that function's docstring is about.
+
+    THE REASON IS REQUIRED, not defaulted. "An acknowledgement is a recorded decision with a
+    reason, not a switch" is the whole design: an `ack` that can be typed without saying why is
+    the switch it was written not to be.
+    """
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Capture-budget gate for the last coordinator run.")
+    sub = ap.add_subparsers(dest="cmd")
+    a = sub.add_parser("ack", help="record that a red has been seen and explained")
+    # --log IS A FLAG, NOT AN OPTIONAL POSITIONAL, and the first draft got that wrong. With
+    # `run_path` optional in front of a required `reason`, argparse binds a lone argument to
+    # `reason` -- so `ack path/to/coordinator.log` recorded the PATH as the reason, against the
+    # newest log, and said nothing. An acknowledgement whose reason is a file path is worse than
+    # none: it satisfies the "a reason was given" rule while saying nothing a reader can use.
+    a.add_argument("--log", dest="run_path", default=None,
+                   help="the coordinator log the verdict is about (default: the newest)")
+    a.add_argument("reason", help="why this red is understood; recorded verbatim")
+    args = ap.parse_args(argv)
+
+    if args.cmd != "ack":
+        ok, why = verdict()
+        print(("[ok] " if ok else "[XX] ") + why)
+        return 0 if ok else 1
+
+    run_path = args.run_path or newest_log()
+    if not run_path:
+        print("no coordinator log to acknowledge")
+        return 2
+    if not (args.reason or "").strip():
+        print("an acknowledgement needs a reason")
+        return 2
+    acknowledge(run_path, args.reason)
     ok, why = verdict()
-    print(("[ok] " if ok else "[XX] ") + why)
+    print("acknowledged %s\n%s" % (os.path.basename(run_path),
+                                   ("[ok] " if ok else "[XX] ") + why))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_cli())

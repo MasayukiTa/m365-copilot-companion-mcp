@@ -221,3 +221,55 @@ def test_the_checkpoint_actually_asks(tmp_path):
     """A check nobody is obliged to read is the failure this repository keeps rediscovering."""
     text = open(os.path.join(ROOT, "scripts", "win", "checkpoint.py"), encoding="utf-8").read()
     assert "capture_budget" in text and "capture budget kept" in text
+
+
+# ---- the gate can be cleared, which until 2026-09-14 it could not -------------------------
+#
+# `verdict()` has always READ the acknowledgement file and `acknowledge()` has always written
+# one, and nothing called `acknowledge()`: `__main__` computed the verdict and printed it. So a
+# red could only be cleared by hand-editing .fleet/capture_budget_acked.json -- which is the
+# failure that function's own docstring exists to prevent ("without this, the first red produces
+# a culture of forcing past the gate, and the gate dies"). The reason it exists is the reason
+# nobody noticed it was unreachable.
+
+def _cli_out(monkeypatch, capsys, argv, ack_path):
+    monkeypatch.setattr(B, "ACKED", str(ack_path), raising=False)
+    rc = B._cli(argv)
+    return rc, capsys.readouterr().out
+
+
+def test_ack_records_the_reason_and_the_verdict_then_clears(tmp_path, monkeypatch, capsys):
+    log = tmp_path / "coordinator_x.log"
+    log.write_text("", encoding="utf-8")
+    ack = tmp_path / "acked.json"
+
+    rc, out = _cli_out(monkeypatch, capsys,
+                       ["ack", "--log", str(log), "known spin, tracked"], ack)
+    assert rc == 0, out
+    assert "acknowledged coordinator_x.log" in out
+    saved = json.loads(ack.read_text(encoding="utf-8"))
+    assert saved["coordinator_x.log"]["reason"] == "known spin, tracked"
+    assert saved["coordinator_x.log"]["at"]
+
+
+def test_an_acknowledgement_without_a_reason_is_refused(monkeypatch, tmp_path, capsys):
+    """"A recorded decision with a reason, not a switch" is the whole design. An `ack` that can
+    be typed without saying why is the switch it was written not to be."""
+    log = tmp_path / "coordinator_y.log"
+    log.write_text("", encoding="utf-8")
+    monkeypatch.setattr(B, "ACKED", str(tmp_path / "acked.json"), raising=False)
+    with pytest.raises(SystemExit):
+        B._cli(["ack"])          # no reason at all
+    # AND a lone path is not silently taken as the reason, which is why `--log` is a flag: with
+    # an optional positional in front of a required one, argparse binds a lone argument to the
+    # REQUIRED one, so `ack path/to/log` recorded the path as the reason and said nothing.
+    with pytest.raises(SystemExit):
+        B._cli(["ack", "--log", str(log)])
+
+
+def test_the_default_subcommand_is_still_the_verdict(monkeypatch, tmp_path, capsys):
+    """The checkpoint shells out to it with no arguments; that call must keep working."""
+    monkeypatch.setattr(B, "ACKED", str(tmp_path / "acked.json"), raising=False)
+    B._cli([])
+    out = capsys.readouterr().out
+    assert out.startswith("[ok] ") or out.startswith("[XX] "), out
