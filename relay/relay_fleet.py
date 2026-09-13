@@ -46,6 +46,15 @@ from .copilot_autopilot_relay import (
 )
 from relay import settle as _settle
 from relay import fanout as fanout_mod
+from relay import invariants as _invariants
+
+#: RECORD, not RAISE -- see the check in reset_socket_route. A reset runs after a browser has
+#: already died and an exception there costs the run the reset was meant to save.
+_INV_RESET_KEEPS_NO_TOKEN = _invariants.register(
+    "socket_route.reset_keeps_no_token", "relay.relay_fleet", _invariants.RECORD,
+    "reset_socket_route's docstring says \"Nothing is preserved: not the token, which belongs "
+    "to the context that just died\". It was false for weeks: profile_token kept its own _MEMO "
+    "and the next send could be handed a token minted against a dead browser context")
 # BOUND ONCE, HERE. This was imported inside each of eight call sites, and two sites did
 # not have it in scope: RelayWorker.__init__'s per-goal fan-out judgement and
 # _spawn_children's split event. Both raised NameError into an `except Exception: pass`,
@@ -1366,6 +1375,19 @@ def reset_socket_route():
     try:
         from relay import profile_token as _pt
         _pt.forget_memo()
+    except Exception:
+        pass
+    # AND THE POST-CONDITION, CHECKED RATHER THAN ASSERTED IN PROSE. The sentence above this
+    # function's body -- "Nothing is preserved: not the token" -- was false for long enough to
+    # be quoted, and nothing would have said so. RECORD, not RAISE: this runs after a browser
+    # has already died, and turning a recoverable reset into an exception would trade a wasted
+    # attempt for a lost run. The violation lands in .fleet/invariants.jsonl either way, which
+    # is the part that was missing.
+    try:
+        from relay import invariants as _iv
+        from relay import profile_token as _pt2
+        _iv.assert_invariant(_INV_RESET_KEEPS_NO_TOKEN, not getattr(_pt2, "_MEMO", None),
+                    "a token survived the browser it was minted against")
     except Exception:
         pass
 

@@ -252,16 +252,29 @@ def scan(files=None):
 
     rows = []
     for name, places in defs.items():
-        if len(places) != 1:
-            continue                      # defined in two modules: a name count cannot resolve
-        rel, lineno, span = places[0]
+        # A NAME DEFINED TWICE USED TO DISAPPEAR, WHICH IS THE WORST OF THE THREE OUTCOMES.
+        # The reference count is by bare name, so with two definitions it cannot say WHICH one
+        # a call reached -- and the answer was to drop the name entirely. Measured 2026-09-13:
+        # adding a function called `require` to relay/invariants.py silently removed
+        # `relay/selfimprove/autonomy.py::require` -- the hard autonomy gate an adversarial
+        # review had flagged -- from the inventory. A new function's NAME could retire an
+        # existing finding, and nothing said so.
+        #
+        # ZERO REFERENCES RESOLVES IT WITHOUT RESOLVING THE NAME. If the count is zero, no
+        # definition of that name is reached, whichever one a call would have meant, so every
+        # place is reported. Only a non-zero count is genuinely ambiguous, and that is the one
+        # case still skipped. Same rule as the rest of this file: prefer noise over silence,
+        # because a false "reached" is a row nobody ever sees.
+        if len(places) != 1 and prod_refs[name]:
+            continue                      # some definition IS reached; a name count cannot say which
         if prod_refs[name]:
             continue
-        if cross and reached_from_shell(name, rel, cross):
-            continue                      # reached from a .ps1/.bat wrapper
-        if decorated.get("%s::%s" % (rel, name)):
-            continue                      # handed to a registry by a decorator
-        rows.append(("%s::%s" % (rel, name), name, rel, lineno, span, test_refs[name]))
+        for rel, lineno, span in places:
+            if cross and reached_from_shell(name, rel, cross):
+                continue                  # reached from a .ps1/.bat wrapper
+            if decorated.get("%s::%s" % (rel, name)):
+                continue                  # handed to a registry by a decorator
+            rows.append(("%s::%s" % (rel, name), name, rel, lineno, span, test_refs[name]))
     rows.sort(key=lambda r: (-r[4], r[0]))
     return rows
 

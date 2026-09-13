@@ -28,8 +28,18 @@ import json
 import os
 import re
 
+from relay import invariants as _inv
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TRANSCRIPTS = os.path.join(REPO, ".fleet", "transcripts")
+
+#: A reader that cannot read is worse than a reader that stops. See the check at the end of
+#: load_completions for the measurement this was written from.
+_INV_TRANSCRIPTS_READABLE = _inv.register(
+    "reconciler.transcripts_are_readable", "relay.fleet_reconcile", _inv.RAISE,
+    "load_completions matched transcript files and returned nothing: the reconciler would "
+    "compare every worker's claim against an empty evidence set and report the result as "
+    "though it had looked")
 
 #: Where a claim stops and its supporting evidence starts. Splitting here is what lets two
 #: workers that AGREE on a verdict but cite different pages read as agreement rather than as a
@@ -191,6 +201,17 @@ def load_completions(run=None, transcripts=TRANSCRIPTS):
         if goal and last:
             key = hashlib.sha1(goal.encode("utf-8")).hexdigest()[:10]
             out[key].append((os.path.basename(path), goal, last))
+    # THE POST-CONDITION THAT WAS FALSE FOR WEEKS AND COST NOTHING TO BE FALSE. This globbed
+    # only "*.jsonl" while retention gzips transcripts as they age, so it returned 2 goals out
+    # of 1557 transcripts and the reconciler compared claims against 0.1% of the evidence.
+    # Nothing raised; the dict was simply smaller. It RAISES now, because a reconciler that
+    # reports on a twentieth of a percent of the record is worse than one that stops. `seen` is
+    # what this function actually matched, so an empty result with files in hand means the
+    # READING broke; a run filter matching no transcript leaves `seen` empty too, and that is a
+    # legitimately empty answer rather than a violation.
+    _inv.assert_invariant(_INV_TRANSCRIPTS_READABLE, out or not seen,
+                 "matched %d transcript file(s) and read none of them" % len(seen),
+                 transcripts=transcripts, run=run or "")
     return out
 
 
