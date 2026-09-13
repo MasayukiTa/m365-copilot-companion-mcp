@@ -50,6 +50,11 @@ LIVE_RECORD_REDIRECTS = {
     # Runtime post-condition violations. A test that deliberately violates one would 
     # otherwise put it in the operator record, where a violation means something real broke.
     "relay.invariants": {"LOG": "invariants.jsonl"},
+    # THE ONLY ONE OF rebuild_history's FOUR THAT IS WRITTEN. It is the DEFAULT output of
+    # `main()`, and two of that module's own tests call main() -- so without this they would
+    # rebuild the operator's archive on every run. The other three (FLEET, SOCKET_ROUTE,
+    # TRANSCRIPTS) are read-only sources and are listed below.
+    "tools.rebuild_history": {"HISTORY": "history.json"},
     # Written on the hot path of EVERY tool call, so a test that reaches the gateway fills the
     # operator's evidence ledger with calls that were never made in earnest.
     "tools.tool_ledger": {"LEDGER_PATH": "tool_events.jsonl"},
@@ -169,6 +174,16 @@ DELIBERATELY_NOT_REDIRECTED = {
         "writes to; redirecting it would disarm that refusal during tests",
     ("relay.selfimprove.quality_loop", "SWEDIR"):
         "a benchmark working directory, not an operator record",
+    # READ-ONLY SOURCES for the archive rebuild. The tool reconstructs history.json FROM these
+    # two ledgers; it never opens either for writing, and its own tests hand it explicit paths
+    # under tmp_path for every case that exercises the reading. FLEET is the directory the
+    # other three are built from, not a location anything writes through.
+    ("tools.rebuild_history", "FLEET"):
+        "a directory the other constants are derived from; nothing writes through it",
+    ("tools.rebuild_history", "SOCKET_ROUTE"):
+        "read-only: the socket ledger is the rebuild's source and is never opened for writing",
+    ("tools.rebuild_history", "TRANSCRIPTS"):
+        "read-only: transcripts are scanned for their goal line and never written",
     ("relay.selfimprove.l2_cron", "DEFAULT_LOCK"):
         "a lock file whose whole purpose is to be taken and released; tests that exercise it "
         "pass their own path",

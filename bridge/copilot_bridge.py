@@ -4118,11 +4118,39 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": "unknown sid"}); return
         ref = sess.get("conv_url") or ""
         kind = classify_conv_ref(ref)
+        via = "page"
         try:
-            _reap_orphan_tabs()
+            # THE SOCKET FIRST, AND WITHOUT A PAGE. A sessref is exactly the shape
+            # socket_route.driver_for(conversation_id=) continues, so the navigation this used
+            # to require was a precondition for the wrong thing: the page had to settle before
+            # ACTIVE_SID moved, and ACTIVE_SID is the only input the socket driver reads.
+            #
+            # The order inverts. Point the session at the conversation, ask for a socket, and
+            # keep it if one comes back. Nothing is navigated, nothing is clicked, and no tab
+            # is opened -- which is the difference between "resumable" and "resumable if you
+            # are willing to open a browser".
             if kind == "sessref":
-                ok, reason = _resume_to_ref(ref)
+                _prev = ACTIVE_SID
+                ACTIVE_SID = sid
+                _drv = None
+                try:
+                    _drv = _bridge_socket_driver()
+                except Exception:
+                    _drv = None
+                if _drv is not None:
+                    global DRIVER
+                    DRIVER = _drv
+                    release_resident_page("resumed over the socket")
+                    ok, reason, via = True, "ok", "socket"
+                else:
+                    # NO SOCKET TO BE HAD. Falling back to the page is still better than
+                    # refusing, but it is the exception now and the caller is told which one
+                    # happened rather than left to assume.
+                    ACTIVE_SID = _prev
+                    _reap_orphan_tabs()
+                    ok, reason = _resume_to_ref(ref)
             elif kind == "conv_url":
+                _reap_orphan_tabs()
                 ok = _goto_settled(ref)
                 reason = "ok" if ok else "navigation did not settle on the conversation"
             else:
@@ -4132,7 +4160,7 @@ class Handler(BaseHTTPRequestHandler):
         if ok:
             ACTIVE_SID = sid
             S.touch(sid, status="active")
-            self._json({"ok": True, "sid": sid})
+            self._json({"ok": True, "sid": sid, "via": via})
         else:
             self._json({"ok": False, "error": reason})
 
