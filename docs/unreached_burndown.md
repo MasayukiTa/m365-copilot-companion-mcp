@@ -112,7 +112,7 @@ control. Leave it.
 
 ### The self-improvement subsystem has no driver
 
-23 of the 76 are in `relay/selfimprove/` — the share has GROWN as the rest came down. `scripts/run_nightly_real.py` — the script meant to
+24 of the 76 are in `relay/selfimprove/` — the share has GROWN as the rest came down, and one of the two names the scanner had never printed is in there too. `scripts/run_nightly_real.py` — the script meant to
 run the loop for real — opens with *"It has never been run at all."* No CI job, scheduler,
 `.bat` or cron invokes any entry point. They are stranded because the loop was never turned on,
 not because they are useless. **Decide that first**; classifying them one by one before the
