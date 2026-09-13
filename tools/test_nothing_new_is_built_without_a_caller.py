@@ -74,6 +74,26 @@ NO_CALLER_NO_TEST = {
 #: Called by nothing outside tests. Tests referencing a function say it was worth writing; they
 #: do not say anything reaches it in production.
 NO_CALLER_BUT_TESTED = {
+    # DEAD SUBGRAPHS, revealed 2026-09-14 by iterating the scan to a fixed point. Each was held
+    # off the list by a caller that is itself unreached, so a reference count said "someone
+    # names this" while nothing could get there. Not new code.
+    "relay/selfimprove/diversify.py::diversify",                    # 62 lines
+    "relay/solve_policy.py::plan_solve",                            # 56 lines
+    "tools/coding_ops.py::worktree_remove",                         # 44 lines
+    "relay/selfimprove/calibration.py::recommend_effort",           # 33 lines
+    "relay/selfimprove/propose.py::mutation_generator",             # 33 lines
+    "tools/coding_ops.py::worktree_add",                            # 29 lines
+    "relay/selfimprove/guards.py::classify_outcome",                # 21 lines
+    "bench/companionbench/shadow_rules.py::verdict",                # 20 lines
+    "bench/skill_use_log.py::observe",                              # 16 lines
+    "tools/env_portability.py::parse_env",                          # 14 lines
+    "relay/project_memory.py::entry_authority",                     # 11 lines
+    "bench/companionbench/shadow_rules.py::old_verdict",            # 9 lines
+    "bench/companionbench/shadow_rules.py::new_verdict",            # 6 lines
+    "relay/selfimprove/calibration.py::competence",                 # 5 lines
+    "relay/lean_capture.py::enabled",                               # 3 lines
+    "tools/env_portability.py::classify",                           # 3 lines
+
     "bench/skill_probe.py::compare",                               # 51 lines, revealed 2026-09-14
     "bench/companionbench/shadow_rules.py::compare",               # 41 lines, revealed 2026-09-14
     "relay/selfimprove/planner_evaluator.py::preflight",           # 39 lines, revealed 2026-09-14
@@ -171,6 +191,35 @@ ALLOWED_REASONS = ("dispatch", "entrypoint", "deliberate", "revealed")
 #: exact move that put `all_inconclusive` and `fleet_is_running` on a triage list they did not
 #: survive. See docs/unreached_burndown.md.
 REASONS: dict[str, tuple[str, str]] = {
+    # A REFERENCE COUNT IS NOT A REACHABILITY ANALYSIS, closed 2026-09-14 by iterating the scan
+    # to a fixed point (5 rounds, 80 -> 96). Every one of these sixteen was held off the list by
+    # a caller that is itself unreached: something named it, and nothing could get there. Three
+    # had already been found by hand while chasing other things, which is what prompted the
+    # loop. Not new code -- dead subgraphs behind leaves that were already on the list.
+    "relay/selfimprove/diversify.py::diversify": ("revealed", "docs/unreached_burndown.md"),
+    "relay/solve_policy.py::plan_solve": ("revealed", "docs/unreached_burndown.md"),
+    "tools/coding_ops.py::worktree_remove": ("revealed", "docs/unreached_burndown.md"),
+    "relay/selfimprove/calibration.py::recommend_effort":
+        ("revealed", "docs/unreached_burndown.md"),
+    "relay/selfimprove/propose.py::mutation_generator":
+        ("revealed", "docs/unreached_burndown.md"),
+    "tools/coding_ops.py::worktree_add": ("revealed", "docs/unreached_burndown.md"),
+    "relay/selfimprove/guards.py::classify_outcome":
+        ("revealed", "docs/unreached_burndown.md"),
+    "bench/companionbench/shadow_rules.py::verdict":
+        ("revealed", "docs/unreached_burndown.md"),
+    "bench/skill_use_log.py::observe": ("revealed", "docs/unreached_burndown.md"),
+    "tools/env_portability.py::parse_env": ("revealed", "docs/unreached_burndown.md"),
+    "relay/project_memory.py::entry_authority": ("revealed", "docs/unreached_burndown.md"),
+    "bench/companionbench/shadow_rules.py::old_verdict":
+        ("revealed", "docs/unreached_burndown.md"),
+    "bench/companionbench/shadow_rules.py::new_verdict":
+        ("revealed", "docs/unreached_burndown.md"),
+    "relay/selfimprove/calibration.py::competence":
+        ("revealed", "docs/unreached_burndown.md"),
+    "relay/lean_capture.py::enabled": ("revealed", "docs/unreached_burndown.md"),
+    "tools/env_portability.py::classify": ("revealed", "docs/unreached_burndown.md"),
+
     # Both were always unreached and neither was ever printed: `compact` is defined in
     # two modules, and a colliding name used to be skipped by the scan rather than
     # reported. Found 2026-09-13 when a new `require` silently retired
