@@ -1,6 +1,6 @@
 # Burning down the unreached baseline
 
-Started 2026-09-13. **93 → 75** so far, and the scan now sees 77 — two names it had never printed at all. This file exists so they do not have to be
+Started 2026-09-13. **93 → 74** so far, and the scan now sees 76 — two names it had never printed at all. This file exists so they do not have to be
 triaged a third time.
 
 ## Why the baseline is being removed rather than maintained
@@ -65,11 +65,12 @@ flagged unwired by an adversarial review hours earlier, nearly hidden behind an 
 | `relay/profile_token.py::forget_memo` | **fixed** — `reset_socket_route`'s docstring asserted "not the token" while the token survived in profile_token's own `_MEMO`; it clears it now |
 | `tools/lock_state.py::token_gap` | **fixed** — the counter that decides whether `MCP_REQUIRE_UNLOCK_TOKEN` can be enforced had gone unread for 26 days. Measured on the live file: **154** token-less calls since 2026-08-18, the newest that same morning, **146 of them one caller** — so enforcement would have refused the live integration. Two readers now: `python -m tools.lock_state token-gap`, and a line the server prints at startup while there is something to say |
 | `relay/mechanism_telemetry.py::patch_hash` | **fixed** — `bench/pro_capture.py::_emit` computed the same digest inline, in a function whose own docstring argues against exactly that ("written twice, these drift"). One implementation now |
+| `relay/review_resilience.py::diagnose_after_fresh_replay` | **fixed** — two of its four answers were typed out as literals at two settle paths (`session_state`/`recovered` and `task_content`/`needs_decomposition`, which ARE the enum's values), leaving the other two unreachable: a fresh replay killed by a transient error, and one whose evidence identifies nothing. Those are exactly the runs where `recovery_cause` stayed EMPTY. All four are reachable now and the diagnosis's sentence is recorded; no string a reader already sees changed |
 
 The ratchet noticed `is_resolved` on its own: the moment it gained callers the test refused to
 keep it listed. That is the mechanism working in the direction it was built for.
 
-## The remaining 77
+## The remaining 76
 
 Classified 2026-09-13 by three parallel surveys, each required to give grep-level evidence and
 to answer "could not determine" rather than guess. **These verdicts are triage, not proof** —
@@ -82,6 +83,26 @@ and `mechanism_telemetry::patch_hash` — and they are listed under *What left t
 above. A name belongs here when a caller for it exists somewhere in the design and is simply
 missing; that is the shape worth doing next, so the heading stays.
 
+### Triaged to a verdict: the refusal taxonomy
+
+`relay/review_resilience.py` defines four refusal detectors and one diagnosis. `relay_fleet`
+imports **one** of the detectors. Measured rather than assumed, by running all four against the
+reply that actually ended run `r6aa597a8`: **all four False**. The reply is nevertheless
+recognised — 「それに応答できませんでした」 is the FIRST entry of
+`relay_fleet.CANNED_NONANSWER_MARKERS`, which has its own live branch. Reading one module and
+concluding "nothing matched" was wrong, and is recorded that way in the failure-mode registry.
+
+| entry | verdict |
+|---|---|
+| `looks_like_transient_error` | **DUPLICATE.** `relay_fleet.TRANSIENT_ERROR_MARKERS` is live and a superset (予期しないエラー / システムエラー / unexpected error / something went wrong, plus reload-the-page and if-the-problem-persists). Deleting it is the right answer; it is left listed until someone confirms nothing outside this repository imports it |
+| `looks_like_capability_failure` | overlaps `TOOL_UNREACHABLE_MARKERS` in intent, not in strings. Neither is a superset. **Could not determine** whether the difference is meaningful without a corpus of capability-failure replies, and there is no such corpus |
+| `looks_like_output_filter` | no live equivalent found. Its four markers (出力できませんでした / 応答を生成できませんでした / response was filtered / content filter blocked) would be a real fifth family, and adding a marker family to a live path needs the measurement the canned-non-answer family got before IT was added: "6 occurrences in 6,585 assistant replies on record, every one of them 89 to 103 characters long". That measurement has not been taken |
+| `diagnose_after_fresh_replay` | **wired** — see above |
+
+The rule those three are waiting on is the one already written into
+`CANNED_NONANSWER_MARKERS`' own comment: *a marker that fires on a real answer costs more than
+one that misses.* None of them may be wired on the strength of reading their strings.
+
 ### Deliberately unwired — do not "fix"
 
 `relay/selfimprove/autonomy.py::raise_to` — its docstring says so, and
@@ -91,7 +112,7 @@ control. Leave it.
 
 ### The self-improvement subsystem has no driver
 
-23 of the 77 are in `relay/selfimprove/` — the share has GROWN as the rest came down. `scripts/run_nightly_real.py` — the script meant to
+23 of the 76 are in `relay/selfimprove/` — the share has GROWN as the rest came down. `scripts/run_nightly_real.py` — the script meant to
 run the loop for real — opens with *"It has never been run at all."* No CI job, scheduler,
 `.bat` or cron invokes any entry point. They are stranded because the loop was never turned on,
 not because they are useless. **Decide that first**; classifying them one by one before the
