@@ -154,3 +154,43 @@ def test_the_reader_prints_the_ambiguity(capsys):
     assert U.main(["--limit", "1"]) == 0
     out = capsys.readouterr().out
     assert "not attributable" in out, out[-400:]
+
+
+def test_an_aliased_import_credits_the_ORIGINAL_name_not_the_alias():
+    """THE BLIND SPOT THIS FILE REINTRODUCED, and the reason it is pinned by name.
+
+    `tools/unreached.py` already fixed aliased calls once: "credit the original name when the
+    alias is CALLED". The attribution path then keyed its own map on the LOCAL name, so
+
+        from relay.profile_token import capture_fn as _choose_capture
+        ...
+        _choose_capture()
+
+    credited `_choose_capture` -- which nothing defines -- and reported
+    `profile_token::capture_fn` as unreached while `relay_fleet.py:1323` called it. Two of the
+    eighteen names the first version revealed were false positives of exactly this shape
+    (`profile_token::capture_fn` and `auth_stats::get_summary`, the latter imported by main.py
+    as `_auth_stats_summary`).
+
+    A false "unreached" is the lesser of the two errors this tool can make -- it wastes a
+    triage, it does not hide a finding -- but it is still a wrong row, and this one was found by
+    reading the code rather than by the check.
+    """
+    q, _u = _attribute({
+        "relay/profile_token.py": "def capture_fn():\n    return 1\n",
+        "relay/user.py": "from relay.profile_token import capture_fn as _choose\n\n"
+                         "def go():\n    return _choose()\n",
+    })
+    assert q[("relay/profile_token.py", "capture_fn")] == 1, \
+        "the credit went to the alias, so the original reads as unreached"
+    assert q[("relay/profile_token.py", "_choose")] == 0
+
+
+def test_an_aliased_value_reference_credits_the_original_too():
+    """The registration shape and the alias shape at once: `main.py` does
+    `from tools.auth_stats import get_summary as _auth_stats_summary` and hands the alias on."""
+    q, _u = _attribute({
+        "tools/auth_stats.py": "def get_summary():\n    return 1\n",
+        "main.py": "from tools.auth_stats import get_summary as _s\n\nTOOLS = (_s,)\n",
+    })
+    assert q[("tools/auth_stats.py", "get_summary")] == 1
