@@ -33,6 +33,13 @@ before the list was acted on. Three blind spots, all measured:
 | registry decorator | `@mcp.custom_route("/health", …)` puts `main.py::health` in Starlette's routing table; no Python line names it again | a decorator that is a **Call** counts as a registration; a bare `@property` does not |
 | **name defined twice** | adding a `require` to `relay/invariants.py` silently removed `relay/selfimprove/autonomy.py::require` — the hard autonomy gate — from the inventory: a colliding name was dropped from the scan entirely | a **zero** reference count resolves the ambiguity without resolving the name (no definition is reached, whichever one a call meant), so every place is reported; only a non-zero count is still skipped |
 
+That fix printed two names on its first run that had **never been printed at all**, both
+called `compact`: `bridge/session_store.py::compact` (a VACUUM the store's own test is the
+only caller of) and `relay/selfimprove/episode_record.py::compact` ("the summary row a
+comparison needs", in the subsystem that has no driver). They share a name, so the scan had
+been dropping both since the day the second one was written. They are in the inventory under
+the `revealed` reason — not new code, but names the scanner could not see at the freeze.
+
 **Two of those fixes were themselves wrong first, and that is the lesson worth keeping.**
 
 - Crediting every *reference* to an alias hid `harness_tree.py::branches`, because
@@ -275,6 +282,51 @@ Two mistakes worth keeping, both caught by measuring rather than by reading:
 
 - The function was called `require`, and that name **retired `relay/selfimprove/autonomy.py::require` from the inventory** — see the blind-spot table above. Renaming it to `assert_invariant` (which is what the source had called it) both fixed the collision and matched the design.
 - `python -m relay.invariants list` printed *"no invariants registered"* with two registered: running the file as `__main__` loads a **second copy** of the module, with its own registry, and the copy doing the printing is the empty one. The entry point calls the package's `main` now.
+
+### The item the analysis skipped, and what it turned out to be worth
+
+The run that produced that analysis was refuted twice, and **the second refutation was right**:
+the goal named `scripts/coverage-partitions.ts` (28,662 bytes, real) as a primary target, and the
+report mentions it **zero times** — neither evaluated nor listed under 「見たが該当なし」, which
+the goal explicitly required. It reported `coverage-uncovered-locations.cjs` instead.
+
+**The goal misdescribed the file it named.** Its parenthetical — 「per-fileカバレッジで未到達
+コードを炙り出す仕組み」 — describes the *reporter*, which is `coverage-uncovered-locations.cjs`.
+The agent followed the description; the refuter followed the name. Both are defensible, and the
+answer is that they are two different mechanisms and the report owed an entry for each.
+
+`coverage-partitions.ts` is the *runner*, not the reporter. Two ideas in it:
+
+| | |
+|---|---|
+| **Longest-processing-time partitioning weighted by MEASURED durations** | per-file times are persisted between runs, refreshed from each run's reporter output, unknown files get a default weight, and placement is a min-heap over buckets (`assignWeightedPartitions`). Heaviest first into the lightest bucket. |
+| **A partition must never judge** | `DSH_COVERAGE_PARTITION_MODE=1` suppresses reports *and thresholds* inside each partition; only the merge runs them. A partial view never produces a verdict. |
+
+The coverage machinery itself does not transfer — we have no coverage thresholds, and the
+unreached ratchet is AST-based. **The partitioning does**, and it is worth it on measurement
+rather than on principle. `pytest --durations=0` over the preflight file list, 2026-09-13:
+
+```
+9,808 timed entries   1,441 s total
+top 20 entries        424 s   (29%)
+top 50 entries        613 s   (43%)
+heaviest single file  relay/test_edge_auth.py  64.3 s
+```
+
+Concentrated enough that naive splitting strands one worker with the tail, and flat enough that
+balancing works: the 64 s file is the floor, so four LPT-weighted partitions put the gate near
+~360 s against 1,441 s serial. That gate ran **fifteen times** in one session.
+
+The second idea has no code to write and is worth stating anyway, because this repository has
+the same hazard in `preflight --quick`, whose own comment already worries about it: *"a signal
+that is never clean stops being read, and then the one that matters (--quick dropping the pytest
+gate) is lost in it."* **A partial run must not be allowed to produce a verdict** is the rule
+`DSH_COVERAGE_PARTITION_MODE` enforces mechanically, and `--quick` enforces by printing a
+warning.
+
+NOT BUILT HERE. Parallelising the pytest gate changes CI as well as preflight, and the entry
+above is the evaluation the report owed, not the implementation. The measurement is recorded so
+the decision is about a number rather than about an intuition.
 
 ### The third item, which is not about the baseline at all
 

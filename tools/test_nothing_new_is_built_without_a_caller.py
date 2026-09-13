@@ -248,6 +248,41 @@ def test_every_reason_points_at_something_that_exists():
     assert not bad, "the pointer names nothing the repository tracks: %s" % ", ".join(bad)
 
 
+def test_every_pointer_actually_names_the_entry_it_excuses():
+    """THE STRONGER HALF, taken from the external harness's own exemption guard.
+
+    Its `coverage-exempt.spec.ts` does not ask whether an exemption's glob is well-formed; it
+    asks whether the glob still SELECTS A NON-EMPTY SET, "so a renamed suite cannot silently
+    fall out of the uninstrumented gate while its exclude goes stale". A pointer that merely
+    resolves to a file is the same shape of nothing.
+
+    IT CAUGHT MINE ON ITS FIRST RUN. Both `revealed` entries pointed at
+    docs/unreached_burndown.md, which described the blind spot that revealed them and did not
+    name either one -- a pointer to a document that does not mention the thing it is excusing.
+    The document names them now, and this test is why.
+
+    The check is deliberately weak-but-real: the pointer's text must contain the entry's bare
+    name. It cannot tell a genuine dispatch table from a document that mentions the name in
+    passing, and pretending otherwise would be the word-count move this file already refuses.
+    What it removes is a pointer that has gone stale or was never true.
+    """
+    have = _tracked_anything()
+    if have is None:
+        pytest.skip("git could not list the tracked files here")
+    bad = []
+    for key, (_why, ptr) in REASONS.items():
+        name = key.split("::")[-1]
+        path = (ptr or "").split("::")[0]
+        try:
+            text = io.open(os.path.join(REPO, path), encoding="utf-8", errors="replace").read()
+        except OSError:
+            bad.append("%s -> %s (unreadable)" % (key, ptr))
+            continue
+        if name not in text:
+            bad.append("%s -> %s (does not name %r)" % (key, ptr, name))
+    assert not bad, "the pointer does not support the claim: %s" % ", ".join(bad)
+
+
 def test_no_reason_outlives_its_entry():
     """A reason for a name that has since been wired or deleted is a sentence the next reader
     will take for the current state -- the same failure the ratchet's other half prevents."""
