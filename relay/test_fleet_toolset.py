@@ -177,7 +177,12 @@ def test_no_decision_survives_the_tool_it_was_about():
         "%d decisions name tools that are no longer registered: %s" % (len(stale), stale))
 
 
-# ---- enforcement: shadow by default, and NOTHING CONSULTS IT -----------------------------
+# ---- enforcement: ENFORCING by default, and NOTHING CONSULTS IT ---------------------------
+#
+# This heading said "shadow by default" until 2026-09-14, which is what the module header said
+# too, and both were wrong: `mode()` defaults to enforce and the first test below pins it. The
+# previous correction to this line fixed the second half of the sentence and copied the stale
+# first half, which is worth recording rather than quietly tidying.
 
 
 def _importers(module, self_path):

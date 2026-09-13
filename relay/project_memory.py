@@ -404,7 +404,15 @@ def entry_authority(line):
 
 
 def authorities_in(theme, state_dir=None, goal=""):
-    """Every distinct authority present in a theme's entries. For the evolution loop."""
+    """Every distinct authority present in a theme's entries.
+
+    IT HAS NO CALLER, because the evolution loop it was written for has no driver.
+    `scripts/run_nightly_real.py` opens "It has never been run at all", and no CI job,
+    scheduler, `.bat` or cron invokes any entry point of `relay/selfimprove/`, so nothing calls
+    this and nothing will until that is decided. Recorded in docs/unreached_burndown.md under
+    the subsystem decision -- run the loop, wire it, or retire it -- rather than left reading
+    as though a consumer were already there.
+    """
     try:
         _theme, slug = _resolve(theme, goal)
         return sorted({entry_authority(ln)
@@ -672,7 +680,13 @@ def load_notes(theme, max_items=None, state_dir=None, goal="", include_index=Tru
 
 
 def list_themes(state_dir=None):
-    """Every remembered theme as (theme, slug, path). For the cockpit and for tests."""
+    """Every remembered theme as (theme, slug, path).
+
+    FOR TESTS -- `relay/test_theme_memory.py` calls it -- AND FOR A COCKPIT SURFACE THAT WAS
+    NEVER BUILT, so it has no production caller. The cockpit has no project-memory panel; its
+    only "theme" is light/dark. Half of the old sentence was true and half named a consumer
+    that does not exist, which is the harder kind to notice.
+    """
     out = []
     try:
         d = _mem_dir(state_dir)

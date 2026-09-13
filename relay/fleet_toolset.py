@@ -210,8 +210,8 @@ def unknown_tools(catalogue):
 # site. Recorded in docs/unreached_burndown.md rather than decided here.
 #
 #   off      the policy is not consulted at all
-#   shadow   every call that WOULD be refused is recorded; nothing is blocked   <- default
-#   enforce  calls outside the allowed set are refused while a run is active
+#   shadow   every call that WOULD be refused is recorded; nothing is blocked
+#   enforce  calls outside the allowed set are refused while a run is active   <- default
 #
 # Promote to enforce only after a shadow window shows the refusals are the ones intended --
 # a shadow log full of read_file means the set is wrong, not that the workers are hostile.
@@ -224,9 +224,14 @@ def unknown_tools(catalogue):
 # that needs to end something it started can do so through shell_exec, inside its own
 # process tree.
 #
-# That is the evidence for enforce. It is deliberately NOT switched here: flipping a gate
-# under a measurement in flight changes the thing being measured. Set FLEET_TOOLSET_MODE=
-# enforce when no run is in progress.
+# That was the evidence for enforce, AND IT HAS SINCE BEEN SWITCHED -- `mode()` defaults to
+# enforce and test_the_default_is_enforce_now_that_the_shadow_window_has_run pins it. This
+# paragraph said "deliberately NOT switched here ... set FLEET_TOOLSET_MODE=enforce when no run
+# is in progress" for as long as the opposite was true. Corrected 2026-09-14, in the same batch
+# that found the test section below claiming the gateway consults a gate nothing consults:
+# prose contradicting a passing test is the failure this module keeps producing.
+#
+# Set FLEET_TOOLSET_MODE=shadow to measure again; shadow remains reachable and is tested.
 import json as _json
 import os as _os
 import time as _time
