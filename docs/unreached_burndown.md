@@ -58,6 +58,51 @@ flagged unwired by an adversarial review hours earlier, nearly hidden behind an 
 > **A false "reached" is worse than a false "unreached".** The row disappears, and nobody reads
 > what is not printed. When tightening this tool, prefer noise over silence.
 
+## The fifth blind spot: a reference count is not a reachability analysis
+
+Counting references answers "does any line name this?" and the inventory needed "can anything
+get here?". Those differ for a whole cluster of dead code that calls itself: the tool reported
+the dead **leaves** and everything behind each leaf stayed invisible until the leaf was deleted
+and the scan run again. Three had already been found by hand, each while chasing something else
+— `worktree_add`/`worktree_remove` (called only from `worktree_scope`), `observe` (called only
+from inside an `if False`), and `versions_differ` (called only from `transport_versions_differ`).
+
+So: report, drop what was reported, count again, repeat. On this repository it settles in **five
+rounds** and reports **16 more names — 80 to 96**. All sixteen are dead subgraphs behind a leaf
+that was already on the list; none is new code:
+
+| name | lines | behind |
+|---|---|---|
+| `relay/selfimprove/diversify.py::diversify` | 62 | `solve_policy.py::plan_solve` |
+| `relay/solve_policy.py::plan_solve` | 56 | nothing calls it |
+| `tools/coding_ops.py::worktree_remove` | 44 | `worktree_scope` |
+| `relay/selfimprove/calibration.py::recommend_effort` | 33 | the selfimprove loop, which has no driver |
+| `relay/selfimprove/propose.py::mutation_generator` | 33 | `propose_candidates` |
+| `tools/coding_ops.py::worktree_add` | 29 | `worktree_scope` |
+| `relay/selfimprove/guards.py::classify_outcome` | 21 | the selfimprove loop |
+| `bench/companionbench/shadow_rules.py::verdict` | 20 | `shadow_rules.py::compare` |
+| `bench/skill_use_log.py::observe` | 16 | an `if False` inside `compare_runs` |
+| `tools/env_portability.py::parse_env` | 14 | `merge_for_new_machine` |
+| `relay/project_memory.py::entry_authority` | 11 | its own dead reader |
+| `bench/companionbench/shadow_rules.py::old_verdict` | 9 | `shadow_rules.py::compare` |
+| `bench/companionbench/shadow_rules.py::new_verdict` | 6 | `shadow_rules.py::compare` |
+| `relay/selfimprove/calibration.py::competence` | 5 | `recommend_effort` |
+| `relay/lean_capture.py::enabled` | 3 | `lean_capture.py::capture_fn` |
+| `tools/env_portability.py::classify` | 3 | `parse_env` |
+
+**`diversify` is the entry worth reading twice.** It was removed from the inventory on
+2026-09-13 as a false positive — correctly, because the *reference* exists, at
+`solve_policy.py:56`. That line sits inside `plan_solve`, which nothing reaches. Both statements
+are true at their own level, and only the second one answers the question the inventory asks.
+
+**What it does not fix, stated rather than claimed.** Iterating works by removing what was
+*reported*, and a name is reported only when its reference count is zero. Two dead functions
+that call each other each hold the other's count above zero, so neither is ever a leaf and the
+loop terminates having found nothing. Catching that needs marking from the entrypoints — a
+different algorithm, not a longer loop. `fleet_toolset::check` and `::mode` are likewise still
+invisible here: they are held by the **ambiguity** bucket, which `scan().ambiguous` prints
+separately. A tool trusted for a question it cannot answer is worse than one with a stated limit.
+
 ## What left the baseline, and why
 
 | entry | reason |

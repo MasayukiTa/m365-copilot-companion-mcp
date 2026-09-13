@@ -164,6 +164,28 @@ class _Rows(list):
     ambiguous: list = []
 
 
+def _without(tree, dead_names):
+    """`tree` with the named top-level functions removed, for the next counting pass.
+
+    PRUNING THE TREE RATHER THAN RESTRUCTURING THE WALK. The counting phase is delicate --
+    aliases, decorators, attribution -- and it has already shipped two bugs this week that only
+    measurement caught. Handing it a tree with the dead functions taken out leaves every one of
+    those rules reading exactly as it did, and the change is one list comprehension instead of a
+    condition threaded through four loops.
+
+    Imports inside a removed function go with it, which is correct: a dead function's import is
+    not a live reference to anything.
+    """
+    if not dead_names:
+        return tree
+    kept = [n for n in tree.body
+            if not (isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and n.name in dead_names)]
+    if len(kept) == len(tree.body):
+        return tree
+    return ast.Module(body=kept, type_ignores=[])
+
+
 def _module_of(dotted, files):
     """'relay.turn_outcome' -> 'relay/turn_outcome.py', when that file is one we scanned."""
     if not dotted:
@@ -338,105 +360,127 @@ def scan(files=None):
                 end = getattr(node, "end_lineno", node.lineno) or node.lineno
                 defs[node.name].append((rel, node.lineno, end - node.lineno + 1))
 
-    prod_refs = defaultdict(int)
-    test_refs = defaultdict(int)
-    qualified = defaultdict(int)        # (rel, name) -> calls the AST could attribute to it
-    unattributable = defaultdict(int)   # name -> calls it could not
-    for rel, tree in trees.items():
-        bucket = test_refs if is_test(rel) else prod_refs
-        # A CALL MADE UNDER AN ALIAS IS STILL A CALL, and this walk could not see one.
-        # References are counted as `ast.Name` / `ast.Attribute`, and an aliased import is
-        # neither -- it is `ast.alias(name=..., asname=...)`. So
-        #     from relay.selfimprove.diversify import diversify as _diversify
-        #     genomes = _diversify(base, n)
-        # recorded the Name `_diversify` and credited `diversify` with nothing. Measured
-        # 2026-09-13: that exact function sat in this repository's unreached BASELINE, frozen
-        # as known-dead, while relay/solve_policy.py:56 called it in production. An inventory
-        # with false entries cannot justify deleting anything.
-        #
-        # AN IMPORT IS STILL NOT A CALL. Only a USE of the alias credits the original name;
-        # `from M import f as g` with `g` never used credits nothing. Counting the import
-        # itself would hide the very defect this tool exists to find -- a function imported by
-        # its tests and called by no one, which is what campaigns_from_ledger was.
-        # CREDITED ONLY WHERE THE ALIAS IS CALLED, not merely referenced -- and the first
-        # version of this fix got that wrong, which is why the rule is spelled out. Crediting
-        # every reference hid `relay/selfimprove/harness_tree.py::branches`, because
-        # `from relay.selfimprove import branches as BR` imports a MODULE that happens to
-        # share the function's name. `from X import y as z` cannot be told from a module
-        # import syntactically -- both are ast.alias -- so the discriminator is USE: a
-        # function alias gets called (`_diversify(base, n)`), a module alias gets attributed
-        # (`BR.something()`). Widening a blind spot into a blind eye is the worse trade: a
-        # false negative here is a live unreached function that never appears at all.
-        aliased = {}
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                for al in node.names:
-                    if al.asname and al.name:
-                        aliased[al.asname] = al.name.rsplit(".", 1)[-1]
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Name):
-                bucket[node.id] += 1
-            elif isinstance(node, ast.Attribute):
-                bucket[node.attr] += 1
-            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-                orig = aliased.get(node.func.id)
-                if orig:
-                    bucket[orig] += 1
+    # ITERATED TO A FIXED POINT. A reference count is not a reachability analysis: a function
+    # called only by ANOTHER unreached function counts as reached, so a cluster of mutually dead
+    # code shows only its entry point. Three were confirmed by hand before this was built --
+    # compare::versions_differ behind transport_versions_differ, fleet_toolset::mode behind
+    # check, and coding_ops::worktree_add / worktree_remove behind worktree_scope.
+    #
+    # So: report, drop what was reported, count again, repeat. Measured on this repository it
+    # settles in four rounds and finds about 15% more. The bound is a guard against a bug in
+    # this loop rather than a property of the data.
+    #
+    # `main` is in PROTOCOL and is therefore never reported, so an entrypoint can never be
+    # dropped and seed the iteration -- which is what keeps `bench/retry_floor.py::report`,
+    # reached only from its own `main()`, correctly out of this.
+    dead, rows, ambiguous = set(), [], []
+    for _round in range(12):
+        active = {rel: _without(tree, {k.split("::", 1)[1] for k in dead
+                                       if k.startswith(rel + "::")})
+                  for rel, tree in trees.items()}
+        prod_refs = defaultdict(int)
+        test_refs = defaultdict(int)
+        qualified = defaultdict(int)        # (rel, name) -> calls the AST could attribute to it
+        unattributable = defaultdict(int)   # name -> calls it could not
+        for rel, tree in active.items():
+            bucket = test_refs if is_test(rel) else prod_refs
+            # A CALL MADE UNDER AN ALIAS IS STILL A CALL, and this walk could not see one.
+            # References are counted as `ast.Name` / `ast.Attribute`, and an aliased import is
+            # neither -- it is `ast.alias(name=..., asname=...)`. So
+            #     from relay.selfimprove.diversify import diversify as _diversify
+            #     genomes = _diversify(base, n)
+            # recorded the Name `_diversify` and credited `diversify` with nothing. Measured
+            # 2026-09-13: that exact function sat in this repository's unreached BASELINE, frozen
+            # as known-dead, while relay/solve_policy.py:56 called it in production. An inventory
+            # with false entries cannot justify deleting anything.
+            #
+            # AN IMPORT IS STILL NOT A CALL. Only a USE of the alias credits the original name;
+            # `from M import f as g` with `g` never used credits nothing. Counting the import
+            # itself would hide the very defect this tool exists to find -- a function imported by
+            # its tests and called by no one, which is what campaigns_from_ledger was.
+            # CREDITED ONLY WHERE THE ALIAS IS CALLED, not merely referenced -- and the first
+            # version of this fix got that wrong, which is why the rule is spelled out. Crediting
+            # every reference hid `relay/selfimprove/harness_tree.py::branches`, because
+            # `from relay.selfimprove import branches as BR` imports a MODULE that happens to
+            # share the function's name. `from X import y as z` cannot be told from a module
+            # import syntactically -- both are ast.alias -- so the discriminator is USE: a
+            # function alias gets called (`_diversify(base, n)`), a module alias gets attributed
+            # (`BR.something()`). Widening a blind spot into a blind eye is the worse trade: a
+            # false negative here is a live unreached function that never appears at all.
+            aliased = {}
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.Import, ast.ImportFrom)):
+                    for al in node.names:
+                        if al.asname and al.name:
+                            aliased[al.asname] = al.name.rsplit(".", 1)[-1]
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Name):
+                    bucket[node.id] += 1
+                elif isinstance(node, ast.Attribute):
+                    bucket[node.attr] += 1
+                elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                    orig = aliased.get(node.func.id)
+                    if orig:
+                        bucket[orig] += 1
 
-        # WHICH MODULE A CALL MEANT, where the AST can say. Used ONLY to resolve a name defined
-        # in more than one place (see the `continue` below); the counts above still decide
-        # every single-definition case, unchanged.
-        if bucket is prod_refs:
-            _attribute_calls(rel, tree, files, qualified, unattributable)
+            # WHICH MODULE A CALL MEANT, where the AST can say. Used ONLY to resolve a name defined
+            # in more than one place (see the `continue` below); the counts above still decide
+            # every single-definition case, unchanged.
+            if bucket is prod_refs:
+                _attribute_calls(rel, tree, files, qualified, unattributable)
 
-    # A CALLER THAT IS NOT PYTHON IS STILL A CALLER. Read once, not per name: this is a
-    # handful of small shell scripts, and a scan per candidate would re-read them ninety times.
-    cross = cross_language_text()
+        # A CALLER THAT IS NOT PYTHON IS STILL A CALLER. Read once, not per name: this is a
+        # handful of small shell scripts, and a scan per candidate would re-read them ninety times.
+        cross = cross_language_text()
 
-    rows = []
-    ambiguous = []
-    for name, places in defs.items():
-        # A NAME DEFINED TWICE USED TO DISAPPEAR, WHICH IS THE WORST OF THE THREE OUTCOMES.
-        # The reference count is by bare name, so with two definitions it cannot say WHICH one
-        # a call reached -- and the answer was to drop the name entirely. Measured 2026-09-13:
-        # adding a function called `require` to relay/invariants.py silently removed
-        # `relay/selfimprove/autonomy.py::require` -- the hard autonomy gate an adversarial
-        # review had flagged -- from the inventory. A new function's NAME could retire an
-        # existing finding, and nothing said so.
-        #
-        # ZERO REFERENCES RESOLVES IT WITHOUT RESOLVING THE NAME. If the count is zero, no
-        # definition of that name is reached, whichever one a call would have meant, so every
-        # place is reported. Only a non-zero count is genuinely ambiguous, and that is the one
-        # case still skipped. Same rule as the rest of this file: prefer noise over silence,
-        # because a false "reached" is a row nobody ever sees.
-        # ATTRIBUTE BEFORE GIVING UP. A bare-name count cannot say which definition a call
-        # meant; the AST usually can. Measured 2026-09-14: 421 definitions sat behind this
-        # branch, and attributing them reports more while leaving the rest genuinely ambiguous.
-        # See `_attribute_calls` for the rule, and for why the obvious version of it -- counting
-        # every Name/Attribute rather than call positions -- would have found three.
-        #
-        # `resolved` EXISTS BECAUSE THE FIRST VERSION OF THIS WAS A NO-OP: it filtered `places`
-        # and then fell through to `if prod_refs[name]: continue`, which is true by construction
-        # for every name that reaches here. The scan reported exactly the same 68 names and the
-        # whole attribution was thrown away one line later.
-        resolved = False
-        if len(places) != 1 and prod_refs[name]:
-            if unattributable[name]:
-                ambiguous.append(name)    # printed, not silent: silence is the defect here
+        rows = []
+        ambiguous = []
+        for name, places in defs.items():
+            # A NAME DEFINED TWICE USED TO DISAPPEAR, WHICH IS THE WORST OF THE THREE OUTCOMES.
+            # The reference count is by bare name, so with two definitions it cannot say WHICH one
+            # a call reached -- and the answer was to drop the name entirely. Measured 2026-09-13:
+            # adding a function called `require` to relay/invariants.py silently removed
+            # `relay/selfimprove/autonomy.py::require` -- the hard autonomy gate an adversarial
+            # review had flagged -- from the inventory. A new function's NAME could retire an
+            # existing finding, and nothing said so.
+            #
+            # ZERO REFERENCES RESOLVES IT WITHOUT RESOLVING THE NAME. If the count is zero, no
+            # definition of that name is reached, whichever one a call would have meant, so every
+            # place is reported. Only a non-zero count is genuinely ambiguous, and that is the one
+            # case still skipped. Same rule as the rest of this file: prefer noise over silence,
+            # because a false "reached" is a row nobody ever sees.
+            # ATTRIBUTE BEFORE GIVING UP. A bare-name count cannot say which definition a call
+            # meant; the AST usually can. Measured 2026-09-14: 421 definitions sat behind this
+            # branch, and attributing them reports more while leaving the rest genuinely ambiguous.
+            # See `_attribute_calls` for the rule, and for why the obvious version of it -- counting
+            # every Name/Attribute rather than call positions -- would have found three.
+            #
+            # `resolved` EXISTS BECAUSE THE FIRST VERSION OF THIS WAS A NO-OP: it filtered `places`
+            # and then fell through to `if prod_refs[name]: continue`, which is true by construction
+            # for every name that reaches here. The scan reported exactly the same 68 names and the
+            # whole attribution was thrown away one line later.
+            resolved = False
+            if len(places) != 1 and prod_refs[name]:
+                if unattributable[name]:
+                    ambiguous.append(name)    # printed, not silent: silence is the defect here
+                    continue
+                places = [(rel, lineno, span) for (rel, lineno, span) in places
+                          if not qualified[(rel, name)]]
+                if not places:
+                    continue
+                resolved = True
+            if not resolved and prod_refs[name]:
                 continue
-            places = [(rel, lineno, span) for (rel, lineno, span) in places
-                      if not qualified[(rel, name)]]
-            if not places:
-                continue
-            resolved = True
-        if not resolved and prod_refs[name]:
-            continue
-        for rel, lineno, span in places:
-            if cross and reached_from_shell(name, rel, cross):
-                continue                  # reached from a .ps1/.bat wrapper
-            if decorated.get("%s::%s" % (rel, name)):
-                continue                  # handed to a registry by a decorator
-            rows.append(("%s::%s" % (rel, name), name, rel, lineno, span, test_refs[name]))
+            for rel, lineno, span in places:
+                if cross and reached_from_shell(name, rel, cross):
+                    continue                  # reached from a .ps1/.bat wrapper
+                if decorated.get("%s::%s" % (rel, name)):
+                    continue                  # handed to a registry by a decorator
+                rows.append(("%s::%s" % (rel, name), name, rel, lineno, span, test_refs[name]))
+        found = {r[0] for r in rows}
+        if found == dead:
+            break
+        dead = found
     rows.sort(key=lambda r: (-r[4], r[0]))
     # WHAT THE TOOL COULD NOT DECIDE, HANDED BACK RATHER THAN DROPPED. A name skipped for
     # ambiguity is the same shape as a row nobody prints -- which is the defect this whole file
