@@ -67,9 +67,20 @@ from relay import mechanism_telemetry as _mt
 from relay import effort as effort_mod
 from .planner import PLAN_PROMPT, extract_plan, opening_turn, plan_ready
 from .review_resilience import (
-    freeze_goal_dict, looks_like_policy_refusal, same_task_envelope,
-    task_envelope_from_goal,
+    RecoveryAction, diagnose_after_fresh_replay, freeze_goal_dict,
+    looks_like_policy_refusal, same_task_envelope, task_envelope_from_goal,
 )
+
+#: RecoveryAction -> the word that goes in the record. NOT the enum's own value: "recovered"
+#: reads better than "fresh_replay" to whoever opens the cockpit, and the two strings already in
+#: use are kept exactly so nothing downstream sees a new vocabulary. The two new rows are the
+#: answers that were unreachable while the diagnosis was typed out by hand.
+_RECOVERY_RESULT = {
+    RecoveryAction.FRESH_REPLAY: "recovered",
+    RecoveryAction.DECOMPOSE: "needs_decomposition",
+    RecoveryAction.RETRY_TRANSIENT: "retry_transient",
+    RecoveryAction.MARK_UNRESOLVED: "unresolved",
+}
 
 # A STATUS BELONGS HERE ONLY IF SOMETHING SETS IT. `unresolved_refusal` was in this tuple,
 # in the label map below, in the cockpit's pill table and in the outcome enum -- five places
@@ -2465,6 +2476,34 @@ class RelayWorker:
         if self.transcript:
             self.attempt_transcripts.append(self.transcript)
 
+    def _apply_diagnosis(self, *, fresh_was_refusal, fresh_succeeded,
+                         fresh_was_transient_error):
+        """Record WHY the refusal recovery ended the way it did.
+
+        One call site used to be `recovery_cause = "session_state"` and the other
+        `recovery_cause = "task_content"` -- the first and third answers of
+        review_resilience.diagnose_after_fresh_replay, written out. The other two were
+        unreachable, and they are the two where these fields stayed empty.
+
+        Never raises: this is a record, and a record must not be able to fail the settle it is
+        describing.
+        """
+        try:
+            d = diagnose_after_fresh_replay(
+                original_was_refusal=True,
+                fresh_was_refusal=bool(fresh_was_refusal),
+                fresh_succeeded=bool(fresh_succeeded),
+                fresh_was_transient_error=bool(fresh_was_transient_error),
+            )
+            self.recovery_cause = str(d.cause.value)
+            self.recovery_result = _RECOVERY_RESULT.get(d.action, str(d.action.value))
+            # THE SENTENCE, WHICH LIVED ONLY INSIDE THE FUNCTION. `reason` is what a person
+            # reads first, and "identical task refused in two independent conversations" was
+            # already the third branch's text typed out by hand.
+            self.reason = d.reason
+        except Exception:
+            pass
+
     def _start_fresh_replay(self):
         """Move this worker to a brand-new conversation and resend the identical envelope."""
         replay_envelope = task_envelope_from_goal(self.goal_record)
@@ -4163,9 +4202,12 @@ class RelayWorker:
                 })
                 self.status, self.outcome = "content_refused", "CONTENT_REFUSED"
                 self.recovery_state = "content_refused"
-                self.recovery_cause = "task_content"
-                self.recovery_result = "needs_decomposition"
-                self.reason = "identical task refused in two independent conversations"
+                # THE DIAGNOSIS, NOT A TRANSCRIPTION OF ONE OF ITS ANSWERS. These three lines
+                # used to be literals equal to the function's third branch, which left its
+                # second and fourth unreachable -- so a fresh replay that died on a transient
+                # error recorded no cause at all.
+                self._apply_diagnosis(fresh_was_refusal=True, fresh_succeeded=False,
+                                      fresh_was_transient_error=False)
                 return
         norm = _norm_for_progress(resp)
         self.no_progress = self.no_progress + 1 if norm and norm == self.last_norm else 0
@@ -4651,9 +4693,9 @@ class RelayWorker:
             self.status = "refuting"
             return
         if self.fresh_replay_count:
-            self.recovery_cause = "session_state"
-            self.recovery_result = "recovered"
             self.recovery_state = "recovered"
+            self._apply_diagnosis(fresh_was_refusal=False, fresh_succeeded=True,
+                                  fresh_was_transient_error=False)
         self._settle_done()
 
     #: Check a DONE claim against the recorded tool calls before reporting it.
@@ -4925,9 +4967,9 @@ class RelayWorker:
             self.status = "ready"
             return False
         if self.fresh_replay_count:
-            self.recovery_cause = "session_state"
-            self.recovery_result = "recovered"
             self.recovery_state = "recovered"
+            self._apply_diagnosis(fresh_was_refusal=False, fresh_succeeded=True,
+                                  fresh_was_transient_error=False)
         self._settle_done()
         return True
 

@@ -93,7 +93,6 @@ NO_CALLER_BUT_TESTED = {
     "tools/tool_probe.py::verify_probe_reply",                   # 27 lines
     "bridge/session_store.py::search_turns",                     # 26 lines
     "tools/tool_probe.py::classify_probe_reply",                 # 26 lines
-    "relay/review_resilience.py::diagnose_after_fresh_replay",   # 25 lines
     "relay/selfimprove/trace_to_eval.py::record_correction",     # 25 lines
     "tools/judge_backend.py::sampling_judge_async",              # 24 lines
     "bridge/session_store.py::latest_attached",                  # 23 lines
