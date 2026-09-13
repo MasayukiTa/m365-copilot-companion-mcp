@@ -4110,9 +4110,36 @@ class Handler(BaseHTTPRequestHandler):
         # a different one. Two docstrings already claimed /resume released it; it did not.
         release_socket_driver("/resume")
         global ACTIVE_SID
-        sid = (urllib.parse.parse_qs(parsed.query).get("sid") or [""])[0]
+        _qs = urllib.parse.parse_qs(parsed.query)
+        sid = (_qs.get("sid") or [""])[0]
+        # BY GUID TOO, BECAUSE A FLEET CONVERSATION HAS NO SID. The cockpit's fleet rows carry
+        # `sess:<guid>` and a worker name; resuming by the worker name would ask the store for a
+        # session that does not exist, so the chat's send had only `/switch` left -- the path
+        # that releases the socket and opens a tab. Resolving the guid here is what lets the
+        # socket-first branch below apply to them.
+        #
+        # An existing row wins (find_by_conv_url matches on the guid whichever shape is stored);
+        # otherwise a session is minted for it. That is what /adopt does, minus the navigation
+        # that was the whole problem.
         if not sid:
-            self._json({"ok": False, "error": "missing sid"}); return
+            _guid = (_qs.get("guid") or [""])[0].strip()
+            if _guid:
+                _ref = make_sessref(_guid)
+                try:
+                    sid = S.find_by_conv_url(_ref) or ""
+                except Exception:
+                    sid = ""
+                if not sid:
+                    try:
+                        sid = S.new_session(title="")["sid"]
+                        S.touch(sid, conv_url=_ref, status="active", source="chat")
+                    except Exception as exc:
+                        self._json({"ok": False,
+                                    "error": "could not bind that conversation: %s"
+                                             % type(exc).__name__})
+                        return
+        if not sid:
+            self._json({"ok": False, "error": "missing sid or guid"}); return
         sess = S.load(sid)
         if sess is None:
             self._json({"ok": False, "error": "unknown sid"}); return
