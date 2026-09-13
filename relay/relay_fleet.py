@@ -46,6 +46,7 @@ from .copilot_autopilot_relay import (
 )
 from relay import settle as _settle
 from relay import fanout as fanout_mod
+from relay.control_markers import CLOSING_INSTRUCTION
 from relay import invariants as _invariants
 
 #: RECORD, not RAISE -- see the check in reset_socket_route. A reset runs after a browser has
@@ -2917,7 +2918,7 @@ class RelayWorker:
         if self.steer_msgs:
             self.job = ("【ユーザーからの追加指示】" + self.steer_msgs.pop(0)
                         + "\n上記を最優先で踏まえて作業を続行してください。"
-                        "完了なら DONE、無理なら FAIL と理由を書いてください。")
+                        + CLOSING_INSTRUCTION)
             self._last_was_steer = True
             # A PERSON INTERVENED, SO THE CHAIN BEFORE THEM IS NOT EVIDENCE ABOUT WHAT COMES
             # AFTER. `_continue_count` has had this rule in three places since it was written
@@ -4382,7 +4383,7 @@ class RelayWorker:
                 self.fanout = False
                 self.job = self._task_anchor(
                     "分割しない判断を受け取りました。上記の目標をこの会話で直接実行してください。"
-                    "完了したら DONE、無理なら FAIL と理由を書いてください。")
+                    + CLOSING_INSTRUCTION)
                 self.status = "ready"
                 self.reason = "エージェントが分割不要と判断（単独実行）"
                 try:
@@ -4432,7 +4433,7 @@ class RelayWorker:
                 self.fanout = False
                 self.job = self._task_anchor(
                     "分割は行いません。上記の目標をこの会話で直接実行してください。"
-                    "完了したら DONE、無理なら FAIL と理由を書いてください。")
+                    + CLOSING_INSTRUCTION)
                 self.status = "ready"
                 self.reason = "分割案が使えなかったため単独実行に切り替え"
                 return
@@ -4489,7 +4490,7 @@ class RelayWorker:
         elif self._last_was_steer:
             # bridge off the steer instead of a raw CONTINUE so the redirection sticks
             self.job = ("先ほどの追加指示を踏まえて作業を続行してください。"
-                        "完了なら DONE、無理なら FAIL と理由を書いてください。")
+                        + CLOSING_INSTRUCTION)
             self._continue_count = 0   # a steer is real progress -> the continue streak resets
         else:
             # HARD CAP, independent of no_progress (which only trips on a VERBATIM-identical
