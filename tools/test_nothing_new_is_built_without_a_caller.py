@@ -64,7 +64,6 @@ NO_CALLER_NO_TEST = {
     "scripts/collect_lens_corpus.py::all_inconclusive",          # 8 lines
     "bench/companionbench/job_authority.py::free_port",          # 7 lines
     "scripts/collect_lens_corpus.py::load_corpus",               # 7 lines
-    "relay/profile_token.py::discard_template",                  # 6 lines
     "relay/autonomy_gate.py::constraints_text",                  # 5 lines
     "tools/security.py::is_trusted_local",                       # 3 lines
     "relay/review_resilience.py::looks_like_capability_failure", # 2 lines
@@ -89,13 +88,11 @@ NO_CALLER_BUT_TESTED = {
     "relay/selfimprove/solver_feedback.py::to_hypotheses",       # 31 lines
     "relay/selfimprove/autonomy.py::require",                    # 29 lines
     "tools/coding_ops.py::worktree_scope",                       # 29 lines
-    "tools/lock_state.py::locked_since",                         # 29 lines
     "tools/tool_probe.py::verify_probe_reply",                   # 27 lines
     "bridge/session_store.py::search_turns",                     # 26 lines
     "tools/tool_probe.py::classify_probe_reply",                 # 26 lines
     "relay/selfimprove/trace_to_eval.py::record_correction",     # 25 lines
     "tools/judge_backend.py::sampling_judge_async",              # 24 lines
-    "bridge/session_store.py::latest_attached",                  # 23 lines
     "relay/selfimprove/compare.py::withdraw",                    # 20 lines
     "scripts/stale_server_check.py::decide_post_update_action",  # 20 lines
     "relay/selfimprove/diversify.py::diversity_report",          # 17 lines
@@ -103,7 +100,6 @@ NO_CALLER_BUT_TESTED = {
     "relay/selfimprove/solver_feedback.py::where_distribution",  # 16 lines
     "bench/companionbench/runner.py::solver_feedback_entries",   # 15 lines
     "relay/project_memory.py::list_themes",                      # 15 lines
-    "tools/lock_state.py::locked_recently",                      # 15 lines
     "tools/tool_probe.py::next_probe_instruction",               # 15 lines
     "relay/selfimprove/autonomy.py::lower_to",                   # 14 lines
     "relay/selfimprove/branches.py::materialize_to_file",        # 14 lines
@@ -121,7 +117,6 @@ NO_CALLER_BUT_TESTED = {
     "scripts/stale_server_check.py::fleet_is_running",           # 10 lines
     "relay/solve_policy.py::finalize",                           # 9 lines
     "relay/solve_policy.py::plan_and_explain",                   # 9 lines
-    "tools/lock_state.py::matching_record",                      # 9 lines
     "relay/project_memory.py::authorities_in",                   # 8 lines
     "relay/chathub.py::collect_text",                            # 7 lines
     "relay/relay_fleet.py::connector_proven",                    # 3 lines

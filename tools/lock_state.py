@@ -339,15 +339,56 @@ def _cli() -> None:
     refuse. It is here rather than beside `python -m tools.security list` because security.py is
     in the frozen set, where a change means the operator re-signs the baseline with a reason --
     not a trade worth making for a report, and the counter it reads lives in this file anyway.
+
+    `recent [seconds]` is the diagnostic THREE FUNCTIONS ALREADY CLAIMED TO BE KEPT FOR.
+    `locked_since`, `matching_record` and `locked_recently` each say in their own docstrings
+    that they exist for the CLI, and this CLI called none of them -- a justification resting on
+    a surface that was never built, which reads as settled and is not. The question they answer
+    together is the one a person asks about a stuck worker: was anything refused in the last N
+    seconds, and which refusal was it.
+
+    NOT `matching_records` (plural). That one answers "which refusals could have been mine",
+    which is a decision a caller makes; this prints what happened. Both are wanted, and only
+    the plural had a caller.
     """
     import sys
 
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "show"
-    if cmd not in ("show", "token-gap"):
-        print(json.dumps({"error": "usage: python -m tools.lock_state [show|token-gap]"}))
+    argv = sys.argv[1:]
+    cmd = argv[0] if argv else "show"
+    if cmd not in ("show", "token-gap", "recent"):
+        print(json.dumps({
+            "error": "usage: python -m tools.lock_state [show|token-gap|recent [seconds]]"}))
         raise SystemExit(2)
     if cmd == "token-gap":
         print(json.dumps(token_gap_report(), ensure_ascii=False))
+        return
+    if cmd == "recent":
+        try:
+            within = float(argv[1]) if len(argv) > 1 else DEFAULT_FRESH_SEC
+        except ValueError:
+            print(json.dumps({"error": "seconds must be a number"}))
+            raise SystemExit(2)
+        now = time.time()
+        # ALL THREE, AND LABELLED SO THEY DO NOT READ AS A CONTRADICTION. They answer different
+        # questions and the first draft of this printed them as though they answered one: over
+        # a 24h window it said locked_recently=true, locked_since=false, record={} -- which
+        # looks like a bug and is the design. `locked_recently` honours the window it is given;
+        # `locked_since` and `matching_record` are ADDITIONALLY capped at DEFAULT_FRESH_SEC, so
+        # a clock jump cannot resurrect an ancient record. The cap is printed beside them.
+        state = read_state()
+        try:
+            last_ts = float(state.get("ts") or 0.0)
+        except (TypeError, ValueError):
+            last_ts = 0.0
+        print(json.dumps({
+            "asked_window_s": within,
+            "in_asked_window": locked_recently(within, now=now),
+            "fresh_window_s": DEFAULT_FRESH_SEC,
+            "in_fresh_window": locked_since(now - within, now=now),
+            "last_refusal_ts": last_ts or None,
+            "last_refusal_age_s": round(now - last_ts, 1) if last_ts else None,
+            "record_if_fresh": matching_record(now - within, now=now),
+        }, ensure_ascii=False))
         return
     print(json.dumps(read_state(), ensure_ascii=False))
 
