@@ -101,3 +101,75 @@ def test_the_scan_still_returns_the_shape_its_readers_expect():
         key, name, rel, lineno, span, tests = row
         assert key == "%s::%s" % (rel, name)
         assert isinstance(lineno, int) and isinstance(span, int)
+
+
+# ── a caller that is not Python ───────────────────────────────────────────────────────────
+#
+# `scripts/win/edge_keeper.ps1` reaches into Python for the managed-profile list:
+#     & $py -c "from relay.edge_recover import keeper_profile_marker as k; print(k())"
+# and three run_*.ps1 scripts call bench/ui_goal_lines.py::write_ui_file the same way. The
+# scanner asks git for *.py only, so those call sites were invisible and the functions could
+# never leave the baseline -- they would have had to become permanent exemptions, which is the
+# mechanism this whole inventory exists to dismantle.
+
+def test_a_function_called_from_a_shell_script_is_not_reported_unreached():
+    names = _names(None)
+    for key in ("relay/edge_recover.py::keeper_profile_marker",
+                "bench/ui_goal_lines.py::write_ui_file"):
+        rel, fn = key.split("::")
+        if not os.path.isfile(os.path.join(REPO, *rel.split("/"))):
+            continue
+        assert fn not in names, (
+            "%s は .ps1 から呼ばれているのに未到達として報告されている" % key)
+
+
+def test_a_bare_name_in_a_shell_script_is_not_enough():
+    """THE FIRST VERSION OF THAT CHECK WAS WRONG, three times out of six.
+
+    It counted any `\bname\b` in a tracked .ps1/.bat. That credited `require` (the autonomy
+    gate an adversarial review had just flagged as unwired), `branches` (shell scripts talk
+    about git branches) and `health` (a health-check script mentions the endpoint). A false
+    "reached" is worse than a false "unreached": it removes the row, and nobody reads what is
+    not printed.
+
+    A real cross-language call names the MODULE too, so that is what is required now.
+    """
+    assert not unreached.reached_from_shell("require", "relay/selfimprove/autonomy.py",
+                                            ["Write-Host 'a step may require approval'"])
+    assert not unreached.reached_from_shell("branches", "relay/selfimprove/harness_tree.py",
+                                            ["git branches --list"])
+    assert unreached.reached_from_shell(
+        "keeper_profile_marker", "relay/edge_recover.py",
+        ['& $py -c "from relay.edge_recover import keeper_profile_marker as k; print(k())"'])
+
+
+def test_the_module_and_the_function_must_be_in_the_SAME_file():
+    """Joining every script's text first would let one file's mention of a function pair with
+    a different file's mention of the module."""
+    assert not unreached.reached_from_shell(
+        "keeper_profile_marker", "relay/edge_recover.py",
+        ["echo keeper_profile_marker", "echo edge_recover"])
+
+
+# ── handed to a registry by a decorator ───────────────────────────────────────────────────
+
+def test_a_route_decorated_function_is_reached():
+    """`main.py::health` carries `@mcp.custom_route("/health", methods=["GET"])`, which puts it
+    in Starlette's routing table at import time. No Python line ever names it again, so the
+    caller-scan cannot represent that call site -- but unlike a word in a shell script it is a
+    fact about the code."""
+    if not os.path.isfile(os.path.join(REPO, "main.py")):
+        return
+    assert "health" not in _names(None), (
+        "デコレータで登録された関数が未到達として報告されている"
+    )
+
+
+def test_a_bare_decorator_does_not_count_as_a_registration():
+    """@property / @staticmethod transform a function; they do not hand it to anything. Only a
+    decorator that is itself a CALL registers."""
+    src = open(os.path.join(REPO, "tools", "unreached.py"), encoding="utf-8").read()
+    i = src.index("decorated = {}")
+    block = src[i:i + 900]
+    assert "isinstance(d, ast.Call)" in block, (
+        "裸のデコレータまで登録扱いにしている -- @property で未到達関数が消える")

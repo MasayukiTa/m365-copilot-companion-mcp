@@ -125,6 +125,9 @@ ui/_buildcheck/
 # Tracked because it is the answer to questions that were re-investigated from source three
 # times; a copy that lives only on one machine is not an answer to that.
 !/docs/fanout_contract.md
+# the unreached burn-down: what the 86 remaining entries are and how to finish.
+# Tracked because losing it means triaging all of them a third time.
+!/docs/unreached_burndown.md
 /docs/validation/
 # scratch probes / b64 dumps / one-off data created during eval sessions
 /bench/_k*.py

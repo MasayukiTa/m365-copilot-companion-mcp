@@ -36,6 +36,7 @@ import argparse
 import ast
 import io
 import os
+import re
 import subprocess
 import sys
 import warnings
@@ -49,6 +50,73 @@ SKIP_DIRS = {"__pycache__", ".git", ".venv", "node_modules"}
 #: pytest, the file protocol. A count over these says nothing.
 PROTOCOL = frozenset({"main", "run", "setup", "teardown", "do_GET", "do_POST", "log_message",
                       "handle", "close", "write", "read", "flush"})
+
+
+#: Tracked files that are not Python but can still call into it -- PowerShell and batch
+#: wrappers reaching a function through `python -c "from M import f; ..."`, which is how
+#: edge_keeper.ps1 reads the managed-profile list and how three run_*.ps1 scripts call
+#: bench/ui_goal_lines.py::write_ui_file. Without these the scanner reports a wired function
+#: as unreached, and the only way to clear it would be a permanent exemption -- the mechanism
+#: this inventory exists to dismantle.
+CROSS_LANGUAGE_GLOBS = ("*.ps1", "*.bat", "*.cmd")
+
+
+def cross_language_text():
+    """Each tracked non-Python caller's text, as a list, or [] when git cannot answer.
+
+    PER FILE, NOT CONCATENATED, because the test below is that ONE file names both the
+    function and its module. Joining them all first would let one script's mention of a
+    function pair with a different script's mention of the module.
+    """
+    parts = []
+    for glob in CROSS_LANGUAGE_GLOBS:
+        try:
+            out = subprocess.run(["git", "-C", REPO, "ls-files", glob],
+                                 capture_output=True, timeout=60)
+        except OSError:
+            return ""
+        if out.returncode != 0:
+            return ""
+        for raw in out.stdout.decode("utf-8", "replace").splitlines():
+            rel = raw.strip()
+            if not rel:
+                continue
+            try:
+                with io.open(os.path.join(REPO, rel), encoding="utf-8",
+                             errors="replace") as fh:
+                    parts.append(fh.read())
+            except OSError:
+                continue
+    return parts
+
+
+def reached_from_shell(name, rel, texts):
+    """Whether a tracked .ps1/.bat plausibly calls `name`, defined in `rel`.
+
+    BOTH THE FUNCTION AND ITS MODULE, IN THE SAME FILE. A bare word-boundary match on the name
+    was the first version of this, and it was wrong three times out of six on the day it was
+    written: "require" (the autonomy gate an adversarial review had just flagged as unwired),
+    "branches" (shell scripts talk about git branches) and "health" (a health-check script
+    mentions the endpoint). A false "reached" is worse than a false "unreached" -- it removes
+    the row, and nobody reads what is not printed.
+
+    A real cross-language call carries both names:
+
+        & $py -c "from relay.edge_recover import keeper_profile_marker as k; print(k())"
+
+    so requiring the module keeps the genuine cases and drops the coincidences.
+    """
+    mod = rel.rsplit("/", 1)[-1]
+    if mod.endswith(".py"):
+        mod = mod[:-3]
+    if not mod or mod in PROTOCOL:
+        return False
+    fn_re = re.compile(r"\b%s\b" % re.escape(name))
+    mod_re = re.compile(r"\b%s\b" % re.escape(mod))
+    for text in texts:
+        if fn_re.search(text) and mod_re.search(text):
+            return True
+    return False
 
 
 def tracked_files():
@@ -110,6 +178,21 @@ def scan(files=None):
                 continue
 
     defs = defaultdict(list)
+    # REGISTERED, NOT CALLED. A decorator that is itself a CALL hands the function to something
+    # -- `@mcp.custom_route("/health", methods=["GET"])` puts it in Starlette's routing table at
+    # import time, and no Python line ever names it again. That is a call site this scan cannot
+    # represent, and unlike a word in a shell script it is a fact about the code. A bare-name
+    # decorator (@property, @staticmethod) does NOT count: it transforms the function rather
+    # than handing it to a registry.
+    decorated = {}
+    for rel, tree in trees.items():
+        if is_test(rel):
+            continue
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if any(isinstance(d, ast.Call) for d in node.decorator_list):
+                    decorated["%s::%s" % (rel, node.name)] = True
+
     for rel, tree in trees.items():
         if is_test(rel):
             continue
@@ -163,6 +246,10 @@ def scan(files=None):
                 if orig:
                     bucket[orig] += 1
 
+    # A CALLER THAT IS NOT PYTHON IS STILL A CALLER. Read once, not per name: this is a
+    # handful of small shell scripts, and a scan per candidate would re-read them ninety times.
+    cross = cross_language_text()
+
     rows = []
     for name, places in defs.items():
         if len(places) != 1:
@@ -170,6 +257,10 @@ def scan(files=None):
         rel, lineno, span = places[0]
         if prod_refs[name]:
             continue
+        if cross and reached_from_shell(name, rel, cross):
+            continue                      # reached from a .ps1/.bat wrapper
+        if decorated.get("%s::%s" % (rel, name)):
+            continue                      # handed to a registry by a decorator
         rows.append(("%s::%s" % (rel, name), name, rel, lineno, span, test_refs[name]))
     rows.sort(key=lambda r: (-r[4], r[0]))
     return rows

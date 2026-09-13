@@ -927,3 +927,79 @@ def check_op(op_class: str, detail: str = "") -> Optional[str]:
 
     # Not listed in either list — not gated
     return None
+
+
+# ── operator surface ──────────────────────────────────────────────────────────────────────
+#
+# WHY A CLI AND NOT AN AUTOMATIC CALL. activate_contract() existed with no caller, so the gate
+# could be turned off and never on: `.fleet/active_contract.json` had to be written by hand for
+# any of this file to do anything. The consuming side is fully wired -- run_relay_fleet reads
+# the contract and caps every worker's turns by budget_turns -- so the only missing piece was a
+# way to start it.
+#
+# Choosing WHEN to activate, and WHAT to gate, is not this file's to decide. `ask_before` and
+# `stop_when` change what the fleet will refuse to do; picking them automatically would be a
+# policy nobody chose, presented as one they did. The operator picks; this only makes picking
+# possible.
+
+
+def main(argv=None):
+    """Show, activate or retire the autonomy contract. Returns a process exit code."""
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        prog="python -m tools.contract_gate",
+        description="Inspect or set the autonomy contract the fleet enforces.")
+    sub = ap.add_subparsers(dest="cmd")
+
+    sub.add_parser("show", help="print the current state and exit")
+
+    on = sub.add_parser("activate", help="write an ACTIVE contract")
+    on.add_argument("--scope", default="",
+                    help="informational folder scope (recorded, not enforced)")
+    on.add_argument("--ask-before", default="",
+                    help="comma-separated op classes to gate for approval: %s"
+                         % ",".join(KNOWN_OP_CLASSES))
+    on.add_argument("--stop-when", default="",
+                    help="comma-separated op classes that hard-stop the run")
+    on.add_argument("--budget-turns", type=int, default=None,
+                    help="cap every worker's turns at this number")
+
+    sub.add_parser("deactivate", help="retire the active contract")
+
+    a = ap.parse_args(argv)
+    if not a.cmd or a.cmd == "show":
+        state, data = contract_state()
+        print("contract: %s" % state)
+        if data:
+            for k in ("scope", "ask_before", "stop_when", "budget_turns", "started"):
+                if k in data:
+                    print("  %-13s %s" % (k, data[k]))
+        if state == "absent":
+            print("  (nothing is gated; activate one to turn the gate on)")
+        return 0
+
+    if a.cmd == "deactivate":
+        deactivate_contract()
+        print("contract: retired")
+        return 0
+
+    def _classes(raw):
+        return tuple(x.strip() for x in (raw or "").split(",") if x.strip())
+
+    res = activate_contract(scope=a.scope, ask_before=_classes(a.ask_before),
+                            stop_when=_classes(a.stop_when), budget_turns=a.budget_turns)
+    # activate_contract REFUSES rather than clobbering an already-active contract, and says why
+    # in the returned dict. Printing its own words beats inventing a message here.
+    if not res.get("ok", True) or res.get("error") or res.get("reason"):
+        print("refused: %s" % (res.get("error") or res.get("reason") or res))
+        return 2
+    print("contract: active")
+    for k in ("scope", "ask_before", "stop_when", "budget_turns"):
+        if res.get(k) not in (None, "", (), []):
+            print("  %-13s %s" % (k, res[k]))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
