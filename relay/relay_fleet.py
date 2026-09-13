@@ -46,6 +46,15 @@ from .copilot_autopilot_relay import (
 )
 from relay import settle as _settle
 from relay import fanout as fanout_mod
+# BOUND ONCE, HERE. This was imported inside each of eight call sites, and two sites did
+# not have it in scope: RelayWorker.__init__'s per-goal fan-out judgement and
+# _spawn_children's split event. Both raised NameError into an `except Exception: pass`,
+# so across 5629 telemetry rows neither rung was ever written -- the two that say whether
+# fan-out was eligible for a goal and whether it actually split one. A module-level name
+# cannot be forgotten at a call site; relay/test_a_swallowed_record_is_no_record.py fails
+# if one ever is again. mechanism_telemetry imports nothing but the standard library, so
+# there is no cycle to avoid by deferring it.
+from relay import mechanism_telemetry as _mt
 from relay import effort as effort_mod
 from .planner import PLAN_PROMPT, extract_plan, opening_turn, plan_ready
 from .review_resilience import (
@@ -1343,6 +1352,22 @@ def reset_socket_route():
     # new route starting life one vote short for no reason anybody could see.
     with _ROUTE_FAULT_LOCK:
         _LAST_ROUTE_FAULT[0] = 0.0
+    # AND THE TOKEN, WHICH THIS DOCSTRING ALREADY CLAIMED. "Nothing is preserved: not the
+    # token, which belongs to the context that just died" was false: profile_token keeps its
+    # own module-level _MEMO of the last answer per surface, and `reset_socket_route` cleared
+    # only _SOCKET_ROUTE and the fault clock. A memo entry inside MIN_CAPTURE_INTERVAL_S with
+    # life left is served straight back after the reset -- a token minted against a browser
+    # context that no longer exists.
+    #
+    # `profile_token.forget_memo` exists for this exact case ("for a browser that was reset
+    # underneath us") and had no caller. Not fatal on its own -- the light path fails and
+    # falls through to a fresh capture -- but it spends an attempt per call on a token that
+    # cannot work, and it made a docstring assert something the code did not do.
+    try:
+        from relay import profile_token as _pt
+        _pt.forget_memo()
+    except Exception:
+        pass
 
 
 
@@ -4549,7 +4574,6 @@ class RelayWorker:
             _sk = "deterministic checks passed; no refuter turn spent"
             self.reason = (self.reason or "") + (" | " if self.reason else "") + _sk
             try:
-                from relay import mechanism_telemetry as _mt
                 _mt.record("refuter", run_id=self.run_id,
                            configured=True, config_source="skip-when-settled",
                            eligible=True, triggered=False,
@@ -4698,7 +4722,6 @@ class RelayWorker:
         # answer was yes, and this repository already paid for collapsing them once, when "the
         # panel ran 155 times" could not be turned into a rate.
         try:
-            from relay import mechanism_telemetry as _mt
             _mt.record("tree_moved_after_verify", run_id=getattr(self, "run_id", ""),
                        goal_hash=str(getattr(self, "goal_hash", "") or "")[:24],
                        turn=getattr(self, "turn", None),
@@ -4789,7 +4812,6 @@ class RelayWorker:
         # that separates "the refuter ran 155 times" from "the refuter improved 155 outcomes",
         # and it is the distinction the whole accuracy stack was accepted without.
         try:
-            from relay import mechanism_telemetry as _mt
             _lenses = [e.get("lens") for e in (record.get("lenses") or [])
                        if isinstance(e, dict)]
             _agg = record.get("aggregate")
@@ -5924,7 +5946,6 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     # A read of the resolved config, so it cannot change behaviour, and wrapped so telemetry
     # can never fail a run.
     try:
-        from relay import mechanism_telemetry as _mt
         # THE RUN'S OWN ID, NOT A FRESH EPOCH. This read `"%s" % int(time.time())` while
         # `run_id` -- the parameter of this very function, resolved above and used to key every
         # transcript file -- sat in scope. The result was a field shaped like an id that joined
@@ -6341,7 +6362,6 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 # module-level name. Without this the NameError would be swallowed by the
                 # except below and the record would silently never be written -- the same
                 # silence this function exists to end, reintroduced inside it.
-                from relay import mechanism_telemetry as _mt
                 _mt.record("retry", run_id=run_id,
                            goal_hash=str(getattr(worker, "goal_hash", "") or "")[:24],
                            turn=getattr(worker, "turn", None),
@@ -6417,7 +6437,6 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 # skips. Recorded rather than argued: the funnel now shows retry stopping at
                 # "did not trigger" with the reason attached, on every goal it declines.
                 try:
-                    from relay import mechanism_telemetry as _mt
                     _mt.record("retry", run_id=run_id,
                                goal_hash=str(getattr(_w, "goal_hash", "") or "")[:24],
                                turn=getattr(_w, "turn", None),
@@ -6450,7 +6469,6 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     in ("1", "on", "true", "yes"))
                 if _unverified_done:
                     try:
-                        from relay import mechanism_telemetry as _mt
                         _mt.record("retry", run_id=run_id,
                                    goal_hash=str(getattr(_w, "goal_hash", "") or "")[:24],
                                    turn=getattr(_w, "turn", None),
@@ -6504,7 +6522,6 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 # three times. An instrument built to tell "never fired" from "fired and
                 # changed nothing" had a rung of its own ladder unset.
                 try:
-                    from relay import mechanism_telemetry as _mt
                     _mt.record("retry", run_id=run_id,
                                goal_hash=str(getattr(_w, "goal_hash", "") or "")[:24],
                                turn=getattr(_w, "turn", None),

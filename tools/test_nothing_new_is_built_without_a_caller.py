@@ -33,6 +33,7 @@ declined one (the judge enforce item) for reasons that have not changed.
 """
 from __future__ import annotations
 
+import io
 import os
 import sys
 
@@ -58,14 +59,11 @@ NO_CALLER_NO_TEST = {
     "relay/selfimprove/guards.py::launch_detached",              # 16 lines
     "relay/selfimprove/run_archive.py::revisions",               # 14 lines
     "tools/security.py::get_client_ip",                          # 12 lines
-    "relay/fleet_retention.py::open_maybe_gz",                   # 10 lines
     "scripts/collect_lens_corpus.py::all_inconclusive",          # 8 lines
-    "tools/lock_state.py::token_gap",                            # 8 lines
     "bench/companionbench/job_authority.py::free_port",          # 7 lines
     "scripts/collect_lens_corpus.py::load_corpus",               # 7 lines
     "relay/profile_token.py::discard_template",                  # 6 lines
     "relay/autonomy_gate.py::constraints_text",                  # 5 lines
-    "relay/profile_token.py::forget_memo",                       # 5 lines
     "tools/security.py::is_trusted_local",                       # 3 lines
     "relay/review_resilience.py::looks_like_capability_failure", # 2 lines
     "relay/review_resilience.py::looks_like_output_filter",      # 2 lines
@@ -81,12 +79,10 @@ NO_CALLER_BUT_TESTED = {
     "relay/selfimprove/routing.py::held_out_advantage",          # 65 lines
     "bench/companionbench/baseline.py::why_they_flip",           # 54 lines
     "relay/selfimprove/autonomy.py::raise_to",                   # 48 lines
-    "relay/selfimprove/runtime_config.py::revert_active",        # 48 lines
     "relay/bestofn_run.py::load_candidate_dir",                  # 39 lines
     "relay/selfimprove/apply.py::safe_commit",                   # 39 lines
     "bench/companionbench/baseline.py::repeat_suite",            # 36 lines
     "tools/env_portability.py::merge_for_new_machine",           # 35 lines
-    "relay/selfimprove/runtime_config.py::reset_to_base",        # 33 lines
     "bench/attempt_snapshots.py::transitions",                   # 32 lines
     "relay/selfimprove/solver_feedback.py::to_hypotheses",       # 31 lines
     "relay/selfimprove/autonomy.py::require",                    # 29 lines
@@ -101,7 +97,6 @@ NO_CALLER_BUT_TESTED = {
     "bridge/session_store.py::latest_attached",                  # 23 lines
     "relay/selfimprove/compare.py::withdraw",                    # 20 lines
     "scripts/stale_server_check.py::decide_post_update_action",  # 20 lines
-    "relay/selfimprove/runtime_config.py::pending_swap",         # 19 lines
     "relay/selfimprove/diversify.py::diversity_report",          # 17 lines
     "relay/selfimprove/harness_tree.py::justified",              # 17 lines
     "relay/selfimprove/solver_feedback.py::where_distribution",  # 16 lines
@@ -129,7 +124,6 @@ NO_CALLER_BUT_TESTED = {
     "tools/lock_state.py::matching_record",                      # 9 lines
     "relay/project_memory.py::authorities_in",                   # 8 lines
     "relay/chathub.py::collect_text",                            # 7 lines
-    "relay/mechanism_telemetry.py::patch_hash",                  # 4 lines
     "relay/relay_fleet.py::connector_proven",                    # 3 lines
     "relay/selfimprove/compare.py::transport_versions_differ",   # 3 lines
     "relay/selfimprove/guards.py::is_domain_general",            # 3 lines
@@ -140,6 +134,89 @@ NO_CALLER_BUT_TESTED = {
 }
 
 BASELINE = NO_CALLER_NO_TEST | NO_CALLER_BUT_TESTED
+
+
+#: The three answers that let a name stay unwired. A CLOSED SET, the same shape
+#: relay/outcomes.py uses and for the same reason: an open field is filled with whatever the
+#: writer was thinking, and a reader then cannot tell a triaged entry from a tired one.
+#:
+#:   dispatch    reached by name rather than by reference -- getattr, a table of handler
+#:               strings, a decorator registry. The pointer names the file that does the
+#:               dispatching.
+#:   entrypoint  invoked from outside Python: a .ps1, a scheduled task, a console shortcut.
+#:               The pointer names that caller.
+#:   deliberate  kept, unwired, on purpose. The pointer names where the decision is written
+#:               down, because "we decided" with no location is how judge_autonomy came to sit
+#:               here for weeks with nobody able to say who had decided what.
+#:
+#: THE POINTER IS CHECKED, THE PROSE IS NOT. A word count would be satisfied by a word count;
+#: a path either exists in the repository or it does not.
+ALLOWED_REASONS = ("dispatch", "entrypoint", "deliberate")
+
+#: "<path>::<name>": ("<reason>", "<path that proves it>")
+#:
+#: EMPTY ON PURPOSE. Nothing has been added to the inventory since the freeze, and filling this
+#: in for the 77 entries that predate it would mean writing 77 sentences from inference -- the
+#: exact move that put `all_inconclusive` and `fleet_is_running` on a triage list they did not
+#: survive. See docs/unreached_burndown.md.
+REASONS: dict[str, tuple[str, str]] = {}
+
+#: The inventory as it stood when the reason requirement went in. See the file's own header.
+FROZEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "unreached_frozen.txt")
+
+
+def frozen_inventory() -> set[str]:
+    out = set()
+    for line in io.open(FROZEN_FILE, encoding="utf-8"):
+        line = line.strip()
+        if line and not line.startswith("#"):
+            out.add(line)
+    return out
+
+
+def test_the_frozen_snapshot_is_intact():
+    """A snapshot that can be edited is not a snapshot. If this number moves, somebody has
+    reopened the past to make the present pass."""
+    frozen = frozen_inventory()
+    assert len(frozen) == 77, (
+        "the 2026-09-13 freeze held 77 names and now holds %d" % len(frozen))
+    assert BASELINE <= frozen, (
+        "the inventory has grown past the freeze without going through REASONS: %s"
+        % ", ".join(sorted(BASELINE - frozen)))
+
+
+def test_a_new_entry_says_which_question_it_answers():
+    """THE ESCAPE HATCH, CLOSED. Pasting a name into the inventory is the cheapest way to make
+    the ratchet green, and it leaves no trace that distinguishes it from a triaged entry."""
+    added = sorted(BASELINE - frozen_inventory())
+    missing = [k for k in added if k not in REASONS]
+    assert not missing, (
+        "added to the inventory with no reason -- each needs (%s) and a path that shows it, "
+        "or a caller, or deletion: %s" % ("|".join(ALLOWED_REASONS), ", ".join(missing)))
+
+
+def test_every_reason_is_one_of_the_three():
+    bad = sorted(k for k, (why, _p) in REASONS.items() if why not in ALLOWED_REASONS)
+    assert not bad, "not one of %s: %s" % (ALLOWED_REASONS, ", ".join(bad))
+
+
+def test_every_reason_points_at_something_that_exists():
+    """The half that cannot be satisfied by typing. A reason with no location is the form
+    "we decided" takes when nobody can say who."""
+    files = U.tracked_files()
+    if files is None:
+        pytest.skip("git could not list the tracked files here")
+    have = set(files)
+    bad = sorted(k for k, (_why, ptr) in REASONS.items()
+                 if (ptr or "").split("::")[0] not in have)
+    assert not bad, "the pointer names nothing the repository tracks: %s" % ", ".join(bad)
+
+
+def test_no_reason_outlives_its_entry():
+    """A reason for a name that has since been wired or deleted is a sentence the next reader
+    will take for the current state -- the same failure the ratchet's other half prevents."""
+    stale = sorted(set(REASONS) - BASELINE)
+    assert not stale, "reasons for names no longer in the inventory: %s" % ", ".join(stale)
 
 
 def _keys():

@@ -1018,6 +1018,20 @@ def _start_approval_watcher(period: float = 3.0) -> None:
 if __name__ == "__main__":
     _install_faulthandler()
     _start_approval_watcher()
+    # THE ONE NUMBER THAT DECIDES A SECURITY SWITCH, SAID OUT LOUD ONCE PER BOOT.
+    # tools/lock_state.py has counted every call that passed the unlock gate on identity alone
+    # since 2026-08-18 so that MCP_REQUIRE_UNLOCK_TOKEN could be turned on with evidence instead
+    # of with an outage. Nothing read the counter. Measured 2026-09-13: 154 calls, the most
+    # recent that morning, 146 of them from one address -- so enforcement would have refused the
+    # live integration, and no one could have known. Silence here is the good case: it means the
+    # gap has stayed quiet for a full grant TTL and the switch is free.
+    try:
+        from tools.lock_state import token_gap_warning
+        _warn = token_gap_warning()
+        if _warn:
+            print(_warn, flush=True)
+    except Exception:
+        pass
     # timeout_graceful_shutdown gives in-flight requests up to 30s to finish on SIGTERM
     # instead of an immediate hard kill (uvicorn default 0 = no grace). Passed through
     # FastMCP.run_http_async -> uvicorn.Config(**uvicorn_config).

@@ -107,7 +107,13 @@ def test_the_run_continues_past_a_timeout(fake_root, monkeypatch, capsys):
     slow = _suite(fake_root, "a_sleepy.py", HANGS)
     fast = _suite(fake_root, "b_quick.py", QUIET_ASCII)
     monkeypatch.setattr(R, "SUITES", {slow: None, fast: None})
-    monkeypatch.setattr(R, "TIMEOUT_S", 2)
+    # 8s, NOT 2s. Every suite now launches through scripts/run_isolated.py, which imports the
+    # modules in conftest.LIVE_RECORD_REDIRECTS so it can point them at a temp directory before
+    # the suite runs -- measured 2.4s of fixed startup, 1.76s of it tools.trace_ops. At 2s the
+    # QUIET_ASCII suite timed out on the wrapper alone and this test failed saying the gate had
+    # stopped at the slow suite, which it had not. The bound is checked for real in
+    # scripts/test_a_script_suite_writes_where_a_test_writes.py rather than left implicit here.
+    monkeypatch.setattr(R, "TIMEOUT_S", 8)
     assert R.main() == 1
     printed = capsys.readouterr().out
     assert "TIMED OUT" in printed

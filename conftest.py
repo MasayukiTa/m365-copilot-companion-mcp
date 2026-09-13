@@ -35,8 +35,14 @@ import pytest
 ONLY_IF_ALREADY_IMPORTED = frozenset({"bridge.copilot_bridge", "bridge.session_store"})
 
 LIVE_RECORD_REDIRECTS = {
+    # _TOKEN_GAP_FILE is DERIVED (`_STATE_FILE.parent / ...`), so redirecting _STATE_FILE alone
+    # left it pointing at the operator's .fleet: it was computed from the real path at import.
+    # Eight RFC 5737 documentation addresses were found in the live file on 2026-09-13, written
+    # by this suite into the counter that decides whether unlock-token enforcement can be
+    # switched on. relay/test_live_record_isolation.py now follows derived constants too.
     "tools.lock_state": {"_LOG_FILE": "lock_refusals.jsonl",
-                         "_STATE_FILE": "lock_state.json"},
+                         "_STATE_FILE": "lock_state.json",
+                         "_TOKEN_GAP_FILE": "unlock_token_gap.json"},
     "relay.socket_route": {"DEFAULT_LOG": "socket_route.jsonl"},
     "relay.selfimprove.pending": {"QUEUE_PATH": "pending_decisions.jsonl"},
     "relay.selfimprove.record_summary": {"CACHE_PATH": "record_summaries.json"},
@@ -122,6 +128,28 @@ DELIBERATELY_NOT_REDIRECTED = {
     ("tools.contract_gate", "_FLEET_DIR"):
         "a directory, not a record; the gate's own files are redirected by the tests that "
         "write them and the contract file is already per-test",
+    # FOUND 2026-09-13 by the derived-path pass, not by anybody reading the file: both are
+    # built from a constant above rather than from a literal, so the walk could not see them
+    # until it followed derivations. The _FLEET_DIR entry above already asserted the first
+    # one's answer in prose ("the contract file is already per-test") -- which is a claim, and
+    # this table is where claims get checked.
+    #
+    # MEASURED, NOT ASSUMED: with .fleet/active_contract.json at c5f60f2cc300798e (written by
+    # the 04:07 fleet run), the 124 tests in tools/test_contract_activation.py,
+    # test_contract_budget_turns.py, test_the_gate_can_be_turned_on.py, test_gate_is_not_demoted.py
+    # and relay/selfimprove/test_evolution_loop.py, test_measurement_integrity.py left it
+    # byte-identical; so did the full 7031-test preflight, which never moved its mtime off 04:07.
+    ("tools.contract_gate", "_CONTRACT_FILE"):
+        "the gate's tests build their own contract path and none writes the live file -- "
+        "measured byte-identical across the gate and loop suites and a full preflight",
+    # GRADE_RESULTS sits inside SWEDIR, which is exempt one line down as a benchmark working
+    # directory. It is closer to a record than most of that tree -- selfimprove/loop reads it
+    # back to decide which targets count as judged -- so it is listed on its own rather than
+    # inherited silently. Measured the same way: the file does not exist after a full run,
+    # because nothing in the suite grades anything.
+    ("relay.selfimprove.loop", "GRADE_RESULTS"):
+        "the grading ledger under the benchmark tree; no test grades, so nothing writes it -- "
+        "measured absent after a full preflight",
     ("tools.folder_policy", "POLICY_FILE"):
         "read by the policy gate and written only by the operator's console; a test that "
         "wrote it would be testing the console, which none do",
