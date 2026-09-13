@@ -1,6 +1,6 @@
 # Burning down the unreached baseline
 
-Started 2026-09-13. **93 → 75** so far. This file exists so the remaining 75 do not have to be
+Started 2026-09-13. **93 → 75** so far, and the scan now sees 77 — two names it had never printed at all. This file exists so they do not have to be
 triaged a third time.
 
 ## Why the baseline is being removed rather than maintained
@@ -31,6 +31,7 @@ before the list was acted on. Three blind spots, all measured:
 | aliased import | `from relay.selfimprove.diversify import diversify as _diversify` then `_diversify(base, n)` — live production code listed as unreached | credit the original name when the **alias is called** |
 | non-Python caller | `edge_keeper.ps1` runs `python -c "from relay.edge_recover import keeper_profile_marker as k; print(k())"` | a tracked `.ps1`/`.bat` naming **both the function and its module, in the same file** |
 | registry decorator | `@mcp.custom_route("/health", …)` puts `main.py::health` in Starlette's routing table; no Python line names it again | a decorator that is a **Call** counts as a registration; a bare `@property` does not |
+| **name defined twice** | adding a `require` to `relay/invariants.py` silently removed `relay/selfimprove/autonomy.py::require` — the hard autonomy gate — from the inventory: a colliding name was dropped from the scan entirely | a **zero** reference count resolves the ambiguity without resolving the name (no definition is reached, whichever one a call meant), so every place is reported; only a non-zero count is still skipped |
 
 **Two of those fixes were themselves wrong first, and that is the lesson worth keeping.**
 
@@ -68,7 +69,7 @@ flagged unwired by an adversarial review hours earlier, nearly hidden behind an 
 The ratchet noticed `is_resolved` on its own: the moment it gained callers the test refused to
 keep it listed. That is the mechanism working in the direction it was built for.
 
-## The remaining 75
+## The remaining 77
 
 Classified 2026-09-13 by three parallel surveys, each required to give grep-level evidence and
 to answer "could not determine" rather than guess. **These verdicts are triage, not proof** —
@@ -76,8 +77,10 @@ the ones acted on so far were re-verified by hand first, and the rest should be 
 
 ### The heaviest UNWIRED — a call site exists and is missing
 
-| function | what is broken today |
-|---|---|
+**Empty, for the first time.** Both entries were wired on 2026-09-13 — `lock_state::token_gap`
+and `mechanism_telemetry::patch_hash` — and they are listed under *What left the baseline*
+above. A name belongs here when a caller for it exists somewhere in the design and is simply
+missing; that is the shape worth doing next, so the heading stays.
 
 ### Deliberately unwired — do not "fix"
 
@@ -88,7 +91,7 @@ control. Leave it.
 
 ### The self-improvement subsystem has no driver
 
-21 of the 86 are in `relay/selfimprove/`. `scripts/run_nightly_real.py` — the script meant to
+23 of the 77 are in `relay/selfimprove/` — the share has GROWN as the rest came down. `scripts/run_nightly_real.py` — the script meant to
 run the loop for real — opens with *"It has never been run at all."* No CI job, scheduler,
 `.bat` or cron invokes any entry point. They are stranded because the loop was never turned on,
 not because they are useless. **Decide that first**; classifying them one by one before the
@@ -206,6 +209,51 @@ Empty on all 9361 rows of `judge.jsonl` because `tools/judge_backend.py::ask_hum
 caller: no judgement has ever been put to a person. That function has been sitting in the
 unreached inventory the whole time. One hole, two symptoms, and neither list could see the other
 until both existed.
+
+## The opposite of a baseline: post-conditions checked while the code runs
+
+The external analysis this burn-down keeps citing named two things worth taking, and both are
+now in. Its own framing of the second one is the sharpest description of what a baseline does
+wrong:
+
+> ベースライン腐敗の本質は「壊れた状態が検証されず静かに緑のまま残る」こと。
+> invariants は状態を許容リストで黙らせず、毎回の実行時に検証し違反を例外で叫ぶ。
+> ベースライン固定の思想的対極。
+
+*(The quotation names this repository by its internal name; that word is not carried into this
+file. The rule is written down in `scripts/check_no_identifying_names.py`, and it caught this
+paragraph before it was committed — the third time content read outside the repository has been
+transcribed into a tracked one.)*
+
+`relay/invariants.py` is the port it asked for — explicitly the minimum: *"a thin layer that
+asserts post-conditions on important paths and raises a machine-readable code;
+`assert_invariant(name, cond, msg)` is enough."* Violations carry `INVARIANT` and the owning
+module, and land in `.fleet/invariants.jsonl` before anything is raised, so a violation swallowed
+three frames up is still on disk.
+
+**One difference from the source, deliberately.** `dsh` raises on every violation. Here a raise
+on the fleet's hot path costs a fifty-minute run, and *telemetry must not be able to fail a run*
+is a rule this repository has already paid for. So each invariant declares its disposition:
+
+| | when | first one |
+|---|---|---|
+| `RAISE` | a wrong answer is worse than a stop | `reconciler.transcripts_are_readable` — the reader that matched 1557 transcripts and returned 2 |
+| `RECORD` | the caller is recovering and stopping is worse | `socket_route.reset_keeps_no_token` — the docstring that claimed the token was gone while it was not |
+
+`python -m relay.invariants list` prints what the repository promises at runtime;
+`violations` prints what has stopped being true.
+
+**The limit is the source's own**, and it is why `relay/test_an_invariant_has_a_call_site.py`
+exists: *"if nobody writes the invariants, nothing is protected."* A registry of promises
+nothing checks would be this same burn-down's defect one level up, so every registered name
+must appear at an `assert_invariant(` call site in non-test code, and that is enforced.
+
+### What the first version of it cost
+
+Two mistakes worth keeping, both caught by measuring rather than by reading:
+
+- The function was called `require`, and that name **retired `relay/selfimprove/autonomy.py::require` from the inventory** — see the blind-spot table above. Renaming it to `assert_invariant` (which is what the source had called it) both fixed the collision and matched the design.
+- `python -m relay.invariants list` printed *"no invariants registered"* with two registered: running the file as `__main__` loads a **second copy** of the module, with its own registry, and the copy doing the printing is the empty one. The entry point calls the package's `main` now.
 
 ## Wired, and still not answering the question it was built for
 

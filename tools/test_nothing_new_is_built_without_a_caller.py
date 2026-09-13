@@ -58,6 +58,8 @@ NO_CALLER_NO_TEST = {
     "tools/judge_backend.py::ask_human_async",                   # 18 lines
     "relay/selfimprove/guards.py::launch_detached",              # 16 lines
     "relay/selfimprove/run_archive.py::revisions",               # 14 lines
+    "bridge/session_store.py::compact",                          # revealed 2026-09-13
+    "relay/selfimprove/episode_record.py::compact",              # revealed 2026-09-13
     "tools/security.py::get_client_ip",                          # 12 lines
     "scripts/collect_lens_corpus.py::all_inconclusive",          # 8 lines
     "bench/companionbench/job_authority.py::free_port",          # 7 lines
@@ -151,7 +153,13 @@ BASELINE = NO_CALLER_NO_TEST | NO_CALLER_BUT_TESTED
 #:
 #: THE POINTER IS CHECKED, THE PROSE IS NOT. A word count would be satisfied by a word count;
 #: a path either exists in the repository or it does not.
-ALLOWED_REASONS = ("dispatch", "entrypoint", "deliberate")
+#:   revealed    the scanner could not SEE it at the freeze. Not new code: a name
+#:               defined in two modules used to be dropped from the scan entirely, so a
+#:               finding could be retired by an unrelated function taking its name. The
+#:               pointer names where the blind spot is written up. Such an entry still
+#:               needs the same triage as the pre-freeze ones -- it is a reason it is on
+#:               the list, not a reason it may stay unwired forever.
+ALLOWED_REASONS = ("dispatch", "entrypoint", "deliberate", "revealed")
 
 #: "<path>::<name>": ("<reason>", "<path that proves it>")
 #:
@@ -159,10 +167,32 @@ ALLOWED_REASONS = ("dispatch", "entrypoint", "deliberate")
 #: in for the 77 entries that predate it would mean writing 77 sentences from inference -- the
 #: exact move that put `all_inconclusive` and `fleet_is_running` on a triage list they did not
 #: survive. See docs/unreached_burndown.md.
-REASONS: dict[str, tuple[str, str]] = {}
+REASONS: dict[str, tuple[str, str]] = {
+    # Both were always unreached and neither was ever printed: `compact` is defined in
+    # two modules, and a colliding name used to be skipped by the scan rather than
+    # reported. Found 2026-09-13 when a new `require` silently retired
+    # relay/selfimprove/autonomy.py::require the same way.
+    "bridge/session_store.py::compact": ("revealed", "docs/unreached_burndown.md"),
+    "relay/selfimprove/episode_record.py::compact": ("revealed",
+                                                    "docs/unreached_burndown.md"),
+}
 
 #: The inventory as it stood when the reason requirement went in. See the file's own header.
 FROZEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "unreached_frozen.txt")
+
+
+def _tracked_anything():
+    """Every path git tracks, of any type. None when git cannot answer."""
+    import subprocess
+
+    try:
+        out = subprocess.run(["git", "-C", REPO, "ls-files"], capture_output=True, timeout=60)
+    except OSError:
+        return None
+    if out.returncode != 0:
+        return None
+    return {ln.strip().replace(chr(92), "/")
+            for ln in out.stdout.decode("utf-8", "replace").splitlines() if ln.strip()}
 
 
 def frozen_inventory() -> set[str]:
@@ -180,9 +210,13 @@ def test_the_frozen_snapshot_is_intact():
     frozen = frozen_inventory()
     assert len(frozen) == 77, (
         "the 2026-09-13 freeze held 77 names and now holds %d" % len(frozen))
-    assert BASELINE <= frozen, (
+    # GROWTH IS ALLOWED ONLY THROUGH REASONS. Forbidding it outright made the REASONS table
+    # unreachable -- the first entry that needed one could not be added at all -- which is a
+    # gate that prevents the procedure it exists to enforce.
+    unexplained = sorted((BASELINE - frozen) - set(REASONS))
+    assert not unexplained, (
         "the inventory has grown past the freeze without going through REASONS: %s"
-        % ", ".join(sorted(BASELINE - frozen)))
+        % ", ".join(unexplained))
 
 
 def test_a_new_entry_says_which_question_it_answers():
@@ -203,11 +237,14 @@ def test_every_reason_is_one_of_the_three():
 def test_every_reason_points_at_something_that_exists():
     """The half that cannot be satisfied by typing. A reason with no location is the form
     "we decided" takes when nobody can say who."""
-    files = U.tracked_files()
-    if files is None:
+    # EVERY TRACKED FILE, NOT ONLY THE PYTHON ONES. U.tracked_files() is `git ls-files *.py`
+    # because that is what the scanner needs; a pointer is just as likely to be a .ps1 that
+    # calls the function or the document where the decision is written down. Checking the
+    # narrower list rejected `docs/unreached_burndown.md` as if it did not exist.
+    have = _tracked_anything()
+    if have is None:
         pytest.skip("git could not list the tracked files here")
-    have = set(files)
-    bad = sorted(k for k, (_why, ptr) in REASONS.items()
+    bad = sorted("%s -> %s" % (k, ptr) for k, (_why, ptr) in REASONS.items()
                  if (ptr or "").split("::")[0] not in have)
     assert not bad, "the pointer names nothing the repository tracks: %s" % ", ".join(bad)
 

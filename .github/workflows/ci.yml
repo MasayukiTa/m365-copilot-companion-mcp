@@ -158,6 +158,7 @@ jobs:
             tools/test_the_gate_can_be_turned_on.py \
             tools/test_a_counter_that_gates_a_switch_is_read.py \
             tools/test_a_declared_field_is_a_written_field.py \
+            tools/test_a_name_defined_twice_is_still_reported.py \
             scripts/test_a_script_suite_writes_where_a_test_writes.py \
             tools/test_a_backfilled_conversation_is_the_right_one.py \
             tools/test_folder_policy.py \
@@ -465,6 +466,7 @@ jobs:
             relay/test_live_record_isolation.py \
             relay/test_a_derived_path_is_still_a_path.py \
             relay/test_a_swallowed_record_is_no_record.py \
+            relay/test_an_invariant_has_a_call_site.py \
             relay/test_mechanism_telemetry.py \
             relay/test_a_measured_timeout_is_not_a_guess.py \
             relay/test_the_repeat_signal_leaves_a_record.py \
