@@ -62,12 +62,35 @@ def test_both_definitions_are_reported_when_neither_is_reached(tmp_path, monkeyp
     assert set(rows) == {"a.py::twin", "b.py::twin"}, sorted(rows)
 
 
-def test_a_reached_name_is_still_skipped_rather_than_guessed(tmp_path, monkeypatch):
-    """The one genuinely ambiguous case. With a call in hand the count cannot say WHICH
-    definition it reached, and reporting both would be two false findings, not one."""
+def test_an_attributable_call_resolves_which_definition_it_reached(tmp_path, monkeypatch):
+    """THIS TEST USED TO ASSERT THE OPPOSITE, and the change is the point.
+
+    It read "a reached name is still skipped rather than guessed" -- with a call in hand the
+    bare-name count cannot say WHICH definition it meant, so both were skipped. True of a COUNT,
+    and not true of the AST: `from a import twin` says exactly which one. Measured 2026-09-14,
+    that skip was hiding **421 definitions** of 106 duplicated names, against a visible baseline
+    of 68, and lifting it revealed eighteen -- each then checked by hand.
+
+    So the fixture that used to prove the limitation now proves it is gone: `a.py::twin` is
+    credited and `b.py::twin`, which nothing reaches, is reported. Reporting both would still be
+    two findings where there is one; reporting NEITHER was one finding thrown away.
+    """
     _write(tmp_path, "a.py", "def twin():\n    return 1\n")
     _write(tmp_path, "b.py", "def twin():\n    return 2\n")
     _write(tmp_path, "c.py", "from a import twin\n\n\ndef go():\n    return twin()\n")
+    rows = _scan(tmp_path, ["a.py", "b.py", "c.py"], monkeypatch)
+    assert "a.py::twin" not in rows, "the definition the import names was reported anyway"
+    assert "b.py::twin" in rows, "the definition nothing reaches is still being hidden"
+
+
+def test_a_call_the_ast_cannot_place_is_still_skipped_rather_than_guessed(tmp_path,
+                                                                          monkeypatch):
+    """The case that is genuinely ambiguous, and remains so. A bare call in a file that neither
+    defines nor imports the name could have meant either definition, and reporting both would be
+    two false findings. It is SAID rather than silently dropped -- see `scan().ambiguous`."""
+    _write(tmp_path, "a.py", "def twin():\n    return 1\n")
+    _write(tmp_path, "b.py", "def twin():\n    return 2\n")
+    _write(tmp_path, "c.py", "def go():\n    return twin()\n")
     rows = _scan(tmp_path, ["a.py", "b.py", "c.py"], monkeypatch)
     assert "a.py::twin" not in rows and "b.py::twin" not in rows, sorted(rows)
 

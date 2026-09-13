@@ -51,6 +51,8 @@ from tools import unreached as U  # noqa: E402
 #: THESE HAVE NO TEST EITHER, which makes them the starkest: nothing calls them and nothing
 #: checks them.
 NO_CALLER_NO_TEST = {
+    "relay/lean_capture.py::capture_fn",                           # 10 lines, revealed 2026-09-14
+    "relay/profile_token.py::capture_fn",                          # 9 lines, revealed 2026-09-14
     "tools/golden.py::run_trajectory",                           # 64 lines
     "relay/autonomy_gate.py::judge_autonomy",                    # 54 lines
     "bench/skill_use_log.py::compare_runs",                      # 23 lines
@@ -73,6 +75,22 @@ NO_CALLER_NO_TEST = {
 #: Called by nothing outside tests. Tests referencing a function say it was worth writing; they
 #: do not say anything reaches it in production.
 NO_CALLER_BUT_TESTED = {
+    "bench/retry_floor.py::report",                                # 67 lines, revealed 2026-09-14
+    "bench/skill_probe.py::compare",                               # 51 lines, revealed 2026-09-14
+    "bench/companionbench/shadow_rules.py::compare",               # 41 lines, revealed 2026-09-14
+    "relay/selfimprove/planner_evaluator.py::preflight",           # 39 lines, revealed 2026-09-14
+    "relay/outcomes.py::tally",                                    # 35 lines, revealed 2026-09-14
+    "relay/selfimprove/solver_feedback.py::tally",                 # 27 lines, revealed 2026-09-14
+    "relay/selfimprove/authority_ledger.py::verify",               # 25 lines, revealed 2026-09-14
+    "relay/selfimprove/decision.py::summarise",                    # 21 lines, revealed 2026-09-14
+    "relay/selfimprove/apply.py::apply_genome",                    # 20 lines, revealed 2026-09-14
+    "relay/quota_meter.py::prune",                                 # 13 lines, revealed 2026-09-14
+    "relay/turn_outcome.py::summarise",                            # 13 lines, revealed 2026-09-14
+    "tools/auth_stats.py::get_summary",                            # 13 lines, revealed 2026-09-14
+    "relay/acceptance_contract.py::intact",                        # 11 lines, revealed 2026-09-14
+    "relay/selfimprove/harness_feedback.py::report",               # 11 lines, revealed 2026-09-14
+    "relay/selfimprove/coreset.py::summarise",                     # 8 lines, revealed 2026-09-14
+    "scripts/win/checkpoint.py::pages",                            # 4 lines, revealed 2026-09-14
     "tools/coding_ops.py::survey_worktrees",                     # 96 lines
     "relay/provenance.py::adjudicate",                           # 82 lines
     "relay/selfimprove/propose.py::propose_candidates",          # 68 lines
@@ -166,6 +184,48 @@ REASONS: dict[str, tuple[str, str]] = {
     "bridge/session_store.py::compact": ("revealed", "docs/unreached_burndown.md"),
     "relay/selfimprove/episode_record.py::compact": ("revealed",
                                                     "docs/unreached_burndown.md"),
+
+    # THE SAME BLIND SPOT, MEASURED AND CLOSED 2026-09-14. `unreached.py` skipped a name
+    # defined in more than one module whenever ANY definition was referenced -- the half of
+    # the 2026-09-13 fix that was left. 421 definitions sat behind that skip. Attributing a
+    # reference to the module the AST names reports these eighteen; each was checked against
+    # the owning module's own importers before being listed.
+    "bench/retry_floor.py::report":
+        ("revealed", "docs/unreached_burndown.md"),
+    "bench/skill_probe.py::compare":
+        ("revealed", "docs/unreached_burndown.md"),
+    "bench/companionbench/shadow_rules.py::compare":
+        ("revealed", "docs/unreached_burndown.md"),
+    "relay/selfimprove/planner_evaluator.py::preflight":
+        ("revealed", "docs/unreached_burndown.md"),
+    "relay/outcomes.py::tally":
+        ("revealed", "docs/unreached_burndown.md"),
+    "relay/selfimprove/solver_feedback.py::tally":
+        ("revealed", "docs/unreached_burndown.md"),
+    "relay/selfimprove/authority_ledger.py::verify":
+        ("revealed", "docs/unreached_burndown.md"),
+    "relay/selfimprove/decision.py::summarise":
+        ("revealed", "docs/unreached_burndown.md"),
+    "relay/selfimprove/apply.py::apply_genome":
+        ("revealed", "docs/unreached_burndown.md"),
+    "relay/quota_meter.py::prune":
+        ("revealed", "docs/unreached_burndown.md"),
+    "relay/turn_outcome.py::summarise":
+        ("revealed", "docs/unreached_burndown.md"),
+    "tools/auth_stats.py::get_summary":
+        ("revealed", "docs/unreached_burndown.md"),
+    "relay/acceptance_contract.py::intact":
+        ("revealed", "docs/unreached_burndown.md"),
+    "relay/selfimprove/harness_feedback.py::report":
+        ("revealed", "docs/unreached_burndown.md"),
+    "relay/lean_capture.py::capture_fn":
+        ("revealed", "docs/unreached_burndown.md"),
+    "relay/profile_token.py::capture_fn":
+        ("revealed", "docs/unreached_burndown.md"),
+    "relay/selfimprove/coreset.py::summarise":
+        ("revealed", "docs/unreached_burndown.md"),
+    "scripts/win/checkpoint.py::pages":
+        ("revealed", "docs/unreached_burndown.md"),
 }
 
 #: The inventory as it stood when the reason requirement went in. See the file's own header.
