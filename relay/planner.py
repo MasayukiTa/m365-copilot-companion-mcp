@@ -29,7 +29,9 @@ PLAN_PROMPT = (
 
 APPROVE_JOB = (
     "計画を承認します。上記の計画に沿って、最初のステップから実際に実装を進めてください。"
-    "各ターンの最後に CONTINUE / DONE / STUCK: 理由 のいずれかを書いてください。"
+    # 最後の「行」。control_markers.parse は最終行しか読まないので、「最後に」では
+    # 本文の途中にマーカーを置いた返信が通ってしまう（run r6aa597a8_a0 の turn 3）。
+    "各ターンの最後の行に CONTINUE / DONE / STUCK: 理由 のいずれかだけを書いてください。"
 )
 
 # a line that starts like a step. Tolerant of: "1." / "1)" / "1、" / "1：" / fullwidth

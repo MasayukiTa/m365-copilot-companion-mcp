@@ -80,6 +80,52 @@ def test_it_names_both_outcomes():
 
 # ── one sentence, not five ────────────────────────────────────────────────────────────────
 
+def test_every_relay_prompt_says_where_the_marker_goes():
+    """THE PROPERTY, NOT THE SPELLING -- and the spelling was what the first version checked.
+
+    That version walked the tree for the exact phrase 「無理なら FAIL と理由を書いて」 and
+    passed. Scanning for the PROPERTY instead -- every production literal that instructs an
+    agent to write DONE -- found 28, of which 14 said nothing about WHERE the marker goes, and
+    five of those were in relay/: three folder_coder templates, the fan-out child prompt, and
+    the planner's approval job. The same defect, in five more places, behind a different
+    wording.
+
+    SCOPED TO relay/, because that is where the contract applies: those replies are read by
+    control_markers.parse(), which takes the last non-empty line and nothing else. The bench/
+    goals are graded on their own output contracts ("ANSWER: <整数> の1行で",
+    "最後に必ず次の2行を出して", "このブロックを出力した後、最後に DONE と書いて終了して") and
+    state their placement in their own terms.
+    """
+    asks = ("書いてください", "と書いて", "してください", "書いてくださ")
+    placement = ("最後の行", "最終行")
+    bad = []
+    root = os.path.join(REPO, "relay")
+    for dirpath, _d, files in os.walk(root):
+        if "__pycache__" in dirpath:
+            continue
+        for fn in files:
+            if not fn.endswith(".py") or fn.startswith("test_"):
+                continue
+            path = os.path.join(dirpath, fn)
+            try:
+                tree = ast.parse(io.open(path, encoding="utf-8", errors="replace").read())
+            except Exception:
+                continue
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+                    continue
+                v = node.value
+                if "DONE" not in v or not any(k in v for k in asks):
+                    continue
+                if any(k in v for k in placement):
+                    continue
+                bad.append("%s:%d" % (os.path.relpath(path, REPO).replace("\\", "/"),
+                                      node.lineno))
+    assert not bad, (
+        "DONE を求めているのに置き場所を言っていないプロンプト（最終行しか読まれない）: %s"
+        % ", ".join(sorted(bad)))
+
+
 def test_no_module_writes_its_own_copy():
     """Five copies is how the placement clause went missing from all of them while the goal
     that started the run still had it."""

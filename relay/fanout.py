@@ -30,6 +30,7 @@ import hashlib
 import re
 
 from relay.planner import _clean_step, extract_plan
+from relay.control_markers import CLOSING_INSTRUCTION
 
 #: The agent writes this when its split is ready, mirroring PLAN_READY. A distinct marker,
 #: because a split and a plan are different things: a plan is steps for ONE conversation to
@@ -276,13 +277,17 @@ def child_goals(parent_goal, steps, *, parent_task_id="", campaign_id="", depth=
     cid = campaign_id or campaign_id_for(parent_goal)
     out = []
     for i, step in enumerate(steps, 1):
+        # THE % BINDS TIGHTER THAN THE +, so the format has to be closed before the constant
+        # is appended. Without these parentheses the substitution applied to
+        # CLOSING_INSTRUCTION alone -- which has no placeholders -- and every split raised
+        # "not all arguments converted during string formatting".
         text = (
-            "%s\n\n"
-            "【この会話が担当する範囲 — 全体の %d/%d】\n%s\n\n"
-            "上の範囲だけを担当してください。他の範囲は別の会話が並行して担当しているので、"
-            "手を出さないこと。担当範囲を完了したら、何を何件取得したかを明記して "
-            "DONE と書いてください。"
-            % (parent_goal, i, len(steps), step)
+            ("%s\n\n"
+             "【この会話が担当する範囲 — 全体の %d/%d】\n%s\n\n"
+             "上の範囲だけを担当してください。他の範囲は別の会話が並行して担当しているので、"
+             "手を出さないこと。担当範囲を完了したら、何を何件取得したかを明記してください。"
+             % (parent_goal, i, len(steps), step))
+            + CLOSING_INSTRUCTION
         )
         out.append({
             "text": text,
