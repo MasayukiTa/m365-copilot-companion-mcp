@@ -2447,6 +2447,26 @@ class CockpitWindow : Window
         return -1;
     }
 
+    // WHICH REPAIR A RED DOT LEADS TO, so the retry budget can be charged to the repair rather
+    // than to the observation. The mapping is RunFix's own branch structure, read off it:
+    //
+    //   3 sign-in  -> start_companion_edge.ps1 -Foreground   (Priority 1)
+    //   2 edge     -> start_companion_edge.ps1 -HardReset    (Priority 1b/2)
+    //   4 agent    -> RunReconnect                           (Priority 3)
+    //   0 server   -\
+    //   1 tunnel   -/ scripts\repair.ps1 -Auto               (Priority 4, ONE branch)
+    //   5 tool     -> its own tier
+    //
+    // ONLY 0 AND 1 ARE MERGED, and only because RunFix merges them in a single `if`. sign-in and
+    // edge both relaunch :9222 and might look mergeable, but they take different branches with
+    // different arguments -- merging them from that resemblance would be inference, and the one
+    // thing this function must not do is guess which repairs are the same.
+    static string AutoFixRepairKey(int dot)
+    {
+        if (dot == 0 || dot == 1) return "repair:stack";
+        return "repair:dot" + dot;
+    }
+
     static bool RepairTouchesFleetEdge(int dot)
     {
         // sign-in and edge relaunch :9222; agent reconnects it. tool targets :9223, and
@@ -2537,7 +2557,23 @@ class CockpitWindow : Window
 
         // A DIFFERENT FAULT GETS ITS OWN BUDGET. One persistent high-priority failure used to
         // consume all three attempts and leave every later fault unrepaired.
-        string fault = "dot" + dot;
+        //
+        // AND THE BUDGET BELONGS TO THE REPAIR, NOT THE DOT -- which is what that earlier fix
+        // got wrong, in a way that made AUTOFIX_MAX_ATTEMPTS bound nothing at all. RunFix
+        // handles `server == Red || tunnel == Red` in ONE branch (Priority 4, scripts\repair.ps1
+        // -Auto), so those two dots are the same repair observed from two probes: any cause that
+        // takes the backend down reddens both, and they flap. Every flip changed `fault`, which
+        // reset _autoFixAttempts to 0, which handed out a fresh budget of three. Measured in
+        // .fleet/autofix.jsonl on 2026-09-14, 07:49-07:51 JST:
+        //
+        //     tunnel#1  tunnel#2  server#1  tunnel#1  tunnel#2  tunnel#3
+        //                                   ^ the cap was reached and then reset
+        //
+        // -- repair.ps1 relaunched every ~186s (its own run time plus the post-repair
+        // _healthWake re-poll) with no bound in sight. Keying on the repair collapses that pair
+        // into one budget while leaving genuinely different repairs their own, which is what the
+        // paragraph above was for.
+        string fault = AutoFixRepairKey(dot);
         if (fault != _autoFixFault)
         {
             _autoFixFault = fault;

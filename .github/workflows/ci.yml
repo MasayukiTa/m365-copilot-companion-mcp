@@ -139,6 +139,7 @@ jobs:
             tests/test_edge_keeper_coverage.py \
             tests/test_edge_taskbar_hygiene.py \
             ui/test_history_is_not_destroyed_by_a_failed_load.py \
+            ui/test_a_retry_budget_bounds_the_repair_it_pays_for.py \
             ui/test_deployed_cockpit_matches_its_source.py \
             ui/test_an_approval_button_always_moves_the_queue.py \
             ui/test_a_fleet_conversation_can_be_answered.py \
