@@ -255,6 +255,21 @@ Two mistakes worth keeping, both caught by measuring rather than by reading:
 - The function was called `require`, and that name **retired `relay/selfimprove/autonomy.py::require` from the inventory** — see the blind-spot table above. Renaming it to `assert_invariant` (which is what the source had called it) both fixed the collision and matched the design.
 - `python -m relay.invariants list` printed *"no invariants registered"* with two registered: running the file as `__main__` loads a **second copy** of the module, with its own registry, and the copy doing the printing is the empty one. The entry point calls the package's `main` now.
 
+### The third item, which is not about the baseline at all
+
+The same analysis listed a `change-scope` reporter last and low, and said plainly that it is not
+a remedy for baseline rot. What it supports is the rule this repository enforces by hand: never
+`git add -A`; name the files the work changed. `scripts/change_scope.py` prints the four states
+separately — committed-but-unpushed, staged, unstaged, untracked — and its `--add-line` names
+only the tracked ones.
+
+That is not tidiness. Run on this working tree it reports **nine** untracked paths that are
+neither ignored nor part of the project, and `check_no_identifying_names.py` reports 86 of their
+files as carrying identifying content, with the sentence that is the whole argument: *"They are
+not public, and they are one `git add` from being so."* The git call is pinned deterministic —
+fsmonitor off, `GIT_OPTIONAL_LOCKS=0`, `LANG=C` — because a stale index or a localised status
+word each give a wrong answer that looks like a right one.
+
 ## Wired, and still not answering the question it was built for
 
 `relay/mechanism_telemetry.py` says in its own header what the whole file is for:

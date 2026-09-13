@@ -160,6 +160,7 @@ jobs:
             tools/test_a_declared_field_is_a_written_field.py \
             tools/test_a_name_defined_twice_is_still_reported.py \
             scripts/test_a_script_suite_writes_where_a_test_writes.py \
+            scripts/test_change_scope_keeps_the_four_apart.py \
             tools/test_a_backfilled_conversation_is_the_right_one.py \
             tools/test_folder_policy.py \
             tools/test_security.py \
