@@ -153,10 +153,31 @@ def load_completions(run=None, transcripts=TRANSCRIPTS):
     """{goal_key: [(worker, goal, final_message)]} for transcripts that reached a final message."""
     out = collections.defaultdict(list)
     pattern = os.path.join(transcripts, ("%s*" % run) if run else "*")
-    for path in glob.glob(pattern + ".jsonl"):
+    # COMPRESSED TRANSCRIPTS ARE STILL TRANSCRIPTS. This globbed only "*.jsonl" and opened with
+    # io.open, and the retention job gzips transcripts as they age -- so a run's record fell out
+    # of this function's view a few days after it finished, silently: the dict just got smaller.
+    # Measured 2026-09-13 on the live directory: 2 plain files, 1555 .gz, and load_completions()
+    # returned 2 goals. A reconciler that compares a worker's claim against its transcript was
+    # working from 0.1% of the record.
+    #
+    # `fleet_retention.open_maybe_gz` was written for this and had no caller: "a reader that has
+    # to know is a reader that will one day be added without knowing." Two other readers had
+    # already re-implemented it independently.
+    #
+    # Names are collapsed to the uncompressed form because a just-compressed run can have both
+    # files for a moment, and open_maybe_gz prefers the plain one -- so each transcript is read
+    # exactly once whichever forms exist.
+    from relay.fleet_retention import open_maybe_gz as _open_maybe_gz
+
+    seen = []
+    for found in glob.glob(pattern + ".jsonl") + glob.glob(pattern + ".jsonl.gz"):
+        plain = found[:-3] if found.endswith(".gz") else found
+        if plain not in seen:
+            seen.append(plain)
+    for path in seen:
         goal, last = None, None
         try:
-            for ln in io.open(path, encoding="utf-8", errors="replace"):
+            for ln in _open_maybe_gz(path):
                 ln = ln.strip()
                 if not ln:
                     continue

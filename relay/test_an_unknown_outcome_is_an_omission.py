@@ -90,13 +90,28 @@ def test_the_omission_is_printed_and_recorded():
     assert "ineligible_reason=" in body
 
 
-def test_the_telemetry_import_is_local_like_every_other_one():
-    """`_mt` is not a module-level name in this file. Without the local import the NameError
-    would be swallowed by the surrounding except and the record would silently never be
-    written -- the same silence this function exists to end, reintroduced inside it."""
+def test_the_telemetry_module_resolves_here():
+    """THIS TEST PINNED THE WORKAROUND AND CALLED IT THE PROPERTY, AND THAT IS THE LESSON.
+
+    It used to require a LOCAL `from relay import mechanism_telemetry as _mt` in this function,
+    reasoning that without it the NameError would be swallowed by the surrounding except and the
+    record would silently never be written. The reasoning was exactly right and the assertion
+    was on the wrong thing: the property is that `_mt` RESOLVES here, and "there is a local
+    import" is one way of satisfying it.
+
+    Measured 2026-09-13: eight call sites each imported it locally, two did not, and those two
+    -- the per-goal fan-out judgement and the split event -- had written zero rows in 5629.
+    A rule that says "repeat this at every call site" is a rule that gets missed at some call
+    site, and three tests including this one were enforcing it.
+
+    `_mt` is a module-level name now, and relay/test_a_swallowed_record_is_no_record.py checks
+    every call site against the property instead of against the spelling."""
+    import relay.relay_fleet as _RF
+
+    assert hasattr(_RF, "_mt"), "_mt がどこからも解決できない"
     i = SRC.index("def _retry_allowed(outcome, worker):")
     body = SRC[i:SRC.index("\n    _reap_counter", i)]
-    assert "from relay import mechanism_telemetry as _mt" in body
+    assert "_mt.record(" in body, "この関数が記録しなくなっている"
 
 
 def test_it_falls_back_to_the_old_rule_when_outcomes_is_unavailable():

@@ -369,3 +369,78 @@ def reset_to_base(path=None) -> bool:
     _invalidate()
     _note(path, "genome_revert", "reset to base: the harness as it shipped", current)
     return True
+
+
+# ── operator surface ──────────────────────────────────────────────────────────────────────
+#
+# WHY THIS EXISTS. `write_active()` is wired -- EvolutionController._conclude calls it when a
+# verdict may_activate -- and `revert_active()`, `reset_to_base()` and `pending_swap()` had no
+# caller at all. Activation was reachable and rollback was not, which is a one-way door: an
+# operator whose activated harness turned out bad had no path back except hand-written Python.
+#
+# It adds no policy. Rolling back automatically on a bad verdict would mean deciding which
+# verdicts are bad enough to undo someone's activation, and nothing in this subsystem says
+# that. The operator decides; this makes deciding possible.
+
+
+def main(argv=None):
+    """Show or change which harness manifest is active. Returns a process exit code."""
+    import argparse
+
+    from relay.selfimprove import manifest as _M
+
+    ap = argparse.ArgumentParser(
+        prog="python -m relay.selfimprove.runtime_config",
+        description="Inspect or roll back the active harness manifest.")
+    sub = ap.add_subparsers(dest="cmd")
+    sub.add_parser("show", help="print the active harness and what a swap would install")
+    sub.add_parser("revert", help="swap the active manifest with the one it replaced")
+    sub.add_parser("reset-to-base", help="return to base, whatever the two slots hold")
+
+    a = ap.parse_args(argv)
+    cmd = a.cmd or "show"
+
+    if cmd == "show":
+        path = os.environ.get(OVERRIDE_ENV, "").strip() or ACTIVE_PATH
+        try:
+            active = _M.harness_id(active_manifest(refresh=True)) or "(none)"
+        except Exception as exc:
+            active = "(unreadable: %s)" % type(exc).__name__
+        # WHERE IT CAME FROM, not just what it is. `active_manifest()` falls back to
+        # `base_manifest()` when no file is there, so printing only the id would show a harness
+        # that is in force but was never activated -- and an operator reading it as "something
+        # is installed" would look for a rollback that has nothing to roll back.
+        print("active harness : %s%s"
+              % (active, "" if os.path.isfile(path) else "   (base -- no manifest file)"))
+        print("manifest path  : %s" % path)
+        # NAMED BY WHAT IT WOULD DO, not by a fixed word: `revert` is a swap, so after one
+        # revert the same command goes the other way. pending_swap exists to say which.
+        nxt = pending_swap()
+        if nxt is None:
+            print("revert would   : nothing -- no other state has ever been stored")
+        elif nxt == "":
+            print("revert would   : leave the system with NO manifest")
+        else:
+            print("revert would   : install %s" % nxt)
+        return 0
+
+    if cmd == "revert":
+        nxt = pending_swap()
+        if not revert_active():
+            # "Returns False when there is no other state ... That must never be reported as a
+            # successful rollback."
+            print("nothing to revert to -- no manifest has ever been replaced")
+            return 2
+        print("reverted; active harness is now %s"
+              % (nxt if nxt not in (None, "") else "(no manifest)"))
+        return 0
+
+    if not reset_to_base():
+        print("already at base -- nothing to reset")
+        return 0
+    print("reset to base")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
