@@ -2755,7 +2755,7 @@ class RelayWorker:
         self.reason = "手動で停止・タブ解放しました"
         self.close()
 
-    def _note_timeout(self, origin, elapsed_s, treatment):
+    def _note_timeout(self, origin, elapsed_s, treatment, budget_s=None):
         """Record one timeout WE measured, with the clock that fired and what we then did.
 
         CAUSE AND TREATMENT ARE SEPARATE. `timeout` is the fact; retrying, salvaging or giving
@@ -2763,18 +2763,30 @@ class RelayWorker:
         retry which gave up began identically -- and encourages "timeout therefore retry",
         which is a reflex rather than a policy.
 
-        `origin` names the clock: `per_turn` is this branch's own budget
-        (`per_turn_timeout_s`, 240s by default); `socket_turn` is the driver's much longer
-        bound (SOCKET_TURN_TIMEOUT_S, 1200s). Without it an inner overrun reads as an outer
-        one, which is the distinction deepseek-harness's timeout-policy scopes its inner timer
-        for.
+        `origin` names the clock: `per_turn` is the tab-era budget (`per_turn_timeout_s`,
+        240s by default); `socket_turn` is the driver's much longer bound
+        (SOCKET_TURN_TIMEOUT_S, 1200s). Without it an inner overrun reads as an outer one,
+        which is the distinction deepseek-harness's timeout-policy scopes its inner timer for.
+
+        THIS PARAGRAPH DESCRIBED AN INTENT THE CODE DID NOT HAVE. The caller compared every
+        worker against per_turn_timeout_s and picked the label from the worker's TRANSPORT, so
+        a socket row said `origin=socket_turn budget_s=240` -- the 1200s clock reported as
+        having expired at 240, which is the one reading the field exists to prevent. The
+        caller applies the matching bound now and passes it in, so `budget_s` is the budget
+        that actually expired.
 
         Never raises: this is telemetry beside a failure path, and a failure path that can
         fail again is worse than no record.
         """
         try:
+            # THE BUDGET THAT EXPIRED, not the one this class happens to hold. It recorded
+            # per_turn_timeout_s whatever clock fired, so every socket row read
+            # `origin=socket_turn budget_s=240` -- the two numbers the origin field exists to
+            # keep apart, printed as one.
             self._tx.metric(self.turn, "timeout", elapsed_s, origin=origin,
-                            budget_s=self.per_turn_timeout_s, treatment=treatment,
+                            budget_s=(self.per_turn_timeout_s if budget_s is None
+                                      else budget_s),
+                            treatment=treatment,
                             transient=getattr(self, "transient", 0), observed=True)
         except Exception:
             pass
@@ -5436,7 +5448,23 @@ class RelayWorker:
             return self.status in TERMINAL
         if self.status == "waiting":
             self._capture_url()
-            if time.time() - self._t_send > self.per_turn_timeout_s:
+            # THE DEADLINE THAT ACTUALLY APPLIES, which is the same correction _defer_generation
+            # already carries (see its `_bound` above): "a socket turn is bounded by its own
+            # turn_timeout_s and _defer_generation deliberately skips this tab-era budget for
+            # it". This branch did not skip it. It compared every worker against the 240s
+            # tab-era budget and then labelled the row `socket_turn` because the WORKER was a
+            # socket worker -- so the origin named the transport, never the clock, and the
+            # field whose whole purpose is that "an inner overrun reads as an outer one" read
+            # as an outer one every time.
+            #
+            # MEASURED on run r6aa597a8_a0. Five turns timed out at 240.5-241.3s against
+            # SOCKET_TURN_TIMEOUT_S=1200, burning 1,204s of a 48-minute run, and every row said
+            # `origin=socket_turn budget_s=240` -- a 1200s clock reported as having expired at
+            # 240. Turn 3 is the cost: its reply arrived 70s in, the turn was declared timed out
+            # at 240s anyway, and the full 7,890-character goal was re-sent three more times.
+            _bound = (SOCKET_TURN_TIMEOUT_S if getattr(self, "socket", False)
+                      else self.per_turn_timeout_s)
+            if time.time() - self._t_send > _bound:
                 # A MEASUREMENT, NOT A GUESS -- and recorded apart from the guesses.
                 # turn_outcome classifies THROTTLE/RECYCLE/TRANSIENT from what the upstream
                 # SAID; this is our own clock passing our own budget. A rate computed over
@@ -5445,15 +5473,15 @@ class RelayWorker:
                 _origin = ("socket_turn" if getattr(self, "socket", False) else "per_turn")
                 # a turn that never finished is a transient stall -- retry before STUCK
                 if self._retry_transient():
-                    self._note_timeout(_origin, _elapsed, "retry")
+                    self._note_timeout(_origin, _elapsed, "retry", budget_s=_bound)
                     self.reason = "turn timeout -> retry %d/%d" % (self.transient, self.max_transient)
                     return False
                 # retries exhausted: don't give up on an already-correct artifact -- if the
                 # workspace already passes the acceptance checks, salvage it as DONE+verified.
                 if self._salvage_via_checks():
-                    self._note_timeout(_origin, _elapsed, "salvaged")
+                    self._note_timeout(_origin, _elapsed, "salvaged", budget_s=_bound)
                     return True
-                self._note_timeout(_origin, _elapsed, "stuck")
+                self._note_timeout(_origin, _elapsed, "stuck", budget_s=_bound)
                 self.status, self.outcome, self.reason = "stuck", "STUCK", \
                     "turn timeout (after %d retries)" % self.transient
                 return True

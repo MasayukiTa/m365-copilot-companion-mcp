@@ -135,10 +135,17 @@ def test_the_call_sites_pass_the_treatment_they_took():
     Comments are stripped first so this cannot match the explanation beside them."""
     src = open(os.path.join(REPO, "relay", "relay_fleet.py"), encoding="utf-8").read()
     body = "\n".join(l.split("#", 1)[0] for l in src.splitlines())
-    i = body.index("if time.time() - self._t_send > self.per_turn_timeout_s:")
-    arm = body[i:i + 1400]
+    # ANCHORED ON THE ARM, NOT ON THE COMPARISON INSIDE IT. This indexed the line
+    # `if time.time() - self._t_send > self.per_turn_timeout_s:` -- which is not what
+    # either test is about, and which changed when a socket turn stopped being judged
+    # against the tab-era budget. Both tests then failed for a reason unrelated to the
+    # property they check. `status == "waiting"` is the arm's identity.
+    i = body.index('if self.status == "waiting":')
+    arm = body[i:i + 2200]
     for treatment in ('"retry"', '"salvaged"', '"stuck"'):
-        assert "_note_timeout(_origin, _elapsed, %s)" % treatment in arm, (
+        # NO CLOSING PAREN: the branch now also passes the budget that expired, and
+        # what this test is about is that each branch names the treatment it took.
+        assert "_note_timeout(_origin, _elapsed, %s" % treatment in arm, (
             "the %s branch does not record what it did" % treatment)
 
 
@@ -147,8 +154,13 @@ def test_the_timeout_arm_still_does_what_it_did():
     policy; if this change also altered the policy, neither could be evaluated afterwards."""
     src = open(os.path.join(REPO, "relay", "relay_fleet.py"), encoding="utf-8").read()
     body = "\n".join(l.split("#", 1)[0] for l in src.splitlines())
-    i = body.index("if time.time() - self._t_send > self.per_turn_timeout_s:")
-    arm = body[i:i + 1400]
+    # ANCHORED ON THE ARM, NOT ON THE COMPARISON INSIDE IT. This indexed the line
+    # `if time.time() - self._t_send > self.per_turn_timeout_s:` -- which is not what
+    # either test is about, and which changed when a socket turn stopped being judged
+    # against the tab-era budget. Both tests then failed for a reason unrelated to the
+    # property they check. `status == "waiting"` is the arm's identity.
+    i = body.index('if self.status == "waiting":')
+    arm = body[i:i + 2200]
     assert "self._retry_transient()" in arm
     assert "self._salvage_via_checks()" in arm
     assert '"stuck", "STUCK"' in arm
