@@ -54,7 +54,6 @@ NO_CALLER_NO_TEST = {
     "relay/autonomy_gate.py::judge_autonomy",                    # 54 lines
     "bench/skill_use_log.py::compare_runs",                      # 23 lines
     "scripts/win/capture_budget.py::acknowledge",                # 19 lines
-    "main.py::health",                                           # 18 lines
     "tools/judge_backend.py::ask_human_async",                   # 18 lines
     "relay/selfimprove/guards.py::launch_detached",              # 16 lines
     "relay/selfimprove/run_archive.py::revisions",               # 14 lines
@@ -68,7 +67,6 @@ NO_CALLER_NO_TEST = {
     "relay/profile_token.py::discard_template",                  # 6 lines
     "relay/autonomy_gate.py::constraints_text",                  # 5 lines
     "relay/profile_token.py::forget_memo",                       # 5 lines
-    "relay/edge_recover.py::keeper_profile_marker",              # 3 lines
     "tools/security.py::is_trusted_local",                       # 3 lines
     "relay/review_resilience.py::looks_like_capability_failure", # 2 lines
     "relay/review_resilience.py::looks_like_output_filter",      # 2 lines
@@ -80,7 +78,6 @@ NO_CALLER_NO_TEST = {
 NO_CALLER_BUT_TESTED = {
     "tools/coding_ops.py::survey_worktrees",                     # 96 lines
     "relay/provenance.py::adjudicate",                           # 82 lines
-    "tools/contract_gate.py::activate_contract",                 # 69 lines
     "relay/selfimprove/propose.py::propose_candidates",          # 68 lines
     "relay/selfimprove/routing.py::held_out_advantage",          # 65 lines
     "bench/companionbench/baseline.py::why_they_flip",           # 54 lines
@@ -134,7 +131,6 @@ NO_CALLER_BUT_TESTED = {
     "tools/lock_state.py::matching_record",                      # 9 lines
     "relay/project_memory.py::authorities_in",                   # 8 lines
     "relay/chathub.py::collect_text",                            # 7 lines
-    "bench/ui_goal_lines.py::write_ui_file",                     # 6 lines
     "relay/mechanism_telemetry.py::patch_hash",                  # 4 lines
     "relay/conv_title.py::salvageable",                          # 3 lines
     "relay/relay_fleet.py::connector_proven",                    # 3 lines

@@ -153,6 +153,7 @@ jobs:
             tools/test_child_output_is_not_decoded_by_luck.py \
             tools/test_nothing_new_is_built_without_a_caller.py \
             tools/test_a_call_under_an_alias_is_a_call.py \
+            tools/test_the_gate_can_be_turned_on.py \
             tools/test_a_backfilled_conversation_is_the_right_one.py \
             tools/test_folder_policy.py \
             tools/test_security.py \
