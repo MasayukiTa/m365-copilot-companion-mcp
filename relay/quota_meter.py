@@ -56,12 +56,45 @@ KEEP_S = 7200.0
 _LOCK = threading.Lock()
 
 
+def _oldest_ts(path):
+    """The timestamp of the FIRST row, or 0.0. One line, so this cost does not grow with the
+    file -- which is the whole point of checking it on every append."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            line = fh.readline().strip()
+        return float(json.loads(line).get("ts") or 0.0) if line else 0.0
+    except (OSError, ValueError, AttributeError):
+        return 0.0
+
+
 def _append(row):
     try:
         with _LOCK:
             os.makedirs(os.path.dirname(METER_PATH), exist_ok=True)
             with open(METER_PATH, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    # ENFORCE THE RETENTION THIS FILE DECLARES. `KEEP_S` says records older than two hours are
+    # dropped "when the file is rewritten", and `prune` does the rewriting -- and nothing called
+    # it. Measured on the live meter 2026-09-14: 4,845 rows spanning 12.8 DAYS, 100% of them
+    # past the window. The reason that matters is written beside KEEP_S itself: keeping more
+    # "would make the meter itself the thing that fills a disk that has already stopped a run
+    # tonight." The mitigation for a real incident was written and never wired.
+    #
+    # AND IT COSTS THE READERS TOO. `snapshot()` parses the WHOLE file to answer a question
+    # about the last minute, so an unpruned meter makes every admission check slower without
+    # bound.
+    #
+    # TRIGGERED ON THE OLDEST ROW, NOT A SIZE OR A COUNTER. A byte threshold is a number
+    # somebody invents; a counter resets with the process. "The first row is older than twice
+    # the window" is the policy restating itself, and reading one line does not get slower as
+    # the file grows. Twice rather than once so an append never rewrites a file that is merely
+    # at the edge.
+    try:
+        oldest = _oldest_ts(METER_PATH)
+        if oldest and (float(row.get("ts") or time.time()) - oldest) > 2 * KEEP_S:
+            prune()
     except Exception:
         pass
 

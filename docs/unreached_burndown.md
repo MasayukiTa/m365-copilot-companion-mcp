@@ -1,6 +1,9 @@
 # Burning down the unreached baseline
 
-Started 2026-09-13. **93 → 68 fixed, and the inventory GREW to 86** when the instrument stopped skipping names it could not attribute. The scan and the baseline agree at 86: the two names the
+Started 2026-09-13. **93 → 68 fixed, and then the inventory GREW to 83** when the instrument
+stopped skipping names it could not attribute: 86 revealed, two of them alias false positives of
+the fix's own making, and `relay/quota_meter.py::prune` wired the moment it appeared. The scan
+and the baseline agree at 83: the two names the
 scanner had never printed at all are in the frozen list with their reason, so a gap between the two
 numbers is once again a signal rather than a known discrepancy. This file exists so they do not have
 to be triaged a third time.
@@ -81,12 +84,13 @@ flagged unwired by an adversarial review hours earlier, nearly hidden behind an 
 | `tools/lock_state.py::locked_recently` / `locked_since` / `matching_record` | **fixed** — all three docstrings said they were "kept for the CLI", and `_cli` had `show` and `token-gap` and called none of them. A justification resting on a surface nobody built is worse than none, because it reads as settled. `recent [seconds]` is that surface. **Not `matching_records`** (plural), which is live in three modules and answers a different question — "which refusals could have been mine", a decision — where these answer "what happened" |
 | `relay/transport_policy.py::evolvable_fields` | **fixed** — it declared `transport_explore_rate`, and a scan over `git ls-files` found that name in exactly one place: that return tuple. Nothing read it — the fifth instance of the defect the version table twelve lines above says this repository "has now found in four separate components", sitting inside the fix for the first four. The remaining knob is spelled once and read through its name, and `choose()` now records a genome knob no policy reads, because an undeclared knob is an A/B arm identical to its control |
 | `scripts/win/capture_budget.py::acknowledge` | **fixed** — `verdict()` has always READ the acknowledgement file, and nothing could write one, so the first red was unclearable except by hand-editing JSON. Its own docstring says what that costs: *"without this, the first red produces a culture of forcing past the gate, and the gate dies."* The reason it exists is the reason nobody noticed it was unreachable. `ack "<reason>"` (with `--log PATH` for a specific run) now exists, with the reason REQUIRED — "a recorded decision with a reason, not a switch" |
+| `relay/quota_meter.py::prune` | **fixed** — one of the eighteen the attribution revealed, and it had never run. `KEEP_S = 7200` says records older than two hours are dropped “when the file is rewritten” and `prune` is the rewriting. Measured on the live meter: **4,845 rows spanning 12.8 days, 100% past the window**. The reason is written beside the constant — keeping more “would make the meter itself the thing that fills a disk that has already stopped a run tonight” — so the mitigation for a real incident had never once run. It also cost the readers: `snapshot()` parses the whole file to answer a question about the last sixty seconds, on every admission check. Triggered on the OLDEST ROW being past twice the window, which is the policy restating itself and stays O(1) as the file grows |
 
 The ratchet noticed `is_resolved` on its own: the moment it gained callers the test refused to
 keep it listed. That is the mechanism working in the direction it was built for. It did the same
 for `evolvable_fields` on 2026-09-14, refusing to keep it listed within seconds of the wiring.
 
-## The remaining 86
+## The remaining 83
 
 Classified 2026-09-13 by three parallel surveys, each required to give grep-level evidence and
 to answer "could not determine" rather than guess. **These verdicts are triage, not proof** —
@@ -389,10 +393,33 @@ to `if prod_refs[name]: continue`, which is true by construction for every name 
 branch. The scan reported the same 68 and the whole attribution was discarded one line later.
 It looked like the rule had simply found nothing.
 
-#### The eighteen, each checked against its own module's importers
+#### The sixteen — and the two that were wrong, which is the part worth reading
 
-Reported by the fixed scan and then verified by hand: for each, an independent pass asked
-whether any module that imports the owning module actually uses the name. All eighteen: no.
+The first version of this reported **eighteen**, and this section said each had been "checked by
+hand". That was overstated: five were checked with an independent pass, and the claim was written
+as though all eighteen had been. Two were false positives.
+
+**The attribution reintroduced a blind spot this tool had already fixed.** Its own header
+records the rule — *credit the original name when the alias is CALLED* — and the new path keyed
+its map on the LOCAL name instead:
+
+    from relay.profile_token import capture_fn as _choose_capture
+    ...
+    _choose_capture()
+
+credited `_choose_capture`, which nothing defines, and reported `profile_token::capture_fn` as
+unreached while `relay_fleet.py:1323` calls it. `tools/auth_stats.py::get_summary` went the same
+way — `main.py:126` imports it as `_auth_stats_summary`.
+
+Both are now credited to the original name and pinned by
+`test_an_aliased_import_credits_the_ORIGINAL_name_not_the_alias`. A false "unreached" is the
+lesser of the two errors this tool can make — it wastes a triage rather than hiding a finding —
+but it is still a wrong row, and this one was found by reading `relay_fleet.py` for another
+reason, not by the check.
+
+The remaining sixteen were then verified the way the first claim should have been: for each, an
+independent pass asked whether any module importing the owning module uses the name. All
+sixteen: no.
 
 | entry | lines | what shares the name |
 |---|---:|---|
@@ -407,15 +434,13 @@ whether any module that imports the owning module actually uses the name. All ei
 | `relay/selfimprove/apply.py::apply_genome` | 20 | shares with the manifest's validator |
 | `relay/quota_meter.py::prune` | 13 | `prune` in four modules |
 | `relay/turn_outcome.py::summarise` | 13 | `relay_fleet` calls only `classify` from this module |
-| `tools/auth_stats.py::get_summary` | 13 | `get_summary` elsewhere |
 | `relay/acceptance_contract.py::intact` | 11 | `intact` in the companionbench episodes |
 | `relay/selfimprove/harness_feedback.py::report` | 11 | the same `report` |
 | `relay/lean_capture.py::capture_fn` | 10 | `capture_fn` is defined twice, here and in profile_token |
-| `relay/profile_token.py::capture_fn` | 9 | the other one |
 | `relay/selfimprove/coreset.py::summarise` | 8 | the same `summarise` |
 | `scripts/win/checkpoint.py::pages` | 4 | `pages` is a browser word, used everywhere |
 
-Ten of the eighteen are in `relay/selfimprove/`, which is the subsystem with no driver — so the
+Ten of the sixteen are in `relay/selfimprove/`, which is the subsystem with no driver — so the
 "decision surface with no decider" row above understates itself by that much again.
 
 **WHAT IS STILL HIDDEN, AND IS NOW SAID OUT LOUD.** 24 names -- 81 definitions between them --
@@ -438,7 +463,7 @@ control. Leave it.
 
 ### The self-improvement subsystem has no driver
 
-24 of the 86 are in `relay/selfimprove/` — the share has GROWN as the rest came down (24/75 → 24/86, and ten of the eighteen newly revealed names are in there too;
+24 of the 83 are in `relay/selfimprove/` — the share has GROWN as the rest came down (24/75 → 24/83, and ten of the sixteen newly revealed names are in there too;
 not one of them has moved), and one of the two names the scanner had never printed is in there too.
 `scripts/run_nightly_real.py` — the script meant to
 run the loop for real — opens with *"It has never been run at all."* No CI job, scheduler,
