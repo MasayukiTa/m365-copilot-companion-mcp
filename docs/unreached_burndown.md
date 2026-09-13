@@ -1,6 +1,6 @@
 # Burning down the unreached baseline
 
-Started 2026-09-13. **93 → 74** so far, and the scan now sees 76 — two names it had never printed at all. This file exists so they do not have to be
+Started 2026-09-13. **93 → 73** so far, and the scan now sees 75 — two names it had never printed at all. This file exists so they do not have to be
 triaged a third time.
 
 ## Why the baseline is being removed rather than maintained
@@ -73,11 +73,12 @@ flagged unwired by an adversarial review hours earlier, nearly hidden behind an 
 | `tools/lock_state.py::token_gap` | **fixed** — the counter that decides whether `MCP_REQUIRE_UNLOCK_TOKEN` can be enforced had gone unread for 26 days. Measured on the live file: **154** token-less calls since 2026-08-18, the newest that same morning, **146 of them one caller** — so enforcement would have refused the live integration. Two readers now: `python -m tools.lock_state token-gap`, and a line the server prints at startup while there is something to say |
 | `relay/mechanism_telemetry.py::patch_hash` | **fixed** — `bench/pro_capture.py::_emit` computed the same digest inline, in a function whose own docstring argues against exactly that ("written twice, these drift"). One implementation now |
 | `relay/review_resilience.py::diagnose_after_fresh_replay` | **fixed** — two of its four answers were typed out as literals at two settle paths (`session_state`/`recovered` and `task_content`/`needs_decomposition`, which ARE the enum's values), leaving the other two unreachable: a fresh replay killed by a transient error, and one whose evidence identifies nothing. Those are exactly the runs where `recovery_cause` stayed EMPTY. All four are reachable now and the diagnosis's sentence is recorded; no string a reader already sees changed |
+| `relay/quota_meter.py::sustainable_workers` | **fixed** — the meter had 4,698 turn rows and nothing computed the number they are for. Its input never existed either: `per_worker_rpm` had no default and `snapshot()` produced no such field, so it returned 0.0 for any snapshot. The denominator was on disk all along (`record_turn` writes `worker`); measured on the busiest minute, **66 turns / 56 workers → 59.4 sustainable** against a hand-chosen concurrency |
 
 The ratchet noticed `is_resolved` on its own: the moment it gained callers the test refused to
 keep it listed. That is the mechanism working in the direction it was built for.
 
-## The remaining 76
+## The remaining 75
 
 Classified 2026-09-13 by three parallel surveys, each required to give grep-level evidence and
 to answer "could not determine" rather than guess. **These verdicts are triage, not proof** —
@@ -110,6 +111,50 @@ The rule those three are waiting on is the one already written into
 `CANNED_NONANSWER_MARKERS`' own comment: *a marker that fires on a real answer costs more than
 one that misses.* None of them may be wired on the strength of reading their strings.
 
+### Triaged by hand, 2026-09-14: four more clusters
+
+Following the procedure below rather than the survey's verdicts. Each one was checked by asking
+which of the module's functions production actually calls, not by reading the docstrings.
+
+**`relay/quota_meter.py::sustainable_workers` — WIRED.** The meter had written 4,698 turn rows
+since 2026-09-01 and the one function that turns them into a decision had no caller. Not a
+forgotten call: `per_worker_rpm` had no default and `snapshot()` produced no such field, so it
+returned `0.0` for any snapshot — the shape `execution_profiles.validate_runtime` has, where the
+INPUT does not exist. The denominator was on disk the whole time (`record_turn` writes `worker`
+on every row), so `snapshot()` now counts distinct workers per minute and the function defaults
+from it. Measured on the busiest minute on record: **66 turns / 56 workers → 1.18 per worker →
+59.4 sustainable**, against a fleet whose concurrency was a number typed on a command line.
+**Not wired into admission**, deliberately — capping concurrency is a policy change to a live
+control, and this session already produced one threshold change that measurement took back.
+
+A window bug fell out of measuring it: `rpm` counted `ts >= now - 60` with no upper bound, so
+`snapshot(now=<a past time>)` counted every later row — 4,698 of them. Harmless at
+`now=time.time()`, wrong for the only reason that parameter exists.
+
+**`relay/turn_outcome.py::is_capacity_signal` — the other half of the same gap.** `classify` is
+live in 15 files; this predicate ("should a controller reduce concurrency") is called nowhere,
+and **nothing in the fleet reduces concurrency on a rate class** — checked across every
+non-test file. The system has 147 recorded `rate` refusals and reached 93% of the hourly quota.
+The predicate is one line; what is missing is a controller to consult it, which is the same
+decision as enforcing `sustainable_workers`. Left listed with that stated.
+
+**`relay/provenance.py::adjudicate` / `outranks` / `resolved_value` — no consumer anywhere,
+and none of the obvious candidates is right.** Of the module's ten functions production calls
+exactly two: `normalise` (4 sites) and `require_authority_for_evolution` (3) — so the
+lineage-poisoning gate itself IS wired. The adjudicator is a general facility for competing
+claims about one fact at different authorities, and the two places that look like consumers are
+not: `RelayWorker._claim_verdict` asks a narrower, binary question and already delegates to
+`evidence_manifest.assess`, and `fleet_reconcile` compares claims that all carry the SAME
+authority, which `adjudicate` refuses to resolve by design. **What would justify wiring it is a
+second source of evidence at a different authority about the same subject — which the system
+does not currently produce.** Recorded rather than forced.
+
+**`tools/tool_probe.py::classify_probe_reply` / `next_probe_instruction` — a half-wired
+protocol.** `verify_probe_reply` is live in 3 files; the classifier and the next-instruction
+generator are not. So the bridge verifies a probe reply but never issues a follow-up probe or
+classifies what came back. Whether the protocol was meant to have more than one round is the
+question, and it is a design question rather than a missing call.
+
 ### Deliberately unwired — do not "fix"
 
 `relay/selfimprove/autonomy.py::raise_to` — its docstring says so, and
@@ -119,7 +164,7 @@ control. Leave it.
 
 ### The self-improvement subsystem has no driver
 
-24 of the 76 are in `relay/selfimprove/` — the share has GROWN as the rest came down, and one of the two names the scanner had never printed is in there too. `scripts/run_nightly_real.py` — the script meant to
+24 of the 75 are in `relay/selfimprove/` — the share has GROWN as the rest came down, and one of the two names the scanner had never printed is in there too. `scripts/run_nightly_real.py` — the script meant to
 run the loop for real — opens with *"It has never been run at all."* No CI job, scheduler,
 `.bat` or cron invokes any entry point. They are stranded because the loop was never turned on,
 not because they are useless. **Decide that first**; classifying them one by one before the

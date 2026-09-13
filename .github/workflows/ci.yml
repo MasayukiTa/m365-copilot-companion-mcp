@@ -485,6 +485,7 @@ jobs:
             relay/test_a_bad_check_costs_only_its_own_goal.py \
             relay/test_a_preamble_is_not_a_subtask.py \
             relay/test_a_separator_is_not_a_step.py \
+            relay/test_the_meter_answers_the_question_it_was_built_for.py \
             relay/test_an_unknown_outcome_is_an_omission.py \
             relay/test_rows_registered_together_are_distinguishable.py \
             relay/test_a_compressed_transcript_is_still_a_transcript.py \
