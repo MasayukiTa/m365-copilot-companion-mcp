@@ -37,6 +37,28 @@ import time
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONTRACT_PATH = os.path.join(_REPO, ".fleet", "acceptance_contracts.jsonl")
 
+#: THE HASH WAS WRITTEN AND NEVER READ. `ensure` computes it on every contract and `intact`
+#: checks it, and nothing called `intact` -- so the grader judged a worker against terms whose
+#: integrity was never verified. What that misses is named in `intact`'s own docstring: "a
+#: contract edited by hand, a partially-written line, a schema-changing refactor that quietly
+#: altered the terms of tasks already in flight."
+#:
+#: RECORD rather than RAISE, and `load` returns None rather than the altered row. A contract
+#: that fails its own hash is not evidence, and `evidence_manifest._assess` already treats an
+#: absent contract honestly ("no acceptance contract was recorded for this task") instead of
+#: reading it as success. Raising here would take down a grading pass over one bad line.
+try:
+    from relay import invariants as _invariants
+    _INV_CONTRACT_INTACT = _invariants.register(
+        "acceptance_contract.matches_its_own_hash", owner="relay/acceptance_contract.py",
+        disposition=_invariants.RECORD,
+        why=("a contract that no longer hashes to what it claims has been altered since "
+             "admission, and grading a worker against altered terms is worse than grading it "
+             "against none"))
+except Exception:                                  # pragma: no cover - import-order safety
+    _invariants = None
+    _INV_CONTRACT_INTACT = ""
+
 SCHEMA_VERSION = 1
 
 
@@ -115,6 +137,20 @@ def load(task: str, path: str = None):
                 except ValueError:
                     continue
                 if row.get("task") == task:
+                    # VERIFIED HERE, because this is the only place a contract is read back and
+                    # every caller goes through it. Measured on the live file 2026-09-14 before
+                    # wiring: 120 contracts, 120 carrying a hash, 120 intact -- so this changes
+                    # nothing about today's data and catches the accident it was written for.
+                    if not intact(row):
+                        if _INV_CONTRACT_INTACT:
+                            try:
+                                _invariants.assert_invariant(
+                                    _INV_CONTRACT_INTACT, False,
+                                    "the contract for %r does not match its own hash; treating "
+                                    "it as absent" % (task,), task=task)
+                            except Exception:
+                                pass
+                        return None
                     return row
     except OSError:
         return None

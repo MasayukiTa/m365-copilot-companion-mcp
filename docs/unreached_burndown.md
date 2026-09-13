@@ -3,7 +3,7 @@
 Started 2026-09-13. **93 → 68 fixed, and then the inventory GREW to 83** when the instrument
 stopped skipping names it could not attribute: 86 revealed, two of them alias false positives of
 the fix's own making, and `relay/quota_meter.py::prune` wired the moment it appeared. The scan
-and the baseline agree at 82: the two names the
+and the baseline agree at 81: the two names the
 scanner had never printed at all are in the frozen list with their reason, so a gap between the two
 numbers is once again a signal rather than a known discrepancy. This file exists so they do not have
 to be triaged a third time.
@@ -86,12 +86,13 @@ flagged unwired by an adversarial review hours earlier, nearly hidden behind an 
 | `scripts/win/capture_budget.py::acknowledge` | **fixed** — `verdict()` has always READ the acknowledgement file, and nothing could write one, so the first red was unclearable except by hand-editing JSON. Its own docstring says what that costs: *"without this, the first red produces a culture of forcing past the gate, and the gate dies."* The reason it exists is the reason nobody noticed it was unreachable. `ack "<reason>"` (with `--log PATH` for a specific run) now exists, with the reason REQUIRED — "a recorded decision with a reason, not a switch" |
 | `relay/quota_meter.py::prune` | **fixed** — one of the eighteen the attribution revealed, and it had never run. `KEEP_S = 7200` says records older than two hours are dropped “when the file is rewritten” and `prune` is the rewriting. Measured on the live meter: **4,845 rows spanning 12.8 days, 100% past the window**. The reason is written beside the constant — keeping more “would make the meter itself the thing that fills a disk that has already stopped a run tonight” — so the mitigation for a real incident had never once run. It also cost the readers: `snapshot()` parses the whole file to answer a question about the last sixty seconds, on every admission check. Triggered on the OLDEST ROW being past twice the window, which is the policy restating itself and stays O(1) as the file grows |
 | `scripts/win/checkpoint.py::pages` | **deleted** — four lines, no caller and no test, returning `targets(port)`’s list with only the urls. The one reader needs the ids too, because ownership is matched by id. See *a narrower view of a function the caller needs in full* below |
+| `relay/acceptance_contract.py::intact` | **fixed** — `ensure` hashes every contract and `intact` checks the hash, and nothing called it: `load()` handed the row straight to the grader, so a worker was judged against terms whose integrity was never verified. Its own docstring names what that misses — “a contract edited by hand, a partially-written line, a schema-changing refactor that quietly altered the terms of tasks already in flight.” Measured before wiring: **120 contracts, 120 hashed, 120 intact**, so the check is invisible to today’s data. An altered contract is now treated as ABSENT (which `_assess` already reports honestly and never reads as success) and the alteration itself is recorded, because “never recorded” and “recorded then altered” are different findings |
 
 The ratchet noticed `is_resolved` on its own: the moment it gained callers the test refused to
 keep it listed. That is the mechanism working in the direction it was built for. It did the same
 for `evolvable_fields` on 2026-09-14, refusing to keep it listed within seconds of the wiring.
 
-## The remaining 82
+## The remaining 81
 
 Classified 2026-09-13 by three parallel surveys, each required to give grep-level evidence and
 to answer "could not determine" rather than guess. **These verdicts are triage, not proof** —
@@ -488,7 +489,7 @@ control. Leave it.
 
 ### The self-improvement subsystem has no driver
 
-24 of the 82 are in `relay/selfimprove/` — the share has GROWN as the rest came down (24/75 → 24/82, and ten of the sixteen newly revealed names are in there too;
+24 of the 81 are in `relay/selfimprove/` — the share has GROWN as the rest came down (24/75 → 24/81, and ten of the sixteen newly revealed names are in there too;
 not one of them has moved), and one of the two names the scanner had never printed is in there too.
 `scripts/run_nightly_real.py` — the script meant to
 run the loop for real — opens with *"It has never been run at all."* No CI job, scheduler,

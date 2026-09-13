@@ -84,7 +84,6 @@ NO_CALLER_BUT_TESTED = {
     "relay/selfimprove/decision.py::summarise",                    # 21 lines, revealed 2026-09-14
     "relay/selfimprove/apply.py::apply_genome",                    # 20 lines, revealed 2026-09-14
     "relay/turn_outcome.py::summarise",                            # 13 lines, revealed 2026-09-14
-    "relay/acceptance_contract.py::intact",                        # 11 lines, revealed 2026-09-14
     "relay/selfimprove/harness_feedback.py::report",               # 11 lines, revealed 2026-09-14
     "relay/selfimprove/coreset.py::summarise",                     # 8 lines, revealed 2026-09-14
     "tools/coding_ops.py::survey_worktrees",                     # 96 lines
@@ -205,8 +204,6 @@ REASONS: dict[str, tuple[str, str]] = {
     "relay/selfimprove/apply.py::apply_genome":
         ("revealed", "docs/unreached_burndown.md"),
     "relay/turn_outcome.py::summarise":
-        ("revealed", "docs/unreached_burndown.md"),
-    "relay/acceptance_contract.py::intact":
         ("revealed", "docs/unreached_burndown.md"),
     "relay/selfimprove/harness_feedback.py::report":
         ("revealed", "docs/unreached_burndown.md"),
