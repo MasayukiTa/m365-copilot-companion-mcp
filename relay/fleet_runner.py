@@ -72,6 +72,7 @@ from relay.relay_fleet import (  # noqa: E402
 from relay.copilot_autopilot_relay import default_notify  # noqa: E402
 from relay.refuter import PANEL_LENSES  # noqa: E402
 from relay.fanout import fanout_family_view  # noqa: E402
+from relay.control_markers import CLOSING_INSTRUCTION  # noqa: E402
 
 
 # ── COORDINATOR OUTPUT CAPTURE (TEE) ────────────────────────────────────────────
@@ -316,7 +317,7 @@ def report_unused_steers(workers, reported=None, log=None):
 FOLLOW_UP_PROMPT = ("【ユーザーからの追加指示】%s\n"
                     "直前までの作業内容を踏まえ、この追加指示に対してだけ答えてください。"
                     "最初からやり直す必要はありません。"
-                    "完了なら DONE、無理なら FAIL と理由を書いてください。")
+                    + CLOSING_INSTRUCTION)
 
 def _follow_up(worker, text, enqueue, say):
     """Queue the message as a new goal continuing `worker`'s conversation. True if queued.
