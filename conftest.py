@@ -47,6 +47,9 @@ LIVE_RECORD_REDIRECTS = {
     "relay.selfimprove.pending": {"QUEUE_PATH": "pending_decisions.jsonl"},
     "relay.selfimprove.record_summary": {"CACHE_PATH": "record_summaries.json"},
     "relay.capture_status": {"STATUS_PATH": "capture_status.json"},
+    # Runtime post-condition violations. A test that deliberately violates one would 
+    # otherwise put it in the operator record, where a violation means something real broke.
+    "relay.invariants": {"LOG": "invariants.jsonl"},
     # Written on the hot path of EVERY tool call, so a test that reaches the gateway fills the
     # operator's evidence ledger with calls that were never made in earnest.
     "tools.tool_ledger": {"LEDGER_PATH": "tool_events.jsonl"},
