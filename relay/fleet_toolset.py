@@ -197,17 +197,18 @@ def unknown_tools(catalogue):
 # switched from permissive to closed without measuring first, the review that caught it said
 # to shadow for an hour and confirm zero. Same discipline here.
 #
-# NOTHING IN PRODUCTION CONSULTS `check` -- measured 2026-09-14, and pinned by
-# test_nothing_in_production_consults_the_gate. `main.py` removed the call site deliberately
-# ("the benchmark's tool-population policy ... is a fact about that benchmark, not about this
-# server") and left the list here "for the runner that owns it"; the runner does not consult it
-# either. So the modes below describe a gate that is currently wired to nothing, and the test
-# section that claims "the gateway actually consults it" claimed something no test checked.
+# THE GATEWAY CONSULTS `check` AGAIN, from 2026-09-14. It had not since 2026-08-31: main.py
+# removed the call site deliberately ("the benchmark's tool-population policy ... is a fact
+# about that benchmark, not about this server") and left the list here "for the runner that owns
+# it" -- and the runner never consulted it either, so for two weeks the modes below described a
+# gate wired to nothing while a heading claimed "the gateway actually consults it".
 #
-# WIRING IT BACK IS AN OPERATOR DECISION, not a burn-down step: it is a policy change to a live
-# dispatch path, and `_fleet_run_active()` -- the mechanism built for exactly the gateway's
-# "cannot tell a worker from the operator" problem -- is what was thrown away with the call
-# site. Recorded in docs/unreached_burndown.md rather than decided here.
+# THE REMOVAL'S ARGUMENT IS STILL RIGHT AND THE REMOVAL WAS STILL WRONG. The policy does not
+# live in dispatch; it lives here, and main.py asks it one question. What went out with the call
+# site was `_fleet_run_active()` -- the mechanism built for the gateway's one real problem, that
+# it cannot tell a worker from the operator. That is what makes a check in general dispatch
+# harmless to the operator: outside an unattended run it allows everything. Operator decision,
+# recorded in docs/unreached_burndown.md.
 #
 #   off      the policy is not consulted at all
 #   shadow   every call that WOULD be refused is recorded; nothing is blocked
@@ -223,6 +224,20 @@ def unknown_tools(catalogue):
 # reaches any process on the machine including the server that is hosting the gate. A worker
 # that needs to end something it started can do so through shell_exec, inside its own
 # process tree.
+#
+# AND THE LOG THAT SENTENCE CITES WAS BEING WRITTEN BY THE TESTS ABOUT IT. Found 2026-09-14:
+# SHADOW_LOG was a RELATIVE path and was not in conftest's redirect table, so every local run of
+# relay/test_fleet_toolset.py appended a row to the operator's file -- measured 219 -> 220 on
+# one run. The file held 220 rows spanning 2026-08-30 to 2026-09-14, not the four the paragraph
+# above describes, and every row said `process_kill`, which is precisely the tool those tests
+# pass. So the log could not distinguish a refusal that happened from one a test simulated.
+#
+# THE FOUR ARE STILL THE FIRST FOUR ROWS and still fall inside the stated window, so the window
+# itself is not withdrawn -- but it is the only part of that file anyone may read as evidence,
+# and even it cannot be proven free of a test write. The default stays `enforce` because the
+# argument for it does not rest on the count: `process_kill` reaches any process on this
+# machine, including the server hosting the gate, and shell_exec covers a worker's own tree.
+# The log is isolated from 2026-09-14, so the NEXT window will measure what it claims to.
 #
 # That was the evidence for enforce, AND IT HAS SINCE BEEN SWITCHED -- `mode()` defaults to
 # enforce and test_the_default_is_enforce_now_that_the_shadow_window_has_run pins it. This

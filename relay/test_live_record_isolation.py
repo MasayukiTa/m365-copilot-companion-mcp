@@ -61,6 +61,34 @@ def _module_path(file_path):
 RECORD_DIR_MARKERS = (".fleet", ".companion_runs")
 
 
+def _names_a_record_dir(value_node):
+    """True if any string literal in this expression names a marker directory.
+
+    THE BLIND SPOT THIS CLOSES, found 2026-09-14. The check used to be a substring test on the
+    assignment's SOURCE TEXT for the marker wrapped in quotes -- `'".fleet"' in segment`. That
+    matches `os.path.join(REPO, ".fleet")`, where the directory is its own literal, and misses
+
+        SHADOW_LOG = ".fleet/toolset_shadow.jsonl"
+
+    because the character after `.fleet` is a slash, not a closing quote. A whole relative path
+    in ONE literal was invisible to a walker whose entire purpose is finding shared records, and
+    relay/fleet_toolset.py wrote through exactly that constant: every local run of its test file
+    appended a line to the operator's shadow log (measured: 219 -> 220 on one run), the same log
+    the module's own prose cites as the production evidence for switching its default to enforce.
+
+    So: parse the literals and split them on both separators, instead of pattern-matching the
+    text they were written in. A marker is credited when it is a path COMPONENT -- which also
+    stops `.fleetwide` or a sentence mentioning .fleet in a docstring from counting.
+    """
+    for node in ast.walk(value_node):
+        if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+            continue
+        parts = node.value.replace("\\", "/").split("/")
+        if any(m in parts for m in RECORD_DIR_MARKERS):
+            return True
+    return False
+
+
 def fleet_constants():
     """(module, CONSTANT) for every module-level constant naming an operator-record directory.
 
@@ -104,8 +132,9 @@ def _record_constants(src, tree):
     """Constants in one module that name a location under an operator-record directory.
 
     TWO PASSES, BECAUSE A PATH DERIVED FROM A RECORD PATH IS STILL A RECORD PATH. The first
-    pass is the original one: a constant whose own source mentions a marker directory. The
-    second credits any constant built from one already credited, to a fixpoint.
+    pass credits a constant whose own literals name a marker directory as a path component
+    (see `_names_a_record_dir`, and the one-literal form it used to miss). The second credits
+    any constant built from one already credited, to a fixpoint.
 
     THE MISS THAT PAID FOR THE SECOND PASS. tools/lock_state.py writes three files under
     .fleet; two name the directory in their own line and were redirected, and the third is
@@ -129,10 +158,9 @@ def _record_constants(src, tree):
         targets = _const_targets(node)
         if not targets:
             continue
-        segment = ast.get_source_segment(src, node) or ""
         refs = {n.id for n in ast.walk(node.value) if isinstance(n, ast.Name)}
         assigns.append((targets, refs))
-        if any('"%s"' % m in segment or "'%s'" % m in segment for m in RECORD_DIR_MARKERS):
+        if _names_a_record_dir(node.value):
             declared.update(targets)
     changed = True
     while changed:
@@ -148,6 +176,32 @@ def test_the_walker_finds_something():
     """A detector that silently finds nothing would pass every assertion below. This
     repository has dozens; if it ever returns an empty set, the walk is broken, not the code."""
     assert len(fleet_constants()) >= 20
+
+
+def test_a_whole_path_in_one_literal_is_seen():
+    """THE FORM THAT WAS INVISIBLE, pinned by shape rather than by the one instance of it.
+
+    `relay/fleet_toolset.py::SHADOW_LOG` was `".fleet/toolset_shadow.jsonl"` -- the record
+    directory and the filename in a single literal. The old check looked for the marker wrapped
+    in quotes in the assignment's source text, which requires the directory to be its OWN
+    literal, so this wrote to the operator's .fleet for as long as it existed without ever
+    appearing in the list this module exists to keep complete.
+
+    The negatives matter as much: a longer directory name that merely starts with a marker, and
+    a marker mentioned in prose, must not be credited -- a walker that over-reports gets
+    entries added to shut it up, and then it is a formality."""
+    def _sees(expr):
+        node = ast.parse(expr, mode="eval").body
+        return _names_a_record_dir(node)
+
+    assert _sees('".fleet/toolset_shadow.jsonl"'), "the one-literal form is invisible again"
+    assert _sees("'.fleet\\\\toolset_shadow.jsonl'"), "the backslash spelling is invisible"
+    assert _sees('os.path.join(REPO, ".fleet", "x.json")'), "the split form regressed"
+    assert _sees('".companion_runs/corrections.jsonl"'), "the second marker is not checked"
+
+    assert not _sees('".fleetwide/x.json"'), "a longer name starting with a marker was credited"
+    assert not _sees('"see .fleet for the record"'), "prose mentioning a marker was credited"
+    assert not _sees('"logs/app.jsonl"'), "an unrelated path was credited"
 
 
 def test_every_shared_record_is_classified():

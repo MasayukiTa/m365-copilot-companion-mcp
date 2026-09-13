@@ -59,13 +59,20 @@ HISTORY = os.path.join(FLEET, "history.json")
 #: The cockpit's durable record of every 履歴を空にする. Append-only, one JSON object per line,
 #: written BEFORE the file is moved aside so that a clear interrupted half way still leaves the
 #: decision on disk -- the opposite ordering would lose exactly the case this exists for.
-CLEARED_LOG = os.path.join(FLEET, "history_cleared.jsonl")
+#:
+#: A NAME, NOT A PATH, and the first version got that wrong. It was `os.path.join(FLEET, ...)`,
+#: which reads as "the operator's clear log" -- but nothing ever uses it as a path: the
+#: directory is chosen by the caller, from the store the ledger came from. Written as a full
+#: path it tripped relay/test_live_record_isolation.py, correctly: a module-level constant
+#: naming .fleet has to be redirected for tests or declared safe, and neither answer fits a
+#: value that is only ever a basename. Naming it as what it is removes the question.
+CLEARED_LOG_NAME = "history_cleared.jsonl"
 
 #: The stamp the cockpit puts on the file it moves aside: history.json.cleared-20260914-075653.
 #: READ AS A SECOND SOURCE, because the log above did not exist when the clears that caused this
 #: happened, and a fix that only honours clears made after the fix would let the old ones be
 #: resurrected once more. Local time, because `DateTime.Now` is what writes it.
-CLEARED_KEPT_GLOB = os.path.join(FLEET, "history.json.cleared-*")
+CLEARED_KEPT_GLOB_NAME = "history.json.cleared-*"
 _KEPT_STAMP = "%Y%m%d-%H%M%S"
 
 
@@ -89,8 +96,8 @@ def cleared_through(fleet=FLEET, log=None, kept_glob=None):
     therefore among what the press discarded. Nothing newer is affected, which is what keeps a
     clear from also erasing the conversations that came after it.
     """
-    log = log or os.path.join(fleet, os.path.basename(CLEARED_LOG))
-    kept_glob = kept_glob or os.path.join(fleet, os.path.basename(CLEARED_KEPT_GLOB))
+    log = log or os.path.join(fleet, CLEARED_LOG_NAME)
+    kept_glob = kept_glob or os.path.join(fleet, CLEARED_KEPT_GLOB_NAME)
     newest = 0.0
     for row in _rows(log):
         try:

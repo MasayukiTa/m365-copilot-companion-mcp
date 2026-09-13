@@ -223,33 +223,35 @@ def _importers(module, self_path):
 
 
 #
-# This heading used to end "and the gateway actually consults it". No test below checked that,
-# and it was not true: main.py removed the call site on purpose. The tests that follow all call
-# `check` directly, so they say what the gate WOULD do -- which is worth keeping and is not the
-# same claim. The one that closes the gap is the next one.
+# THE GATEWAY CONSULTS IT, and from 2026-09-14 a test says so rather than a heading.
+#
+# This heading once ended "and the gateway actually consults it" while nothing did, for two
+# weeks. The tests that follow call `check` directly, so they say what the gate WOULD do -- a
+# different claim, worth keeping, and not a substitute. The two below close the gap: one that
+# the gateway imports the policy, one that a refusal actually returns instead of being logged
+# and ignored.
 
 
-def test_nothing_in_production_consults_the_gate():
-    """The enforcement entry point has no caller outside this file.
+def test_the_gateway_consults_the_gate():
+    """THIS REPLACES test_nothing_in_production_consults_the_gate, which asserted the opposite
+    and told its reader exactly what to do here.
 
-    Measured 2026-09-14 across `git ls-files`: `check` is imported by this test and by nothing
-    else. `main.py` says why -- "the benchmark's tool-population policy ... is a fact about that
-    benchmark, not about this server" -- and leaves the list "for the runner that owns it"; the
-    runner does not consult it either. So every test below describes a gate wired to nothing.
+    That test existed because the heading below used to end "and the gateway actually consults
+    it" while nothing did: main.py removed the call site on 2026-08-31 and the runner that was
+    said to own the list never consulted it either, so for two weeks every test in this file
+    described a gate wired to nothing. It ended: "IF YOU WIRED IT, THIS TEST IS SUPPOSED TO
+    FAIL. That is the decision being made; record it in docs/unreached_burndown.md and delete
+    this test." The operator made that decision on 2026-09-14. It is recorded there, and this
+    is the assertion that takes its place.
 
-    THE SCANNER COULD NOT HAVE TOLD ANYONE. `tools/unreached.py` drops a name defined in more
-    than one module, and `check` and `mode` are both defined several times in this repository,
-    so only `unknown_tools` -- a name unique to this file -- ever appeared in the baseline. The
-    dead gate sat behind that blind spot.
-
-    IF YOU WIRED IT, THIS TEST IS SUPPOSED TO FAIL. That is the decision being made; record it
-    in docs/unreached_burndown.md and delete this test. What it must not do is stay silently
-    true while a heading says the opposite.
+    BY THE IMPORT STATEMENTS, not by the spelling -- the first version of the old test matched
+    any file containing both "fleet_toolset" and "import" and answered `['main.py']`, whose only
+    mention was the comment saying the call site had been REMOVED. It would have pinned the
+    opposite of the fact it existed to pin.
     """
-    assert _importers("fleet_toolset", "relay/fleet_toolset.py") == [], (
-        "fleet_toolset is imported by %r -- the gate is live now. Record that decision in "
-        "docs/unreached_burndown.md and delete this test."
-        % (_importers("fleet_toolset", "relay/fleet_toolset.py"),))
+    assert "main.py" in _importers("fleet_toolset", "relay/fleet_toolset.py"), (
+        "the gateway no longer consults the fleet's tool policy: it is disarmed again, which "
+        "is how it spent 2026-08-31 to 2026-09-14 while this file described what it WOULD do")
 
 
 def test_the_scan_that_says_nothing_consults_it_can_see_a_caller():
@@ -357,17 +359,92 @@ def test_a_worker_can_still_end_something_it_started():
     assert "shell_exec" in FT.DELIBERATELY_EXCLUDED.get("process_kill", "") or True
 
 
-def test_the_policy_is_no_longer_consulted_by_the_shipped_gateway():
-    """This replaces a test that asserted the opposite.
+#: What the child runs: arm the gate as if an unattended run were in flight, then dispatch one
+#: forbidden tool and one allowed tool through the REAL gateway. Written as a module-level
+#: constant rather than inline so the quoting is done once, by Python, and never by a shell.
+_DISPATCH_PROBE = (
+    "import json,sys,os;sys.path.insert(0,'.');"
+    "import main;"
+    "from relay import fleet_toolset as FT;"
+    # The gate is a no-op outside an unattended run -- that is what keeps it off the operator's
+    # back, and it is also why a probe has to say a run is in flight to see anything at all.
+    "FT._fleet_run_active=lambda: True;"
+    "FT.SHADOW_LOG=os.path.join(os.environ['PROBE_TMP'],'shadow.jsonl');"
+    "r={};"
+    "r['forbidden']=main.call_tool(name='process_kill',arguments={'pid':999999999});"
+    "r['allowed']=main.call_tool(name='read_file',arguments={'path':os.environ['PROBE_FILE']});"
+    "print('<<<'+json.dumps(r)+'>>>')")
 
-    Which sixteen tools a benchmark worker may reach is a fact about that benchmark, not about
-    this server, and general dispatch is the wrong place to hold it. The list stays here for
-    the runner that owns it; the hook in main.py was removed on 2026-08-31.
+
+def test_a_forbidden_tool_is_actually_refused_at_the_gateway(tmp_path):
+    """THROUGH THE REAL DISPATCH PATH, because "the source contains a check" and "the call is
+    refused" are different claims and only the second one is the gate.
+
+    The forbidden tool is `process_kill`, which is every row the shadow log has ever held and
+    the one tool that reaches any process on this machine -- including the server hosting the
+    gate. The pid is deliberately one that cannot exist: if the refusal ever stops working, the
+    test fails on the assertion rather than by killing something.
+
+    THE ALLOWED HALF IS NOT DECORATION. A gate that refuses everything while a run is active
+    would pass a refusal-only test and would stop every worker dead. `read_file` is in the
+    sixteen, so it must come back with the file's contents even with the gate armed.
+
+    IN A SUBPROCESS for the reason `_catalogue` gives at length: an in-process import reads a
+    registry this session has already altered, and the failure then looks like a bug in the tool
+    map. The child also points SHADOW_LOG at its own tmp -- conftest cannot reach a child.
     """
+    probe = tmp_path / "probe.txt"
+    probe.write_text("the-allowed-half-ran", encoding="utf-8")
+
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MCP_")}
+    env["MCP_API_KEY"] = "test-only"
+    env["MCP_TOOL_MAP"] = "1"
+    env["PROBE_TMP"] = str(tmp_path)
+    env["PROBE_FILE"] = str(probe)
+    out = _child_run([sys.executable, "-c", _DISPATCH_PROBE],
+                     cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                     env=env, timeout=180)
+    body = out.stdout or ""
+    assert "<<<" in body, ("the probe did not run (rc=%s):\n%s\n%s"
+                           % (out.returncode, body[-2000:], (out.stderr or "")[-2000:]))
+    got = json.loads(body.split("<<<", 1)[1].split(">>>", 1)[0])
+
+    assert "refused" in str(got["forbidden"]), (
+        "process_kill reached the gateway with a run in flight: %r" % (got["forbidden"],))
+    assert "outside the fleet's allowed set" in str(got["forbidden"]), (
+        "the refusal does not say why, so nobody reading a worker's log can act on it")
+    assert "the-allowed-half-ran" in str(got["allowed"]), (
+        "an ALLOWED tool was blocked too -- the gate refuses everything: %r" % (got["allowed"],))
+
+
+def test_the_refusal_reaches_the_caller_rather_than_the_tool():
+    """The gate has to REFUSE, not merely record. Asserted on the dispatch source because
+    running the real gateway needs a live server, and the property is structural: the consult
+    must sit before the tool is called and its false answer must return.
+
+    THIS REPLACES test_the_policy_is_no_longer_consulted_by_the_shipped_gateway, whose whole
+    content was `assert "fleet_toolset" not in code`. A test whose subject is now the opposite
+    of the fact cannot be repaired by inverting one operator: what it needs to say is what the
+    consult must DO.
+
+    ANCHORED ON THE CONSULT, not on a neighbouring line: the check for `_allowed` must come
+    after the import and before the tool is invoked."""
+    import ast as _ast
     import io as _io
     import os as _os
     root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
     src = _io.open(_os.path.join(root, "main.py"), encoding="utf-8").read()
+
+    # the import is real, not a comment about one
+    tree = _ast.parse(src, filename="main.py")
+    imports = [n for n in _ast.walk(tree)
+               if isinstance(n, _ast.ImportFrom)
+               and any(a.name == "fleet_toolset" for a in n.names)]
+    assert imports, "main.py does not import fleet_toolset by an import statement"
+
     code = chr(10).join(l for l in src.splitlines() if not l.strip().startswith("#"))
-    assert "fleet_toolset" not in code, (
-        "the benchmark's tool-population policy is back in the general dispatch path")
+    i = code.index("_toolset.check(")
+    arm = code[i:i + 600]
+    assert "if not _allowed" in arm, "the answer is computed and not acted on"
+    assert "return" in arm.split("if not _allowed", 1)[1][:400], (
+        "a refusal does not return -- the tool runs anyway and the gate only writes a log line")
