@@ -767,7 +767,7 @@ class CockpitWindow : Window
     TextBlock _uiScaleVal;
 
     readonly string _statusPath, _commandsPath, _historyPath, _openPath;
-    string _convsPath, _hiddenPath, _resumeDismissPath;
+    string _convsPath, _hiddenPath, _resumeDismissPath, _clearedLogPath;
     System.Collections.Generic.HashSet<string> _archivedKeys = new System.Collections.Generic.HashSet<string>();
     // Persistent "cleared" set: keys of TERMINAL cards the user dismissed via Clear. Survives
     // the runner regenerating status.json every second, so cleared cards stay gone mid-run.
@@ -966,6 +966,7 @@ class CockpitWindow : Window
         _convsPath = Path.Combine(dir, "conversations.json");
         _hiddenPath = Path.Combine(dir, "cockpit_hidden.json");
         _resumeDismissPath = Path.Combine(dir, "cockpit_resume_dismissed.json");
+        _clearedLogPath = Path.Combine(dir, "history_cleared.jsonl");
         LoadGlyphs();
         LoadHistory();
         LoadHidden();
@@ -13011,6 +13012,29 @@ class CockpitWindow : Window
 
     void ClearHistory()
     {
+        // RECORD THE DECISION BEFORE TOUCHING THE DATA. Renaming the file aside protects the
+        // BYTES; it does not protect the CHOICE, and those are not the same thing. .fleet/
+        // socket_route.jsonl is append-only and still holds every conversation this button
+        // discards, so a rebuild from it reconstructs exactly what was cleared -- which is what
+        // happened on 2026-09-13: 3,469 rows the operator had deleted came back, perfectly, and
+        // the tool that did it had no way to know it was undoing an instruction rather than
+        // repairing a loss. This line is the way to know. tools/rebuild_history.py reads it as a
+        // watermark and withholds everything at or before it.
+        //
+        // FIRST, not last: a clear interrupted between the rename and the log would leave the
+        // history gone and the reason unrecorded, which is precisely the state this prevents.
+        int clearedRows = _history.Count;
+        try
+        {
+            File.AppendAllText(_clearedLogPath,
+                _js.Serialize(new Dictionary<string, object> {
+                    { "ts", NowUnix() },
+                    { "iso", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") },
+                    { "rows", clearedRows },
+                    { "by", "cockpit/clear_history" },
+                }) + "\n", new UTF8Encoding(false));
+        }
+        catch (Exception) { }
         _history.Clear(); _archivedKeys.Clear();
         // RENAMED, NOT DELETED -- the same rule PreserveUnreadableHistory already applies to
         // this exact file. The button still clears the history; the bytes are still on disk for

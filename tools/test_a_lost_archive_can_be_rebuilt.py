@@ -173,16 +173,33 @@ def test_the_file_it_writes_has_no_bom(tmp_path):
 
 
 def test_the_live_archive_is_loadable_and_resumable():
-    """Against the real file, because a rebuild that only works on fixtures is a fixture."""
+    """Against the real file, because a rebuild that only works on fixtures is a fixture.
+
+    TWO WRITERS, ONE FILE, AND THIS TEST KNEW ABOUT ONE. It was written when .fleet/history.json
+    was entirely rebuild output, so it asserted the rebuild's field name -- `resume_guid` -- and
+    that `conv_url` was empty on every row. The cockpit then archived 48 finished workers of its
+    own, which carry the id in `conv_url` as `sess:<guid>` and have no `resume_guid` at all, and
+    the test failed with "48 of 48 rows carry no conversation id" about a file in which every
+    row was resumable. A spelling was being checked where a property was meant.
+
+    THE PROPERTY: a row can be reopened, and reopening it does not open a tab. Both shapes
+    satisfy the first. For the second the thing to exclude is a PAGE url, not a populated field:
+    ui/CopilotChat.cs:4090 says in as many words that a `sess:<guid>` is not a url and must not
+    go to /switch, and bridge/test_a_resume_does_not_open_a_page.py holds that path down.
+    """
     p = os.path.join(REPO, ".fleet", "history.json")
     if not os.path.isfile(p):
         pytest.skip("no history.json on this machine")
     rows = json.load(io.open(p, encoding="utf-8"))
     assert isinstance(rows, list) and rows
-    resumable = [r for r in rows if r.get("resume_guid")]
-    assert len(resumable) == len(rows), "%d of %d rows carry no conversation id" % (
-        len(rows) - len(resumable), len(rows))
-    # AND NONE OF THEM ROUTES TO THE PAGE. A populated conv_url sends the cockpit through
-    # /switch, which releases the socket and opens a tab.
-    routed = [r for r in rows if r.get("conv_url")]
+
+    def _ref(r):
+        return (r.get("resume_guid") or "").strip() or (r.get("conv_url") or "").strip()
+
+    unreopenable = [r for r in rows if not _ref(r)]
+    assert not unreopenable, "%d of %d rows carry no conversation id" % (
+        len(unreopenable), len(rows))
+    # AND NONE OF THEM ROUTES TO THE PAGE. A conv_url that is a real url sends the cockpit
+    # through /switch, which releases the socket and opens a tab.
+    routed = [r for r in rows if str(r.get("conv_url") or "").startswith("http")]
     assert not routed, "%d rows would resume through /switch (a page path)" % len(routed)

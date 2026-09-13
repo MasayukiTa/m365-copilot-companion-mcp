@@ -28,6 +28,15 @@ WHAT IT CANNOT PROMISE. Resume works by clicking the conversation's row in Copil
 An id whose conversation Copilot has since aged out will not have a row to click. This restores
 the INDEX; how much of it Copilot still honours is Copilot's retention, not ours.
 
+WHAT IT MUST NOT DO, AND DID. An absent history.json has TWO causes and they want opposite
+treatment: the file was lost, or the operator pressed 履歴を空にする. This tool was written for
+the first and could not tell them apart, so on 2026-09-13 it rebuilt 3,469 rows the operator had
+deliberately cleared -- and it could, perfectly, because `socket_route.jsonl` is append-only and
+still holds every one of them. The cockpit was renaming the file aside rather than deleting it,
+which protected the BYTES and not the DECISION. `cleared_through()` is that decision, read back:
+rows at or before the last clear are withheld, and the count of what was withheld is printed
+rather than passed over in silence.
+
     python -m tools.rebuild_history            # write .fleet/history.json (refuses to clobber)
     python -m tools.rebuild_history --dry-run  # count what it would write
     python -m tools.rebuild_history --force    # overwrite an existing file
@@ -35,6 +44,7 @@ the INDEX; how much of it Copilot still honours is Copilot's retention, not ours
 from __future__ import annotations
 
 import argparse
+import datetime
 import glob
 import io
 import json
@@ -45,6 +55,52 @@ FLEET = os.path.join(REPO, ".fleet")
 SOCKET_ROUTE = os.path.join(FLEET, "socket_route.jsonl")
 TRANSCRIPTS = os.path.join(FLEET, "transcripts")
 HISTORY = os.path.join(FLEET, "history.json")
+
+#: The cockpit's durable record of every 履歴を空にする. Append-only, one JSON object per line,
+#: written BEFORE the file is moved aside so that a clear interrupted half way still leaves the
+#: decision on disk -- the opposite ordering would lose exactly the case this exists for.
+CLEARED_LOG = os.path.join(FLEET, "history_cleared.jsonl")
+
+#: The stamp the cockpit puts on the file it moves aside: history.json.cleared-20260914-075653.
+#: READ AS A SECOND SOURCE, because the log above did not exist when the clears that caused this
+#: happened, and a fix that only honours clears made after the fix would let the old ones be
+#: resurrected once more. Local time, because `DateTime.Now` is what writes it.
+CLEARED_KEPT_GLOB = os.path.join(FLEET, "history.json.cleared-*")
+_KEPT_STAMP = "%Y%m%d-%H%M%S"
+
+
+def _stamp_to_ts(stamp):
+    try:
+        return datetime.datetime.strptime(stamp, _KEPT_STAMP).timestamp()
+    except Exception:
+        return 0.0
+
+
+def cleared_through(fleet=FLEET, log=None, kept_glob=None):
+    """The moment of the most recent clear, or 0.0 if the operator has never cleared.
+
+    TAKES THE STORE, not the process's idea of one. The first version read the repository's own
+    `.fleet` whatever ledger it was asked about, so every test that built a synthetic ledger in a
+    temporary directory was silenced by a clear made on this machine -- nine of them, at once. A
+    watermark belongs to the store whose rows it withholds.
+
+    Everything a clear removed had already happened, so the WALL TIME of the clear is a sound
+    watermark for it: a row older than that was on screen when the button was pressed and was
+    therefore among what the press discarded. Nothing newer is affected, which is what keeps a
+    clear from also erasing the conversations that came after it.
+    """
+    log = log or os.path.join(fleet, os.path.basename(CLEARED_LOG))
+    kept_glob = kept_glob or os.path.join(fleet, os.path.basename(CLEARED_KEPT_GLOB))
+    newest = 0.0
+    for row in _rows(log):
+        try:
+            newest = max(newest, float(row.get("ts") or 0.0))
+        except (TypeError, ValueError):
+            continue
+    for path in glob.glob(kept_glob):
+        newest = max(newest, _stamp_to_ts(os.path.basename(path).rsplit("-", 2)[-2] + "-"
+                                          + os.path.basename(path).rsplit("-", 1)[-1]))
+    return newest
 
 #: The synthetic reference the bridge resumes. Imported rather than restated so a change to the
 #: scheme cannot leave this writing a shape nothing can open.
@@ -139,14 +195,20 @@ def _nearest(candidates, ts):
     return best if (best_dt is not None and best_dt <= TRANSCRIPT_MATCH_WINDOW_S) else ""
 
 
-def build(socket_route=SOCKET_ROUTE, transcripts=TRANSCRIPTS, conv_url=False):
+def build(socket_route=SOCKET_ROUTE, transcripts=TRANSCRIPTS, conv_url=False, since=None):
     """The rows a cockpit can load, newest last. One per finished worker that has an id.
 
     `conv_url=False` keeps the resumable id out of the field the GUI routes on -- see the
     comment at that key. Pass True only once a socket resume path exists in the UI.
+
+    `since` is the clear watermark; None means ask `cleared_through()`. Rows at or before it are
+    the ones the operator deliberately discarded and are NOT rebuilt. Pass 0.0 to rebuild them
+    anyway, which is what `--ignore-clears` does and why that flag has to be typed.
     """
+    if since is None:
+        since = cleared_through(os.path.dirname(os.path.abspath(socket_route)))
     index = transcript_index(transcripts)
-    out = []
+    out, withheld = [], 0
     for row in _rows(socket_route):
         if row.get("event") != "worker_done":
             continue
@@ -156,6 +218,11 @@ def build(socket_route=SOCKET_ROUTE, transcripts=TRANSCRIPTS, conv_url=False):
         if not (guid and goal and ts):
             # A row with no id cannot be resumed and a row with no goal cannot be recognised;
             # either way it would be a line in the archive that does nothing.
+            continue
+        if since and ts <= since:
+            # CLEARED BY THE OPERATOR. The ledger still has it and always will; that is not
+            # permission to put it back on screen.
+            withheld += 1
             continue
         name = str(row.get("worker") or "w?")
         out.append({
@@ -193,7 +260,18 @@ def build(socket_route=SOCKET_ROUTE, transcripts=TRANSCRIPTS, conv_url=False):
     out.sort(key=lambda r: r["ts"])
     for i, r in enumerate(out):
         r["seq"] = i
-    return out
+    # A LIST, so every existing caller is unaffected, carrying the number it withheld -- because
+    # "rebuilt 0 rows" and "rebuilt 0 rows, 3469 of them cleared" are different answers and only
+    # the second one is true.
+    rows = _Built(out)
+    rows.withheld = withheld
+    rows.since = since
+    return rows
+
+
+class _Built(list):
+    withheld = 0
+    since = 0.0
 
 
 def main(argv=None) -> int:
@@ -205,13 +283,21 @@ def main(argv=None) -> int:
                     help="also fill conv_url, which makes the cockpit resume through /switch "
                          "-- a PAGE path that releases the socket. Only once the UI can "
                          "resume over the websocket.")
+    ap.add_argument("--ignore-clears", action="store_true",
+                    help="rebuild rows the operator cleared with 履歴を空にする. They are in the "
+                         "ledger forever; this puts them back on screen. Only when the clear "
+                         "itself was the accident.")
     args = ap.parse_args(argv)
 
-    rows = build(conv_url=args.conv_url)
+    rows = build(conv_url=args.conv_url, since=0.0 if args.ignore_clears else None)
     resumable = sum(1 for r in rows if r["resume_guid"])
     with_tx = sum(1 for r in rows if r["transcript"])
     print("rebuilt rows: %d  (resumable: %d, with a transcript on disk: %d)"
           % (len(rows), resumable, with_tx))
+    if rows.withheld:
+        print("withheld %d row(s) cleared at %s -- pass --ignore-clears to rebuild them anyway"
+              % (rows.withheld,
+                 datetime.datetime.fromtimestamp(rows.since).strftime("%Y-%m-%d %H:%M:%S")))
     if args.dry_run:
         return 0
     if os.path.exists(args.out) and not args.force:
