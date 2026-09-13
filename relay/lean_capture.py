@@ -189,6 +189,14 @@ def maybe_install(page):
     function -- relay/socket_route.py's capture_via_tab -- whose signature cannot change. The
     flag is set for the duration of one open, so a worker's own tab is never affected even
     when the two run side by side.
+
+    THIS IS THE ENTRY POINT, not `capture_fn` at the bottom of the file. That one returns a
+    capture for a caller to install -- which is how `profile_token.capture_fn` works and why
+    `relay_fleet.py:1307` calls THAT one. This module cannot be installed that way, for the
+    reason in the paragraph above, so its selector has no production caller and `maybe_install`
+    is what `relay_fleet.py:1847` reaches. Both are kept: the selector is covered by two tests
+    that are about the flag being read at call time, and deleting a tested function to shorten
+    a list is not a trade this repository makes.
     """
     if not getattr(_LEAN, "on", False):
         return None
@@ -255,6 +263,14 @@ def capture_fn():
 
     Named as a function rather than resolved at import so a test -- and an operator setting the
     variable in a running shell -- gets the answer that is true now.
+
+    NO PRODUCTION CALLER, and that is structural rather than an oversight: installing a capture
+    this way means handing it to the route, and this module's page work has to happen INSIDE
+    `socket_route.capture_via_tab`, which is frozen. `maybe_install` is the entry point the
+    fleet actually reaches (`relay_fleet.py:1847`); the selector shape belongs to
+    `profile_token.capture_fn`, which relay_fleet does call. Listed in
+    docs/unreached_burndown.md, kept because two tests in tests/test_lean_capture.py assert
+    through it that the flag is read at call time.
     """
     if enabled():
         return capture_via_lean_tab
