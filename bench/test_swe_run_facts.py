@@ -163,7 +163,7 @@ WT2 = {"proj__proj-1": r"C:\wt\p1", "proj__proj-10": r"C:\wt\p10"}
 
 
 def test_a_path_does_not_match_a_longer_path_it_prefixes():
-    """`...\p1` inside text naming `...\p10` matched, and the first map entry in dictionary
+    r"""`...\p1` inside text naming `...\p10` matched, and the first map entry in dictionary
     order won. One instance's outcome was attributable to another."""
     facts = facts_from_history(WT2, [{"goal": r"work at C:\wt\p10 now",
                                       "outcome": "DONE", "turn": 1}])

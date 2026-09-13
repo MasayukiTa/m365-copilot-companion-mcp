@@ -191,7 +191,24 @@ def script_style_suites() -> set[str]:
         return set()
 
 
-def main() -> int:
+def main(argv=None) -> int:
+    # `--strict-untracked` PROMOTES THE NOTE BELOW TO AN ERROR, and exists because the note was
+    # not enough. This module's own docstring already said the failure mode is procedural --
+    # 「実際に CI で落ちた原因はチェックの欠陥ではなく、add する前にチェックを走らせた手順の
+    # ほうにある」 -- and on 2026-09-14 it happened again exactly as written: preflight printed
+    # the note, exited 0, the file was committed, and CI went red on the next push.
+    #
+    # A note that is printed and ignored is a note that does not work. The gate keeps its
+    # lenient default, because run by hand while a test is being written it is right to be
+    # lenient -- but preflight, whose whole contract is "everything CI runs, run here", passes
+    # this flag. In CI the flag changes nothing: a checkout has no untracked test files.
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Audit the CI test manifest.")
+    ap.add_argument("--strict-untracked", action="store_true",
+                    help="fail when an untracked test file exists (pre-push use)")
+    args = ap.parse_args(argv)
+
     discovered = discover_tests()
     listed = listed_tests()
     excluded = set(EXCLUDED)
@@ -260,6 +277,14 @@ def main() -> int:
                      if re.fullmatch(r"(?:%s)/(?:[^/]+/)*%s"
                                      % ("|".join(TEST_ROOTS), _TEST_FILE_RE), p))
     if pending:
+        if args.strict_untracked:
+            print("ERROR: untracked test file(s). Under --strict-untracked these are a "
+                  "failure, because a push turns them into a CI failure and this audit "
+                  "cannot see them until they are staged. `git add` them and list them in "
+                  "ci.yml, or add them to EXCLUDED with a reason:")
+            for path in pending:
+                print("  -", path)
+            return 1
         print("NOTE: not tracked yet, so not required yet -- but required the moment you "
               "`git add` them:")
         for path in pending:

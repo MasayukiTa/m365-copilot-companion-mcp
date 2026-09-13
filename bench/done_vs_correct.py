@@ -47,7 +47,11 @@ def load_ledger(path):
 
 
 def worktree_map_for(slice_path):
-    """instance_id -> worktree path, reconstructed from the slice.
+    r"""instance_id -> worktree path, reconstructed from the slice.
+
+    (Raw string: the example path below contains `\.`, which is an invalid escape sequence --
+    a DeprecationWarning today and a SyntaxError in a future Python. It surfaced as
+    `<unknown>:50` from a scan that did not pass a filename, which named nothing.)
 
     THE GOALS DO NOT NAME THE INSTANCE. They name the checkout:
 

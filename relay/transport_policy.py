@@ -171,7 +171,7 @@ def _policy_v2(goal: str, *, kind="", knobs=None, explore=False) -> str:
     whose two arms are not reproducible is not measurable.
     """
     knobs = knobs or {}
-    eligible = knobs.get("transport_eligible_kinds")
+    eligible = knobs.get(ELIGIBLE_KINDS)
     if eligible is not None and kind and kind not in set(eligible):
         return SOCKET if explore else TAB
     return SOCKET
@@ -185,9 +185,49 @@ TRANSPORT_VERSIONS = {
 }
 
 
+#: Declared at import so the promise is listable, and guarded so a transport decision can never
+#: fail over its own bookkeeping. RECORD rather than RAISE: an undeclared knob is a campaign's
+#: mistake about what it is measuring, not a reason to lose the run that revealed it.
+try:
+    from relay import invariants as _invariants
+    _KNOB_INVARIANT = _invariants.register(
+        "transport_knob_is_declared", owner="relay/transport_policy.py",
+        disposition=_invariants.RECORD,
+        why=("a genome knob no policy reads produces an A/B arm identical to its control, "
+             "which the loop then scores as a result; transport_explore_rate was exactly "
+             "that, declared and read by nothing"))
+except Exception:                                  # pragma: no cover - import-order safety
+    _invariants = None
+    _KNOB_INVARIANT = ""
+
+
+#: The one knob a genome may move here, spelled once. `_policy_v2` reads through this name
+#: rather than repeating the string, because "written twice, these drift" -- the argument
+#: mechanism_telemetry.patch_hash makes about itself, and the reason it now has one
+#: implementation instead of two.
+ELIGIBLE_KINDS = "transport_eligible_kinds"
+
+
 def evolvable_fields() -> tuple:
-    """The knobs a genome may move. The attachment rule is deliberately absent."""
-    return ("transport_eligible_kinds", "transport_explore_rate")
+    """The knobs a genome may move. The attachment rule is deliberately absent.
+
+    `transport_explore_rate` WAS HERE AND NOTHING READ IT. A scan over `git ls-files` found the
+    name in exactly one place: this return tuple. That is the defect the version table twelve
+    lines above says this repository "has now found in four separate components" -- a name a
+    genome could carry that nothing reads -- sitting inside the fix for the first four.
+
+    It is not an oversight about where to read it, either: `_policy_v2`'s own docstring says
+    "the exploration decision is the caller's, not this function's", so an explore RATE has no
+    home in a transport policy at all. It goes back only with a reader.
+
+    THE GUARD THAT EXISTS COULD NOT HAVE SEEN IT. `relay/selfimprove/
+    test_parameters_have_effect.py` reads `manifest.DEFAULT_PARAMETERS`, and neither of these is
+    declared there -- which is its own disagreement, recorded in docs/unreached_burndown.md
+    rather than resolved by adding a coordinate to a loop that has no driver. What replaces it
+    here is a test that asks the question that guard asks, of whatever THIS function declares:
+    change the value, and something observable changes.
+    """
+    return (ELIGIBLE_KINDS,)
 
 
 def choose(goal: str, *, kind="", knobs=None, explore=False, upload_path="") -> str:
@@ -199,6 +239,23 @@ def choose(goal: str, *, kind="", knobs=None, explore=False, upload_path="") -> 
     """
     if needs_tab(upload_path):
         return TAB
+    # A KNOB NOTHING DECLARES IS AN A/B ARM IDENTICAL TO ITS CONTROL. project_memory says the
+    # rule -- "an evolvable parameter that no running code reads produces A/B arms that are the
+    # same" -- and until now nothing checked the genome's side of it: a campaign could set any
+    # key it liked and the policy would quietly ignore it while the run was scored as a variant.
+    # RECORDED, NOT REFUSED. Dropping the knob would change what the policy sees; raising would
+    # let a bookkeeping mistake fail a run. The undeclared name is written down and the call
+    # proceeds exactly as before.
+    if knobs:
+        _undeclared = sorted(set(knobs) - set(evolvable_fields()))
+        if _undeclared and _KNOB_INVARIANT:
+            try:
+                _invariants.assert_invariant(
+                    _KNOB_INVARIANT, False,
+                    "genome set knobs no transport policy reads: %s" % (_undeclared,),
+                    declared=list(evolvable_fields()))
+            except Exception:
+                pass
     try:
         from relay.selfimprove import runtime_config as _rc
         impl = TRANSPORT_VERSIONS.get(_rc.component("transport"), _policy_v1)
