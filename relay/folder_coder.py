@@ -37,6 +37,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from relay.coding_discipline import coding_discipline_text
+from relay.control_markers import CLOSING_INSTRUCTION
 
 # Directory names that are never interesting to a coding task -- vendored deps,
 # build output, VCS internals, virtualenvs, and the fleet's own scratch dirs.
@@ -118,17 +119,18 @@ def scan_folder(folder, exts=None, max_files=200):
 _TPL_PER_FILE = (
     "リポジトリ {folder} の {relpath} に対して次を実施してください: {instruction}。"
     "MCPツール(read_file / replace_in_file / write_file)で実際にファイルを編集し、"
-    "変更が完了したら DONE と書いてください。"
-    "安全に進められない・情報不足なら FAIL と理由を書いてください。"
+    + CLOSING_INSTRUCTION
 )
 _TPL_REVIEW = (
     "リポジトリ {folder} の {relpath} を read_file で読み、"
-    "{instruction} の観点でレビューして指摘を箇条書きで返してください。終わったら DONE。"
+    "{instruction} の観点でレビューして指摘を箇条書きで返してください。"
+    + CLOSING_INSTRUCTION
 )
 _TPL_SINGLE = (
     "リポジトリ {folder} 全体に対して次を実施してください: {instruction}。"
     "必要なファイルを list_directory / grep / read_file で調べ、"
-    "replace_in_file / write_file で編集してください。完了したら DONE、無理なら FAIL と理由。"
+    "replace_in_file / write_file で編集してください。"
+    + CLOSING_INSTRUCTION
 )
 
 
