@@ -52,7 +52,6 @@ from tools import unreached as U  # noqa: E402
 #: checks them.
 NO_CALLER_NO_TEST = {
     "relay/lean_capture.py::capture_fn",                           # 10 lines, revealed 2026-09-14
-    "relay/profile_token.py::capture_fn",                          # 9 lines, revealed 2026-09-14
     "tools/golden.py::run_trajectory",                           # 64 lines
     "relay/autonomy_gate.py::judge_autonomy",                    # 54 lines
     "bench/skill_use_log.py::compare_runs",                      # 23 lines
@@ -84,9 +83,7 @@ NO_CALLER_BUT_TESTED = {
     "relay/selfimprove/authority_ledger.py::verify",               # 25 lines, revealed 2026-09-14
     "relay/selfimprove/decision.py::summarise",                    # 21 lines, revealed 2026-09-14
     "relay/selfimprove/apply.py::apply_genome",                    # 20 lines, revealed 2026-09-14
-    "relay/quota_meter.py::prune",                                 # 13 lines, revealed 2026-09-14
     "relay/turn_outcome.py::summarise",                            # 13 lines, revealed 2026-09-14
-    "tools/auth_stats.py::get_summary",                            # 13 lines, revealed 2026-09-14
     "relay/acceptance_contract.py::intact",                        # 11 lines, revealed 2026-09-14
     "relay/selfimprove/harness_feedback.py::report",               # 11 lines, revealed 2026-09-14
     "relay/selfimprove/coreset.py::summarise",                     # 8 lines, revealed 2026-09-14
@@ -208,19 +205,13 @@ REASONS: dict[str, tuple[str, str]] = {
         ("revealed", "docs/unreached_burndown.md"),
     "relay/selfimprove/apply.py::apply_genome":
         ("revealed", "docs/unreached_burndown.md"),
-    "relay/quota_meter.py::prune":
-        ("revealed", "docs/unreached_burndown.md"),
     "relay/turn_outcome.py::summarise":
-        ("revealed", "docs/unreached_burndown.md"),
-    "tools/auth_stats.py::get_summary":
         ("revealed", "docs/unreached_burndown.md"),
     "relay/acceptance_contract.py::intact":
         ("revealed", "docs/unreached_burndown.md"),
     "relay/selfimprove/harness_feedback.py::report":
         ("revealed", "docs/unreached_burndown.md"),
     "relay/lean_capture.py::capture_fn":
-        ("revealed", "docs/unreached_burndown.md"),
-    "relay/profile_token.py::capture_fn":
         ("revealed", "docs/unreached_burndown.md"),
     "relay/selfimprove/coreset.py::summarise":
         ("revealed", "docs/unreached_burndown.md"),

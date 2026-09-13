@@ -209,8 +209,15 @@ def _attribute_calls(rel, tree, files, qualified, unattributable):
                 # `from relay.turn_outcome import summarise` binds a FUNCTION. They are the same
                 # node shape, so both readings are recorded and whichever resolves to a real
                 # file is the one used.
+                # THE ALIAS IS THE LOCAL NAME; THE CREDIT BELONGS TO THE ORIGINAL. Keying the
+                # credit on `al.asname` reintroduced the blind spot this file already fixed once:
+                # `from relay.profile_token import capture_fn as _choose_capture` followed by
+                # `_choose_capture()` credited `_choose_capture`, which nothing defines, and
+                # reported `profile_token::capture_fn` as unreached while relay_fleet.py:1323
+                # called it. So the map stores (module, ORIGINAL name) and the call site credits
+                # that.
                 mod_alias[al.asname or al.name] = (base + "." + al.name) if base else al.name
-                func_from[al.asname or al.name] = base
+                func_from[al.asname or al.name] = (base, al.name)
 
     local = {n.name for n in tree.body
              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
@@ -235,9 +242,10 @@ def _attribute_calls(rel, tree, files, qualified, unattributable):
         if id(node) in callees:
             continue
         if isinstance(node, ast.Name) and not isinstance(getattr(node, "ctx", None), ast.Store):
-            target = _module_of(func_from.get(node.id), files)
+            src = func_from.get(node.id)
+            target = _module_of(src[0], files) if src else None
             if target:
-                qualified[(target, node.id)] += 1
+                qualified[(target, src[1])] += 1
         elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
             if node.value.id not in ("self", "cls"):
                 target = _module_of(mod_alias.get(node.value.id), files)
@@ -259,9 +267,10 @@ def _attribute_calls(rel, tree, files, qualified, unattributable):
             else:
                 unattributable[fn.attr] += 1
         elif isinstance(fn, ast.Name):
-            target = _module_of(func_from.get(fn.id), files)
+            src = func_from.get(fn.id)
+            target = _module_of(src[0], files) if src else None
             if target:
-                qualified[(target, fn.id)] += 1
+                qualified[(target, src[1])] += 1
             elif fn.id in local:
                 qualified[(rel, fn.id)] += 1
             else:
