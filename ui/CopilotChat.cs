@@ -4087,7 +4087,24 @@ class ChatWindow : Window
         // ── page pinning: make sure the bridge page actually shows `target` before we send ──
         if (!ReferenceEquals(target, _pageConv))
         {
-            if (!string.IsNullOrEmpty(target.ConvUrl))
+            // A "sess:<guid>" IS NOT A URL AND MUST NOT GO TO /switch. /switch is
+            // `release_socket_driver()` followed by `_goto_settled(url)`: it drops the
+            // websocket and opens a tab. Every fleet conversation carries that shape, so the
+            // ordinary case was also the one that cost a browser -- and the archive rebuild
+            // would have made 3,469 of them.
+            //
+            // /resume takes a guid now and binds the session WITHOUT touching the page, then
+            // ensure_driver() continues the conversation over the socket
+            // (socket_route.driver_for(conversation_id=...), measured 2026-08-24). It answers
+            // {"via":"socket"} or {"via":"page"} so a fallback is visible rather than assumed.
+            string sref = target.ConvUrl ?? "";
+            if (sref.StartsWith("sess:"))
+            {
+                string sguid = sref.Substring("sess:".Length);
+                try { HttpGet("/resume?guid=" + Uri.EscapeDataString(sguid), 30000); _pageConv = target; }
+                catch { AddAssistant(T("send_wrong_page")); return; }
+            }
+            else if (!string.IsNullOrEmpty(target.ConvUrl))
             {
                 try { HttpGet("/switch?url=" + Uri.EscapeDataString(target.ConvUrl), 15000); _pageConv = target; }
                 catch { AddAssistant(T("send_wrong_page")); return; }
