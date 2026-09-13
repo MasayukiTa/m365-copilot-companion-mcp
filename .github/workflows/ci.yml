@@ -159,6 +159,7 @@ jobs:
             tools/test_a_counter_that_gates_a_switch_is_read.py \
             tools/test_a_declared_field_is_a_written_field.py \
             tools/test_a_name_defined_twice_is_still_reported.py \
+            tools/test_a_lost_archive_can_be_rebuilt.py \
             scripts/test_a_script_suite_writes_where_a_test_writes.py \
             scripts/test_change_scope_keeps_the_four_apart.py \
             tools/test_a_backfilled_conversation_is_the_right_one.py \
@@ -199,6 +200,7 @@ jobs:
             scripts/test_bridge_startup_reporting.py \
             scripts/test_start_companion_edge_headless.py \
             bridge/test_bridge_sessions.py \
+            bridge/test_a_resume_does_not_open_a_page.py \
             bridge/test_cdp_watchdog.py \
             bridge/test_consent_chain.py \
             bridge/test_consent_surface.py \
