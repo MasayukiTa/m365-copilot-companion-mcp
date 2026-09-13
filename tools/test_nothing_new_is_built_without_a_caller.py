@@ -87,7 +87,6 @@ NO_CALLER_BUT_TESTED = {
     "relay/acceptance_contract.py::intact",                        # 11 lines, revealed 2026-09-14
     "relay/selfimprove/harness_feedback.py::report",               # 11 lines, revealed 2026-09-14
     "relay/selfimprove/coreset.py::summarise",                     # 8 lines, revealed 2026-09-14
-    "scripts/win/checkpoint.py::pages",                            # 4 lines, revealed 2026-09-14
     "tools/coding_ops.py::survey_worktrees",                     # 96 lines
     "relay/provenance.py::adjudicate",                           # 82 lines
     "relay/selfimprove/propose.py::propose_candidates",          # 68 lines
@@ -214,8 +213,6 @@ REASONS: dict[str, tuple[str, str]] = {
     "relay/lean_capture.py::capture_fn":
         ("revealed", "docs/unreached_burndown.md"),
     "relay/selfimprove/coreset.py::summarise":
-        ("revealed", "docs/unreached_burndown.md"),
-    "scripts/win/checkpoint.py::pages":
         ("revealed", "docs/unreached_burndown.md"),
 }
 

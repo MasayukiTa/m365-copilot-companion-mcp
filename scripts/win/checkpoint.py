@@ -36,12 +36,6 @@ def _ps(script, timeout=40):
         return ""
 
 
-def pages(port):
-    """Open page URLs, or None if the port is not answering."""
-    got = targets(port)
-    return None if got is None else [t.get("url", "") for t in got]
-
-
 def _listening(port, timeout_s=0.5):
     """Is anything bound to that port on loopback? A bounded wait, not a definitive answer.
 
@@ -79,7 +73,14 @@ def _listening(port, timeout_s=0.5):
 
 
 def targets(port):
-    """Open page targets, ids included, or None. The id is how a claim is matched."""
+    """Open page targets, ids included, or None. The id is how a claim is matched.
+
+    A `pages(port)` sat beside this until 2026-09-14, returning the same list with only the
+    urls. It had no caller and no test: the one reader here needs the ids too, because
+    ownership is matched by id and a url alone cannot answer the question this file exists to
+    ask. Removed rather than kept -- a narrower view of a function the caller needs in full is
+    a row on the unreached list and nothing else.
+    """
     # ASK WHETHER ANYONE IS THERE BEFORE ASKING WHAT THEY HAVE. urlopen against a port with
     # nothing bound waits out its full timeout -- measured 2.03 s for port 9224, the eval
     # Edge, which is not running for most launches. The launch gate calls this once per port,
