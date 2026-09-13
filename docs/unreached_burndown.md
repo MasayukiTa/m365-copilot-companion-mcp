@@ -3,7 +3,7 @@
 Started 2026-09-13. **93 → 68 fixed, and then the inventory GREW to 83** when the instrument
 stopped skipping names it could not attribute: 86 revealed, two of them alias false positives of
 the fix's own making, and `relay/quota_meter.py::prune` wired the moment it appeared. The scan
-and the baseline agree at 83: the two names the
+and the baseline agree at 82: the two names the
 scanner had never printed at all are in the frozen list with their reason, so a gap between the two
 numbers is once again a signal rather than a known discrepancy. This file exists so they do not have
 to be triaged a third time.
@@ -85,12 +85,13 @@ flagged unwired by an adversarial review hours earlier, nearly hidden behind an 
 | `relay/transport_policy.py::evolvable_fields` | **fixed** — it declared `transport_explore_rate`, and a scan over `git ls-files` found that name in exactly one place: that return tuple. Nothing read it — the fifth instance of the defect the version table twelve lines above says this repository "has now found in four separate components", sitting inside the fix for the first four. The remaining knob is spelled once and read through its name, and `choose()` now records a genome knob no policy reads, because an undeclared knob is an A/B arm identical to its control |
 | `scripts/win/capture_budget.py::acknowledge` | **fixed** — `verdict()` has always READ the acknowledgement file, and nothing could write one, so the first red was unclearable except by hand-editing JSON. Its own docstring says what that costs: *"without this, the first red produces a culture of forcing past the gate, and the gate dies."* The reason it exists is the reason nobody noticed it was unreachable. `ack "<reason>"` (with `--log PATH` for a specific run) now exists, with the reason REQUIRED — "a recorded decision with a reason, not a switch" |
 | `relay/quota_meter.py::prune` | **fixed** — one of the eighteen the attribution revealed, and it had never run. `KEEP_S = 7200` says records older than two hours are dropped “when the file is rewritten” and `prune` is the rewriting. Measured on the live meter: **4,845 rows spanning 12.8 days, 100% past the window**. The reason is written beside the constant — keeping more “would make the meter itself the thing that fills a disk that has already stopped a run tonight” — so the mitigation for a real incident had never once run. It also cost the readers: `snapshot()` parses the whole file to answer a question about the last sixty seconds, on every admission check. Triggered on the OLDEST ROW being past twice the window, which is the policy restating itself and stays O(1) as the file grows |
+| `scripts/win/checkpoint.py::pages` | **deleted** — four lines, no caller and no test, returning `targets(port)`’s list with only the urls. The one reader needs the ids too, because ownership is matched by id. See *a narrower view of a function the caller needs in full* below |
 
 The ratchet noticed `is_resolved` on its own: the moment it gained callers the test refused to
 keep it listed. That is the mechanism working in the direction it was built for. It did the same
 for `evolvable_fields` on 2026-09-14, refusing to keep it listed within seconds of the wiring.
 
-## The remaining 83
+## The remaining 82
 
 Classified 2026-09-13 by three parallel surveys, each required to give grep-level evidence and
 to answer "could not determine" rather than guess. **These verdicts are triage, not proof** —
@@ -454,6 +455,30 @@ analysis. Three confirmed instances — `compare.py::versions_differ` behind
 / `worktree_remove` behind `worktree_scope`. Iterating the scan to a fixed point was measured at
 **+15%** (78 → 90 under a cruder probe) and is the next instrument change, not this one.
 
+### A recurring shape: a narrower view of a function the caller needs in full
+
+Four entries so far are the same thing, and naming the class saves triaging it a fifth time.
+Each is a small wrapper that answers a *coarser* question than the one production asks, so the
+live caller reaches past it to the richer form:
+
+| the narrow one | the rich one production uses | what the wrapper drops |
+|---|---|---|
+| `scripts/win/checkpoint.py::pages` | `targets(port)` | the target **ids** — and ownership is matched by id, so a url alone cannot answer the question the file exists to ask |
+| `relay/relay_fleet.py::connector_proven` | `connector_proof_source()` | **which** evidence proved it; production branches three ways on `run` / `probe` / nothing and writes a different sentence for each |
+| `relay/chathub.py::collect_text` | `collect_delta` / `collect_final` | nothing — it is their `or`, and no caller wants the pair collapsed |
+| `relay/selfimprove/compare.py::transport_versions_differ` | `versions_differ("transport", …)` | nothing — its own docstring says "the question is now asked generically" |
+
+**The disposition is not the same for all four, and that is the point of naming the class rather
+than the instances.** `pages` had no caller *and no test*, so it is deleted. `collect_text` is
+asserted through three times in `test_chathub.py`, so it stays with a corrected docstring.
+`connector_proven` is the coarse question five tests legitimately ask, and deleting it would
+make five assertions read worse for three lines. `transport_versions_differ` is in the
+subsystem with no driver, so it is blocked on that decision either way.
+
+What they share is the *reason they are on the list*: nothing wrong with them, and nothing that
+needs them. A wrapper earns its place by having a caller that wants the narrower answer — and
+when the only caller wants the wider one, the wrapper is a row on this list and nothing else.
+
 ### Deliberately unwired — do not "fix"
 
 `relay/selfimprove/autonomy.py::raise_to` — its docstring says so, and
@@ -463,7 +488,7 @@ control. Leave it.
 
 ### The self-improvement subsystem has no driver
 
-24 of the 83 are in `relay/selfimprove/` — the share has GROWN as the rest came down (24/75 → 24/83, and ten of the sixteen newly revealed names are in there too;
+24 of the 82 are in `relay/selfimprove/` — the share has GROWN as the rest came down (24/75 → 24/82, and ten of the sixteen newly revealed names are in there too;
 not one of them has moved), and one of the two names the scanner had never printed is in there too.
 `scripts/run_nightly_real.py` — the script meant to
 run the loop for real — opens with *"It has never been run at all."* No CI job, scheduler,
