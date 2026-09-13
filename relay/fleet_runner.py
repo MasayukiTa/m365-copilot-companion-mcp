@@ -2202,6 +2202,38 @@ def main():
                                 # is not currently connected to).
                                 "transcript": tr,
                                 "name": getattr(w, "name", ""), "ts": time.time()})
+            # SEVEN ROWS, ONE TITLE. `make_title` is called once per row above, in isolation,
+            # so rows whose goals share an opening come out identical -- and every child of a
+            # fan-out carries the parent's goal by design. Measured on a real seven-way split:
+            # 1 distinct title of 7. That is the symptom conv_title.py exists to remove (213 of
+            # 424 stored rows named after identical text), reproduced by a mechanism that
+            # became the default today.
+            #
+            # `repeated` / `salvageable` / `disambiguate` were written for exactly this and had
+            # no caller. WITHIN THIS REGISTRATION ONLY: rewriting a stored title would move a
+            # row under somebody who is looking at it, and what was measured is rows appearing
+            # together.
+            try:
+                from relay import conv_title as _ct2
+                _dupes = _ct2.repeated([e.get("title", "") for e in entries], min_count=2)
+                if _dupes:
+                    _counts = {}
+                    for _e in entries:
+                        _t = (_e.get("title") or "").strip()
+                        if _t in _dupes:
+                            _counts[_t] = _counts.get(_t, 0) + 1
+                    for _e in entries:
+                        _t = (_e.get("title") or "").strip()
+                        if _t not in _dupes:
+                            continue
+                        _k = _e.get("url") or _e.get("transcript") or _e.get("name") or ""
+                        _e["title"] = (_ct2.disambiguate(_t, key=_k, when=_e.get("ts"))
+                                       if _ct2.salvageable(_t, _counts[_t])
+                                       else _ct2.neutral_title(key=_k, when=_e.get("ts")))
+                        _e["title_source"] = _ct2.SOURCE + "+dedupe"
+            except Exception:
+                pass          # a cosmetic title is never worth failing a registration over
+
             merged, changed = merge_conv_rows(existing, entries)
             if changed:
                 _write_atomic(convs_path, merged)

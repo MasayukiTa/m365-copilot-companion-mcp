@@ -5218,7 +5218,8 @@ class RelayWorker:
         # evidence behind, and this line is the only place the pairing of a goal with the
         # reason it needed a tab exists at all.
         try:
-            from relay.transport_policy import classify_fallback, delivery_status
+            from relay.transport_policy import (
+                classify_fallback, delivery_status, duplicate_risk as _duplicate_risk)
             cause, delivery = classify_fallback(reason), delivery_status(reason)
         except Exception:
             cause, delivery = "unknown", "unknown"
@@ -5228,7 +5229,12 @@ class RelayWorker:
                      # derivable from `reason` and neither was written down, so every question
                      # about them had to be answered by re-reading prose after the fact.
                      cause=cause, delivery=delivery,
-                     duplicate_risk=delivery in ("delivered", "unknown"),
+                     # THROUGH THE SHARED PREDICATE. This inlined its body, and a test in
+                     # relay/test_socket_route.py records what that cost: duplicate_risk()
+                     # went into the tab-fallback path the night it was written and this
+                     # socket-retry path "neither referenced nor recorded it". One rule, two
+                     # copies, and only one of them was ever updated.
+                     duplicate_risk=_duplicate_risk(reason),
                      # HOW MANY RECONNECTS THIS COST, and how much token was left when the
                      # last one failed. Without the second field the 2026-08-25 drops could
                      # not be attributed to token expiry or cleared of it.
@@ -6277,9 +6283,11 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     # terminal, so without it one failure would re-queue on every pass and never stop.
     try:
         from relay.fleet_runner import RETRYABLE_OUTCOMES, settings_autoretry
+        from relay.outcomes import UnknownOutcome as _UnknownOutcome, is_retryable as _retryable
         _retry_on, _retry_cap = settings_autoretry()
     except Exception:
         _retry_on, _retry_cap, RETRYABLE_OUTCOMES = False, 0, frozenset()
+        _UnknownOutcome, _retryable = Exception, None
     _retry_seen, _retry_used = set(), {}
     if add_box is None:
         _retry_on = False        # nowhere to put a re-queued goal
@@ -6304,6 +6312,47 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         # means the box is needed either way. Gating it on the flag left the crash in place
         # for exactly the recovery path the ledger exists for.
         add_box = []
+
+    def _retry_allowed(outcome, worker):
+        """Whether this outcome may be re-queued, saying so out loud when it is not KNOWN.
+
+        `outcomes.is_retryable` refuses an outcome outside the closed set instead of answering
+        "no" -- because "not retryable" and "not considered" were the same answer once, and the
+        outcome that actually occurred (STUCK) was the one left out. The raw membership test
+        this replaces gave the silent answer, and the telemetry beside it then wrote "outcome X
+        is not retryable" as though someone had decided.
+
+        THE REFUSAL IS NOT RAISED INTO THE RUN. This is inside the main loop; an uncaught
+        UnknownOutcome would end a live fleet over one worker's typo'd outcome string, which is
+        a worse answer than declining to retry one goal. So an unknown outcome is treated as
+        not retryable -- exactly as before -- and PRINTED and RECORDED, which is the half that
+        was missing.
+        """
+        if _retryable is None:                      # outcomes module unavailable: prior rule
+            return outcome in RETRYABLE_OUTCOMES
+        try:
+            return _retryable(outcome)
+        except _UnknownOutcome:
+            print("[retry] %r is not in the outcome vocabulary; not retrying, and this is an "
+                  "omission rather than a decision (relay/outcomes.py::OUTCOMES)"
+                  % (outcome,), flush=True)
+            try:
+                # IMPORTED HERE, like every other telemetry call in this file: `_mt` is not a
+                # module-level name. Without this the NameError would be swallowed by the
+                # except below and the record would silently never be written -- the same
+                # silence this function exists to end, reintroduced inside it.
+                from relay import mechanism_telemetry as _mt
+                _mt.record("retry", run_id=run_id,
+                           goal_hash=str(getattr(worker, "goal_hash", "") or "")[:24],
+                           turn=getattr(worker, "turn", None),
+                           configured=True, config_source="run",
+                           eligible=False, triggered=False,
+                           ineligible_reason="outcome %r is outside the closed set; nobody "
+                                             "considered it" % (outcome,),
+                           self_report_outcome=str(outcome or ""))
+            except Exception:
+                pass
+            return False
 
     _reap_counter = 0
     while (any(w.status not in TERMINAL for w in workers)
@@ -6374,9 +6423,9 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                                turn=getattr(_w, "turn", None),
                                configured=True, config_source="run",
                                eligible=True,
-                               triggered=(_oc in RETRYABLE_OUTCOMES),
+                               triggered=_retry_allowed(_oc, _w),
                                not_triggered_reason=(
-                                   "" if _oc in RETRYABLE_OUTCOMES else
+                                   "" if _retry_allowed(_oc, _w) else
                                    "outcome %s is not retryable; the trigger reads the "
                                    "worker's own report" % _oc),
                                self_report_outcome=str(_oc or ""))
@@ -6411,7 +6460,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                                    extra={"reason": "DONE with no verification gate"})
                     except Exception:
                         pass
-                elif _oc not in RETRYABLE_OUTCOMES:
+                elif not _retry_allowed(_oc, _w):
                     continue
                 # A CAMPAIGN THAT HAS ALREADY BEEN MERGED NEEDS NO MORE MERGES. A merge that
                 # goes STUCK is retryable like anything else, so a family could end up

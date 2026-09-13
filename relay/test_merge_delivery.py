@@ -248,9 +248,13 @@ def test_a_merged_campaign_stops_retrying_its_failed_merges():
     with io.open(os.path.join(root, "relay", "relay_fleet.py"), encoding="utf-8") as fh:
         src = fh.read()
     code = "\n".join(l for l in src.splitlines() if not l.strip().startswith("#"))
-    i = code.index("RETRYABLE_OUTCOMES:")
+    # ANCHORED ON THE GUARD ITSELF, not on a neighbouring line. This used to find
+    # `RETRYABLE_OUTCOMES:` and read 900 characters forward -- and that line disappeared the
+    # day the retry decision started going through `outcomes.is_retryable`, so the test broke
+    # on a change that did not touch what it checks. A source assertion should point at the
+    # thing it is about.
+    i = code.index('role", "") == "aggregator"')
     blk = code[i:i + 900]
-    assert 'role", "") == "aggregator"' in blk, "統合かどうかを見ていない"
     assert '(x.outcome or "") == "DONE"' in blk, "家族に成功した統合があるかを見ていない"
     assert "already merged" in src, "止めた理由を記録していない"
 
@@ -264,9 +268,9 @@ def test_a_failed_child_is_still_retried():
     with io.open(os.path.join(root, "relay", "relay_fleet.py"), encoding="utf-8") as fh:
         code = "\n".join(l for l in fh.read().splitlines()
                          if not l.strip().startswith("#"))
-    i = code.index("RETRYABLE_OUTCOMES:")
-    blk = code[i:i + 900]
+    # 再試行の判定行からではなく、ガードそのものからたどる（上の注記と同じ理由）。
+    guard = code.index('role", "") == "aggregator"')
+    done = code.index('(x.outcome or "") == "DONE"', guard)
+    assert done - guard < 900, "DONE 判定が aggregator ガードから離れすぎている"
     # aggregator ガードは role 判定の内側にあること(外に出ると全ワーカーに効く)
-    guard = blk.index('role", "") == "aggregator"')
-    done = blk.index('(x.outcome or "") == "DONE"')
     assert guard < done, "統合以外にも DONE 判定が効いている"

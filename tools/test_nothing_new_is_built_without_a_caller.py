@@ -62,7 +62,6 @@ NO_CALLER_NO_TEST = {
     "scripts/collect_lens_corpus.py::all_inconclusive",          # 8 lines
     "tools/lock_state.py::token_gap",                            # 8 lines
     "bench/companionbench/job_authority.py::free_port",          # 7 lines
-    "relay/outcomes.py::is_retryable",                           # 7 lines
     "scripts/collect_lens_corpus.py::load_corpus",               # 7 lines
     "relay/profile_token.py::discard_template",                  # 6 lines
     "relay/autonomy_gate.py::constraints_text",                  # 5 lines
@@ -114,7 +113,6 @@ NO_CALLER_BUT_TESTED = {
     "relay/selfimprove/branches.py::materialize_to_file",        # 14 lines
     "relay/selfimprove/harness_tree.py::branches",               # 14 lines
     "relay/selfimprove/l2.py::run_until",                        # 14 lines
-    "relay/conv_title.py::disambiguate",                         # 13 lines
     "relay/selfimprove/apply.py::revert",                        # 13 lines
     "relay/turn_outcome.py::classify_turns",                     # 13 lines
     "relay/provenance.py::outranks",                             # 12 lines
@@ -132,11 +130,9 @@ NO_CALLER_BUT_TESTED = {
     "relay/project_memory.py::authorities_in",                   # 8 lines
     "relay/chathub.py::collect_text",                            # 7 lines
     "relay/mechanism_telemetry.py::patch_hash",                  # 4 lines
-    "relay/conv_title.py::salvageable",                          # 3 lines
     "relay/relay_fleet.py::connector_proven",                    # 3 lines
     "relay/selfimprove/compare.py::transport_versions_differ",   # 3 lines
     "relay/selfimprove/guards.py::is_domain_general",            # 3 lines
-    "relay/transport_policy.py::duplicate_risk",                 # 3 lines
     "relay/transport_policy.py::evolvable_fields",               # 3 lines
     "bench/remote/broker_client.py::ping",                       # 2 lines
     "relay/selfimprove/runtime_config.py::active_harness_id",    # 2 lines
