@@ -450,6 +450,7 @@ jobs:
             bench/test_pro_record_arm.py \
             bench/test_pro_record_denominator.py \
             bench/test_retry_floor.py \
+            bench/test_the_first_number_can_be_asked_for.py \
             bench/test_retry_floor_graded.py \
             bench/test_routing_switch.py \
             bench/test_skill_match_rate.py \

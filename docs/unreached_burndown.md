@@ -3,7 +3,7 @@
 Started 2026-09-13. **93 → 68 fixed, and then the inventory GREW to 83** when the instrument
 stopped skipping names it could not attribute: 86 revealed, two of them alias false positives of
 the fix's own making, and `relay/quota_meter.py::prune` wired the moment it appeared. The scan
-and the baseline agree at 81: the two names the
+and the baseline agree at 80: the two names the
 scanner had never printed at all are in the frozen list with their reason, so a gap between the two
 numbers is once again a signal rather than a known discrepancy. This file exists so they do not have
 to be triaged a third time.
@@ -87,12 +87,13 @@ flagged unwired by an adversarial review hours earlier, nearly hidden behind an 
 | `relay/quota_meter.py::prune` | **fixed** — one of the eighteen the attribution revealed, and it had never run. `KEEP_S = 7200` says records older than two hours are dropped “when the file is rewritten” and `prune` is the rewriting. Measured on the live meter: **4,845 rows spanning 12.8 days, 100% past the window**. The reason is written beside the constant — keeping more “would make the meter itself the thing that fills a disk that has already stopped a run tonight” — so the mitigation for a real incident had never once run. It also cost the readers: `snapshot()` parses the whole file to answer a question about the last sixty seconds, on every admission check. Triggered on the OLDEST ROW being past twice the window, which is the policy restating itself and stays O(1) as the file grows |
 | `scripts/win/checkpoint.py::pages` | **deleted** — four lines, no caller and no test, returning `targets(port)`’s list with only the urls. The one reader needs the ids too, because ownership is matched by id. See *a narrower view of a function the caller needs in full* below |
 | `relay/acceptance_contract.py::intact` | **fixed** — `ensure` hashes every contract and `intact` checks the hash, and nothing called it: `load()` handed the row straight to the grader, so a worker was judged against terms whose integrity was never verified. Its own docstring names what that misses — “a contract edited by hand, a partially-written line, a schema-changing refactor that quietly altered the terms of tasks already in flight.” Measured before wiring: **120 contracts, 120 hashed, 120 intact**, so the check is invisible to today’s data. An altered contract is now treated as ABSENT (which `_assess` already reports honestly and never reads as success) and the alteration itself is recorded, because “never recorded” and “recorded then altered” are different findings |
+| `bench/retry_floor.py::report` | **fixed** — the module opens by arguing this is “the FIRST number”: every mechanism on top of a single attempt has to beat simply running the goal again, and it cites a scaffold at 88.0%/$134.50 against a plain retry at 92.0%/$2.51. `report()` computes that floor and had no CLI and no caller — two test files imported it and nothing in the repository could run it. Against the live ledger (3,469 rows, computable only since the archive was rebuilt the same day): **k=1 0.419, k=2 0.687 (+26.7pt), k=5 0.865 (+0.0)**. A second attempt is worth twenty-seven points and a fifth is worth nothing, and that was sitting unread. The reader prints the four caveats beside the curve, because these are COMPLETION rates and k=1 is conditioned on goals that were retried at all |
 
 The ratchet noticed `is_resolved` on its own: the moment it gained callers the test refused to
 keep it listed. That is the mechanism working in the direction it was built for. It did the same
 for `evolvable_fields` on 2026-09-14, refusing to keep it listed within seconds of the wiring.
 
-## The remaining 81
+## The remaining 80
 
 Classified 2026-09-13 by three parallel surveys, each required to give grep-level evidence and
 to answer "could not determine" rather than guess. **These verdicts are triage, not proof** —
@@ -468,9 +469,27 @@ live caller reaches past it to the richer form:
 | `relay/relay_fleet.py::connector_proven` | `connector_proof_source()` | **which** evidence proved it; production branches three ways on `run` / `probe` / nothing and writes a different sentence for each |
 | `relay/chathub.py::collect_text` | `collect_delta` / `collect_final` | nothing — it is their `or`, and no caller wants the pair collapsed |
 | `relay/selfimprove/compare.py::transport_versions_differ` | `versions_differ("transport", …)` | nothing — its own docstring says "the question is now asked generically" |
+| `relay/lean_capture.py::capture_fn` | `maybe_install` + the `lean_pages` context manager | nothing — it is the SELECTOR shape, and this module cannot be installed that way |
 
-**The disposition is not the same for all four, and that is the point of naming the class rather
-than the instances.** `pages` had no caller *and no test*, so it is deleted. `collect_text` is
+**A fifth found the same day, and it nearly cost a tested function.** `lean_capture::capture_fn`
+looked deletable: the module explains forty lines above it that its page work must happen INSIDE
+the frozen `socket_route.capture_via_tab`, so a selector cannot be installed and `maybe_install`
+is the live entry point. The check for callers was
+
+    git grep -n "capture_fn" -- relay/lean_capture.py scripts/ tests/ relay/test_*.py bench/ | head
+
+and `head` cut the output at ten lines — all ten being `SocketRoute(capture_fn=…)`, the
+constructor's keyword argument, which is a different thing wearing the same name. The two tests
+in `tests/test_lean_capture.py` that assert through the function were past the cut. It was
+deleted, the tests went red, and it was put back.
+
+That is the third time in one day a search hid its own evidence: a `grep -v` filter that also
+excluded `test_chathub.py`, a substring scan that matched a comment saying the call site had
+been REMOVED, and now a `head`. **A truncated or filtered search used to justify a deletion is
+worse than no search, because the result reads as thorough.**
+
+**The disposition is not the same for any of them, and that is the point of naming the class
+rather than the instances.** `pages` had no caller *and no test*, so it is deleted. `collect_text` is
 asserted through three times in `test_chathub.py`, so it stays with a corrected docstring.
 `connector_proven` is the coarse question five tests legitimately ask, and deleting it would
 make five assertions read worse for three lines. `transport_versions_differ` is in the
@@ -489,7 +508,7 @@ control. Leave it.
 
 ### The self-improvement subsystem has no driver
 
-24 of the 81 are in `relay/selfimprove/` — the share has GROWN as the rest came down (24/75 → 24/81, and ten of the sixteen newly revealed names are in there too;
+24 of the 80 are in `relay/selfimprove/` — the share has GROWN as the rest came down (24/75 → 24/80, and ten of the sixteen newly revealed names are in there too;
 not one of them has moved), and one of the two names the scanner had never printed is in there too.
 `scripts/run_nightly_real.py` — the script meant to
 run the loop for real — opens with *"It has never been run at all."* No CI job, scheduler,
