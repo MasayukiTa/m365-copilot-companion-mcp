@@ -1,7 +1,9 @@
 # Burning down the unreached baseline
 
-Started 2026-09-13. **93 → 73** so far, and the scan now sees 75 — two names it had never printed at all. This file exists so they do not have to be
-triaged a third time.
+Started 2026-09-13. **93 → 70** so far. The scan and the baseline now agree at 70: the two names the
+scanner had never printed at all are in the frozen list with their reason, so a gap between the two
+numbers is once again a signal rather than a known discrepancy. This file exists so they do not have
+to be triaged a third time.
 
 ## Why the baseline is being removed rather than maintained
 
@@ -74,11 +76,14 @@ flagged unwired by an adversarial review hours earlier, nearly hidden behind an 
 | `relay/mechanism_telemetry.py::patch_hash` | **fixed** — `bench/pro_capture.py::_emit` computed the same digest inline, in a function whose own docstring argues against exactly that ("written twice, these drift"). One implementation now |
 | `relay/review_resilience.py::diagnose_after_fresh_replay` | **fixed** — two of its four answers were typed out as literals at two settle paths (`session_state`/`recovered` and `task_content`/`needs_decomposition`, which ARE the enum's values), leaving the other two unreachable: a fresh replay killed by a transient error, and one whose evidence identifies nothing. Those are exactly the runs where `recovery_cause` stayed EMPTY. All four are reachable now and the diagnosis's sentence is recorded; no string a reader already sees changed |
 | `relay/quota_meter.py::sustainable_workers` | **fixed** — the meter had 4,698 turn rows and nothing computed the number they are for. Its input never existed either: `per_worker_rpm` had no default and `snapshot()` produced no such field, so it returned 0.0 for any snapshot. The denominator was on disk all along (`record_turn` writes `worker`); measured on the busiest minute, **66 turns / 56 workers → 59.4 sustainable** against a hand-chosen concurrency |
+| `bridge/session_store.py::latest_attached` | **deleted** — not unwired, *retired*. It had been deliberately replaced by `latest_session()` on 2026-08-28 after it reached past the newest session into one 54 hours old, and the replacement's comment says so. Keeping the superseded reader listed as "a function with no caller" invited someone to wire the bug back in. 23 lines gone, and its test with it |
+| `relay/profile_token.py::discard_template` | **fixed** — `load_template` rejected a template older than the age cap and then *left it on disk*, so the same expired template was re-read and re-rejected on every capture, forever. Measured on the live store: one of the two cached templates was **150.6h old against a 24h cap**. The rejection now discards it |
+| `tools/lock_state.py::locked_recently` / `locked_since` / `matching_record` | **fixed** — all three docstrings said they were "kept for the CLI", and `_cli` had `show` and `token-gap` and called none of them. A justification resting on a surface nobody built is worse than none, because it reads as settled. `recent [seconds]` is that surface. **Not `matching_records`** (plural), which is live in three modules and answers a different question — "which refusals could have been mine", a decision — where these answer "what happened" |
 
 The ratchet noticed `is_resolved` on its own: the moment it gained callers the test refused to
 keep it listed. That is the mechanism working in the direction it was built for.
 
-## The remaining 75
+## The remaining 70
 
 Classified 2026-09-13 by three parallel surveys, each required to give grep-level evidence and
 to answer "could not determine" rather than guess. **These verdicts are triage, not proof** —
@@ -155,6 +160,42 @@ generator are not. So the bridge verifies a probe reply but never issues a follo
 classifies what came back. Whether the protocol was meant to have more than one round is the
 question, and it is a design question rather than a missing call.
 
+### Triaged by hand, 2026-09-14 (second pass): a retirement and two half-built surfaces
+
+**`bridge/session_store.py::latest_attached` — DELETED, and the distinction matters.** Its own
+history says why: on 2026-08-28 `latest_session()` was written to replace it because
+`latest_attached` sorted by attach time and handed back a session **54 hours old** while a newer one
+existed. The replacement is live; the original stayed in the tree with a docstring that still reads
+like an offer. A superseded implementation sitting in the unreached list is a trap, because the list
+is a to-do list of things to *wire* — the correct action here was the opposite one. 23 lines and a
+17-line test removed, with a note left on `latest_session()` saying why it must not come back.
+
+**`relay/profile_token.py::discard_template` — WIRED, and it was hiding a live leak.** `load_template`
+compared a cached template's age against the cap and returned `None` when it was over — without
+removing it. So an expired template is re-read from disk, re-parsed and re-rejected on **every single
+capture**, permanently, and the eviction function written for exactly that moment had no caller.
+Measured on the live store before the change: two cached templates, one of them **150.6 hours old
+against a 24-hour cap**. The age-cap branch now calls `discard_template` before returning.
+
+**`tools/lock_state.py::locked_recently` / `locked_since` / `matching_record` — WIRED, all three.**
+Each says in its own docstring that it is kept for the CLI ("kept for the CLI and for diagnostics,
+where naming the last refusal is exactly the question"), and `_cli` offered `show` and `token-gap`
+and called none of them. That is a worse state than an unjustified name: it reads as decided, so
+nobody asks. `recent [seconds]` is the diagnostic they were kept for — was anything refused in the
+last N seconds, when, and which record.
+
+**Not `matching_records`** (plural). That one is live in three modules and answers a different
+question — *which refusals could have been mine*, which a caller uses to decide — where these three
+answer *what happened*, which is what a person looking at a stuck worker asks.
+
+The first draft of the reader printed what looked like a contradiction: over a 24-hour window,
+`locked_recently: true`, `locked_since: false`, `record: {}`. That is not a defect in the three
+functions — `locked_since` and `matching_record` are **additionally** capped at `DEFAULT_FRESH_SEC`
+so a clock jump cannot resurrect an ancient refusal, while `locked_recently` honours the window it
+is given. Two windows, two questions. The defect was in the presentation, and the fields are named
+for their windows now (`asked_window_s` / `fresh_window_s`, with the record's age printed beside
+them) — pinned by a test that asserts the disagreement is legible rather than asserting it away.
+
 ### Deliberately unwired — do not "fix"
 
 `relay/selfimprove/autonomy.py::raise_to` — its docstring says so, and
@@ -164,7 +205,9 @@ control. Leave it.
 
 ### The self-improvement subsystem has no driver
 
-24 of the 75 are in `relay/selfimprove/` — the share has GROWN as the rest came down, and one of the two names the scanner had never printed is in there too. `scripts/run_nightly_real.py` — the script meant to
+24 of the 70 are in `relay/selfimprove/` — the share has GROWN as the rest came down (24/75 → 24/70;
+not one of them has moved), and one of the two names the scanner had never printed is in there too.
+`scripts/run_nightly_real.py` — the script meant to
 run the loop for real — opens with *"It has never been run at all."* No CI job, scheduler,
 `.bat` or cron invokes any entry point. They are stranded because the loop was never turned on,
 not because they are useless. **Decide that first**; classifying them one by one before the

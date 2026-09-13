@@ -230,6 +230,19 @@ def load_template(agent_url: str, directory=None, now=None, max_age_s=None):
     if age_cap > 0:
         age = (time.time() if now is None else now) - float(data.get("ts") or 0)
         if age > age_cap:
+            # AND IT IS EVICTED, because it can never become valid again. `ts` only moves
+            # further away, so a template past the cap is re-opened, parsed and thrown away on
+            # every capture from here to forever. Measured 2026-09-14: one of the two cached
+            # templates was 150.6 hours old against a 24-hour cap -- 8 KB of JSON read and
+            # discarded on each attempt since 2026-09-07.
+            #
+            # `discard_template` is exactly this and had no caller. The cap's own comment says
+            # it is "a backstop, not the mechanism: the real signal is the backend refusing a
+            # request" -- and that signal is NOT wired here, deliberately: the recorded reason
+            # for a decline ("the backend declined the request: InternalError", 8 on record)
+            # does not distinguish a bad request shape from a fault on their side, and
+            # re-deriving costs a full capture. This case needs no such judgement.
+            discard_template(agent_url, directory)
             return None
     try:
         from relay.chathub import RequestTemplate
@@ -243,7 +256,14 @@ def load_template(agent_url: str, directory=None, now=None, max_age_s=None):
 
 
 def discard_template(agent_url: str, directory=None) -> None:
-    """Forget this agent's cached template so the next capture re-derives it from a real turn."""
+    """Forget this agent's cached template so the next capture re-derives it from a real turn.
+
+    Called by `load_template` above when a cached template is past TEMPLATE_MAX_AGE_S -- it is
+    defined after its caller, which Python resolves at call time. That eviction is the only
+    automatic one: it is the case where "this can never be valid again" is certain. A template
+    the BACKEND rejects is the other half, and the decline reason on record does not say whether
+    the request shape or the backend was at fault, so nothing guesses here.
+    """
     try:
         os.remove(template_path(agent_url, directory))
     except OSError:

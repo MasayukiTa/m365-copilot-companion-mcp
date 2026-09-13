@@ -875,36 +875,18 @@ def latest_session():
 
     A policy that wants "resume only if the thing we just left is resumable" needs to see the
     thing we just left, whether or not it is resumable. That is this.
+
+    `latest_attached()` was DELETED on 2026-09-14 rather than left listed as unreached. It had
+    no caller from the day this replaced it, and its test pinned the skip that caused the
+    incident above -- so the repository was holding a tested function whose tested behaviour is
+    the one it had decided against. If a future caller wants "newest row with a conversation",
+    write it there and name what it is for; do not restore a name whose only documentation is
+    why it was wrong.
     """
     conn = _db()
     try:
         row = conn.execute(
             "SELECT * FROM sessions ORDER BY last_active_ts DESC LIMIT 1").fetchone()
-    finally:
-        conn.close()
-    return _row_to_session(row) if row else None
-
-
-def latest_attached():
-    """Most recent session (by last_active_ts) that has a conversation attached.
-
-    NAMED FOR ITS CONDITION, WHICH IS conv_url <> '' AND NOT status. It was latest_active,
-    which is the third thing in this program called active and the second that does not
-    mean what the others do:
-
-      - the `status` column, written as 'active' by every touch() and read by nothing
-      - ACTIVE_SID in the bridge, the session a turn actually goes to
-      - this, which asked only whether a conversation was attached
-
-    A reader reasoning from the name would have expected the status column to matter here.
-    It never did, and a filter that is named but not applied is worse than one that is
-    absent, because it gets relied on.
-    """
-    conn = _db()
-    try:
-        row = conn.execute(
-            "SELECT * FROM sessions WHERE conv_url <> '' "
-            "ORDER BY last_active_ts DESC LIMIT 1").fetchone()
     finally:
         conn.close()
     return _row_to_session(row) if row else None
