@@ -122,7 +122,6 @@ NO_CALLER_BUT_TESTED = {
     "relay/relay_fleet.py::connector_proven",                    # 3 lines
     "relay/selfimprove/compare.py::transport_versions_differ",   # 3 lines
     "relay/selfimprove/guards.py::is_domain_general",            # 3 lines
-    "relay/transport_policy.py::evolvable_fields",               # 3 lines
     "bench/remote/broker_client.py::ping",                       # 2 lines
     "relay/selfimprove/runtime_config.py::active_harness_id",    # 2 lines
     "tools/security.py::clear_presented_token",                  # 2 lines

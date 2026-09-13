@@ -97,6 +97,27 @@ DELIBERATELY_EXCLUDED = {
     "notify_desktop":    "the operator's attention is not a resource the worker allocates",
     "verify_python":     "executes Python under a name that reads like a check",
     "python_check":      "executes Python under a name that reads like a static check",
+
+    # FOUND 2026-09-14, by running the undecided-tools guard against the real registry for the
+    # first time. The guard had been reading a gitignored dump, so it skipped in CI and, here,
+    # compared against a snapshot taken by hand on 2026-08-30. Eleven tools had appeared since
+    # and were neither allowed nor refused. Recording them as excluded does not change what the
+    # gate does -- unlisted was already refused -- it changes whether anybody looked.
+    "restore_point":     "establishes a way back before editing; the capture step reads `git diff HEAD`, so a worker able to roll the tree back can erase the artefact the run exists to produce -- same reason as git_checkout",
+    "roll_back":         "returns the tree to a restore_point, which is exactly the diff the run is being graded on",
+    "fleet_submit":      "queues work for this machine's fleet: a worker that can enqueue runs is not bounded by the run it is in -- same family as stop_request and schedule_create",
+    "fleet_queue":       "reads what else the operator has running, which is not part of fixing the instance",
+    "loop_until_verified": "drives an edit/verify loop of its own inside one turn; a worker that can start an unbounded agent loop is not bounded by a list of tools -- same reason as forge_tool",
+    "recurrent_begin":   "opens a self-generating loop, for the same reason",
+    "recurrent_step":    "advances that loop",
+    "recurrent_state":   "reads that loop",
+    "loop_trajectory":   "reports on those iterations; nothing to report when the loop is not available",
+    "render_page":       "fetches a page after its JavaScript has run -- web_fetch's reason applies unchanged, and the container's package manager is where downloads belong",
+    # NOT WEIGHED, RECORDED. This is the one of the eleven a worker could plausibly want: it is
+    # replace_in_file with a verification and an automatic undo, which is strictly safer than
+    # the multi_edit already allowed. It is listed here because that is what the gate already
+    # did with it, NOT because a case against it was made. Promoting it is an operator's call.
+    "edit_and_verify":   "not weighed -- recorded as excluded because unlisted already meant refused; the one of the eleven with a real case for promotion",
 }
 
 # ---------------------------------------------------------------------------------------
@@ -175,6 +196,18 @@ def unknown_tools(catalogue):
 # Which is exactly why this does not begin by refusing anything: the last time a gate was
 # switched from permissive to closed without measuring first, the review that caught it said
 # to shadow for an hour and confirm zero. Same discipline here.
+#
+# NOTHING IN PRODUCTION CONSULTS `check` -- measured 2026-09-14, and pinned by
+# test_nothing_in_production_consults_the_gate. `main.py` removed the call site deliberately
+# ("the benchmark's tool-population policy ... is a fact about that benchmark, not about this
+# server") and left the list here "for the runner that owns it"; the runner does not consult it
+# either. So the modes below describe a gate that is currently wired to nothing, and the test
+# section that claims "the gateway actually consults it" claimed something no test checked.
+#
+# WIRING IT BACK IS AN OPERATOR DECISION, not a burn-down step: it is a policy change to a live
+# dispatch path, and `_fleet_run_active()` -- the mechanism built for exactly the gateway's
+# "cannot tell a worker from the operator" problem -- is what was thrown away with the call
+# site. Recorded in docs/unreached_burndown.md rather than decided here.
 #
 #   off      the policy is not consulted at all
 #   shadow   every call that WOULD be refused is recorded; nothing is blocked   <- default

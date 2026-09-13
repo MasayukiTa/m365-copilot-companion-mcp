@@ -134,5 +134,9 @@ def test_a_marker_file_can_switch_routing_without_a_restart(tmp_path, monkeypatc
 def test_a_missing_marker_directory_is_not_an_error(monkeypatch):
     """A switch that raises when its file is absent would fail every call it is asked about."""
     monkeypatch.delenv("SWE_BROKER", raising=False)
-    monkeypatch.setattr(BC, "MARKER", "Z:\nope\BROKER_ON")
+    # RAW, AND IT WAS A REAL DEFECT. `"Z:\nope\BROKER_ON"` put a NEWLINE after `Z:` -- `\n` is
+    # a valid escape, so this was never the Windows path it reads as. The test passed anyway,
+    # because a path with a newline in it is just as absent as a path without one, which is
+    # exactly how a fixture stops testing what its author meant.
+    monkeypatch.setattr(BC, "MARKER", r"Z:\nope\BROKER_ON")
     assert BC.enabled() is False

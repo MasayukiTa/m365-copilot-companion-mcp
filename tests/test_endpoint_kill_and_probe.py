@@ -126,7 +126,7 @@ def test_non_json_is_rejected():
 # ---- the selector must not depend on the host OS --------------------------
 
 def test_the_selector_never_resolves_an_already_absolute_venv_path():
-    """THE REGRESSION THESE FIVE TESTS SAT ON. The selector folded the venv path with
+    r"""THE REGRESSION THESE FIVE TESTS SAT ON. The selector folded the venv path with
     os.path.normcase(os.path.abspath(...)). Off Windows, abspath treats "C:\...\python.exe"
     as relative and prepends the cwd, and normcase lowercases nothing -- so every comparison
     failed and _endpoint_pids returned [] for every row. The five tests above were red on the
