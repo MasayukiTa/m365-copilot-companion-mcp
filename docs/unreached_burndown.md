@@ -1,6 +1,6 @@
 # Burning down the unreached baseline
 
-Started 2026-09-13. **93 → 70** so far. The scan and the baseline now agree at 70: the two names the
+Started 2026-09-13. **93 → 69** so far. The scan and the baseline now agree at 69: the two names the
 scanner had never printed at all are in the frozen list with their reason, so a gap between the two
 numbers is once again a signal rather than a known discrepancy. This file exists so they do not have
 to be triaged a third time.
@@ -79,11 +79,13 @@ flagged unwired by an adversarial review hours earlier, nearly hidden behind an 
 | `bridge/session_store.py::latest_attached` | **deleted** — not unwired, *retired*. It had been deliberately replaced by `latest_session()` on 2026-08-28 after it reached past the newest session into one 54 hours old, and the replacement's comment says so. Keeping the superseded reader listed as "a function with no caller" invited someone to wire the bug back in. 23 lines gone, and its test with it |
 | `relay/profile_token.py::discard_template` | **fixed** — `load_template` rejected a template older than the age cap and then *left it on disk*, so the same expired template was re-read and re-rejected on every capture, forever. Measured on the live store: one of the two cached templates was **150.6h old against a 24h cap**. The rejection now discards it |
 | `tools/lock_state.py::locked_recently` / `locked_since` / `matching_record` | **fixed** — all three docstrings said they were "kept for the CLI", and `_cli` had `show` and `token-gap` and called none of them. A justification resting on a surface nobody built is worse than none, because it reads as settled. `recent [seconds]` is that surface. **Not `matching_records`** (plural), which is live in three modules and answers a different question — "which refusals could have been mine", a decision — where these answer "what happened" |
+| `relay/transport_policy.py::evolvable_fields` | **fixed** — it declared `transport_explore_rate`, and a scan over `git ls-files` found that name in exactly one place: that return tuple. Nothing read it — the fifth instance of the defect the version table twelve lines above says this repository "has now found in four separate components", sitting inside the fix for the first four. The remaining knob is spelled once and read through its name, and `choose()` now records a genome knob no policy reads, because an undeclared knob is an A/B arm identical to its control |
 
 The ratchet noticed `is_resolved` on its own: the moment it gained callers the test refused to
-keep it listed. That is the mechanism working in the direction it was built for.
+keep it listed. That is the mechanism working in the direction it was built for. It did the same
+for `evolvable_fields` on 2026-09-14, refusing to keep it listed within seconds of the wiring.
 
-## The remaining 70
+## The remaining 69
 
 Classified 2026-09-13 by three parallel surveys, each required to give grep-level evidence and
 to answer "could not determine" rather than guess. **These verdicts are triage, not proof** —
@@ -155,10 +157,11 @@ second source of evidence at a different authority about the same subject — wh
 does not currently produce.** Recorded rather than forced.
 
 **`tools/tool_probe.py::classify_probe_reply` / `next_probe_instruction` — a half-wired
-protocol.** `verify_probe_reply` is live in 3 files; the classifier and the next-instruction
-generator are not. So the bridge verifies a probe reply but never issues a follow-up probe or
-classifies what came back. Whether the protocol was meant to have more than one round is the
-question, and it is a design question rather than a missing call.
+protocol.** ~~`verify_probe_reply` is live in 3 files~~ — **wrong, corrected 2026-09-14 below.**
+The classifier and the next-instruction generator are not called. So the bridge verifies a probe
+reply but never issues a follow-up probe or classifies what came back. Whether the protocol was
+meant to have more than one round is the question, and it is a design question rather than a
+missing call.
 
 ### Triaged by hand, 2026-09-14 (second pass): a retirement and two half-built surfaces
 
@@ -196,6 +199,87 @@ is given. Two windows, two questions. The defect was in the presentation, and th
 for their windows now (`asked_window_s` / `fresh_window_s`, with the record's age printed beside
 them) — pinned by a test that asserts the disagreement is legible rather than asserting it away.
 
+### The pattern under half the list: a decision surface with no decider
+
+Counted 2026-09-14 over the 69. These are not scattered leftovers. **34 of them belong to six
+subsystems that were each built complete — logic, documentation, tests — and are consulted by
+nothing.** They are unreached because their *callers* were never written, so triaging them one at
+a time cannot terminate: every answer is "the caller does not exist", and the decision that would
+create one is above the level of this burn-down.
+
+| subsystem | listed | what has no caller | what is actually missing |
+|---|---:|---|---|
+| `relay/selfimprove/` | 24 | the whole loop | a driver. `scripts/run_nightly_real.py` opens *"It has never been run at all."* No CI job, scheduler, `.bat` or cron invokes any entry point |
+| `relay/fleet_toolset.py` | 1 (3 real) | `check`, `mode`, `unknown_tools` | a consumer. `main.py` removed the call site deliberately and left the list "for the runner that owns it"; the runner does not consult it either |
+| `tools/tool_probe.py` | 3 | `verify_probe_reply`, `classify_probe_reply`, `next_probe_instruction` | two of the three are RETIRED, not unbuilt — see the correction below |
+| `relay/provenance.py` | 3 | `adjudicate`, `outranks`, `resolved_value` | a second source of evidence at a different authority about the same subject, which the system does not produce |
+| `relay/autonomy_gate.py` | 2 | `judge_autonomy`, `constraints_text` | a run-level gate. Its STOP/ASK **vocabulary** is live in `task_router._static_risk` and `contract_gate`; its **verdict** is not, because the fleet gates per job and this judges a whole run |
+| `relay/turn_outcome.py` | 1 | `is_capacity_signal` | a controller. Nothing in the fleet reduces concurrency on a rate class — checked across every non-test file |
+
+**Why this is one row and not six.** The burn-down's procedure — take an entry, find the caller
+that should exist, write it — works on the other 35 and cannot work on these. What they need is a
+decision per *subsystem*: run it, wire it, or retire it. Until that is made, every pass over the
+list re-derives the same six answers, which is what the first two surveys did.
+
+**`relay/fleet_toolset.py` is the one to read first**, because it shows what the state costs. Its
+test section was headed *"enforcement: shadow by default, and the gateway actually consults it"*
+and not one test checked the second half — `main.py` had removed the call site. The guard the
+module calls "the point of the whole module" read a dump under gitignored `.fleet/`, so it
+**skipped in CI on every run since it was written**, and on the one machine with a dump it
+compared against a snapshot taken by hand on 2026-08-30 that nothing refreshes. Pointed at the
+real registry it found **eleven tools nobody had decided about**, among them `fleet_submit` (a
+worker enqueuing fleet runs), `roll_back` (returning the very tree the capture step grades) and
+the `recurrent_*` loop drivers. All eleven are recorded now, and the guard reads the registry.
+
+**And the registry has to be read from a clean interpreter.** The first version imported `main`
+inside the pytest session and got a registry the session had already altered: conftest's autouse
+`_no_desktop_toasts` replaces `notify_ops.notify_desktop` with a local function named `_capture`,
+and `_ALL_TOOLS` is keyed by `__name__` — so the in-process import reported `notify_desktop`
+missing, `_capture` present, and six turn tools absent. conftest names this hazard forty lines
+above that fixture: *"the failure looks like a bug in the tool map and is a bug in what the test
+inherited."* It is read in a subprocess now.
+
+**The scanner could not have raised any of it.** `check` and `mode` are each defined in several
+modules, and `tools/unreached.py` drops a name it sees defined twice — the fourth blind spot,
+found 2026-09-13. Only `unknown_tools`, a name unique to that file, ever reached the baseline.
+The list understates this row: the dead gate was behind the blind spot, not on the list.
+
+#### Correction: `verify_probe_reply` is not live
+
+An earlier entry above said *"`verify_probe_reply` is live in 3 files; the classifier and the
+next-instruction generator are not."* That was a substring grep over text, and every one of those
+three mentions is a comment naming the function. An AST scan over `git ls-files` for real call
+sites finds **zero** for all three.
+
+What actually happened is better than a gap: `verify_probe_arrival` replaced it, because the old
+one asked the agent to transcribe a secret back and *the live agent refused*.
+`tools/test_tool_probe_inbound.py` pins that both probe sites call the new one and neither calls
+the old — using an AST scan, for the same reason the grep was wrong, and its docstring says so:
+*"Parse, don't grep."* So the disposition is:
+
+- `verify_probe_reply` — **retired**, kept deliberately: `verify_probe_arrival`'s contract is
+  defined as mirroring it ("same `kind` vocabulary, same precedence"), and a test cross-checks
+  the two. Deleting it would orphan the definition the live function is written against.
+- `classify_probe_reply` — the vocabulary anchor that equivalence is asserted against.
+- `next_probe_instruction` — the only genuinely unbuilt one: a second probe round nothing asks
+  for. Whether the protocol was meant to have more than one round is a design question.
+
+#### Also recorded, not resolved: two declarations of what may evolve
+
+`transport_policy.evolvable_fields()` names the knobs a genome may move; `selfimprove/manifest.py`
+holds `PARAMETER_TYPES`, the registry the evolution campaign actually sweeps. Neither transport
+knob is in it, so `campaign.variants_for` raises *"not an evolvable coordinate"* for either one
+and `coordinates()` never sweeps them. They cannot simply be added: `PARAMETER_TYPES` entries are
+numeric `(low, high)` ranges and `transport_eligible_kinds` is a list of kinds.
+
+That type gap has a visible consequence, asserted rather than patched: `_policy_v2` does
+`kind not in set(eligible)`, so a knob of the wrong type raises `TypeError` out of a transport
+decision — against this repository's own rule that a policy which can crash its caller is worse
+than no policy. It is unreachable today (the one production call site passes no knobs, and the
+genome path that would has no driver), and wrapping the comparison would hide the disagreement
+instead of settling it. Settling it means deciding whether transport knobs belong in the
+manifest, which is the same subsystem decision as the table above.
+
 ### Deliberately unwired — do not "fix"
 
 `relay/selfimprove/autonomy.py::raise_to` — its docstring says so, and
@@ -205,7 +289,7 @@ control. Leave it.
 
 ### The self-improvement subsystem has no driver
 
-24 of the 70 are in `relay/selfimprove/` — the share has GROWN as the rest came down (24/75 → 24/70;
+24 of the 69 are in `relay/selfimprove/` — the share has GROWN as the rest came down (24/75 → 24/69;
 not one of them has moved), and one of the two names the scanner had never printed is in there too.
 `scripts/run_nightly_real.py` — the script meant to
 run the loop for real — opens with *"It has never been run at all."* No CI job, scheduler,

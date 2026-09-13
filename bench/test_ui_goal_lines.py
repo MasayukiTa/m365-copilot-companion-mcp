@@ -18,7 +18,12 @@ def test_a_multiline_goal_becomes_exactly_one_line():
 
 
 def test_the_line_round_trips_to_the_original_text():
-    g = "問題文\nwith \"quotes\" and \backslashes\ and \ttabs"
+    # THE BACKSLASHES WERE NOT BACKSLASHES. `\b` is a valid escape, so `\backslashes` was a
+    # BACKSPACE followed by "ackslashes", and `\ ` was an invalid escape that survived by
+    # accident -- a fixture named "backslashes" that contained one backslash, not two. The
+    # newline and tab are escapes ON PURPOSE (they are what a cockpit line must not break on),
+    # so this cannot become a raw string: the literal backslashes are doubled instead.
+    g = "問題文\nwith \"quotes\" and \\backslashes\\ and \ttabs"
     obj = json.loads(to_ui_lines([g])[0])
     assert obj["text"] == g
 

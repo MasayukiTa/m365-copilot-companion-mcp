@@ -138,7 +138,7 @@ def test_quickstart_falls_back_to_the_preserved_crash_log():
     assert qs.index("server.err.log") < qs.index("server.err.history.log")
     assert doctor.index("$script:serverErrLog") < doctor.index("$script:serverErrHistory")
     # and quickstart still runs the doctor, or none of its checks reach anyone
-    assert "scripts\doctor.ps1" in qs
+    assert r"scripts\doctor.ps1" in qs
 
 
 def test_a_successful_startup_is_never_reported_as_the_reason_it_died():
@@ -218,12 +218,12 @@ def test_the_first_server_launch_does_not_wait_out_the_debounce():
 
     # and quickstart waits for the server before asking whether it is healthy
     wait = qs.index("Waiting for the MCP server to answer")
-    doctor_call = qs.index("scripts\doctor.ps1")
+    doctor_call = qs.index(r"scripts\doctor.ps1")
     assert wait < doctor_call, "the health check still runs before the wait"
 
 
 def test_every_devtunnel_resolver_knows_both_install_locations():
-    """setup_devtunnel.ps1 installs by winget when it can and DIRECT-DOWNLOADS to
+    r"""setup_devtunnel.ps1 installs by winget when it can and DIRECT-DOWNLOADS to
     %LOCALAPPDATA%\devtunnel when it cannot, appending that directory to the USER PATH -- which
     the already-running cmd cannot see, and that cmd is quickstart, the parent of start_all,
     supervisor and doctor. So on exactly the locked-down machines that needed the fallback, the
@@ -235,7 +235,7 @@ def test_every_devtunnel_resolver_knows_both_install_locations():
 
     for rel in ("scripts/doctor.ps1", "scripts/heal_tunnel.ps1", "scripts/supervisor.ps1"):
         src = (ROOT / rel).read_text(encoding="utf-8")
-        assert 'Join-Path $env:LOCALAPPDATA "devtunnel\devtunnel.exe"' in src, rel
+        assert r'Join-Path $env:LOCALAPPDATA "devtunnel\devtunnel.exe"' in src, rel
     boot = (ROOT / "scripts" / "bootstrap.py").read_text(encoding="utf-8")
     assert 'local / "devtunnel" / "devtunnel.exe"' in boot
 
@@ -642,14 +642,14 @@ def test_a_keepalive_process_is_not_a_serving_bridge():
     as the supervisor check that was green whether or not a supervisor was running."""
     start_all = (ROOT / "scripts" / "start_all.ps1").read_text(encoding="utf-8")
 
-    assert "(Proc-Running 'start_bridge\.ps1') -and (Http-Up" in start_all
+    assert r"(Proc-Running 'start_bridge\.ps1') -and (Http-Up" in start_all
     assert "already running and serving" in start_all
     # and the diagnosis below is now reachable when it is running but not serving
     assert start_all.index("already running and serving") < start_all.index("is HELD by pid")
 
 
 def test_the_supervisor_probe_matches_this_checkout_and_not_whoever_mentions_it():
-    """MEASURED while writing this. `CommandLine -match 'supervisor\.ps1'` selected five
+    r"""MEASURED while writing this. `CommandLine -match 'supervisor\.ps1'` selected five
     processes on this machine: the real supervisor, another powershell, and three bash commands
     that contained the string because they were SEARCHING for it. This project already has the
     lesson written down -- a process query matches the process making it.
@@ -666,7 +666,7 @@ def test_the_supervisor_probe_matches_this_checkout_and_not_whoever_mentions_it(
 
     for src, what in ((doctor, "doctor"), (start_all, "start_all")):
         code = "\n".join(l for l in src.splitlines() if not l.lstrip().startswith("#"))
-        assert "$_.CommandLine -match 'supervisor\.ps1'" not in code, \
+        assert r"$_.CommandLine -match 'supervisor\.ps1'" not in code, \
             "%s matches anything that mentions the file again" % what
         assert '$_.Name -match \'^(powershell|pwsh)\'' in code, what
         assert '-notlike "*register-supervisor*"' in code, what
@@ -768,7 +768,7 @@ def test_the_access_choice_beats_the_file_and_the_environment():
     assert "$AllowAnonymous = $ForceAnonymous.IsPresent -or (Get-AllowAnonymous)" in dt
     assert "-ForceAnonymous" in qs and "ANON_FLAG" in qs
     # replaced, not appended: an older line further up would otherwise keep winning
-    assert "MCP_TUNNEL_ALLOW_ANONYMOUS\s*=" in qs
+    assert r"MCP_TUNNEL_ALLOW_ANONYMOUS\s*=" in qs
     # AND WRITTEN AS UTF-8 ON BOTH SIDES. The rewrite used Set-Content -Encoding ASCII, which
     # replaces every non-ASCII byte with a question mark, and read with a bare Get-Content,
     # which decodes as the ANSI codepage. Measured on a .env carrying one Japanese comment:

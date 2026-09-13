@@ -1,35 +1,80 @@
 """The fleet's tool set is a list somebody wrote, not a filter somebody hoped was complete.
 
-The gateway carries 167 tools. The first containment plan was "move the execution tools",
+The gateway carries 178 tools. The first containment plan was "move the execution tools",
 which is subtraction -- and a classification of all 167 by name put replace_in_file,
 process_kill, run_in_background, verify_python, outlook_send_mail, clipboard_set, screenshot,
 trash_path, zip_extract and schedule_run_now in the harmless bucket. Not one of them has
 "exec" or "shell" in its name. Subtraction would have shipped every one.
 """
-import io
+import json
 import os
-import re
+import subprocess
+import sys
 
 import pytest
+
+from tools.childproc import run as _child_run
 
 from relay.fleet_toolset import (DELIBERATELY_EXCLUDED, FLEET_TOOLS, is_allowed,
                                  unknown_tools)
 
-CATALOGUE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                         ".fleet", "tool_catalogue.txt")
-
-
 def _catalogue():
-    if not os.path.exists(CATALOGUE):
-        pytest.skip("no catalogue dump on this machine")
-    names = []
-    for line in io.open(CATALOGUE, encoding="utf-8"):
-        m = re.match(r"^([a-z][a-z0-9_]{2,44})\s+--\s", line)
-        if m:
-            names.append(m.group(1))
-    if not names:
-        pytest.skip("catalogue dump parsed to nothing")
-    return sorted(set(names))
+    """The tools that actually exist, from the registry the gateway dispatches on.
+
+    THIS READ A DUMP UNDER `.fleet/`, WHICH IS GITIGNORED. So the guard below -- the one this
+    module's own docstring calls the point of the whole module -- skipped in CI on every run
+    since it was written, and on the one machine that had a dump it compared against a snapshot
+    taken by hand on 2026-08-30 that nothing refreshes. Pointed at the live registry on
+    2026-09-14 it immediately found ELEVEN tools nobody had decided about.
+
+    IN A SUBPROCESS, AND THAT IS THE POINT. Importing `main` inside the pytest session reads a
+    registry the session has already altered: conftest's autouse `_no_desktop_toasts` replaces
+    `notify_ops.notify_desktop` with a local function called `_capture`, and `_ALL_TOOLS` is
+    keyed by `__name__` -- so an in-process import reported `notify_desktop` MISSING and
+    `_capture` PRESENT, and six turn tools absent besides. conftest already names this hazard
+    forty lines above the fixture: *"the failure looks like a bug in the tool map and is a bug
+    in what the test inherited."* A clean interpreter is the only way to see the real thing.
+    """
+    # `childproc.run`, NOT `subprocess.run(text=True)`. The first draft used the latter and
+    # `tools/test_child_output_is_not_decoded_by_luck.py` refused it within the hour: `text=True`
+    # decodes with the local code page (cp932 on this machine), so one non-cp932 byte from the
+    # child loses the WHOLE output -- measured twice in one week on `git diff`, once aborting an
+    # arm with 60 instances already solved. A tool NAME cannot carry such a byte, and that is
+    # exactly the reasoning the guard exists to refuse: the rule is the call shape, not a guess
+    # about the payload.
+    # THE ENVIRONMENT IS STATED, NOT INHERITED -- and that is half of what makes the answer
+    # reproducible. `main.py` decides what to register from a dozen MCP_* variables, so
+    # `dict(os.environ, ...)` let ~5,900 earlier tests choose. Measured:
+    #
+    #   MCP_EXECUTION_PROFILES=0  ->  172 tools
+    #   MCP_EXECUTION_PROFILES=1  ->  178 tools   (the six turn tools, main.py:167)
+    #
+    # This file passed 19/19 alone, in a shell where the flag happened to be on, and failed at
+    # test 5,967 of the CI suite where it was off -- reporting six decided tools as "no longer
+    # registered", which was true of that configuration and the wrong question.
+    #
+    # THE WIDEST SURFACE IS THE ONE TO AUDIT: a tool that exists under any supported
+    # configuration is one a worker could reach, so it needs a decision -- and a decision about
+    # a profile-only tool is live, not stale. The flag is on here for that reason, and every
+    # other MCP_* is dropped so nothing can move the answer behind this test's back.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MCP_")}
+    env["MCP_API_KEY"] = "test-only"
+    env["MCP_TOOL_MAP"] = "1"
+    env["MCP_EXECUTION_PROFILES"] = "1"
+    out = _child_run(
+        [sys.executable, "-c",
+         "import json,sys;sys.path.insert(0,'.');import main;"
+         "print('<<<'+json.dumps(sorted(main._ALL_TOOLS))+'>>>')"],
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        env=env, timeout=180)
+    body = out.stdout or ""
+    # A SKIP HERE WOULD RECREATE THE BUG BEING FIXED -- the old version skipped whenever its
+    # input was missing, which in CI was always, so say what went wrong instead.
+    assert "<<<" in body and ">>>" in body, (
+        "could not read the tool registry (rc=%s), with MCP_* = %r:\n%s\n%s"
+        % (out.returncode, sorted(k for k in env if k.startswith("MCP_")),
+           body[-2000:], (out.stderr or "")[-2000:]))
+    return json.loads(body.split("<<<", 1)[1].split(">>>", 1)[0])
 
 
 def test_the_allowed_set_is_small_enough_to_have_been_read():
@@ -99,7 +144,121 @@ def test_every_catalogue_tool_has_been_decided_about():
         % (len(missing), ", ".join(missing)))
 
 
-# ---- enforcement: shadow by default, and the gateway actually consults it -----------------
+def test_the_audited_registry_is_the_widest_one():
+    """WHICH TOOLS EXIST IS A FUNCTION OF A FEATURE FLAG, and the audit must not inherit it.
+
+    `main.py:167` registers six turn tools only under `MCP_EXECUTION_PROFILES=1` -- 172 tools
+    without it, 178 with. Auditing the narrow set would call six live decisions stale (which is
+    exactly how this file failed at test 5,967 of the CI suite), and auditing whatever the
+    environment happened to hold would make the answer depend on test order.
+
+    So the six are asserted present. If a future profile adds more tools, this fails and the
+    fix is to widen the stated environment, not to narrow the question.
+    """
+    got = set(_catalogue())
+    profile_only = {"claim_turn", "heartbeat", "commit_turn", "abort_turn",
+                    "read_job_context", "get_job_status"}
+    missing = sorted(profile_only - got)
+    assert not missing, (
+        "the audited registry is missing the execution-profile tools %s, so this file is "
+        "auditing a narrower surface than a worker can reach" % (missing,))
+
+
+def test_no_decision_survives_the_tool_it_was_about():
+    """The same rot in the other direction, and the guard only ever looked one way.
+
+    A tool that is renamed or removed leaves its entry behind, and the entry reads exactly like
+    a live decision -- so the set slowly becomes a list of refusals about things that no longer
+    exist, which is how a reader stops trusting any of it. Zero today; the point is that it
+    stays checkable now that the comparison is against the registry rather than a dump."""
+    known = set(FLEET_TOOLS) | set(DELIBERATELY_EXCLUDED)
+    stale = sorted(known - set(_catalogue()))
+    assert not stale, (
+        "%d decisions name tools that are no longer registered: %s" % (len(stale), stale))
+
+
+# ---- enforcement: shadow by default, and NOTHING CONSULTS IT -----------------------------
+
+
+def _importers(module, self_path):
+    """Tracked non-test modules that IMPORT `module` -- by the import statements, not by the
+    spelling. A substring scan cannot tell an import from a comment about one."""
+    import ast
+    import subprocess
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    out = subprocess.check_output(["git", "ls-files"], cwd=root).decode("utf-8", "replace")
+    hits = set()
+    for rel in out.splitlines():
+        if not rel.endswith(".py") or rel == self_path:
+            continue
+        base = os.path.basename(rel)
+        if base.startswith("test_") or base.endswith("_test.py"):
+            continue
+        try:
+            # THE FILENAME IS PASSED so a SyntaxWarning from a scanned file says WHICH file.
+            # Without it the scan emits `<unknown>:50: invalid escape sequence '\.'` on every
+            # run, which names nothing and teaches a reader to ignore warnings.
+            tree = ast.parse(open(os.path.join(root, rel), encoding="utf-8").read(),
+                             filename=rel)
+        except (OSError, UnicodeDecodeError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                if any(a.name.split(".")[-1] == module for a in node.names):
+                    hits.add(rel)
+                    break
+            elif isinstance(node, ast.ImportFrom):
+                parts = (node.module or "").split(".")
+                if (parts and parts[-1] == module) or any(a.name == module
+                                                          for a in node.names):
+                    hits.add(rel)
+                    break
+    return sorted(hits)
+
+
+#
+# This heading used to end "and the gateway actually consults it". No test below checked that,
+# and it was not true: main.py removed the call site on purpose. The tests that follow all call
+# `check` directly, so they say what the gate WOULD do -- which is worth keeping and is not the
+# same claim. The one that closes the gap is the next one.
+
+
+def test_nothing_in_production_consults_the_gate():
+    """The enforcement entry point has no caller outside this file.
+
+    Measured 2026-09-14 across `git ls-files`: `check` is imported by this test and by nothing
+    else. `main.py` says why -- "the benchmark's tool-population policy ... is a fact about that
+    benchmark, not about this server" -- and leaves the list "for the runner that owns it"; the
+    runner does not consult it either. So every test below describes a gate wired to nothing.
+
+    THE SCANNER COULD NOT HAVE TOLD ANYONE. `tools/unreached.py` drops a name defined in more
+    than one module, and `check` and `mode` are both defined several times in this repository,
+    so only `unknown_tools` -- a name unique to this file -- ever appeared in the baseline. The
+    dead gate sat behind that blind spot.
+
+    IF YOU WIRED IT, THIS TEST IS SUPPOSED TO FAIL. That is the decision being made; record it
+    in docs/unreached_burndown.md and delete this test. What it must not do is stay silently
+    true while a heading says the opposite.
+    """
+    assert _importers("fleet_toolset", "relay/fleet_toolset.py") == [], (
+        "fleet_toolset is imported by %r -- the gate is live now. Record that decision in "
+        "docs/unreached_burndown.md and delete this test."
+        % (_importers("fleet_toolset", "relay/fleet_toolset.py"),))
+
+
+def test_the_scan_that_says_nothing_consults_it_can_see_a_caller():
+    """A scan that finds nothing everywhere proves nothing anywhere.
+
+    The first version of the test above matched the SPELLING -- any file containing both
+    "fleet_toolset" and "import" -- and answered `['main.py']`, whose only mention is the
+    comment saying the call site was REMOVED. It would have pinned the opposite of the fact it
+    exists to pin. These three modules are imported by name in production, so an AST scan that
+    returns nothing for them is broken rather than reassuring."""
+    for mod, own in (("quota_meter", "relay/quota_meter.py"),
+                     ("autonomy_gate", "relay/autonomy_gate.py"),
+                     ("session_store", "bridge/session_store.py")):
+        assert _importers(mod, own), "the scan found no importer of %s; it is broken" % mod
 
 def test_the_default_is_enforce_now_that_the_shadow_window_has_run():
     """It defaulted to shadow while nobody knew what enforcing would refuse.

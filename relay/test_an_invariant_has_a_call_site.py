@@ -35,6 +35,16 @@ sys.path.insert(0, REPO)
 
 from relay import invariants as INV  # noqa: E402
 
+# AT MODULE SCOPE, DELIBERATELY. These two modules call `invariants.register()` at import, and
+# that is the thing under test -- a promise is declared when the module loads, not when someone
+# asks. Importing them inside `_registered_names()` meant the FIRST test to call it performed
+# the import, so the registration landed in that test's throwaway copy of the registry (see
+# `_clean_registry`) and was restored away before the next test looked. The file then passed
+# only when some other file in the run had already imported them, which is exactly what
+# happened: alone it failed, and with relay/test_fleet_reconcile.py in front of it, it passed.
+import relay.fleet_reconcile  # noqa: E402,F401
+import relay.relay_fleet      # noqa: E402,F401
+
 
 @pytest.fixture(autouse=True)
 def _clean_registry(monkeypatch, tmp_path):
@@ -125,9 +135,8 @@ def test_an_allowlist_narrows_to_what_it_names(monkeypatch):
 # ── the promises this repository actually makes ───────────────────────────────────────────
 
 def _registered_names():
-    import relay.fleet_reconcile  # noqa: F401
-    import relay.relay_fleet      # noqa: F401
-
+    """Whatever the production modules declared at import. They are imported at the top of this
+    file, not here -- see the note beside those imports for the bug that caused."""
     return dict(INV.REGISTRY)
 
 
@@ -185,6 +194,20 @@ def test_every_invariant_states_why_it_exists():
     thin = sorted(n for n, e in _registered_names().items()
                   if len((e.get("why") or "").strip()) < 40)
     assert not thin, "理由が書かれていない: %s" % ", ".join(thin)
+
+
+def test_the_registry_is_populated_before_any_fixture_copies_it():
+    """THE BUG THIS FILE HAD. `_clean_registry` hands each test its own copy of the registry, so
+    a registration that happens DURING a test is discarded when monkeypatch restores. Production
+    invariants must therefore be declared at import -- which is what the layer promises anyway:
+    "declared up front so the set of promises this repository makes at runtime can be listed".
+
+    Asserted against the copy this test was given, not against a fresh import, because the copy
+    is what every other test in the file reads."""
+    assert "reconciler.transcripts_are_readable" in INV.REGISTRY, (
+        "the registry this test was handed is missing a production invariant, which means the "
+        "registering module was imported lazily and its declaration was thrown away with some "
+        "earlier test's copy")
 
 
 def test_the_reconciler_promise_is_the_one_that_failed():

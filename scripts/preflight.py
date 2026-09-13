@@ -92,7 +92,14 @@ def main(argv=None):
         return 1
 
     gates = [
-        ("Audit hermetic test manifest", [PY, "scripts/check_ci_test_manifest.py"]),
+        # --strict-untracked BECAUSE THIS COMMAND IS THE PRE-PUSH ONE. The audit reads the git
+        # INDEX, so a test file that exists but has not been added is invisible to it: on
+        # 2026-09-14 this gate passed here, printing the new file only as a NOTE, and CI went
+        # red on that exact file one commit later. "Everything CI runs, run here" is false
+        # whenever the tree being audited is not the tree being pushed, and an untracked test
+        # file is the commonest way for those two to differ.
+        ("Audit hermetic test manifest",
+         [PY, "scripts/check_ci_test_manifest.py", "--strict-untracked"]),
         ("Integration evidence for new definitions", [PY, "scripts/check_integration_evidence.py"]),
         ("No identifying names in tracked files", [PY, "scripts/check_no_identifying_names.py", "."]),
         ("Run script-style tracer tests", [PY, "tools/test_trace.py"]),
