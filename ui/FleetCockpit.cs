@@ -13012,7 +13012,22 @@ class CockpitWindow : Window
     void ClearHistory()
     {
         _history.Clear(); _archivedKeys.Clear();
-        try { if (File.Exists(_historyPath)) File.Delete(_historyPath); } catch (Exception) { }
+        // RENAMED, NOT DELETED -- the same rule PreserveUnreadableHistory already applies to
+        // this exact file. The button still clears the history; the bytes are still on disk for
+        // whoever asks what went wrong. .fleet/history.json went missing once and the only code
+        // that could have removed it was this line, with no confirmation in front of it and
+        // nothing left behind to read. An absent history is indistinguishable from a first run
+        // by design (see LoadHistory), so nothing would have reported it either.
+        try
+        {
+            if (File.Exists(_historyPath))
+            {
+                string kept = _historyPath + ".cleared-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+                if (File.Exists(kept)) File.Delete(_historyPath);
+                else File.Move(_historyPath, kept);
+            }
+        }
+        catch (Exception) { }
         try
         {
             var st = ReadStatus();

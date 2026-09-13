@@ -5,9 +5,18 @@ never stage all 50 at once). After a fleet batch finishes:
 
   python bench/pro_capture.py --preds .fleet/swe/pro_preds_50.json [--keep]   # --keep = don't delete
 """
-import argparse, hashlib, json, os, pathlib, shutil, subprocess, time
+import argparse, json, os, pathlib, shutil, subprocess, sys, time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# SAME REASON AS _routed_diff's import note, one level up: run as `python bench/pro_capture.py`,
+# sys.path[0] is bench/ and `import relay` raises ImportError. That file turned the failure into
+# "routing is off" and a run scored zero; here it would silently cost the digest that joins an
+# attempt to its verdict, so the path is fixed instead of the failure being caught.
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
+
+from relay.mechanism_telemetry import patch_hash  # noqa: E402
 SW = os.path.join(REPO, ".fleet", "swe")
 WTMAP = os.path.join(SW, "pro_wt_map.json")
 
@@ -72,8 +81,11 @@ def _emit(preds, have, inst, d, prefix, refused=""):
         stamp = time.strftime("%Y%m%d_%H%M%S")
         with open(os.path.join(snap_dir, "%s__%s.json" % (inst[:80], stamp)),
                   "w", encoding="utf-8") as fh:
+            # THE SHARED RULE, NOT A SECOND COPY OF IT. mechanism_telemetry.patch_hash is
+            # the digest the grader join is defined on; computing the same thing here by hand
+            # is how the two come to disagree about what "the patch" was.
             json.dump({"instance_id": inst, "patch": d, "captured_at": time.time(),
-                       "patch_sha256_16": hashlib.sha256(d.encode("utf-8")).hexdigest()[:16]},
+                       "patch_sha256_16": patch_hash(d)},
                       fh, ensure_ascii=False)
     except Exception:
         # A snapshot that cannot be written must not cost the capture it is observing.

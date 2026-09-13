@@ -38,6 +38,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
+#: RESOLVED FROM THIS FILE, NOT FROM ROOT. The runner's own tests relocate ROOT to a temp
+# tree holding the fake suites they build, so `ROOT / "scripts" / ...` points at nothing
+# there and every suite failed to launch with exit 2 -- which the runner reported as the
+# suite failing. The wrapper lives beside this file whatever ROOT is pointed at.
+_ISOLATE = Path(__file__).resolve().parent / "run_isolated.py"
+
 #: path -> expected passing checks, or None for "must pass completely".
 #:
 #: EVERY ENTRY IS None AS OF 2026-08-18, and that is the point: when CI first ran
@@ -99,7 +105,13 @@ def run_one(rel: str, expected, timeout: int = None):
     # ._git: text=True alone decodes the child with the locale codec, and these suites print
     # Japanese.
     try:
-        proc = subprocess.run([sys.executable, str(ROOT / rel)], cwd=str(ROOT),
+        # THROUGH run_isolated, NOT DIRECTLY. These are plain scripts, so conftest never
+        # runs for them and nothing has ever stopped them writing into the operator records
+        # pytest tests are kept out of. Measured 2026-09-13: one preflight appended 67 rows
+        # to the real .fleet/mechanisms.jsonl from this phase. run_isolated applies
+        # conftest.LIVE_RECORD_REDIRECTS -- the same table, not a copy -- before exec.
+        proc = subprocess.run([sys.executable, str(_ISOLATE), str(ROOT / rel)],
+                              cwd=str(ROOT),
                               capture_output=True, text=True,
                               encoding="utf-8", errors="replace",
                               timeout=TIMEOUT_S if timeout is None else timeout)

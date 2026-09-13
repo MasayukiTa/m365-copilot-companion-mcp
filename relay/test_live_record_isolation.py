@@ -87,19 +87,61 @@ def fleet_constants():
                     tree = ast.parse(src)
                 except Exception:
                     continue
-                for node in tree.body:
-                    if not isinstance(node, ast.Assign):
-                        continue
-                    segment = ast.get_source_segment(src, node) or ""
-                    if not any('"%s"' % m in segment or "'%s'" % m in segment
-                               for m in RECORD_DIR_MARKERS):
-                        continue
-                    for target in node.targets:
-                        # Uppercase or _UPPERCASE: the module-level-constant convention. A
-                        # lowercase module-level name is a computed value, not a declared path.
-                        if isinstance(target, ast.Name) and target.id.lstrip("_").isupper():
-                            found.add((_module_path(path), target.id))
+                found |= {(_module_path(path), n) for n in _record_constants(src, tree)}
     return found
+
+
+def _const_targets(node):
+    """The names this assignment binds, filtered to the module-level-constant convention.
+
+    Uppercase or _UPPERCASE. A lowercase module-level name is a computed value, not a declared
+    path."""
+    return [t.id for t in node.targets
+            if isinstance(t, ast.Name) and t.id.lstrip("_").isupper()]
+
+
+def _record_constants(src, tree):
+    """Constants in one module that name a location under an operator-record directory.
+
+    TWO PASSES, BECAUSE A PATH DERIVED FROM A RECORD PATH IS STILL A RECORD PATH. The first
+    pass is the original one: a constant whose own source mentions a marker directory. The
+    second credits any constant built from one already credited, to a fixpoint.
+
+    THE MISS THAT PAID FOR THE SECOND PASS. tools/lock_state.py writes three files under
+    .fleet; two name the directory in their own line and were redirected, and the third is
+
+        _TOKEN_GAP_FILE = _STATE_FILE.parent / "unlock_token_gap.json"
+
+    which mentions no marker and so was never listed -- while conftest, moving `_STATE_FILE`
+    alone, left it pointing at the real directory, because it was computed from the real one at
+    import time. Measured 2026-09-13: the operator's live unlock_token_gap.json held
+    198.51.100.2/.3/.77 and 203.0.113.77, RFC 5737 documentation addresses that exist only in
+    this repository's tests. That file's count is what decides whether MCP_REQUIRE_UNLOCK_TOKEN
+    can be enforced, so the contamination was in the evidence for a security change.
+
+    STILL A TRIPWIRE, NOT A PROOF -- see fleet_constants(). A path assembled at call time, or
+    derived through a function rather than an assignment, passes through both passes.
+    """
+    assigns, declared = [], set()
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        targets = _const_targets(node)
+        if not targets:
+            continue
+        segment = ast.get_source_segment(src, node) or ""
+        refs = {n.id for n in ast.walk(node.value) if isinstance(n, ast.Name)}
+        assigns.append((targets, refs))
+        if any('"%s"' % m in segment or "'%s'" % m in segment for m in RECORD_DIR_MARKERS):
+            declared.update(targets)
+    changed = True
+    while changed:
+        changed = False
+        for targets, refs in assigns:
+            if (refs & declared) and not set(targets) <= declared:
+                declared.update(targets)
+                changed = True
+    return declared
 
 
 def test_the_walker_finds_something():

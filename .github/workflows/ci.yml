@@ -110,6 +110,7 @@ jobs:
             bench/test_a_partial_stage_is_not_a_lost_chunk.py \
             bench/test_a_benchmark_episode_is_not_split.py \
             bench/test_resolved_has_one_home.py \
+            bench/test_the_patch_digest_has_one_implementation.py \
             tests/test_grep_memory_bound.py \
             tests/test_bridge_answer_source.py \
             relay/test_sibling_edge_reset.py \
@@ -150,10 +151,14 @@ jobs:
             tools/test_auto_is_a_mode_not_a_label.py \
             relay/selfimprove/test_one_rate_over_two_populations.py \
             relay/selfimprove/test_a_slice_that_cannot_decide_is_not_burned.py \
+            relay/selfimprove/test_the_rollback_has_a_handle.py \
             tools/test_child_output_is_not_decoded_by_luck.py \
             tools/test_nothing_new_is_built_without_a_caller.py \
             tools/test_a_call_under_an_alias_is_a_call.py \
             tools/test_the_gate_can_be_turned_on.py \
+            tools/test_a_counter_that_gates_a_switch_is_read.py \
+            tools/test_a_declared_field_is_a_written_field.py \
+            scripts/test_a_script_suite_writes_where_a_test_writes.py \
             tools/test_a_backfilled_conversation_is_the_right_one.py \
             tools/test_folder_policy.py \
             tools/test_security.py \
@@ -458,6 +463,8 @@ jobs:
             relay/test_gateway_executes.py \
             relay/test_lens_selection.py \
             relay/test_live_record_isolation.py \
+            relay/test_a_derived_path_is_still_a_path.py \
+            relay/test_a_swallowed_record_is_no_record.py \
             relay/test_mechanism_telemetry.py \
             relay/test_a_measured_timeout_is_not_a_guess.py \
             relay/test_the_repeat_signal_leaves_a_record.py \
@@ -471,6 +478,8 @@ jobs:
             relay/test_a_preamble_is_not_a_subtask.py \
             relay/test_an_unknown_outcome_is_an_omission.py \
             relay/test_rows_registered_together_are_distinguishable.py \
+            relay/test_a_compressed_transcript_is_still_a_transcript.py \
+            relay/test_a_reset_browser_keeps_no_token.py \
             relay/test_mechanism_records_name_their_run.py \
             relay/test_memory_dedupe.py \
             relay/test_fleet_reconcile.py \

@@ -329,19 +329,27 @@ def locked_since(since: float, now: Optional[float] = None) -> bool:
 
 
 def _cli() -> None:
-    """`python -m tools.lock_state show` -- prints the last recorded refusal (or {}) as
-    JSON. The cockpit's 詳細設定/Advanced panel shells out to this to surface the most
-    recently refused client without a human having to look the IP up by hand."""
+    """`python -m tools.lock_state [show|token-gap]`, printing JSON.
+
+    `show` prints the last recorded refusal (or {}). The cockpit's 詳細設定/Advanced panel
+    shells out to it to surface the most recently refused client without a human having to look
+    the IP up by hand, and it is the default so that call keeps working unchanged.
+
+    `token-gap` answers whether MCP_REQUIRE_UNLOCK_TOKEN can be switched on and what it would
+    refuse. It is here rather than beside `python -m tools.security list` because security.py is
+    in the frozen set, where a change means the operator re-signs the baseline with a reason --
+    not a trade worth making for a report, and the counter it reads lives in this file anyway.
+    """
     import sys
 
-    if len(sys.argv) > 1 and sys.argv[1] != "show":
-        print(json.dumps({"error": "usage: python -m tools.lock_state show"}))
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "show"
+    if cmd not in ("show", "token-gap"):
+        print(json.dumps({"error": "usage: python -m tools.lock_state [show|token-gap]"}))
         raise SystemExit(2)
+    if cmd == "token-gap":
+        print(json.dumps(token_gap_report(), ensure_ascii=False))
+        return
     print(json.dumps(read_state(), ensure_ascii=False))
-
-
-if __name__ == "__main__":
-    _cli()
 
 
 #: Calls that PASSED the unlock gate on the strength of the identity alone -- no matching
@@ -399,3 +407,80 @@ def token_gap() -> dict:
     except Exception:
         pass
     return {}
+
+
+#: How long the gap must stay quiet before enforcement is safe to switch on.
+#:
+#: DERIVED, NOT CHOSEN. An unlock grant lasts MCP_UNLOCK_TTL_DAYS (default 30), and a caller
+#: that has passed the gate on identity alone holds one. Once a full TTL has gone by with no
+#: such call recorded, every grant still in the table was established after the last gap, so
+#: nothing is relying on the identity-only path any more.
+#:
+#: WHAT IT DOES NOT PROVE: a caller that holds a grant and simply has not called in that window
+#: is indistinguishable from one that went away. This is the strongest statement the counter can
+#: support, not a guarantee, which is why the report prints the raw numbers beside it.
+def _token_gap_quiet_seconds() -> float:
+    return float(os.environ.get("MCP_UNLOCK_TTL_DAYS", "30")) * 86400.0
+
+
+def token_gap_report() -> dict:
+    """Whether MCP_REQUIRE_UNLOCK_TOKEN can be switched on, and what it would break.
+
+    record_token_gap() above has counted every call that passed the unlock gate on the strength
+    of the identity alone since 2026-08-18, and its docstring says what the count is for -- "this
+    counter is what says when it is safe ... when it stops growing, every live caller is
+    presenting a token and the switch costs nothing". Nothing read it for 26 days.
+
+    MEASURED 2026-09-13 on the live file: 154 calls, the most recent that same morning, 146 of
+    them from ONE address. So the answer it had been holding was no, and emphatically --
+    enforcement would have refused the live integration -- and there was no way to ask.
+
+    `ips` is part of the answer, not decoration: the count alone cannot tell one live integration
+    from a hundred stragglers, and that difference is the whole decision.
+    """
+    from tools.security import enforce_unlock_token   # read, not modified: see module note
+
+    gap = token_gap()
+    count = int(gap.get("count", 0) or 0)
+    last = float(gap.get("last_ts", 0) or 0)
+    quiet_for = (time.time() - last) if last else None
+    return {
+        "enforcing": enforce_unlock_token(),
+        "count": count,
+        "first_ts": gap.get("first_ts") or None,
+        "last_ts": gap.get("last_ts") or None,
+        "quiet_for_seconds": quiet_for,
+        "quiet_required_seconds": _token_gap_quiet_seconds(),
+        "ips": dict(gap.get("ips") or {}),
+        "safe_to_enforce": count == 0 or (
+            quiet_for is not None and quiet_for >= _token_gap_quiet_seconds()),
+    }
+
+
+def token_gap_warning() -> str:
+    """One line for the server log at startup, or "" when there is nothing to say.
+
+    A REPORT NOBODY RUNS IS THE SAME AS NO REPORT. The counter went unread for 26 days while a
+    subcommand would have printed it on request; what was missing was not a formatter but a
+    reader that runs without being asked. Printed once per boot, and only while there is an
+    actual answer -- silence here means the switch is free.
+    """
+    try:
+        r = token_gap_report()
+    except Exception:
+        return ""
+    if r["enforcing"] or r["safe_to_enforce"] or not r["count"]:
+        return ""
+    top = sorted(r["ips"].items(), key=lambda kv: -kv[1])[:3]
+    return ("[unlock] MCP_REQUIRE_UNLOCK_TOKEN is OFF; %d call(s) have passed with no token "
+            "(last %s). Turning it on now would refuse: %s"
+            % (r["count"],
+               time.strftime("%Y-%m-%d %H:%M", time.localtime(r["last_ts"] or 0)),
+               ", ".join("%s x%d" % (ip or "(unknown)", n) for ip, n in top) or "(unknown)"))
+
+
+# AT THE END, NOT IN THE MIDDLE. This block used to sit directly under _cli(), which
+# meant it ran while the rest of the module was still being defined -- fine for `show`,
+# and a NameError for any subcommand reading something declared below it.
+if __name__ == "__main__":
+    _cli()
