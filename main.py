@@ -537,11 +537,30 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
             _help = "%s%s\n%s" % (name, sig, (getattr(fn, "__doc__", "") or "").strip())
             _log_discovery("call_tool.signature", {"name": name}, _help)
             return _help
-        # REMOVED: the benchmark's tool-population policy, consulted here.
+        # THE FLEET'S TOOL POLICY, CONSULTED HERE AGAIN -- an operator decision taken
+        # 2026-09-14, recorded in docs/unreached_burndown.md.
         #
-        # Which sixteen tools a benchmark worker may reach is a fact about that benchmark,
-        # not about this server, and general dispatch is the wrong place to hold it. The
-        # list is still in relay/fleet_toolset.py for the runner that owns it.
+        # It was removed on 2026-08-31 with the argument that "which sixteen tools a benchmark
+        # worker may reach is a fact about that benchmark, not about this server", and that
+        # general dispatch is the wrong place to hold it. The policy is still not held here --
+        # it lives in relay/fleet_toolset.py and this line only ASKS it. What the removal also
+        # threw away was `_fleet_run_active()`, the mechanism built for the gateway's one real
+        # problem: it cannot tell a worker from the operator. That is why the check can sit in
+        # general dispatch without governing the operator -- it returns allowed unless an
+        # unattended run is in flight, and the runner that owns the list never consulted it
+        # either, so removing the call site did not move the gate anywhere. It disarmed it.
+        #
+        # This is the only point that sees every dispatched call by its real name; the adapter
+        # above sees `call_tool`.
+        try:
+            from relay import fleet_toolset as _toolset
+            _allowed, _why = _toolset.check(name)
+        except Exception:
+            _allowed, _why = True, ""      # a policy that can break dispatch is worse than none
+        if not _allowed:
+            _refused = "[call_tool: refused. %s]" % _why
+            _log_discovery("call_tool.refused", {"name": name}, _refused)
+            return _refused
         # EVIDENCE TRACE. Off unless a runner asked for one, and a no-op in ordinary
         # operation. This is the only point that sees every dispatched call with its real
         # name and arguments -- recording at the adapter would name `call_tool` and nothing

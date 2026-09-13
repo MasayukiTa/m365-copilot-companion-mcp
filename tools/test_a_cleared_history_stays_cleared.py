@@ -136,6 +136,25 @@ def test_the_watermark_belongs_to_the_store_the_ledger_came_from(tmp_path):
     assert list(R.build(socket_route=ledger, transcripts=str(tmp_path / "none"))) == []
 
 
+def test_the_clear_markers_are_names_rather_than_paths(tmp_path):
+    """WHY THEY ARE NOT `os.path.join(FLEET, ...)`, which is how they were first written.
+
+    Nothing uses them as a path -- the directory always comes from the caller, derived from the
+    store the ledger was read from. Spelt as full paths they read as "the operator's clear log"
+    and tripped relay/test_live_record_isolation.py, which requires every module-level constant
+    naming .fleet to be redirected for tests or declared safe. Neither answer fits a value that
+    is only ever a basename: redirecting it would change the FILENAME and leave the directory
+    exactly where it was. The gate was right and the constant was wrong.
+    """
+    for name in (R.CLEARED_LOG_NAME, R.CLEARED_KEPT_GLOB_NAME):
+        assert os.sep not in name and "/" not in name, (
+            "%r names a directory; the store is the caller's to choose" % (name,))
+    # and they are still the names the cockpit actually writes
+    assert R.cleared_through(fleet=str(tmp_path)) == 0.0
+    (tmp_path / R.CLEARED_LOG_NAME).write_text(json.dumps({"ts": 7.0}) + "\n", encoding="utf-8")
+    assert R.cleared_through(fleet=str(tmp_path)) == 7.0
+
+
 # ── the cockpit's half ────────────────────────────────────────────────────────────────────
 
 def _clear_history_body():

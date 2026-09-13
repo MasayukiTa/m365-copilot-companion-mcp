@@ -58,6 +58,15 @@ LIVE_RECORD_REDIRECTS = {
     # Written on the hot path of EVERY tool call, so a test that reaches the gateway fills the
     # operator's evidence ledger with calls that were never made in earnest.
     "tools.tool_ledger": {"LEDGER_PATH": "tool_events.jsonl"},
+    # THE EVIDENCE FOR A POLICY DECISION, WRITTEN BY THE TESTS ABOUT IT. fleet_toolset.check()
+    # appends a row for every call it would refuse, and the module's own prose cites that log
+    # as the measurement justifying its default of `enforce`. Its tests call check() directly
+    # with _fleet_run_active monkeypatched true, so each local run added a row to the operator's
+    # file: 219 lines on 2026-09-14, one of which this suite had just written (measured 219 ->
+    # 220 on a single run of relay/test_fleet_toolset.py). Every row was `process_kill`, which
+    # is exactly what the tests use -- so the log could not distinguish a refusal that happened
+    # from one a test simulated, and the evidence for the switch was not evidence.
+    "relay.fleet_toolset": {"SHADOW_LOG": "toolset_shadow.jsonl"},
     # Written at admission for every benchmark task; a test that admits a task would otherwise
     # add terms to the operator's real contract file, which is append-only and first-wins.
     "relay.acceptance_contract": {"CONTRACT_PATH": "acceptance_contracts.jsonl"},

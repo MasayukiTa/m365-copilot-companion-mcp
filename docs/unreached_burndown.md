@@ -58,6 +58,69 @@ flagged unwired by an adversarial review hours earlier, nearly hidden behind an 
 > **A false "reached" is worse than a false "unreached".** The row disappears, and nobody reads
 > what is not printed. When tightening this tool, prefer noise over silence.
 
+## The gate that was wired to nothing, and the operator decision to wire it back
+
+`relay/fleet_toolset.py::check` is the enforcement entry point for the sixteen tools a fleet
+worker may reach. On 2026-08-31 `main.py` removed the call site with a good argument — "which
+sixteen tools a benchmark worker may reach is a fact about that benchmark, not about this
+server, and general dispatch is the wrong place to hold it" — and left the list "for the runner
+that owns it". **The runner never consulted it either.** For the fortnight that followed, the
+module's own heading said "and the gateway actually consults it", every test in its file
+described what the gate *would* do, and nothing anywhere asked it a question.
+
+**The scanner could not have reported it.** `check` and `mode` are each defined in several
+modules, so they sat in the ambiguity bucket — a name the tool was never allowed to judge — and
+only `unknown_tools`, unique to that file, ever reached the inventory. Iterating to a fixed
+point does not reveal them either; that is a different mechanism, and `scan().ambiguous` now
+prints them rather than skipping them silently.
+
+**Wired back 2026-09-14, an operator decision.** The removal's argument still holds and the
+policy still is not held in dispatch: `main.py` asks one question and `fleet_toolset` owns the
+answer. What the removal also discarded was `_fleet_run_active()` — the mechanism built for the
+gateway's one real problem, that it cannot tell a worker from the operator. That is what makes
+a check in general dispatch harmless: outside an unattended run it allows everything, verified
+here against the live contract state (`inactive`, so nothing is refused today).
+
+Two tests were replaced rather than inverted, as the old ones instructed:
+
+| removed | replaced by |
+|---|---|
+| `test_nothing_in_production_consults_the_gate` | `test_the_gateway_consults_the_gate` — by import statements, not spelling |
+| `test_the_policy_is_no_longer_consulted_by_the_shipped_gateway` | `test_the_refusal_reaches_the_caller_rather_than_the_tool` |
+
+and one was added that neither source assertion can stand in for:
+`test_a_forbidden_tool_is_actually_refused_at_the_gateway` dispatches `process_kill` through the
+real gateway with the gate armed and asserts the refusal, **and** dispatches `read_file` to
+prove an allowed tool is not blocked with it — a gate that refused everything would pass a
+refusal-only test and stop every worker dead.
+
+### The evidence for `enforce` was being written by the tests about it
+
+The module cites its shadow log as the measurement that justified switching the default from
+`shadow` to `enforce`: "FOUR entries, all of them `process_kill`". The file held **220 rows
+spanning 2026-08-30 to 2026-09-14**, and every row said `process_kill` — which is exactly the
+tool its own tests pass to `check()`.
+
+`SHADOW_LOG` was a relative path and was absent from `conftest.LIVE_RECORD_REDIRECTS`, so each
+local run of `relay/test_fleet_toolset.py` appended a row to the operator's file. Measured
+directly: **219 → 220 on one run, and 220 → 220 after the redirect was added.** The log could
+not distinguish a refusal that happened from one a test simulated.
+
+The four rows are still the first four and still fall inside the stated window, so the window is
+not withdrawn — but nothing after it may be read as evidence. The default stays `enforce`
+because the argument does not rest on the count: `process_kill` reaches any process on the
+machine including the server hosting the gate, and `shell_exec` covers a worker's own tree.
+
+**And the walker that should have caught it had a blind spot of the same shape as everything
+else here.** `relay/test_live_record_isolation.py` credits a constant when its source text
+contains the marker *wrapped in quotes* — `'".fleet"' in segment`. That matches
+`os.path.join(REPO, ".fleet")` and misses `".fleet/toolset_shadow.jsonl"`, where the character
+after `.fleet` is a slash. A whole path in one literal was invisible to the walker whose entire
+purpose is finding shared records. It now parses the literals and splits on both separators, so
+a marker counts when it is a path *component* — and `test_a_whole_path_in_one_literal_is_seen`
+pins both the positives and the negatives (`.fleetwide`, prose mentioning `.fleet`), because a
+walker that over-reports gets entries added to silence it and then it is a formality.
+
 ## The fifth blind spot: a reference count is not a reachability analysis
 
 Counting references answers "does any line name this?" and the inventory needed "can anything
