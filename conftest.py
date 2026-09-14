@@ -43,9 +43,8 @@ ONLY_IF_ALREADY_IMPORTED = frozenset({
     "scripts.diag_report", "scripts.diag_warmup_bias", "scripts.recycle_report",
     "scripts.run_nightly_real", "scripts.settle_stage0_replay",
     "scripts.verify_fleet_transcripts", "scripts.verify_secret_redaction",
-    "scripts.win._mem_strata", "scripts.win._merge_watch", "scripts.win.capture_budget",
-    "scripts.win.checkpoint", "scripts.win.tab_audit", "scripts.win.verify_stack",
-    "scripts.win.watch_stack",
+    "scripts.win.capture_budget", "scripts.win.checkpoint", "scripts.win.tab_audit",
+    "scripts.win.verify_stack", "scripts.win.watch_stack",
 })
 
 LIVE_RECORD_REDIRECTS = {
@@ -109,7 +108,6 @@ LIVE_RECORD_REDIRECTS = {
     "scripts.run_nightly_real": {"ARCHIVE": "selfimprove/archive.jsonl"},
     "scripts.settle_stage0_replay": {"DEFAULT_TRACE": "settle_trace_collect.jsonl"},
     "scripts.verify_fleet_transcripts": {"DEFAULT_DIR": "transcripts"},
-    "scripts.win._merge_watch": {"LOG": "merge_watch.jsonl"},
     "scripts.win.capture_budget": {"ACKED": "capture_budget_acked.json",
                                    "LEDGER": "capture_budget.jsonl"},
     "scripts.win.checkpoint": {"AUDIT_LOG": "checkpoint_audit.jsonl",
@@ -183,20 +181,20 @@ DELIBERATELY_NOT_REDIRECTED = {
     ("scripts.update_from_release", "PRESERVE_NAMES"):
         "a set of directory names to preserve during an update, not a location anything "
         "writes to; redirecting it would stop the updater preserving the real .fleet",
-    # THESE TWO RUN WHEN THEY ARE IMPORTED, which is the evidence rather than the excuse. Both
-    # read sys.argv at module scope: importing verify_secret_redaction raises SystemExit(0), and
-    # _mem_strata dies converting a pytest node id to a float. The redirect fixture found that
-    # out by importing them, which is how the pair moved from the table above to this one.
+    # IT RUNS WHEN IT IS IMPORTED, which is the evidence rather than the excuse: it reads
+    # sys.argv at module scope and raises SystemExit(0). The redirect fixture found that out by
+    # importing it, which is how it moved from the table above to this one. A module no test can
+    # import is a module no test can write through -- and a test that DID import it would not
+    # quietly dirty a record, it would fail loudly on the import. That is a stronger guarantee
+    # than a redirect, not a weaker one.
     #
-    # A module no test can import is a module no test can write through -- and a test that DID
-    # import one would not quietly dirty a record, it would fail loudly on the import. That is a
-    # stronger guarantee than a redirect, not a weaker one.
+    # `scripts/win/_mem_strata.py` and `_merge_watch.py` were listed here and above until CI
+    # rejected both: they are UNTRACKED, present only in one checkout. The walker now reads
+    # `git ls-files`, so neither is visible to it on any machine, and an entry for either is a
+    # stale claim about a file the pushed tree does not contain.
     ("scripts.verify_secret_redaction", "LED"):
         "importing it executes it (sys.argv at module scope, then SystemExit), so no test "
         "can import it and none can write through it",
-    ("scripts.win._mem_strata", "OUT"):
-        "importing it executes it (sys.argv at module scope), so no test can import it and "
-        "none can write through it",
     ("relay.fleet_reconcile", "TRANSCRIPTS"):
         "read-only: the reconciler only ever reads finished transcripts to compare them, and "
         "writes nothing at all. Its own tests pass an explicit directory, so nothing here "

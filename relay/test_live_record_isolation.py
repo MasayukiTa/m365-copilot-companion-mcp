@@ -29,6 +29,7 @@ happened five times: a shared record nobody thought about.
 import ast
 import io
 import os
+import subprocess
 
 import pytest
 
@@ -108,25 +109,31 @@ def fleet_constants():
     passes straight through. What it removes is the failure that actually happened five times
     here: a shared record nobody thought about. Its own docstring said as much when it only
     knew .fleet, and knowing one more name does not make it complete.
+
+    OVER `git ls-files`, NOT OVER THE FILESYSTEM, since 2026-09-14. Walking the directory sees
+    whatever happens to be lying in the checkout, and on this machine that included two
+    untracked scripts. They were classified here, the classification was correct locally, and
+    CI -- which only has the tracked tree -- reported both entries as naming something that does
+    not exist AND could not import one of them. The tree that gets pushed is the only tree whose
+    answer matters; a walk over anything wider produces a table that is right on exactly one
+    machine.
     """
+    out = subprocess.check_output(["git", "ls-files"], cwd=REPO).decode("utf-8", "replace")
     found = set()
-    for package in PACKAGES:
-        root = os.path.join(REPO, package)
-        if not os.path.isdir(root):
+    for rel in out.splitlines():
+        if not rel.endswith(".py") or "__pycache__" in rel:
             continue
-        for dirpath, _dirs, files in os.walk(root):
-            if "__pycache__" in dirpath:
-                continue
-            for name in files:
-                if not name.endswith(".py") or name.startswith("test_"):
-                    continue
-                path = os.path.join(dirpath, name)
-                try:
-                    src = io.open(path, encoding="utf-8", errors="replace").read()
-                    tree = ast.parse(src)
-                except Exception:
-                    continue
-                found |= {(_module_path(path), n) for n in _record_constants(src, tree)}
+        if rel.split("/", 1)[0] not in PACKAGES:
+            continue
+        if os.path.basename(rel).startswith("test_"):
+            continue
+        path = os.path.join(REPO, *rel.split("/"))
+        try:
+            src = io.open(path, encoding="utf-8", errors="replace").read()
+            tree = ast.parse(src)
+        except Exception:
+            continue
+        found |= {(_module_path(path), n) for n in _record_constants(src, tree)}
     return found
 
 
@@ -187,6 +194,31 @@ def test_the_walker_finds_something():
     """A detector that silently finds nothing would pass every assertion below. This
     repository has dozens; if it ever returns an empty set, the walk is broken, not the code."""
     assert len(fleet_constants()) >= 20
+
+
+def test_the_walk_sees_the_tree_that_will_be_pushed():
+    """AN UNTRACKED FILE MUST BE INVISIBLE HERE, and this is what CI taught on 2026-09-14.
+
+    The walk used `os.walk`, so it saw whatever was lying in the checkout. Two untracked scripts
+    on one machine (`scripts/win/_mem_strata.py`, `_merge_watch.py`) were found, classified in
+    conftest, and passed locally -- then CI, which has only the tracked tree, failed twice over:
+    the entries named constants it could not see, and the redirect fixture could not import one
+    of the modules at all. Local green and CI green are different claims, and a table built from
+    a wider tree is right on exactly one machine.
+
+    Asserted by construction rather than by naming those two files: an untracked module is
+    written into the checkout and the walk must not pick it up."""
+    probe = os.path.join(REPO, "relay", "_untracked_walk_probe.py")
+    assert not os.path.exists(probe), "a previous run left %s behind" % probe
+    io.open(probe, "w", encoding="utf-8").write(
+        "import os\nOUT = os.path.join('.fleet', 'untracked_probe.jsonl')\n")
+    try:
+        names = {m for m, _c in fleet_constants()}
+        assert "relay._untracked_walk_probe" not in names, (
+            "the walk reads the filesystem again, so a file that exists only in this checkout "
+            "is being classified -- and CI, which has only the tracked tree, will disagree")
+    finally:
+        os.remove(probe)
 
 
 def test_a_whole_path_in_one_literal_is_seen():
