@@ -672,6 +672,16 @@ AUTOSTART_GRACE_S = float(os.environ.get("FLEET_INTAKE_AUTOSTART_GRACE_S", "240"
 #: spawn a browser every drain pass -- every fifteen seconds -- for as long as the goal waits.
 AUTOSTART_BACKOFF_S = float(os.environ.get("FLEET_INTAKE_AUTOSTART_BACKOFF_S", "900") or 900)
 
+#: The free-space floor an autostarted (non-bench) run admits against. Small on purpose -- it is
+#: not protecting a Docker build, it is protecting the machine's ability to keep working at all.
+#: Sized from what stops being possible below it: git cannot write a loose object, the fleet
+#: cannot write a transcript, and the browser cannot cache. Measured 2026-09-14, all three
+#: failed together at zero, and 174 MB was not enough for a commit of five files.
+#:
+#: See the long note at its use site for why this is not 0 (an "ordinary" goal wrote 5.43 GB)
+#: and not the bench's 6 GB (which blocked everything, silently, for twenty-five minutes twice).
+AUTOSTART_DISK_FLOOR_GB = float(os.environ.get("FLEET_AUTOSTART_DISK_FLOOR_GB", "2") or 2)
+
 #: When an autostarted run gets --fanout. fleet_runner exposes the flag and threads it into
 #: run_relay_fleet(fanout=...), but autostart_fleet never passed it, so a goal that arrives
 #: from the tunnel could never be split -- the one path where a phone-sized instruction is
@@ -890,9 +900,23 @@ def autostart_fleet(goals, state_dir=None, now=None, launcher=None) -> dict:
     # multi-gigabyte Docker reserve was a category error, and the failure it produced (silent,
     # unobservable from the device that asked) is worse than the disk pressure it was avoiding.
     # Bench runs still pass their own floor and keep the protection that was actually earned.
+    #
+    # BUT NOT ZERO, AND "KILOBYTES" WAS WRONG. Measured 2026-09-14: an ordinary goal told to back
+    # a folder up before editing it wrote a **5.43 GB** archive (zip_create walked its own output
+    # -- fixed in tools/archive_ops, but the premise it broke is the one this line rested on).
+    # With the gate disabled the fleet kept admitting while C: drained to **zero bytes**, which
+    # took out git, the fleet's own writes and a business folder's backups together. A goal that
+    # writes kilobytes is the common case, not a guarantee, and this is the last brake before the
+    # machine stops working at all.
+    #
+    # The floor that silently blocked everything is not being restored either: it was the SIZE
+    # (a Docker-sized reserve for a goal that needs none) and the SILENCE (a log line nobody
+    # could see) together that made it unusable. `_note_disk_defer` now reports a block outward
+    # once it outlasts DISK_DEFER_ALERT_AFTER_S, so a floor this small can only ever cost a
+    # notification -- never another twenty-five silent minutes.
     cmd = [sys.executable, "-m", "relay.fleet_runner",
            "--goals-file", goals_file, "--agent-url", url, "--state-dir", sd,
-           "--disk-floor-gb", "0"]
+           "--disk-floor-gb", str(AUTOSTART_DISK_FLOOR_GB)]
     # FAN-OUT WAS WIRED EVERYWHERE BUT HERE. fleet_runner parses --fanout and passes it to
     # run_relay_fleet(fanout=...); the worker gates the split turn itself (depth 0 only). The
     # missing link was this command line: without the flag an autostarted goal could never
