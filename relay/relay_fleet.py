@@ -5813,9 +5813,40 @@ def _with_theme_memory(goal_text, theme_text=None):
         notes = load_notes(theme_from_goal(keyed_on), goal=keyed_on)
         if not notes:
             return goal_text
-        return "%s\n%s\n--- メモここまで ---\n\n%s" % (_MEMORY_HEADER, notes, text)
+        return "%s\n%s\n--- メモここまで ---\n\n%s" % (_MEMORY_HEADER, _where(notes), text)
     except Exception:
         return goal_text
+
+
+#: What goes into a worker's prompt in place of the store's contents.
+#:
+#: MEASURED ON A REAL GOAL, 2026-09-14. Priming "9月分のGC付着異物の報告資料を作ってください"
+#: produced 999 characters, ten index lines, of which NINE were arithmetic smoke tests --
+#: "5 と 6 を足した数だけを1行で返してください" and its siblings -- and the tenth was an earlier
+#: failed run of the same work. Against a protocol of about 1,401 characters. Not one line of it
+#: could have helped, and it is in the prompt of every goal.
+#:
+#: RANKING AND PRUNING WERE ALREADY THERE and did not save it: `prune_index_lines` drops the
+#: unrelated entries only when NONE of them shares a token with the goal, so one line matching
+#: on "ogf" carried the other nine in with it. That is the shape of every fix applied here so
+#: far -- machinery to make an enumeration survive growth, when enumeration is the thing that
+#: cannot survive it. The store holds 216 themes today, 36% of them one-shot questions; at ten
+#: thousand the question is not which forty to send, it is why any are being sent.
+#:
+#: SO: THE LOCATION, NOT THE CONTENTS. A worker that judges the past relevant can read it, the
+#: same way it reaches a Skill -- by asking, not by being handed a catalogue. One line, and it
+#: stays one line however large the store grows.
+_MEMORY_POINTER = ("過去の作業記録は .fleet/memory/ にある（テーマごとの .md と INDEX.md）。"
+                   "必要だと判断したときだけ read_file / list_directory で読むこと。")
+
+
+def _where(_notes):
+    """The pointer, whatever the store contains.
+
+    Takes the notes it replaces so the call site still shows what was being substituted, and so
+    a reader who wants the old behaviour can see exactly where it was.
+    """
+    return _MEMORY_POINTER
 
 
 def _with_repo_contract(goal_text):
