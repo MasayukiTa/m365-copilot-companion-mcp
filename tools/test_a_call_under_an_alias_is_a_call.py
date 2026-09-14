@@ -45,23 +45,55 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
 import unreached  # noqa: E402
 
 
-def _names(files):
-    rows = unreached.scan(files=files) or []
+def _names(files, iterate=True):
+    rows = unreached.scan(files=files, iterate=iterate) or []
     return {name for _key, name, _rel, _ln, _sp, _tr in rows}
 
 
 # ── the defect ────────────────────────────────────────────────────────────────────────────
 
 def test_a_function_called_under_an_alias_is_not_reported_unreached():
-    """THE MEASURED CASE. solve_policy imports it as `_diversify` and calls it."""
+    """THE MEASURED CASE. solve_policy imports it as `_diversify` and calls it.
+
+    ASKED WITHOUT THE ITERATION, and that is the whole care of this test. `scan()` answers two
+    questions: "does any line reach this name" (attribution, which is what an alias is about)
+    and "can anything get here" (reachability). This file is about the first. In the two-file
+    slice below, `solve_policy::plan_solve` -- the function holding the aliased call -- has no
+    caller of its own, so with the iteration on, the chain is legitimately dead and `diversify`
+    is reported for a reason that has nothing to do with aliases.
+
+    INVERTING THE ASSERTION WOULD HAVE BEEN WRONG. `assert "diversify" in _names(...)` passes
+    whether or not the alias is credited, so the test would go on being green while the defect
+    it was written for came back. The next test pins the interaction instead."""
     caller = os.path.join(REPO, "relay", "solve_policy.py")
     callee = os.path.join(REPO, "relay", "selfimprove", "diversify.py")
     if not (os.path.isfile(caller) and os.path.isfile(callee)):
         pytest.skip("the files this was measured on are not present")
     assert "diversify" not in _names(["relay/solve_policy.py",
-                                      "relay/selfimprove/diversify.py"]), (
+                                      "relay/selfimprove/diversify.py"], iterate=False), (
         "エイリアス経由の呼び出しが見えていない -- 現役の本番関数が『未到達』として"
         "ベースラインに凍結される")
+
+
+def test_the_alias_is_credited_and_the_referrer_is_still_unreachable():
+    """BOTH STATEMENTS ARE TRUE AT THEIR OWN LEVEL, and this pins the pair so neither can be
+    quietly traded for the other.
+
+    The reference at solve_policy.py:56 is real -- `diversify` was removed from the inventory on
+    2026-09-13 as a false positive, correctly. The line sits inside `plan_solve`, which nothing
+    reaches. So with the iteration on, both `plan_solve` and `diversify` are reported, and the
+    inventory is right to report them: a reference from dead code is not a caller.
+
+    If `plan_solve` ever acquires a caller, this fails -- and it should, because the answer to
+    the inventory's question will have changed."""
+    slice_ = ["relay/solve_policy.py", "relay/selfimprove/diversify.py"]
+    if not all(os.path.isfile(os.path.join(REPO, *p.split("/"))) for p in slice_):
+        pytest.skip("the files this was measured on are not present")
+    with_iteration = _names(slice_, iterate=True)
+    assert "plan_solve" in with_iteration, (
+        "plan_solve has a caller now -- re-derive what this file claims about diversify")
+    assert "diversify" in with_iteration, (
+        "diversify survived the iteration while its only referrer is unreached")
 
 
 def test_importing_a_module_of_the_same_name_does_not_credit_the_function():

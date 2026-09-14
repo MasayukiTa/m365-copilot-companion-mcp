@@ -309,11 +309,23 @@ def _attribute_calls(rel, tree, files, qualified, unattributable):
                     unattributable[nm] += 1
 
 
-def scan(files=None):
+def scan(files=None, iterate=True):
     """[(key, name, rel, lineno, span, test_refs)] sorted biggest-first.
 
     `key` is "path::name" -- a bare name would collide across modules, and a line number would
     move on every edit above it.
+
+    `iterate=False` asks the ATTRIBUTION question alone: does any line reach this name, counting
+    aliased imports, shell callers and registry decorators? `iterate=True` (the default, and the
+    inventory's question) additionally drops what has been reported and counts again, so a
+    function whose only caller is itself unreached is reported too.
+
+    THE TWO ARE DIFFERENT QUESTIONS AND A TEST HAS TO SAY WHICH IT IS ASKING. Three tests failed
+    when the iteration landed, all of them about attribution: the alias test scans a two-file
+    slice in which `solve_policy::plan_solve` -- the aliased caller -- has no caller of its own,
+    so the whole chain is legitimately dead and `diversify` is reported for a reason that has
+    nothing to do with aliases. Inverting such a test would make it pass while the alias credit
+    it exists to protect was broken.
     """
     files = tracked_files() if files is None else files
     if files is None:
@@ -478,7 +490,7 @@ def scan(files=None):
                     continue                  # handed to a registry by a decorator
                 rows.append(("%s::%s" % (rel, name), name, rel, lineno, span, test_refs[name]))
         found = {r[0] for r in rows}
-        if found == dead:
+        if not iterate or found == dead:
             break
         dead = found
     rows.sort(key=lambda r: (-r[4], r[0]))
