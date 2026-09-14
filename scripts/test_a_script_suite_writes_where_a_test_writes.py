@@ -115,19 +115,67 @@ def test_it_refuses_with_no_script():
 
 def test_the_wrapper_costs_less_than_a_suite_is_given(tmp_path):
     """THE PRICE OF THE ISOLATION, PINNED. The wrapper imports every module in the redirect
-    table so it can move their constants before the suite runs, and 1.76s of the 2.4s is
-    tools.trace_ops. That cost is paid once per suite; at 2.4s x 20 it measured +11s on a real
-    preflight, which is worth the isolation. It is not worth an unbounded amount, and a fixed
-    cost that creeps up shows first as suites timing out for no reason anybody can see -- which
-    is exactly how it showed the first time (scripts/test_run_script_style_tests.py's 2s)."""
+    table so it can move their constants before the suite runs. That cost is paid once per
+    suite; at 2.4s x 20 it measured +11s on a real preflight, which is worth the isolation. It
+    is not worth an unbounded amount, and a fixed cost that creeps up shows first as suites
+    timing out for no reason anybody can see -- which is exactly how it showed the first time
+    (scripts/test_run_script_style_tests.py's 2s).
+
+    MEASURED AGAINST THE FLOOR, NOT AGAINST A NUMBER, since 2026-09-14. The budget was
+    `cost < 6.0` against the wall clock of one subprocess, and what that number mostly contained
+    was `import fastmcp` -- reached from tools.file_ops through tools.security, 2.59s of a 2.69s
+    import of tools.trace_ops, and paid by ANY isolated run whether or not the wrapper exists.
+    So the budget drifted with the library (the 1.76s this docstring used to quote had become
+    2.69s without anything in this repository changing), and inside a full suite, where the same
+    wall clock also contains contention from seven thousand other tests, it read 10.6s and
+    failed -- while passing on its own minutes later. A budget that fails on load gets raised
+    until it means nothing, which is the same death the paragraph above is trying to prevent,
+    reached from the other side.
+
+    What it now measures is the wrapper's OWN cost: the same subprocess, minus the floor that an
+    isolated run cannot avoid, both timed in the same seconds. Measured 0.42s, 0.72s and 2.23s
+    across three pairs on a loaded machine -- the minimum, 0.42s, is the one nearest the truth,
+    because contention can only add.
+
+    AND ONE REAL 2.7s WAS FOUND AND REMOVED while diagnosing this: tools/rebuild_history.py
+    imported `bridge.copilot_bridge` at module scope for one helper. conftest lists that module
+    in ONLY_IF_ALREADY_IMPORTED precisely because "the bridge takes ~4s", and this walked in
+    through the back door -- the wrapper skipped importing the bridge and then imported
+    rebuild_history, which imported it anyway. Deferring that import to the call site took
+    `import tools.rebuild_history` from 2.73s to 0.03s."""
     import time
 
     p = tmp_path / "nothing.py"
     p.write_text("print('=== 1/1 checks passed ===')\n", encoding="utf-8")
-    t = time.time()
-    r = subprocess.run([sys.executable, RUNNER, str(p)], cwd=REPO,
-                       capture_output=True, text=True, encoding="utf-8",
-                       errors="replace", timeout=120)
-    cost = time.time() - t
-    assert r.returncode == 0, r.stderr
-    assert cost < 6.0, "起動コストが %.1fs まで伸びている" % cost
+
+    def _time(argv):
+        t = time.time()
+        r = subprocess.run(argv, cwd=REPO, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=180)
+        return time.time() - t, r
+
+    # THE FLOOR ANY ISOLATED RUN PAYS ANYWAY. tools.file_ops -> tools.security -> fastmcp, and
+    # `import fastmcp` alone is 2.59s of it. Measured on this machine the floor is 3.3s and the
+    # whole wrapper 3.7s, so an absolute budget of 6.0s was measuring the LIBRARY, not the
+    # wrapper -- which is why it drifted from the 2.4s its docstring recorded, and why it
+    # reached 10.6s inside a full suite and failed there while passing alone.
+    floor = [sys.executable, "-c", "import sys; sys.path.insert(0, '.'); import tools.file_ops"]
+
+    # THE MINIMUM OF THREE, not the mean. Both numbers are wall clock on a machine that may be
+    # running seven thousand other tests; contention only ever makes a sample larger, so the
+    # smallest is the one closest to the fixed cost this is about. Taken in the same seconds as
+    # each other, so whatever load there is applies to both.
+    costs, floors = [], []
+    for _ in range(3):
+        fc, _fr = _time(floor)
+        wc, r = _time([sys.executable, RUNNER, str(p)])
+        assert r.returncode == 0, r.stderr
+        floors.append(fc)
+        costs.append(wc)
+
+    overhead = min(costs) - min(floors)
+    assert overhead < 2.0, (
+        "ラッパー自身の固定コストが %.1fs まで伸びている (wrapper %.1fs / floor %.1fs)。"
+        "計測値は 0.4-0.7s。2.7s 増えるのは redirect 表のモジュールが bridge や "
+        "それに並ぶ重い依存を import し始めたとき"
+        % (overhead, min(costs), min(floors)))
