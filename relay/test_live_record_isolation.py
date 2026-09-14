@@ -64,7 +64,12 @@ def _module_path(file_path):
 #: file written by a test could be promoted as though a person had written it. There were zero
 #: such files at the time, which is not a reason for an exemption: it is the reason there was
 #: no damage yet.
-RECORD_DIR_MARKERS = (".fleet", ".companion_runs")
+#: `.companion_gates` ADDED 2026-09-14, and it is the operator's DECISION QUEUE rather than a
+#: log: every file in it is a question waiting for a person, and a toast fires when one is
+#: written. The walk could not see it, so the class was invisible -- measured that day, 2,174
+#: files in the live queue, 187 written by test runs that morning alone, every one naming a
+#: pytest temp directory and none naming anything real.
+RECORD_DIR_MARKERS = (".fleet", ".companion_runs", ".companion_gates")
 
 
 def _names_a_record_dir(value_node):

@@ -69,8 +69,18 @@ def test_a_contract_gate_lands_in_the_sandbox_and_nowhere_else(tmp_path):
     env = dict(os.environ)
     env["MCP_GATE_DIR"] = str(sandbox)
     env.pop("PYTEST_CURRENT_TEST", None)
+    # THE NOTIFICATION IS SILENCED AND THE GATE IS NOT. Popping PYTEST_CURRENT_TEST above is
+    # deliberate -- the child has to behave like a real run to prove anything about where a real
+    # run writes -- but that variable is ALSO what suppresses the desktop toast and the
+    # FleetCockpit approval window that `notify_approval_gate` launches. So this test put a real
+    # "自律契約ゲート - 承認が必要です / probe?" notification on the owner's screen on every
+    # preflight, for a gate that existed only in a temp directory. Stubbing the notifier in the
+    # child removes the toast without touching the thing being measured: the gate file is still
+    # written by the real `_create_gate`, to whatever directory the real resolution picks.
     code = (
         "import sys, json, os; sys.path.insert(0, r'%s');\n"
+        "import tools.notify_ops as NO\n"
+        "NO.notify_approval_gate = lambda *a, **k: 'suppressed in an isolation probe'\n"
         "import tools.contract_gate as CG\n"
         "CG._create_gate('gate_isolation_probe', 'probe?', 'isolation probe')\n"
         "print(json.dumps({'dir': str(CG._gate_dir())}))\n" % REPO)
