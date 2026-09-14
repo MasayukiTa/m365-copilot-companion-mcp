@@ -2282,6 +2282,13 @@ class RelayWorker:
         # Deliberately explicit rather than "the same goal text resumes itself". Re-running a
         # goal is a fresh attempt, and silently continuing the old conversation would carry an
         # earlier run's mistakes into it while looking like a clean start.
+        # WHICH DOOR THE RESUME CAME THROUGH, said out loud. An id handed in is identity; a
+        # lookup by goal text is a guess that happened to land, and the two are worth telling
+        # apart afterwards -- for a fortnight "continuing through the fleet works" was true of
+        # neither, and nothing in the record distinguished them.
+        if self.resume_conv:
+            print("[fleet] %s: resuming by id (%s)"
+                  % (self.name, str(self.resume_conv)[:48]), flush=True)
         if not self.resume_conv and isinstance(goal, dict) and goal.get("follow_up_to"):
             try:
                 found = _socket_route().conversation_for_goal(str(goal["follow_up_to"]))
@@ -2289,6 +2296,9 @@ class RelayWorker:
                 found = ""
             if found:
                 self.resume_conv = found
+                print("[fleet] %s: no id was supplied; matched a conversation by goal TEXT. "
+                      "That is a guess -- the caller should carry resume_conv." % self.name,
+                      flush=True)
             else:
                 # Said out loud. A follow-up that silently became a fresh conversation is
                 # exactly the failure being fixed, and it answers plausibly either way.
