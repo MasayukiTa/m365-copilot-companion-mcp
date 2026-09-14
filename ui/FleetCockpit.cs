@@ -231,11 +231,11 @@ class ApprovalPromptWindow : Window
                 throw new InvalidOperationException("not an approval gate file: " + full);
             // ASK THE FILESYSTEM, DO NOT COMPARE SPELLINGS. The first version compared
             // Path.GetFullPath of both directories as strings, and failed the moment they were
-            // spelled differently -- measured: a gate under %TEMP%, which Windows hands back as
-            // the 8.3 name C:\Users\M118A8~1\..., against the same directory written long. The
-            // window closed and the operator saw nothing. GetFullPath does not expand 8.3 names,
-            // and neither does any string comparison; enumerating the allowed directory answers
-            // "is this file in there" in whatever spelling either side used.
+            // spelled differently -- measured with a gate under %TEMP%, which Windows hands back
+            // in its 8.3 short form, against the same directory written long. The window closed
+            // and the operator saw nothing. GetFullPath does not expand a short name, and
+            // neither does any string comparison; enumerating the allowed directory answers "is
+            // this file in there" in whatever spelling either side used.
             if (!Directory.Exists(allowed) ||
                 Directory.GetFiles(allowed, Path.GetFileName(full)).Length == 0)
                 throw new InvalidOperationException(
@@ -5345,9 +5345,32 @@ class CockpitWindow : Window
         return txt;
     }
 
-    // Build the FRESH goal text for a "Continue" run. There is NO stable reopenable URL for this
-    // agent, so we do NOT reopen the old conversation: instead we PREPEND the prior task's context
-    // and tell the agent to re-read its on-disk outputs before doing the new instruction.
+    // The follow-up as it should be SENT, given whether the old conversation is being reopened.
+    //
+    // WHEN THERE IS AN ID, SEND THE FOLLOW-UP AND NOTHING ELSE. The caller already puts
+    // `resume_conv` on the goal, so the worker continues the real conversation and the server
+    // still holds every prior turn -- pasting the prior goal on top of that is not context, it
+    // is a second copy of context the conversation already has. And it compounds: `priorGoal` is
+    // the previously ASSEMBLED goal, so each continuation swallows the last one whole. Measured
+    // on screen 2026-09-14: a follow-up of one sentence arrived as a wall containing the
+    // original goal, an earlier follow-up, a five-step editing procedure and a verification
+    // request. At that size no instruction can be tested -- the operator's rule is that anything
+    // outside bench measurement and coding goes in the length a person types, and the machinery
+    // was making that impossible.
+    //
+    // The paste below is the FALLBACK, for a row with no conversation id, and the comment it
+    // replaces stated its own premise: "There is NO stable reopenable URL for this agent". There
+    // is one now. Every fleet transcript carries a guid line and ContextTokenLimitExceeded on a
+    // resumed conversation is the proof that the server keeps the history.
+    string ContinueText(string priorGoal, string followup, string conversationId)
+    {
+        return string.IsNullOrEmpty(conversationId)
+            ? BuildContinueGoal(priorGoal, followup)
+            : followup;
+    }
+
+    // Build the FRESH goal text for a continuation that has NO conversation to reopen: prepend
+    // the prior task's context and tell the agent to re-read its on-disk outputs first.
     string BuildContinueGoal(string priorGoal, string followup)
     {
         if (_lang == 0)
@@ -10916,7 +10939,7 @@ class CockpitWindow : Window
             {
                 string fu = PromptFollowup();
                 if (string.IsNullOrEmpty(fu)) return;
-                string goalText = BuildContinueGoal(contPrior, fu);
+                string goalText = ContinueText(contPrior, fu, contConv);
                 // The continuation goal is MULTI-LINE; SpawnFleet's GoalsToJsonl now escapes a
                 // plain multi-line goal string safely on its own, so no manual serialization is
                 // needed for the common case. Only pre-serialize here when there's an EXTRA key
@@ -12327,7 +12350,7 @@ class CockpitWindow : Window
         {
             string t = (tb.Text ?? "").Trim();
             if (t.Length == 0) return false;
-            string goalText = BuildContinueGoal(g, t);
+            string goalText = ContinueText(g, t, c);
             // SpawnFleet's GoalsToJsonl escapes a plain multi-line goal string safely on its
             // own; only pre-serialize here to carry the EXTRA resume_conv key (GoalsToJsonl
             // detects an already-JSON goal string and passes it through as-is).

@@ -382,7 +382,37 @@ class ChatWindow : Window
 
         _messages = new StackPanel { Margin = new Thickness(0, 8, 0, 8), MaxWidth = 760, HorizontalAlignment = HorizontalAlignment.Center };
         _scroll = new ScrollViewer { Content = _messages, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Padding = new Thickness(24, 16, 24, 16) };
-        Grid.SetRow(_scroll, 1); main.Children.Add(_scroll);
+
+        // ── THE STATE OF THE WORK, OUT OF THE CONVERSATION ──────────────────────────────
+        //
+        // A status line was being appended to the transcript as an assistant TURN: "状態: running
+        // ターン 3/1000" arrived as though the agent had said it. Status is a value that is true
+        // NOW; a message is a record of a moment. Mixing them forces the whole transcript to be
+        // rebuilt whenever the status moves, which is what destroyed the reader's text selection
+        // once a second, and it puts the least durable thing in the most permanent place.
+        //
+        // So it lives here: one band, above the transcript, updated in place. Nothing about it
+        // touches _messages, so a status change cannot disturb what the reader is looking at.
+        _statusBand = new Border
+        {
+            // 4-MULTIPLE SPACING, from the set already in use. The first draft used 14/7 and the
+            // repository's own design test refused it: "new spacing values appeared: [14.0] --
+            // pick one already in use". A band that introduces its own rhythm is exactly the
+            // "全く違うものになっている" this restructure is meant to stop.
+            Padding = new Thickness(16, 8, 16, 8),
+            BorderThickness = new Thickness(0, 0, 0, 1),
+            Visibility = Visibility.Collapsed,
+        };
+        SetRef(_statusBand, Border.BorderBrushProperty, "Border");
+        _statusText = new TextBlock { TextWrapping = TextWrapping.Wrap, FontSize = 12.5 };
+        SetRef(_statusText, TextBlock.ForegroundProperty, "Muted");
+        _statusBand.Child = _statusText;
+        var chatCol = new Grid();
+        chatCol.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        chatCol.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        Grid.SetRow(_statusBand, 0); chatCol.Children.Add(_statusBand);
+        Grid.SetRow(_scroll, 1); chatCol.Children.Add(_scroll);
+        Grid.SetRow(chatCol, 1); main.Children.Add(chatCol);
         // Auto-scroll, but yield to the user. ScrollChanged fires for BOTH user scrolls and content
         // growth: when the extent didn't change it was the USER moving -> stick only if they're at
         // the bottom; when content grew -> pin to the bottom ONLY if still sticking. So while a reply
@@ -686,6 +716,15 @@ class ChatWindow : Window
     }
     string _activeFleetUrl;              // conv URL of the fleet snapshot currently shown (null = none)
     long _statusMtime;                   // last-seen mtime of status.json (for live re-render)
+    //: What the fleet view last PUT ON SCREEN. The mtime above says the file moved; this says
+    //: whether the reader would see anything different. Rebuilding on the first without
+    //: consulting the second destroyed the user's text selection once a second.
+    string _fleetRenderSig;
+    //: The band above the transcript that carries the CURRENT state of a fleet run. Separate
+    //: from the messages on purpose: a status is a value now, a message is a record of a moment,
+    //: and giving them one place made every status tick rewrite the conversation.
+    Border _statusBand;
+    TextBlock _statusText;
 
     static string SS(Dictionary<string, object> d, string k)
     { return (d.ContainsKey(k) && d[k] != null) ? d[k].ToString() : ""; }
@@ -1301,6 +1340,36 @@ class ChatWindow : Window
         if (_conv == null || _conv.ConvUrl != _activeFleetUrl) return;   // user navigated away
         var w = ReadFleetWorker(_activeFleetUrl);
         if (w == null) return;
+
+        // REBUILD ONLY WHEN WHAT IS ON SCREEN WOULD DIFFER.
+        //
+        // The trigger for this method is status.json's MTIME, and a live fleet rewrites that
+        // file about once a second whether or not anything a reader can see has changed. So the
+        // whole message panel was cleared and re-created every second: `_messages.Children
+        // .Clear()` destroys the TextBox the user is selecting in, and a selection cannot
+        // survive the control it lives in. Select a few words, and they were gone before Ctrl+C
+        // -- "選択してctrl cしてもなにもコピーできていない", and nothing was wrong with the
+        // controls, which are read-only and selectable and always were.
+        //
+        // The signature is the RENDERED CONTENT -- the transcript lines and the status tail --
+        // and not the worker dict, which carries per-second fields that would defeat the point.
+        var txPre = ReadTranscript(SS(w, "transcript"));
+        string tailPre = BuildFleetStatusTail(w, includeLast: txPre.Count == 0);
+
+        // THE BAND IS UPDATED FIRST AND UNCONDITIONALLY, because it is the part that moves. It
+        // is not in _messages, so writing it cannot disturb a selection or a scroll position --
+        // which is the whole reason the status was taken out of the transcript.
+        ShowRunState(tailPre);
+
+        // AND THE TRANSCRIPT IS SIGNED WITHOUT IT. Including the status here would put the
+        // conversation back on the status's clock: every tick would differ, the guard would
+        // never hold, and the rebuild would return exactly as often as before.
+        var sigSb = new StringBuilder();
+        foreach (var m in txPre) sigSb.Append(m.Role).Append('').Append(m.Text).Append('');
+        string sig = sigSb.ToString();
+        if (sig == _fleetRenderSig) return;
+        _fleetRenderSig = sig;
+
         _messages.Children.Clear();
         var note = new TextBlock { Text = T("fleetview_note"), TextWrapping = TextWrapping.Wrap, FontSize = 12.5, Margin = new Thickness(2, 2, 2, 12) };
         SetRef(note, TextBlock.ForegroundProperty, "Muted");
@@ -1308,17 +1377,30 @@ class ChatWindow : Window
         // If this worker has a persisted transcript, re-render the WHOLE conversation from disk
         // (untruncated) and append the live status tail -- otherwise fall back to the snapshot
         // fragment. Reading the jsonl touches only disk, never the live companion Edge.
-        var tx = ReadTranscript(SS(w, "transcript"));
+        // The same read the signature was taken from -- reading the transcript twice would put
+        // a second disk hit on a path that runs whenever the fleet writes.
+        var tx = txPre;
         if (tx.Count > 0)
         {
+            // NO STATUS TURN AT THE END. It used to be appended here as an assistant message;
+            // it is in the band above now.
             foreach (var m in tx) { if (m.Role == "U") AddUser(m.Text); else AddAssistant(m.Text); }
-            AddAssistant(BuildFleetStatusTail(w, includeLast: false));
         }
         else
         {
             RenderFleetSnapshot(w);
         }
         StickToEnd();
+    }
+
+    // Put the run's current state in the band, or hide it. Touches nothing in the transcript.
+    void ShowRunState(string text)
+    {
+        if (_statusBand == null || _statusText == null) return;
+        string t = (text ?? "").Trim();
+        if (t.Length == 0) { _statusBand.Visibility = Visibility.Collapsed; return; }
+        if (!string.Equals(_statusText.Text, t, StringComparison.Ordinal)) _statusText.Text = t;
+        _statusBand.Visibility = Visibility.Visible;
     }
 
     // If a fleet snapshot is the active view, re-render it when status.json's mtime changes
@@ -1328,7 +1410,7 @@ class ChatWindow : Window
         try
         {
             if (string.IsNullOrEmpty(_activeFleetUrl)) return;
-            if (_conv == null || _conv.ConvUrl != _activeFleetUrl) { _activeFleetUrl = null; RefreshSteerVisual(); return; }
+            if (_conv == null || _conv.ConvUrl != _activeFleetUrl) { _activeFleetUrl = null; ShowRunState(null); RefreshSteerVisual(); return; }
             string sp = Path.Combine(Path.GetDirectoryName(_convsPath), "status.json");
             if (!File.Exists(sp)) return;
             long m = File.GetLastWriteTimeUtc(sp).Ticks;
@@ -3106,7 +3188,7 @@ class ChatWindow : Window
         _messages.Children.Clear();
         _emptyState = null;             // cleared with the children above; rebuild fresh below
         ShowEmptyState();               // fresh chat -> show the empty state again
-        _activeFleetUrl = null; RefreshSteerVisual();
+        _activeFleetUrl = null; ShowRunState(null); RefreshSteerVisual();
         RefreshConvList();
         _input.Focus();
     }
@@ -3163,7 +3245,7 @@ class ChatWindow : Window
             RefreshConvList();
             return;
         }
-        _activeFleetUrl = null; RefreshSteerVisual();   // a normal local conversation is NOT steer mode
+        _activeFleetUrl = null; ShowRunState(null); RefreshSteerVisual();   // a normal local conversation is NOT steer mode
         foreach (var m in c.Messages) { if (m.Role == "U") AddUser(m.Text); else AddAssistant(m.Text); }
         RefreshConvList();
         if (!string.IsNullOrEmpty(c.ConvUrl))

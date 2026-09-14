@@ -53,12 +53,16 @@ def build_goal(instruction, folder, extra_check=None, no_verify=False,
     prefix = ""
     if with_memory:
         try:
+            # THE LOCATION, NOT THE CONTENTS -- the same change as relay_fleet's, and for the
+            # same measurement: priming a real goal put 999 characters of index into the prompt
+            # and nine of its ten lines were arithmetic smoke tests. See _MEMORY_POINTER there.
             from relay.project_memory import load_notes
+            from relay.relay_fleet import _MEMORY_POINTER
             mem = load_notes(folder, state_dir=state_dir)
             if mem:
                 prefix += ("--- このリポジトリでの過去の作業メモ ---\n%s\n"
-                           "--- メモここまで ---\n\n" % mem)
-                notes.append("project memory primed")
+                           "--- メモここまで ---\n\n" % _MEMORY_POINTER)
+                notes.append("project memory pointed at")
         except Exception:
             pass
     if with_map:
