@@ -1204,15 +1204,21 @@ class CockpitWindow : Window
         if (k == "set_retention_section") return ja ? "会話の保持" : "Conversation retention";
         if (k == "set_rate_section") return ja ? "レート上限" : "Rate ceiling";
         if (k == "rate_rpm") return ja ? "毎分の上限" : "Per minute";
+        // ONE LINE, BECAUSE THE PANEL IS A LIST OF CONTROLS AND NOT A MANUAL. This was five
+        // sentences -- what the ceiling does, what the bar is drawn against, where the default
+        // comes from, when to lower it, what 0 means. Together with the retention note below it
+        // made the panel taller than the display, and the section at the bottom (詳細設定) was
+        // pushed off the screen entirely. The operator reported that section as missing.
+        // What survives is what changes a decision: the number's meaning and how to turn it off.
         if (k == "rate_note") return ja
-            ? "直近１分がこの本数に達している間は新しい投入を止め、下がったら再開します。上のバーもこの数字を分母に描きます。既定100はMicrosoftの公開値(環境あたり毎分)。拒否が出るのに余裕があるように見えるなら、ここを下げてください。0で無効。"
-            : "While the last minute is at this number, nothing new is admitted; it resumes when it drops. The bar above is drawn against it too. The default 100 is Microsoft's published per-environment figure. If refusals arrive while the bar still shows headroom, lower this. 0 disables it.";
+            ? "直近1分がこの本数に達したら投入を止め、下がったら再開。0で無効。"
+            : "Admission pauses while the last minute is at this number, and resumes when it drops. 0 disables it.";
         if (k == "set_fleetret_section") return ja ? "作業ディレクトリの保持" : "Working directory retention";
         if (k == "fleet_log_days") return ja ? "ログ(日)" : "Logs (days)";
         if (k == "fleet_store_days") return ja ? "実行記録(日)" : "Run records (days)";
         if (k == "fleet_ret_note") return ja
-            ? "終わった走行のログの保持期間。会話の保持とは別物で、消えるのはログだけです。これより新しいものは圧縮して残します(93〜99%小さくなるので、期間を縮めるより先に効きます)。"
-            : "How long finished runs' logs are kept. Separate from conversation retention -- only logs are removed. Anything newer is compressed rather than deleted (93-99% smaller, which does more than shortening this ever will).";
+            ? "終わった走行のログのみ。会話は消えません。新しい分は圧縮して残します。"
+            : "Finished runs' logs only -- conversations are not touched. Newer ones are compressed, not deleted.";
         if (k == "ret_days") return ja ? "保持日数" : "Keep for (days)";
         if (k == "ret_keep") return ja ? "消さない" : "keep all";
         if (k == "ret_mb") return ja ? "上限サイズ (MB)" : "Size cap (MB)";
@@ -2111,6 +2117,11 @@ class CockpitWindow : Window
     // MUST run on the UI thread (called from BuildHealthStrip and from the Dispatcher marshal).
     void ApplyHealthToUi()
     {
+        // BEFORE the early return: the reconnect control lives in the settings panel, which is
+        // built and shown independently of the health dots. Putting this after the guard would
+        // leave it stuck on whatever tint it was born with on any machine where `_healthDot` is
+        // null -- which is the "it is always amber" symptom, reintroduced by the fix for it.
+        RefreshReconnectChatTint();
         if (_healthDot == null) return;
         bool anyBad = false;
         DotState[] snap = new DotState[HEALTH_DOT_COUNT];
@@ -3354,6 +3365,23 @@ class CockpitWindow : Window
     // throw into the UI thread. Reuses ShowScaleToast -- the cockpit's existing lightweight toast
     // -- for the optimistic "reconnecting…" message and the outcome (mirrors the steer-ack toast
     // pattern at "steer_collapsed_ack").
+    /// Tint the manual reconnect control by the Tool dot -- amber only when a reconnect is
+    /// actually indicated (dot Yellow or Red), muted otherwise.
+    ///
+    /// GRAY IS MUTED, NOT AMBER. Gray means the probe has no opinion (it has not run, or this
+    /// machine does not run it). "No opinion" is not "something is wrong", and painting it amber
+    /// is how the control came to be permanently lit in the first place.
+    void RefreshReconnectChatTint()
+    {
+        if (_reconnectChatBtn == null) return;
+        HealthState tool;
+        lock (_healthLock) { tool = _health[5].State; }
+        bool needed = tool == HealthState.Yellow || tool == HealthState.Red;
+        var tint = needed ? Theme.Br(Theme.Warning(_dark)) : Muted;
+        _reconnectChatBtn.Foreground = tint;
+        _reconnectChatBtn.BorderBrush = tint;
+    }
+
     void RunBridgeReconnectManual()
     {
         if (_bridgeReconnectRunning) return;
@@ -6342,9 +6370,18 @@ class CockpitWindow : Window
         _reconnectChatBtn.Margin = new Thickness(0, 2, 0, 4);
         _reconnectChatBtn.Template = FlatButtonTemplate();
         _reconnectChatBtn.Background = Brushes.Transparent;
-        _reconnectChatBtn.Foreground = Theme.Br(Theme.Warning(_dark));
-        _reconnectChatBtn.BorderBrush = Theme.Br(Theme.Warning(_dark));
         _reconnectChatBtn.ToolTip = T("reconnect_chat_hint");
+        // COLOURED BY WHETHER IT IS NEEDED, NOT BY WHETHER IT EXISTS. These two lines were
+        // `Theme.Warning` unconditionally, so the control sat amber from the moment the panel
+        // opened, on a machine with nothing wrong. A warning that is always on is not a warning;
+        // the operator asked why it is never grey, which is the question a permanently-lit
+        // indicator always eventually produces, and by then it has taught everyone to ignore it.
+        //
+        // The button STAYS clickable in every state -- that was a deliberate decision (see
+        // RunBridgeReconnectManual: the Tool dot can read Gray on a machine whose bridge
+        // self-probe is not active, and the operator may simply want to force a reconnect). What
+        // was wrong was tying the colour to the same always-true fact as the availability.
+        RefreshReconnectChatTint();
         System.Windows.Automation.AutomationProperties.SetName(_reconnectChatBtn, T("reconnect_chat"));
         _reconnectChatBtn.Click += delegate { RunBridgeReconnectManual(); };
         col.Children.Add(_reconnectChatBtn);
@@ -6381,8 +6418,33 @@ class CockpitWindow : Window
         // like a context-menu submenu, which is where people expect "more, over here".
         col.Children.Add(SectionHeader(L("詳細設定", "Advanced")));
         col.Children.Add(AdvancedSubmenuRow());
+        // Nothing is added after this point, which is exactly why it was the section that
+        // vanished: see the ScrollViewer added below `card.Child`.
 
-        card.Child = col;
+        // A POPUP DOES NOT SCROLL ON ITS OWN, and this one had grown past the screen.
+        //
+        // The settings panel is a StackPanel of sections that has only ever got longer, and the
+        // last of them -- 詳細設定, which is where アクセス範囲 and 接続クライアント live -- fell
+        // off the bottom of the display. The operator reported it as "詳細設定 が消えている",
+        // and every check said otherwise: the section is in the source (26 tests assert it), the
+        // binary was built after the source, the running process was started from that binary,
+        // and both `詳細設定` and `アクセス範囲・接続クライアント` are present as UTF-16 strings
+        // inside the running executable. It was built, it was there, and it was unreachable.
+        //
+        // The same trap is already written down 200 lines below, on the popup this row OPENS:
+        // "a popup does not scroll on its own -- without this it grows past the screen and the
+        // buttons at the bottom become unreachable." The child was given a ScrollViewer and the
+        // parent was not.
+        //
+        // MaxHeight comes from the work area rather than a constant so this cannot silently
+        // return on a shorter display or at a larger UI scale -- the panel scales with
+        // `ui_scale`, so a fixed pixel budget is only ever right for one setting of it.
+        var panelScroll = new ScrollViewer();
+        panelScroll.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+        panelScroll.HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled;
+        panelScroll.MaxHeight = Math.Max(320, SystemParameters.WorkArea.Height - 120);
+        panelScroll.Content = col;
+        card.Child = panelScroll;
         UpdateAutoEnabled();   // grey the ceiling stepper if autoscale is off
         return card;
     }
@@ -8451,9 +8513,29 @@ class CockpitWindow : Window
         _approvalPendingHost.Children.Clear(); _approvalRecentHost.Children.Clear();
         var pending = new List<Dictionary<string, object>>();
         var recent = new List<Dictionary<string, object>>();
+        // RECENT DECISIONS ARE DE-DUPLICATED BY CONTENT, NOT DELETED FROM DISK. A gate answered
+        // under `auto`/`bypass` job policy (see task_router.job_gate) never reaches this list to
+        // begin with -- those modes return ALLOW without ever writing a gate file, so there is
+        // nothing here to hide for them. What DOES flood this list in practice is the SAME
+        // decision recorded over and over: an external Skill's approval expires (APPROVAL_TTL in
+        // relay/skills.py) and gets re-approved against the identical, unchanged bundle, or a
+        // background loop repeats the identical request. Measured on one machine: 2169 of 2175
+        // gate files were Skill approvals, and 2167 of those were the SAME skill at the SAME
+        // content digest -- one signature, answered thousands of times, burying everything else
+        // under the 20-card cap below.
+        //
+        // `all` is sorted newest-first (ReadAllGates), so keeping the FIRST occurrence of a key
+        // keeps the MOST RECENT instance of that decision as the list's representative. A Skill's
+        // first-ever approval, or its re-approval after the bundle CHANGED, carries a different
+        // digest and therefore a different question string -- a different key -- so it is never
+        // folded away here. Nothing is written back to the gate file or deleted: the on-disk
+        // gate_*.json is the durable log this collapsing must not touch.
+        var seenRecentKeys = new HashSet<string>(StringComparer.Ordinal);
         foreach (var gate in all)
         {
-            if (GateAnswered(gate)) recent.Add(gate); else pending.Add(gate);
+            if (!GateAnswered(gate)) { pending.Add(gate); continue; }
+            string recentKey = GateKind(gate) + "" + S(gate, "question") + "" + S(gate, "answer");
+            if (seenRecentKeys.Add(recentKey)) recent.Add(gate);
         }
         if (_approvalCenterSummary != null)
             _approvalCenterSummary.Text = _lang == 0 ? (pending.Count + " 件 未処理") : (pending.Count + " pending");
