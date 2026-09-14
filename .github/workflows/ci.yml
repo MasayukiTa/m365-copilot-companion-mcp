@@ -219,6 +219,7 @@ jobs:
             bridge/test_session_cli.py \
             bridge/test_session_store.py \
             bridge/test_session_store_sqlite.py \
+            bridge/test_the_same_goal_is_not_stored_thirty_thousand_times.py \
             bridge/test_delete_conversation.py \
             bridge/test_page_revival.py \
             bridge/test_conv_capture_selectors.py \

@@ -145,6 +145,86 @@ def _migrate(conn):
         # ALTER TABLE ADD COLUMN only appends, so existing rows keep every value they had
         # and take the default for the new one. No data is rewritten.
         conn.execute("ALTER TABLE sessions ADD COLUMN %s %s" % (name, decl))
+    if "goal_id" not in {r[1] for r in conn.execute("PRAGMA table_info(fleet_turns)")}:
+        conn.execute("ALTER TABLE fleet_turns ADD COLUMN goal_id INTEGER")
+    _collapse_goals(conn)
+
+
+#: How long one automatic fold may spend, and a row cap behind it.
+#:
+#: BOUNDED BY TIME, BECAUSE TIME IS WHAT HURTS. This runs on a connection the bridge is about to
+#: record a turn through, so the cost that matters is the stall, not the row count -- and a row
+#: count is a poor proxy for it: the first version capped at 4,000 rows and was measured at
+#: 47 SECONDS per connection on the live store (8 connections, 374s, to fold 30,903 rows).
+#: A turn-recording path does not have 47 seconds.
+#:
+#: THE BATCH IS NOW THE READ SIZE, not the pass size: the budget loops over batches. Reading
+#: 4,000 rows of goal is ~10 MB before any folding starts, which is why a 0.5s budget still cost
+#: 1.37s per connection until the read moved inside it.
+GOAL_COLLAPSE_SECONDS = 0.5
+GOAL_COLLAPSE_BATCH = 200
+
+
+def _collapse_goals(conn):
+    """Fold duplicated goal text out of fleet_turns, a bounded slice at a time.
+
+    WHY THIS EXISTS AT ALL, rather than only interning what is written from now on: the
+    duplication is already on disk, and a compression that only applies to future rows leaves
+    the 68.9 MB where it is and reports success. Automatic because the alternative is a person
+    remembering to run it, and nobody has -- `prune()` has never had fleet_turns in it and
+    `compact()` has no caller in the repository at all.
+
+    NEVER RAISES. This is on the connection path; a store that cannot be folded must still be a
+    store that can be written to.
+    """
+    deadline = time.time() + float(GOAL_COLLAPSE_SECONDS)
+    done = 0
+    try:
+        # SMALL BATCHES INSIDE THE BUDGET, rather than one big read the deadline cannot reach.
+        # The second version read GOAL_COLLAPSE_BATCH rows up front and only then started
+        # checking the clock -- so a 0.5s budget still cost 1.37s per connection, because
+        # fetching 4,000 rows of goal is ~10 MB before any work begins. The read is part of the
+        # cost, so it has to be inside the bound too.
+        while True:
+            rows = conn.execute(
+                "SELECT id, goal FROM fleet_turns WHERE goal <> '' LIMIT ?",
+                (int(GOAL_COLLAPSE_BATCH),)).fetchall()
+            if not rows:
+                break
+            for row in rows:
+                gid = _intern_goal(conn, row["goal"])
+                # ONE STATEMENT, so the goal cannot be lost between two. The first version set
+                # goal_id and then blanked goal separately, reasoning about which order survived
+                # a crash -- there is no such ordering to get right when the write is atomic.
+                conn.execute("UPDATE fleet_turns SET goal_id = ?, goal = '' WHERE id = ?",
+                             (gid, row["id"]))
+                done += 1
+                # PER ROW, NOT PER BATCH. Checking only between batches made the granularity of
+                # the bound a whole batch: measured 2.35s worst against a 0.5s budget, because
+                # 200 rows of interning and updating is already over it. The check is after the
+                # write, so a pass always folds at least one row and can never spin.
+                if time.time() >= deadline:
+                    break
+            if time.time() >= deadline:
+                break
+        if done:
+            # Hand the freed pages back; auto_vacuum is INCREMENTAL, so they do not return by
+            # themselves. The rows MUST be consumed or the pragma stops after one page -- the
+            # same lesson prune() records below.
+            list(conn.execute("PRAGMA incremental_vacuum"))
+        return done
+    except Exception:
+        return done
+
+
+def _intern_goal(conn, goal):
+    """The id of this goal text, storing it if it is new. Empty goal -> None, not a row."""
+    goal = str(goal or "")
+    if not goal:
+        return None
+    conn.execute("INSERT OR IGNORE INTO fleet_goals (goal) VALUES (?)", (goal,))
+    row = conn.execute("SELECT goal_id FROM fleet_goals WHERE goal = ?", (goal,)).fetchone()
+    return row["goal_id"] if row else None
 
 
 def _initialize(conn):
@@ -190,12 +270,29 @@ def _initialize(conn):
             id    INTEGER PRIMARY KEY AUTOINCREMENT,
             key   TEXT NOT NULL,
             name  TEXT NOT NULL DEFAULT '',
+            -- KEPT, AND EMPTY ON EVERY ROW WRITTEN FROM 2026-09-14. The goal text now lives
+            -- once in fleet_goals and this row points at it; see _intern_goal. Rows written
+            -- before that still carry their own copy, and the reader coalesces the two -- so
+            -- the column cannot be dropped, and nothing new should be written into it.
             goal  TEXT NOT NULL DEFAULT '',
             turn  INTEGER,
             role  TEXT NOT NULL,
             text  TEXT NOT NULL DEFAULT '',
             extra TEXT NOT NULL DEFAULT '{}',
             ts    REAL NOT NULL
+        );
+        -- THE SAME GOAL, ONCE. A fleet turn row repeats the whole goal text, and a goal is run
+        -- for many turns by many workers: measured 2026-09-14 on the live store, 30,903 rows
+        -- held 74.08 MB of goal against 5.12 MB of distinct goal text (1,950 of them). That is
+        -- 68.9 MB of pure duplication -- 26% of a 265 MB database, and MORE than every turn's
+        -- text put together (64.15 MB).
+        --
+        -- INTERNED ON THE TEXT, NOT ON THE RUN KEY, and the difference is not academic: 60 keys
+        -- in that store carry more than one distinct goal, so keying the table by `key` would
+        -- have silently given those rows the wrong goal. A hash of the text cannot do that.
+        CREATE TABLE IF NOT EXISTS fleet_goals (
+            goal_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            goal    TEXT NOT NULL UNIQUE
         );
         CREATE INDEX IF NOT EXISTS fleet_turns_key_idx ON fleet_turns(key, id);
         CREATE INDEX IF NOT EXISTS fleet_turns_ts_idx ON fleet_turns(ts DESC);
@@ -564,10 +661,13 @@ def record_fleet_turn(key, obj, name="", goal=""):
                  if k not in ("turn", "role", "text", "ts")}
         conn = _db(import_files=False)
         try:
+            # THE GOAL GOES IN ONCE AND THIS ROW POINTS AT IT. `goal` stays empty; the reader
+            # coalesces, so rows written before 2026-09-14 (which carry their own copy) and
+            # rows written after are indistinguishable to every caller.
             conn.execute(
-                "INSERT INTO fleet_turns (key, name, goal, turn, role, text, extra, ts) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (str(key), str(name or ""), str(goal or ""),
+                "INSERT INTO fleet_turns (key, name, goal, goal_id, turn, role, text, extra, ts) "
+                "VALUES (?, ?, '', ?, ?, ?, ?, ?, ?)",
+                (str(key), str(name or ""), _intern_goal(conn, goal),
                  obj.get("turn"), str(role), str(obj.get("text") or ""),
                  json.dumps(extra, ensure_ascii=False, default=str),
                  float(obj.get("ts") or time.time())))
@@ -578,17 +678,28 @@ def record_fleet_turn(key, obj, name="", goal=""):
         return False
 
 
+#: Both shapes at once. A row written before the goal was interned carries its own copy in
+#: `goal`; one written after carries a `goal_id` and an empty `goal`. COALESCE puts the same
+#: value in front of every caller, which is what lets the fold above run a slice at a time
+#: instead of having to finish before the store is readable.
+_FLEET_TURN_SELECT = (
+    "SELECT t.key AS key, t.name AS name, t.turn AS turn, t.role AS role, t.text AS text, "
+    "       t.extra AS extra, t.ts AS ts, "
+    "       COALESCE(NULLIF(t.goal, ''), g.goal, '') AS goal "
+    "FROM fleet_turns t LEFT JOIN fleet_goals g ON g.goal_id = t.goal_id ")
+
+
 def fleet_turns(key=None, limit=200):
     """Recorded fleet transcript lines, newest-first, optionally for one worker key."""
     conn = _db(import_files=False)
     try:
         if key:
             rows = conn.execute(
-                "SELECT * FROM fleet_turns WHERE key = ? ORDER BY id DESC LIMIT ?",
+                _FLEET_TURN_SELECT + "WHERE t.key = ? ORDER BY t.id DESC LIMIT ?",
                 (str(key), int(limit))).fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM fleet_turns ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
+                _FLEET_TURN_SELECT + "ORDER BY t.id DESC LIMIT ?", (int(limit),)).fetchall()
     finally:
         conn.close()
     return [{"key": r["key"], "name": r["name"], "goal": r["goal"], "turn": r["turn"],
