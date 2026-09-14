@@ -71,23 +71,31 @@ def test_the_band_lives_outside_the_message_panel():
 
 def test_the_transcript_signature_excludes_the_status():
     """THE SUBTLE HALF. Signing the status alongside the messages would make every tick differ,
-    the guard would never hold, and the rebuild -- and the lost selection -- would come back
-    while looking fixed."""
+    the comparison would never hold, and the rebuild -- and the lost selection -- would come back
+    while looking fixed.
+
+    Anchored on the block that BUILDS the signature, not on one line of it: the signature became
+    a per-turn list when appending was added, and pinning its old single-string spelling failed
+    here about a change that made the property stronger."""
     body = _code_only(_method("void RefreshFleetSnapshot()"))
-    i = body.index("string sig = sigSb.ToString();")
-    arm = body[:i]
-    assert "sigSb.Append('\\u0003').Append(tailPre)" not in arm, (
-        "the status is part of the transcript signature again")
-    assert "tailPre" not in arm.split("ShowRunState(tailPre);", 1)[-1], (
-        "the status is feeding the signature after being shown")
+    block = body.split("var sigs = new List<string>();", 1)[1].split("int common", 1)[0]
+    assert "tailPre" not in block, "the status is part of the transcript signature again"
 
 
-def test_the_band_is_updated_before_the_guard_can_return():
-    """The guard returns early when the transcript is unchanged -- which is most ticks. If the
-    band were written after it, the state would freeze on screen while the run moved."""
+def test_the_band_is_updated_before_any_early_return():
+    """Most ticks change nothing and return early. If the band were written after that, the
+    state would freeze on screen while the run moved -- the opposite defect, and quieter.
+
+    THE RETURNS THAT MATTER ARE THE ONES AFTER THE STATE IS KNOWN. The method opens with guards
+    for "no fleet view" and "no such worker", and there is nothing to show in those cases -- an
+    earlier draft counted those too and failed on a correct method."""
     body = _code_only(_method("void RefreshFleetSnapshot()"))
-    assert body.index("ShowRunState(tailPre);") < body.index("if (sig == _fleetRenderSig) return;"), (
-        "the state is only refreshed on ticks where the transcript also changed")
+    after_state = body.split("string tailPre = ", 1)[1]
+    shown = after_state.index("ShowRunState(tailPre);")
+    ret = after_state.index("return;")
+    assert shown < ret, (
+        "a tick can return before the band is written, leaving the state stale on screen "
+        "while the run moves")
 
 
 def test_leaving_the_fleet_view_clears_the_band():

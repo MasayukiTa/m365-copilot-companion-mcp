@@ -716,10 +716,11 @@ class ChatWindow : Window
     }
     string _activeFleetUrl;              // conv URL of the fleet snapshot currently shown (null = none)
     long _statusMtime;                   // last-seen mtime of status.json (for live re-render)
-    //: What the fleet view last PUT ON SCREEN. The mtime above says the file moved; this says
-    //: whether the reader would see anything different. Rebuilding on the first without
-    //: consulting the second destroyed the user's text selection once a second.
-    string _fleetRenderSig;
+    //: What the fleet view last PUT ON SCREEN, one entry per rendered turn. The mtime above says
+    //: the file moved; this says whether the reader would see anything different, and WHERE it
+    //: differs -- a per-turn list is what lets new turns be appended instead of the panel being
+    //: rebuilt around the reader. A single joined string could only answer "same or not".
+    List<string> _fleetTurnSigs = new List<string>();
     //: The band above the transcript that carries the CURRENT state of a fleet run. Separate
     //: from the messages on purpose: a status is a value now, a message is a record of a moment,
     //: and giving them one place made every status tick rewrite the conversation.
@@ -841,6 +842,18 @@ class ChatWindow : Window
                 if (!o.ContainsKey("role")) continue;   // skip meta / guid marker lines
                 string role = o["role"] != null ? o["role"].ToString() : "assistant";
                 string text = (o.ContainsKey("text") && o["text"] != null) ? o["text"].ToString() : "";
+                // NOT EVERY RECORDED ROLE IS A TURN. The test was `role.StartsWith("user") ? "U"
+                // : "A"`, so EVERYTHING that was not a user line became an assistant line --
+                // including `metric`, which the fleet writes with an empty text. Those rendered
+                // as a "Copilot" label with nothing under it, and a reader looking for what the
+                // agent said mid-run found a blank where the answer should be. Reported as
+                // "copilotの分が途中のが表示されないケースが".
+                //
+                // Asked as "is this a turn with something in it", because that is the question:
+                // a role nobody has seen before should be shown if it carries text, and an empty
+                // record of any role is bookkeeping, not speech.
+                if (role == "metric" || role == "meta" || role == "guid" || role == "note") continue;
+                if (text.Trim().Length == 0) continue;
                 msgs.Add(new Msg(role.StartsWith("user") ? "U" : "A", text));
             }
         }
@@ -1433,14 +1446,44 @@ class ChatWindow : Window
         // which is the whole reason the status was taken out of the transcript.
         ShowRunState(tailPre);
 
-        // AND THE TRANSCRIPT IS SIGNED WITHOUT IT. Including the status here would put the
-        // conversation back on the status's clock: every tick would differ, the guard would
-        // never hold, and the rebuild would return exactly as often as before.
-        var sigSb = new StringBuilder();
-        foreach (var m in txPre) sigSb.Append(m.Role).Append('').Append(m.Text).Append('');
-        string sig = sigSb.ToString();
-        if (sig == _fleetRenderSig) return;
-        _fleetRenderSig = sig;
+        // AND THE TRANSCRIPT IS SIGNED WITHOUT IT -- per turn, not as one string. Including the
+        // status would put the conversation back on the status's clock: every tick would differ,
+        // the guard would never hold, and the rebuild would return exactly as often as before.
+        var sigs = new List<string>();
+        foreach (var m in txPre) sigs.Add(m.Role + "" + m.Text);
+
+        // APPEND WHAT IS NEW; REBUILD ONLY WHEN THE PAST CHANGED.
+        //
+        // The signature guard above stops the rebuild on a tick where nothing moved, which is
+        // most of them -- but a live worker DOES produce turns, and on each of those the whole
+        // panel was still being cleared and re-created. The review that asked for this said so
+        // in as many words: 「表示署名の判定だけでは、本文が増えた際の全再構築が残る。既存部分
+        // を保持し、追記と対象箇所の更新で済むことを設計要件にします」. A reader mid-selection
+        // when the agent answers loses the selection for the same reason as before, just less
+        // often -- and "less often" is not a property anybody can rely on.
+        //
+        // The past does not normally change: a transcript is append-only. So compare turn by
+        // turn, and when everything already rendered is still identical, add only the tail. A
+        // rebuild stays the answer for the case that is NOT an append -- a different worker, a
+        // recycled conversation, a transcript rewritten underneath us -- because then what is on
+        // screen is about something else.
+        int common = 0;
+        while (common < sigs.Count && common < _fleetTurnSigs.Count
+               && sigs[common] == _fleetTurnSigs[common]) common++;
+        bool append = common == _fleetTurnSigs.Count && common > 0 && sigs.Count > common
+                      && _messages.Children.Count > 0;
+        if (append)
+        {
+            for (int i = common; i < sigs.Count; i++)
+            {
+                var m = txPre[i];
+                if (m.Role == "U") AddUser(m.Text); else AddAssistant(m.Text);
+            }
+            _fleetTurnSigs = sigs;
+            return;
+        }
+        if (sigs.Count == _fleetTurnSigs.Count && common == sigs.Count) return;
+        _fleetTurnSigs = sigs;
 
         _messages.Children.Clear();
         var note = new TextBlock { Text = T("fleetview_note"), TextWrapping = TextWrapping.Wrap, FontSize = 12.5, Margin = new Thickness(2, 2, 2, 12) };
