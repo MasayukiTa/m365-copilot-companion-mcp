@@ -1765,18 +1765,73 @@ def repo_eval_gb(inst):
 _DISK_DEFER_LAST = [0.0]
 DISK_DEFER_NOTICE_S = 60.0
 
+#: When the current run of deferrals began (0.0 = not currently deferring), and when a
+#: notification about it last left this process.
+_DISK_DEFER_SINCE = [0.0]
+_DISK_DEFER_NOTIFIED = [0.0]
 
-def _note_disk_defer(floor_gb, waiting):
-    """Print why nothing is being admitted. Never raises; never becomes the log itself."""
+#: How long admission must stay blocked before anyone outside this process is told. A dip below
+#: the floor for a few sweeps while a finished job's eval is reclaimed is ordinary and not worth
+#: a notification; a block that outlives this is the shape that has twice sat silent for
+#: twenty-five minutes with the submitter told only "queued".
+DISK_DEFER_ALERT_AFTER_S = 240.0
+
+#: And how often to say it again while it persists. Long, because the message does not change
+#: and the second one is only there so a person who walked away still finds out.
+DISK_DEFER_ALERT_REPEAT_S = 1800.0
+
+
+def disk_defer_clear():
+    """Admission succeeded: forget the deferral, so the next block is timed from its own start."""
+    _DISK_DEFER_SINCE[0] = 0.0
+    _DISK_DEFER_NOTIFIED[0] = 0.0
+
+
+def _note_disk_defer(floor_gb, waiting, notify=None, now=None):
+    """Say why nothing is being admitted -- and say it somewhere outside this process.
+
+    THE LOG WAS NOT ENOUGH, and that is the whole reason this function grew. `relay/task_router`
+    hard-codes `--disk-floor-gb 0` for autostarted goals, and its comment explains why: with the
+    bench floor inherited, admission refused everything, forever, printing the reason "once a
+    minute into the coordinator's log, which is the one place a person holding a phone cannot
+    look", while the submitter had already been told the goal was queued. Disabling the gate
+    made the silence go away by removing the refusal -- and on 2026-09-14 C: reached **zero
+    bytes** with the fleet still admitting, which took down git, the fleet's own writes, and a
+    business folder's backups in one go.
+
+    Both failures are the same failure: a decision nobody outside the process could see. So the
+    block is reported outward once it has lasted `DISK_DEFER_ALERT_AFTER_S`, and the floor can
+    go back to protecting the machine.
+
+    `notify` and `now` are injectable so a test can watch this without a desktop.
+    """
     try:
-        now = time.time()
-        if now - _DISK_DEFER_LAST[0] < DISK_DEFER_NOTICE_S:
-            return
-        _DISK_DEFER_LAST[0] = now
+        now = float(now if now is not None else time.time())
         free = free_disk_gb()
-        print("[fleet] admitting nothing: %.2f GB free on C:, floor %.1f GB -- %d goal(s) "
-              "waiting. Free disk; lowering the floor turns this refusal into a crash."
-              % (free, float(floor_gb or DEFAULT_DISK_FLOOR_GB), waiting), flush=True)
+        floor = float(floor_gb or DEFAULT_DISK_FLOOR_GB)
+
+        if _DISK_DEFER_SINCE[0] <= 0.0:
+            _DISK_DEFER_SINCE[0] = now
+        blocked_for = now - _DISK_DEFER_SINCE[0]
+
+        if now - _DISK_DEFER_LAST[0] >= DISK_DEFER_NOTICE_S:
+            _DISK_DEFER_LAST[0] = now
+            print("[fleet] admitting nothing: %.2f GB free on C:, floor %.1f GB -- %d goal(s) "
+                  "waiting for %.0f min. Free disk; lowering the floor turns this refusal into "
+                  "a crash." % (free, floor, waiting, blocked_for / 60.0), flush=True)
+
+        if blocked_for < DISK_DEFER_ALERT_AFTER_S:
+            return
+        if _DISK_DEFER_NOTIFIED[0] and \
+                (now - _DISK_DEFER_NOTIFIED[0]) < DISK_DEFER_ALERT_REPEAT_S:
+            return
+        _DISK_DEFER_NOTIFIED[0] = now
+        if notify is None:
+            from tools.notify_ops import notify_desktop as notify
+        notify("Fleet is admitting nothing",
+               "%d goal(s) have been waiting %.0f minutes: C: has %.2f GB free and the floor "
+               "is %.1f GB. Free disk to let them start."
+               % (waiting, blocked_for / 60.0, free, floor))
     except Exception:
         pass
 
@@ -6960,6 +7015,11 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     # does not become the log.
                     _note_disk_defer(disk_box[0], len(pending))
                     break              # disk floor would be breached -> defer admission
+                # ADMITTED, so the block (if there was one) is over. Cleared here rather than
+                # inside the predicate because the predicate is pure and tested as such; without
+                # this the next block would be timed from the first one's start and would alert
+                # immediately, which is the fastest way to teach someone to ignore the alert.
+                disk_defer_clear()
                 w = pending.pop(0)
             if w.status in TERMINAL:   # (shouldn't happen, but be safe)
                 continue

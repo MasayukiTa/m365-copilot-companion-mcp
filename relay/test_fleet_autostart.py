@@ -460,17 +460,23 @@ class _FakeProc:
 
 
 def test_a_tunnel_goal_is_not_gated_behind_the_bench_disk_floor(state):
-    """A GOAL FROM A PHONE IS NOT A BENCH EVAL.
+    """A GOAL FROM A PHONE IS NOT A BENCH EVAL -- BUT IT IS NOT WEIGHTLESS EITHER.
 
-    The floor protects against SWE-bench Docker builds -- five concurrent ones once filled C:
-    and corrupted WSL. Autostart passed no --disk-floor-gb, so a tunnel goal inherited that
-    bench reserve, and below the floor the run admits NOTHING: every sweep refuses, breaks and
-    defers, with no timeout. The reason is printed once a minute into the coordinator's log,
-    which is exactly where the person holding the phone cannot look -- and they have already
-    been told the goal is queued and will be picked up.
+    The bench floor protects against SWE-bench Docker builds; five concurrent ones once filled
+    C: and corrupted WSL. Autostart passed no --disk-floor-gb, so a tunnel goal inherited that
+    multi-gigabyte reserve, and below it the run admits NOTHING: every sweep refuses, breaks and
+    defers, with no timeout, while the submitter has been told the goal is queued.
 
-    An ordinary goal writes kilobytes. Both relay_fleet.disk_admission_ok and --disk-floor-gb
-    already say "0 = disable the disk gate (normal, non-bench use)"; this only passes it.
+    THIS TEST USED TO PIN THE FLOOR AT EXACTLY "0", on the stated grounds that "an ordinary goal
+    writes kilobytes". Measured 2026-09-14, that premise is false: an ordinary goal told to back
+    a folder up before editing it wrote a 5.43 GB archive, and with the gate disabled the fleet
+    kept admitting while C: drained to zero bytes -- taking git, the fleet's own writes and a
+    business folder's backups down together.
+
+    So what is asserted now is the thing that was actually right about the original decision --
+    a tunnel goal must not inherit the BENCH reserve -- without the part that turned out to be a
+    hole. The silence that made a floor unusable is fixed separately, in `_note_disk_defer`,
+    which now reports a lasting block outward instead of only into the coordinator's log.
     """
     launcher = _Launcher()
     plan = TR.autostart_fleet([{"text": "anything", "priority": False}], str(state),
@@ -478,8 +484,14 @@ def test_a_tunnel_goal_is_not_gated_behind_the_bench_disk_floor(state):
     assert plan["ok"] is True, plan
     cmd = launcher.calls[0]
     assert "--disk-floor-gb" in cmd, "the disk gate was left at the bench default: %s" % cmd
-    assert cmd[cmd.index("--disk-floor-gb") + 1] == "0", (
-        "a tunnel goal is still gated on free space: %s" % cmd)
+    floor = float(cmd[cmd.index("--disk-floor-gb") + 1])
+    assert floor > 0, (
+        "the disk gate is disabled outright; C: reached zero bytes this way on 2026-09-14: %s"
+        % cmd)
+    from relay.relay_fleet import DEFAULT_DISK_FLOOR_GB
+    assert floor < DEFAULT_DISK_FLOOR_GB, (
+        "a tunnel goal is gated behind the bench reserve (%.1f GB): %s"
+        % (DEFAULT_DISK_FLOOR_GB, cmd))
 
 
 def test_the_goal_still_reaches_the_launch_alongside_the_floor_flag(state):
