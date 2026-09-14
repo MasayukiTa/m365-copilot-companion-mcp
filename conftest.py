@@ -286,6 +286,11 @@ DELIBERATELY_NOT_REDIRECTED = {
         "read-only: the socket ledger is the rebuild's source and is never opened for writing",
     ("tools.rebuild_history", "TRANSCRIPTS"):
         "read-only: transcripts are scanned for their goal line and never written",
+    ("tools.skill_candidates", "LEDGER"):
+        "read-only, and the same socket ledger rebuild_history reads above: skill_candidates, "
+        "skill_lessons and skill_draft open it to count past work and never write through it. "
+        "Their own tests pass an explicit `ledger=` path, so nothing here depends on the "
+        "operator's file being present or on what it happens to contain",
     ("relay.selfimprove.l2_cron", "DEFAULT_LOCK"):
         "a lock file whose whole purpose is to be taken and released; tests that exercise it "
         "pass their own path",

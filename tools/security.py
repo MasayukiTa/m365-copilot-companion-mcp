@@ -284,7 +284,41 @@ _MAX_TOKENS_PER_IDENTITY = 128
 #: Mcp-Session-Id) under the SAME forwarded IP would inherit each other's authorization. For a
 #: single-operator deployment this is the same person; written down because it would not be in
 #: a multi-tenant one.
-_MAX_SESSIONS_PER_IDENTITY = 64
+#: SIZED FOR A FLEET, NOT FOR ONE OPERATOR. This was 64, chosen when an identity meant a person
+#: and a couple of agents. Measured 2026-09-14 on the live tenant egress: **79 distinct sessions
+#: in one hour behind a SINGLE forwarded IP**, 148 in ten hours, 126 of them seen exactly
+#: once -- every fleet worker turn is issued its own Mcp-Session-Id. The stored table sat at
+#: exactly 64 sessions and exactly 128 tokens, both caps saturated, and workers were evicting
+#: each other's authorization as fast as they earned it.
+#:
+#: WHAT THAT COST, because it is not obvious from the cap alone: a worker unlocks (its session
+#: is recorded), other workers' unlocks evict it, its next call arrives with no token and an
+#: evicted session and is refused -- and the relay answers a refusal by injecting ANOTHER unlock
+#: (`MAX_UNLOCK_ATTEMPTS` = 4), each of which evicts four more sessions belonging to other
+#: workers. The recovery path was the amplifier. Measured over ten hours: 275 of 276 refusals
+#: presented no token at all, and 14 of 19 STUCK runs ended on "unlock を 4 回投入したが解錠が
+#: 続かない" -- the single largest cause of failure on the machine that day.
+#:
+#: RAISING IT IS NOT A WEAKENING, WHICH IS THE ONLY REASON IT IS RAISED. A session is recorded
+#: here only after a correct-password unlock() or a valid-token call; the table is therefore a
+#: list of *already authenticated* sessions, and holding more of them admits nobody new. The
+#: security bound is `_session_ttl_s()` -- 30 minutes, sliding -- and it is untouched. This cap
+#: only ever bounded memory, and at 64 it was bounding the wrong thing.
+_MAX_SESSIONS_PER_IDENTITY = 512
+
+
+def _max_sessions_per_identity() -> int:
+    """Read live, like `session_auth_enabled()` and `_session_ttl_s()`.
+
+    The fleet's size is an operational fact that changes between runs, and a cap that can only
+    be changed by restarting the MCP server is one nobody adjusts during the incident it is
+    causing.
+    """
+    try:
+        value = int(os.environ.get("MCP_UNLOCK_MAX_SESSIONS", "") or _MAX_SESSIONS_PER_IDENTITY)
+    except (TypeError, ValueError):
+        return _MAX_SESSIONS_PER_IDENTITY
+    return max(1, value)
 
 
 def session_auth_enabled() -> bool:
@@ -341,8 +375,18 @@ def _touch_session(entry: dict, sess: str, now: float) -> dict:
         return entry
     sessions = dict(entry.get("sessions") or {})
     sessions[sess] = now
-    if len(sessions) > _MAX_SESSIONS_PER_IDENTITY:
-        sessions = dict(sorted(sessions.items(), key=lambda kv: kv[1])[-_MAX_SESSIONS_PER_IDENTITY:])
+    # DROP THE DEAD BEFORE EVICTING THE LIVING. A session past its TTL authorizes nothing --
+    # `_session_authorized` rejects it on age regardless of whether it is still in this table --
+    # so keeping it costs a slot that a session which WOULD have been honoured then loses. With
+    # the cap at 64 against 79 new sessions an hour, those slots were the difference between a
+    # worker's authorization surviving its own next call and not.
+    cap = _max_sessions_per_identity()
+    if len(sessions) > cap:
+        ttl = _session_ttl_s()
+        live = {s: t for s, t in sessions.items() if (now - t) < ttl}
+        sessions = live if len(live) >= 1 else sessions
+    if len(sessions) > cap:
+        sessions = dict(sorted(sessions.items(), key=lambda kv: kv[1])[-cap:])
     entry["sessions"] = sessions
     return entry
 
