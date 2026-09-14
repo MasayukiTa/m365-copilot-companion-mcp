@@ -1159,6 +1159,13 @@ class ChatWindow : Window
             string url = (d.ContainsKey("url") && d["url"] != null) ? d["url"].ToString() : "";
             string worker = (d.ContainsKey("worker") && d["worker"] != null) ? d["worker"].ToString() : "";
             string transcript = (d.ContainsKey("transcript") && d["transcript"] != null) ? d["transcript"].ToString() : "";
+            // WHICH ENTRY WAS CHOSEN, when one was. The cockpit card lists what happened and
+            // holds no body; clicking an entry has to land the reader ON it, not at the end of a
+            // conversation they then have to search. Absent means "just open it", which is what
+            // the card header and the history list still ask for.
+            int turnIndex = -1;
+            if (d.ContainsKey("turn_index") && d["turn_index"] != null)
+                int.TryParse(d["turn_index"].ToString(), out turnIndex);
             if (string.IsNullOrEmpty(url) && string.IsNullOrEmpty(worker) && string.IsNullOrEmpty(transcript)) return;
             // Bring this chat window to the front so a cockpit "▶ 開く" click lands you here without
             // an alt-tab -- the two-window round-trip was the biggest gap vs Claude Code's one pane.
@@ -1168,9 +1175,74 @@ class ChatWindow : Window
                 Activate(); Topmost = true; Topmost = false; Focus();
             }
             catch { }
-            new Thread((ThreadStart)delegate { OpenFromFleet(url, worker, transcript); }) { IsBackground = true }.Start();
+            int wantIdx = turnIndex;
+            new Thread((ThreadStart)delegate { OpenFromFleet(url, worker, transcript); ScrollToTurn(wantIdx); })
+            { IsBackground = true }.Start();
         }
         catch { }
+    }
+
+    // Put the chosen entry at the top of the view and mark it, so a click on a card lands on the
+    // thing that was clicked.
+    //
+    // AND STOP FOLLOWING THE TAIL. Arriving at turn 4 of 40 and then being dragged to the bottom
+    // by the next status write is the same defect as opening at the end, with an extra step. The
+    // scroll handler re-arms following on its own the moment the reader returns to the bottom,
+    // so this suppresses it exactly until they do.
+    //
+    // Index is over the whole transcript, counting the same entries the card counted: the
+    // conversation panel holds one child per turn plus a note at the top for a fleet view, so
+    // the mapping is stated here rather than assumed, and a value that does not land inside the
+    // panel is ignored rather than clamped -- a silent jump to the wrong entry is worse than no
+    // jump, because it reads as the right one.
+    void ScrollToTurn(int index)
+    {
+        if (index < 0) return;
+        try
+        {
+            Dispatcher.BeginInvoke(new Action(delegate
+            {
+                try
+                {
+                    int offset = 0;
+                    if (_messages.Children.Count > 0 && _messages.Children[0] is TextBlock) offset = 1;
+                    int at = index + offset;
+                    if (at < 0 || at >= _messages.Children.Count) return;
+                    var target = _messages.Children[at] as FrameworkElement;
+                    if (target == null) return;
+                    _stickBottom = false;
+                    target.BringIntoView();
+                    HighlightBriefly(target);
+                }
+                catch { }
+            }), System.Windows.Threading.DispatcherPriority.Loaded);
+        }
+        catch { }
+    }
+
+    // A short, self-clearing mark on the entry that was opened. Without it the reader has to
+    // work out which of several similar blocks they were sent to.
+    void HighlightBriefly(FrameworkElement target)
+    {
+        var border = target as Border;
+        if (border == null)
+        {
+            // Assistant turns are a StackPanel, not a Border; wrap nothing and mark the panel's
+            // own background instead of restructuring the tree under the reader.
+            var panel = target as Panel;
+            if (panel == null) return;
+            var was = panel.Background;
+            panel.SetResourceReference(Panel.BackgroundProperty, "PanelAlt");
+            var t = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(1600) };
+            t.Tick += delegate { t.Stop(); panel.Background = was; };
+            t.Start();
+            return;
+        }
+        var prev = border.Background;
+        border.SetResourceReference(Border.BackgroundProperty, "PanelAlt");
+        var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(1600) };
+        timer.Tick += delegate { timer.Stop(); border.Background = prev; };
+        timer.Start();
     }
 
     void OpenFromFleet(string url, string worker) { OpenFromFleet(url, worker, null); }

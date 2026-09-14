@@ -11515,7 +11515,7 @@ class CockpitWindow : Window
 
         var panels = new UIElement[] {
             TabOverview(goal, last, outcome, terminal, reviews, verifiedOk, tpath, w),
-            TabConversation(tpath),
+            TabConversation(tpath, S(w, "name"), S(w, "conv_url")),
             TabReview(reason, done, terminal, reviews),
             TabLogs(w, reason)
         };
@@ -11961,11 +11961,11 @@ class CockpitWindow : Window
         return 0;
     }
 
-    UIElement TabConversation(string tpath)
+    UIElement TabConversation(string tpath, string workerName, string convUrl)
     {
         if (!string.IsNullOrEmpty(tpath))
         {
-            var mini = MiniThread(tpath);
+            var mini = MiniThread(tpath, workerName, convUrl);
             if (mini != null) return mini;
         }
         return new TextBlock { Text = _lang == 0 ? "（会話の履歴はまだありません）" : "(No conversation yet)",
@@ -12064,7 +12064,7 @@ class CockpitWindow : Window
     // a modal (it covers the monitor) and an unbounded body (one lane eats the view).
     //
     // Null when the transcript is empty or missing, as before.
-    UIElement MiniThread(string transcriptPath)
+    UIElement MiniThread(string transcriptPath, string workerName, string convUrl)
     {
         var turns = ReadLastTurns(transcriptPath, MINI_THREAD_ENTRIES);
         if (turns.Count == 0) return null;
@@ -12072,6 +12072,11 @@ class CockpitWindow : Window
         var panel = new StackPanel { Margin = new Thickness(0, 6, 0, 6) };
 
         int total = CountTurns(transcriptPath);
+        // The listed entries are the LAST few, so the first of them sits at this offset in the
+        // whole transcript. Clicking one has to name the entry the reader chose, not the n-th
+        // of the three shown.
+        int firstIndex = Math.Max(0, total - turns.Count);
+        int shown = 0;
         foreach (var t in turns)
         {
             bool user = t.Item1 == "U";
@@ -12115,7 +12120,28 @@ class CockpitWindow : Window
                 };
                 row.Children.Add(size);
             }
-            panel.Children.Add(row);
+
+            // THE ENTRY IS THE CHOOSER. Clicking it opens the conversation in the chat window
+            // AT THIS ENTRY -- the card decides what to read, the chat window is where reading
+            // happens. Opening at the end would hand the reader the job of finding again what
+            // they had just picked.
+            int idx = firstIndex + shown;
+            string wn = workerName, cu = convUrl;
+            var hit = new Border
+            {
+                Child = row,
+                Background = Brushes.Transparent,
+                Cursor = Cursors.Hand,
+                Padding = new Thickness(0, 4, 0, 4),
+            };
+            hit.ToolTip = ja ? "この発言をメインチャットで開く" : "Open this entry in the chat window";
+            hit.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e)
+            {
+                e.Handled = true;
+                OpenWorker(wn, cu, idx);
+            };
+            panel.Children.Add(hit);
+            shown++;
         }
 
         if (total > turns.Count)
@@ -13057,13 +13083,26 @@ class CockpitWindow : Window
     // Open a worker in the main chat by NAME (robust click target). The chat polls open.json;
     // it resolves the worker by name in status.json and shows its live snapshot, and uses url
     // for /history when a real Copilot conv_url was captured.
-    void OpenWorker(string name, string url)
+    void OpenWorker(string name, string url) { OpenWorker(name, url, -1); }
+
+    // `turnIndex` is which entry the reader clicked, 0-based over the transcript's turns, or -1
+    // for "just open it".
+    //
+    // WHY THE INDEX TRAVELS. The card lists what happened and holds no body; the full text opens
+    // in the chat window. Opening it at the END would make the reader hunt for the entry they
+    // had just chosen -- the review asked about this said so plainly: 「単に会話の末尾を開く
+    // 設計では、対象を探し直す負担が残る」. Carrying the position is what makes the card a
+    // chooser rather than a teaser.
+    void OpenWorker(string name, string url, int turnIndex)
     {
         try
         {
             _openSeq++;
             var o = new Dictionary<string, object>();
             o["worker"] = name ?? ""; o["url"] = url ?? ""; o["ts"] = _openSeq;
+            // Written only when there is one, so a reader of open.json can tell "no position
+            // was asked for" from "position 0" -- which are different requests.
+            if (turnIndex >= 0) o["turn_index"] = turnIndex;
             File.WriteAllText(_openPath, _js.Serialize(o), new UTF8Encoding(false));
         }
         catch (Exception) { }
