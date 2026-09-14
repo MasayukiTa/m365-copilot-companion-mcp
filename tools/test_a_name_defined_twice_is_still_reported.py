@@ -77,7 +77,13 @@ def test_an_attributable_call_resolves_which_definition_it_reached(tmp_path, mon
     """
     _write(tmp_path, "a.py", "def twin():\n    return 1\n")
     _write(tmp_path, "b.py", "def twin():\n    return 2\n")
-    _write(tmp_path, "c.py", "from a import twin\n\n\ndef go():\n    return twin()\n")
+    # THE CALLER HAS TO BE `main`. In a synthetic tree nothing is reachable unless it is an
+    # ENTRYPOINT, and `main` is the only root this scanner has (PROTOCOL). The first version
+    # used `go()`, which nothing calls -- so once scan() started iterating to a fixed point,
+    # `go` was dead, the call inside it stopped counting, and `a.py::twin` was reported. The
+    # test then read as a bug in attribution when attribution was right: a fixture that forgets
+    # to give its chain a root is asserting that dead code is alive.
+    _write(tmp_path, "c.py", "from a import twin\n\n\ndef main():\n    return twin()\n")
     rows = _scan(tmp_path, ["a.py", "b.py", "c.py"], monkeypatch)
     assert "a.py::twin" not in rows, "the definition the import names was reported anyway"
     assert "b.py::twin" in rows, "the definition nothing reaches is still being hidden"
@@ -90,7 +96,10 @@ def test_a_call_the_ast_cannot_place_is_still_skipped_rather_than_guessed(tmp_pa
     two false findings. It is SAID rather than silently dropped -- see `scan().ambiguous`."""
     _write(tmp_path, "a.py", "def twin():\n    return 1\n")
     _write(tmp_path, "b.py", "def twin():\n    return 2\n")
-    _write(tmp_path, "c.py", "def go():\n    return twin()\n")
+    # `main` for the same reason as above: the point here is that the call CANNOT BE PLACED, and
+    # a caller that is itself dead would make both definitions unreported for the ordinary
+    # reason instead -- the test would pass while saying nothing about ambiguity.
+    _write(tmp_path, "c.py", "def main():\n    return twin()\n")
     rows = _scan(tmp_path, ["a.py", "b.py", "c.py"], monkeypatch)
     assert "a.py::twin" not in rows and "b.py::twin" not in rows, sorted(rows)
 
