@@ -109,14 +109,28 @@ def cleared_through(fleet=FLEET, log=None, kept_glob=None):
                                           + os.path.basename(path).rsplit("-", 1)[-1]))
     return newest
 
-#: The synthetic reference the bridge resumes. Imported rather than restated so a change to the
-#: scheme cannot leave this writing a shape nothing can open.
-try:
-    from bridge.copilot_bridge import make_sessref
-except Exception:                                   # the bridge is expensive and optional here
-    def make_sessref(guid):
+def make_sessref(guid):
+    """The synthetic reference the bridge resumes. Asked of the bridge rather than restated, so
+    a change to the scheme cannot leave this writing a shape nothing can open.
+
+    IMPORTED AT CALL TIME, and the reason is measured. `from bridge.copilot_bridge import
+    make_sessref` at module scope cost 2.73 seconds of every import of this module -- conftest
+    lists `bridge.copilot_bridge` in ONLY_IF_ALREADY_IMPORTED precisely because "the bridge
+    takes ~4s", and this line defeated that skip through a back door: scripts/run_isolated.py
+    skipped importing the bridge and then imported THIS, which imported the bridge anyway. The
+    isolation wrapper's fixed cost had drifted from a documented 2.4s to 3.3s standalone, and
+    under a full suite it reached 10.6s against a 6.0s budget and failed the test that exists to
+    catch exactly that creep.
+
+    The fallback is unchanged and still matters: this module is run as a CLI on hosts where the
+    bridge's dependencies are not installed.
+    """
+    try:
+        from bridge.copilot_bridge import make_sessref as _real
+    except Exception:                               # the bridge is expensive and optional here
         guid = (guid or "").strip()
         return ("sess:" + guid) if guid else ""
+    return _real(guid)
 
 
 def _rows(path):
