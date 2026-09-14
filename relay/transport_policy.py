@@ -431,6 +431,17 @@ CHECKABLE_EFFECT = (
     r"\bpush\b",
     r"コミット(?:して(?!い)|しろ|せよ|します|する|してください)",
     r"プッシュ(?:して(?!い)|しろ|せよ|します|する|してください)",
+    # A FILE PUT SOMEWHERE IS AS CHECKABLE AS A COMMIT, and for a while it was not treated as
+    # such. Measured 2026-09-14: a goal reading 「…9月報告分の資料を作ってください。…同じフォルダ
+    # に出してください」 lost its websocket six minutes in, was correctly refused a re-send
+    # because it acts and delivery was unknown, and then sat dead for the remaining fifty
+    # minutes and overnight. Nothing had been written at all -- the question "did the act
+    # happen" had an answer sitting on disk, and nobody asked it.
+    #
+    # The deliberate asymmetry with mail is kept: mail leaves no trace this process can read,
+    # so it stays uncheckable and stays refused. A file does leave one.
+    r"(?:出力|保存|書き出|作成|出して|置いて)(?:して)?(?:ください|しろ|せよ|する|します)?",
+    r"\b(?:save|write|output|export|produce)\b.{0,40}\b(?:file|folder|directory|pptx|xlsx|docx|pdf|csv)\b",
 )
 
 

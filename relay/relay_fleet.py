@@ -1525,6 +1525,49 @@ def socket_fault_is_transport(reason):
         return False
 
 
+#: An absolute Windows or POSIX path written into an instruction. Deliberately does not try to
+#: resolve a relative or prose location ("デスクトップの ogf フォルダ") -- guessing which of
+#: several plausible folders an operator meant would make the effect check look somewhere the
+#: worker never wrote, report `absent`, and re-send an act that already ran. A path this cannot
+#: read is a path the caller falls back to `cwd` for, or gives up on.
+_GOAL_PATH = re.compile(r"[A-Za-z]:[\\/][^\s\"'<>|、。，））\]]+|/(?:home|tmp|usr|var)/[^\s\"'<>|、。]+")
+
+
+def _folders_named_in(goal):
+    """The existing folders an instruction names, longest first, de-duplicated.
+
+    A path that names a FILE contributes its directory: "…\\ogf\\report.pptx に出して" is an
+    instruction about the ogf folder as much as one that names the folder outright.
+    """
+    seen, out = set(), []
+    for raw in _GOAL_PATH.findall(goal or ""):
+        path = raw.rstrip(".,、。)]　")
+        try:
+            if os.path.isdir(path):
+                folder = path
+            elif os.path.splitext(path)[1]:
+                # A path with an extension names a FILE, and an instruction about a file is an
+                # instruction about the folder it goes in -- whether or not it exists yet, which
+                # for an output is the normal case.
+                folder = os.path.dirname(path)
+            else:
+                # No extension and not a directory: the operator named a FOLDER that is not
+                # there. Walking up to its parent would check somewhere they never mentioned,
+                # find whatever else lives there, and answer a question nobody asked.
+                continue
+        except (OSError, ValueError):
+            continue
+        if not folder:
+            continue
+        key = os.path.normcase(os.path.normpath(folder))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(folder)
+    out.sort(key=len, reverse=True)
+    return out
+
+
 def _commit_subject_from_goal(goal):
     """The commit subject a goal names, so `git log` can be asked whether it is already there.
 
@@ -5101,6 +5144,17 @@ class RelayWorker:
             return None
         if not effect_is_checkable(self.goal or ""):
             return None
+
+        # A GOAL THAT PUTS A FILE SOMEWHERE IS CHECKED ON DISK, NOT IN `git log`. This is
+        # tried before the commit checker because a goal can match both vocabularies ("build
+        # the deck and commit it"), and of the two the filesystem question is the one that can
+        # be answered without a repository -- `_file_effect_checker` returns None when it
+        # cannot find a folder to look in, and the commit path below then gets its turn
+        # exactly as before.
+        file_check = self._file_effect_checker()
+        if file_check is not None:
+            return file_check
+
         repo = getattr(self, "_effect_repo", None) or (getattr(self, "cwd", None) or None)
         if not repo:
             return None
@@ -5132,6 +5186,70 @@ class RelayWorker:
                 return CHECK_UNKNOWN
             subjects = [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
             return CHECK_PRESENT if subject in subjects else CHECK_ABSENT
+
+        return _check
+
+    #: Folders named in a goal are looked at no deeper than this. A deep tree can hold tens of
+    #: thousands of entries and this runs on the fault path, where the connection is already
+    #: broken and a slow answer is one nobody waits for.
+    EFFECT_SCAN_DEPTH = 2
+
+    def _file_effect_checker(self):
+        """A checker for "the goal was supposed to put a file somewhere". None if it cannot look.
+
+        WHAT IT ASKS. Not "does the named file exist" -- an ordinary instruction does not name
+        its output ("8月までのpptxと同じようなものを、同じフォルダに出してください"). It asks the
+        question that actually decides the re-send: **did anything appear in that folder after
+        this turn was sent.** Something appeared, so the act ran, so refuse. Nothing appeared,
+        so it did not, so re-sending repeats nothing.
+
+        IT NEVER ANSWERS `present`, AND THAT IS NOT AN OVERSIGHT. `resend_decision_for_landed_act`
+        reads `present` as "the effect is already in the world, so re-sending is a harmless
+        no-op" -- true of a commit, whose subject cannot land twice, and false of a file, which
+        a second run would write again. What this checker can actually establish is the ABSENCE
+        of any write; seeing *a* new file does not establish that THIS goal's effect completed.
+        So the honest answers are `absent` (nothing was written, re-sending repeats nothing) and
+        `unknown` (something changed, or the folder could not be read) -- and `unknown` refuses,
+        which is the behaviour that existed before this method did.
+
+        WHY IT NEEDS THE SEND TIME. Without it the question degrades to "are there files here",
+        which is yes for every real folder, so every act would read as landed and nothing would
+        ever be recovered. `_turn_sent_at` is set by `_begin_send`; with no send time there is
+        nothing to compare against and this returns None rather than inventing one.
+        """
+        try:
+            from relay.transport_policy import CHECK_ABSENT, CHECK_UNKNOWN
+        except Exception:
+            return None
+
+        sent_at = float(getattr(self, "_turn_sent_at", 0.0) or 0.0)
+        if sent_at <= 0.0:
+            return None
+
+        folders = _folders_named_in(self.goal or "")
+        if not folders:
+            cwd = getattr(self, "cwd", None)
+            if cwd and os.path.isdir(cwd):
+                folders = [cwd]
+        folders = [f for f in folders if os.path.isdir(f)]
+        if not folders:
+            return None
+
+        def _check(_goal):
+            looked = False
+            for folder in folders:
+                for root, dirs, files in os.walk(folder):
+                    depth = root[len(folder):].count(os.sep)
+                    if depth >= self.EFFECT_SCAN_DEPTH:
+                        dirs[:] = []
+                    for name in files:
+                        try:
+                            if os.path.getmtime(os.path.join(root, name)) > sent_at:
+                                return CHECK_UNKNOWN   # something ran; not provably THIS goal
+                        except OSError:
+                            continue
+                    looked = True
+            return CHECK_ABSENT if looked else CHECK_UNKNOWN
 
         return _check
 
