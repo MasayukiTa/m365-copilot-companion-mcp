@@ -4082,6 +4082,97 @@ class ChatWindow : Window
 
         string plain = PlainText(text);
 
+        // A LONG ANSWER OPENS SHORT, ONCE.
+        //
+        // MEASURED BEFORE BUILDING ANYTHING, because the obvious design was the wrong one. An
+        // external review recommended folding long TOOL OUTPUT; on this machine's transcripts
+        // that is not where the length is. 138 assistant turns with text: median 280 characters,
+        // p90 1,130, max 2,282, and only 8% mention a tool call at all. Folding tool output would
+        // have been machinery aimed at a case that barely occurs, while the 14% of turns over a
+        // thousand characters -- ordinary prose -- kept pushing everything else off the screen.
+        //
+        // So the threshold is the measurement: above ASSISTANT_FOLD_CHARS the body opens clipped
+        // with a line saying how much is hidden, and one click shows all of it.
+        //
+        // THREE RULES FROM THE REVIEW, each of which is a way this goes wrong:
+        //   * the summary is an ENTRANCE to the original, never a replacement -- so the fold is
+        //     the same text, clipped, and never a paraphrase;
+        //   * nothing the reader has opened is ever folded again -- a panel that re-folds while
+        //     being read is worse than one that never folded;
+        //   * folding happens on first render only, which is why it is here and not in the
+        //     refresh path.
+        bool folds = plain.Length > ASSISTANT_FOLD_CHARS;
+        string full = plain;
+        if (folds) plain = plain.Substring(0, ASSISTANT_FOLD_CHARS);
+
+        FillFlowDocument(doc, plain);
+
+        rtb.Document = doc;
+        content.Children.Add(rtb);
+
+        if (folds)
+        {
+            // SAYS HOW MUCH IS HIDDEN, not just that something is. "続きを表示" alone leaves the
+            // reader guessing whether it is a line or a page -- which is the question they are
+            // trying to answer before clicking.
+            int hidden = full.Length - ASSISTANT_FOLD_CHARS;
+            var more = new TextBlock
+            {
+                Text = _lang == 0 ? ("続きを表示（あと " + hidden + " 字）")
+                                  : ("Show the rest (" + hidden + " more characters)"),
+                FontSize = 12,
+                Cursor = Cursors.Hand,
+                Margin = new Thickness(2, 6, 0, 0),
+            };
+            SetRef(more, TextBlock.ForegroundProperty, "Accent");
+            var rtbRef = rtb;
+            var moreRef = more;
+            string fullRef = full;
+            more.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e)
+            {
+                e.Handled = true;
+                // ONE WAY ONLY. There is no "fold again": the reader asked for the text, and a
+                // control that takes it back is the panel changing under them, which is the
+                // whole family of defect this file has been working through.
+                rtbRef.Document = BuildFlowDocument(fullRef, rtbRef.FontFamily);
+                moreRef.Visibility = Visibility.Collapsed;
+            };
+            content.Children.Add(more);
+        }
+    }
+
+    //: Above this many characters an assistant answer opens clipped, with a line saying how
+    //: much is hidden and one click to show all of it.
+    //:
+    //: FROM THE MEASUREMENT, not from a guess. 138 assistant turns on this machine: median 280
+    //: characters, p90 1,130, max 2,282. A threshold at the p90 leaves the 86 percent that were
+    //: already short untouched and catches the 14 percent that were burying everything under
+    //: them. Set it much lower and every answer grows a control nobody needs.
+    const int ASSISTANT_FOLD_CHARS = 1100;
+
+    static string PlainText(string md)
+    {
+        if (md == null) return "";
+        var sb = new StringBuilder();
+        string[] lines = md.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n');
+        foreach (var raw in lines)
+        {
+            string ln = raw;
+            int h = 0; while (h < ln.Length && ln[h] == '#') h++;
+            if (h > 0 && h < ln.Length && ln[h] == ' ') ln = ln.Substring(h + 1);   // heading -> plain
+            ln = ln.Replace("**", "").Replace("`", "");                              // drop bold/code markers
+            sb.Append(ln).Append('\n');
+        }
+        return sb.ToString().TrimEnd('\n');
+    }
+
+
+    // The paragraph layout for an assistant answer, as a function so the folded body and the
+    // full body are built the same way. It was inline, which is why unfolding had no way to
+    // re-render without duplicating it -- and a second copy of a layout is a second place for it
+    // to drift.
+    static void FillFlowDocument(FlowDocument doc, string plain)
+    {
         // Split on runs of 2+ newlines to identify paragraph boundaries.
         // We do this manually without Regex (C# 5 compatible, no extra imports).
         var paragraphBlocks = new List<string>();
@@ -4135,24 +4226,15 @@ class ChatWindow : Window
             }
         }
 
-        rtb.Document = doc;
-        content.Children.Add(rtb);
     }
 
-    static string PlainText(string md)
+    // A document for `plain` with the same layout, used when a folded answer is opened.
+    static FlowDocument BuildFlowDocument(string plain, FontFamily family)
     {
-        if (md == null) return "";
-        var sb = new StringBuilder();
-        string[] lines = md.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n');
-        foreach (var raw in lines)
-        {
-            string ln = raw;
-            int h = 0; while (h < ln.Length && ln[h] == '#') h++;
-            if (h > 0 && h < ln.Length && ln[h] == ' ') ln = ln.Substring(h + 1);   // heading -> plain
-            ln = ln.Replace("**", "").Replace("`", "");                              // drop bold/code markers
-            sb.Append(ln).Append('\n');
-        }
-        return sb.ToString().TrimEnd('\n');
+        var d = new FlowDocument { PagePadding = new Thickness(0), FontFamily = family, FontSize = 14 };
+        d.SetResourceReference(FlowDocument.ForegroundProperty, "Fg");
+        FillFlowDocument(d, plain);
+        return d;
     }
 
     TextBox MakeText(string text)
