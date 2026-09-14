@@ -136,6 +136,10 @@ LIVE_RECORD_REDIRECTS = {
                           "TASKS": "tasks.jsonl"},
     "tools.auth_stats": {"_STATS_FILE": "auth_stats.json"},
     "tools.skill_ops": {"_SKILL_USE_LOG": "skill_use.jsonl"},
+    # REDIRECTED, NOT EXCUSED, because this one is written to: `skill_draft.write` puts a
+    # generated bundle per proposal here, and a test that exercised it would otherwise drop
+    # files into the operator's own proposals directory and leave them there.
+    "tools.skill_draft": {"PROPOSALS_DIR": "skill_proposals"},
     "relay.mechanism_telemetry": {"LOG": "mechanisms.jsonl"},
     # THE GAUGE READS THIS FILE DIRECTLY. Every turn the fleet sends is appended here, and the
     # cockpit's rate strip renders whatever it finds -- so a test that records a turn does not
@@ -286,6 +290,10 @@ DELIBERATELY_NOT_REDIRECTED = {
         "read-only: the socket ledger is the rebuild's source and is never opened for writing",
     ("tools.rebuild_history", "TRANSCRIPTS"):
         "read-only: transcripts are scanned for their goal line and never written",
+    ("tools.skill_candidates", "SESSIONS_DB"):
+        "read-only, and opened that way in so many words: `_full_goals` connects with "
+        "`mode=ro` in the URI, so sqlite itself refuses a write through this handle. It is "
+        "read to recover the whole goal text behind the ledger's 600-character truncation",
     ("tools.skill_candidates", "LEDGER"):
         "read-only, and the same socket ledger rebuild_history reads above: skill_candidates, "
         "skill_lessons and skill_draft open it to count past work and never write through it. "

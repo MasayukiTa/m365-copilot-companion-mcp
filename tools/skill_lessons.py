@@ -57,7 +57,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
-from tools.skill_candidates import LEDGER, is_benchmark  # noqa: E402
+from tools.skill_candidates import LEDGER, _full_goals, is_benchmark, rehydrate  # noqa: E402
 
 #: Outcomes that mean the attempt did not deliver.
 FAILED = ("STUCK", "REFUSED", "EVIDENCE_CONTRADICTED", "CANCELLED")
@@ -186,9 +186,15 @@ def pairs(ledger=None, include_benchmarks=False, min_similarity=MIN_SIMILARITY):
     a shared word. Probing with the ceil((1-t)|A|)+1 rarest words of A therefore cannot miss a
     pair that would have qualified, at any threshold and any corpus size.
     """
+    # THE WHOLE GOAL, NOT THE LEDGER'S FIRST 600 CHARACTERS. A lesson is a segment one
+    # instruction carried and another did not; 71% of goals are longer than the cap, so
+    # comparing the truncations made every difference past character 600 invisible -- which is
+    # exactly where an operator who is adding a missing fact tends to add it. Built once and
+    # passed down, because it is one query and this loop runs over thousands of rows.
+    table = _full_goals()
     rows = []
     for row in _rows(ledger):
-        goal = str(row.get("goal") or "").strip()
+        goal = rehydrate(str(row.get("goal") or "").strip(), table)
         if not goal:
             continue
         if not include_benchmarks and is_benchmark(goal):
