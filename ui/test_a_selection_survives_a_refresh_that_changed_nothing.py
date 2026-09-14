@@ -53,20 +53,45 @@ def _code_only(text):
 def test_the_fleet_view_does_not_rebuild_when_nothing_changed():
     """THE DEFECT, in one assertion."""
     body = _code_only(_method("void RefreshFleetSnapshot()"))
-    assert "_fleetRenderSig" in body, (
+    assert "_fleetTurnSigs" in body, (
         "the fleet view rebuilds on every status.json write again; a text selection cannot "
         "survive one second of that")
-    assert "if (sig == _fleetRenderSig) return;" in body, (
-        "the signature is computed and not acted on")
+    # PER TURN, NOT ONE STRING. The first version signed the whole transcript as a single value,
+    # which can only answer "same or not" -- so a new turn still meant a full rebuild. A list
+    # says WHERE it differs, which is what lets the new turns be appended instead.
+    assert "List<string> _fleetTurnSigs" in _code_only(_src()), (
+        "the signature is a single string again, so a growing transcript rebuilds the panel")
 
 
-def test_the_rebuild_happens_after_the_guard_and_not_before():
+def test_nothing_is_cleared_before_the_comparison_is_made():
     """Clearing first and comparing afterwards would destroy the selection and then decide not
-    to have destroyed it."""
+    to have destroyed it. Asserted as an ORDER over the panel, whatever the comparison looks
+    like -- the first version pinned one `if` line and broke when the guard became a per-turn
+    diff, reporting a failure about a defect that had just been fixed further."""
     body = _code_only(_method("void RefreshFleetSnapshot()"))
-    assert body.index("if (sig == _fleetRenderSig) return;") < body.index(
-        "_messages.Children.Clear();"), (
-        "the panel is cleared before the guard runs")
+    assert body.index("int common = 0;") < body.index("_messages.Children.Clear();"), (
+        "the panel is cleared before the comparison runs")
+
+
+def test_only_the_new_turns_are_added_when_the_past_is_unchanged():
+    """THE HALF THE SIGNATURE GUARD DID NOT COVER. A tick with no change was already cheap; a
+    tick that ADDS a turn still rebuilt everything, so a reader mid-selection lost it whenever
+    the agent answered -- less often, which is not a property to rely on."""
+    body = _code_only(_method("void RefreshFleetSnapshot()"))
+    assert "for (int i = common; i < sigs.Count; i++)" in body, (
+        "new turns are no longer appended; the panel is rebuilt when the transcript grows")
+    i = body.index("for (int i = common; i < sigs.Count; i++)")
+    assert "_messages.Children.Clear();" not in body[:i], (
+        "the append path runs after a clear, which defeats it")
+
+
+def test_a_past_that_changed_still_forces_a_rebuild():
+    """Appending is only correct while the transcript is append-only. A different worker, a
+    recycled conversation or a rewritten file means what is on screen is about something else,
+    and keeping it would be worse than the flicker."""
+    body = _code_only(_method("void RefreshFleetSnapshot()"))
+    assert "common == _fleetTurnSigs.Count" in body, (
+        "the append path no longer checks that everything already rendered still matches")
 
 
 def test_the_signature_is_taken_from_what_is_displayed():
@@ -74,12 +99,21 @@ def test_the_signature_is_taken_from_what_is_displayed():
     heartbeat -- so signing it would keep the rebuild running at exactly the old rate while
     looking like a fix."""
     body = _code_only(_method("void RefreshFleetSnapshot()"))
-    assert "txPre" in body and "tailPre" in body, (
-        "the signature no longer derives from the transcript and the status tail")
-    i = body.index("string sig =")
+    assert "txPre" in body, "the signature no longer derives from the transcript"
+    i = body.index("var sigs = new List<string>();")
     arm = body[max(0, i - 500):i]
     assert "Serialize(w)" not in arm, (
         "the signature is being taken from the worker dictionary, which changes every second")
+    # THE STATUS MUST NOT RE-ENTER THE SIGNATURE. If it did, every tick would differ, the
+    # comparison would never hold and both the guard and the append would be decoration.
+    # (The first draft of this assertion ended in `or True`, which is a test that cannot fail --
+    # the green-by-omission this file exists to prevent, written into the file itself.)
+    sig_block = body.split("var sigs = new List<string>();", 1)[1].split("int common", 1)[0]
+    assert "tailPre" not in sig_block, (
+        "the status tail is part of the per-turn signature again")
+    assert "foreach (var m in txPre)" in sig_block, (
+        "the signature is no longer built from the transcript turns")
+    assert "ShowRunState(tailPre)" in body, "the status no longer reaches its own band"
 
 
 def test_the_transcript_is_read_once():
