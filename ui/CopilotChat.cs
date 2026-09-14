@@ -4250,6 +4250,23 @@ class ChatWindow : Window
         g["text"] = (_lang == 0
             ? "【ユーザーからの追加指示】" + text + "\n直前までの作業内容を踏まえ、この追加指示に対してだけ答えてください。最初からやり直す必要はありません。完了なら DONE、無理なら FAIL と理由を書いてください。"
             : "[follow-up from the user] " + text + "\nAnswer only this follow-up, building on the work so far. Do not start over. Write DONE when finished, or FAIL and why.");
+        // THE CONVERSATION BY ITS ID, WHICH THIS ROW HAS HAD ALL ALONG. `ConvUrl` is
+        // "sess:<guid>", read out of the transcript's own guid line a few hundred lines above.
+        // Until now the follow-up carried only `follow_up_to` -- the GOAL TEXT -- and the fleet
+        // looked the conversation up with socket_route.conversation_for_goal, matching on that
+        // text. Identity by wording: re-phrase the goal, or run it twice, and the follow-up
+        // lands in a conversation that never heard the question, or in a fresh one.
+        //
+        // docs/incidents/20260912_a_fleet_conversation_could_be_read_and_never_answered.md put
+        // it plainly -- "the identity existed and was durable the whole time ... the ability was
+        // built and nothing ever asked" -- and recorded that what looked like continuing through
+        // the fleet was "a new conversation with the context re-pasted by hand".
+        //
+        // relay_fleet takes `resume_conv` and runs it through _conversation_id_or_empty, which
+        // accepts exactly this shape. `follow_up_to` stays as the fallback for a row that has no
+        // guid (a conversation captured before the guid was recorded).
+        if (c.ConvUrl != null && c.ConvUrl.StartsWith("sess:", StringComparison.OrdinalIgnoreCase))
+            g["resume_conv"] = c.ConvUrl;
         g["follow_up_to"] = goal;
         g["priority"] = true;
         bool ok = AppendCommand("add_goal", g);

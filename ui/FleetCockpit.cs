@@ -153,6 +153,10 @@ class ApprovalPromptWindow : Window
     readonly JavaScriptSerializer _js = new JavaScriptSerializer();
     string _gateDir;
     string _currentPath;
+    //: Why the path was refused, kept so the window can say it. It used to close itself in
+    //: `Loaded` before painting, so a refused gate and a working one looked identical from the
+    //: outside: the notification was clicked and nothing happened at all.
+    string _gateWhy;
     Dictionary<string, object> _current;
     TextBlock _kind, _question, _context, _count, _policyHelp;
     Button _approve, _deny;
@@ -214,20 +218,48 @@ class ApprovalPromptWindow : Window
         Background = Bg; ShowInTaskbar = true; FontFamily = new FontFamily(Theme.UiFont);
         try
         {
+            // THE SAME QUESTION THE WRITER ASKED. Not "is this folder called .companion_gates"
+            // -- gate_ops.py writes to MCP_GATE_DIR when it is set, and a cockpit that only
+            // recognises the default name can never open what it wrote. Still a whitelist, and
+            // still exactly one directory: an arbitrary path handed to --approval-gate is
+            // refused as firmly as before, it is simply the RIGHT directory now.
             string full = Path.GetFullPath(initialGatePath);
             _gateDir = Path.GetDirectoryName(full);
+            string allowed = CockpitWindow.ResolveGateDirectory("", "");
             if (!Path.GetFileName(full).StartsWith("gate_", StringComparison.OrdinalIgnoreCase) ||
-                !Path.GetExtension(full).Equals(".json", StringComparison.OrdinalIgnoreCase) ||
-                !Path.GetFileName(_gateDir).Equals(".companion_gates", StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException("invalid approval-gate path");
+                !Path.GetExtension(full).Equals(".json", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("not an approval gate file: " + full);
+            // ASK THE FILESYSTEM, DO NOT COMPARE SPELLINGS. The first version compared
+            // Path.GetFullPath of both directories as strings, and failed the moment they were
+            // spelled differently -- measured: a gate under %TEMP%, which Windows hands back as
+            // the 8.3 name C:\Users\M118A8~1\..., against the same directory written long. The
+            // window closed and the operator saw nothing. GetFullPath does not expand 8.3 names,
+            // and neither does any string comparison; enumerating the allowed directory answers
+            // "is this file in there" in whatever spelling either side used.
+            if (!Directory.Exists(allowed) ||
+                Directory.GetFiles(allowed, Path.GetFileName(full)).Length == 0)
+                throw new InvalidOperationException(
+                    "approval gate is not in the gate directory: " + _gateDir +
+                    " (expected " + allowed + ")");
             _currentPath = full;
         }
-        catch { _gateDir = null; _currentPath = null; }
+        catch (Exception ex) { _gateDir = null; _currentPath = null; _gateWhy = ex.Message; }
 
         Build();
         Loaded += delegate
         {
-            if (_gateDir == null) { Close(); return; }
+            if (_gateDir == null)
+            {
+                // A REFUSAL IS AN ANSWER AND HAS TO BE GIVEN. Closing here is what made a
+                // clicked notification do nothing at all -- no window, no message, no log.
+                MessageBox.Show(this,
+                    L("承認ゲートを開けませんでした。", "The approval gate could not be opened.")
+                    + "\n\n" + (_gateWhy ?? ""),
+                    L("承認が必要です", "Approval required"),
+                    MessageBoxButton.OK, MessageBoxImage.Warning);
+                Close();
+                return;
+            }
             LoadNext();
             _timer = new DispatcherTimer(); _timer.Interval = TimeSpan.FromSeconds(2);
             _timer.Tick += delegate
@@ -7806,12 +7838,34 @@ class CockpitWindow : Window
     }
 
     // ── APPROVAL CENTER: durable gates, available even while the fleet is idle ───────────
-    string GateDirectory()
+    //
+    // ONE RESOLUTION, USED BY BOTH CLASSES. ApprovalPromptWindow cannot call an instance method
+    // of CockpitWindow, so it had its own rule -- "the gate's folder must be named
+    // .companion_gates" -- while the WRITER (tools/gate_ops.py) resolves
+    // `MCP_GATE_DIR or ALLOWED_BASE/.companion_gates`. Whenever MCP_GATE_DIR pointed elsewhere
+    // the two disagreed, the prompt threw "invalid approval-gate path", and the window closed
+    // itself in `Loaded` before painting anything: the operator clicked a notification and
+    // nothing happened, with no message anywhere. Two places deciding where gates live, in one
+    // file, because one of them could not reach the other's method.
+    string GateDirectory() { return ResolveGateDirectory(EnvValue("MCP_ALLOWED_BASE"),
+                                                         EnvValue("MCP_GATE_DIR")); }
+
+    //: `fileBase` / `fileGateDir` are what the .env says; the process environment wins, exactly
+    //: as it does in gate_ops.py. Static so the approval window can ask the same question.
+    internal static string ResolveGateDirectory(string fileBase, string fileGateDir)
     {
         try
         {
+            // MCP_GATE_DIR FIRST, because that is the order the writer uses. It is what the
+            // test suite sets to keep its gates out of the operator's queue, and a cockpit that
+            // ignores it can never open a gate written under it.
+            string over = Environment.GetEnvironmentVariable("MCP_GATE_DIR") ?? "";
+            if (string.IsNullOrWhiteSpace(over)) over = fileGateDir ?? "";
+            over = (over ?? "").Trim().Trim('"');
+            if (over.Length > 0) return Path.GetFullPath(over);
+
             string raw = Environment.GetEnvironmentVariable("MCP_ALLOWED_BASE") ?? "";
-            if (string.IsNullOrWhiteSpace(raw)) raw = EnvValue("MCP_ALLOWED_BASE");
+            if (string.IsNullOrWhiteSpace(raw)) raw = fileBase ?? "";
             raw = (raw ?? "").Trim();
             string basePath;
             if (raw.Length == 0 || raw == "*")
@@ -10205,14 +10259,15 @@ class CockpitWindow : Window
             ? (ja ? ("ゴール (" + goalTexts.Count + ")") : ("Goals (" + goalTexts.Count + ")"))
             : (ja ? "指示" : "DIRECTIVE");
 
-        // Goal text: first goal + "(+N more lanes)" indicator for multi-goal.
-        string primaryGoal = goalTexts.Count > 0 ? goalTexts[0] : "";
-        string goalDisplay = primaryGoal;
-        if (multiGoal && goalTexts.Count > 1)
-        {
-            int extras = goalTexts.Count - 1;
-            goalDisplay = primaryGoal + (ja ? (" (他 " + extras + " lane)") : (" (+" + extras + " more lanes)"));
-        }
+        // EVERY GOAL, ONE PER LINE. This used to render goalTexts[0] and summarise the rest as
+        // "(他 N lane)" -- so with two goals in flight the band showed one of them and a count,
+        // and WHICH one it showed depended on the order the worker list happened to arrive in.
+        // Every refresh could pick a different first element, so the panel flickered between
+        // goals as lanes progressed, and the operator saw the view "move" on its own.
+        //
+        // The list was already complete here; only the rendering threw it away. Concurrent
+        // lanes are concurrent: they belong side by side, not behind a number.
+        string goalDisplay = string.Join("\n", goalTexts.ToArray());
 
         // Meta line: "started HH:MM · {elapsed} · {active}/{total} lanes active" [COMPUTED]
         string metaLine = _directiveBandMeta;
