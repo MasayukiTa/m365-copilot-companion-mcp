@@ -32,7 +32,21 @@ import pytest
 #: that test until somebody decides which it is -- so the silence becomes a decision.
 #: Modules that are expensive to import (the bridge takes ~4s) and are therefore patched only
 #: when a test has already imported them. A test that never imports one cannot write through it.
-ONLY_IF_ALREADY_IMPORTED = frozenset({"bridge.copilot_bridge", "bridge.session_store"})
+#: AND EVERY `scripts.*` ENTRY BELOW, for the same reason and one more. The walker did not look
+#: at scripts/ at all until 2026-09-14 -- it swept relay/, tools/ and bridge/ -- and widening it
+#: found EIGHTEEN constants there naming .fleet, an entire package nobody had classified. They
+#: are patched only once a test has imported the module: several of them (run_nightly_real,
+#: settle_stage0_replay) pull the selfimprove stack in behind them, and paying that on every one
+#: of seven thousand tests to protect a file a test cannot reach is the wrong trade.
+ONLY_IF_ALREADY_IMPORTED = frozenset({
+    "bridge.copilot_bridge", "bridge.session_store",
+    "scripts.diag_report", "scripts.diag_warmup_bias", "scripts.recycle_report",
+    "scripts.run_nightly_real", "scripts.settle_stage0_replay",
+    "scripts.verify_fleet_transcripts", "scripts.verify_secret_redaction",
+    "scripts.win._mem_strata", "scripts.win._merge_watch", "scripts.win.capture_budget",
+    "scripts.win.checkpoint", "scripts.win.tab_audit", "scripts.win.verify_stack",
+    "scripts.win.watch_stack",
+})
 
 LIVE_RECORD_REDIRECTS = {
     # _TOKEN_GAP_FILE is DERIVED (`_STATE_FILE.parent / ...`), so redirecting _STATE_FILE alone
@@ -67,6 +81,42 @@ LIVE_RECORD_REDIRECTS = {
     # is exactly what the tests use -- so the log could not distinguish a refusal that happened
     # from one a test simulated, and the evidence for the switch was not evidence.
     "relay.fleet_toolset": {"SHADOW_LOG": "toolset_shadow.jsonl"},
+    # THE ONLY RECORD OF WHETHER THE NIGHTLY LOOP ACTUALLY RUNS. A test firing written here
+    # would answer "has it run?" with yes on a machine where it never has -- which is precisely
+    # the question the file was added to make answerable. NOT in ONLY_IF_ALREADY_IMPORTED with
+    # the other scripts: this module's own imports are stdlib, and the heavy ones are inside the
+    # functions that need them.
+    "scripts.selfimprove_driver": {"LOG": "selfimprove_driver.jsonl"},
+
+    # ── scripts/, which the walker did not sweep until 2026-09-14 ───────────────────────────
+    #
+    # EIGHTEEN CONSTANTS IN A PACKAGE NOBODY HAD CLASSIFIED. PACKAGES was ("relay", "tools",
+    # "bridge") and scripts/ writes to .fleet as much as any of them -- the sweep simply never
+    # looked. Found while trying to register the driver log above, which could not be listed
+    # because the walker could not see the module it lives in.
+    #
+    # REDIRECTED RATHER THAN TRIAGED ONE BY ONE, and that is a deliberate choice about what can
+    # be known cheaply. An AST pass over these eighteen reported all but two as read-only, and
+    # it was WRONG: scripts/win/capture_budget.py::ACKED is written through
+    # `target = path or ACKED` ... `open(target, "w")`, an indirection the pass could not
+    # follow. A classification nobody can stand behind is worse than none, so the ones that are
+    # paths are redirected -- which costs a read-only constant nothing but a temp path -- and
+    # anything a test genuinely needs to read from the live tree comes back here as a demotion
+    # with the failure that proved it.
+    "scripts.diag_report": {"DIAG": "diag"},
+    "scripts.diag_warmup_bias": {"OUT": "diag"},
+    "scripts.recycle_report": {"PATH": "recycle_samples.jsonl"},
+    "scripts.run_nightly_real": {"ARCHIVE": "selfimprove/archive.jsonl"},
+    "scripts.settle_stage0_replay": {"DEFAULT_TRACE": "settle_trace_collect.jsonl"},
+    "scripts.verify_fleet_transcripts": {"DEFAULT_DIR": "transcripts"},
+    "scripts.win._merge_watch": {"LOG": "merge_watch.jsonl"},
+    "scripts.win.capture_budget": {"ACKED": "capture_budget_acked.json",
+                                   "LEDGER": "capture_budget.jsonl"},
+    "scripts.win.checkpoint": {"AUDIT_LOG": "checkpoint_audit.jsonl",
+                               "ROUTE_LOG": "socket_route.jsonl"},
+    "scripts.win.tab_audit": {"ROUTE_LOG": "socket_route.jsonl"},
+    "scripts.win.verify_stack": {"ROUTE_LOG": "socket_route.jsonl"},
+    "scripts.win.watch_stack": {"ROUTE_LOG": "socket_route.jsonl"},
     # Written at admission for every benchmark task; a test that admits a task would otherwise
     # add terms to the operator's real contract file, which is append-only and first-wins.
     "relay.acceptance_contract": {"CONTRACT_PATH": "acceptance_contracts.jsonl"},
@@ -126,6 +176,27 @@ LIVE_RECORD_REDIRECTS = {
 #: this list is a claim that a test writing there is harmless -- so it is short, and each line
 #: has to be defensible.
 DELIBERATELY_NOT_REDIRECTED = {
+    # NOT A PATH -- A SET OF DIRECTORY NAMES the updater must keep when it replaces a tree:
+    # {".env", ".venv", ".setup", ".fleet", ...}. Nothing is written THROUGH it, and pointing it
+    # at a temp directory would make the updater stop preserving the operator's .fleet, which is
+    # the opposite of protection. Same shape as tools.file_ops._SECURITY_STATE_DIRS below.
+    ("scripts.update_from_release", "PRESERVE_NAMES"):
+        "a set of directory names to preserve during an update, not a location anything "
+        "writes to; redirecting it would stop the updater preserving the real .fleet",
+    # THESE TWO RUN WHEN THEY ARE IMPORTED, which is the evidence rather than the excuse. Both
+    # read sys.argv at module scope: importing verify_secret_redaction raises SystemExit(0), and
+    # _mem_strata dies converting a pytest node id to a float. The redirect fixture found that
+    # out by importing them, which is how the pair moved from the table above to this one.
+    #
+    # A module no test can import is a module no test can write through -- and a test that DID
+    # import one would not quietly dirty a record, it would fail loudly on the import. That is a
+    # stronger guarantee than a redirect, not a weaker one.
+    ("scripts.verify_secret_redaction", "LED"):
+        "importing it executes it (sys.argv at module scope, then SystemExit), so no test "
+        "can import it and none can write through it",
+    ("scripts.win._mem_strata", "OUT"):
+        "importing it executes it (sys.argv at module scope), so no test can import it and "
+        "none can write through it",
     ("relay.fleet_reconcile", "TRANSCRIPTS"):
         "read-only: the reconciler only ever reads finished transcripts to compare them, and "
         "writes nothing at all. Its own tests pass an explicit directory, so nothing here "

@@ -35,7 +35,13 @@ import pytest
 import conftest as C
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PACKAGES = ("relay", "tools", "bridge")
+#: SCRIPTS ADDED 2026-09-14. The sweep was ("relay", "tools", "bridge") and scripts/ writes to
+#: .fleet as much as any of them -- it simply was never looked at. Widening it found EIGHTEEN
+#: unclassified constants there, an entire package. Found the way these always are: by trying to
+#: register a new one (the nightly driver's log) and discovering the walker could not see the
+#: module it lived in. A hand-maintained allowlist fails open by construction, and so does the
+#: walk that feeds it.
+PACKAGES = ("relay", "tools", "bridge", "scripts")
 
 
 def _module_path(file_path):
