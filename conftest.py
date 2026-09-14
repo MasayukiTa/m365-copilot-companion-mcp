@@ -213,6 +213,30 @@ DELIBERATELY_NOT_REDIRECTED = {
     ("relay.task_router", "FLEET_STATE_DIR"):
         "resolved through the FLEET_STATE_DIR environment variable, which conftest already "
         "points at a per-run temp directory; the .fleet path is only its fallback",
+    # ── surfaced 2026-09-14 by teaching the walk about `.companion_gates` ────────────────
+    #
+    # ALREADY REDIRECTED, BY THE VARIABLE RATHER THAN BY THIS TABLE -- the same arrangement as
+    # relay.task_router.FLEET_STATE_DIR above, and for a stronger reason: gate_ops reads
+    # MCP_GATE_DIR at IMPORT, so conftest sets it at module scope rather than in a fixture, and
+    # a value moved here afterwards could disagree with the one the module already resolved.
+    ("tools.gate_ops", "GATE_DIR"):
+        "resolved through MCP_GATE_DIR, which conftest sets at module scope before the module "
+        "is imported; the .companion_gates path is only its fallback",
+    # DERIVED FROM GATE_DIR (`GATE_DIR / \"STOP_RELAY\"`), so it moves with it. It matters more
+    # than most entries here: it is the kill switch, one file per account shared by every
+    # checkout, and a test that left it ON once reported six unrelated scenarios as ABORTED.
+    # conftest also clears it around every test -- the redirect stops a test reaching
+    # production, the fixture stops a test reaching the test after it.
+    ("tools.gate_ops", "STOP_FILE"):
+        "derived from GATE_DIR, which MCP_GATE_DIR already moves, and cleared around every "
+        "test by the _no_leftover_kill_switch fixture",
+    # NOT A PATH -- A LIST OF REGEXES the destructive-command classifier matches against, one of
+    # which happens to name `.companion_gates` because a shell that will `type` the approval
+    # queue is destructive. Nothing is written through it. Same shape as
+    # tools.file_ops._SECURITY_STATE_DIRS below; redirecting it would disarm the classifier.
+    ("tools.contract_gate", "_DESTRUCTIVE_PATTERNS"):
+        "a list of regexes the destructive-command classifier matches against, not a location; "
+        "one of them names .companion_gates because reading the approval queue is destructive",
     ("tools.contract_gate", "_FLEET_DIR"):
         "a directory, not a record; the gate's own files are redirected by the tests that "
         "write them and the contract file is already per-test",
@@ -419,6 +443,37 @@ import tempfile as _tempfile
 _os.environ.setdefault(
     "MCP_GATE_DIR",
     _os.path.join(_tempfile.gettempdir(), "companion_gates_pytest_%d" % _os.getpid()))
+
+# THE SAME QUEUE, REACHED BY A SECOND DOOR NOBODY CLOSED. relay/skills.py writes its approval
+# questions through its OWN gate directory, not gate_ops', and MCP_GATE_DIR does not move it.
+# Its docstring records the first half of this: "THE ONE OF THE THREE WITH NO ESCAPE HATCH, AND
+# IT LEAKED FOR MONTHS ... Measured 2026-09-07: 378 pending questions in ~/.companion_gates,
+# every single one naming a pytest temp directory, none naming a skill that exists."
+#
+# MCP_SKILLS_GATE_DIR was added that day as the escape hatch -- AND NOTHING EVER SET IT. Measured
+# 2026-09-14: 2,174 files in the live queue, 187 of them written today, 11 per run across 17
+# runs, every one still naming a pytest temp directory. An escape hatch nobody turns on is not
+# an escape hatch, and the owner is looking at a backlog of decisions of which zero are real.
+_os.environ.setdefault(
+    "MCP_SKILLS_GATE_DIR",
+    _os.path.join(_tempfile.gettempdir(), "skills_gates_pytest_%d" % _os.getpid()))
+
+# And the skills state DB behind the same object. Its tests DO point this at a tmp_path
+# themselves -- measured: the live store holds 9 rows and every one names a real skill directory,
+# none a pytest path -- so this is belt and braces rather than a repair. It costs nothing, and
+# "the tests remember to set it" is exactly the guarantee the gate directory also had.
+_os.environ.setdefault(
+    "MCP_SKILLS_STATE_DB",
+    _os.path.join(_tempfile.gettempdir(), "skills_state_pytest_%d.sqlite3" % _os.getpid()))
+
+# The local job store, which is a record and not a cache: relay/local_job_store.py defaults to
+# <repo>/.jobs/jobs.sqlite3 and MCP_LOCAL_JOB_DB is its override. Measured 2026-09-14: of 451
+# jobs in the operator's store, 57 carry a pytest path in their job_json. The newest is from
+# 2026-08-10, so it is not filling today -- which is the reason to close it now rather than the
+# reason to leave it.
+_os.environ.setdefault(
+    "MCP_LOCAL_JOB_DB",
+    _os.path.join(_tempfile.gettempdir(), "local_jobs_pytest_%d.sqlite3" % _os.getpid()))
 
 # Same reason, different file: relay.selfimprove.ledger appends to a hash-chained record in the
 # operator's home directory. A test run that wrote there would manufacture entries in the one
