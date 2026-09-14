@@ -107,9 +107,31 @@ def zip_create(
                 elif p.is_dir():
                     base = p
                     for child in p.rglob("*"):
-                        if child.is_file():
-                            zf.write(child, arcname=str(child.relative_to(base.parent)))
-                            added += 1
+                        if not child.is_file():
+                            continue
+                        # NEVER WRITE THE ARCHIVE INTO ITSELF. When archive_path lies inside a
+                        # source directory -- which is what a caller does when it keeps its
+                        # backups next to what it is backing up -- rglob hands back the output
+                        # file, and zipping a file that is growing because you are zipping it
+                        # does not terminate: the read chases the write until the disk runs out,
+                        # and what is left is an archive with no central directory, so not one
+                        # byte of it can be extracted.
+                        #
+                        # MEASURED, 2026-09-14. Six snapshots of one ~150MB business folder,
+                        # taken into a subdirectory of that same folder, occupied 9.51GB. Four
+                        # of them (0.18, 1.46, 2.42 and 5.43GB) had no end-of-central-directory
+                        # record at all, and each of the three largest was found to contain an
+                        # earlier snapshot nested inside it. The workers that made them reported
+                        # a successful backup and went on to edit the originals -- the whole
+                        # value of a backup is that it is there when it is needed, and these
+                        # would not have been.
+                        try:
+                            if child.resolve() == out.resolve():
+                                continue
+                        except OSError:
+                            pass
+                        zf.write(child, arcname=str(child.relative_to(base.parent)))
+                        added += 1
                 else:
                     return f"[zip_create error: source missing: {p}]"
         return f"Wrote {out} ({added} file(s), {out.stat().st_size:,} bytes)"
