@@ -12035,37 +12035,140 @@ class CockpitWindow : Window
         }
     }
 
-    // #14 mini-chat: the last few turns of a worker's disk transcript, as a compact scrollable
-    // thread inside the EXPANDED card -- read recent context + steer from the cockpit without
-    // switching to the chat window. Null when the transcript is empty/missing. Only expanded cards
-    // call this, so the I/O is bounded to the one or two cards the user opened.
+    //: How many recent entries the card lists. Three is the starting value, not a measurement --
+    //: it is what fits beside the state and the controls without the card becoming the reading
+    //: surface again. The rest are reachable by count and a link, never by scrolling here.
+    const int MINI_THREAD_ENTRIES = 3;
+
+    //: How much of an entry is shown so a reader can decide whether to open it. A line, not a
+    //: paragraph: the question this answers is "is this worth reading", and a paragraph answers
+    //: "what does it say", which is the other screen's job.
+    const int MINI_THREAD_SUMMARY_CHARS = 110;
+
+    // WHAT THE CARD SHOWS OF A CONVERSATION: enough to choose what to read, and no reading
+    // surface of its own.
+    //
+    // THE DEFECT THIS REPLACES. Each turn was a TextBox capped at MaxHeight 90 with its own
+    // scrollbar, inside a ScrollViewer capped at 240 with another, inside the card list's
+    // scroller. Three scroll regions stacked in the same direction: to reach the second turn you
+    // scrolled the first one to its end, then the panel, and the card moved under you while you
+    // did it. Reported as 「開いてしまえば一番下までスクロールしないと次のが見られない」 --
+    // read-shaped, not readable. An external review put the principle exactly: 「問題はスクロールの
+    // 存在ではなく、同じ操作方向に異なる本文領域が重なっていること」.
+    //
+    // Raising the caps does not fix it and lowering them is the same thing smaller: a monitoring
+    // card cannot host hundreds of lines without becoming the thing it was meant to summarise,
+    // and one long-running worker would push every other card off the screen. So the card lists
+    // WHAT HAPPENED and the full text opens where reading belongs -- the chat window, positioned
+    // on the entry, which the review recommended over an in-card expansion (the card jumps),
+    // a modal (it covers the monitor) and an unbounded body (one lane eats the view).
+    //
+    // Null when the transcript is empty or missing, as before.
     UIElement MiniThread(string transcriptPath)
     {
-        var turns = ReadLastTurns(transcriptPath, 4);
+        var turns = ReadLastTurns(transcriptPath, MINI_THREAD_ENTRIES);
         if (turns.Count == 0) return null;
-        var panel = new StackPanel();
+        bool ja = _lang == 0;
+        var panel = new StackPanel { Margin = new Thickness(0, 6, 0, 6) };
+
+        int total = CountTurns(transcriptPath);
         foreach (var t in turns)
         {
             bool user = t.Item1 == "U";
-            var b = new Border { Background = QuoteBg, CornerRadius = new CornerRadius(Theme.RadSmall),
-                                 Padding = new Thickness(12, 7, 12, 7), Margin = new Thickness(0, 0, 0, 5) };
-            var sp = new StackPanel();
-            var who = new TextBlock { Text = user ? (_lang == 0 ? "指示 / あなた" : "Instruction / You") : (_lang == 0 ? "エージェント" : "Agent"), FontSize = 11,
-                                      FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 3) };
-            who.Foreground = user ? Accent : Muted;
-            sp.Children.Add(who);
-            var tb = new TextBox { Text = t.Item2, FontSize = 12, IsReadOnly = true,
-                                   BorderThickness = new Thickness(0), Background = Brushes.Transparent,
-                                   Padding = new Thickness(0), IsTabStop = false, TextWrapping = TextWrapping.Wrap,
-                                   MaxHeight = 90, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
-            tb.Foreground = Fg;
-            SwallowMouseUp(tb);
-            sp.Children.Add(tb);
-            b.Child = sp;
-            panel.Children.Add(b);
+            string body = (t.Item2 ?? "").Replace("\r", "");
+            int lines = body.Length == 0 ? 0 : body.Split('\n').Length;
+            string summary = FirstMeaningfulLine(body, MINI_THREAD_SUMMARY_CHARS);
+
+            var row = new StackPanel { Margin = new Thickness(0, 0, 0, 8) };
+            var head = new TextBlock
+            {
+                Text = user ? (ja ? "指示 / あなた" : "Instruction / You") : (ja ? "エージェント" : "Agent"),
+                FontSize = 11,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = user ? Accent : Muted,
+                Margin = new Thickness(0, 0, 0, 2),
+            };
+            row.Children.Add(head);
+
+            // ONE LINE, AND IT DOES NOT SCROLL. TextTrimming rather than a height cap: a clipped
+            // line is honest about being clipped, a scrollbox invites reading and then refuses.
+            var line = new TextBlock
+            {
+                Text = summary,
+                FontSize = 12,
+                Foreground = Fg,
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                TextWrapping = TextWrapping.NoWrap,
+            };
+            row.Children.Add(line);
+
+            // THE SIZE IS THE REASON TO OPEN IT, so it is stated rather than implied by a
+            // scrollbar the reader has to discover.
+            if (lines > 1)
+            {
+                var size = new TextBlock
+                {
+                    Text = ja ? ("本文 " + lines + " 行") : (lines + " lines"),
+                    FontSize = 11,
+                    Foreground = Muted,
+                    Margin = new Thickness(0, 2, 0, 0),
+                };
+                row.Children.Add(size);
+            }
+            panel.Children.Add(row);
         }
-        return new ScrollViewer { MaxHeight = 240, VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-                                  Content = panel, Margin = new Thickness(0, 6, 0, 6) };
+
+        if (total > turns.Count)
+        {
+            var more = new TextBlock
+            {
+                Text = ja ? ("ほか " + (total - turns.Count) + " 件") : ((total - turns.Count) + " more"),
+                FontSize = 11,
+                Foreground = Muted,
+                Margin = new Thickness(0, 0, 0, 0),
+            };
+            panel.Children.Add(more);
+        }
+        return panel;
+    }
+
+    // The first line worth showing: skips blanks and a lone markdown heading marker, and trims to
+    // `max`. Not a summary -- a label. Producing a real summary is the agent's job, not the
+    // card's, and a card that paraphrases would be inventing.
+    static string FirstMeaningfulLine(string body, int max)
+    {
+        if (string.IsNullOrEmpty(body)) return "";
+        foreach (string raw in body.Split('\n'))
+        {
+            string ln = raw.Trim();
+            if (ln.Length == 0) continue;
+            int h = 0; while (h < ln.Length && ln[h] == '#') h++;
+            if (h > 0 && h < ln.Length && ln[h] == ' ') ln = ln.Substring(h + 1).Trim();
+            ln = ln.Replace("**", "").Replace("`", "");
+            if (ln.Length == 0) continue;
+            return ln.Length > max ? ln.Substring(0, max) + "…" : ln;
+        }
+        return "";
+    }
+
+    // How many turns the transcript holds, so "ほか N 件" is a fact rather than a guess. Counts
+    // the same lines ReadLastTurns keeps (meta and guid markers skipped); 0 on any failure,
+    // which renders as no line at all rather than as a wrong number.
+    int CountTurns(string transcriptPath)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(transcriptPath) || !File.Exists(transcriptPath)) return 0;
+            int n = 0;
+            foreach (string ln in File.ReadLines(transcriptPath))
+            {
+                if (ln.Length == 0) continue;
+                if (ln.IndexOf("\"role\"", StringComparison.Ordinal) < 0) continue;
+                n++;
+            }
+            return n;
+        }
+        catch (Exception) { return 0; }
     }
 
     // Last `n` (role, text) turns from a jsonl transcript (skips meta / guid marker lines).
