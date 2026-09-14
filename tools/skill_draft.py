@@ -80,19 +80,30 @@ def _contracts_in(text):
 
 
 def _slug(text):
-    """A bundle name from the work itself: ascii, hyphenated, short, and stable.
+    """An OPAQUE bundle name. Deliberately not derived from the goal, and this is the point.
 
-    Japanese goals give no ascii words, so the fallback is a digest -- an opaque name a person
-    will rename. That is better than transliterating, which invents a spelling nobody chose and
-    which changes the day the transliteration table does.
+    The first version built the name from the goal's ascii words, which read as an obvious
+    convenience. On the first real run -- before anything was written to disk -- the top
+    proposal's name was the operator's home-directory path turned into a slug, so it carried
+    the employee id and the company name side by side, and three more were colleagues'
+    surnames taken from a telephone-directory job. The names themselves are not reproduced
+    here: writing a leaked identifier into a tracked file in order to explain that it must not
+    be written into a tracked file is the same mistake wearing a lesson's clothes, and the
+    naming gate caught this paragraph doing exactly that.
+
+    A proposal's name becomes a DIRECTORY name. Directory names appear in listings, in shell
+    history, in `git status`, and are one `git add` away from a public repository -- the exact
+    transcription this repository has already done three times, most recently putting an
+    employee id into a public history that then had to be rewritten.
+
+    A blocklist cannot fix it. The configured secret words catch the company name and the
+    employee-id shape; nothing catches a colleague's surname, and goal text is full of them.
+    Since no filter over business text can be shown to be complete, the name is not taken from
+    business text at all. The readable version lives INSIDE the file, which a person reads
+    before deciding anything, and renaming the bundle is part of that decision.
     """
-    wordish = re.findall(r"[A-Za-z][A-Za-z0-9]{2,}", text or "")
-    stop = {"the", "and", "for", "with", "from", "this", "that", "you", "your", "please"}
-    keep = [w.lower() for w in wordish if w.lower() not in stop][:4]
-    if len(keep) >= 2:
-        return "-".join(keep)
     import hashlib
-    return "work-" + hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:8]
+    return "work-" + hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:10]
 
 
 def _applicable_lessons(goal, lessons, min_similarity=0.35):
