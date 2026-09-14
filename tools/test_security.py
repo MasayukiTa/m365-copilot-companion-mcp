@@ -511,15 +511,52 @@ def test_session_auth_can_be_switched_off(monkeypatch):
 
 def test_touch_session_evicts_by_recency_not_insertion_order():
     """Pure-function check on the bounding rule: a session used a moment ago must never be
-    the one dropped to make room for one merely recorded earlier and idle since."""
+    the one dropped to make room for one merely recorded earlier and idle since.
+
+    The length assertion this test used to carry (`== _MAX_SESSIONS_PER_IDENTITY`) was dropped
+    deliberately: the fixtures below are all far past `_session_ttl_s()` by the time the
+    eviction runs, and a session past its TTL authorizes nothing whatever the table says, so
+    keeping the table exactly full of them was never the property worth holding. What the test
+    was written to protect -- the recently-used session survives, the idle ones go -- is
+    asserted directly instead.
+    """
     entry = {}
     now = 1_000_000.0
-    for i in range(sec._MAX_SESSIONS_PER_IDENTITY):
+    for i in range(sec._max_sessions_per_identity()):
         entry = sec._touch_session(entry, "old-%d" % i, now + i)
     # touch the FIRST one again, much later -- it must survive the eviction below
     entry = sec._touch_session(entry, "old-0", now + 10_000.0)
     # push one more in, forcing an eviction
     entry = sec._touch_session(entry, "new-1", now + 10_001.0)
-    assert len(entry["sessions"]) == sec._MAX_SESSIONS_PER_IDENTITY
+    assert len(entry["sessions"]) <= sec._max_sessions_per_identity()
     assert "old-0" in entry["sessions"], "the recently-touched session was evicted anyway"
     assert "new-1" in entry["sessions"]
+
+
+def test_an_expired_session_is_dropped_before_a_live_one_is_evicted(monkeypatch):
+    """The fleet's failure of 2026-09-14, as a unit.
+
+    Behind one tenant egress IP, 79 distinct Mcp-Session-Ids were issued in a single hour while
+    the cap stood at 64, and workers evicted each other's authorization as fast as they earned
+    it -- 275 of 276 refusals in ten hours presented no token at all, and 14 of 19 STUCK runs
+    ended on the relay's "unlock を 4 回投入したが" give-up. A session past its TTL cannot
+    authorize a call, so surrendering a LIVE slot to keep a dead one is a pure loss.
+    """
+    monkeypatch.setenv("MCP_UNLOCK_MAX_SESSIONS", "4")
+    ttl = sec._session_ttl_s()
+    now = 1_000_000.0
+    entry = {}
+    for i in range(4):
+        entry = sec._touch_session(entry, "stale-%d" % i, now)           # all die together
+    live_at = now + ttl + 1.0
+    entry = sec._touch_session(entry, "live-1", live_at)
+    assert "live-1" in entry["sessions"]
+    assert not any(s.startswith("stale-") for s in entry["sessions"]), (
+        "expired sessions kept their slots while a live one had to fight for one")
+
+
+def test_the_session_cap_is_readable_without_a_restart(monkeypatch):
+    monkeypatch.setenv("MCP_UNLOCK_MAX_SESSIONS", "7")
+    assert sec._max_sessions_per_identity() == 7
+    monkeypatch.setenv("MCP_UNLOCK_MAX_SESSIONS", "nonsense")
+    assert sec._max_sessions_per_identity() == sec._MAX_SESSIONS_PER_IDENTITY
