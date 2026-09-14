@@ -92,6 +92,66 @@ def is_benchmark(goal):
     return any(m in low for m in BENCHMARK_MARKS)
 
 
+#: The ledger keeps only the first 600 characters of a goal -- `relay_fleet.py` writes
+#: `goal=(self.goal or "").strip()[:600]` on every `worker_done`, and that cap is load-bearing
+#: elsewhere (conversation matching compares the same 600-character prefix on both sides), so it
+#: is not something to widen from here.
+GOAL_LEDGER_CAP = 600
+
+#: Where the WHOLE goal survives. `bridge/session_store.py` interns every goal exactly once in
+#: `fleet_goals`, so the full text is on disk even though the ledger's copy is cut.
+SESSIONS_DB = os.path.join(REPO, ".fleet", "sessions", "sessions.sqlite3")
+
+
+def _full_goals(db_path=None):
+    """{first 600 chars: whole goal} for every goal the session store has interned.
+
+    Returns {} when the database is absent or unreadable -- every caller then goes on with the
+    truncated text, which is worse but not wrong.
+    """
+    import sqlite3
+    path = db_path or SESSIONS_DB
+    if not os.path.exists(path):
+        return {}
+    out = {}
+    try:
+        conn = sqlite3.connect("file:%s?mode=ro" % path.replace("\\", "/"), uri=True)
+        try:
+            for (goal,) in conn.execute("SELECT goal FROM fleet_goals"):
+                if goal and len(goal) > GOAL_LEDGER_CAP:
+                    out[goal.strip()[:GOAL_LEDGER_CAP]] = goal
+        finally:
+            conn.close()
+    except Exception:
+        return {}
+    return out
+
+
+def rehydrate(goal, table=None):
+    """The whole goal behind a ledger row's truncated copy, or the truncation unchanged.
+
+    WHY THIS EXISTS, AND WHAT IT CHANGED. Every measurement this module and `skill_lessons` make
+    about what a goal CONTAINS was being made on the first 600 characters, because that is all
+    the ledger holds. Measured 2026-09-14 over the 1,977 interned goals: **71% are longer than
+    the cap** (median 2,126 characters, longest 14,052), and the difference is not cosmetic --
+    goals declaring an output contract go from 19% to 37%, and goals carrying BOTH a path and a
+    contract from 15 to 287. The conclusion drawn from the truncated text, that the record holds
+    almost no material a Skill could be grounded in, was an artefact of the cap.
+
+    Keyed on the prefix rather than joined through `fleet_turns` on purpose: the outcome
+    (DONE / STUCK) lives in the ledger and the full text lives in the database, and the prefix
+    is the only thing both are guaranteed to agree on. A prefix collision would attach the wrong
+    tail to a goal, so only goals that ACTUALLY exceed the cap are put in the table -- a short
+    goal is already whole and has nothing to gain.
+    """
+    text = str(goal or "")
+    if len(text) < GOAL_LEDGER_CAP:
+        return text                       # never truncated; nothing to look up
+    if table is None:
+        table = _full_goals()
+    return table.get(text.strip()[:GOAL_LEDGER_CAP], text)
+
+
 def _rows(path):
     try:
         for line in io.open(path, encoding="utf-8", errors="replace"):
@@ -123,10 +183,14 @@ def collect(ledger=LEDGER, include_benchmarks=False):
     reports only what survived it is the one that reads as thorough and is not.
     """
     groups, excluded = {}, 0
+    _goal_table = _full_goals()          # one query, then thousands of lookups
     for row in _rows(ledger):
         if row.get("event") != "worker_done":
             continue
-        goal = str(row.get("goal") or "").strip()
+        # REHYDRATED FIRST. What a group's example goal CONTAINS -- the paths, the output
+        # contract -- is the whole reason these groups are collected, and the ledger's copy of
+        # it stops at 600 characters. See `rehydrate` for what that cap was hiding.
+        goal = rehydrate(str(row.get("goal") or "").strip(), _goal_table)
         if not goal:
             continue
         if not include_benchmarks and is_benchmark(goal):

@@ -166,6 +166,50 @@ def _spawn(argv, timeout_s):
             "tail": tail[-2000:]}
 
 
+def refresh_skill_proposals(propose=None, write=None):
+    """Rebuild the Skill proposals from the ledger, and record what came of it.
+
+    WHY IT RIDES ON THIS FIRING RATHER THAN ITS OWN SCHEDULE. The requirement on the proposal
+    path was that it "certainly gets made, certainly runs, and certainly stays up to date". A
+    second scheduled task is a second thing that can silently stop -- this repository has one
+    loop that spent twenty days doing nothing because nobody looked at its exit code, which is
+    the entire reason `_status_text` exists. Attaching to a firing that is already watched costs
+    nothing and cannot rot separately.
+
+    IT IS FAILURE-ISOLATED ON PURPOSE. The driver's job is to run the self-improvement sweep;
+    drafting proposals is a by-product. A traceback in the by-product must not cost the sweep,
+    so everything here is caught and recorded as a row rather than raised -- and recorded
+    rather than swallowed, because a by-product that fails invisibly every night is worse than
+    one that was never wired up at all.
+
+    WHAT IT WRITES: only `.fleet/skill_proposals/`, which is git-ignored and outside skill
+    discovery. Nothing here can make a Skill live; see `tools/skill_draft` for why that step is
+    a person's.
+    """
+    started = time.time()
+    try:
+        if propose is None or write is None:
+            from tools import skill_draft
+            propose = propose or skill_draft.propose
+            write = write or skill_draft.write
+        result = propose()
+        written = write(result)
+        row = {"event": "skill_proposals", "ts": time.time(),
+               "elapsed_s": round(time.time() - started, 1),
+               "status": "ok",
+               "new": len(result.get("new") or []),
+               "amend": len(result.get("amend") or []),
+               "refused": len(result.get("refused") or []),
+               "lesson_pairs": result.get("lesson_pairs", 0),
+               "files": len(written)}
+    except Exception as e:
+        row = {"event": "skill_proposals", "ts": time.time(),
+               "elapsed_s": round(time.time() - started, 1),
+               "status": "error", "reason": "%s: %s" % (type(e).__name__, e)}
+    _record(row)
+    return row
+
+
 def _status_text():
     got = rows()
     if not got:
@@ -203,6 +247,15 @@ def main(argv=None):
     row = run_once(timeout_s=args.timeout_s, coordinate=args.coordinate)
     print("selfimprove driver: status=%s%s"
           % (row.get("status"), (" reason=%s" % row["reason"]) if row.get("reason") else ""))
+    # AFTER the sweep, and outside its status. The sweep's exit code is what Task Scheduler
+    # shows and what anyone debugging the loop reads; folding a by-product's failure into it
+    # would make a green sweep look red for a reason that has nothing to do with the fleet.
+    drafts = refresh_skill_proposals()
+    if drafts.get("status") == "ok":
+        print("skill proposals: %d new, %d amendments, %d refused (from %d lesson pairs)"
+              % (drafts["new"], drafts["amend"], drafts["refused"], drafts["lesson_pairs"]))
+    else:
+        print("skill proposals: FAILED -- %s" % drafts.get("reason"))
     # NON-ZERO FOR ANYTHING THAT IS NOT A CLEAN PASS, including "blocked". Task Scheduler shows
     # the last result, and a task that always reports success is a task nobody ever looks at --
     # which is how this loop spent twenty days doing nothing.
