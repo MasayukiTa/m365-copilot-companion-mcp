@@ -36,10 +36,16 @@ def _src():
 
 
 def _mini_thread():
+    """Located by the method NAME, not by its full signature.
+
+    The first version pinned `MiniThread(string transcriptPath)` exactly, and every assertion in
+    this file broke the moment the method gained the two arguments it needs to open an entry in
+    the chat window -- four failures reading "substring not found", about a restructure that was
+    working. The subject is the method; its parameter list is free to change."""
     src = _src()
-    i = src.index("UIElement MiniThread(string transcriptPath)")
-    j = src.index("\n    // The first meaningful line", i) if "\n    // The first meaningful line" in src[i:] \
-        else src.index("\n    static string FirstMeaningfulLine", i)
+    i = src.index("UIElement MiniThread(")
+    j = src.find("\n    static string FirstMeaningfulLine", i)
+    assert j > 0, "MiniThread's end marker moved; re-derive this helper"
     return src[i:j]
 
 
