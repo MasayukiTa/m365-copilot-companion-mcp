@@ -152,6 +152,13 @@ STATUS_PILL = {
     "verifying": ("検証中", "good"),     # spec 3-3: running the acceptance check locally
     "refuting":  ("反証中", "good"),     # spec 4B: an independent reviewer is checking it
     "researching": ("外部調査中", "good"),  # non-blocking deep-research side-agent is running
+    # operator E, wired in: relay_fleet.py raised a HITL gate (converged STUCK / unlock
+    # exhausted / retry budget -- see GATE_AFTER_STUCK_RETRIES) instead of settling STUCK.
+    # Non-blocking like 'researching' -- the sweep keeps stepping every other worker -- and
+    # the gate itself (question + answer path) is already surfaced via status.json's
+    # pending_gates / the cockpit's existing Bucket C banner; this pill is just this worker's
+    # own card saying the same thing.
+    "awaiting_gate": ("人間の判断待ち", "muted"),
     "done":      ("完了",   "done"),     # finished cleanly
     "stuck":     ("停滞",   "bad"),       # B_BAD red
     "maxturns":  ("上限",   "bad"),

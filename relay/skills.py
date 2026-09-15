@@ -756,11 +756,62 @@ class SkillStore:
             raise SkillError("Skill changed while its resource was being read")
         return text
 
-    #: A match must rest on this many distinct tokens. Two bigrams of ONE word are not two
-    #: pieces of evidence: every fail-open measured rested on a single shared word -- a query
-    #: about copper prices landing on the copper SURVEY, one about a mail server landing on
-    #: mail lookup.
+    #: Historical gate, no longer consulted by match() itself -- kept because
+    #: relay/test_repo_bug_fix_skill.py asserts against it directly as a documented minimum,
+    #: and because it is the RAW bigram-count reading of the same idea MIN_MATCH_WORDS now
+    #: enforces correctly. It was meant to require "two bigrams of one word are not two
+    #: pieces of evidence", but counted bigrams rather than words: ロット's two bigrams
+    #: (ロッ, ット) plus one unrelated word's single bigram cleared 3 with only two real
+    #: words behind it, one of which turned out to be the wrong signal to judge on -- see
+    #: MIN_MATCH_WORDS and MIN_DISTINCTIVE_WORDS below, which replaced its role in match().
     MIN_MATCH_TOKENS = 3
+
+    #: Distinct real WORDS -- not bigrams -- a candidate's overlap with the query must
+    #: contain, counting only content (kanji/katakana/ASCII) words. See _merge_word_groups:
+    #: _match_tokens slides a 2-character window across every run, so one word of 3+
+    #: characters yields several overlapping bigrams that used to count as that many separate
+    #: pieces of evidence.
+    #:
+    #: WHY THIS EXISTS, MEASURED LIVE 2026-09-15. A query investigating a different material's
+    #: lots -- naming neither -- scored 1.0 against copper-foil-survey with the full body
+    #: injected. Its overlap was exactly {ロッ, ット, 調査}: three tokens, all content, each
+    #: passing the content-only filter this replaced (MIN_CONTENT_FRACTION, see git history) --
+    #: that filter caught a DIFFERENT wrong match (one leaning on hiragana grammar fragments)
+    #: and was never going to catch this one, because none of these three tokens is a grammar
+    #: fragment. ロッ and ット are the two bigrams of ONE word, ロット (lot) -- the same shape
+    #: test_a_shared_word_is_not_enough already existed to catch, except that test's cases
+    #: supply no second real word, and this query does (調査, investigate). So the query
+    #: reduces to two real words, ロット and 調査, and MIN_MATCH_TOKENS=3 was satisfied by
+    #: three BIGRAMS of those two words -- the gate counted evidence sources wrong, not too
+    #: few of them. Merging by shared-boundary-character (see _merge_word_groups) turns that
+    #: overlap into 2 word-groups; MIN_MATCH_WORDS below is measured against the whole fixture
+    #: plus this case, not chosen to make one query pass.
+    MIN_MATCH_WORDS = 2
+
+    #: Of a candidate's overlap (merged, content-only, see above), this many word-groups must
+    #: be DISTINCTIVE: absent from every OTHER trusted candidate's vocabulary. See
+    #: _document_frequency. Content is not the discriminator a small store needs --
+    #: 調査, 調べ, ロット and similar are shared by any procedure that investigates records,
+    #: and a token every candidate could plausibly use says nothing about which one is meant.
+    #:
+    #: MEASURED. The live wrong match's two merged words are ロット (df=1: only
+    #: copper-foil-survey's vocabulary has it, among the 5 Skills trusted today) and 調査
+    #: (df=2: also in mail-lookup's). Requiring 2 distinctive words rejects it -- only ロット
+    #: qualifies. Requiring only 1 does not: ロット alone clears it, and the live case was
+    #: this test's whole reason for existing. On the fixture, 2 also holds every existing
+    #: match: メールを検索したい's two merged words, メール and 検索, are BOTH df=1 (df is
+    #: computed the same way -- across the 5 currently trusted Skills, not some larger corpus,
+    #: so it moves if the store's shape moves).
+    #:
+    #: WHAT IT COSTS, MEASURED. 先月のメールを一覧にして now misses: its two merged words are
+    #: メール (df=1) and 一覧 (df=2, shared with desktop-md-inventory's own listing), the exact
+    #: shape of the wrong match this exists to catch -- one distinctive word plus one shared
+    #: one -- and nothing available to this matcher tells those two situations apart. This
+    #: matcher already favours false negatives on purpose; between the two identically-shaped
+    #: cases, the one that used to be wrong-and-expensive is the one worth losing the other to
+    #: refuse. Re-measure both directions with scripts/win/skill_match_bench.py before
+    #: changing this.
+    MIN_DISTINCTIVE_WORDS = 2
 
     def match(self, text: str) -> dict[str, Any] | None:
         """Conservatively select one trusted, model-invocable Skill by metadata only.
@@ -782,6 +833,13 @@ class SkillStore:
         expensive kind, where the agent follows a procedure meant for something else. Together
         with MIN_MATCH_TOKENS: 16 of 16 on the fixture, no misses, no wrong matches.
         Re-measure with scripts/win/skill_match_bench.py before touching any of it.
+
+        MIN_MATCH_WORDS and MIN_DISTINCTIVE_WORDS (below) are a later, separate fix for a
+        different fail-open this one does not touch: with few Skills trusted, `known` can
+        collapse to one Skill's own vocabulary regardless of topic, so precision against it
+        is 1.0 by construction, and a single word's overlapping bigrams could be counted as
+        multiple pieces of evidence. See those constants' docstrings for what they catch and,
+        as important, what they do not.
         """
         query = _match_tokens(text)
         if len(query) < 2:
@@ -790,22 +848,35 @@ class SkillStore:
                       if s.trust == "trusted"
                       and s.metadata.get("disable-model-invocation") is not True]
         vocabulary: set[str] = set()
+        haystacks: dict[str, set[str]] = {}
         for skill in candidates:
-            vocabulary |= _match_tokens(
+            terms = _match_tokens(
                 skill.description + " " + str(skill.metadata.get("when_to_use") or ""))
+            haystacks[skill.name] = terms
+            vocabulary |= terms
+        # How many trusted candidates' vocabulary a token appears in. A token every procedure
+        # in the store could plausibly use is not evidence for any one of them; see
+        # MIN_DISTINCTIVE_WORDS.
+        doc_freq = {tok: sum(1 for terms in haystacks.values() if tok in terms)
+                    for tok in vocabulary}
         known = query & vocabulary
-        if len(known) < self.MIN_MATCH_TOKENS:
+        known_words = _content_word_groups(known)
+        if len(known_words) < self.MIN_MATCH_WORDS:
             return None
         scored: list[tuple[float, Skill]] = []
         for skill in candidates:
-            haystack = skill.description + " " + str(skill.metadata.get("when_to_use") or "")
-            terms = _match_tokens(haystack)
+            terms = haystacks[skill.name]
             if not terms:
                 continue
             overlap = query & terms
-            if len(overlap) < self.MIN_MATCH_TOKENS:
+            overlap_words = _content_word_groups(overlap)
+            if len(overlap_words) < self.MIN_MATCH_WORDS:
                 continue
-            score = len(overlap) / max(1, len(known))
+            distinctive = [g for g in overlap_words
+                           if any(doc_freq.get(t, 99) <= 1 for t in g)]
+            if len(distinctive) < self.MIN_DISTINCTIVE_WORDS:
+                continue
+            score = len(overlap_words) / max(1, len(known_words))
             if skill.name in text.lower():
                 score += 0.6
             scored.append((score, skill))
@@ -904,6 +975,73 @@ def _script_of(ch: str) -> str:
     if 0x30A0 <= o <= 0x30FF:
         return "kata"
     return "han"
+
+
+def _is_content_token(token: str) -> bool:
+    """False for a token made entirely of hiragana -- a _merge_word_groups filter's unit.
+
+    _match_tokens already drops short and stoplisted hiragana pieces, but a longer piece it
+    keeps still yields boundary bigrams for its whole length, and those still carry no topic:
+    a verb conjugation and a matching Skill description can share several of them by pure
+    grammatical coincidence. Kanji, katakana, and ASCII tokens are never filtered here --
+    the two-script segmentation in _match_tokens already keeps those whole per run, so a
+    kanji/katakana bigram is always a fragment of real vocabulary, not grammar.
+    """
+    return not all(0x3040 <= ord(ch) <= 0x309F for ch in token)
+
+
+def _merge_word_groups(tokens: set[str]) -> list[set[str]]:
+    """Group _match_tokens output back into the real WORDS it fragmented, one group per word.
+
+    _match_tokens slides a 2-character window across every kanji/katakana run, so a single
+    word of 3 or more characters yields several overlapping bigrams: ロット (lot) becomes
+    {ロッ, ット}, 保証期限 (guarantee period) becomes {保証, 証期, 期限}. Two-character words
+    -- most kanji compounds -- already produce exactly one bigram and are untouched by this.
+
+    Sliding-window bigrams from the SAME word always share their overlapping character:
+    piece[i:i+2][1] == piece[i+1:i+3][0] by construction. Grouping tokens by that adjacency
+    (union-find over the length-2 tokens; ASCII tokens are length 3+ and never chain, being
+    already-whole words) recovers word identity without _match_tokens having to carry
+    position information, and without changing what _match_tokens itself returns -- callers
+    that inspect its raw bigram output are unaffected.
+
+    Two bigrams from genuinely unrelated words can still chain by character coincidence
+    (one word's trailing bigram happens to share a character with another's leading one),
+    which UNDER-counts -- merges two real words into one group -- rather than over-counts.
+    That errs toward fewer matches, the direction this matcher already prefers.
+    """
+    remaining = set(tokens)
+    parent = {t: t for t in remaining}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    twos = [t for t in remaining if len(t) == 2]
+    for i, a in enumerate(twos):
+        for b in twos[i + 1:]:
+            if a[1] == b[0] or b[1] == a[0]:
+                union(a, b)
+    groups: dict[str, set[str]] = {}
+    for t in remaining:
+        groups.setdefault(find(t), set()).add(t)
+    return list(groups.values())
+
+
+def _content_word_groups(tokens: set[str]) -> list[set[str]]:
+    """_merge_word_groups, keeping only groups that carry at least one content token.
+
+    A group made ENTIRELY of hiragana fragments (see _is_content_token) is grammar, not a
+    word this matcher should count as evidence -- see SkillStore.MIN_MATCH_WORDS.
+    """
+    return [g for g in _merge_word_groups(tokens) if any(_is_content_token(t) for t in g)]
 
 
 def _match_tokens(text: str) -> set[str]:

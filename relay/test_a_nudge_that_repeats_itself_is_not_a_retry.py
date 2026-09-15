@@ -72,6 +72,22 @@ from relay.relay_fleet import (
     _stuck_retry_nudge,
     stuck_reason_text,
 )
+from tools.gate_ops import gate_get
+
+
+def _raised_gate_question(w):
+    """The question text of the gate `w` should have just raised on convergence (operator E,
+    wired in 2026-09-15: convergence now asks a human instead of settling STUCK immediately --
+    see relay_fleet.GATE_AFTER_STUCK_RETRIES). Fails loudly (not None) if no gate was raised,
+    so a regression back to the old immediate-STUCK behaviour shows up here as clearly as it
+    would in relay/test_a_worker_that_needs_a_person_should_say_so.py, which covers the
+    mechanism itself in depth."""
+    assert w.status == "awaiting_gate", "convergence must ask a human, not settle STUCK, now"
+    assert w.status not in TERMINAL
+    assert w._gate_token, "a gate must actually have been raised"
+    gate = gate_get(w._gate_token)
+    assert gate is not None, "the raised gate must be readable back"
+    return gate["question"]
 
 #: A word no nudge in this file may contain -- naming a concrete source in the text sent to the
 #: worker is exactly the cheat this repository forbids elsewhere (the answer must never be
@@ -148,11 +164,15 @@ def test_two_consecutive_similar_stuck_replies_stop_the_retrying():
     w._decide("STUCK: " + _SAME_FINDING_A)
     assert w.status == "ready", "the first STUCK must still get its retry"
     w._decide("STUCK: " + _SAME_FINDING_B)
-    assert w.status in TERMINAL
-    assert w.outcome == "STUCK"
-    # the worker's OWN reason reached the outcome -- not a generic "gave up"
-    assert "見つかりません" in w.reason
-    assert "gave up" not in (w.reason or "").lower()
+    # CHANGED 2026-09-15 (operator E, wired in): convergence used to settle STUCK immediately;
+    # it now asks a human instead, carrying the worker's own words as the question, and only
+    # settles STUCK itself if nobody answers (see GATE_ANSWER_TIMEOUT_S). This test's job is
+    # confirming convergence detection now REACHES for that mechanism, not re-testing the
+    # mechanism -- see relay/test_a_worker_that_needs_a_person_should_say_so.py for that.
+    question = _raised_gate_question(w)
+    # the worker's OWN reason reached the question -- not a generic "gave up"
+    assert "見つかりません" in question
+    assert "gave up" not in question.lower()
 
 
 def test_two_consecutive_different_stuck_replies_do_not_stop_it():
@@ -207,9 +227,10 @@ def test_the_enumeration_ask_counts_toward_convergence_not_a_fresh_budget():
     assert _EXHAUSTIVE_CLAIM_NUDGE in w.job, "should be asked to enumerate, not re-nudged blindly"
     # the worker answers the enumeration ask by repeating the same (unfalsifiable) claim
     w._decide("STUCK: " + _EXHAUSTIVE_CLAIM_B)
-    assert w.status in TERMINAL, "repeating the claim after being asked to enumerate must stop"
-    assert w.outcome == "STUCK"
-    assert "確認済み" in w.reason or "見つかりません" in w.reason
+    # CHANGED 2026-09-15 (operator E, wired in): "must stop" now means "must ask a human"
+    # rather than settle STUCK outright -- see the note on the prior test above.
+    question = _raised_gate_question(w)
+    assert "確認済み" in question or "見つかりません" in question
 
 
 def test_an_enumeration_reply_that_still_concludes_the_same_thing_converges():
@@ -229,8 +250,9 @@ def test_an_enumeration_reply_that_still_concludes_the_same_thing_converges():
         "それぞれ個別に確認しました。STUCK: " + _EXHAUSTIVE_CLAIM_B
     )
     w._decide(enumeration_reply)
-    assert w.status in TERMINAL, "the list is new text, but the closing claim repeats"
-    assert w.outcome == "STUCK"
+    # CHANGED 2026-09-15 (operator E, wired in): the list is new text, but the closing claim
+    # repeats -> that still asks a human now, rather than settling STUCK outright.
+    _raised_gate_question(w)
 
 
 def test_an_enumeration_reply_with_a_new_finding_does_not_converge():

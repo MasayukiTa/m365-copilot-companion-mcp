@@ -163,6 +163,47 @@ human never sees before a decision is made on it, first; a cosmetic UI gap, last
   the chat window for one worker, with no error — this is precisely the shape of the seed
   incident (row 0), just for the filename stem instead of the extension.
 
+### 7. A fleet job's outcome — recorded in one ledger, joined by an id the ledger never carried
+
+- **The fact**: whether an admitted fleet-bound job (`.fleet/tasks/done/<jid>.json`,
+  `status="dispatched"` or `"awaiting_fleet"`) ever actually finished, and how.
+- **Writer of the queue record**: `relay/task_router.py::run_job` / `fleet_handoff`
+  (`relay/task_router.py`) — writes `done/<jid>.json` the instant a goal leaves the queue,
+  with `status` frozen at "dispatched"/"awaiting_fleet" and `ts_done=None` forever after,
+  because nothing revisited the record once the goal was handed to the fleet.
+- **Writer of the actual outcome**: `relay/relay_fleet.py::RelayWorker.close()` — appends one
+  line per finished worker (`outcome`, `turns`, `reason`, `status`) to
+  `<state_dir>/socket_route.jsonl`, unconditionally, whether or not the C# cockpit is open to
+  archive anything into `.fleet/history.json` (a *different* file that already carried the
+  same join key — see below — but only when a person has the cockpit running to write it).
+- **The join key that was missing**: `jid`, the admission-time id `task_router.py` mints per
+  goal and already threads into the goal dict `RelayWorker` reads
+  (`self.jid = goal.get("jid")`, `relay/relay_fleet.py:2559`). It already reached
+  `history.json` and the final sweep snapshot (both added 2026-09-09, per the comment on
+  `add_goal_to_live_fleet`), but the `_socket_route().record("worker_done", ...)` call at
+  `relay/relay_fleet.py:3181` never carried it — measured directly: 0 of 4,035 `worker_done`
+  rows in the live ledger had a `jid` field before this was fixed.
+- **A sweep of the live queue, same day**: all 164 records in `.fleet/tasks/done/` read
+  `status="dispatched"`, `ts_done=None` — including at least two goals delivered into a fleet
+  run that was later stopped by hand and never finished. `done/`'s own module docstring
+  already warned "DOES NOT MEAN THE WORK IS DONE"; the warning did not make the true outcome
+  readable from anywhere the queue's own reader could reach.
+- **Guard today**: `relay/test_a_job_marked_done_reads_as_dispatched_not_finished.py`, added
+  in the same change that added `jid` to the `worker_done` record and taught
+  `task_router.py::job_status()` / `_reconcile_outcomes()` to read it. Covers: a finished job
+  reads as finished with its real outcome; a job whose run ended with no outcome ever
+  recorded reads "unknown" rather than a false "dispatched" forever; a job still an active
+  worker in the current run reads "in_flight"; and — the honest limit of the fix — a
+  `worker_done` row with no `jid` (anything logged before this change, or a goal that never
+  passed through admission) cannot be joined and is not guessed at via goal text, which is
+  truncated to 600 characters in this ledger and duplicated across retries of one goal.
+- **What breaks silently if it drifts further**: exactly the incident this row records — a
+  new fleet-bound job type, or a new path that hands a goal to `RelayWorker` without setting
+  `self.jid`, produces completions this join can never find, and `job_status()` degrades back
+  to reporting "unknown" for jobs that actually finished, which is an availability problem
+  rather than a wrong-answer one but is the same shape of silent drift as every other row
+  here.
+
 ### 0. Transcript compression (`.jsonl` → `.jsonl.gz`) — the seed incident, now fixed, still unguarded
 
 Listed last despite being the header incident, because it is **already fixed** and this

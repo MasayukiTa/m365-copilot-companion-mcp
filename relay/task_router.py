@@ -29,6 +29,19 @@ Queue layout (all under .fleet/tasks/):
   by some route they could not determine. Nothing had moved: the record and the handoff are
   two artifacts written in the same pass, and only the handoff is the outstanding work.
 
+  AND ONCE A FLEET GOAL LANDED, NOTHING EVER LOOKED AT THE JOB AGAIN EITHER -- until
+  2026-09-15. "dispatched" was written the instant the goal left the queue and never revisited:
+  a goal that finished cleanly ten minutes later and one that was still running when someone
+  stopped the fleet both read exactly "dispatched" in done/<jid>.json, indefinitely, because
+  the outcome existed only in relay/relay_fleet.py's own per-worker ledger
+  (<state_dir>/socket_route.jsonl) and nothing joined the two. `job_status(jid)` (below) is the
+  read path that closes this: it answers "did this job finish, and how" by checking, in order,
+  a reconciled outcome record, a live scan of that ledger, whether the jid is a worker the
+  CURRENT run is still holding, and only then falling back to an honest "unknown" rather than
+  repeating "dispatched" forever. `_reconcile_outcomes()` is the write path that keeps
+  done/<jid>.outcome.json current on every dispatch tick so a caller does not have to run the
+  read path's live-scan fallback to get an up-to-date answer.
+
 Design notes:
   * One writer claims a job by moving pending/ -> running/ (atomic rename) so two routers never
     double-run a job.
@@ -1331,6 +1344,320 @@ def _reconcile_landings(now_ts=None, state_dir=None):
     return out
 
 
+# ── Outcome reconciliation: done/ RECORDS DISPATCH, NOT COMPLETION ────────────────────────────
+#
+# THE GAP _reconcile_landings DOES NOT CLOSE. That pass confirms the fleet actually READ a
+# goal off its command channel -- it turns "dispatched" into "dispatched, landing confirmed".
+# It says nothing about what happened next. A goal that landed cleanly and then ran for
+# twenty minutes, or a goal that landed and was still running when someone stopped the fleet,
+# both still read exactly "dispatched" in done/<jid>.json today, forever, because nothing
+# after landing ever looks at the job again.
+#
+# THE RECORD THAT ALREADY HAS THE ANSWER. relay/relay_fleet.py's RelayWorker.close() writes
+# one line to <state_dir>/socket_route.jsonl for every worker that ever finishes, cockpit
+# open or not, run still live or not: outcome, turns, reason, the works. It is the one
+# completion record in this whole stack that does not depend on a second program (the C#
+# cockpit) choosing to archive it -- .fleet/history.json is written by the cockpit FROM the
+# live status.json snapshot, so a fleet started by a phone with nobody watching (see
+# ensure_cockpit's own docstring) never gets archived there at all. socket_route.jsonl is
+# written by the same Python process that ran the goal, unconditionally.
+#
+# THE JOIN KEY THIS FILE MINTS AND socket_route.jsonl DID NOT CARRY. `jid` -- the admission
+# id this module hands every fleet-bound goal in add_goal_to_live_fleet / autostart_fleet --
+# already reached history.json and the final sweep snapshot (see the comment on
+# add_goal_to_live_fleet above), but the one line RelayWorker.close() writes on ITS way out
+# never carried it. Fixed at the write site: relay/relay_fleet.py's `_socket_route().record(
+# "worker_done", ...)` call now passes `jid=(self.jid or "")`. A row written before that fix
+# has no jid and cannot be joined here -- there is no way to recover an id that was never
+# recorded, and this module does not fall back to matching on goal text to paper over that:
+# the text is truncated to 600 chars and the same goal is routinely dispatched more than once
+# as a retry, so a text match risks attributing one goal's outcome to a different admission.
+def _find_worker_outcome_by_jid(jid, state_dir=None):
+    """The worker_done row for `jid`, or None if the ledger has never recorded one -- either
+    because the worker has not finished yet, or because the row predates the jid fix above.
+
+    Full linear scan on purpose: this is the on-demand path job_status() uses for a one-off
+    "did X finish" question, and a single pass over even a many-thousand-line ledger is
+    milliseconds. _reconcile_outcomes() below is the path that runs forever (once per dispatch
+    tick) and is the one that actually needs a cursor to stay cheap.
+    """
+    if not jid:
+        return None
+    path = _socket_route_path(state_dir)
+    found = None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue          # several processes append; a torn tail is normal
+                if not isinstance(row, dict) or row.get("event") != "worker_done":
+                    continue
+                if row.get("jid") == jid:
+                    found = row       # newest wins; jid is minted once per admission so this
+                                      # should never see two rows, but "last word" is the
+                                      # same rule every other reader in this file uses
+    except OSError:
+        return None
+    return found
+
+
+def _socket_route_path(state_dir=None):
+    """Where the fleet's own append-only completion ledger lives. Resolved through state_dir/
+    FLEET_STATE_DIR exactly like status.json and the acks directory above -- in production all
+    three live under the same .fleet/, and a test that redirects one must be free to redirect
+    the rest identically rather than this module hard-coding relay.socket_route's own default."""
+    return os.path.join(state_dir or FLEET_STATE_DIR, "socket_route.jsonl")
+
+
+#: Terminal `status` values a worker_done row can carry (relay/relay_fleet.py sets self.status
+#: to one of these before recording -- measured against the live ledger: done/cancelled/error/
+#: stuck cover 8,014 of 8,027 rows sampled). Mapped to the status this module reports so a
+#: reader never has to know the fleet's own vocabulary. "pending" (13 rows measured, all with
+#: outcome=None) is not a real terminal state -- an artifact of a row recorded before the
+#: worker had settled -- so it deliberately maps to nothing and is treated the same as no row
+#: at all: not yet resolved.
+_WORKER_STATUS_TO_JOB_STATUS = {"done": "done", "cancelled": "cancelled",
+                                "error": "error", "stuck": "stuck"}
+
+#: One cursor per state_dir. The ledger this repo already has runs to several thousand lines
+#: and _reconcile_outcomes runs on every dispatch tick (every couple of seconds, forever), so
+#: unlike _find_worker_outcome_by_jid's one-off scan this path re-reads only what is new.
+#: A byte offset, read and written on a RAW binary handle -- Python's text-mode seek/tell only
+#: promises correct behaviour for a cookie obtained from tell() on that same handle, not for an
+#: offset computed independently by summing encoded line lengths, which is exactly what this
+#: does. Binary mode sidesteps that entirely.
+OUTCOME_CURSOR_FILE = "outcome_cursor.json"
+
+
+def _outcome_cursor_path(state_dir=None):
+    return os.path.join(state_dir or FLEET_STATE_DIR, OUTCOME_CURSOR_FILE)
+
+
+def _read_outcome_cursor(state_dir=None):
+    try:
+        with open(_outcome_cursor_path(state_dir), encoding="utf-8") as fh:
+            return int((json.load(fh) or {}).get("offset") or 0)
+    except Exception:
+        return 0
+
+
+def _write_outcome_cursor(offset, state_dir=None):
+    path = _outcome_cursor_path(state_dir)
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = "%s.%d.tmp" % (path, os.getpid())
+        with open(tmp, "w", encoding="utf-8", newline="") as fh:
+            json.dump({"offset": offset}, fh)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _reconcile_outcomes(now_ts=None, state_dir=None):
+    """Turn every worker_done row the ledger has grown since the last pass into a completion
+    record for the job that finished, IF that job is still sitting at "dispatched" or
+    "awaiting_fleet" in done/. Returns the list of completion records written.
+
+    Cursor-based (see OUTCOME_CURSOR_FILE above). A torn tail -- a line with no trailing
+    newline yet, because another process is mid-write -- stops the scan for this pass without
+    advancing past it; the next pass picks up from the same byte and reads it whole once the
+    writer finishes. Idempotent: a jid that already has a done/<jid>.outcome.json is skipped,
+    so replaying the same cursor twice (a crash between advancing it and finishing this
+    function) cannot double-write.
+    """
+    out = []
+    ensure_dirs()
+    now = time.time()
+    path = _socket_route_path(state_dir)
+    offset = _read_outcome_cursor(state_dir)
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return out                     # no ledger yet -- nothing to reconcile
+    if offset > size:
+        offset = 0                     # the ledger was rotated/replaced under us
+    new_offset = offset
+    rows = []
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(offset)
+            for raw in fh:
+                if not raw.endswith(b"\n"):
+                    break               # torn tail -- leave it for the next pass
+                new_offset += len(raw)
+                try:
+                    line = raw.decode("utf-8", errors="replace").strip()
+                except Exception:
+                    continue
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(row, dict) and row.get("event") == "worker_done" and row.get("jid"):
+                    rows.append(row)
+    except OSError:
+        return out
+    _write_outcome_cursor(new_offset, state_dir)
+
+    for row in rows:
+        jid = row.get("jid")
+        base_path = _p("done", "%s.json" % jid)
+        outcome_path = _p("done", "%s.outcome.json" % jid)
+        if os.path.isfile(outcome_path):
+            continue
+        try:
+            with open(base_path, encoding="utf-8") as fh:
+                base_rec = json.load(fh)
+        except Exception:
+            continue                   # no dispatch record for this jid (a bare -g goal, an
+                                        # interactive retry) -- nothing here to reconcile
+        if base_rec.get("status") not in ("dispatched", "awaiting_fleet"):
+            continue
+        norm = _WORKER_STATUS_TO_JOB_STATUS.get(row.get("status"), "unknown")
+        rec = {"id": jid, "type": "fleet_goal", "destination": "fleet",
+               "ts_done": now_ts if now_ts is not None else now,
+               "status": norm,
+               "result": {"worker": row.get("worker"), "outcome": row.get("outcome"),
+                          "turns": row.get("turns"), "reason": row.get("reason"),
+                          "route": row.get("route"), "worker_status": row.get("status"),
+                          "ledger_ts": row.get("ts")},
+               "error": None}
+        try:
+            with open(outcome_path, "w", encoding="utf-8") as fh:
+                json.dump(rec, fh, ensure_ascii=False, indent=2)
+        except OSError:
+            continue
+        out.append(rec)
+    return out
+
+
+#: How long a fleet-bound job may sit at "dispatched"/"awaiting_fleet" with no landing ack, no
+#: recorded outcome, and no matching live worker before job_status() stops repeating that word
+#: and says plainly that nothing more is known. Generous: autostart's own grace is measured in
+#: minutes, and reporting "unknown" too early would just be a second word for the silence this
+#: function exists to replace.
+JOB_STATUS_UNKNOWN_AFTER_S = float(
+    os.environ.get("TASK_JOB_STATUS_UNKNOWN_AFTER_S", "1800") or 1800)
+
+
+def _jid_is_live_worker(jid, state_dir=None):
+    """Is `jid` a worker the CURRENT live run is actually holding right now? Reads status.json
+    with the same liveness rule fleet_is_live uses, so a stale snapshot from a run that has
+    already died cannot be read as "still in flight"."""
+    if not jid:
+        return False
+    sd = state_dir or FLEET_STATE_DIR
+    try:
+        sp = os.path.join(sd, "status.json")
+        if not os.path.isfile(sp) or (time.time() - os.path.getmtime(sp)) > FLEET_LIVE_MAX_AGE_S:
+            return False
+        with open(sp, encoding="utf-8-sig") as fh:
+            snap = json.load(fh) or {}
+        if not snap.get("running"):
+            return False
+        for w in snap.get("workers") or []:
+            if isinstance(w, dict) and w.get("jid") == jid:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def job_status(jid, state_dir=None):
+    """Answer "did this job finish, and how", for one admitted goal, without the caller needing
+    to know that done/<jid>.json records dispatch rather than completion, or that the real
+    answer might be sitting in a different file entirely. Read-only: never writes, so it is
+    always safe to call against a live queue.
+
+    Returns {id, state, status, detail, ts_done, result}. `state` is one of:
+      "finished"   a worker_done row for this jid exists (already reconciled into
+                   done/<jid>.outcome.json, or found live if that pass has not run yet).
+                   `status` is the normalized outcome (done/cancelled/error/stuck).
+      "in_flight"  no outcome yet, but the jid is a worker in the CURRENT live run right now --
+                   it has not finished, and this function can plainly see it has not been
+                   lost either.
+      "unknown"    the base record says "dispatched"/"awaiting_fleet", nothing else has ever
+                   been recorded for it, it is not a live worker, and either no fleet is
+                   running now or the wait has outlasted JOB_STATUS_UNKNOWN_AFTER_S. This is
+                   the case this module exists to stop mis-stating: a goal dispatched into a
+                   run that was later stopped, or one whose completion predates jid reaching
+                   the ledger, no longer reads as though it were quietly still in progress --
+                   it reads as exactly what is true, which is that nothing further is known.
+      "not_found"  no done/ record exists for this jid at all.
+      (anything else) the job's own recorded terminal status, unchanged -- local jobs
+                   (ok/error/denied/awaiting_approval) and CLAUDE escalations already resolve
+                   through their own path and are not the gap this function closes.
+    """
+    ensure_dirs()
+    outcome_path = _p("done", "%s.outcome.json" % jid)
+    if os.path.isfile(outcome_path):
+        try:
+            with open(outcome_path, encoding="utf-8") as fh:
+                rec = json.load(fh)
+            return {"id": jid, "state": "finished", "status": rec.get("status"),
+                    "detail": "completion recorded by the fleet's own ledger",
+                    "ts_done": rec.get("ts_done"), "result": rec.get("result")}
+        except Exception:
+            pass
+
+    base_path = _p("done", "%s.json" % jid)
+    if not os.path.isfile(base_path):
+        return {"id": jid, "state": "not_found", "status": None,
+                "detail": "no done/ record exists for this id", "ts_done": None, "result": None}
+    try:
+        with open(base_path, encoding="utf-8") as fh:
+            base_rec = json.load(fh)
+    except Exception:
+        base_rec = {}
+
+    if base_rec.get("status") not in ("dispatched", "awaiting_fleet"):
+        return {"id": jid, "state": base_rec.get("status"), "status": base_rec.get("status"),
+                "detail": "terminal status recorded at dispatch time",
+                "ts_done": base_rec.get("ts_done"), "result": base_rec.get("result")}
+
+    # A completion that landed in the ledger since the last _reconcile_outcomes tick.
+    row = _find_worker_outcome_by_jid(jid, state_dir)
+    if row is not None:
+        norm = _WORKER_STATUS_TO_JOB_STATUS.get(row.get("status"), "unknown")
+        return {"id": jid, "state": "finished", "status": norm,
+                "detail": "completion recorded by the fleet's own ledger",
+                "ts_done": row.get("ts"),
+                "result": {"worker": row.get("worker"), "outcome": row.get("outcome"),
+                          "turns": row.get("turns"), "reason": row.get("reason"),
+                          "route": row.get("route"), "worker_status": row.get("status")}}
+
+    if _jid_is_live_worker(jid, state_dir):
+        return {"id": jid, "state": "in_flight", "status": base_rec.get("status"),
+                "detail": "still an active worker in the current live run",
+                "ts_done": None, "result": None}
+
+    try:
+        dispatched_ts = os.path.getmtime(base_path)
+    except OSError:
+        dispatched_ts = 0
+    age = time.time() - dispatched_ts
+    live_now = fleet_is_live(state_dir)
+    if (not live_now) or age > JOB_STATUS_UNKNOWN_AFTER_S:
+        why = ("no fleet is running now" if not live_now
+               else "it has been waiting %.0fs with no result" % age)
+        return {"id": jid, "state": "unknown", "status": base_rec.get("status"),
+                "detail": ("no completion was ever recorded for this goal, and %s -- this is "
+                           "not a claim that it failed, only that nothing further is known"
+                           % why),
+                "ts_done": None, "result": base_rec.get("result")}
+
+    return {"id": jid, "state": "dispatched", "status": base_rec.get("status"),
+            "detail": "recently dispatched; no completion or live-worker signal yet",
+            "ts_done": None, "result": base_rec.get("result")}
+
+
 def run_job(job, now_ts=None):
     """Execute (LOCAL) or hand off (FLEET/CLAUDE) a single job. Returns the done-record dict.
     Never raises -- any failure is captured as status 'error'."""
@@ -1459,6 +1786,14 @@ def dispatch_once(now_ts=None):
     # sweep rather than the next.
     try:
         out.extend(_reconcile_landings(now_ts=now_ts))
+    except Exception:
+        pass
+    # OUTCOME RECONCILE. Independent of the landing pass above: landing says the fleet TOOK a
+    # goal, this says what happened to it afterwards. Runs every tick so a completion shows up
+    # in done/ within one poll interval of the ledger recording it, rather than only when
+    # someone happens to call job_status() for that particular id.
+    try:
+        out.extend(_reconcile_outcomes(now_ts=now_ts))
     except Exception:
         pass
     out.extend(_deliver_waiting_goals(now_ts=now_ts))
@@ -1611,8 +1946,15 @@ def main():
     ap = argparse.ArgumentParser(description="Typed-job task router (LOCAL/FLEET/CLAUDE).")
     ap.add_argument("--once", action="store_true", help="process the pending queue once and exit")
     ap.add_argument("--poll-s", type=float, default=2.0, help="poll interval when looping")
+    ap.add_argument("--status", metavar="JID",
+                    help="print job_status() for one admitted job id and exit -- 'did this "
+                         "job finish, and how', read-only, without needing to know done/ "
+                         "records dispatch rather than completion")
     args = ap.parse_args()
     ensure_dirs()
+    if args.status:
+        print(json.dumps(job_status(args.status), ensure_ascii=False, indent=2))
+        return
     if args.once:
         recs = dispatch_once()
         print(json.dumps(recs, ensure_ascii=False))

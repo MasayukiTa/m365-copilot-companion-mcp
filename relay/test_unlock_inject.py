@@ -51,6 +51,22 @@ try:
 except ImportError:      # 単体スクリプトとして走らせたとき
     pytest = None
 
+# UNLOCK EXHAUSTION NOW RAISES A REAL HITL GATE (operator E, 2026-09-15) instead of only
+# setting a status field -- and this file's OWN documented invocation
+# (".venv\Scripts\python.exe relay\test_unlock_inject.py") runs OUTSIDE pytest, so
+# conftest.py's module-scope MCP_GATE_DIR/MCP_SUPPRESS_GUI redirects (set before pytest
+# imports anything) never run. Running this exact cap-exhaustion test standalone, before this
+# was added, wrote a real gate file into the operator's live ~/.companion_gates AND spawned a
+# real FleetCockpit.exe --approval-gate window on the operator's desktop -- the identical
+# failure mode conftest.py's own comment warns about for the pytest path ("378 pending
+# questions ... every one naming a pytest temp directory"), reached here by the one entry
+# point that skips conftest.py entirely. `setdefault` so a run UNDER pytest (which already set
+# these at collection time) is unaffected; only the standalone script path is redirected.
+os.environ.setdefault("MCP_SUPPRESS_GUI", "1")
+os.environ.setdefault(
+    "MCP_GATE_DIR", os.path.join(tempfile.gettempdir(),
+                                 "companion_gates_test_unlock_inject_%d" % os.getpid()))
+
 import relay.relay_fleet as rf
 from relay.relay_fleet import RelayWorker, MAX_UNLOCK_ATTEMPTS
 
@@ -100,13 +116,18 @@ def main():
     check("reason_no_password_leak", PW not in (w.reason or ""))
     check("inject_job_names_the_token", "unlock_token" in (w.job or ""))
 
-    # 2. cap: after MAX_UNLOCK_ATTEMPTS injections, the next locked reply -> STUCK (no infinite loop)
+    # 2. cap: after MAX_UNLOCK_ATTEMPTS injections, the next locked reply -> ask a human
+    # (CHANGED 2026-09-15, operator E wired in: exhausting the unlock budget is precisely a
+    # question only a person can answer -- MCP_REQUIRE_UNLOCK_TOKEN? a rotating IP? a wrong
+    # password? -- so it now raises a HITL gate instead of settling STUCK outright; see
+    # relay/test_a_worker_that_needs_a_person_should_say_so.py for that mechanism in depth.
+    # It still settles STUCK, unanswered, after GATE_ANSWER_TIMEOUT_S -- not exercised here.)
     w2 = RelayWorker("g", "u1")
     for _ in range(MAX_UNLOCK_ATTEMPTS - 1):
         w2._decide(LOCKED)
     check("cap_attempts_reached", w2._unlock_attempts == MAX_UNLOCK_ATTEMPTS)
     w2._decide(LOCKED)                                  # one past the cap
-    check("cap_goes_stuck", w2.status == "stuck" and w2.outcome == "STUCK")
+    check("cap_asks_a_human", w2.status == "awaiting_gate" and bool(w2._gate_token))
     check("cap_reason_actionable", "unlock" in (w2.reason or "") and PW not in (w2.reason or ""))
     # THE REASON MUST LIST THE CAUSE THAT HAPPENS. It named a rotating backend IP and a wrong
     # password; on 2026-09-07 it was neither, and the two jobs that hit this spent 17 and 6

@@ -65,7 +65,10 @@ def test_the_fleet_records_it_beside_the_outcome():
     from pathlib import Path
     src = (Path(SD.__file__).parent / "relay_fleet.py").read_text(encoding="utf-8")
     body = src[src.index('"worker_done", worker=self.name') - 1500:]
-    body = body[:body.index('reason=(self.reason or "")[:200])') + 40]
+    # ", jid=" now follows `reason=...` as the join key task_router.py needs to read this
+    # ledger back (2026-09-15) -- the call no longer closes immediately after `reason=`, so
+    # this cuts on the comma rather than assuming reason is the last keyword argument.
+    body = body[:body.index('reason=(self.reason or "")[:200],') + 40]
     assert "self.drv.conversation_ids()" in body
     assert 'conv_client=ids.get("client", "")' in body
     assert 'conv_server=ids.get("server", "")' in body
