@@ -34,7 +34,7 @@ from ctypes import wintypes
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from tools import desktop_input as DI
-from tools import win_hit_test as W
+from tools import window_probe as W
 from tools.screen_capture import capture, capture_reports_what_it_did
 
 SAMPLE = "computer-use 実行器の確認 ABC 123 釜の蓋"

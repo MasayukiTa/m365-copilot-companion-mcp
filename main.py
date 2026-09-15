@@ -103,6 +103,8 @@ from tools.foundry import forge_tool, forge_list, forge_read, forge_delete
 from tools.registry_ops import registry_read, service_status
 from tools.shell_extra import pwsh_exec, pwsh_exec_file, shell_which
 from tools.screenshot_ops import screenshot
+from tools.screen_ops import (screen_look, screen_click, screen_scroll,
+                              screen_type, screen_press, screen_windows)
 from tools.odbc_ops import (
     odbc_columns,
     odbc_connections,
@@ -409,6 +411,11 @@ TOOLS = (
     outlook_inbox, outlook_send_mail, outlook_calendar, outlook_create_event,
     # clipboard / screen capture
     clipboard_get, clipboard_set, screenshot,
+    # acting on the screen: screen_look records the coordinate frame the picture
+    # was taken in, so screen_click can convert a pixel of THAT image back to a
+    # desktop point. `screenshot` states no frame and cannot be clicked in.
+    screen_look, screen_click, screen_scroll, screen_type, screen_press,
+    screen_windows,
     # task management
     todo_write, todo_list, todo_clear,
     # orchestration: audit/replay run-log (operator D)

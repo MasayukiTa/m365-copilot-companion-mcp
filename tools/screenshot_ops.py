@@ -64,6 +64,29 @@ def screenshot(
             img = img.convert("RGB")
             save_kwargs["quality"] = 88
         img.save(out, **save_kwargs)
-        return f"saved screenshot: {out} ({img.size[0]}x{img.size[1]} px, {out.stat().st_size:,} bytes)"
+        # WHAT THIS LINE USED TO LEAVE OUT. The reply said only the file's own size,
+        # so nothing told a reader that a desktop wider than max_dimension had been
+        # halved on the way here, nor that its top-left corner is not (0, 0) -- on
+        # this machine the virtual desktop starts at (-985, -1093) because a monitor
+        # sits above and to the left of the primary one. Coordinates read off this
+        # image and used as desktop points are therefore wrong by more than the width
+        # of most windows, and nothing in the old reply could have warned anyone.
+        # Saying so is not a substitute for the frame: to CLICK on what was seen, use
+        # screen_look, which records the frame and lets screen_click convert.
+        note = ""
+        try:
+            from .screen_capture import virtual_screen
+
+            left, top, vw, vh = virtual_screen()
+            scale = vw / float(img.size[0]) if img.size[0] else 1.0
+            note = (f" -- desktop is {vw}x{vh} at ({left}, {top})"
+                    + (f", this image is 1:{scale:.3f} of it" if abs(scale - 1.0) > 1e-9
+                       else "")
+                    + ". To click on what you see here, take the picture with"
+                      " screen_look instead: it records the frame.")
+        except Exception:
+            pass
+        return (f"saved screenshot: {out} ({img.size[0]}x{img.size[1]} px, "
+                f"{out.stat().st_size:,} bytes){note}")
     except Exception as e:
         return f"[screenshot error: {type(e).__name__}: {e}]"
