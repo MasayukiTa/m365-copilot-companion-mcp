@@ -216,6 +216,50 @@ def _body(group, paths, contracts, lessons, name):
     return "\n".join(lines)
 
 
+#: How much of a Skill's own vocabulary a job must share before the job is treated as work that
+#: Skill already covers. Low, because a SKILL.md is mostly procedure prose while a goal is mostly
+#: request -- the two overlap on the subject and little else. What protects against a wrong match
+#: is not the number but the consequence: a wrong match produces a suggested ADDITION for a
+#: person to read beside the named file, which they discard in a second. A missed match produces
+#: a duplicate Skill proposal, which is worse, because two Skills for one job is how a catalogue
+#: stops being searchable.
+SKILL_MATCH_SIMILARITY = 0.12
+
+
+def _skill_texts(skills_dir=SKILLS_DIR):
+    """{skill name: its SKILL.md}, for matching work against what is already written down."""
+    out = {}
+    for name in existing_skill_names(skills_dir):
+        path = os.path.join(skills_dir, name, "SKILL.md")
+        try:
+            out[name] = io.open(path, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+    return out
+
+
+def matching_skill(goal, texts):
+    """The existing Skill this work belongs to, or "".
+
+    MATCHED ON CONTENT, NOT ON NAME, and the difference is the whole feature. Bundle names became
+    opaque digests the moment they were found to be carrying an employee id and colleagues'
+    surnames (see `_slug`), so the previous check -- "is this proposal's name already a directory
+    in skills/" -- could never be true again and the amendment path was structurally dead: 0
+    additions proposed, every run, with five Skills sitting right there.
+
+    That path is the one the operator actually asked for: "skills は同じ作業なのでエージェントが
+    協力し合ってどんどん良い skills にしていくのが理想". A lesson learned on today's run of work a
+    Skill already covers belongs in THAT Skill, not in a sixth proposal beside it.
+    """
+    w = skill_lessons.words(goal)
+    best, score = "", 0.0
+    for name, text in (texts or {}).items():
+        sim = skill_lessons.similarity(w, skill_lessons.words(text))
+        if sim > score:
+            best, score = name, sim
+    return best if score >= SKILL_MATCH_SIMILARITY else ""
+
+
 def propose(ledger=None, skills_dir=SKILLS_DIR, include_benchmarks=False):
     """Every Skill the record can support, and every one it cannot, with the reason.
 
@@ -225,12 +269,36 @@ def propose(ledger=None, skills_dir=SKILLS_DIR, include_benchmarks=False):
     """
     got = candidates(include_benchmarks=include_benchmarks)
     lessons = skill_lessons.pairs(ledger=ledger, include_benchmarks=include_benchmarks)
-    have = {n.lower() for n in existing_skill_names(skills_dir)}
+    skill_texts = _skill_texts(skills_dir)
 
-    out = {"new": [], "amend": [], "refused": [],
+    out = {"new": [], "amend": [], "refused": [], "merged": 0,
            "lesson_pairs": len(lessons), "candidates": len(got["qualified"])}
 
+    # ONE PROPOSAL PER INSTRUCTION, MERGED BEFORE ANYTHING IS WRITTEN.
+    #
+    # `skill_candidates` groups by the normalised goal, which is the text that was SENT; a
+    # fan-out parent and its children therefore land in different groups even though the
+    # operator wrote one instruction. Stripping our own composition (operator_instruction)
+    # collapses them back together -- and since the bundle name is a digest OF that instruction,
+    # the collapsed groups then compete for one filename. Measured: 10 amendments proposed, 5
+    # files on disk. Five were silently overwritten by the other five.
+    #
+    # They are the same work, so they are merged rather than renamed apart: the run counts add
+    # up, which is the number a person uses to decide whether a Skill is worth writing, and it
+    # was being split across rows that each looked less used than the work really is.
+    merged = {}
     for group in got["qualified"]:
+        key = _slug(skill_lessons.operator_instruction(group["examples"][0]))
+        if key in merged:
+            prior = merged[key]
+            prior["runs"] += group["runs"]
+            prior["done"] += group["done"]
+            prior["examples"] = list(prior["examples"]) + list(group["examples"])
+            out["merged"] += 1
+            continue
+        merged[key] = dict(group)
+
+    for group in merged.values():
         goal = skill_lessons.operator_instruction(group["examples"][0])
         paths = _paths_in(" ".join(group["examples"]))
         contracts = _contracts_in(" ".join(group["examples"]))
@@ -247,8 +315,9 @@ def propose(ledger=None, skills_dir=SKILLS_DIR, include_benchmarks=False):
         proposal = {"name": name, "runs": group["runs"], "done": group["done"], "goal": goal,
                     "paths": paths, "contracts": contracts, "lessons": applicable,
                     "body": _body(group, paths, contracts, applicable, name)}
-        if name in have:
-            proposal["existing"] = name
+        existing = matching_skill(goal, skill_texts)
+        if existing:
+            proposal["existing"] = existing
             out["amend"].append(proposal)
         else:
             out["new"].append(proposal)
@@ -278,30 +347,56 @@ def write(result, directory=PROPOSALS_DIR):
             fh.write(proposal["body"])
         written.append(path)
 
+    # ONE FILE PER SKILL, CARRYING EVERY AMENDMENT FOR IT.
+    #
+    # NEVER into the bundle: an added file changes its digest and revokes its trust. This is a
+    # block of text with the name of the file a person may choose to paste it into -- and the
+    # name has to be the SKILL's, not the proposal's digest, or the reader is sent to a
+    # `skills/work-<digest>/` that does not exist.
+    #
+    # And grouped, because naming them after the target made several amendments share one
+    # filename and overwrite each other: five proposed, two files on disk, three gone without a
+    # word. That is the third time in one sitting that this generator lost work to a shared
+    # filename -- the same shape as the proposals that collapsed to one instruction, and as the
+    # snapshots that overwrote each other in the OGF folder. A writer that can silently drop its
+    # own output is not reporting what it did, so this one groups first and the count of files
+    # matches the count of targets.
+    by_target = {}
     for proposal in result["amend"]:
-        # NEVER into the bundle: an added file changes its digest and revokes its trust. This is
-        # a block of text with the name of the file a person may choose to paste it into.
-        path = os.path.join(directory, "%s.amend.md" % proposal["name"])
+        target = proposal.get("existing") or proposal["name"]
+        by_target.setdefault(target, []).append(proposal)
+
+    for target, proposals in by_target.items():
+        path = os.path.join(directory, "%s.amend.md" % target)
         try:
             os.makedirs(directory)
         except OSError:
             pass
         with io.open(path, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write("# `skills/%s/SKILL.md` への追記案（自動では反映しない）\n\n"
+            fh.write("# `skills/%s/SKILL.md` への追記案 %d 件（自動では反映しない）\n\n"
                      "既存の Skill は人が書いたものなので上書きしない。"
                      "束の中にファイルを増やすと digest が変わり、**承認済みの Skill が"
                      "`changed` に落ちて失効する**ので、ここに置くだけにしてある。\n\n"
-                     % proposal["name"])
-            fh.write(proposal["body"])
+                     % (target, len(proposals)))
+            for i, proposal in enumerate(proposals, 1):
+                fh.write("\n\n---\n\n## 追記案 %d / %d\n\n" % (i, len(proposals)))
+                fh.write(proposal["body"])
         written.append(path)
 
+    # THE STAMP IS A NOTE, AND A NOTE MUST NOT COST THE WRITE. It read `result["lesson_pairs"]`
+    # directly, so a caller handing over a result without that statistic lost every file this
+    # function had just been asked to write -- the KeyError is raised after the proposals are
+    # written but the exception still reaches the caller, who has no way to know what landed.
+    # `.get` because a missing count is a missing count, not a reason to fail.
     stamp = os.path.join(directory, "last_run.txt")
     try:
         with io.open(stamp, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write("%s\nnew=%d amend=%d refused=%d lesson_pairs=%d\n"
-                     % (time.strftime("%Y-%m-%d %H:%M:%S"), len(result["new"]),
-                        len(result["amend"]), len(result["refused"]), result["lesson_pairs"]))
-    except OSError:
+            fh.write("%s\nnew=%d amend=%d refused=%d merged=%d lesson_pairs=%d\n"
+                     % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                        len(result.get("new") or []), len(result.get("amend") or []),
+                        len(result.get("refused") or []), int(result.get("merged") or 0),
+                        int(result.get("lesson_pairs") or 0)))
+    except (OSError, TypeError, ValueError):
         pass
     return written
 
