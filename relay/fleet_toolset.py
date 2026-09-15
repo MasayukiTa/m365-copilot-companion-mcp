@@ -76,6 +76,16 @@ DELIBERATELY_EXCLUDED = {
     "clipboard_get":     "reads whatever the operator last copied, which may be anything",
     "clipboard_set":     "writes the operator's clipboard, which nothing here needs",
     "screenshot":        "captures the operator's screen, including work unrelated to the run",
+    # Computer use. A benchmark worker fixing a bug inside a container has nothing to do
+    # on the operator's desktop, and these are the tools that would let it move the mouse
+    # and press keys on the machine hosting the run. Excluded as a group, not one at a
+    # time, so that adding a seventh does not quietly arrive allowed.
+    "screen_look":       "captures the operator's screen, and unlike screenshot it also records the frame needed to click in it",
+    "screen_click":      "clicks on the operator's desktop; no instance is solved by pressing a button on the machine running the fleet",
+    "screen_scroll":     "scrolls the operator's windows, for the same reason screen_click is out",
+    "screen_type":       "types into whatever the operator has focused, which is not the worker's container",
+    "screen_press":      "presses keys on the operator's keyboard, including combinations that act on their windows",
+    "screen_windows":    "lists the operator's open windows and titles, which is work unrelated to the run",
     "web_fetch":         "dependency downloads belong to the package manager inside the container, not to the worker",
     "web_search":        "the task ships with its own issue text; searching is how a worker finds someone else's answer",
     "web_search_news":   "the task ships with its own issue text; searching finds someone else's answer",

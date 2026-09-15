@@ -16,7 +16,7 @@ belongs to the model. Disagreement means no model accuracy would have helped.
 
 WHAT IT DOES NOT DO: click anything. WindowFromPoint runs the same hit test that
 decides where a click is delivered, so it is evidence about clicks, and it presses
-nothing on the operator's desktop. See tools/win_hit_test.py.
+nothing on the operator's desktop. See tools/window_probe.py.
 
 Three outcomes, kept apart on purpose:
 
@@ -41,7 +41,7 @@ import time
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from tools import win_hit_test as W
+from tools import window_probe as W
 from tools.screen_capture import capture, capture_reports_what_it_did
 from tools.screen_frame import round_trip_error
 
