@@ -451,6 +451,24 @@ def _no_desktop_toasts(monkeypatch):
 import os as _os
 import tempfile as _tempfile
 
+# NO WINDOWS OPEN ON THE OPERATOR'S DESKTOP DURING A TEST RUN.
+#
+# `tools/notify_ops.notify_approval_gate` launches FleetCockpit's approval prompt as a real GUI
+# process and already guards on PYTEST_CURRENT_TEST -- but pytest sets that variable only while
+# a test FUNCTION is executing. Collection, session-scoped fixtures and teardown all run with it
+# absent, and a gate written in any of those phases sails straight past the guard.
+#
+# Measured 2026-09-15: a dialog reading 「承認ゲートを開けませんでした」 appeared on the desktop
+# mid-run, naming BOTH `skills_gates_pytest_<pid>` and `companion_gates_pytest_<pid>` -- so the
+# window was a child of a pytest process, and it could never be satisfied either: the skills
+# store had written the gate through MCP_SKILLS_GATE_DIR while the cockpit resolved
+# MCP_GATE_DIR, two directories that are equal in production and deliberately different here.
+# The operator was handed a prompt with nothing behind it and no way to dismiss the cause.
+#
+# Set at MODULE scope for the reason PYTEST_CURRENT_TEST fails: this must hold for the whole
+# session, not for the phases pytest happens to label.
+_os.environ.setdefault("MCP_SUPPRESS_GUI", "1")
+
 _os.environ.setdefault(
     "MCP_GATE_DIR",
     _os.path.join(_tempfile.gettempdir(), "companion_gates_pytest_%d" % _os.getpid()))

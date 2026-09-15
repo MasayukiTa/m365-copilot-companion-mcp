@@ -17,6 +17,15 @@ def notify_approval_gate(title: str, body: str, gate_path: str | Path) -> str:
     auto, and bypass policy controls.
     """
     toast_result = notify_desktop(title, body) or "[notification handler returned no status]"
+    # PYTEST_CURRENT_TEST IS NOT ENOUGH, AND THE GAP IS NOT SUBTLE. pytest sets it only while a
+    # test FUNCTION runs; collection, session fixtures and teardown all run without it, and a
+    # gate written in any of those phases opened a real window on the operator's desktop. It
+    # could not even be answered: the skills store writes through MCP_SKILLS_GATE_DIR while this
+    # prompt resolves MCP_GATE_DIR, which are the same directory in production and deliberately
+    # different under test, so the window appeared solely to report that it had failed.
+    # MCP_SUPPRESS_GUI is set by conftest at module scope and therefore covers every phase.
+    if os.environ.get("MCP_SUPPRESS_GUI") == "1":
+        return toast_result + "; approval prompt suppressed (MCP_SUPPRESS_GUI)"
     if os.environ.get("PYTEST_CURRENT_TEST"):
         return toast_result + "; approval prompt suppressed under pytest"
 
