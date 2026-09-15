@@ -57,6 +57,31 @@ FLEET_TOOLS = {
     # -- see its own work ----------------------------------------------------------------
     "git_status":       "what have I changed",
     "git_diff":         "the answer it is being asked for IS this diff",
+
+    # -- drive the desktop ---------------------------------------------------------------
+    #
+    # THESE DO NOT BELONG TO A SWE-BENCH WORKER AND ARE HERE ANYWAY, WHICH IS WORTH SAYING
+    # PLAINLY. Everything above serves the five things a bench worker does; nothing below
+    # does. They are here because this list is consulted for EVERY fleet run, not only a
+    # bench one, and a fleet worker is the only caller that can exercise computer use at
+    # all -- the operator's own calls do not go through an unattended run, and the library
+    # can be driven directly from a script, which proves the executor and proves nothing
+    # about the agent. Listing them elsewhere and refusing them here made the capability
+    # untestable rather than making a bench run safer.
+    #
+    # The distinction that is actually wanted is by RUN KIND, which this file cannot
+    # express today: a bench run should not reach these and an office-work run should.
+    # Recorded here rather than solved here, because inventing a second list is how the
+    # first one stopped being a decision.
+    #
+    # What still gates them is the unlock: all six call require_unlocked(), so a worker
+    # that has not been given the password moves no mouse.
+    "screen_look":      "see the screen, with the coordinate frame needed to act on what it sees",
+    "screen_click":     "click what it saw, in that frame",
+    "screen_scroll":    "reach what is below the fold",
+    "screen_type":      "type into the focused field, as characters rather than keystrokes",
+    "screen_press":     "the named keys ordinary office work needs, refusing the destructive combinations",
+    "screen_windows":   "what is open, which is often enough to decide without a picture",
 }
 
 # Named so a reader can see what was considered and refused, rather than guessing that it was
@@ -76,16 +101,12 @@ DELIBERATELY_EXCLUDED = {
     "clipboard_get":     "reads whatever the operator last copied, which may be anything",
     "clipboard_set":     "writes the operator's clipboard, which nothing here needs",
     "screenshot":        "captures the operator's screen, including work unrelated to the run",
-    # Computer use. A benchmark worker fixing a bug inside a container has nothing to do
-    # on the operator's desktop, and these are the tools that would let it move the mouse
-    # and press keys on the machine hosting the run. Excluded as a group, not one at a
-    # time, so that adding a seventh does not quietly arrive allowed.
-    "screen_look":       "captures the operator's screen, and unlike screenshot it also records the frame needed to click in it",
-    "screen_click":      "clicks on the operator's desktop; no instance is solved by pressing a button on the machine running the fleet",
-    "screen_scroll":     "scrolls the operator's windows, for the same reason screen_click is out",
-    "screen_type":       "types into whatever the operator has focused, which is not the worker's container",
-    "screen_press":      "presses keys on the operator's keyboard, including combinations that act on their windows",
-    "screen_windows":    "lists the operator's open windows and titles, which is work unrelated to the run",
+    # NOTE: the six screen_* computer-use tools were listed here for a day and that was
+    # wrong -- see the block above FLEET_TOOLS. The reason ("a benchmark worker has no
+    # business driving the operator's desktop") is correct and this list cannot express it,
+    # because it is consulted for EVERY fleet run and not only for a benchmark one. Refusing
+    # them here did not protect a bench run; it made computer use unreachable by the only
+    # caller that can exercise it, which is a fleet worker.
     "web_fetch":         "dependency downloads belong to the package manager inside the container, not to the worker",
     "web_search":        "the task ships with its own issue text; searching is how a worker finds someone else's answer",
     "web_search_news":   "the task ships with its own issue text; searching finds someone else's answer",
