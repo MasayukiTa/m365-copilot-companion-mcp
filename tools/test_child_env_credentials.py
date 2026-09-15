@@ -63,10 +63,16 @@ def test_the_operators_pythonpath_still_reaches_the_child(monkeypatch):
     """
     import os
 
-    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(["C:/p", "C:/q"]))
+    # NO COLONS IN THE VALUES. The first version used "C:/p" and "C:/q" -- Windows paths, in
+    # a test the Linux job also runs -- joined with os.pathsep, which is ":" there. The
+    # separator was inside the values, so splitting produced ['C', '/p', 'C', '/q'] and the
+    # test failed on a platform where nothing was wrong. The entries only have to be
+    # distinguishable and ordered; what they look like is not the subject.
+    first, second = "operator_dir_one", "operator_dir_two"
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join([first, second]))
     got = (sanitized_child_env().get("PYTHONPATH") or "").split(os.pathsep)
-    assert "C:/p" in got and "C:/q" in got, got
-    assert got.index("C:/p") < got.index("C:/q"), ("their order changed", got)
+    assert first in got and second in got, got
+    assert got.index(first) < got.index(second), ("their order changed", got)
 
 
 def test_path_is_always_kept():
