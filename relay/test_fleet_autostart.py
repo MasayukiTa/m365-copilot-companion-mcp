@@ -459,7 +459,7 @@ class _FakeProc:
     pid = 4242
 
 
-def test_a_tunnel_goal_is_not_gated_behind_the_bench_disk_floor(state):
+def test_a_tunnel_goal_is_not_gated_behind_the_bench_disk_floor(state, monkeypatch):
     """A GOAL FROM A PHONE IS NOT A BENCH EVAL -- BUT IT IS NOT WEIGHTLESS EITHER.
 
     The bench floor protects against SWE-bench Docker builds; five concurrent ones once filled
@@ -478,6 +478,12 @@ def test_a_tunnel_goal_is_not_gated_behind_the_bench_disk_floor(state):
     hole. The silence that made a floor unusable is fixed separately, in `_note_disk_defer`,
     which now reports a lasting block outward instead of only into the coordinator's log.
     """
+    # NOTHING CHOSEN IN THE COCKPIT, which is the case this flag exists for. When the operator
+    # HAS chosen, the flag must not be passed at all -- it beats settings.txt in fleet_runner's
+    # resolution chain, so passing it would override the number the settings panel is showing.
+    # That is asserted separately in test_the_panel_shows_the_floor_the_run_uses.py; without
+    # pinning it here, this test read whatever the machine happened to be configured with.
+    monkeypatch.setattr(TR, "_operator_set_a_disk_floor", lambda: False)
     launcher = _Launcher()
     plan = TR.autostart_fleet([{"text": "anything", "priority": False}], str(state),
                               launcher=launcher)
