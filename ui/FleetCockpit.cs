@@ -1232,6 +1232,28 @@ class CockpitWindow : Window
         if (k == "disk_floor") return ja ? "実行下限ディスク (GB)" : "Disk floor (GB)";
         if (k == "disk_floor_hint") return ja ? "空きディスクがこの値を下回るとタブ開放を待機します。" : "Pauses opening tabs when free disk drops below this.";
         if (k == "ram_floor") return ja ? "確保する空きRAM (MB)" : "RAM floor (MB)";
+        // FALLBACK: on-demand re-unlock. Automatic recovery already exists (relay_fleet
+        // injects the unlock password into a worker's first turn, and a heuristic retries
+        // it when a reply looks like a lock refusal) but both can miss -- see
+        // relay/fleet_runner.py's apply_reunlock docstring for the incident this answers:
+        // twice in one day a worker was refused for lock, nothing recovered it, and the
+        // run carried on regardless. The route is visible here; the password never is --
+        // it is read on the coordinator's machine from its own .env and never appears in
+        // the command file this button writes.
+        if (k == "set_reunlock_section") return ja ? "再解錠（フォールバック）" : "Re-unlock (fallback)";
+        if (k == "reunlock_target_hint") return ja
+            ? "対象ワーカー名（例: w0）。空欄なら実行中の全ワーカーへ送ります。"
+            : "Target worker name (e.g. w0). Leave blank for every live worker.";
+        if (k == "reunlock_btn") return ja ? "再解錠を送信" : "Send re-unlock";
+        if (k == "reunlock_hint") return ja
+            ? "自動解錠が効かずロックで止まったワーカーに、解錠指示をもう一度送ります。パスワードは"
+              + "この端末の .env からその場で読まれ、コマンドファイルには一切書き込まれません。"
+            : "Re-sends the unlock instruction to a worker stuck on a lock refusal that automatic "
+              + "recovery missed. The password is read from this machine's .env at the moment it "
+              + "is sent and is never written into the command file.";
+        if (k == "reunlock_sent_all") return ja
+            ? "全ワーカーへ再解錠を送信しました（結果は次の更新で表示）"
+            : "Re-unlock sent to every live worker (result on next refresh)";
         if (k == "ui_scale_section") return ja ? "表示サイズ" : "UI scale";
         if (k == "ui_scale") return ja ? "表示サイズ" : "UI scale";
         if (k == "ui_scale_hint") return ja ? "Ctrl+ホイールや Ctrl +/− でも変更できます（Ctrl+0 で自動）。" : "Also change with Ctrl+wheel or Ctrl +/− (Ctrl+0 = auto).";
@@ -6048,6 +6070,13 @@ class CockpitWindow : Window
     }
 
     TextBlock _diskFloorVal;
+    // Re-unlock fallback button (settings panel): target-worker input, send button, and the
+    // note that reports what happened. _reunlockNoteTs dedupes against status.json's
+    // "reunlock" receipt so the note updates once per press rather than once per ~1s poll.
+    TextBox _reunlockTargetInput;
+    Button _reunlockBtn;
+    TextBlock _reunlockNote;
+    double _reunlockNoteTs = 0.0;
     TextBlock SectionHeader(string text)
     {
         var t = new TextBlock(); t.Text = text; t.Foreground = Muted; t.FontSize = 11;
@@ -6354,6 +6383,46 @@ class CockpitWindow : Window
         var hint = new TextBlock(); hint.Text = T("disk_floor_hint"); hint.Foreground = Muted;
         hint.FontSize = 10.5; hint.TextWrapping = TextWrapping.Wrap; hint.Margin = new Thickness(0, 0, 0, 2);
         col.Children.Add(hint);
+
+        // ── FALLBACK: on-demand re-unlock (settings panel, not the worker card). Chosen here
+        // rather than per-card because the button's own point is to keep working when the
+        // automatic path has already failed silently -- which is exactly when a person is
+        // least sure WHICH card, if any, is the stuck one. A panel control reachable the same
+        // way disk floor / RAM floor / reconnect-chat already are needs no card to still be on
+        // screen, no scroll position, and covers the target="" broadcast case (every live
+        // worker) as directly as a single named one. See relay/fleet_runner.py's
+        // apply_reunlock docstring for the incident this exists to answer.
+        col.Children.Add(SectionHeader(T("set_reunlock_section")));
+        var reunlockRow = new StackPanel();
+        reunlockRow.Orientation = Orientation.Horizontal;
+        reunlockRow.Margin = new Thickness(0, 2, 0, 2);
+        _reunlockTargetInput = new TextBox();
+        _reunlockTargetInput.Width = 70;
+        _reunlockTargetInput.FontSize = 12;
+        _reunlockTargetInput.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
+        _reunlockTargetInput.Foreground = Theme.Br(Theme.Text(_dark));
+        _reunlockTargetInput.BorderBrush = Theme.Br(Theme.Border(_dark));
+        _reunlockTargetInput.BorderThickness = new Thickness(1);
+        _reunlockTargetInput.Padding = new Thickness(6, 3, 6, 3);
+        _reunlockTargetInput.VerticalAlignment = VerticalAlignment.Center;
+        _reunlockTargetInput.ToolTip = T("reunlock_target_hint");
+        reunlockRow.Children.Add(_reunlockTargetInput);
+        _reunlockBtn = new Button();
+        _reunlockBtn.Content = T("reunlock_btn");
+        _reunlockBtn.FontSize = 12; _reunlockBtn.FontWeight = FontWeights.SemiBold;
+        _reunlockBtn.Cursor = Cursors.Hand; _reunlockBtn.BorderThickness = new Thickness(1);
+        _reunlockBtn.Padding = new Thickness(12, 4, 12, 4);
+        _reunlockBtn.Margin = new Thickness(6, 0, 0, 0);
+        _reunlockBtn.Template = FlatButtonTemplate();
+        _reunlockBtn.ToolTip = T("reunlock_hint");
+        _reunlockBtn.Click += delegate { RequestReunlock(_reunlockTargetInput.Text); };
+        reunlockRow.Children.Add(_reunlockBtn);
+        col.Children.Add(reunlockRow);
+        _reunlockNote = new TextBlock();
+        _reunlockNote.FontSize = 10.5; _reunlockNote.TextWrapping = TextWrapping.Wrap;
+        _reunlockNote.Foreground = Muted; _reunlockNote.Margin = new Thickness(0, 2, 0, 2);
+        _reunlockNote.Text = T("reunlock_hint");
+        col.Children.Add(_reunlockNote);
 
         // ── Chat: always-available manual bridge reconnect. Unlike the Fix button (only shown
         // when a dot is red/yellow), this fires on demand regardless of the Tool dot's state --
@@ -7093,6 +7162,72 @@ class CockpitWindow : Window
             cmd["set_ram_floor_mb"] = _ramFloor;
             WriteCommands(cmd);
         }
+    }
+
+    // THE FALLBACK BUTTON. Writes {"reunlock": "<name-or-empty>"} through the SAME merge-with-
+    // existing ReadCommands->WriteCommands path SetDiskFloor/SetRamFloor use, so it cannot
+    // clobber a concurrent close/steer/set_maxtabs. CARRIES NO SECRET: fleet_runner.py's
+    // apply_reunlock reads the unlock password locally, on the coordinator's own machine, from
+    // that machine's .env -- never from this file, which is plain text read by several
+    // processes. `target` blank means every live worker (fleet_runner treats "" the same as the
+    // steer broadcast rule it is built on; "*" is accepted there too for the same reason).
+    //
+    // This gives immediate LOCAL feedback ("sent") and then RefreshReunlockNote overwrites it
+    // once status.json's "reunlock" receipt lands (~1s later) with whether it actually
+    // delivered or why not -- so "I pressed the button and nothing happened" has an answer
+    // instead of silence, which is the entire reason this exists.
+    void RequestReunlock(string target)
+    {
+        if (!RunIsLive())
+        {
+            if (_reunlockNote != null) _reunlockNote.Text = T("steer_dead");
+            return;
+        }
+        string t = (target ?? "").Trim();
+        var cmd = ReadCommands();
+        cmd["reunlock"] = t;
+        WriteCommands(cmd);
+        bool ja = _lang == 0;
+        if (_reunlockNote != null)
+        {
+            _reunlockNote.Foreground = Muted;
+            _reunlockNote.Text = string.IsNullOrEmpty(t)
+                ? T("reunlock_sent_all")
+                : (ja ? (t + " へ再解錠を送信しました（結果は次の更新で表示）")
+                     : ("Re-unlock sent to " + t + " (result on next refresh)"));
+        }
+    }
+
+    // Reactive counterpart to RequestReunlock: reads status.json's "reunlock" receipt
+    // (apply_reunlock's return value, written by fleet_runner.py) each tick and, the first
+    // time a NEW one appears (deduped on its "ts" against _reunlockNoteTs so the note does not
+    // re-announce the same result on every ~1s poll), replaces the optimistic "sent" note with
+    // the real outcome: delivered-to-whom-and-how-many, or the stated reason it was not --
+    // most importantly "no local unlock password", which used to be indistinguishable from the
+    // button doing nothing at all.
+    void RefreshReunlockNote(Dictionary<string, object> root)
+    {
+        if (_reunlockNote == null || root == null) return;
+        object raw;
+        if (!root.TryGetValue("reunlock", out raw)) return;
+        var r = raw as Dictionary<string, object>;
+        if (r == null) return;
+        double ts = Dbl(r, "ts");
+        if (ts <= _reunlockNoteTs) return;
+        _reunlockNoteTs = ts;
+        bool ok = false;
+        object okRaw;
+        if (r.TryGetValue("ok", out okRaw)) { try { ok = Convert.ToBoolean(okRaw); } catch { } }
+        string target = S(r, "target");
+        int delivered = I(r, "delivered");
+        string reason = S(r, "reason");
+        bool ja = _lang == 0;
+        _reunlockNote.Text = ok
+            ? (ja ? ("再解錠: " + target + " に配信しました（" + delivered + "件）")
+                 : ("Re-unlock: delivered to " + target + " (" + delivered + ")"))
+            : (ja ? ("再解錠 失敗（" + target + "）: " + reason)
+                 : ("Re-unlock failed (" + target + "): " + reason));
+        _reunlockNote.Foreground = ok ? Theme.Br(Theme.Success(_dark)) : Theme.Br(Theme.Danger(_dark));
     }
 
     // Effort selector: ComboBox dropdown for min/max/ultra/auto.
@@ -8982,6 +9117,7 @@ class CockpitWindow : Window
         RefreshStoppingState(root);         // FIX B: resolve the optimistic "stopping" state once the sweep confirms it
         UpdateGateBanner(root);             // Bucket C TASK 2: show pending approval gates (blocks worker until answered)
         UpdateCapBanner(root);              // TASK 1: surface the admission-gate wait reactively each tick
+        RefreshReunlockNote(root);          // fallback re-unlock button: replace "sent" with the real receipt
         bool idle = root == null || I(root, "total") == 0
                     || (root.ContainsKey("idle") && Convert.ToBoolean(root["idle"]));
         if (idle)

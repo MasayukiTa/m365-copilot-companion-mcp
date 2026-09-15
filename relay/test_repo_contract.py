@@ -91,8 +91,17 @@ def test_the_composed_body_still_ends_with_the_goal():
 
 # Frozen from the current module; a change to PROTOCOL (intended or not) flips these and
 # forces a deliberate re-pin rather than a silent edit.
-_PROTOCOL_SHA256 = "a45b126857d377a01ab0478b449c093bd2d3b6a011659a4022b3e79ff1af82cd"
-_PROTOCOL_LEN = 1401
+#
+# RE-PINNED 2026-09-15: PROTOCOL trimmed 1401 -> 1147 chars (first-turn budget push, the
+# ContextTokenLimitExceeded incident). The preamble dropped a stale tool count and two of
+# three example names; the tail dropped a STUCK-specific "verify before declaring stuck"
+# sentence that had no incident comment of its own and duplicated OUTPUT_DISCIPLINE's
+# already-guarded "don't declare 無い/できない without checking" clause within this same
+# first turn (see the comments at those two edit sites in copilot_autopilot_relay.py). The
+# contract-prefix wiring this file's part (b) tests is unaffected: the contract still lands
+# ahead of the goal, never inside PROTOCOL's tail.
+_PROTOCOL_SHA256 = "d9500bac384e5b2a618001da0291b4b2b86ac557521c841b3b91eb66d4956771"
+_PROTOCOL_LEN = 1147
 
 
 def _protocol():

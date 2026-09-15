@@ -314,10 +314,16 @@ SKILL_SENTENCE = ("" if os.environ.get("MCP_NO_SKILL_SENTENCE") else
 PROTOCOL = (
     # ゲートウェイの説明を先頭に置く。規律文が先だと、ツールを探す前に
     # 「無いので不可」と切り上げる側に効いてしまう（実測でその挙動が出た）。
-    "【最重要】使えるツールは約160個あり、すべて call_tool ゲートウェイの先にある。"
-    "read_file / list_directory / run_python といった名前は、あなた自身のツール一覧には"
-    "出てこない。一覧に無いことを理由に「この環境には存在しない」と結論してはならない。"
-    "必ず call_tool(name='') で実際の一覧を確認してから可否を述べること。 "
+    #
+    # TRIMMED 2026-09-15 (first-turn budget push, ContextTokenLimitExceeded incident).
+    # Dropped "約160個" (a count that goes stale -- call_tool('') answers this itself)
+    # and two of the three example names (read_file/list_directory/run_python -> read_file
+    # 等). Kept: gateway framing, "not in your own list", "don't conclude absent", and the
+    # call_tool(name='') instruction itself -- those are the load-bearing parts the POSITION
+    # comment above and test_the_gateway_sentence_comes_before_the_discipline exist for.
+    "【最重要】ツールは全て call_tool ゲートウェイの先にあり、read_file 等の名前は"
+    "あなた自身の一覧には出てこない。無いことを理由に「存在しない」と結論せず、"
+    "必ず call_tool(name='') で確認してから述べること。 "
     # POSITION, MEASURED. The same sentence sat after the output discipline and the worker
     # ignored it: arm A prompt 1,665 chars without it, arm B 1,801 chars WITH it, and
     # neither called skill_match on a goal that exactly matches a skill. The server rule it
@@ -339,16 +345,28 @@ PROTOCOL = (
     + SKILL_SENTENCE
     + OUTPUT_DISCIPLINE + " "
     "ツールを使い自律的に進める。重い作業は小さく分割し1ターンに1〜数ステップ。"
-    "ツールは call_tool ゲートウェイ経由: まず call_tool(name='') で一覧(名前+要約)を見て"
-    "このタスクに必要なツールを見極め、call_tool(name='X') で使い方を確認、"
-    "call_tool(name='X', arguments={...}) で実行する。"
-    "初手はこの一覧確認＋対象フォルダ/ファイルの存在確認(call_tool で list_directory)から始め、"
-    "いきなり絶対パス直行しない。パスは必ず「/」区切り(例 C:/dir/file)、バックスラッシュ禁止(\\t等に化ける)。"
+    # TRIMMED 2026-09-15: was "ツールは call_tool ゲートウェイ経由: まず call_tool(name='')
+    # で一覧(名前+要約)を見てこのタスクに必要なツールを見極め、call_tool(name='X') で使い方を
+    # 確認、call_tool(name='X', arguments={...}) で実行する。" -- same three-call sequence,
+    # connective filler removed. The 3-verb chain (list/describe/call) is the load-bearing part.
+    "call_tool(name='') で一覧、call_tool(name='X') で使い方確認、"
+    "call_tool(name='X', arguments={...}) で実行。"
+    "初手は一覧確認+対象の存在確認(list_directory)から。絶対パス直行しない。"
+    "パスは必ず「/」区切り(例 C:/dir/file)、バックスラッシュ禁止(\\t等に化ける)。"
     "ファイル/画像/データの大量処理は1ターンに1件だけ処理し、都度ディスク(Excel等)に保存して次へ"
     "(まとめて読むと OpenAIModelTokenLimit で失敗)。各ターン冒頭で保存済み状態を見て未処理の続きから。"
     "深い調査は行頭 `RESEARCH: 内容`、データ分析は `ANALYZE: 絶対パス | 指示`。"
-    "各ターン最終行に必ず: 続行=CONTINUE、完了(検証も通過)=DONE、行き詰まり=STUCK: 理由。""STUCK を出す前に必ず call_tool(name='') で一覧を見直し、未確認の経路が無いことを""確かめること。ツールを一度も叩かずに STUCK と書いてはならない。"
-    "任意: 最終マーカーの直前に `NEXT: <次アクション1行>` と `CONFIDENCE: low|medium|high` を書いてよい。"
+    "各ターン最終行に必ず: 続行=CONTINUE、完了(検証も通過)=DONE、行き詰まり=STUCK: 理由。"
+    # TRIMMED 2026-09-15: dropped the standalone "STUCK を出す前に必ず call_tool(name='') で
+    # 一覧を見直し...確かめること。ツールを一度も叩かずに STUCK と書いてはならない。" sentence.
+    # It had no incident comment of its own and duplicated, inside this SAME first turn,
+    # OUTPUT_DISCIPLINE's own guarded clause ("ツールの有無・実行可否は、実際に call_tool を
+    # 叩いて確かめてから述べる。確かめずに「無い」「できない」と書くことは、この規律違反である。"
+    # -- see _DEFAULT_DISCIPLINE above, NOT touched here), which already covers STUCK: a STUCK
+    # is a declaration of "できない" and OUTPUT_DISCIPLINE is embedded a few dozen characters
+    # earlier in this very string. Do not re-add without a comment recording a DISTINCT
+    # incident this shorter form fails to prevent -- see relay/test_instruction_budget.py.
+    "任意: 最後に `NEXT: <次アクション1行>` `CONFIDENCE: low|medium|high` を書いてよい。"
     "まず最初のステップを実行。\nGoal: "
 )
 
@@ -490,7 +508,16 @@ def _tool_health_for_stuck(max_age_s: float = STUCK_TOOL_HEALTH_MAX_AGE_S,
 # requires that two invocations of the SAME call site see strictly increasing counts, which a
 # monotonic per-site counter already guarantees regardless of what other branches ran between
 # them.
-
+#
+# THE FIRST THREE PHRASES ALL ASSUME A MECHANICAL FAILURE (bad argument, wrong path, missing
+# permission) -- and a mined incident (.fleet/transcripts, worker r6aa8fc73_a0_w0) shows that
+# assumption is sometimes just wrong. That worker exhaustively searched every place its one
+# data source could hold the fact it needed, said so precisely, and reported STUCK naming the
+# exact unresolved question. Every phrase above still tells it to double-check arguments and
+# paths and try the SAME call again -- of no use when the call was fine and the fact was never
+# in that source at all. The fourth phrase below is the missing case: it does not name what the
+# other source might be (this repository never puts the answer in the nudge -- that is the
+# worker's job to find), only that the place already searched may not be the right place.
 _RETRY_ESCALATION_PHRASES = (
     "同じ手順を単純に繰り返すのではなく、直前に失敗した呼び出しの引数・パス指定・権限を"
     "見直してから再試行してください。",
@@ -498,6 +525,8 @@ _RETRY_ESCALATION_PHRASES = (
     "もう一度実行してください。",
     "エラーの内容を踏まえて手順を調整し、同じ失敗を繰り返さないようにしてから"
     "再試行してください。",
+    "今探している場所に目的の情報が無い可能性があります。同じ場所を探し直すのではなく、"
+    "他に手がかりになりそうな資料や経路がないか考えてから再試行してください。",
 )
 
 
