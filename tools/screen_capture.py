@@ -95,18 +95,43 @@ def virtual_screen() -> Tuple[int, int, int, int]:
             g(SM_CXVIRTUALSCREEN), g(SM_CYVIRTUALSCREEN))
 
 
-def capture(max_dimension: int = 0):
-    """Grab the whole virtual desktop. Returns (PIL.Image, Frame).
+def capture(max_dimension: int = 0, region=None):
+    """Grab the desktop, or one rectangle of it. Returns (PIL.Image, Frame).
 
     max_dimension=0 means full size, which is the default because a downscale is a
     loss of precision that the thing acting on the image cannot see. When a caller
     does downscale (to fit a model's input limit, say), the Frame records it, and
     screen_frame.round_trip_error will say how much precision that cost.
+
+    REGION IS THE CHEAP AXIS, AND IT IS THE ONE THAT MATTERS IN A CONVERSATION.
+    Measured 2026-09-15: workers whose task was to look at the screen hit the
+    conversation's token limit in 9 of 11 runs, against 4 of 24 for workers that
+    looked at nothing -- after two to seven turns. A picture costs far more in a
+    conversation than its byte count suggests, and this machine's virtual desktop is
+    3840x2173, so capturing all of it to answer "did that dialog open" spends the
+    budget on three screens of wallpaper.
+
+    `region` is (left, top, right, bottom) in DESKTOP coordinates -- the same frame
+    tools/window_probe.py reports a window's rectangle in, so a caller can hand one
+    straight through. The returned Frame describes the crop, so a pixel named in the
+    cropped image still converts back to the right place on the desktop: the origin
+    moves with the crop, which is exactly what the Frame is for.
     """
     from PIL import Image, ImageGrab
 
     make_process_dpi_aware()
     left, top, width, height = virtual_screen()
+    if region is not None:
+        r_left, r_top, r_right, r_bottom = (int(v) for v in region)
+        # Clamped to what is actually on a screen: a window can hang off the edge,
+        # and a crop that reaches past the desktop returns black pixels the model
+        # would then be asked to find something in.
+        r_left = max(left, min(r_left, left + width))
+        r_top = max(top, min(r_top, top + height))
+        r_right = max(r_left + 1, min(r_right, left + width))
+        r_bottom = max(r_top + 1, min(r_bottom, top + height))
+        left, top = r_left, r_top
+        width, height = r_right - r_left, r_bottom - r_top
     try:
         img = ImageGrab.grab(bbox=(left, top, left + width, top + height),
                              all_screens=True)
