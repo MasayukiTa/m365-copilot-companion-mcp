@@ -109,6 +109,7 @@ def screen_look(output_path: Optional[str] = None, max_dimension: int = 1600,
 
         region = None
         picked = ""
+        warn = []
         want = (window or "").strip()
         if want:
             from . import window_probe as W
@@ -125,6 +126,33 @@ def screen_look(output_path: Optional[str] = None, max_dimension: int = 1600,
             region = (t.left, t.top, t.right, t.bottom)
             picked = t.title or t.cls
 
+            # WHAT THE CROP CANNOT SEE, SAID OUT LOUD.
+            #
+            # Cropping to one window buys the saving by looking away from the rest of the
+            # screen, and the coordinate transform being correct says nothing about the
+            # observation being sufficient. The case that matters is a dialog: it belongs
+            # to a different window, it is usually what is actually blocking the work, and
+            # a picture of the window underneath it shows a screen that looks fine.
+            #
+            # So the reply names anything sitting on top of the target and any dialog
+            # anywhere, rather than leaving the reader to assume the picture is the whole
+            # story. Cheap -- the same enumeration that found the window.
+            in_front = []
+            for other in W.top_level_windows():
+                if other.hwnd == t.hwnd:
+                    break                      # z-order: everything after this is behind
+                if (other.left < t.right and other.right > t.left
+                        and other.top < t.bottom and other.bottom > t.top):
+                    in_front.append(other.title or other.cls)
+            dialogs = [w.title or w.cls for w in W.top_level_windows(min_side=80)
+                       if w.cls == "#32770" and w.hwnd != t.hwnd]
+            if in_front:
+                warn.append("%d window(s) overlap it and are in front: %s"
+                            % (len(in_front), ", ".join(x[:24] for x in in_front[:3])))
+            if dialogs:
+                warn.append("a dialog is open elsewhere on screen: %s"
+                            % ", ".join(x[:24] for x in dialogs[:3]))
+
         img, frame = capture(max_dimension=max(0, int(max_dimension)), region=region)
         img.save(out, optimize=True)
         _frame_path(out).write_text(json.dumps(frame._asdict()), encoding="utf-8")
@@ -133,11 +161,16 @@ def screen_look(output_path: Optional[str] = None, max_dimension: int = 1600,
                  "within that" % frame.scale) if frame.is_downscaled else \
                 "image pixels are desktop pixels here"
         scope = ("window 「%s」" % picked[:40]) if picked else "the whole desktop"
+        # Appended rather than folded into `scope`, so that a reader who skims the first
+        # sentence still meets it, and a reader who does not skim cannot miss it.
+        caution = ("  CAUTION: this picture shows only that window -- " + "; ".join(warn)
+                   + ". Use screen_windows, or capture without `window`, before concluding "
+                     "from it.") if warn else ""
         return ("saved %s -- %s (%dx%d px, %s bytes). Give positions as pixels in THIS "
                 "image and pass them to screen_click with image='%s' -- %s. [%s]"
                 % (out, scope, frame.image_width, frame.image_height,
                    format(out.stat().st_size, ","), out, block,
-                   capture_reports_what_it_did()))
+                   capture_reports_what_it_did()) + caution)
     except Exception as e:
         return "[screen_look error: %s: %s]" % (type(e).__name__, e)
 
