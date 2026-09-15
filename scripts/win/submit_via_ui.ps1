@@ -231,15 +231,14 @@ if ($target) {
 #
 # keybd_event goes through SendInput, which has no hook and no timeout, so a busy machine
 # delays the keystroke instead of failing it. Same keys, same window, no journal.
-function Send-CtrlEnter {
-    $VK_CONTROL = 0x11; $VK_RETURN = 0x0D; $KEYEVENTF_KEYUP = 0x0002
-    [Win32.KeyInput]::keybd_event($VK_CONTROL, 0, 0, [System.UIntPtr]::Zero)
-    Start-Sleep -Milliseconds 40
-    [Win32.KeyInput]::keybd_event($VK_RETURN, 0, 0, [System.UIntPtr]::Zero)
-    Start-Sleep -Milliseconds 40
-    [Win32.KeyInput]::keybd_event($VK_RETURN, 0, $KEYEVENTF_KEYUP, [System.UIntPtr]::Zero)
-    [Win32.KeyInput]::keybd_event($VK_CONTROL, 0, $KEYEVENTF_KEYUP, [System.UIntPtr]::Zero)
-}
+#
+# AND THEN KEYSTROKES WERE DROPPED ENTIRELY (2026-08-30). Submit now invokes the Start/Send
+# button through InvokePattern, which needs no focus and no foreground window at all -- see
+# the comment inside Submit. The Send-CtrlEnter that used to live here was left behind,
+# called from nowhere, for a fortnight: a function that still looks like the way this script
+# works, that a reader would reasonably call, and that would silently reintroduce the
+# focus-dependence the button-invoke exists to avoid. Deleted rather than kept "in case",
+# because the history above is the part worth keeping and it is right here.
 
 function Submit([string]$text) {
     # CTRL+ENTER, NOT ENTER. The composer sets AcceptsReturn, so a plain Enter inserts a
