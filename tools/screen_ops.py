@@ -62,7 +62,8 @@ def _load_frame(image: str):
                  d["image_width"], d["image_height"]).validate()
 
 
-def screen_look(output_path: Optional[str] = None, max_dimension: int = 1600) -> str:
+def screen_look(output_path: Optional[str] = None, max_dimension: int = 1600,
+                window: str = "") -> str:
     """Capture the screen for the agent to act on, and record what its pixels mean.
 
     Use this instead of `screenshot` whenever something is going to CLICK on what it
@@ -80,6 +81,17 @@ def screen_look(output_path: Optional[str] = None, max_dimension: int = 1600) ->
         max_dimension: Longest edge of the saved image. The reduction is recorded,
             so a click is still exact to within the block one image pixel stands
             for; that block size is stated in the reply.
+        window: Capture ONE window instead of the whole desktop -- a substring of its
+            title, matched against what is on screen. Prefer this. A picture is the
+            most expensive thing that can enter a conversation, and this desktop is
+            3840x2173; capturing all of it to look at one dialog spends the budget on
+            wallpaper. Measured 2026-09-15: workers that looked at the screen ran out
+            of conversation in 9 of 11 runs, after two to seven turns, against 4 of 24
+            for workers that looked at nothing.
+
+    Before reaching for a picture at all, consider screen_windows: it answers what is
+    open, what is in front, and where each window is, in a few lines of text. Most
+    questions of the form "did X open" are answered there for a hundredth of the cost.
     """
     locked = require_unlocked()
     if locked:
@@ -95,16 +107,35 @@ def screen_look(output_path: Optional[str] = None, max_dimension: int = 1600) ->
             return "[screen_look error: output_path must be .png]"
         out.parent.mkdir(parents=True, exist_ok=True)
 
-        img, frame = capture(max_dimension=max(0, int(max_dimension)))
+        region = None
+        picked = ""
+        want = (window or "").strip()
+        if want:
+            from . import window_probe as W
+
+            # Front to back, so an ambiguous substring picks the one the operator is
+            # actually looking at rather than whichever happens to be enumerated first.
+            hits = [t for t in W.top_level_windows()
+                    if want.lower() in (t.title or "").lower()]
+            if not hits:
+                return ("[screen_look: no window whose title contains %r. Call "
+                        "screen_windows to see what is open -- it is text, and it "
+                        "answers most questions without a picture at all.]" % want)
+            t = hits[0]
+            region = (t.left, t.top, t.right, t.bottom)
+            picked = t.title or t.cls
+
+        img, frame = capture(max_dimension=max(0, int(max_dimension)), region=region)
         img.save(out, optimize=True)
         _frame_path(out).write_text(json.dumps(frame._asdict()), encoding="utf-8")
 
         block = ("each image pixel covers %.2f desktop pixels, so a click is exact to "
                  "within that" % frame.scale) if frame.is_downscaled else \
                 "image pixels are desktop pixels here"
-        return ("saved %s (%dx%d px, %s bytes). Give positions as pixels in THIS image "
-                "and pass them to screen_click with image='%s' -- %s. [%s]"
-                % (out, frame.image_width, frame.image_height,
+        scope = ("window 「%s」" % picked[:40]) if picked else "the whole desktop"
+        return ("saved %s -- %s (%dx%d px, %s bytes). Give positions as pixels in THIS "
+                "image and pass them to screen_click with image='%s' -- %s. [%s]"
+                % (out, scope, frame.image_width, frame.image_height,
                    format(out.stat().st_size, ","), out, block,
                    capture_reports_what_it_did()))
     except Exception as e:

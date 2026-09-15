@@ -78,10 +78,29 @@ VK = {
     "up": 0x26, "down": 0x28, "left": 0x25, "right": 0x27,
     "home": 0x24, "end": 0x23, "pageup": 0x21, "pagedown": 0x22,
     "ctrl": 0x11, "shift": 0x10, "alt": 0x12,
+    # The Windows key. Left out at first because it is the one modifier that can reach the
+    # shell rather than the focused application -- but leaving it out does not make the
+    # desktop safe, it only makes ordinary work impossible: opening an application at all
+    # goes through Win or Win+R. It is in, and the combinations that are actually
+    # destructive are named and refused below, which is a statement one can check rather
+    # than an absence one has to trust.
+    "win": 0x5B,
     "f1": 0x70, "f2": 0x71, "f3": 0x72, "f4": 0x73, "f5": 0x74, "f6": 0x75,
     "f7": 0x76, "f8": 0x77, "f9": 0x78, "f10": 0x79, "f11": 0x7A, "f12": 0x7B,
-    "a": 0x41, "c": 0x43, "v": 0x56, "x": 0x58, "z": 0x5A, "s": 0x53, "f": 0x46,
+    "a": 0x41, "c": 0x43, "d": 0x44, "e": 0x45, "f": 0x46, "l": 0x4C, "n": 0x4E,
+    "r": 0x52, "s": 0x53, "v": 0x56, "w": 0x57, "x": 0x58, "z": 0x5A,
 }
+
+#: Combinations that are refused however they are spelled. Not a security boundary -- a
+#: caller holding this module can call _send directly -- but the difference between a
+#: mistake that is possible and one that is easy. Each of these ends the operator's session
+#: or their unsaved work, and none of them is ever part of doing their job.
+_REFUSED_COMBOS = (
+    frozenset({"win", "l"}),            # locks the workstation
+    frozenset({"alt", "f4"}),           # closes whatever happens to be in front
+    frozenset({"ctrl", "alt", "delete"}),
+    frozenset({"ctrl", "shift", "escape"}),
+)
 
 #: Keys whose scan code needs the extended flag or they are delivered as the numpad
 #: equivalent -- an arrow press that arrives as a numeric keypad digit is a classic
@@ -344,12 +363,20 @@ def press(*keys: str) -> None:
     ordinary keystroke arrives as a shortcut. That residue outlives the call, and
     the damage lands somewhere else entirely.
     """
+    names = [str(k).strip().lower() for k in keys]
+    asked = frozenset(names)
+    for combo in _REFUSED_COMBOS:
+        if combo <= asked:
+            raise InputRefused(
+                "refusing %s: it ends the operator's session or their unsaved work, and is "
+                "never part of doing their job. If that really is the intent, a person can "
+                "press it." % "+".join(sorted(combo)))
     codes = []
-    for k in keys:
-        vk = VK.get(str(k).strip().lower())
+    for name in names:
+        vk = VK.get(name)
         if vk is None:
             raise InputRefused(
-                "unknown key %r. Known: %s" % (k, ", ".join(sorted(VK))))
+                "unknown key %r. Known: %s" % (name, ", ".join(sorted(VK))))
         codes.append(vk)
     batch = []
     for vk in codes:

@@ -86,6 +86,7 @@ jobs:
             tools/test_arg_repair.py \
             tools/test_tool_catalogue.py \
             tools/test_fleet_intake.py \
+            tools/test_a_locked_out_worker_should_not_clone_its_own_work.py \
             tests/test_security_state_is_not_readable.py \
             tests/test_git_shared_guard.py \
             tests/test_dedicated_root_guard.py \
@@ -130,6 +131,7 @@ jobs:
             relay/test_for_fleet_is_not_a_dead_end.py \
             relay/test_fleet_landing_ack.py \
             relay/test_fleet_landing_reconcile.py \
+            relay/test_a_job_marked_done_reads_as_dispatched_not_finished.py \
             tests/test_fleet_landing_ack_e2e.py \
             tests/test_fleet_landing_reconcile_e2e.py \
             tests/test_fleet_landing_ack_seam.py \
@@ -188,6 +190,7 @@ jobs:
             relay/test_whose_refusal_it_was_is_recorded_so_stop_guessing_from_length.py \
             relay/test_running_out_of_review_budget_is_not_passing_review.py \
             tools/test_a_pixel_means_the_same_place_at_both_ends.py \
+            tools/test_a_picture_of_one_window_still_knows_where_it_is.py \
             relay/test_a_setting_the_operator_changed_reaches_a_running_fleet.py \
             relay/test_a_file_that_was_never_written_is_worth_asking_about.py \
             relay/test_no_test_writes_into_the_operators_approval_queue.py \
