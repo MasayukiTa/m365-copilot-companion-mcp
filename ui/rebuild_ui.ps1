@@ -29,6 +29,9 @@ function Build($name, $sources) {
     $refs = @("/r:$WPF\PresentationFramework.dll","/r:$WPF\PresentationCore.dll","/r:$WPF\WindowsBase.dll",
               "/r:$FW\System.Xaml.dll","/r:$FW\System.Web.Extensions.dll")
     if ($name -eq "FleetCockpit") { $refs += "/r:$FW\System.Windows.Forms.dll" }
+    # CopilotChat reads gzipped transcripts (System.IO.Compression.GZipStream) -- not in csc's
+    # default reference set, must be added explicitly or the build fails with CS0234/CS0246.
+    if ($name -eq "CopilotChat") { $refs += "/r:$FW\System.IO.Compression.dll" }
     $manifest = if (Test-Path (Join-Path $ui "app.manifest")) { @("/win32manifest:$ui\app.manifest") } else { @() }
     $args = @("/nologo","/target:winexe","/out:$out") + $manifest + $refs + ($sources | ForEach-Object { Join-Path $ui $_ })
     $log = & $CSC @args 2>&1

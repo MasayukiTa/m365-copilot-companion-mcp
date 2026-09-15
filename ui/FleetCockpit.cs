@@ -12380,7 +12380,18 @@ class CockpitWindow : Window
             return true;
         };
         send.Click += delegate { trySend(); };
-        tb.KeyDown += delegate (object s2, KeyEventArgs e2)
+        // PreviewKeyDown (tunnel), NOT KeyDown (bubble) -- matches _goalInput's own Enter
+        // handling (line ~4358). MEASURED BUG: the operator typed a steer into a running
+        // job's box and pressing Enter minimised the whole cockpit window instead of (or as
+        // well as) sending it. This box used a bubbling KeyDown, so this control's own
+        // Handled=true only stops OTHER BUBBLE handlers -- it can never run early enough to
+        // stop a tunnel-phase handler above it, and it cannot stop a class handler anywhere
+        // in the ancestor chain that listens with handledEventsToo=true (WPF's IsDefault-button
+        // mechanism is exactly that shape). Handling it in Preview, at the box itself, marks
+        // Handled during the tunnel pass -- before the bubble pass (and anything hooked to it)
+        // ever runs -- which is the earliest point this control can act and the same guarantee
+        // the composer already relies on.
+        tb.PreviewKeyDown += delegate (object s2, KeyEventArgs e2)
         {
             if (e2.Key == Key.Return) { trySend(); e2.Handled = true; }
         };
@@ -12486,7 +12497,9 @@ class CockpitWindow : Window
             return true;
         };
         send.Click += delegate { trySteer(); };
-        tb.KeyDown += delegate (object s, KeyEventArgs e)
+        // PreviewKeyDown, not KeyDown -- see the matching note on CollapsedSteerRow's box
+        // above (same control family, same fix, same reason).
+        tb.PreviewKeyDown += delegate (object s, KeyEventArgs e)
         {
             if (e.Key == Key.Return) { trySteer(); e.Handled = true; }
         };
@@ -12583,7 +12596,8 @@ class CockpitWindow : Window
             return true;
         };
         send.Click += delegate { tryContinue(); };
-        tb.KeyDown += delegate (object s, KeyEventArgs e)
+        // PreviewKeyDown, not KeyDown -- see the matching note on CollapsedSteerRow's box.
+        tb.PreviewKeyDown += delegate (object s, KeyEventArgs e)
         {
             if (e.Key == Key.Return) { tryContinue(); e.Handled = true; }
         };
@@ -13207,9 +13221,62 @@ class CockpitWindow : Window
         catch (Exception) { }
     }
 
-    // A concise card/conversation title: the Copilot-generated conv_title when present, else the
-    // issue heading derived from the goal (the first real line after the "== ... issue ==" marker,
-    // else the first non-boilerplate line), trimmed so long goal text never wrecks readability.
+    // Markers that open scaffolding WE compose and append to an operator's own instruction --
+    // fanout range headers, fan-in aggregation notes, subtask separators, continuation notes.
+    // Mirrors tools/skill_lessons.py's _COMPOSED_FROM exactly (same list, same "cut at the
+    // earliest one" rule) so a card headline and a generated Skill proposal agree on where an
+    // operator's own words end. MEASURED without this: 69 stored goals render, verbatim, as one
+    // of these markers and nothing else -- e.g. a card headlined only "【前回タスクの続き】" or
+    // "【この会話が担当する範囲 — 全体の 1/9】". Both are literally true and completely useless:
+    // every unrelated fanout run's first card says the same thing.
+    static readonly string[] _ComposedFrom = new string[] {
+        "【この会話が担当する範囲", "【分割実行の結果をまとめてください】",
+        "--- サブタスク ", "【前回タスクの続き】"
+    };
+
+    // The fixed per-turn protocol preamble (relay/copilot_autopilot_relay.py's PROTOCOL) that is
+    // prepended ahead of the operator's own goal for every turn sent to a worker. Anchored on its
+    // literal opening and literal closing sentence -- both constants -- rather than the whole
+    // block, because the text between them (OUTPUT_DISCIPLINE) is loaded from a file and can
+    // change length without notice. A goal that doesn't start with this preamble is untouched.
+    const string _PreambleStart = "【最重要】使えるツールは";
+    const string _PreambleEndMark = "まず最初のステップを実行。";
+
+    // The part of `goal` a person actually typed: composed scaffolding, then the fixed protocol
+    // preamble, stripped. Mirrors tools/skill_lessons.py's operator_instruction() -- conservative
+    // in the same direction: a goal carrying neither is returned unchanged, never emptied.
+    string OperatorInstruction(string goal)
+    {
+        string text = goal ?? "";
+        int cut = text.Length;
+        foreach (string mark in _ComposedFrom)
+        {
+            int i = text.IndexOf(mark, StringComparison.Ordinal);
+            if (i >= 0 && i < cut) cut = i;
+        }
+        string outp = text.Substring(0, cut).Trim();
+        if (outp.Length == 0) outp = text.Trim();
+        if (outp.StartsWith(_PreambleStart, StringComparison.Ordinal))
+        {
+            int endIdx = outp.IndexOf(_PreambleEndMark, StringComparison.Ordinal);
+            if (endIdx >= 0)
+            {
+                int rest = endIdx + _PreambleEndMark.Length;
+                if (rest < outp.Length && outp[rest] == '\n') rest++;
+                if (rest + 5 <= outp.Length && outp.Substring(rest, 5) == "Goal:") rest += 5;
+                while (rest < outp.Length && (outp[rest] == ' ' || outp[rest] == '\n')) rest++;
+                if (rest < outp.Length) outp = outp.Substring(rest).Trim();
+            }
+        }
+        return outp;
+    }
+
+    // A concise card/conversation title, in order of preference: the Copilot-generated conv_title
+    // when present and not generic; else the issue heading derived from the goal (the first real
+    // line after a "== ... issue ==" marker -- SWE-bench-shaped goals only); else the first
+    // non-boilerplate line of the OPERATOR'S OWN instruction (composed scaffolding + the fixed
+    // protocol preamble stripped via OperatorInstruction, above); else the raw goal. Trimmed so
+    // long goal text never wrecks readability.
     string CardTitle(string convTitle, string goal)
     {
         // A generic Copilot auto-title ("会話" / "Chat" / "新しいチャット") carries no information,
@@ -13234,14 +13301,20 @@ class CockpitWindow : Window
                 }
             }
         }
-        foreach (string l in lines)
+        // From here on, work off the operator's own instruction rather than the raw goal, so a
+        // fanout/continuation goal's headline names the job instead of the scaffolding we glued
+        // onto it.
+        string opGoal = OperatorInstruction(goal);
+        if (string.IsNullOrEmpty(opGoal)) opGoal = goal;
+        string[] opLines = opGoal.Replace("\r", "").Split('\n');
+        foreach (string l in opLines)
         {
             string t = l.Trim();
             if (t.Length > 0 && !t.StartsWith("==") && !t.StartsWith("あなたは")
                 && !t.StartsWith("対象") && !t.StartsWith("この"))
                 return Trunc(t, 90);
         }
-        foreach (string l in lines) { string t = l.Trim(); if (t.Length > 0) return Trunc(t, 90); }
+        foreach (string l in opLines) { string t = l.Trim(); if (t.Length > 0) return Trunc(t, 90); }
         return "";
     }
 
