@@ -790,6 +790,62 @@ def _note_locked(branch, resp, since, consumed):
         pass
 
 
+def _looks_locked_ambiguous(resp: str) -> bool:
+    """True iff `resp` carries a distinctive LOCKED_MARKERS marker but is too long for
+    _looks_locked's dominance rule to trust on its own (len(resp) >= LOCKED_DOMINANCE_MAX_CHARS)
+    -- the exact case _looks_locked drops ON PURPOSE (see its docstring) so that a long
+    security-review reply merely quoting the marker is never mistaken for the genuine short
+    server error.
+
+    Mutually exclusive with a True result from _looks_locked: that function's marker branch
+    only returns True when the SAME marker check ALSO satisfies dominance (len < the cap).
+    So this function existing, and being checked, cannot change anything _looks_locked already
+    decides -- it only names the leftover case, where neither of _looks_locked's two branches
+    fires because the marker is real but the reply is long.
+
+    THE INCIDENT THIS EXISTS FOR: worker r6aa8e10b_a0_w0 (2026-09-15) had its IP unlocked but no
+    per-call unlock_token, was refused a third time, and wrote a long multi-paragraph analysis
+    that QUOTED "[locked: no valid unlock token]" (in the shortened form the server actually
+    emits, with no "for '<ip>'" tail) and concluded the task was blocked. Over 400 chars, so
+    _looks_locked returned False and no unlock was ever injected -- the goal was lost. This
+    function is the trigger for the PROBE path in _decide: instead of guessing from length,
+    ask the worker whether that reply really was a lock refusal.
+    """
+    low = (resp or "").lower()
+    return (any(m in low for m in LOCKED_MARKERS)
+            and len(resp or "") >= LOCKED_DOMINANCE_MAX_CHARS)
+
+
+#: The probe question sent to a worker when _looks_locked_ambiguous() fires. Deliberately the
+#: length a person would actually type for a yes/no check-in -- NOT an explanation of why we're
+#: asking, and NOT a mention of "unlock" or "password": a probe that describes the expected
+#: answer is not a probe, it is a leading question, and would just reproduce the same
+#: length-based guess this path exists to replace. Matches the shape of the other short control
+#: turns in this module (RETRY_JOB, CONTINUE_JOB, etc. in copilot_autopilot_relay.py): one or
+#: two plain sentences, no goal restatement, sent as `self.job` through the ordinary send path.
+LOCK_PROBE_QUESTION = (
+    "直前の call_tool は locked で拒否されましたか。"
+    "「はい」か「いいえ」だけで答えてください。"
+)
+
+
+def _probe_answer_is_yes(resp: str) -> bool:
+    """True iff a LOCK_PROBE_QUESTION reply is an unambiguous affirmative ("はい" / "yes"),
+    read as a whole-word/whole-phrase token rather than a bare substring -- "いいえ、はい違いで
+    はなく..." must not match on "はい" appearing inside a negative sentence. Anything else
+    (a negative, a hedge, silence, garbage) reads as "no" -- the safe direction, since that is
+    what happens today when no probe exists at all."""
+    text = (resp or "").strip()
+    if not text:
+        return False
+    low = text.lower()
+    if "いいえ" in text or re.search(r"\bno\b", low):
+        return False
+    if "はい" in text or re.search(r"\byes\b", low):
+        return True
+    return False
+
+
 def _unlock_password():
     """The unlock password, read LOCALLY (process env or .env) -- never stored in the agent
     config. Returns '' if unset."""
@@ -2361,6 +2417,17 @@ class RelayWorker:
         self._signin_surfaced_ok = False  # TRUTHFUL result of that surface() call (see edge_recover.surface)
         self._headed_recovery_done = False  # forced a HEADED companion relaunch once (last resort)
         self._unlock_attempts = 0       # auto-injected unlock(password) turns (write/exec gate)
+        # LOCK-AMBIGUITY PROBE (see _decide's handling of _looks_locked_ambiguous()): a reply
+        # carries a LOCKED_MARKERS marker but is too long for _looks_locked's dominance rule to
+        # trust on its own -- the case that lost r6aa8e10b_a0_w0's whole goal on 2026-09-15
+        # (a long analysis that quoted "[locked: no valid unlock token]" and concluded STUCK,
+        # never auto-unlocked because len(resp) >= LOCKED_DOMINANCE_MAX_CHARS). Rather than guess
+        # from length, ask the worker directly. Bounded to ONE probe per worker, EVER (not one
+        # per episode) -- `_lock_probe_used` never resets.
+        self._lock_probe_used = False    # a probe has already been spent (budget is 1, lifetime)
+        self._lock_probe_pending = False  # a probe question is in flight; the NEXT reply answers it
+        self._lock_probe_resp = None     # the ambiguous reply the probe is deciding on
+        self._lock_probe_since = 0.0     # its `since` (turn-sent) timestamp, for _note_locked/unlock
         self._recycles = 0              # fresh-conversation recycles after a token-limit exhaustion
         try:
             self._max_recycles = int(os.environ.get("MCP_MAX_RECYCLES", "8"))
@@ -3755,9 +3822,91 @@ class RelayWorker:
         self._last_heap_mb = heap
         return heap >= FLEET_HEAP_RECYCLE_MB
 
-    def _decide(self, resp):
+    def _inject_unlock(self):
+        """UNLOCK-REQUIRED recovery: auto-inject unlock(password) with the LOCAL .env password
+        (NOT the agent's persistent instructions), then resume the goal. Bounded by
+        MAX_UNLOCK_ATTEMPTS -- the M365 backend IP can rotate and re-lock, so a few auto-unlocks
+        are normal; past the cap STUCK with an actionable reason.
+
+        Extracted so BOTH callers that have already decided a reply is a genuine lock refusal
+        run identical recovery: _decide's _looks_locked() branch (unchanged behaviour -- this
+        is the same code that used to live inline there), and the lock-ambiguity probe's
+        affirmative-answer branch. Never raises out of caller expectations; sets
+        self.job/self.status/self.reason, or self.status/self.outcome/self.reason on STUCK.
+        """
+        pw = _unlock_password()
+        if not pw:
+            self.status, self.outcome = "stuck", "STUCK"
+            self.reason = ("⚠ 書込/実行に unlock が必要だが MCP_UNLOCK_PASSWORD が未設定。"
+                           ".env に設定して再投入してください。")
+            return
+        if self._unlock_attempts < MAX_UNLOCK_ATTEMPTS:
+            self._unlock_attempts += 1
+            self.job = PROTOCOL + (UNLOCK_PREFIX % pw) + self.goal
+            self.reason = "コネクタ未解錠 → unlock 自動投入 (%d/%d)" % (
+                self._unlock_attempts, MAX_UNLOCK_ATTEMPTS)
+            # WITHOUT THIS THE UNLOCK IS NEVER SENT. 'ready' is the state that sends
+            # self.job; the branch composed the job and left the worker in 'waiting', so
+            # the next sweep re-read the SAME reply, re-classified it as locked, and spent
+            # another attempt -- four gone in about eight seconds, and the message blamed
+            # a rotating IP and a wrong password for a turn that was never sent. Every
+            # sibling branch that sets self.job sets this too; this one did not.
+            self.status = "ready"
+            return
+        self.status, self.outcome = "stuck", "STUCK"
+        # NAME THE CAUSE THAT ACTUALLY HAPPENS. This listed a rotating backend IP and a wrong
+        # password, and on 2026-09-07 it was neither: MCP_REQUIRE_UNLOCK_TOKEN was on, the
+        # unlock succeeded, and every following call was refused for arriving without the
+        # token. Whoever reads this line is trying to find out why, so the possibility that
+        # was true must be in it -- and it is the cheapest one to check.
+        self.reason = ("⚠ unlock を %d 回投入したが解錠が続かない。"
+                       "(1) MCP_REQUIRE_UNLOCK_TOKEN が有効で、unlock_token を後続の "
+                       "call_tool に渡せていない (lock_refusals.jsonl の site が "
+                       "security.py:324 ならこれ)、"
+                       "(2) M365バックエンドの送信元IPが毎回変わる(unlockはIP単位)、"
+                       "(3) MCP_UNLOCK_PASSWORD 不一致。のいずれか。"
+                       % self._unlock_attempts)
+
+    def _decide(self, resp, _resume=False):
+        # LOCK-AMBIGUITY PROBE ANSWER. A LOCK_PROBE_QUESTION was sent as this worker's previous
+        # turn (see _looks_locked_ambiguous's handling further down); THIS reply answers it, not
+        # the goal. Consumed here, before anything below can treat it as progress: self.last_
+        # response in particular is what the cockpit displays and what DONE-detection/adaptive-
+        # feature extraction read as "the result", and a bare "はい"/"いいえ" must never become
+        # either. Never loops: _lock_probe_used is already set (spent) by the time this fires,
+        # so the resumed call below cannot re-enter this branch or re-offer a probe.
+        if self._lock_probe_pending:
+            self._lock_probe_pending = False
+            orig_resp, orig_since = self._lock_probe_resp, self._lock_probe_since
+            self._lock_probe_resp, self._lock_probe_since = None, 0.0
+            try:
+                self._tx.assistant(self.turn, resp)   # the probe's own answer, on its own turn
+            except Exception:
+                pass
+            # A PROBE THAT FAILS MEANS "NOT LOCKED" -- THE SAFE DIRECTION. Whatever raised
+            # (a malformed/None reply, a parsing defect) or came back empty is read exactly
+            # like an explicit "いいえ": the worker STUCKs visibly downstream if it really is
+            # stuck, which is what happens today with no probe at all.
+            try:
+                answered_yes = _probe_answer_is_yes(resp)
+            except Exception:
+                answered_yes = False
+            if answered_yes:
+                _note_locked("probe", orig_resp, orig_since, None)
+                self._inject_unlock()
+                return
+            # "いいえ", a hedge, silence, or anything else short of a clear affirmative -> not
+            # locked -- the safe direction, same as today's behaviour with no probe at all.
+            # Resume the ORIGINAL (ambiguous) reply through the ordinary decision pipeline so
+            # whatever real progress/DONE/CONTINUE/STUCK it carried is still acted on. _resume
+            # skips the recording below (transcript/heap-metric/turn_outcome) -- it already ran
+            # once for this exact reply, on the turn it actually arrived on; re-running it here
+            # would duplicate those rows under the LATER (probe) turn number instead.
+            self._decide(orig_resp, _resume=True)
+            return
         self.last_response = resp
-        self._tx.assistant(self.turn, resp)    # persist the full Copilot reply for this turn
+        if not _resume:
+            self._tx.assistant(self.turn, resp)    # persist the full Copilot reply for this turn
         # HEAP PER TURN, RECORDED. The recycle threshold above is provisional and the only way
         # to replace it with a measured one is to know MB-per-turn on real work -- a worker's
         # turns carry OCR text and spreadsheet rows and are nothing like the bridge probe's
@@ -3765,7 +3914,7 @@ class RelayWorker:
         # turn, beside the transcript that already exists.
         try:
             _h = self._heap_mb()
-            if _h is not None:
+            if _h is not None and not _resume:
                 self._tx.metric(self.turn, "heap_mb", round(_h, 1),
                                 recycles=self._recycles)
         except Exception:
@@ -3791,10 +3940,11 @@ class RelayWorker:
         # taxonomy -- the contamination that once turned a task ABOUT HTTP 429 into fifteen
         # phantom rate limits.
         try:
-            from relay import turn_outcome as _to
-            _klass, _code = _to.classify(resp, "assistant")
-            if _klass != _to.OK:
-                self._tx.metric(self.turn, "turn_class", _klass, code=_code)
+            if not _resume:
+                from relay import turn_outcome as _to
+                _klass, _code = _to.classify(resp, "assistant")
+                if _klass != _to.OK:
+                    self._tx.metric(self.turn, "turn_class", _klass, code=_code)
         except Exception:
             pass
         # Parse optional NEXT/CONFIDENCE turn markers (informational only, no gating).
@@ -4041,38 +4191,25 @@ class RelayWorker:
         # marker + dominance) rather than a bare substring match so a long security-review
         # response that merely discusses unlock() is never mistaken for the real lock error.
         if _looks_locked(resp, getattr(self, "_turn_sent_at", 0.0)):
-            pw = _unlock_password()
-            if not pw:
-                self.status, self.outcome = "stuck", "STUCK"
-                self.reason = ("⚠ 書込/実行に unlock が必要だが MCP_UNLOCK_PASSWORD が未設定。"
-                               ".env に設定して再投入してください。")
-                return
-            if self._unlock_attempts < MAX_UNLOCK_ATTEMPTS:
-                self._unlock_attempts += 1
-                self.job = PROTOCOL + (UNLOCK_PREFIX % pw) + self.goal
-                self.reason = "コネクタ未解錠 → unlock 自動投入 (%d/%d)" % (
-                    self._unlock_attempts, MAX_UNLOCK_ATTEMPTS)
-                # WITHOUT THIS THE UNLOCK IS NEVER SENT. 'ready' is the state that sends
-                # self.job; the branch composed the job and left the worker in 'waiting', so
-                # the next sweep re-read the SAME reply, re-classified it as locked, and spent
-                # another attempt -- four gone in about eight seconds, and the message blamed
-                # a rotating IP and a wrong password for a turn that was never sent. Every
-                # sibling branch that sets self.job sets this too; this one did not.
-                self.status = "ready"
-                return
-            self.status, self.outcome = "stuck", "STUCK"
-            # NAME THE CAUSE THAT ACTUALLY HAPPENS. This listed a rotating backend IP and a wrong
-            # password, and on 2026-09-07 it was neither: MCP_REQUIRE_UNLOCK_TOKEN was on, the
-            # unlock succeeded, and every following call was refused for arriving without the
-            # token. Whoever reads this line is trying to find out why, so the possibility that
-            # was true must be in it -- and it is the cheapest one to check.
-            self.reason = ("⚠ unlock を %d 回投入したが解錠が続かない。"
-                           "(1) MCP_REQUIRE_UNLOCK_TOKEN が有効で、unlock_token を後続の "
-                           "call_tool に渡せていない (lock_refusals.jsonl の site が "
-                           "security.py:324 ならこれ)、"
-                           "(2) M365バックエンドの送信元IPが毎回変わる(unlockはIP単位)、"
-                           "(3) MCP_UNLOCK_PASSWORD 不一致。のいずれか。"
-                           % self._unlock_attempts)
+            self._inject_unlock()
+            return
+        # LOCK-AMBIGUITY PROBE (widens the above, does not replace it -- _looks_locked's two
+        # branches are untouched and still fire exactly as before). _looks_locked_ambiguous()
+        # only matches the leftover case: a distinctive marker present, but the reply is too
+        # long for the dominance rule to trust (>= LOCKED_DOMINANCE_MAX_CHARS) -- today that
+        # case falls through as "not locked" with no evidence either way. Rather than keep
+        # guessing from length, ask the worker directly: it saw the actual tool-call result.
+        # Bounded to ONE probe per worker, EVER -- past the budget this falls through to
+        # today's behaviour (not locked) instead of probing again.
+        if (not self._lock_probe_pending and not self._lock_probe_used
+                and _looks_locked_ambiguous(resp)):
+            self._lock_probe_used = True
+            self._lock_probe_pending = True
+            self._lock_probe_resp = resp
+            self._lock_probe_since = getattr(self, "_turn_sent_at", 0.0)
+            self.job = LOCK_PROBE_QUESTION
+            self.reason = "ロック疑い(長文中の marker) → 本人に確認中"
+            self.status = "ready"
             return
         # TOOL-BACKEND-UNREACHABLE: the agent's tool calls failed (devtunnel/network blip) and it
         # self-locked claiming its tools don't exist. INFRA-FALSE, not a miss. Re-send the GOAL (the
