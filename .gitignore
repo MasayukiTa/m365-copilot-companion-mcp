@@ -260,3 +260,10 @@ experiments/
 # The scheduled campaign's cross-process lock. A killed run leaves it behind;
 # it is state, not source.
 relay/selfimprove/*.lock
+
+# GENERATED LAUNCHERS CARRY THE OPERATOR'S HOME PATH. register_selfimprove_nightly.ps1
+# writes this file with absolute paths built from $repo, so committing it publishes the
+# path of whichever machine last registered the task -- which is how an employee-id-shaped
+# string reached a public repository for the third time. The generator is the source; this
+# is its output.
+scripts/win/_selfimprove_nightly_hidden.vbs

@@ -244,13 +244,21 @@ def screen_type(text: str) -> str:
 
 
 def screen_press(keys: str) -> str:
-    """Press a key or a combination: "enter", "ctrl s", "ctrl shift tab".
+    """Press a key or a combination: "enter", "ctrl s", "ctrl shift tab", "win d".
 
-    Only the named keys are accepted, deliberately. A loop that can press any key
-    can press Win+L or Alt+F4 by accident, and the accepted set is what ordinary
-    office work needs. Modifiers are released in reverse order, so nothing is left
-    held down afterwards -- a stuck Ctrl turns the operator's next keystroke into a
-    shortcut, and nothing on screen says why.
+    The whole keyboard is available -- letters, digits, f1-f24, arrows, punctuation
+    named by the character on the key, the numpad, and the modifiers. This used to be
+    a short hand-picked list, which meant Win+M could not be pressed because nobody
+    had needed `m` yet, and the caller could not tell that from a rule.
+
+    Four combinations are refused and say so: win+l, alt+f4, ctrl+alt+delete and
+    ctrl+shift+escape, each of which ends the operator's session or their unsaved
+    work. To close something, use ctrl+w. Anything else that comes back "unknown key"
+    is a gap, not a policy -- report it.
+
+    Modifiers are released in reverse order, so nothing is left held down afterwards:
+    a stuck Ctrl turns the operator's next keystroke into a shortcut, and nothing on
+    screen says why.
     """
     locked = require_unlocked()
     if locked:

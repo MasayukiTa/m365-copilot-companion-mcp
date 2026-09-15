@@ -75,28 +75,71 @@ WHEEL_DELTA = 120
 #: on its message pump has seen it.
 MODIFIER_SETTLE_S = 0.04
 
-#: The named keys a caller may press, as virtual key codes. Deliberately a small
-#: fixed vocabulary rather than "any key name": a computer-use loop that can press
-#: arbitrary keys can press Win+L, Alt+F4 and Ctrl+Alt+Del combinations by accident,
-#: and the set below is what ordinary office work actually needs.
+#: THE WHOLE KEYBOARD, BUILT RATHER THAN LISTED.
+#:
+#: This was a hand-picked set -- "the keys ordinary office work actually needs" -- which
+#: sounds careful and is a hole. Win+M could not be pressed, because `m` was never a key I
+#: happened to need; nor could Win+E, Win+Tab, Ctrl+B, or any of the hundreds of shortcuts
+#: nobody had thought of yet. A caller cannot tell a key that is REFUSED from a key that
+#: was simply never typed into this dict, and neither can a reader.
+#:
+#: Typing is not affected by any of it -- type_text sends characters through
+#: KEYEVENTF_UNICODE and never reads this table -- so what a missing entry cost was always
+#: a key COMBINATION, which is exactly how Windows is driven.
+#:
+#: What restrains this module is not an absent key. It is _REFUSED_COMBOS below, which
+#: names the combinations that end the operator's session or their unsaved work. That is a
+#: statement a reader can check. An incomplete table is a property nobody can see.
 VK = {
     "enter": 0x0D, "return": 0x0D, "tab": 0x09, "escape": 0x1B, "esc": 0x1B,
-    "backspace": 0x08, "delete": 0x2E, "space": 0x20,
+    "backspace": 0x08, "delete": 0x2E, "del": 0x2E, "insert": 0x2D, "ins": 0x2D,
+    "space": 0x20, "spacebar": 0x20,
     "up": 0x26, "down": 0x28, "left": 0x25, "right": 0x27,
-    "home": 0x24, "end": 0x23, "pageup": 0x21, "pagedown": 0x22,
-    "ctrl": 0x11, "shift": 0x10, "alt": 0x12,
-    # The Windows key. Left out at first because it is the one modifier that can reach the
-    # shell rather than the focused application -- but leaving it out does not make the
-    # desktop safe, it only makes ordinary work impossible: opening an application at all
-    # goes through Win or Win+R. It is in, and the combinations that are actually
-    # destructive are named and refused below, which is a statement one can check rather
-    # than an absence one has to trust.
-    "win": 0x5B,
-    "f1": 0x70, "f2": 0x71, "f3": 0x72, "f4": 0x73, "f5": 0x74, "f6": 0x75,
-    "f7": 0x76, "f8": 0x77, "f9": 0x78, "f10": 0x79, "f11": 0x7A, "f12": 0x7B,
-    "a": 0x41, "c": 0x43, "d": 0x44, "e": 0x45, "f": 0x46, "l": 0x4C, "n": 0x4E,
-    "r": 0x52, "s": 0x53, "v": 0x56, "w": 0x57, "x": 0x58, "z": 0x5A,
+    "home": 0x24, "end": 0x23, "pageup": 0x21, "pgup": 0x21,
+    "pagedown": 0x22, "pgdn": 0x22,
+    "ctrl": 0x11, "control": 0x11, "shift": 0x10, "alt": 0x12, "menu": 0x12,
+    "lctrl": 0xA2, "rctrl": 0xA3, "lshift": 0xA0, "rshift": 0xA1,
+    "lalt": 0xA4, "ralt": 0xA5,
+    # The Windows key. Left out at first because it is the one modifier that reaches the
+    # shell rather than the focused application -- but leaving it out did not make the
+    # desktop safe, it made opening an application impossible, since Win and Win+R are how
+    # that is done.
+    "win": 0x5B, "lwin": 0x5B, "rwin": 0x5C, "apps": 0x5D, "contextmenu": 0x5D,
+    "capslock": 0x14, "numlock": 0x90, "scrolllock": 0x91,
+    "printscreen": 0x2C, "prtsc": 0x2C, "pause": 0x13, "break": 0x13,
+    # Punctuation, named by the character printed on the key as well as by its OEM name: a
+    # caller asking for "," should not have to know it is VK_OEM_COMMA. These are the codes
+    # for a US layout -- on another layout the same code produces a different character,
+    # which is why text goes through type_text and only SHORTCUTS come through here.
+    ";": 0xBA, "=": 0xBB, ",": 0xBC, "-": 0xBD, ".": 0xBE, "/": 0xBF,
+    "`": 0xC0, "[": 0xDB, "\\": 0xDC, "]": 0xDD, "'": 0xDE,
+    "semicolon": 0xBA, "equals": 0xBB, "plus": 0xBB, "comma": 0xBC, "minus": 0xBD,
+    "period": 0xBE, "dot": 0xBE, "slash": 0xBF, "backtick": 0xC0, "grave": 0xC0,
+    "lbracket": 0xDB, "backslash": 0xDC, "rbracket": 0xDD, "quote": 0xDE,
+    # The numeric keypad, which is a different key from the digit row and is delivered
+    # differently to applications that distinguish them.
+    "numpad*": 0x6A, "numpadmultiply": 0x6A,
+    "numpad+": 0x6B, "numpadadd": 0x6B,
+    "numpad-": 0x6D, "numpadsubtract": 0x6D,
+    "numpad.": 0x6E, "numpaddecimal": 0x6E,
+    "numpad/": 0x6F, "numpaddivide": 0x6F,
+    # Browser and media keys, present on most keyboards and the only way to reach some
+    # hardware behaviour at all.
+    "volumemute": 0xAD, "volumedown": 0xAE, "volumeup": 0xAF,
+    "medianext": 0xB0, "mediaprev": 0xB1, "mediastop": 0xB2, "mediaplay": 0xB3,
+    "browserback": 0xA6, "browserforward": 0xA7, "browserrefresh": 0xA8,
+    # Japanese IME keys. This machine runs a Japanese layout, where switching input mode is
+    # part of typing rather than an exotic extra.
+    "kanji": 0x19, "convert": 0x1C, "nonconvert": 0x1D, "kana": 0x15,
+    "hankaku": 0xF3, "zenkaku": 0xF4, "hanzen": 0x19,
 }
+#: Letters, digits, the function row and the keypad digits, GENERATED so that none can be
+#: forgotten. A hand-written list of twenty-six letters is twenty-six chances to miss one,
+#: and the previous version missed thirteen.
+VK.update({chr(c): 0x41 + c - ord("a") for c in range(ord("a"), ord("z") + 1)})
+VK.update({str(d): 0x30 + d for d in range(10)})
+VK.update({"f%d" % n: 0x70 + n - 1 for n in range(1, 25)})
+VK.update({"numpad%d" % d: 0x60 + d for d in range(10)})
 
 #: Combinations that are refused however they are spelled. Not a security boundary -- a
 #: caller holding this module can call _send directly -- but the difference between a
@@ -112,7 +155,14 @@ _REFUSED_COMBOS = (
 #: Keys whose scan code needs the extended flag or they are delivered as the numpad
 #: equivalent -- an arrow press that arrives as a numeric keypad digit is a classic
 #: silent failure, visible only as text appearing where navigation was intended.
-_EXTENDED = {0x26, 0x28, 0x25, 0x27, 0x24, 0x23, 0x21, 0x22, 0x2E}
+_EXTENDED = {0x26, 0x28, 0x25, 0x27, 0x24, 0x23, 0x21, 0x22, 0x2E,
+             0x2D,                      # insert, the twin of numpad 0
+             0x5C, 0x5D,                # right Windows key, context menu
+             0xA3, 0xA5,                # right ctrl, right alt
+             0x6F,                      # numpad divide
+             0x90, 0x2C,                # numlock, print screen
+             0xAD, 0xAE, 0xAF, 0xB0, 0xB1, 0xB2, 0xB3,   # media keys
+             0xA6, 0xA7, 0xA8}          # browser keys
 
 
 class InputRefused(RuntimeError):
@@ -382,8 +432,15 @@ def press(*keys: str) -> None:
     for name in names:
         vk = VK.get(name)
         if vk is None:
+            # NAME THE NEAR MISSES, NOT THE WHOLE TABLE. Listing every known key was
+            # readable when there were thirty of them; at 167 it is several hundred
+            # characters of noise pushed into the caller's conversation for a typo, which
+            # is the cost the tool index was just shrunk to avoid.
+            near = sorted(k for k in VK if k.startswith(name[:2]) or name.startswith(k))
             raise InputRefused(
-                "unknown key %r. Known: %s" % (name, ", ".join(sorted(VK))))
+                "unknown key %r.%s Letters, digits, f1-f24, arrows, punctuation by the "
+                "character on the key, numpad0-9 and the modifiers are all valid names."
+                % (name, (" Did you mean: " + ", ".join(near[:8]) + "?") if near else ""))
         codes.append(vk)
     # SENT AS SEPARATE EVENTS WITH THE MODIFIER GIVEN TIME TO SETTLE, not as one batch.
     #
@@ -415,8 +472,14 @@ def release_all_modifiers() -> None:
     using: every subsequent keystroke they type becomes a shortcut, and nothing on
     screen says why.
     """
+    # EVERY MODIFIER THAT CAN BE PRESSED, not the three that used to be. The table now
+    # names the left and right variants separately and the Windows key, so each of them can
+    # be left down by an interrupted sequence -- and a stuck Win key turns every subsequent
+    # letter the operator types into a shell shortcut. Releasing a key that was never down
+    # costs nothing and is delivered as a no-op.
     batch = []
-    for name in ("ctrl", "shift", "alt"):
+    for name in ("ctrl", "shift", "alt", "lctrl", "rctrl", "lshift", "rshift",
+                 "lalt", "ralt", "lwin", "rwin"):
         batch.extend(_key_inputs(VK[name], up=True))
     try:
         _send(*batch)

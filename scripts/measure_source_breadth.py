@@ -86,7 +86,11 @@ def families_in(text: str):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--dir", default=r"C:\Users\USER\resonac-mcp\.fleet\transcripts")
+    # Derived from this file's own location rather than typed. A hard-coded home
+    # directory makes the script single-machine AND puts an identifying path in a public
+    # repository -- the second of which is a rule this repository has now broken three times.
+    _repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ap.add_argument("--dir", default=os.path.join(_repo, ".fleet", "transcripts"))
     ap.add_argument("--limit", type=int, default=0, help="0 = every transcript")
     ap.add_argument("--min-chars", type=int, default=400,
                     help="ignore runs too short to have considered anything (default 400)")
