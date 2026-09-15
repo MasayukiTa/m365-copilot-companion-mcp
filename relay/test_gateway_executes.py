@@ -30,8 +30,22 @@ def gateway():
 
 
 def test_the_catalogue_call_returns_rather_than_raising(gateway):
+    """The phrase changed; the property did not.
+
+    This asserted the literal "tools available", which was the flat catalogue's opening line.
+    On 2026-09-15 that list became an INDEX of categories -- 16,594 characters to 4,445 --
+    and the phrase went with it, so the test failed on wording rather than on the property it
+    is named for. Asserting the new opening line would only re-arm the same trap, so what is
+    checked here is what a caller actually needs back: a non-trivial string that says how to
+    open a category and how to run a tool.
+    """
     out = gateway(name="")
-    assert isinstance(out, str) and "tools available" in out
+    assert isinstance(out, str) and len(out) > 200
+    assert "call_tool(name=" in out, out[:200]
+    from tools import tool_catalogue as tc
+    import main as M
+    for key in tc.by_category(M._ALL_TOOLS):
+        assert key in out, "the index does not name category %r" % key
 
 
 def test_a_help_call_returns_rather_than_raising(gateway):
@@ -58,5 +72,16 @@ def test_an_actual_tool_call_reaches_the_tool(gateway):
 
 
 def test_an_unknown_tool_is_reported_not_raised(gateway):
+    """Same stale-wording fix, and the behaviour behind it got better rather than only different.
+
+    The message was "unknown tool '<name>'. Use call_tool(name='') to list all." -- measured
+    76 times in six hours of the ledger, each one a wasted round trip that ended in a
+    re-listing. It now names the closest tools and the categories, so the miss is answered
+    instead of merely reported. What this test holds is the original property: a name that
+    does not exist comes back as text, never as an exception, and the text identifies what
+    was asked for.
+    """
     out = gateway(name="definitely_not_a_tool", arguments={})
-    assert "unknown tool" in out
+    assert isinstance(out, str)
+    assert "definitely_not_a_tool" in out
+    assert "call_tool(name='')" in out, out[:200]

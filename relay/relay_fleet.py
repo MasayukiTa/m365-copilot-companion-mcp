@@ -3406,9 +3406,18 @@ class RelayWorker:
         from needs a live page to reach, so what it built was only ever checkable by reading
         it -- and its comment, "the same initial payload as the original", had quietly stopped
         being true when the original grew memory and a procedure.
+
+        CARRIES THE UNLOCK for the same reason _recycle_job does, and it is the same class of
+        defect found at the same time: this is a BRAND NEW conversation, so it is a new MCP
+        session, so whatever token the agent held is gone with the old chat. Fixing only the
+        recycle would have left the identical hole one method down -- the two branches that
+        hand the agent a chat with no history are exactly the two that must re-unlock.
         """
+        pw = _unlock_password()
+        if pw:
+            self._unlock_attempts = 1
         return (conversation_start_label(self.name + "-replay%d" % self.fresh_replay_count)
-                + PROTOCOL + self._composed_goal)
+                + PROTOCOL + ((UNLOCK_PREFIX % pw) if pw else "") + self._composed_goal)
 
     def _recycle_job(self):
         """The opening turn after a token-limit recycle, which is a BRAND NEW chat.
@@ -3416,9 +3425,34 @@ class RelayWorker:
         The agent has no memory of anything, including the procedure it was given at turn 1,
         so it travels again. It goes ABOVE the reset notice because RECYCLE_PREFIX ends with a
         "--- 元のゴール ---" heading, and what follows that heading should be the goal.
+
+        THE UNLOCK TRAVELS TOO, and its absence was the largest single source of refusals in
+        the system. _composed_prefix is taken from composed_goal, which is built BEFORE
+        _initial_job_with_unlock adds UNLOCK_PREFIX -- so every recycled conversation opened
+        with the memory, the skill and the contract, and no unlock. A fresh conversation is
+        also a fresh MCP session, and authorization is per session by design, so the token the
+        agent was holding died with the old chat and the new one was locked from its first
+        gated call.
+
+        Measured, run r6aa92e5a: 4 distinct MCP sessions in 34 minutes for ONE worker; the two
+        that were never authorized never called unlock at all, and all three refusals were the
+        "brand-new session" case rather than any session ageing out. The comment at
+        TOKEN_MISSING_REFUSAL records the scale -- 489 of 492 refusals over two days were this
+        one branch, "one already-unlocked identity that never presented a token". Waiting for
+        the refusal and then injecting was recovery from a certainty.
+
+        The reactive budget is RESET rather than spent. MAX_UNLOCK_ATTEMPTS bounds a re-unlock
+        loop WITHIN one conversation, where repeated failure means the password or the identity
+        is wrong; this is a different conversation, and the outer loop is already bounded by
+        _max_recycles. Charging recycles to that budget would make a long, healthy job go STUCK
+        for "unlock attempts exhausted" when nothing about the unlock had failed.
         """
+        pw = _unlock_password()
+        head = PROTOCOL + ((UNLOCK_PREFIX % pw) if pw else "")
+        if pw:
+            self._unlock_attempts = 1
         return (conversation_start_label(self.name + "-recycle%d" % self._recycles)
-                + PROTOCOL + self._composed_prefix + RECYCLE_PREFIX + self.goal)
+                + head + self._composed_prefix + RECYCLE_PREFIX + self.goal)
 
     def _task_anchor(self, nudge):
         """Prepend the worker's task identity to a GENERIC retry/continue/fix nudge so a

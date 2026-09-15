@@ -51,6 +51,8 @@ from tools import unreached as U  # noqa: E402
 #: THESE HAVE NO TEST EITHER, which makes them the starkest: nothing calls them and nothing
 #: checks them.
 NO_CALLER_NO_TEST = {
+    # Forged by the tool foundry, registered by a directory walk. See REASONS below.
+    "tools/auto/office_password_recovery.py::office_password_recovery",
     "relay/lean_capture.py::capture_fn",                           # 10 lines, revealed 2026-09-14
     "tools/golden.py::run_trajectory",                           # 64 lines
     "relay/autonomy_gate.py::judge_autonomy",                    # 54 lines
@@ -191,6 +193,13 @@ ALLOWED_REASONS = ("dispatch", "entrypoint", "deliberate", "revealed")
 #: exact move that put `all_inconclusive` and `fleet_is_running` on a triage list they did not
 #: survive. See docs/unreached_burndown.md.
 REASONS: dict[str, tuple[str, str]] = {
+    # A FORGED TOOL HAS NO STATIC CALLER, BY CONSTRUCTION. tools/auto/ is where the tool
+    # foundry writes forged modules, and main.py registers them by WALKING that directory
+    # (tools/auto_loader.py::load_auto_tools, main.py ~962) -- a reference no count can see.
+    # This is a property of the directory, so every future forged tool arrives here the same
+    # way and is a real entry rather than a scanner bug.
+    "tools/auto/office_password_recovery.py::office_password_recovery":
+        ("dispatch", "docs/unreached_burndown.md"),
     # A REFERENCE COUNT IS NOT A REACHABILITY ANALYSIS, closed 2026-09-14 by iterating the scan
     # to a fixed point (5 rounds, 80 -> 96). Every one of these sixteen was held off the list by
     # a caller that is itself unreached: something named it, and nothing could get there. Three

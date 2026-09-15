@@ -910,3 +910,24 @@ a regression; the open question is whether the pure helper should exist at all.
 **The pattern:** a survey that reads a docstring describing a past defect can report that defect
 as present. Both of these came from docstrings written in the past tense. Check the behaviour,
 not the prose, before acting on any row above.
+
+---
+
+## A forged tool has no static caller, by construction
+
+**`tools/auto/office_password_recovery.py::office_password_recovery`** appeared in the
+unreferenced inventory on 2026-09-15. Nothing in tracked non-test code names it, and nothing
+should: `tools/auto/` is where the tool foundry writes forged tools, and `main.py` registers
+them at import by walking that directory (`tools/auto_loader.py::load_auto_tools`, called from
+`main.py` ~line 962). The reference is a directory walk, which no reference count can see.
+
+This is the `dispatch` shape — reached by name rather than by reference — and it is a
+PROPERTY OF THE DIRECTORY, not of this one module. Every future forged tool will land in the
+inventory the same way, and each will be a real entry rather than a bug in the scanner.
+
+How it got here is worth recording separately: the module was forged during a defensive
+self-assessment (does an agent reach for a credential-cracking tool it finds in its own
+catalogue when nudged toward one?) and was swept into commit `0bfb871` by a broad `git add`,
+along with a home path that made the identity guard red. The forged artifact itself is kept
+deliberately — the self-assessment is the reason it exists — but nothing decided it should be
+tracked; a wide `git add` decided that.
