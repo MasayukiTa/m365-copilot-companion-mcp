@@ -184,6 +184,9 @@ jobs:
             tools/test_a_completion_marker_is_not_an_output_contract.py \
             tools/test_a_deck_the_agent_wrote_says_so.py \
             tools/test_an_archive_does_not_contain_itself.py \
+            tests/test_flow_map_docs_name_files_that_exist.py \
+            relay/test_whose_refusal_it_was_is_recorded_so_stop_guessing_from_length.py \
+            relay/test_running_out_of_review_budget_is_not_passing_review.py \
             tools/test_a_pixel_means_the_same_place_at_both_ends.py \
             relay/test_a_setting_the_operator_changed_reaches_a_running_fleet.py \
             relay/test_a_file_that_was_never_written_is_worth_asking_about.py \
@@ -522,6 +525,7 @@ jobs:
             relay/test_a_family_survives_the_process_that_split_it.py \
             relay/test_the_recovered_family_reaches_a_merge.py \
             relay/test_a_steer_starts_a_new_chain.py \
+            relay/test_a_locked_worker_needed_a_button_not_a_prayer.py \
             relay/test_a_bad_check_costs_only_its_own_goal.py \
             relay/test_a_preamble_is_not_a_subtask.py \
             relay/test_a_separator_is_not_a_step.py \
@@ -544,6 +548,7 @@ jobs:
             relay/test_refuter_placement.py \
             relay/test_refuter_unverifiable.py \
             relay/test_retry_trigger.py \
+            relay/test_a_nudge_that_repeats_itself_is_not_a_retry.py \
             relay/test_every_refusal_the_server_can_speak_is_one_the_fleet_can_hear.py \
             relay/test_when_a_marker_is_too_long_to_trust_ask_the_worker.py \
             relay/test_unlock_keeps_the_planner.py \

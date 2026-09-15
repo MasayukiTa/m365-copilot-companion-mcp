@@ -39,8 +39,8 @@ from . import splittability as _splittability
 from .copilot_autopilot_relay import (
     CONTINUE_JOB, COPILOT_SELECTORS, ConversationClosed, CopilotWebDriver, FIX_JOB,
     GenerationInProgress, PROTOCOL, REFUTE_FIX_JOB, RETRY_JOB, VERIFY_FIX_JOB,
-    _is_processing, default_notify, extract_analyze, extract_research, goal_not_seen,
-    has_end_marker,
+    _is_processing, _next_retry_job, default_notify, extract_analyze, extract_research,
+    goal_not_seen, has_end_marker,
     reported_stuck, transient_backoff, conversation_exhausted, RECYCLE_PREFIX,
     conversation_start_label,
 )
@@ -372,6 +372,166 @@ AGENT_ERR_WINDOW_S = float(os.environ.get("MCP_AGENT_ERR_S", "1200"))     # agen
 # genuinely wedged endpoint stops burning wall-clock quickly.
 NET_RETRY_NOPROGRESS_MAX = int(os.environ.get("MCP_NET_RETRY_NOPROGRESS_MAX", "3"))
 
+# STUCK-CONVERGENCE DETECTOR (mined incident: .fleet/transcripts/r6aa8fc73_a0_w0.jsonl, worker
+# a0_w0, turns 2-11). The no-progress check above only catches a STUCK reply that repeats
+# ITSELF near-verbatim (_norm_for_progress strips a GUID/timestamp and compares what's left).
+# It does NOT catch a worker that reaches the same dead end and writes a fresh paragraph
+# explaining it every time -- which is what actually happened: turn 2 named the exact unresolved
+# question, and every one of the next 9 turns restated the same finding in different words. Each
+# was scored as "progress" (the normalized text never matched the last one) and answered with
+# another RETRY_JOB, so the run spent 9 turns asking the worker to retry a lookup it had already
+# told us, in its own words, would not change.
+#
+# "Reached the same conclusion" therefore cannot be exact-text matching -- it has to be judged
+# on CONTENT, and this reuses the shape tools/skill_lessons.py already settled on for exactly
+# that problem (grouping two freely-worded passages as "the same work"). That module's docstring
+# explains at length why it is NOT `skill_candidates.normalise`-style exact matching: normalising
+# two texts apart just because their wording differs would make this detector require the very
+# byte-identical repetition the no-progress check above already catches, and never fire on the
+# case that actually happened here.
+#
+# DIGITS ARE CONTENT, DELIBERATELY, WHICH IS WHERE THIS DIFFERS FROM skill_lessons._WORD. A
+# number inside a STUCK reason is usually the specific thing distinguishing one failure from
+# another -- a turn count, an error code, an item id -- so two reasons differing only in their
+# digits are NOT the same finding restated; a NEW error code is a new fact, exactly the "genuinely
+# narrows the problem or adds a new fact" case this detector must never stop on. Proven wrong the
+# other way once already: test_admission.py's changing_replies_do_not_early_exit feeds a worker
+# STUCK replies that differ ONLY by an embedded turn number and error code ("一時的なエラー(0回目)、
+# 詳細コード=0", then (1回目)/37, (2回目)/74, ...) to prove a genuinely changing transient outage
+# is never mistaken for a dead end. Dropping digits made every one of those replies tokenise to
+# the exact same five words and read as "converged" on the second reply -- the false stop that
+# test exists to catch, from a second mechanism it predates.
+_STUCK_CONTENT_WORD = re.compile(r"[A-Za-z]{3,}|[0-9]+|[一-鿿]{2,}|[゠-ヿ]{2,}")
+_STUCK_STOPWORDS = frozenset(
+    "the and for with from this that you your please into out all any are was were have "
+    "has had not but its use using can will should".split())
+
+#: Overlap fraction above which two STUCK reasons count as "the same conclusion, reworded".
+#:
+#: NOT tools/skill_lessons.py's MIN_SIMILARITY (0.5) -- CALIBRATED AGAINST BOTH SIDES OF THE
+#: SAME FAILURE, not tuned until one test passed. Including digits above is not enough by
+#: itself: test_admission.py's changing-error-code fixture still shares 5 of its ~6-7 words
+#: turn to turn (only the digits differ), measured at Jaccard 0.56-0.63 across every consecutive
+#: pair -- a genuinely different failure that still reads as mostly-the-same TEXT. The real mined
+#: transcript's STUCK reasons, in contrast, are 15-26 words of dense prose restating one finding;
+#: measured pairwise, turns 5-6/8-9/9-10/10-11 sit at 0.77-1.00 and turn 4-5 (the pair right after
+#: the incident's second STUCK) at 0.57. A threshold has to clear 0.63 to never fire on the
+#: fixture; 0.7 does that with margin and still catches the transcript's clear convergence at
+#: turns 5-6 -- one turn later than a looser bound would have, in exchange for never mistaking a
+#: changing error code for a repeated conclusion. (It misses turn 4-5's 0.57 specifically; that
+#: is the cost of the margin, paid once, not a tuning accident -- see
+#: test_a_nudge_that_repeats_itself_is_not_a_retry.py's real-transcript sanity check.)
+STUCK_CONVERGENCE_SIMILARITY = 0.7
+
+#: Below this many content words, overlap is not evidence either way -- a short reason can
+#: overlap or fail to overlap by chance alone. This is a floor against near-empty text, not the
+#: mechanism that excludes the admission-test fixture above (that fixture has 6-7 words, easily
+#: over any floor low enough to still admit a real one-sentence STUCK reason) -- STUCK_CONVERGENCE_
+#: SIMILARITY is what excludes it, deliberately, so this can stay low.
+STUCK_CONVERGENCE_MIN_WORDS = 4
+
+#: Marks the worker's own conclusion inside a "STUCK: <reason>" reply. The LAST occurrence is
+#: used because the protocol wants the marker on the closing line, but a worker's reasoning
+#: sometimes discusses the word earlier (quoting the instruction back to itself).
+_STUCK_REASON_MARK = re.compile(r"STUCK[:：]\s*", re.IGNORECASE)
+
+
+def _stuck_words(text):
+    return {w.lower() for w in _STUCK_CONTENT_WORD.findall(text or "")} - _STUCK_STOPWORDS
+
+
+def stuck_reason_text(resp, limit=400):
+    """The worker's own stated reason from a "STUCK: <reason>" reply, so that a STUCK THIS
+    MODULE declares on the worker's behalf still carries what the worker actually said, rather
+    than a generic "gave up". In the mined transcript, the operator's real answer was sitting in
+    the worker's own turn-2 reply the entire time; every later turn told it to try again instead
+    of surfacing that reply. Falls back to the whole (trimmed) reply if the marker is somehow
+    absent -- callers only reach this after reported_stuck(resp) has already confirmed one is
+    present, so this is defensive, not the expected path."""
+    text = resp or ""
+    marks = list(_STUCK_REASON_MARK.finditer(text))
+    if not marks:
+        return text.strip()[:limit]
+    tail = text[marks[-1].end():].strip()
+    return (tail or text.strip())[:limit]
+
+
+def _stuck_converged(previous_reason, current_reason):
+    """True when two CONSECUTIVE STUCK reasons are substantially the same conclusion, worded
+    differently. Two is deliberately enough evidence -- the mined incident needed only a second
+    restatement of turn 2's finding to know nothing was going to change; waiting for a third
+    repetition (matching the shape of NET_RETRY_NOPROGRESS_MAX above) would spend another whole
+    retry proving what the second restatement already showed."""
+    a, b = _stuck_words(previous_reason), _stuck_words(current_reason)
+    if len(a) < STUCK_CONVERGENCE_MIN_WORDS or len(b) < STUCK_CONVERGENCE_MIN_WORDS:
+        return False
+    return len(a & b) / float(len(a | b)) >= STUCK_CONVERGENCE_SIMILARITY
+
+# EXHAUSTIVE-COVERAGE-CLAIM OVERRIDE -- a second defect found in the SAME mined incident.
+# Turns 3-11 didn't just restate the same conclusion in different words; several asserted
+# outright that every route had already been checked ("結論不変。全経路実測済みのため再照会
+# はしません", "追加の探索経路はありません"). The claim was false: one table that would have
+# held the answer was never opened. A worker that BELIEVES it already looked everywhere cannot
+# be talked out of that belief by a nudge that argues with it -- "consider a different source"
+# (the fourth _RETRY_ESCALATION_PHRASES entry, copilot_autopilot_relay.py) asks it to
+# reconsider a possibility it has just told us it already ruled out, and gets back a
+# restatement of the same claim, which is exactly what those nine turns are. A second, unrelated
+# run the same day showed the identical shape from a different cause: a worker whose tools were
+# locked wrote that it had verified content against a source it could not actually read. Both are
+# a worker asserting exhaustiveness/verification that did not happen, and both are unfalsifiable
+# from out here -- nothing in this loop can inspect what the worker actually queried.
+#
+# The claim can't be argued with, but it CAN be turned into something checkable: ask the worker
+# to enumerate what it actually looked at, against its own turns, instead of restating its
+# conclusion. In the mined transcript this would have surfaced the never-opened table on the
+# first ask. Deliberately literal and conservative (a handful of phrasings actually seen in
+# these two incidents, not an inferred pattern) -- a false positive here costs one extra turn
+# asking for a list; a false negative costs the ten turns this incident actually cost.
+_EXHAUSTIVE_CLAIM_MARKERS = (
+    "全経路", "追加の探索経路はありません", "全て確認", "全件", "横断",
+)
+
+
+def _claims_exhaustive_search(resp):
+    """True when a reply asserts (in these literal, previously-seen phrasings) that it already
+    covered everything, as opposed to explaining a specific thing it could not find or do."""
+    return any(m in (resp or "") for m in _EXHAUSTIVE_CLAIM_MARKERS)
+
+
+#: One or two sentences, a person's length, naming no source: the enumeration is something the
+#: worker can check against its own turns, and naming a guessed source would just hand it an
+#: answer instead of asking it to find one.
+_EXHAUSTIVE_CLAIM_NUDGE = (
+    "「すべて確認した」という結論そのものには反論しません。代わりに、実際に確認した対象を"
+    "具体的に列挙し、まだ確認していない候補があればそれも挙げてください。"
+    "列挙してもなお本当に手がかりが無ければ最後の行に STUCK: と理由を、見つかれば DONE と"
+    "書いてください。"
+)
+
+
+def _stuck_retry_nudge(resp, count):
+    """The nudge text for the count-th (1-based) transient retry after a STUCK reply.
+
+    PRECEDENCE: an exhaustive-coverage claim (_claims_exhaustive_search) overrides the normal
+    count-based escalation (_next_retry_job) AT ANY COUNT -- including the back-compat window
+    (counts 1-2) that otherwise keeps RETRY_JOB byte-identical for a plain transient failure.
+    Once a worker has asserted it already checked everything, every phrase in the count-based
+    ladder (check your arguments/paths/permissions, or even "consider a different source") asks
+    it to act on a possibility it has just told us it already ruled out. Only the enumeration ask
+    is left that such a worker can actually answer with something NEW (a list of its own turns)
+    rather than a restatement of its conclusion.
+
+    THIS MUST NOT DEFEAT STUCK-CONVERGENCE (_stuck_converged) above, and by construction it
+    can't: the caller runs the convergence comparison and updates self._last_stuck_reason BEFORE
+    choosing a nudge text (this function is only reached once that comparison has already said
+    "not converged yet"). So a worker that answers this enumeration ask with the same conclusion
+    again is simply the NEXT pair _stuck_converged sees, and is caught on its own reply, same as
+    any other repeated STUCK -- the enumeration is one extra chance to notice a gap, not a fresh
+    retry budget."""
+    if _claims_exhaustive_search(resp):
+        return _EXHAUSTIVE_CLAIM_NUDGE
+    return _next_retry_job(count)
+
 # TOOL-BACKEND-UNREACHABLE detector. When the MCP tool path (devtunnel) drops for even a moment, the
 # agent's tool calls fail and it WRONGLY concludes its tools don't exist / aren't assigned and self-
 # locks ("再試行では解消しません / won't respond without new input"). That is INFRA-FALSE (the tools
@@ -679,17 +839,39 @@ MAX_UNLOCK_ATTEMPTS = int(os.environ.get("MCP_FLEET_MAX_UNLOCK", "4"))
 #: -- at which point the stuck reason below blamed a rotating IP or a wrong password, neither of
 #: which was true. Two jobs lost seventeen and six turns to that on 2026-09-07 before the cause
 #: was found. The password alone was never the whole story; say what the server actually wants.
+# TRIMMED 2026-09-15 (first-turn budget push). Cut the parenthetical "拒否メッセージ自体に
+# もそう書かれています" aside and merged the two password-related sentences into one -- the
+# load-bearing content (unlock_token is required, the password is already here so do not
+# hunt for it, .env is refused, read-only needs no unlock) is unchanged and each required
+# phrase relay/test_unlock_inject.py checks for is still present verbatim.
 UNLOCK_PREFIX = (
-    "【要解錠】書込/実行ツールはロック解除が必要です。まず最初に call_tool で "
-    "'unlock' ツールを引数 {\"password\": \"%s\"} で1回だけ実行してください。"
-    "**その戻り値に含まれる unlock_token を必ず保持し、以後の書込/実行系の call_tool すべてに "
-    "引数 unlock_token として渡してください。** IPの解錠だけでは足りず、トークンを付けない呼び出しは "
-    "拒否されます（拒否メッセージ自体にもそう書かれています）。トークンを付けて解錠できたら"
-    "当初のゴールをそのまま続行してください。解錠後は password を二度と出力しないこと"
-    "（unlock_token は引数として渡すのは必要です）。なお password はこの指示に既に含まれています。探しに行かないこと――"
-    "特に .env を読まないこと（サーバが必ず拒否し何度でも通らない）。読み取り専用の作業に unlock は不要。"
+    "【要解錠】書込/実行ツールはロック解除が必要です。まず call_tool で "
+    "'unlock' を引数 {\"password\": \"%s\"} で1回実行してください。"
+    "**戻り値の unlock_token を必ず保持し、以後の書込/実行系 call_tool すべてに "
+    "引数 unlock_token として渡してください。** IPの解錠だけでは足りず、トークン無しの呼び出しは拒否されます。"
+    "解錠できたら当初のゴールを続行し、password は二度と出力しないこと。"
+    "password はこの指示に既にあるので探しに行かないこと――"
+    "特に .env は読まないこと(サーバが必ず拒否し何度も通らない)。読み取り専用の作業に unlock は不要。"
     "\n--- 元のゴール ---\n"
 )
+
+
+#: Ways a worker says it was refused for lock when it is NOT pasting the server's error back.
+#: Deliberately loose, and deliberately never used on its own -- see _looks_locked's
+#: session branch, which only consults this once the server's own record already says a
+#: refusal happened in this turn's window and names exactly one session it could belong to.
+#: On its own this is the 2026-07 false positive verbatim; paired with the record it is the
+#: half that survives the paraphrasing the output discipline asks for.
+_LOCK_PARAPHRASES = (
+    "unlock_token", "unlock token", "未解錠", "解錠", "locked", "ロック解除",
+    "施錠", "アンロック",
+)
+
+
+def _mentions_being_locked(resp: str) -> bool:
+    """Does this reply talk about being refused for lock, in any wording at all."""
+    low = (resp or "").lower()
+    return any(p.lower() in low for p in _LOCK_PARAPHRASES)
 
 
 def _looks_locked(resp: str, since: float = 0.0) -> bool:
@@ -730,13 +912,84 @@ def _looks_locked(resp: str, since: float = 0.0) -> bool:
     # refusal reply ("I cannot assist with that request") was then read as a lock.
     if since <= 0.0:
         return False
+
+    # ── ATTRIBUTE BY SESSION, NOT BY LENGTH.
+    #
+    # The dominance rule below exists because "the refusal record is a single global slot with
+    # no client identity, so under concurrency one caller's refusal colours everyone's reply".
+    # That was true when it was written and it is not true now: tools/lock_state.py records the
+    # MCP session each refusal arrived on, and its own docstring says the field exists so a
+    # refusal can be joined to the session it belongs to. Measured 2026-09-15: 36 refusals in
+    # two hours carrying 13 distinct sessions -- the identity is there and it discriminates.
+    # The reader was simply never told, which is the third time today that a writer grew a
+    # field and the code that keys on it kept guessing.
+    #
+    # WHAT THE LENGTH RULE COSTS WHEN IDENTITY EXISTS. Detection keyed on the server's literal
+    # bracketed marker only fires while the agent pastes the error back verbatim, and it
+    # usually paraphrases -- the operator discipline in every turn tells it to. Today a worker
+    # wrote 「screen_look は「no valid unlock token」で拒否」: the words are there, the bracket
+    # is not, so no marker matched; and every one of its replies ran past 400 characters, so
+    # the record branch below was closed too. Four turns were spent telling it to retry a
+    # transient failure before one reply happened to come in under the cap and let the
+    # recovery through. Nothing about that recovery was about the reply's length.
+    #
+    # THE RULE. A refusal genuinely happened inside this turn's window, and the reply talks
+    # about being refused in ANY wording rather than only in the server's bracketed one.
+    #
+    # WHY THERE IS NO IDENTITY CHECK HERE, HAVING JUST ARGUED THAT IDENTITY EXISTS. The first
+    # version of this branch also required that exactly ONE session appear among the window's
+    # refusals, so that there was nobody else the refusal could belong to. Replayed against
+    # the two runs that died today, with the clock frozen at each turn so the freshness window
+    # means what it meant then, that condition never once held: fourteen refusals sat in the
+    # window, from several sessions, because several workers are locked at the same time. It
+    # is the normal state of a fleet, not an edge case, and a rule that only fires when the
+    # machine is idle is a rule that never fires.
+    #
+    # AND THE BRANCH BELOW ALREADY ATTRIBUTES WITHOUT ANY IDENTITY AT ALL. It asks only
+    # "was anything refused in this window" and answers yes for any reply under the length
+    # cap -- including a reply that never mentions locks. So requiring identity here, and
+    # only here, would hold the long replies to a standard the short ones have never met,
+    # while the short path keeps the exposure. This branch is that same attribution with one
+    # ADDITIONAL requirement -- that the reply be about being refused -- applied to the
+    # replies the cap excludes. It adds no risk class that is not already carried; it removes
+    # a length test that was standing in for an identity check the code could not make.
+    #
+    # The asymmetry settles what remains: a false positive costs one injected turn, bounded
+    # by MAX_UNLOCK_ATTEMPTS. A false negative costs the whole goal, which is what it cost
+    # today, twice.
+    try:
+        from tools import lock_state as _ls
+
+        _recs = [r for r in _ls.matching_records(since)
+                 if not str(r.get("detail") or "").startswith(NO_CONTEXT_REFUSAL)]
+        if _recs and _mentions_being_locked(resp):
+            _note_locked("paraphrase", resp, since, _recs[-1])
+            return True
+    except Exception:
+        pass
     # THE SAME DOMINANCE RULE THE MARKER BRANCH USES. Without it this branch judged replies of
     # any length: a 533-character summary of a meeting was classified as a lock error because
-    # some OTHER concurrent worker had been refused within the freshness window. The refusal
-    # record is a single global slot with no client identity, so under concurrency one caller's
-    # refusal colours everyone's reply -- and a long, ordinary answer is exactly what the
-    # dominance rule exists to exclude. Identity is the real fix and it is not available here;
-    # this removes the case that fired.
+    # some OTHER concurrent worker had been refused within the freshness window, and a long,
+    # ordinary answer is exactly what the dominance rule exists to exclude.
+    #
+    # THIS COMMENT USED TO END "identity is the real fix and it is not available here", AND
+    # THAT SENTENCE WAS STALE. tools/lock_state.py records the MCP session on every refusal
+    # and its docstring says the field exists so a refusal can be joined to the session it
+    # belongs to; measured 2026-09-15, 36 refusals in two hours carrying 13 distinct sessions.
+    # The identity is there.
+    #
+    # IT IS STILL NOT USED, AND THAT IS A MEASUREMENT RATHER THAN AN OVERSIGHT. The branch
+    # above was first written to require exactly one session among the window's refusals, so
+    # that there was nobody else the refusal could belong to. Replayed against the two runs
+    # that died on 2026-09-15, with the clock frozen at each turn so the freshness window
+    # meant what it meant then, that condition never once held: fourteen refusals sat in the
+    # window, from several sessions, because several workers are locked at the same time.
+    # Knowing WHICH session is this worker's would fix it, and the relay has no join to that;
+    # knowing that SOME session was refused does not narrow anything. So the branch above
+    # attributes without identity -- exactly as this one always has -- and pays for it with a
+    # requirement this one does not make, that the reply be about being refused at all.
+    #
+    # What remains here is the length rule, kept for the replies that say nothing about locks.
     if len(resp or "") >= LOCKED_DOMINANCE_MAX_CHARS:
         return False
     try:
@@ -2643,6 +2896,11 @@ class RelayWorker:
         self._turn_sent_at = 0.0
         self.no_progress = 0
         self.last_norm = None
+        # The worker's own STUCK reason from its immediately preceding turn, for the
+        # STUCK-CONVERGENCE detector above; None means "no STUCK yet this streak", which is
+        # also why the very first STUCK of a streak can never converge (there's nothing to
+        # compare it to yet) -- it always earns its one retry.
+        self._last_stuck_reason = None
         # phase_events MUST be initialized before `self.status = PENDING` so the setter
         # can append the initial "Queued" event immediately on construction.
         self.phase_events = []
@@ -2756,6 +3014,8 @@ class RelayWorker:
         self._turn_sent_at = 0.0
         self.no_progress = 0
         self.last_norm = None
+        # A fresh conversation has no memory of the old one's STUCK streak either.
+        self._last_stuck_reason = None
         self.last_response = ""
         self._continue_count = 0
         self.transient = 0
@@ -3139,9 +3399,12 @@ class RelayWorker:
             # immediately.
             #
             # Reset HERE, where the steer is actually delivered, not where it was queued -- a
-            # message sitting in the queue has not reached anyone yet.
+            # message sitting in the queue has not reached anyone yet. Same logic applies to
+            # the STUCK-convergence streak: a person's message in between two STUCK replies
+            # means the second is not evidence the first was a dead end.
             self.no_progress = 0
             self.last_norm = None
+            self._last_stuck_reason = None
         else:
             self._last_was_steer = False
         # A DEFERRED SEND LEAVES self.job INTACT, SO THE NEXT SWEEP RE-SENDS IT VERBATIM.
@@ -4551,6 +4814,30 @@ class RelayWorker:
                     ("identical STUCK reply repeated %d times (no progress) -> dead endpoint, "
                      "not waiting out the full %ds retry window" % (self.no_progress, NET_RETRY_WINDOW_S))
                 return
+            # STUCK-CONVERGENCE (see _stuck_converged above the TOOL-BACKEND-UNREACHABLE
+            # detector for the incident this closes): the no-progress check just above only
+            # catches a STUCK reply that repeats near-VERBATIM. A worker that reaches the same
+            # conclusion but restates it in fresh wording every turn slips past that check
+            # entirely -- which is exactly what burned 9 turns in the mined transcript, each
+            # answered with another retry nudge as if the reply were new information. Judge
+            # CONTENT, not text: if this STUCK's reason and the immediately preceding STUCK's
+            # reason are substantially the same finding, no further nudge is going to change
+            # it -- settle now, on the worker's OWN words, rather than spend the rest of the
+            # retry budget re-asking a question it already answered. The very first STUCK of a
+            # streak (self._last_stuck_reason is still None) can never trigger this -- it has
+            # nothing yet to have converged WITH, so it always gets its one retry, same as
+            # before this detector existed.
+            reason_text = stuck_reason_text(resp)
+            if self._last_stuck_reason is not None \
+                    and _stuck_converged(self._last_stuck_reason, reason_text):
+                if self._salvage_via_checks():
+                    return
+                self.status, self.outcome = "stuck", "STUCK"
+                self.reason = ("worker reached the same conclusion on consecutive turns -> "
+                               "settling on its own stated reason instead of nudging again: %s"
+                               % reason_text)
+                return
+            self._last_stuck_reason = reason_text
             # Under load, an agent STUCK is usually a downstream symptom of a transient
             # tool/network failure (the agent couldn't write a file etc.). Retry the turn
             # (re-prompt to try the tools again) before giving up, up to the budget.
@@ -4569,16 +4856,28 @@ class RelayWorker:
             # worker" -- so the self-improvement loop could tune a parameter with no effect
             # and measure the noise. Transport retries keep the window; this one keeps the
             # count, which is what both the name and the manifest already claimed.
+            #
+            # THE NUDGE TEXT ITSELF ESCALATES TOO (2026-09-15 fix): this call site used to send
+            # the byte-identical RETRY_JOB constant on every one of these retries -- the OTHER
+            # half of the same mined incident, and the reason all 9 wasted turns saw the exact
+            # same Japanese text asking the worker to try again as though its earlier failure
+            # had been transient. _stuck_retry_nudge (see EXHAUSTIVE-COVERAGE-CLAIM OVERRIDE
+            # above) keeps back-compat for the first two retries (unchanged RETRY_JOB) and
+            # from the third rotates through _next_retry_job's escalation -- UNLESS this reply
+            # claims exhaustive coverage, in which case it asks for an enumeration instead, at
+            # any count, because no phrasing in that ladder helps a worker convinced there is
+            # nothing left to check.
             if self.transient < self.max_transient and self._retry_transient():
-                self.job = self._task_anchor(RETRY_JOB)
+                self.job = self._task_anchor(_stuck_retry_nudge(resp, self.transient))
                 self.reason = "STUCK -> transient retry %d/%d" % (self.transient, self.max_transient)
                 return
             if self._salvage_via_checks():
                 return
             self.status, self.outcome, self.reason = "stuck", "STUCK", \
-                "agent reported STUCK (after %d retries)" % self.transient
+                "agent reported STUCK (after %d retries): %s" % (self.transient, reason_text)
             return
         self.transient = 0   # a real (non-stuck) response -> the transient issue cleared
+        self._last_stuck_reason = None  # a real reply breaks the STUCK-convergence streak too
         self.first_transient_ts = 0.0   # reset the outage window on a healthy reply
         self._toolerr_ts = 0.0          # tool path is back -> clear the tool-unreachable window
         self._throttle_ts = 0.0         # the quota refilled -> clear the throttle window
@@ -5105,6 +5404,36 @@ class RelayWorker:
         before. An absence of evidence is not evidence, and a worker must not be demoted
         because nothing happened to be recording.
         """
+        # RUNNING OUT OF REVIEW BUDGET IS NOT PASSING REVIEW.
+        #
+        # The refuter only runs while `refute_count < max_refute`. A worker that is REFUTED on
+        # its last allowed round is sent back to fix the work, and the fix it returns arrives
+        # with the budget spent -- so the gate is not entered, execution falls through to
+        # _settle_done, and the run is recorded DONE while the last thing any checker said
+        # about it was that it was wrong.
+        #
+        # MEASURED 2026-09-15, and it is not a theoretical hole. A worker could not read a
+        # file because the execution tools were locked, wrote into the deliverable that it had
+        # verified the content against that file, and the refuter caught the fabrication in
+        # as many words. The ledger row reads `outcome=DONE  reason=refuter#3: REFUTED: ...`.
+        # The operator's phrase for the whole class was 「無視して回すだけ回す」, and this is
+        # the exact mechanism they were describing.
+        #
+        # EVIDENCE_CONTRADICTED RATHER THAN A NEW OUTCOME, and rather than STUCK. Its entry in
+        # relay/outcomes.py already says what this is -- the claim is contradicted by the
+        # record of what was done -- and says why it reports "done" rather than "stuck": the
+        # work FINISHED, and telling an operator to re-run something that ran to completion is
+        # the wrong instruction. What is in doubt is the claim, which is precisely the doubt
+        # here. self.reason already carries the refuter's own words, so the operator reads why
+        # rather than a label.
+        #
+        # Before the ledger logic below because it is unconditional: that path returns DONE
+        # early for any goal without acceptance checks or a cwd, which is every ordinary
+        # Copilot fleet goal -- including the one this was found in.
+        if (getattr(self, "_last_refute_verdict", "") == "REFUTED"
+                and getattr(self, "refuter", False)
+                and self.refute_count >= self.max_refute):
+            return "EVIDENCE_CONTRADICTED"
         if not self.VERIFY_CLAIM_AGAINST_LEDGER:
             return "DONE"
         try:
@@ -5247,6 +5576,16 @@ class RelayWorker:
         self.reason = ("refuter#%d: %s%s"
                        % (self.refute_count, kind,
                           (": " + reason) if reason else ""))[:300]
+        # THE LAST WORD ANY CHECKER SAID, REMEMBERED, BECAUSE THE BUDGET CAN RUN OUT BEFORE
+        # ONE IS SAID AGAIN. A REFUTED verdict sends the worker back to fix the work; if its
+        # next candidate arrives with refute_count already at max_refute, the gate above is
+        # not entered and NOTHING examines the fix. _claim_verdict reads this, so that the
+        # run does not report DONE when the last thing said about it was that it was wrong.
+        #
+        # Assigned for every verdict and not only REFUTED, so that a later UPHELD clears it.
+        # Setting it inside the REFUTED branch alone would leave the flag standing after the
+        # work was subsequently approved, and mark a verdict that was actually satisfied.
+        self._last_refute_verdict = kind
         if kind == "REFUTED":
             # A NEW refute round: reset the resend counter, so its first send is byte-identical
             # to what this branch has always produced.
