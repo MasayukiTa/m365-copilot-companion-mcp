@@ -176,6 +176,14 @@ jobs:
             tools/test_a_dead_caller_is_not_a_caller.py \
             tools/test_the_diagnostic_three_functions_were_kept_for.py \
             tools/test_a_backslash_in_a_literal_means_what_it_says.py \
+            tools/test_a_lesson_is_a_difference_not_a_paraphrase.py \
+            tools/test_a_proposal_name_carries_nothing_from_the_business.py \
+            tools/test_an_archive_does_not_contain_itself.py \
+            relay/test_a_file_that_was_never_written_is_worth_asking_about.py \
+            relay/test_no_test_writes_into_the_operators_approval_queue.py \
+            ui/test_a_warning_that_is_always_on_is_not_a_warning.py \
+            ui/test_the_last_setting_is_reachable.py \
+            ui/test_the_same_decision_does_not_flood_the_approval_history.py \
             relay/test_a_declared_knob_changes_something.py \
             relay/test_a_kept_for_claim_names_a_real_consumer.py \
             scripts/test_the_audit_sees_the_tree_that_will_be_pushed.py \
