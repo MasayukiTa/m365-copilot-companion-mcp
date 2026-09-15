@@ -45,8 +45,17 @@ from typing import Iterable, Optional, Tuple
 from .screen_capture import make_process_dpi_aware, virtual_screen
 from .screen_frame import Frame
 
-_user32 = ctypes.windll.user32
+# use_last_error=True OR THE ERROR CODE IS NOISE. ctypes.windll caches a handle that does
+# NOT preserve the Win32 last-error across the call, so ctypes.get_last_error() afterwards
+# returns whatever happened to be there. The refusal message shipped on 2026-09-15 printed
+# that value as "error %d" and it meant nothing.
+_user32 = ctypes.WinDLL("user32", use_last_error=True)
 _user32.OpenInputDesktop.restype = wintypes.HANDLE
+_user32.GetThreadDesktop.restype = wintypes.HANDLE
+_user32.GetThreadDesktop.argtypes = [wintypes.DWORD]
+_user32.GetUserObjectInformationW.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                              ctypes.c_void_p, wintypes.DWORD,
+                                              ctypes.POINTER(wintypes.DWORD)]
 _user32.GetForegroundWindow.restype = wintypes.HWND
 
 INPUT_MOUSE = 0
@@ -228,6 +237,43 @@ def input_desktop_name() -> str:
         return ""
 
 
+def thread_desktop_receives_input():
+    """Is the desktop of the CALLING THREAD the one currently receiving user input?
+
+    True / False / None, where None means the query itself failed and nothing may be
+    concluded. This is the probe that answers the question the others only circle around,
+    and it is asked on the same thread that calls SendInput, which is the thread whose
+    desktop actually matters.
+
+    WHY NOT input_desktop_name(). OpenInputDesktop succeeds and reports "Default" in a
+    DISCONNECTED session too -- it names the desktop that will become active on
+    reconnection, not the one receiving input now. So a "Default" reading is consistent with
+    a session nobody is looking at, and the name alone cannot carry the conclusion. That was
+    established after the code below was first written, which is why both are kept: the name
+    is context, this is the answer.
+
+    The handle from GetThreadDesktop is borrowed and must NOT be closed.
+    """
+    try:
+        hdesk = _user32.GetThreadDesktop(ctypes.windll.kernel32.GetCurrentThreadId())
+        if not hdesk:
+            return None
+        receiving = wintypes.BOOL(0)
+        needed = wintypes.DWORD()
+        # UOI_IO is 6. Written as 20 first and the call returned ERROR_INVALID_PARAMETER
+        # (87) while UOI_NAME succeeded on the same handle, which is how the wrong
+        # constant was found -- a sweep of 1,2,3,5,6,7 against a live desktop.
+        ok = _user32.GetUserObjectInformationW(hdesk, 6,  # UOI_IO
+                                               ctypes.byref(receiving),
+                                               ctypes.sizeof(receiving),
+                                               ctypes.byref(needed))
+        if not ok:
+            return None
+        return bool(receiving.value)
+    except Exception:
+        return None
+
+
 def _foreground_description() -> str:
     """Title and class of whatever is in front, or a note that there is nothing."""
     try:
@@ -258,26 +304,40 @@ def _send(*inputs: INPUT) -> int:
     lock screen, which runs BELOW this process rather than above it. A confident wrong cause
     is worse than none: it sent a person to fix something that was not broken.
 
-    So this states the two facts that are readable at the moment of refusal -- which desktop
-    receives input, and what is in front -- and names both known causes without choosing
-    between them. A reader with those two facts can tell them apart immediately; this
-    function, from inside the failure, demonstrably could not.
+    WHAT ASTRA CORRECTED, 2026-09-16. Neither the return count nor GetLastError identifies
+    the mechanism -- Microsoft says so explicitly for UIPI, and there is no documented
+    distinguishing value for the secure desktop or session isolation either. So no classifier
+    of the form "0 + ACCESS_DENIED means secure desktop" is warranted, and none is built here.
+    What IS decidable is narrower and sufficient: whether this thread's desktop is the one
+    receiving user input. That single three-state fact separates "nobody can receive this"
+    from "somebody could, but this window refuses it", which are the two different people who
+    have to act.
     """
     n = len(inputs)
     arr = (INPUT * n)(*inputs)
+    # CLEARED AND READ AROUND THE CALL, with nothing in between. Any other API call between
+    # SendInput and the read replaces the value with its own.
+    ctypes.set_last_error(0)
     sent = _user32.SendInput(n, arr, ctypes.sizeof(INPUT))
+    err = ctypes.get_last_error()
     if sent != n:
-        err = ctypes.get_last_error() if hasattr(ctypes, "get_last_error") else 0
-        desk = input_desktop_name() or "unreadable"
+        receiving = thread_desktop_receives_input()
         raise InputRefused(
-            "Windows accepted %d of %d inputs (error %d). Input desktop: %s. In front: %s. "
-            "Retrying unchanged will not help -- SendInput is refusing, not failing. Either "
-            "the session is locked or on the secure desktop (input desktop 'Winlogon', or no "
-            "foreground window), in which case somebody has to sign in at the machine; or "
-            "the foreground window runs at a higher integrity level than this process (an "
-            "elevated application, a UAC prompt), in which case bringing an ordinary window "
-            "to the front is enough. The two facts above say which."
-            % (sent, n, err, desk, _foreground_description()))
+            "Windows accepted %d of %d inputs (last error %d). This thread's desktop is "
+            "receiving user input: %s. Input desktop name: %s. In front: %s. "
+            "Retrying unchanged will not help -- SendInput is refusing, not failing.%s"
+            % (sent, n, err,
+               {True: "yes", False: "NO", None: "could not be determined"}[receiving],
+               input_desktop_name() or "unreadable", _foreground_description(),
+               (" Since this thread's desktop is NOT the one receiving input, nothing sent "
+                "from here reaches the user until that changes -- a locked session, the "
+                "secure desktop during a UAC prompt, or a disconnected session. A person has "
+                "to attend the machine." if receiving is False else
+                " The desktop is receiving input, so the remaining documented cause is a "
+                "foreground window at a higher integrity level than this process; bringing "
+                "an ordinary window to the front is enough." if receiving is True else
+                " With the desktop query itself failing, no cause can be named from here; "
+                "report these values rather than guessing.")))
     return sent
 
 
