@@ -60,8 +60,23 @@ PROPOSALS_DIR = os.path.join(REPO, ".fleet", "skill_proposals")
 #: to search -- the failure the operator named when they said a catalogue of 10,000 names cannot
 #: be handed to a model.
 _PATH = re.compile(r"[A-Za-z]:[\\/][^\s\"'<>|、。，]+")
-_CONTRACT_MARKS = ("出力形式", "1行1名", "列のみ", "最後の行に", "厳守", "の形式", "だけ出力",
-                   "出力は", "形式だけ", "DONE")
+#: Phrases by which an instruction declares the SHAPE OF ITS ANSWER. Having one is part of what
+#: makes a job worth writing a procedure for, so what counts here decides what gets proposed.
+#:
+#: A COMPLETION MARKER IS NOT AN OUTPUT CONTRACT, and treating it as one let every probe through.
+#: `DONE` and `最後の行に` were in this list; both come from how a fleet goal ENDS, not from what
+#: it asks for. `relay/control_markers.CLOSING_INSTRUCTION` asks every worker for a final DONE
+#: line, and an operator writing a goal by hand mirrors it. Measured over the 157 qualified
+#: candidates: 52% carried `DONE` and 13% carried nothing else -- so the sieve was passing them
+#: on the strength of the protocol's own boilerplate.
+#:
+#: What that cost was visible in the ranking. The most-run "work" included 「次の足し算の答えを
+#: 数字だけで書いてください: 137 + 486」 (52 runs), a documents listing (62) and a filename
+#: listing (40) -- smoke probes, not jobs anybody needs a procedure for. Dropping the two
+#: markers took the proposals from 95 to 57 and removed every probe; what remains is the
+#: telephone-directory classification, the furigana check, the OGF report and the mail searches.
+_CONTRACT_MARKS = ("出力形式", "1行1名", "列のみ", "厳守", "の形式", "だけ出力",
+                   "出力は", "形式だけ")
 
 
 def _paths_in(text):
