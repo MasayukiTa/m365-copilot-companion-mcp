@@ -272,10 +272,6 @@ def click(frame: Frame, x: int, y: int, button: str = "left",
     return cursor_position()
 
 
-def double_click(frame: Frame, x: int, y: int, button: str = "left"):
-    return click(frame, x, y, button=button, count=2)
-
-
 def scroll(frame: Frame, x: int, y: int, clicks: int, horizontal: bool = False):
     """Scroll at a point. Positive is up (or right); one click is one notch."""
     _require_layout(frame)
