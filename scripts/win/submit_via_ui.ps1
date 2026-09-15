@@ -106,7 +106,25 @@ function Get-Edits($window) {
     $cond = New-Object System.Windows.Automation.PropertyCondition(
         [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
         [System.Windows.Automation.ControlType]::Edit)
-    return $window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
+    # THE LEADING COMMA IS LOAD-BEARING. PowerShell unwraps a collection of exactly one
+    # element as it leaves a function, so with a single Edit on screen this returned the
+    # AutomationElement ITSELF rather than a collection of one, and the caller's
+    # `$edits.Item($i)` died with
+    #     [System.Windows.Automation.AutomationElement] does not contain a method named 'Item'
+    #
+    # WHAT MADE IT HARD TO SEE: `$edits.Count` still says 1 afterwards, because PowerShell
+    # gives every object a synthetic Count. So the line above it prints "editable fields: 1",
+    # which looks like the collection is intact, and the failure lands one line later on a
+    # method call. Two facts that disagree, with the reassuring one printed first.
+    #
+    # WHEN IT FIRES: a cockpit that has just been rebuilt has no history box and no worker
+    # cards, so goalInput is the ONLY Edit in the tree -- exactly one. A freshly started
+    # cockpit therefore hit this every time, while one that had been used did not.
+    #
+    # The same shape is safe at the two other FindAll sites in this file (`$wins`, `$btns`)
+    # because those assign the result to a variable inside the same scope; the unwrap happens
+    # on the way OUT of a function, and only this one returns.
+    return ,$window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
 }
 
 function Set-Text($element, [string]$text) {

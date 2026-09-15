@@ -39,6 +39,11 @@ param(
     # cheap insurance against a single slow /health response triggering a needless kill
     # that would tear down a live Copilot MCP session.
     [int]$FailuresBeforeAction = 4,
+    # How long a main.py of ours may be alive-but-not-listening before its failures start
+    # counting. It is not a guess at startup time so much as a ceiling on how long we are
+    # willing to wait for one: imports alone measured 10-25s, and the whole boot is longer
+    # under load. Only ever applies while such a process is actually alive.
+    [int]$StartupGraceSeconds = 180,
     # Dry-run the fleet coordinator auto-resume check only: log what WOULD happen
     # (marker found, pid dead, would relaunch with these args) without actually
     # starting a process. Used for verification -- never triggers a real relaunch.
@@ -152,6 +157,18 @@ function Test-ServerUp {
     # requests; only a timeout / connect failure / no-response counts as down. (Older
     # builds had no /health and probed /mcp, treating any 4xx as alive; /health is a
     # cleaner liveness signal that does not depend on MCP stream-header quirks.)
+    # IT USED TO COLLAPSE THREE DIFFERENT ANSWERS INTO ONE `$false`, AND THEY WANT OPPOSITE
+    # TREATMENT. "Nothing is listening" means the server has not finished starting (or has
+    # died) -- the right response is to wait, or to launch if it really is gone. "Listening
+    # but not answering within the timeout" means a wedged event loop -- the right response is
+    # to kill it. The log said only "server check failed" for both.
+    #
+    # 2026-09-15: a restart loop ran for nine minutes, killing a server three times. The log
+    # could not say whether each kill hit a booting server or a wedged one, and those have
+    # opposite fixes, so the loop could not be diagnosed from what was recorded -- only from
+    # standing next to the machine. $script:LastServerCheck now carries the distinction so the
+    # next occurrence names itself.
+    $script:LastServerCheck = "unknown"
     try {
         $req = [System.Net.WebRequest]::Create("http://127.0.0.1:$Port/health")
         $req.Method = "GET"
@@ -159,11 +176,30 @@ function Test-ServerUp {
         $req.ReadWriteTimeout = 5000
         $resp = $req.GetResponse()
         $resp.Close()
+        $script:LastServerCheck = "ok"
         return $true
     } catch [System.Net.WebException] {
         $r = $_.Exception.Response
-        if ($r) { $r.Close(); return $true }   # any HTTP status = app responded = alive
-        return $false                           # timeout, refused, reset = down
+        if ($r) {
+            $r.Close()
+            $script:LastServerCheck = "answered"
+            return $true                        # any HTTP status = app responded = alive
+        }
+        $script:LastServerCheck = [string]$_.Exception.Status   # Timeout / ConnectFailure / ...
+        return $false
+    } catch {
+        $script:LastServerCheck = "threw: " + $_.Exception.GetType().Name
+        return $false
+    }
+}
+
+
+function Test-PortListening {
+    # Is ANYTHING accepting connections on the port? Distinguishes "has not bound yet" from
+    # "bound and not answering", which Test-ServerUp alone cannot: both arrive as $false.
+    try {
+        $c = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+        return [bool]$c
     } catch { return $false }
 }
 
@@ -202,6 +238,7 @@ function Start-Server {
         $_.CommandLine -match 'main\.py' -and $_.CommandLine -like "*$Root*"
     } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Seconds 2
+    $script:LastLaunchAt = Get-Date
     Push-Location $Root
     # ITS STARTUP ERROR WAS GOING NOWHERE. Hidden window, no redirection: when main.py dies on
     # startup -- a missing dependency, a port already bound, an unreadable .env -- the reason is
@@ -617,12 +654,40 @@ while ($true) {
     if (Test-ServerUp) {
         $serverMiss = 0
     } else {
-        $serverMiss++
-        Write-Log "server check failed ($serverMiss/$FailuresBeforeAction)"
-        if ($serverMiss -ge $FailuresBeforeAction) {
-            Start-Server
-            $serverMiss = 0
-            Start-Sleep -Seconds 6
+        # DO NOT KILL A SERVER THAT IS STILL STARTING. main.py takes 10-25 seconds just to
+        # import (fastmcp alone is ~19s) before it binds, and longer while the machine is
+        # busy. A failure whose reason is "nothing is listening" while a main.py from this
+        # repo is alive is a server mid-boot, and launching again does not help it -- it kills
+        # the one that was nearly ready and restarts the clock. That is a loop that sustains
+        # itself: measured 2026-09-15, three kills over nine minutes, each one hitting a
+        # process that had not finished starting.
+        #
+        # The grace is bounded by the PROCESS, not only by time: if no main.py of ours is
+        # alive, there is nothing to wait for and the strike counts immediately. So a server
+        # that died at launch is still restarted at the usual speed, and only one that is
+        # visibly working towards listening is given room.
+        $reason = $script:LastServerCheck
+        $booting = $false
+        if (-not (Test-PortListening)) {
+            $alive = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+                       Where-Object { $_.CommandLine -match 'main\.py' -and
+                                      $_.CommandLine -like "*$Root*" })
+            if ($alive.Count -gt 0 -and $script:LastLaunchAt -and
+                ((Get-Date) - $script:LastLaunchAt).TotalSeconds -lt $StartupGraceSeconds) {
+                $booting = $true
+            }
+        }
+        if ($booting) {
+            Write-Log ("server not listening yet ({0}); main.py alive {1:N0}s after launch -- waiting, not restarting" -f
+                       $reason, ((Get-Date) - $script:LastLaunchAt).TotalSeconds)
+        } else {
+            $serverMiss++
+            Write-Log "server check failed ($serverMiss/$FailuresBeforeAction) -- $reason"
+            if ($serverMiss -ge $FailuresBeforeAction) {
+                Start-Server
+                $serverMiss = 0
+                Start-Sleep -Seconds 6
+            }
         }
     }
 
