@@ -224,8 +224,15 @@ def staged_files(repo="."):
     could speak was after a commit had been pushed and CI ran -- which on 2026-09-13 meant an
     employee id was already public and the fix was a history rewrite. A staged file is the last
     moment before that, and in CI nothing is staged, so CI is unaffected.
+
+    DELETIONS ARE EXCLUDED, and leaving them in blocked the guard's own advice. `git rm
+    --cached <file>` is exactly what this check tells you to do with a generated file that
+    carries a home path -- and the plain name-only listing includes the removed path, while
+    the file is still sitting in the working tree untracked. The scan then read it and
+    refused the commit that was removing it. --diff-filter=ACMR keeps additions, copies,
+    modifications and renames: everything whose CONTENT is about to become tracked.
     """
-    return _git_lines(repo, ["diff", "--cached", "--name-only"])
+    return _git_lines(repo, ["diff", "--cached", "--name-only", "--diff-filter=ACMR"])
 
 
 def untracked_files(repo="."):
@@ -375,6 +382,21 @@ def commit_metadata_offences(repo=".", names=None, rev_range=None):
 
 
 def main(argv=None) -> int:
+    # THE GUARD DIED WHILE REPORTING, WHICH IS THE ONLY TIME IT MATTERS.
+    #
+    # It prints the offending LINE, and this repository is full of Japanese. On Windows a
+    # bare console is cp932, so a flagged line containing anything cp932 cannot encode --
+    # a replacement character from a binary read, an emoji, a non-JIS glyph -- raised
+    # UnicodeEncodeError part-way through the listing. The traceback still exits non-zero,
+    # so nothing got committed, but the operator saw a codec error instead of the filename,
+    # and the check that runs before every commit became a thing that "crashes sometimes".
+    # CI never saw it: Linux is UTF-8.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     argv = argv if argv is not None else sys.argv[1:]
     args = [a for a in argv if not a.startswith("--")]
     strict = "--require-names" in argv

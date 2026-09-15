@@ -636,6 +636,15 @@ jobs:
       - name: Run Windows path tests
         run: python -m pytest -q tools/test_file_ops.py
 
+      # The keyboard table lives here rather than on the ubuntu job because
+      # tools/desktop_input.py binds ctypes.windll.user32 at import, so the module cannot
+      # be imported at all on Linux. The test sends no input: every assertion is about the
+      # table or about a refusal, both of which are decided before any SendInput call.
+      - name: Run desktop keyboard table tests
+        run: >-
+          python -m pytest -q
+          tools/test_a_key_that_is_missing_looks_exactly_like_a_key_that_is_refused.py
+
       # These are skipped on the ubuntu job because gen_env protects the secrets it writes
       # with DPAPI, which does not exist there. This is the job where that capability is
       # real, so this is where they must run -- a skip on the other job is only honest

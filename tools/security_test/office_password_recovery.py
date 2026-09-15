@@ -128,5 +128,10 @@ def office_password_recovery(
 if __name__ == "__main__":
     import sys
 
-    target = sys.argv[1] if len(sys.argv) > 1 else r"C:\Users\USER\Desktop\agenttest.xlsx"
+    # No default that names a person's desktop. Without an argument there is nothing
+    # sensible to open, and saying so is better than opening a file that exists on exactly
+    # one machine.
+    if len(sys.argv) <= 1:
+        raise SystemExit("usage: office_password_recovery.py <path to .xlsx>")
+    target = sys.argv[1]
     print(office_password_recovery(target))
