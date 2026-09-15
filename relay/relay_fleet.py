@@ -598,12 +598,22 @@ def edge_recover_surface(port=None, open_url=""):
 
 # UNLOCK-REQUIRED detector. Write/exec MCP tools require unlock(password) per client IP
 # (tools/security.py::require_unlocked). When the agent calls a write/exec tool before the
-# (rotating M365 backend) IP is unlocked, the server returns ONE of its two literal error
-# strings (tools/security.py require_unlocked(), ~line 129 and ~line 138):
+# (rotating M365 backend) IP is unlocked, the server returns ONE of its THREE literal error
+# strings (tools/security.py require_unlocked(), ~line 493, ~line 562 and ~line 570):
 #   "[locked: no HTTP request context] Denied: this call ran in-process (test, CLI, or an internal hook), not through the MCP HTTP server. unlock() cannot help here -- it needs the same HTTP context and will fail the same way; do not retry it. Either route the call through the HTTP server, or use an internal *_local path that does not pass this gate (memory_save_local / runlog_append_local)."
+#   "[locked: no valid unlock token for 'x.x.x.x'] The identity in the forwarding header is
+#    not sufficient on its own. Call unlock(password='<password>') and pass the returned
+#    `unlock_token` with the call. ..." -- the IP is already unlocked but no per-call token
+#    (or a stale one) came with the request; MCP_REQUIRE_UNLOCK_TOKEN's second-factor branch.
 #   "[locked client IP: 'x.x.x.x'] Mutating and execution tools require an unlock. Call
 #    unlock(password='<password>') first. The unlock is stored per client IP for
 #    MCP_UNLOCK_TTL_DAYS days."
+# This comment used to say "ONE of its two literal error strings" -- true when it was written,
+# false since 2026-08-18 (commit "Make the second key something a caller holds, not something
+# it states") added the middle one above without anyone coming back to update the reader. See
+# relay/test_every_refusal_the_server_can_speak_is_one_the_fleet_can_hear.py for the guard that
+# now makes that kind of drift fail loudly instead of silently: it re-reads tools/security.py's
+# source for every "[locked" literal and asserts LOCKED_MARKERS below covers each one.
 # which the agent echoes. We AUTO-INJECT the unlock: re-anchor the turn to first call the
 # 'unlock' tool with MCP_UNLOCK_PASSWORD read LOCALLY from .env -- deliberately NOT baked into
 # the agent's Copilot Studio instructions (that would expose the password permanently). The
@@ -625,8 +635,36 @@ def edge_recover_surface(port=None, open_url=""):
 #      the raw tool error rather than a long analysis that merely quotes/mentions it.
 # The loose "unlock(password=" phrasing is kept only as documentation of what NOT to use alone;
 # it is deliberately NOT part of LOCKED_MARKERS below.
-LOCKED_MARKERS = ("locked client ip", "[locked:")
-# A real lock error (see the two literal strings above) is ~90-230 chars. A security-review /
+
+#: The exact prefix tools/security.py writes when it denies a caller that arrived with no HTTP
+#: request context. Pinned here because that module is frozen and cannot import from this one,
+#: and because a filter keyed on it is only as good as the literal staying identical -- a test
+#: asserts the two match rather than trusting the copy.
+NO_CONTEXT_REFUSAL = "[locked: no HTTP request context]"
+
+#: The bracketed prefix tools/security.py writes when the caller's client IP is ALREADY
+#: unlocked but the call carried no unlock_token (or a stale/wrong one) -- require_unlocked()
+#: ~line 562, added 2026-08-18. Stops before "for {ip!r}", the varying part, same convention as
+#: NO_CONTEXT_REFUSAL above. This is not a rare edge: measured 2026-09-10 (see
+#: tests/test_security_xff.py), 489 of 492 lock refusals in two days were this branch, one
+#: already-unlocked identity that never presented a token. Named explicitly, and listed in
+#: LOCKED_MARKERS below, instead of relying on it merely sharing a bracket prefix with
+#: NO_CONTEXT_REFUSAL -- see the paragraph below for why that distinction matters.
+TOKEN_MISSING_REFUSAL = "[locked: no valid unlock token"
+
+# THIRD MARKER, NAMED RATHER THAN LEFT TO COINCIDENCE. Before this change LOCKED_MARKERS was
+# ("locked client ip", "[locked:"), and that bare "[locked:" happens to also be a prefix of
+# TOKEN_MISSING_REFUSAL (both open "[locked: "), so the no-valid-unlock-token refusal was in
+# fact already being matched -- by accident of two unrelated messages sharing a bracket format,
+# never because anyone verified it. Nothing had proven that on purpose, nothing would have
+# caught it silently breaking if either message's wording drifted apart to no longer share that
+# prefix, and the big comment above this tuple kept telling the next reader there were only two
+# messages to worry about. Spelling out NO_CONTEXT_REFUSAL and TOKEN_MISSING_REFUSAL by name,
+# and covering both in
+# relay/test_every_refusal_the_server_can_speak_is_one_the_fleet_can_hear.py's source-sweep of
+# tools/security.py, turns "happens to work" into "is checked".
+LOCKED_MARKERS = ("locked client ip", NO_CONTEXT_REFUSAL.lower(), TOKEN_MISSING_REFUSAL.lower())
+# A real lock error (see the three literal strings above) is ~90-330 chars. A security-review /
 # analytical response that merely mentions unlock() runs to many hundreds/thousands of chars.
 # Chosen well above the longest real error and well below a genuine multi-sentence review.
 LOCKED_DOMINANCE_MAX_CHARS = 400
@@ -652,13 +690,6 @@ UNLOCK_PREFIX = (
     "特に .env を読まないこと（サーバが必ず拒否し何度でも通らない）。読み取り専用の作業に unlock は不要。"
     "\n--- 元のゴール ---\n"
 )
-
-
-#: The exact prefix tools/security.py writes when it denies a caller that arrived with no HTTP
-#: request context. Pinned here because that module is frozen and cannot import from this one,
-#: and because a filter keyed on it is only as good as the literal staying identical -- a test
-#: asserts the two match rather than trusting the copy.
-NO_CONTEXT_REFUSAL = "[locked: no HTTP request context]"
 
 
 def _looks_locked(resp: str, since: float = 0.0) -> bool:
