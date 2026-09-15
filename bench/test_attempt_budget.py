@@ -323,9 +323,18 @@ def test_the_language_costs_are_not_below_what_was_measured():
             % (lang, C.LANG_DISK_MB.get(lang), mb))
 
 
-def test_a_thin_disk_admits_one_instance_and_not_more():
-    # The floor of the function is one -- a batch of zero makes no progress -- but at 4.5 GiB
-    # nothing should be running two of anything.
+def test_a_thin_disk_admits_one_instance_and_not_more(monkeypatch):
+    """The floor of the function is one -- a batch of zero makes no progress -- but at 4.5 GiB
+    nothing should be running two of anything.
+
+    THE FLEET FLOOR IS PINNED HERE, because it is read from the operator's settings.txt at
+    import (`_fleet_floor_gib`), and this assertion is arithmetic ABOUT that floor rather than
+    about whatever the machine happens to be configured with. Measured 2026-09-15: a machine
+    carrying `disk_floor_gb=1` made `concurrency_for(['go'], 4.5)` return 2 and failed this
+    test, while the same code on a default machine returned 1 -- a hermetic suite reporting
+    the contents of a settings file. CI has no settings.txt and so never saw it.
+    """
+    monkeypatch.setattr(C, "FLEET_FLOOR_GIB", 3.0)
     for lang in ("python", "go", "js"):
         assert C.concurrency_for([lang], 4.5) == 1, lang
 
