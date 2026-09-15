@@ -4054,11 +4054,11 @@ class ChatWindow : Window
         rtb.IsDocumentEnabled = false;
         rtb.BorderThickness = new Thickness(0);
         rtb.Background = Brushes.Transparent;
-        rtb.Padding = new Thickness(0);
+        rtb.Padding = BODY_PAD;
         rtb.Focusable = true;   // required for text selection to work
         rtb.HorizontalAlignment = HorizontalAlignment.Stretch;
-        rtb.FontFamily = new FontFamily("Segoe UI Variable, Segoe UI");
-        rtb.FontSize = 14;
+        rtb.FontFamily = BODY_FACE;
+        rtb.FontSize = BODY_SIZE;
         // Disable scrollbars so the RichTextBox auto-sizes to its content height
         // instead of clipping to a fixed viewport.
         ScrollViewer.SetVerticalScrollBarVisibility(rtb, ScrollBarVisibility.Disabled);
@@ -4074,7 +4074,7 @@ class ChatWindow : Window
         var doc = new FlowDocument();
         doc.PagePadding = new Thickness(0);
         doc.FontFamily = rtb.FontFamily;
-        doc.FontSize = 14;
+        doc.FontSize = BODY_SIZE;
         // Ensure the document foreground picks up the theme color.
         // FlowDocument is DependencyObject but not FrameworkElement, so call
         // SetResourceReference directly rather than through the SetRef helper.
@@ -4231,18 +4231,37 @@ class ChatWindow : Window
     // A document for `plain` with the same layout, used when a folded answer is opened.
     static FlowDocument BuildFlowDocument(string plain, FontFamily family)
     {
-        var d = new FlowDocument { PagePadding = new Thickness(0), FontFamily = family, FontSize = 14 };
+        var d = new FlowDocument { PagePadding = new Thickness(0), FontFamily = family, FontSize = BODY_SIZE };
         d.SetResourceReference(FlowDocument.ForegroundProperty, "Fg");
         FillFlowDocument(d, plain);
         return d;
     }
+
+    //: THE TWO RENDERINGS OF ONE ANSWER MUST MEASURE THE SAME.
+    //
+    // A streaming answer is a plain TextBox (MakeText); the settled one is a RichTextBox over a
+    // FlowDocument (RenderAssistantBody), because TextBlock cannot be selected and TextBox has
+    // no line height. That swap is fine as long as the two agree on everything that decides
+    // where a line breaks -- and they did not. The streaming box asked for "Segoe UI" and the
+    // settled one for "Segoe UI Variable, Segoe UI", which are different faces with different
+    // advance widths, and the streaming box carried 2px of left padding the settled one did
+    // not. So at the moment an answer finished, every line re-wrapped.
+    //
+    // An external review of this window named exactly this and said to treat it as a READING
+    // POSITION problem rather than a cosmetic one: the reader is mid-sentence when the text
+    // moves under them. These constants exist so the two paths cannot drift apart again, and
+    // `test_an_answer_does_not_rewrap_when_it_settles` asserts both use them.
+    static readonly FontFamily BODY_FACE = new FontFamily("Segoe UI Variable, Segoe UI");
+    const double BODY_SIZE = 14;
+    static readonly Thickness BODY_PAD = new Thickness(0);
 
     TextBox MakeText(string text)
     {
         var tb = new TextBox
         {
             Text = text, IsReadOnly = true, BorderThickness = new Thickness(0), Background = Brushes.Transparent,
-            TextWrapping = TextWrapping.Wrap, IsTabStop = false, FontFamily = new FontFamily("Segoe UI"), FontSize = 14, Padding = new Thickness(2, 0, 0, 0)
+            TextWrapping = TextWrapping.Wrap, IsTabStop = false,
+            FontFamily = BODY_FACE, FontSize = BODY_SIZE, Padding = BODY_PAD
         };
         SetRef(tb, ForegroundProperty, "Fg");
         return tb;
