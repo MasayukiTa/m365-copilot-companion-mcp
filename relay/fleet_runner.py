@@ -442,6 +442,80 @@ def deliver_steers(items, workers, log=None, enqueue=None):
             say("[steer] DROPPED: %s: %s" % (type(exc).__name__, str(exc)[:120]))
     return delivered
 
+
+def apply_reunlock(target, workers, enqueue=None, log=None):
+    """THE FALLBACK BUTTON. Automatic recovery already exists: relay_fleet injects
+    `UNLOCK_PREFIX % password` into a worker's FIRST turn whenever a local password is
+    found (see `_initial_job_with_unlock`), and a heuristic elsewhere retries it when a
+    reply LOOKS like a lock refusal. Both can miss -- the heuristic is deliberately loose
+    and gated on a matching record, and neither runs at all for a refusal that arrives
+    after the first turn and never gets recognised as one. Measured twice in one day
+    (2026-09-15): a worker refused for lock, no recovery fired, and the run continued
+    regardless -- once producing a deliverable that claimed to have verified content it
+    had never been able to read. There was no button for the operator to press.
+
+    This is that button, and it is DELIBERATELY the same delivery path as a steer: the
+    unlock instruction is a turn like any other, and `deliver_steers` already carries the
+    hard-won rule that every rejection must be named rather than swallowed (see its
+    docstring and tests/test_steer_delivery.py). Re-deriving that here would risk
+    re-introducing the empty-name-drops-silently defect that file exists to prevent.
+
+    THE PASSWORD IS READ HERE, ON THIS MACHINE, FROM THIS MACHINE'S .env -- and goes
+    NOWHERE but into the one transient turn handed to `deliver_steers`. It is never
+    written to `.fleet/commands.d/*.json` (plain text, read by several processes) and
+    never appears in the dict this function returns: that dict is built only from the
+    LOG LINES `deliver_steers` emits about names and statuses, which by construction
+    never echo the turn text (see its own say() calls -- none of them format `text`).
+
+    `target` is a worker name, or "" / "*" for every live worker (mirrors deliver_steers'
+    own empty-name-means-broadcast rule -- "*" is accepted too because a command typed by
+    a person reaches for the wildcard before the empty string).
+
+    Returns a dict meant to be written straight into status.json so the operator can see
+    what happened without guessing: {"ts", "target", "ok", "delivered", "reason"}. `ok`
+    is False both when nothing was delivered AND when there was no password to try --
+    "I pressed the button and nothing happened" is exactly the failure this exists to end,
+    so a missing password is reported, not swallowed.
+    """
+    say = log or (lambda m: print(m, flush=True))
+    name = (target or "").strip()
+    if name == "*":
+        name = ""
+
+    from relay.relay_fleet import UNLOCK_PREFIX, _unlock_password
+    pw = _unlock_password()
+    if not pw:
+        try:
+            from tools.secret_store import (PROBLEM_UNDECRYPTABLE,
+                                            unlock_password_problem)
+            problem = unlock_password_problem()
+        except Exception:
+            problem = ""
+        if problem == PROBLEM_UNDECRYPTABLE:
+            reason = ("local unlock password is set but could not be decrypted on this "
+                      "machine -- nothing delivered")
+        else:
+            reason = "no local unlock password configured (.env unset) -- nothing delivered"
+        say("[reunlock] REFUSED for %r: %s" % (name or "*", reason))
+        return {"ts": time.time(), "target": name or "*", "ok": False,
+                "delivered": 0, "reason": reason}
+
+    msgs = []
+
+    def _capture(m):
+        msgs.append(m)
+        say(m)
+
+    item = {"worker": name, "text": UNLOCK_PREFIX % pw}
+    delivered = deliver_steers(item, workers, log=_capture, enqueue=enqueue)
+    ok = delivered > 0
+    reason = "; ".join(msgs)[-400:]
+    if not reason:
+        reason = "delivered" if ok else "not delivered (see fleet console log)"
+    return {"ts": time.time(), "target": name or "*", "ok": ok,
+            "delivered": delivered, "reason": reason}
+
+
 def report_status(o):
     """The reported status for an outcome, from the closed set in relay/outcomes.py.
 
@@ -1000,7 +1074,8 @@ def _close_idle_copilot_pages(context) -> int:
 
 
 def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paused=False,
-              ram_floor_mb=0.0, directive="", run_label="", goal_count=0, queued=0):
+              ram_floor_mb=0.0, directive="", run_label="", goal_count=0, queued=0,
+              reunlock=None):
     from relay.relay_fleet import free_disk_gb
     total = len(workers)        # dynamic: goals can be added mid-run (native chat queue)
     done = sum(1 for w in workers if w.status in TERMINAL)
@@ -1042,6 +1117,13 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         # environment and downstream services may impose lower ones, so refusals arriving under
         # the line mean the line is the wrong line, not that the gauge is broken.
         "quota": _quota_snapshot(),
+        # THE FALLBACK BUTTON'S OWN RECEIPT. None until a {"reunlock":...} command has been
+        # applied at least once this run; after that,
+        # {"ts","target","ok","delivered","reason"} from apply_reunlock -- so "I pressed the
+        # button and nothing happened" has an answer on this same screen instead of nowhere.
+        # NEVER a password: apply_reunlock builds "reason" only from deliver_steers' own log
+        # lines, which never format the turn text.
+        "reunlock": reunlock,
         # Fleet-level directive (Bucket B): the single authoritative goal text when this run
         # was started from exactly one goal; "" when there are multiple independent goals (the
         # UI already handles multi-goal honestly and should NOT fabricate a summary). Only
@@ -2128,6 +2210,9 @@ def main():
     pause_box = [False]                # cockpit pause toggle: freeze the fleet without losing
                                        # state (e.g. across a network switch); resume to continue
     stop_box = [False]                 # cockpit graceful-stop: cancel all workers and end the run
+    reunlock_box = [None]               # last {"reunlock":...} outcome -- see apply_reunlock;
+                                       # surfaced in status.json so the operator can tell whether
+                                       # the button worked rather than watching silence
 
     def _drain_commands(workers):
         # cockpit -> fleet control channel. {"close":["w2"], "set_maxtabs":5}. Consume.
@@ -2185,6 +2270,16 @@ def main():
             # steering: {"steer": {"worker":"w0","text":"..."}} or a list of such
             if cmd.get("steer") is not None:
                 deliver_steers(cmd["steer"], workers, enqueue=add_box.append)
+            # THE FALLBACK BUTTON: {"reunlock": "w0"} (or "" / "*" for every live worker)
+            # re-delivers the unlock turn ON DEMAND, for when the automatic recovery in
+            # relay_fleet (UNLOCK_PREFIX % password injected into a worker's first turn,
+            # plus the lock-refusal heuristic that retries it) never fired or missed a
+            # later refusal. See apply_reunlock's docstring for the incident. The result
+            # is kept for status.json rather than only printed, because a command that
+            # silently did nothing is the exact failure this exists to remove.
+            if "reunlock" in cmd:
+                reunlock_box[0] = apply_reunlock(cmd.get("reunlock"), workers,
+                                                 enqueue=add_box.append)
             # native chat / cockpit queued a new goal into the running fleet
             for g in goals_from_command(cmd):
                 add_box.append(g)
@@ -2311,7 +2406,8 @@ def main():
                                                  # goals accepted but not yet workers --
                                                  # a split's children live here until the
                                                  # next sweep admits them.
-                                                 queued=len(add_box or [])))
+                                                 queued=len(add_box or []),
+                                                 reunlock=reunlock_box[0]))
         except Exception:
             pass
         _print_table(workers)
