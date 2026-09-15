@@ -545,6 +545,7 @@ jobs:
             relay/test_refuter_unverifiable.py \
             relay/test_retry_trigger.py \
             relay/test_every_refusal_the_server_can_speak_is_one_the_fleet_can_hear.py \
+            relay/test_when_a_marker_is_too_long_to_trust_ask_the_worker.py \
             relay/test_unlock_keeps_the_planner.py \
             relay/test_unverifiable_turn_cap.py \
             relay/test_settings_round_trip.py \
