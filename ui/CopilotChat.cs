@@ -12,6 +12,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.IO.Compression;
 using System.Net;
 using System.Text;
 using System.Threading;
@@ -673,6 +674,9 @@ class ChatWindow : Window
         openTimer.Start();
         SetDot("idle");   // optimistic idle at launch; the first ProbeBridge tick confirms/corrects
         SyncRegistry();
+        // Dispose the transcript watcher on exit -- a FileSystemWatcher left running past window
+        // close is a leaked OS handle, not just a leaked object.
+        Closed += delegate { StopFollowingTranscript(); };
     }
 
     string _openPath; long _openMtime;
@@ -727,6 +731,218 @@ class ChatWindow : Window
     Border _statusBand;
     TextBlock _statusText;
 
+    // ── live-follow of the OPEN fleet transcript ─────────────────────────────────────────
+    //
+    // "別のを開いて開きなおさないと現行のが見えない" -- the operator should never have to
+    // leave and come back to see a running conversation's new turns. status.json's mtime-poll
+    // (CheckFleetSnapshot, above) already re-renders a live snapshot, but it is keyed to the
+    // WHOLE fleet's status file and a 20s "is this fresh" heuristic that can go stale while a
+    // worker is genuinely still writing. This instead watches the ONE open transcript file
+    // directly with a FileSystemWatcher and appends bytes as they land -- no tick, no re-read
+    // of anything but the new tail, and it can never fight over what is "new" with the status
+    // poll because every line it renders is folded into _fleetTurnSigs, which the status poll
+    // treats as "already on screen".
+    FileSystemWatcher _txWatcher;          // non-null while a transcript is being followed
+    string _txWatchPath;                   // full path of the plain .jsonl being followed
+    string _txWatchConvKey;                // Conversation.ConvUrl this follow belongs to -- a
+                                            // stale callback for a conversation the user has
+                                            // since left is dropped rather than misapplied
+    long _txReadOffset;                    // bytes of _txWatchPath already consumed
+    byte[] _txPartialLine = new byte[0];   // trailing bytes not yet terminated by '\n'
+    readonly object _txFollowLock = new object();  // serializes catch-up passes
+    volatile bool _txRecheckQueued;                // another change arrived while one was running
+
+    // Begin following 'path' for appends, starting from byte offset 'fromOffset' (the length
+    // already rendered on screen, so nothing already shown is re-emitted). 'convKey' is the
+    // Conversation.ConvUrl this follow belongs to; a callback only applies its result while
+    // _conv still matches it. Any previous follow is torn down first -- exactly one transcript
+    // is ever watched at a time. A '.gz' path (fleet_retention already archived it) or a
+    // missing directory is a no-op: there is nothing left that could still grow.
+    void StartFollowingTranscript(string path, long fromOffset, string convKey)
+    {
+        StopFollowingTranscript();
+        try
+        {
+            if (string.IsNullOrEmpty(path)) return;
+            if (path.EndsWith(".gz", StringComparison.OrdinalIgnoreCase)) return;
+            string dir = Path.GetDirectoryName(path);
+            string file = Path.GetFileName(path);
+            if (string.IsNullOrEmpty(dir) || string.IsNullOrEmpty(file) || !Directory.Exists(dir)) return;
+            _txWatchPath = path;
+            _txWatchConvKey = convKey ?? "";
+            _txReadOffset = fromOffset > 0 ? fromOffset : 0;
+            _txPartialLine = new byte[0];
+            var w = new FileSystemWatcher(dir, file);
+            w.NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.FileName;
+            w.Changed += OnTranscriptFileEvent;
+            w.Created += OnTranscriptFileEvent;
+            w.Renamed += OnTranscriptFileEvent;
+            // fleet_retention deletes the plain file once it has gzipped it -- that is the normal,
+            // quiet end of a follow, handled inside ConsumeFollowedTranscriptOnce (File.Exists check),
+            // not treated as an error here.
+            w.Deleted += OnTranscriptFileEvent;
+            w.Error += delegate { Dispatcher.BeginInvoke(new Action(delegate { if (_txWatchPath == path) StopFollowingTranscript(); })); };
+            w.EnableRaisingEvents = true;
+            _txWatcher = w;
+        }
+        catch { StopFollowingTranscript(); }
+    }
+
+    // Tear down the current follow, if any. Safe to call when nothing is being followed.
+    void StopFollowingTranscript()
+    {
+        var w = _txWatcher;
+        _txWatcher = null; _txWatchPath = null; _txWatchConvKey = null;
+        _txReadOffset = 0; _txPartialLine = new byte[0];
+        if (w == null) return;
+        try { w.EnableRaisingEvents = false; } catch { }
+        try
+        {
+            w.Changed -= OnTranscriptFileEvent; w.Created -= OnTranscriptFileEvent;
+            w.Renamed -= OnTranscriptFileEvent; w.Deleted -= OnTranscriptFileEvent;
+        }
+        catch { }
+        try { w.Dispose(); } catch { }
+    }
+
+    // FileSystemWatcher fires on a threadpool thread, in bursts, and can fire before the
+    // writer's flush lands -- so this never assumes the event means "a whole new line is ready".
+    // It just means "go look again"; ConsumeFollowedTranscriptOnce does the actual, safe read.
+    void OnTranscriptFileEvent(object sender, FileSystemEventArgs e)
+    {
+        // Serialize catch-up passes instead of running them concurrently: if one is already in
+        // flight, mark that another look is needed and let IT pick up the new bytes when done,
+        // rather than piling up threadpool threads racing the same file/offset.
+        if (!Monitor.TryEnter(_txFollowLock)) { _txRecheckQueued = true; return; }
+        try
+        {
+            do { _txRecheckQueued = false; ConsumeFollowedTranscriptOnce(); }
+            while (_txRecheckQueued);
+        }
+        finally { Monitor.Exit(_txFollowLock); }
+    }
+
+    static byte[] Combine(byte[] a, byte[] b)
+    {
+        if (a == null || a.Length == 0) return b ?? new byte[0];
+        if (b == null || b.Length == 0) return a;
+        byte[] r = new byte[a.Length + b.Length];
+        Buffer.BlockCopy(a, 0, r, 0, a.Length);
+        Buffer.BlockCopy(b, 0, r, a.Length, b.Length);
+        return r;
+    }
+
+    // Read exactly the bytes appended since the last pass, parse whatever complete JSONL lines
+    // they contain, and append those as messages -- never re-reads or re-renders anything
+    // already on screen. Runs on the watcher's threadpool thread; only the UI application at
+    // the end is marshaled onto the dispatcher.
+    void ConsumeFollowedTranscriptOnce()
+    {
+        string path = _txWatchPath;
+        string convKey = _txWatchConvKey;
+        if (string.IsNullOrEmpty(path)) return;
+        var newMsgs = new List<Msg>();
+        try
+        {
+            if (!File.Exists(path))
+            {
+                // The run finished and fleet_retention gzipped (and deleted) the plain file, or it
+                // otherwise vanished. That is not an error -- just the quiet end of this follow.
+                Dispatcher.BeginInvoke(new Action(delegate { if (_txWatchPath == path) StopFollowingTranscript(); }));
+                return;
+            }
+            byte[] chunk;
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                long len = fs.Length;
+                if (len < _txReadOffset) { _txReadOffset = 0; _txPartialLine = new byte[0]; }  // truncated/replaced -- resync
+                long toRead = len - _txReadOffset;
+                if (toRead <= 0) return;   // nothing new since last pass
+                fs.Seek(_txReadOffset, SeekOrigin.Begin);
+                chunk = new byte[toRead];
+                int off = 0;
+                while (off < chunk.Length)
+                {
+                    int n = fs.Read(chunk, off, chunk.Length - off);
+                    if (n <= 0) break;   // read landed mid-flush -- whatever we got becomes the new partial tail
+                    off += n;
+                }
+                if (off < chunk.Length) Array.Resize(ref chunk, off);
+                _txReadOffset += off;
+            }
+
+            // Split at the BYTE level, not after decoding the whole chunk as UTF8: 0x0A never
+            // appears as a continuation byte of a multi-byte UTF-8 sequence, so a segment between
+            // two 0x0A bytes is always a complete, independently-decodable run of characters --
+            // decoding a still-partial multi-byte tail is exactly the corruption this avoids.
+            byte[] all = Combine(_txPartialLine, chunk);
+            int start = 0;
+            for (int i = 0; i < all.Length; i++)
+            {
+                if (all[i] != (byte)'\n') continue;
+                int lineLen = i - start;
+                if (lineLen > 0 && all[start + lineLen - 1] == (byte)'\r') lineLen--;   // CRLF -> LF
+                string ln = Encoding.UTF8.GetString(all, start, lineLen);
+                Msg m;
+                if (TryParseTranscriptLine(ln, out m)) newMsgs.Add(m);
+                start = i + 1;
+            }
+            // Whatever follows the last '\n' (possibly nothing) is an incomplete line -- buffered
+            // verbatim and left UNPARSED until the rest of it arrives on a later pass.
+            int remain = all.Length - start;
+            var partial = new byte[remain];
+            if (remain > 0) Array.Copy(all, start, partial, 0, remain);
+            _txPartialLine = partial;
+        }
+        catch (IOException) { return; }   // writer holds the range mid-flush; the next event retries
+        catch { return; }
+
+        if (newMsgs.Count == 0) return;
+        Dispatcher.BeginInvoke(new Action(delegate
+        {
+            // The open conversation may have changed since this pass started; apply the result
+            // only to the SAME one this follow was started for.
+            if (_txWatchPath != path || _conv == null || _conv.ConvUrl != convKey) return;
+            foreach (var m in newMsgs)
+            {
+                if (m.Role == "U") AddUser(m.Text); else AddAssistant(m.Text);
+                _conv.Messages.Add(m);
+                // Keep the status-poll's own diff baseline in sync so its next tick sees these
+                // lines as already-rendered, instead of re-appending or rebuilding over them.
+                _fleetTurnSigs.Add(m.Role + "" + m.Text);
+            }
+        }));
+    }
+
+    // Resume/stop following the ONE fleet transcript that matches the just-opened conversation.
+    // Called every time a conversation is put on screen (from OpenFromFleet, from re-opening an
+    // already-cached fleet conversation, and from the startup restore) so a watcher never lingers
+    // on a conversation the user has left, and one is (re)armed whenever the newly-opened one is
+    // still a live-tracked fleet worker with an on-disk, not-yet-archived transcript.
+    void MaybeFollowConversation(Conversation c, string transcriptHint)
+    {
+        try
+        {
+            string key = c != null ? (c.ConvUrl ?? "") : "";
+            var wkr = ReadFleetWorker(key);
+            if (wkr == null) { StopFollowingTranscript(); return; }
+            string tp = SS(wkr, "transcript");
+            if (string.IsNullOrEmpty(tp)) tp = transcriptHint;
+            if (string.IsNullOrEmpty(tp) && c != null && !string.IsNullOrEmpty(c.Name))
+                tp = NewestTranscriptForWorker(c.Name);
+            if (string.IsNullOrEmpty(tp) || tp.EndsWith(".gz", StringComparison.OrdinalIgnoreCase))
+            { StopFollowingTranscript(); return; }
+            long startOff = 0;
+            try { if (File.Exists(tp)) startOff = new FileInfo(tp).Length; } catch { }
+            // Sync the status-poll's diff baseline to exactly what is already on screen, so its
+            // next tick does not treat this fresh follow's starting point as something to append.
+            _fleetTurnSigs = new List<string>();
+            if (c != null) foreach (var m in c.Messages) _fleetTurnSigs.Add(m.Role + "" + m.Text);
+            StartFollowingTranscript(tp, startOff, key);
+        }
+        catch { StopFollowingTranscript(); }
+    }
+
     static string SS(Dictionary<string, object> d, string k)
     { return (d.ContainsKey(k) && d[k] != null) ? d[k].ToString() : ""; }
 
@@ -761,10 +977,73 @@ class ChatWindow : Window
         return null;
     }
 
+    // relay/fleet_retention.py::compress() gzips any transcript older than COMPRESS_AFTER_HOURS
+    // (default 6h) to "<name>.jsonl.gz" and DELETES the plain file -- introduced 2026-09-01. This
+    // reader was never updated, so every one of the three lookups below used to see only the last
+    // few hours of transcripts and silently drop the rest (no error, just an empty-looking history).
+    // These three helpers are the single place that knows about both name shapes; every call site
+    // routes through them so the bug class can't reappear one glob at a time.
+    //
+    // Strip a trailing ".gz" to get the logical (uncompressed) transcript identity, so a plain file
+    // and its compressed successor are recognised as the SAME transcript.
+    static string StripGz(string path)
+    {
+        return (path != null && path.EndsWith(".gz", StringComparison.OrdinalIgnoreCase))
+            ? path.Substring(0, path.Length - 3) : path;
+    }
+
+    // True if the transcript exists on disk in EITHER form (plain or gzipped), regardless of
+    // which spelling the caller has.
+    static bool TranscriptFileExists(string path)
+    {
+        if (string.IsNullOrEmpty(path)) return false;
+        if (File.Exists(path)) return true;
+        return path.EndsWith(".gz", StringComparison.OrdinalIgnoreCase)
+            ? File.Exists(StripGz(path)) : File.Exists(path + ".gz");
+    }
+
+    // Enumerate every transcript in tdir, merging "*.jsonl" and "*.jsonl.gz" into one list
+    // deduped by logical name (StripGz) -- when both spellings exist for the same transcript
+    // (a race with fleet_retention mid-compress), the plain file wins the slot.
+    static List<string> ListTranscriptFiles(string tdir)
+    {
+        var byKey = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var raw = new List<string>(Directory.GetFiles(tdir, "*.jsonl"));
+        raw.AddRange(Directory.GetFiles(tdir, "*.jsonl.gz"));
+        foreach (var f in raw)
+        {
+            string key = StripGz(f);
+            string existing;
+            bool fIsGz = f.EndsWith(".gz", StringComparison.OrdinalIgnoreCase);
+            if (!byKey.TryGetValue(key, out existing) || (!fIsGz && existing.EndsWith(".gz", StringComparison.OrdinalIgnoreCase)))
+                byKey[key] = f;
+        }
+        return new List<string>(byKey.Values);
+    }
+
+    // Open a transcript for reading regardless of compression: resolves to whichever of
+    // path/path+".gz" actually exists on disk (a caller may hand either spelling), then wraps the
+    // stream in GZipStream when needed. Every read of a transcript's bytes must go through this --
+    // see relay/fleet_retention.py::open_maybe_gz(), whose docstring says readers must not have to
+    // know about compression. This is that contract kept on the C# side.
+    static StreamReader OpenTranscriptReader(string path)
+    {
+        string actual = path;
+        if (!File.Exists(actual))
+        {
+            actual = actual.EndsWith(".gz", StringComparison.OrdinalIgnoreCase) ? StripGz(actual) : actual + ".gz";
+        }
+        var fsr = new FileStream(actual, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        if (actual.EndsWith(".gz", StringComparison.OrdinalIgnoreCase))
+            return new StreamReader(new GZipStream(fsr, CompressionMode.Decompress), Encoding.UTF8);
+        return new StreamReader(fsr, Encoding.UTF8);
+    }
+
     // Locate a worker's on-disk transcript by NAME, independent of the live status.json worker
-    // entry. Transcripts are named "<runid>_a<agent>_w<N>.jsonl" and OUTLIVE the live worker dict,
-    // so this lets click-to-open load the full conversation for a finished/restarted/history worker
-    // (when ReadFleetWorker returns null) instead of falling back to the "not available" placeholder.
+    // entry. Transcripts are named "<runid>_a<agent>_w<N>.jsonl" (or "...jsonl.gz" once
+    // fleet_retention compresses it) and OUTLIVE the live worker dict, so this lets click-to-open
+    // load the full conversation for a finished/restarted/history worker (when ReadFleetWorker
+    // returns null) instead of falling back to the "not available" placeholder.
     // Returns the NEWEST matching file (the latest run for that worker), or "" if none.
     string NewestTranscriptForWorker(string worker)
     {
@@ -774,10 +1053,14 @@ class ChatWindow : Window
             string tdir = Path.Combine(Path.GetDirectoryName(_convsPath), "transcripts");
             if (!Directory.Exists(tdir)) return "";
             string suffix = "_" + worker + ".jsonl";   // exact suffix: "w1" must not match "w10"
+            string gzSuffix = suffix + ".gz";
             string newest = null; DateTime best = DateTime.MinValue;
-            foreach (string f in Directory.GetFiles(tdir, "*" + suffix))
+            var candidates = new List<string>(Directory.GetFiles(tdir, "*" + suffix));
+            candidates.AddRange(Directory.GetFiles(tdir, "*" + gzSuffix));
+            foreach (string f in candidates)
             {
-                if (!Path.GetFileName(f).EndsWith(suffix, StringComparison.Ordinal)) continue;
+                string name = Path.GetFileName(f);
+                if (!(name.EndsWith(suffix, StringComparison.Ordinal) || name.EndsWith(gzSuffix, StringComparison.Ordinal))) continue;
                 DateTime t = File.GetLastWriteTimeUtc(f);
                 if (t > best) { best = t; newest = f; }
             }
@@ -825,40 +1108,49 @@ class ChatWindow : Window
     List<Msg> ReadTranscript(string path)
     {
         var msgs = new List<Msg>();
-        if (string.IsNullOrEmpty(path) || !File.Exists(path)) return msgs;
+        if (string.IsNullOrEmpty(path) || !TranscriptFileExists(path)) return msgs;
         try
         {
             string[] lines;
-            using (var fsr = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-            using (var sr = new StreamReader(fsr, Encoding.UTF8))
+            using (var sr = OpenTranscriptReader(path))
                 lines = sr.ReadToEnd().Replace("\r", "").Split('\n');
             foreach (string ln in lines)
             {
-                if (string.IsNullOrEmpty(ln)) continue;
-                Dictionary<string, object> o;
-                try { o = _cjs.DeserializeObject(ln) as Dictionary<string, object>; }
-                catch { continue; }
-                if (o == null) continue;
-                if (!o.ContainsKey("role")) continue;   // skip meta / guid marker lines
-                string role = o["role"] != null ? o["role"].ToString() : "assistant";
-                string text = (o.ContainsKey("text") && o["text"] != null) ? o["text"].ToString() : "";
-                // NOT EVERY RECORDED ROLE IS A TURN. The test was `role.StartsWith("user") ? "U"
-                // : "A"`, so EVERYTHING that was not a user line became an assistant line --
-                // including `metric`, which the fleet writes with an empty text. Those rendered
-                // as a "Copilot" label with nothing under it, and a reader looking for what the
-                // agent said mid-run found a blank where the answer should be. Reported as
-                // "copilotの分が途中のが表示されないケースが".
-                //
-                // Asked as "is this a turn with something in it", because that is the question:
-                // a role nobody has seen before should be shown if it carries text, and an empty
-                // record of any role is bookkeeping, not speech.
-                if (role == "metric" || role == "meta" || role == "guid" || role == "note") continue;
-                if (text.Trim().Length == 0) continue;
-                msgs.Add(new Msg(role.StartsWith("user") ? "U" : "A", text));
+                Msg m;
+                if (TryParseTranscriptLine(ln, out m)) msgs.Add(m);
             }
         }
         catch { }
         return msgs;
+    }
+
+    // One JSONL transcript line -> a turn, or nothing. Shared by the full read above and the
+    // incremental live-follow below so the two can never disagree about what counts as a turn.
+    //
+    // NOT EVERY RECORDED ROLE IS A TURN. The test used to be `role.StartsWith("user") ? "U" :
+    // "A"`, so EVERYTHING that was not a user line became an assistant line -- including
+    // `metric`, which the fleet writes with an empty text. Those rendered as a "Copilot" label
+    // with nothing under it, and a reader looking for what the agent said mid-run found a blank
+    // where the answer should be. Reported as "copilotの分が途中のが表示されないケースが".
+    //
+    // Asked as "is this a turn with something in it", because that is the question: a role
+    // nobody has seen before should be shown if it carries text, and an empty record of any
+    // role is bookkeeping, not speech.
+    bool TryParseTranscriptLine(string ln, out Msg msg)
+    {
+        msg = null;
+        if (string.IsNullOrEmpty(ln)) return false;
+        Dictionary<string, object> o;
+        try { o = _cjs.DeserializeObject(ln) as Dictionary<string, object>; }
+        catch { return false; }
+        if (o == null) return false;
+        if (!o.ContainsKey("role")) return false;   // skip meta / guid marker lines
+        string role = o["role"] != null ? o["role"].ToString() : "assistant";
+        string text = (o.ContainsKey("text") && o["text"] != null) ? o["text"].ToString() : "";
+        if (role == "metric" || role == "meta" || role == "guid" || role == "note") return false;
+        if (text.Trim().Length == 0) return false;
+        msg = new Msg(role.StartsWith("user") ? "U" : "A", text);
+        return true;
     }
 
     // Append any captured sub-agent (research) conversations for this worker. Each deep-dive is
@@ -1383,6 +1675,10 @@ class ChatWindow : Window
                 reload.Click += delegate { new Thread((ThreadStart)delegate { OpenFromFleet(url, worker, transcriptHint); }) { IsBackground = true }.Start(); };
                 noTxContent.Children.Add(reload);
             }
+            // Follow this transcript's tail live from here on -- appends land as they are
+            // written, no re-open needed to see them. No-ops (and stops any previous follow)
+            // when this worker is no longer live-tracked or its transcript is already archived.
+            MaybeFollowConversation(c, transcriptPath);
             RefreshConvList();
             RefreshSteerVisual();   // tint the input border if this is a live steerable worker
             StickToEnd();
@@ -3304,12 +3600,14 @@ class ChatWindow : Window
         _emptyState = null;             // cleared with the children above; rebuild fresh below
         ShowEmptyState();               // fresh chat -> show the empty state again
         _activeFleetUrl = null; ShowRunState(null); RefreshSteerVisual();
+        StopFollowingTranscript();      // a brand-new chat has nothing to live-follow
         RefreshConvList();
         _input.Focus();
     }
 
     void OpenConversation(Conversation c)
     {
+        StopFollowingTranscript();      // leaving whatever was open -- its watcher must not linger
         _conv = c;
         // Persist which conversation is open NOW. SaveSettings only ran on theme / language /
         // zoom / sidebar changes, so nothing recorded the active conversation and the restore
@@ -3362,6 +3660,11 @@ class ChatWindow : Window
         }
         _activeFleetUrl = null; ShowRunState(null); RefreshSteerVisual();   // a normal local conversation is NOT steer mode
         foreach (var m in c.Messages) { if (m.Role == "U") AddUser(m.Text); else AddAssistant(m.Text); }
+        // Re-arm live-follow for a re-opened fleet conversation whose messages were already
+        // cached in 'c' -- without this, switching away and back would need a poll tick to
+        // resume showing new turns, which is the exact defect this feature exists to remove.
+        // A no-op (and stays stopped) for a plain local chat or a worker no longer live-tracked.
+        MaybeFollowConversation(c, c.Transcript);
         RefreshConvList();
         if (!string.IsNullOrEmpty(c.ConvUrl))
             new Thread((ThreadStart)delegate
@@ -3453,7 +3756,7 @@ class ChatWindow : Window
                 if (next < 0) next = 0;
                 OpenConversation(_all[next]);
             }
-            else { _conv = new Conversation(); _all.Add(_conv); _messages.Children.Clear(); }
+            else { StopFollowingTranscript(); _conv = new Conversation(); _all.Add(_conv); _messages.Children.Clear(); }
         }
         RefreshConvList();
     }
@@ -3721,7 +4024,7 @@ class ChatWindow : Window
                         if (_renamingId == c.Id) _renamingId = null;
                         _all.Remove(c);
                         if (!string.IsNullOrEmpty(c.ConvUrl)) deletedUrls.Add(c.ConvUrl);
-                        if (_conv.Id == c.Id) { _conv = new Conversation(); _messages.Children.Clear(); }
+                        if (_conv.Id == c.Id) { StopFollowingTranscript(); _conv = new Conversation(); _messages.Children.Clear(); }
                     }));
                     deleted++;
                     if (!localOnly && !string.IsNullOrEmpty(c.ConvUrl))
@@ -3750,7 +4053,7 @@ class ChatWindow : Window
                 {
                     UnregisterConvs(deletedUrls);
                     if (sidebarChanged[0]) SaveSidebarState();   // persist pinned/archived/forcedToday purge once
-                    if (_all.Count == 0) { _conv = new Conversation(); _all.Add(_conv); _messages.Children.Clear(); }
+                    if (_all.Count == 0) { StopFollowingTranscript(); _conv = new Conversation(); _all.Add(_conv); _messages.Children.Clear(); }
                     RefreshConvList();
                     rebuild[0]();
                     string summary = (_lang == 0)
@@ -4924,6 +5227,10 @@ class ChatWindow : Window
             }
             _conv = want;
             foreach (var m in _conv.Messages) { if (m.Role == "U") AddUser(m.Text); else AddAssistant(m.Text); }
+            // Resume live-follow for whatever was open at last exit, if it is still a
+            // live-tracked fleet worker -- otherwise the operator would have to touch the
+            // sidebar once just to re-arm updates for the conversation already on screen.
+            MaybeFollowConversation(_conv, _conv.Transcript);
         }
         else { _conv = new Conversation(); _all.Add(_conv); }
         ShowEmptyState();        // no-op if the active conversation rendered any real message
@@ -4941,7 +5248,10 @@ class ChatWindow : Window
         {
             string tdir = Path.Combine(Path.GetDirectoryName(_convsPath), "transcripts");
             if (!Directory.Exists(tdir)) return;
-            var files = new List<string>(Directory.GetFiles(tdir, "*.jsonl"));
+            // Merged glob: relay/fleet_retention.py gzips anything older than
+            // COMPRESS_AFTER_HOURS and deletes the plain file, so "*.jsonl" alone only ever
+            // shows the last few hours. See ListTranscriptFiles for the dedupe rule.
+            var files = ListTranscriptFiles(tdir);
             files.Sort(delegate (string a, string b) { return File.GetLastWriteTimeUtc(b).CompareTo(File.GetLastWriteTimeUtc(a)); });
             int budget = 80;
             foreach (var f in files)
@@ -4949,12 +5259,12 @@ class ChatWindow : Window
                 if (budget-- <= 0) break;
                 if (f.IndexOf("__sub_", StringComparison.Ordinal) >= 0) continue;   // research children
                 bool exists = false;
-                foreach (var c in _all) if (c.Transcript == f) { exists = true; break; }
+                foreach (var c in _all) if (StripGz(c.Transcript) == StripGz(f)) { exists = true; break; }
                 if (exists) continue;
                 string goal = "", name = "", guid = "";
                 try
                 {
-                    using (var sr = new StreamReader(f, Encoding.UTF8))
+                    using (var sr = OpenTranscriptReader(f))
                     {
                         string first = sr.ReadLine();
                         if (!string.IsNullOrEmpty(first))
@@ -4980,7 +5290,7 @@ class ChatWindow : Window
                 }
                 catch { }
                 string title = goal.Length > 0 ? (goal.Length > 54 ? goal.Substring(0, 54) + "…" : goal)
-                                               : Path.GetFileNameWithoutExtension(f);
+                                               : Path.GetFileNameWithoutExtension(StripGz(f));
                 double ts = 0;
                 try { ts = (File.GetLastWriteTimeUtc(f) - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds; }
                 catch { }
