@@ -46,6 +46,8 @@ from .screen_capture import make_process_dpi_aware, virtual_screen
 from .screen_frame import Frame
 
 _user32 = ctypes.windll.user32
+_user32.OpenInputDesktop.restype = wintypes.HANDLE
+_user32.GetForegroundWindow.restype = wintypes.HWND
 
 INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
@@ -197,24 +199,85 @@ _user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int
 _user32.SendInput.restype = wintypes.UINT
 
 
+def input_desktop_name() -> str:
+    """The name of the desktop that currently RECEIVES INPUT, or "" if it cannot be read.
+
+    "Default" is an ordinary interactive session. "Winlogon" is the lock screen or a UAC
+    prompt on the secure desktop, where nothing this process sends will arrive.
+
+    A HANDLE IS NOT THE ANSWER, WHICH IS WHY THIS RETURNS A NAME. The first version of this
+    check treated OpenInputDesktop succeeding as "not locked". Sampled on 2026-09-15 while
+    the lock screen was the foreground window and GetForegroundWindow() returned 0, the call
+    still handed back a handle -- so the handle says nothing and only the name does.
+    """
+    try:
+        h = _user32.OpenInputDesktop(0, False, 0x0001)  # DESKTOP_READOBJECTS
+        if not h:
+            return ""
+        try:
+            need = wintypes.DWORD()
+            _user32.GetUserObjectInformationW(h, 2, None, 0, ctypes.byref(need))
+            buf = ctypes.create_unicode_buffer(max(2, need.value))
+            if not _user32.GetUserObjectInformationW(h, 2, buf, need.value,
+                                                     ctypes.byref(need)):
+                return ""
+            return buf.value
+        finally:
+            _user32.CloseDesktop(h)
+    except Exception:
+        return ""
+
+
+def _foreground_description() -> str:
+    """Title and class of whatever is in front, or a note that there is nothing."""
+    try:
+        hwnd = _user32.GetForegroundWindow()
+        if not hwnd:
+            return ("no foreground window at all, which happens on the lock screen and "
+                    "during a UAC prompt")
+        n = _user32.GetWindowTextLengthW(hwnd)
+        title = ctypes.create_unicode_buffer(n + 1)
+        _user32.GetWindowTextW(hwnd, title, n + 1)
+        cls = ctypes.create_unicode_buffer(256)
+        _user32.GetClassNameW(hwnd, cls, 256)
+        return "%r (class %s)" % (title.value or "(untitled)", cls.value)
+    except Exception:
+        return "unreadable"
+
+
 def _send(*inputs: INPUT) -> int:
     """Send a batch atomically. Returns how many the OS accepted.
 
-    A short count is not a detail to swallow: SendInput refuses silently when the
-    target window is at a higher integrity level than this process (an elevated
-    app, the UAC dialog, the secure desktop), and a caller that ignored the count
-    would report success for keystrokes nobody received.
+    A short count is not a detail to swallow: SendInput refuses silently when the input
+    cannot reach its target, and a caller that ignored the count would report success for
+    keystrokes nobody received.
+
+    THE MESSAGE REPORTS, IT DOES NOT DIAGNOSE. It used to name one cause -- an elevated
+    foreground window -- and on 2026-09-15 a worker believed it, spent six identical retries,
+    and asked a human to "resolve the foreground window" while the thing in front was the
+    lock screen, which runs BELOW this process rather than above it. A confident wrong cause
+    is worse than none: it sent a person to fix something that was not broken.
+
+    So this states the two facts that are readable at the moment of refusal -- which desktop
+    receives input, and what is in front -- and names both known causes without choosing
+    between them. A reader with those two facts can tell them apart immediately; this
+    function, from inside the failure, demonstrably could not.
     """
     n = len(inputs)
     arr = (INPUT * n)(*inputs)
     sent = _user32.SendInput(n, arr, ctypes.sizeof(INPUT))
     if sent != n:
+        err = ctypes.get_last_error() if hasattr(ctypes, "get_last_error") else 0
+        desk = input_desktop_name() or "unreadable"
         raise InputRefused(
-            "Windows accepted %d of %d inputs (error %d). The usual cause is that the "
-            "focused window runs at a higher integrity level than this process -- an "
-            "elevated application, a UAC prompt, or the secure desktop -- which no "
-            "amount of retrying will change."
-            % (sent, n, ctypes.get_last_error() if hasattr(ctypes, "get_last_error") else 0))
+            "Windows accepted %d of %d inputs (error %d). Input desktop: %s. In front: %s. "
+            "Retrying unchanged will not help -- SendInput is refusing, not failing. Either "
+            "the session is locked or on the secure desktop (input desktop 'Winlogon', or no "
+            "foreground window), in which case somebody has to sign in at the machine; or "
+            "the foreground window runs at a higher integrity level than this process (an "
+            "elevated application, a UAC prompt), in which case bringing an ordinary window "
+            "to the front is enough. The two facts above say which."
+            % (sent, n, err, desk, _foreground_description()))
     return sent
 
 
