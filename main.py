@@ -195,8 +195,11 @@ mcp = FastMCP(
         # 「この環境にファイルシステムのツールは無い」と断定して拒否した。差はそこだけ
         # だったので、一覧取得を「推奨」ではなく「最初の行動」として書き切る。
         "RULE 1 -- DO THIS FIRST, ALWAYS: call call_tool(name='') and read the returned "
-        "catalogue (about 160 entries) BEFORE answering anything about what you can or "
-        "cannot do. This is not optional and not a fallback. "
+        "index BEFORE answering anything about what you can or cannot do. It is a short "
+        "list of CATEGORIES, not every tool: call_tool(name='<category>') opens one, and "
+        "call_tool(name='<tool>') shows that tool's parameters. A name that is neither "
+        "comes back with the closest matches, so a near miss is one more call rather than "
+        "a dead end. This is not optional and not a fallback. "
         # 実測: 「MT18EX5 RM の期限切れを調べて」の一言を投げたら、承認済みの手順が
         # あるのに skill_match を呼ばず、DB を自分で叩いて別解を作文した。もっともらしいが
         # 問い自体がすり替わっていた（材料の期限切れの話になり、本来の「期限を過ぎてから
@@ -524,16 +527,46 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
             # 4,100. Nothing is removed: 115 tools have never been called, but the ledger is
             # almost all coding runs, so they were never NEEDED rather than found wanting.
             # See tools/tool_catalogue.py.
+            # AND THEN IT BECAME THE THING ITS READERS COULD NOT READ. The flat list grew
+            # to 16,594 characters -- about 6,600 tokens -- and RULE 1 orders every agent to
+            # fetch it first. Measured over six hours of the ledger, 1,716 calls: 112
+            # catalogue fetches (1,858,528 characters into conversations), 76 names guessed
+            # and missed, 78 signature lookups after the fact. 266 calls, 15.4% of
+            # everything, spent working out what to call. One single turn contained
+            # seventeen consecutive unknown names: the agent had read the catalogue and
+            # still could not find what it needed.
+            #
+            # So it is an index now: 12 categories, one line each, keeping the MOST USED
+            # block because the same ledger says round trips are the expensive part. 16,594
+            # characters becomes 4,445, and a category costs 2,270 at its largest.
             from tools import tool_catalogue as _tc
-            _catalogue = _tc.render(_ALL_TOOLS)
+            _catalogue = _tc.render_index(_ALL_TOOLS)
             _log_discovery("call_tool.catalogue",
-                           {"tools": len(_ALL_TOOLS), "with_signatures": len(_tc.HOT)},
+                           {"tools": len(_ALL_TOOLS), "with_signatures": len(_tc.HOT),
+                            "shape": "index"},
                            _catalogue)
             return _catalogue
         fn = _ALL_TOOLS.get(name)
         if fn is None:
-            _unknown = "[call_tool: unknown tool '%s'. Use call_tool(name='') to list all.]" % name
-            _log_discovery("call_tool.unknown", {"name": name}, _unknown)
+            from tools import tool_catalogue as _tc
+            # A CATEGORY IS A LEGITIMATE THING TO ASK FOR. Checked before the unknown-name
+            # path, so `call_tool(name='screen')` opens a category rather than being
+            # refused. A tool and a category cannot collide: every category name is a bare
+            # word and every tool name is already in _ALL_TOOLS, which was tested above.
+            if name in _tc.by_category(_ALL_TOOLS):
+                _listing = _tc.render_category(_ALL_TOOLS, name)
+                _log_discovery("call_tool.category", {"name": name}, _listing)
+                return _listing
+            # A NEAR MISS IS NOT A DEAD END. "no such tool" turns each of the 76 missed
+            # names into a wasted round trip; naming the closest matches and the categories
+            # turns it into the lookup the caller was trying to do.
+            _near = _tc.nearest(_ALL_TOOLS, name)
+            _unknown = ("[call_tool: no tool or category named '%s'.%s Categories: %s. "
+                        "call_tool(name='') for the index.]"
+                        % (name,
+                           (" Closest tools: " + ", ".join(_near) + ".") if _near else "",
+                           ", ".join(sorted(_tc.by_category(_ALL_TOOLS)))))
+            _log_discovery("call_tool.unknown", {"name": name, "suggested": _near}, _unknown)
             return _unknown
         if arguments is None:
             # HELP for ONE tool: signature + doc. To actually run a no-arg tool, pass arguments={}.
