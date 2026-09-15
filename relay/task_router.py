@@ -682,6 +682,26 @@ AUTOSTART_BACKOFF_S = float(os.environ.get("FLEET_INTAKE_AUTOSTART_BACKOFF_S", "
 #: and not the bench's 6 GB (which blocked everything, silently, for twenty-five minutes twice).
 AUTOSTART_DISK_FLOOR_GB = float(os.environ.get("FLEET_AUTOSTART_DISK_FLOOR_GB", "2") or 2)
 
+
+def _operator_set_a_disk_floor() -> bool:
+    """Has the operator chosen a disk floor in the cockpit, or is there nothing to respect?
+
+    `settings_disk_floor` substitutes a default when the key is absent, so it cannot answer this
+    on its own -- a sentinel default is passed and a negative result means "no line in
+    settings.txt". Any real choice, including 0, counts: the cockpit clamps that control to
+    0..100 and therefore offers 0, so treating it as "unset" would be substituting a number for
+    one the operator picked.
+
+    Never raises. An unreadable settings file reads as "nothing chosen", which lands on the
+    autostart default -- the conservative side, since the alternative is inheriting the bench
+    reserve and admitting nothing.
+    """
+    try:
+        from relay.fleet_runner import settings_disk_floor
+        return float(settings_disk_floor(default=-1.0)) >= 0
+    except Exception:
+        return False
+
 #: When an autostarted run gets --fanout. fleet_runner exposes the flag and threads it into
 #: run_relay_fleet(fanout=...), but autostart_fleet never passed it, so a goal that arrives
 #: from the tunnel could never be split -- the one path where a phone-sized instruction is
@@ -914,9 +934,24 @@ def autostart_fleet(goals, state_dir=None, now=None, launcher=None) -> dict:
     # could see) together that made it unusable. `_note_disk_defer` now reports a block outward
     # once it outlasts DISK_DEFER_ALERT_AFTER_S, so a floor this small can only ever cost a
     # notification -- never another twenty-five silent minutes.
+    #
+    # AND IT IS A DEFAULT, NOT AN OVERRIDE. fleet_runner resolves the floor as
+    # "CLI --disk-floor-gb >= 0 -> settings.txt disk_floor_gb -> env", so passing the flag at all
+    # BEATS the cockpit's own control. Measured 2026-09-15: the settings panel showed 1 GB, the
+    # operator had set it there, and an autostarted run used 2 -- the panel was displaying a
+    # number the run did not use. (It was worse before, at 0: the same override, further from
+    # the setting.) The cockpit clamps that control to 0..100, so 1 is a choice it offers and
+    # 0 is too; silently substituting a number for one the operator chose makes the panel lie,
+    # which is the defect class this session has spent its length removing.
+    #
+    # So the flag goes on ONLY when settings.txt carries no floor -- which is the case the
+    # hard-coding was written for, a tunnel goal inheriting the bench reserve because nobody
+    # had chosen anything. When the operator has chosen, their choice is left to the chain, and
+    # the cockpit's live `set_disk_floor_gb` keeps working because nothing is pinned at launch.
     cmd = [sys.executable, "-m", "relay.fleet_runner",
-           "--goals-file", goals_file, "--agent-url", url, "--state-dir", sd,
-           "--disk-floor-gb", str(AUTOSTART_DISK_FLOOR_GB)]
+           "--goals-file", goals_file, "--agent-url", url, "--state-dir", sd]
+    if not _operator_set_a_disk_floor():
+        cmd += ["--disk-floor-gb", str(AUTOSTART_DISK_FLOOR_GB)]
     # FAN-OUT WAS WIRED EVERYWHERE BUT HERE. fleet_runner parses --fanout and passes it to
     # run_relay_fleet(fanout=...); the worker gates the split turn itself (depth 0 only). The
     # missing link was this command line: without the flag an autostarted goal could never
