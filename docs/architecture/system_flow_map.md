@@ -140,7 +140,9 @@ flowchart TD
     classify -->|CONTINUE| nudge["_continue_nudge(count)<br/>relay/relay_fleet.py:2399<br/>counts 1-2: plain CONTINUE_JOB<br/>count 3+: rotating, count-tagged phrase<br/>(never byte-identical past turn 2)"]
     classify -->|"transient failure<br/>(send/timeout/likely-transient STUCK)"| retryt["_retry_transient()<br/>relay/relay_fleet.py:3718<br/>bounded by --max-transient (default 10)"]
     classify -->|"STUCK, converged with<br/>previous STUCK reason<br/>(_stuck_converged, :460)"| terminal_stuck["status=stuck, outcome=STUCK<br/>(same conclusion reworded -> stop asking)"]
-    classify -->|"conversation token limit hit<br/>(conversation_exhausted / memory pressure)"| recycle["open a FRESH conversation,<br/>re-anchor goal from disk state<br/>(_recycle_job), bounded by max_recycles"]
+    classify -->|"conversation token limit hit<br/>(conversation_exhausted / memory pressure)"| recycle["open a FRESH conversation,<br/>re-anchor goal from disk state<br/>(_recycle_job), bounded by max_recycles<br/><b>carries UNLOCK_PREFIX</b>: a new chat is a new<br/>MCP session, so the token died with the old one"]
+    recycle --> freshsession["new Mcp-Session-Id -> unauthorized by design<br/>(authorization is per session, tools/security.py:277-345)"]
+    replay["_replay_job() -- the other branch that opens<br/>a chat with no history; <b>same unlock</b>"] --> freshsession
 
     classify -->|"connection-consent card<br/>(_consent_streak)"| consent["_auto_consent() 3 tiers:<br/>tier0 in-page Allow click (:3691)<br/>tier2 connection-manager popup flow (:3724)<br/>must resolve FULLY automatically or STUCK"]
     classify -->|"agent never answers /<br/>canned non-answer streak"| deadagent["INFRA_STUCK classification<br/>(distinct from a solved/failed task)"]
@@ -215,6 +217,18 @@ Notes:
 - `require_unlocked()`'s three refusal strings are the single source of truth; everything
   downstream (the fleet's lock detector, the bridge's own filter) keeps its own copy of
   some or all of them. See the fact ledger, row 2.
+- **Of those three, one is essentially the whole population.** `.fleet/lock_refusals.jsonl`,
+  4,271 refusals since 2026-08-22: 4,258 are `[locked: no valid unlock token` (99.7%), 6 are
+  the no-HTTP-context branch, 7 are the never-unlocked-IP branch. That branch means the IP
+  *is* unlocked and holds tokens — 128 for this identity — and the call presented none.
+  Until 2026-09-15 the cause was structural rather than agent forgetfulness: `_composed_prefix`
+  is sliced off `composed_goal`, which is built *before* `_initial_job_with_unlock` prepends
+  the unlock, so both branches that open a chat with no history rebuilt it without one.
+  Measured on run `r6aa92e5a`: one worker, 34 minutes, 4 distinct MCP sessions, 3 refusals,
+  all of them the brand-new-session case and none an expiry. Recovery was not reliable —
+  of 518 refusals whose session was recorded, 453 never saw a successful `unlock()` in that
+  session again. Guarded by
+  `relay/test_a_fresh_conversation_is_a_locked_conversation.py`.
 
 ---
 
