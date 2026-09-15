@@ -112,4 +112,43 @@ def sanitized_child_env() -> dict[str, str]:
         # what the variable is called.
         if _USERINFO_IN_URL.search(env.get(key) or ""):
             del env[key]
+    return _with_pptx_autostamp(env)
+
+
+#: Where the child interpreter's `sitecustomize` lives. Python imports that module by name at
+#: interpreter start when it is importable, so a directory on PYTHONPATH reaches every script the
+#: child runs -- which is the only way to reach code the worker composed itself.
+_AUTOSTAMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_pptx_autostamp")
+
+
+def _with_pptx_autostamp(env: dict) -> dict:
+    """Put the deck-stamping sitecustomize on the child's path. Never raises.
+
+    WHY THE CHILD AND NOT THE TOOL SURFACE. The fleet has tools that write decks, and stamping
+    inside them was the obvious place -- but across the four OGF runs of 2026-09-14/15 not one
+    used them. Every deck came from python-pptx code the worker composed and handed to
+    `run_python`, so a stamp in the tool surface would have covered none of the output it exists
+    to describe. The child interpreter is where that code actually runs.
+    """
+    try:
+        if not os.path.isdir(_AUTOSTAMP_DIR):
+            return env
+        # THE SWITCH IS READ FROM THE ENVIRONMENT BEING BUILT, not from this process's own.
+        # Checking `os.environ` alone looked equivalent -- `env` is a copy of it -- and is not:
+        # a caller that hands this function an environment it assembled, which is how the
+        # function is tested, would have the switch ignored. The operator's `os.environ` case
+        # still works because `env` carries it, so this covers both rather than one.
+        if (env.get("MCP_NO_PPTX_AUTOSTAMP")
+                or os.environ.get("MCP_NO_PPTX_AUTOSTAMP")) == "1":
+            return env              # kill switch, for diagnosing the stamp itself
+        existing = env.get("PYTHONPATH") or ""
+        parts = [p for p in existing.split(os.pathsep) if p]
+        if _AUTOSTAMP_DIR not in parts:
+            parts.insert(0, _AUTOSTAMP_DIR)
+        env["PYTHONPATH"] = os.pathsep.join(parts)
+        # The stamp module lives in the repo, which the child has no other reason to know.
+        env.setdefault("MCP_COMPANION_REPO", os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))))
+    except Exception:
+        return env
     return env
