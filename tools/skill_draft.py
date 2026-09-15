@@ -135,13 +135,43 @@ def _applicable_lessons(goal, lessons, min_similarity=0.35):
     return kept[:8]
 
 
+#: How much of an instruction a proposal quotes before it says what it left out.
+#:
+#: A PROCEDURE IS NOT A PAYLOAD. Generated from the real ledger, the largest proposal came to
+#: 19KB, and almost all of it was a reference table the operator had pasted INTO the instruction
+#: -- several hundred colleagues with their mobile numbers. Two things are wrong with carrying
+#: that forward. A draft nobody will read is a draft nobody will approve; and a Skill is meant
+#: to be handed around (the operator's own words: send it over Teams if you need to), so a
+#: procedure that has a staff directory stapled to it travels with one.
+#:
+#: The cut is on LENGTH rather than on recognising a directory, because recognising "this looks
+#: like personal data" is exactly the judgement that cannot be shown to be complete -- the same
+#: reason `_slug` is a digest. Length is a property of the text, not a guess about it, and an
+#: instruction past this length has stopped being a procedure whatever it contains.
+QUOTED_INSTRUCTION_CHARS = 1200
+
+
+def _quote_instruction(goal):
+    """The instruction as a proposal quotes it: readable, and honest about what it dropped."""
+    text = (goal or "").strip()
+    if len(text) <= QUOTED_INSTRUCTION_CHARS:
+        return text
+    return (text[:QUOTED_INSTRUCTION_CHARS].rstrip()
+            + "\n\n… 以下 %d 文字を省略。" % (len(text) - QUOTED_INSTRUCTION_CHARS)
+            + "この長さの大半は、依頼文に貼り付けられた参照データ（名簿・対象行の一覧など）である"
+            + "ことが多い。**手順書に載せるのはデータではなく、データの渡し方**。"
+            + "元の全文は台帳にあり、ここには引かない。")
+
+
 def _body(group, paths, contracts, lessons, name):
     """The proposal text. Sections are omitted rather than filled with a placeholder.
 
     A template with `TODO` in it gets approved with the TODO still in it. If a section has no
     evidence behind it, it is not in the file.
     """
-    goal = group["examples"][0]
+    # THE PART A PERSON WROTE, not the composed string that was sent. See
+    # `skill_lessons.operator_instruction` for what quoting the whole thing produced.
+    goal = skill_lessons.operator_instruction(group["examples"][0])
     lines = ["---", "name: %s" % name,
              'description: "PROPOSED DRAFT -- not reviewed. %s"'
              % goal[:160].replace('"', "'").replace("\n", " "),
@@ -155,7 +185,7 @@ def _body(group, paths, contracts, lessons, name):
              "- 同じ作業の実行回数: **%d**（うち完了 %d）" % (group["runs"], group["done"]),
              ""]
 
-    lines += ["## 依頼文（実際に投入されたもの）", "", "```", goal.strip(), "```", ""]
+    lines += ["## 依頼文（実際に投入されたもの）", "", "```", _quote_instruction(goal), "```", ""]
 
     if paths:
         lines += ["## 参照先（過去の依頼文が名指ししていた場所）", ""]
@@ -201,7 +231,7 @@ def propose(ledger=None, skills_dir=SKILLS_DIR, include_benchmarks=False):
            "lesson_pairs": len(lessons), "candidates": len(got["qualified"])}
 
     for group in got["qualified"]:
-        goal = group["examples"][0]
+        goal = skill_lessons.operator_instruction(group["examples"][0])
         paths = _paths_in(" ".join(group["examples"]))
         contracts = _contracts_in(" ".join(group["examples"]))
         applicable = _applicable_lessons(goal, lessons)

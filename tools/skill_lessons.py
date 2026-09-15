@@ -147,6 +147,38 @@ def is_machine_authored(segment):
     return any(mark in (segment or "") for mark, _src in MACHINE_AUTHORED)
 
 
+#: Where this repository's own composition begins inside a stored goal. `fleet_goals` keeps the
+#: text that was actually SENT, and for a fan-out that text is the operator's instruction with a
+#: slice header appended -- or, for the merge turn, with every child's full report pasted after
+#: it. Both are ours.
+_COMPOSED_FROM = ("【この会話が担当する範囲", "【分割実行の結果をまとめてください】",
+                  "--- サブタスク ", "【前回タスクの続き】")
+
+
+def operator_instruction(goal):
+    """The part of a stored goal a person actually wrote.
+
+    WHY ANYTHING QUOTES THIS RATHER THAN THE WHOLE STRING. A generated Skill proposal is only
+    worth reading if what it quotes is an instruction somebody gave. Quoting the stored goal
+    whole produced a "依頼文" section that ran to nine subtask reports -- colleagues' names,
+    message subjects, per-day counts -- none of which anyone typed and none of which belongs in
+    a procedure. It was found by opening one of 106 generated proposals; counting them had said
+    nothing was wrong.
+
+    Cuts at the first marker of our own composition and keeps what precedes it. Conservative in
+    the direction that matters: a goal with no marker is returned unchanged, so a plain
+    instruction never loses anything, and the worst case for a marked one is that a person reads
+    a slightly short instruction rather than a page of machine-generated text.
+    """
+    text = str(goal or "")
+    cut = len(text)
+    for mark in _COMPOSED_FROM:
+        i = text.find(mark)
+        if 0 <= i < cut:
+            cut = i
+    return text[:cut].strip() or text.strip()
+
+
 def added(failed_goal, worked_goal):
     """Segments the working instruction carried that the failing one did not.
 
