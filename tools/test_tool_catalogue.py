@@ -164,10 +164,27 @@ def test_the_hot_set_still_matches_the_ledger():
                         or "required positional argument" in blob):
                     argfail[calls.get(r.get("id"), "?")] += 1
 
-    total = sum(counts.values()) or 1
-    covered = sum(counts.get(n, 0) for n in C.HOT) / float(total)
+    # THE DENOMINATOR IS TOOLS, NOT GATEWAY CHATTER.
+    #
+    # `call_tool.catalogue`, `.unknown` and `.signature` are pseudo-entries: asking for the
+    # list, asking for a signature, naming something that does not exist. They have no
+    # parameter names to show, so they can never be in a head whose whole purpose is "these
+    # can be called without a lookup" -- tool_catalogue.HOT says exactly that, and warns that
+    # admitting them to chase a higher number "would be reporting a number rather than
+    # improving the head".
+    #
+    # They were left in the denominator anyway, and their share grew: 2,057 of 31,447 calls
+    # (6.5%) when HOT was last derived, 3,899 of 39,103 (10.0%) on 2026-09-15. That pushed the
+    # attainable ceiling from 93.5% down to exactly 90.0% -- the threshold itself -- so this
+    # assertion had become unsatisfiable unless every single real tool were in the head. It
+    # read as "the head has gone stale" and was really "the yardstick moved".
+    #
+    # Measured after the correction: the head covers 94.2% of real tool calls.
+    real = {n: c for n, c in counts.items() if not str(n).startswith("call_tool.")}
+    total = sum(real.values()) or 1
+    covered = sum(real.get(n, 0) for n in C.HOT) / float(total)
     assert covered >= 0.90, (
-        "the head covers only %.1f%% of calls; re-derive HOT" % (100 * covered))
+        "the head covers only %.1f%% of tool calls; re-derive HOT" % (100 * covered))
 
     total_af = sum(argfail.values())
     if total_af:
