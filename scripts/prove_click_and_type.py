@@ -160,6 +160,21 @@ def main():
             return 2
         print("hit test at (%d, %d): %s  -- it is our window" % (x, y, under.label()))
 
+        # BEFORE PRESSING ANYTHING: can the pointer be PUT where we ask? Moving and reading
+        # the position back separates the two ways this half fails -- DPI virtualisation and
+        # SendInput's 0..65535 normalisation land here as a displacement, while a button that
+        # never arrives lands later as text that does not appear. One number could not say
+        # which. No clicks, and the pointer is put back where the operator left it.
+        sweep = [(win.left + win.width * a // 8, win.top + win.height * b // 8)
+                 for a in (1, 4, 7) for b in (1, 4, 7)]
+        landings = DI.where_did_it_go(frame, sweep)
+        worst = max((off for _asked, _got, off in landings), default=0)
+        print("pointer sweep: %d points, worst displacement %d px" % (len(landings), worst))
+        if worst:
+            for asked, got, off in landings:
+                if off:
+                    print("   asked %s -> landed %s (off by %d)" % (asked, got, off))
+
         landed = DI.click(frame, x, y)
         print("clicked; pointer at %s (asked for (%d, %d), off by %d px)"
               % (landed, x, y, max(abs(landed[0] - x), abs(landed[1] - y))))

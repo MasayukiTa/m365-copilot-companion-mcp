@@ -37,7 +37,6 @@ def test_a_variable_nobody_listed_is_withheld_on_its_VALUE(monkeypatch):
 
 
 @pytest.mark.parametrize("name,value", [
-    ("PYTHONPATH", "C:/p"),
     ("TEMP", "C:/t"),
     ("MY_PLAIN_URL", "https://example.invalid/no-userinfo"),
 ])
@@ -45,6 +44,29 @@ def test_ordinary_variables_survive(monkeypatch, name, value):
     """A sanitiser that breaks execution gets turned off, which protects nothing."""
     monkeypatch.setenv(name, value)
     assert sanitized_child_env().get(name) == value
+
+
+def test_the_operators_pythonpath_still_reaches_the_child(monkeypatch):
+    """PYTHONPATH is the one ordinary variable something else deliberately adds to.
+
+    It used to be asserted byte-identical alongside TEMP, and that stopped being the right
+    question when `_with_pptx_autostamp` began prepending its own directory so the deck stamp
+    reaches code the worker composed. Equality then failed while nothing was actually broken --
+    the operator's entries were all still there, with one more in front.
+
+    What this test protects is the property the old assertion was standing in for: whatever the
+    operator put on PYTHONPATH still reaches the child, in their order. A sanitiser (or a
+    feature) that DROPPED or REORDERED their entries would break imports in ways that look like
+    the child being broken rather than the environment being edited, and that is what must not
+    happen. That something may be prepended is deliberate and documented; that anything of
+    theirs may be lost is not.
+    """
+    import os
+
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(["C:/p", "C:/q"]))
+    got = (sanitized_child_env().get("PYTHONPATH") or "").split(os.pathsep)
+    assert "C:/p" in got and "C:/q" in got, got
+    assert got.index("C:/p") < got.index("C:/q"), ("their order changed", got)
 
 
 def test_path_is_always_kept():

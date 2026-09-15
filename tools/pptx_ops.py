@@ -106,6 +106,18 @@ def pptx_info(path: str) -> str:
             return "[pptx_info error: path must end with .pptx]"
         prs = Presentation(str(p))
         lines = [f"slides: {len(prs.slides)}"]
+        # WHERE THE PROVENANCE TAG GETS READ. Writing a tag nothing ever reads is a tag that
+        # does not exist; this is the place somebody already asks about a deck. Stated only
+        # when it is there, because absence says nothing -- a deck written before the stamp
+        # existed, or by a path that never reaches it, carries no tag either, and printing
+        # "not agent-made" would turn silence into a claim about a person.
+        try:
+            from .pptx_provenance import made_by_agent
+
+            if made_by_agent(str(p)):
+                lines.append("provenance: this deck carries the agent's own mark")
+        except Exception:
+            pass
         for i, slide in enumerate(prs.slides, 1):
             title_text = ""
             if slide.shapes.title and slide.shapes.title.has_text_frame:

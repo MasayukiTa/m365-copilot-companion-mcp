@@ -83,4 +83,38 @@ def _install():
     _Cls.save = _save
 
 
+def _chain_to_the_next_sitecustomize():
+    """Run any OTHER sitecustomize the child's path carries, after ours.
+
+    PYTHON IMPORTS EXACTLY ONE MODULE OF THIS NAME, AND WE PUT OURSELVES FIRST. Reaching the
+    worker's composed code means being on PYTHONPATH ahead of whatever else is there, and the
+    cost of being first is that an operator's own sitecustomize -- theirs, a tool's, a
+    site-packages one -- is shadowed and silently never runs. Nothing would say so: the module
+    that did not load leaves no trace, and whatever it was configuring simply stops happening.
+
+    So load it ourselves once we are done. `sys.path` minus our own directory is exactly the
+    path the interpreter would have searched had we not been there, so what this finds is what
+    would have run. Failures are swallowed for the same reason the stamp's are: this module
+    exists to add a tag, and it must never be able to stop a child interpreter from starting.
+    """
+    try:
+        import importlib.util
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        rest = [p for p in sys.path if p and os.path.abspath(p) != here]
+        spec = importlib.util.find_spec("sitecustomize", rest) if rest else None
+    except Exception:
+        return
+    if spec is None or spec.loader is None:
+        return
+    try:
+        if os.path.abspath(getattr(spec, "origin", "") or "") == os.path.abspath(__file__):
+            return                  # found ourselves again; nothing else is out there
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception:
+        pass
+
+
 _install()
+_chain_to_the_next_sitecustomize()

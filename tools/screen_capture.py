@@ -28,7 +28,7 @@ from __future__ import annotations
 import ctypes
 from typing import Optional, Tuple
 
-from .screen_frame import Frame
+from .screen_frame import Frame, full_size
 
 SM_XVIRTUALSCREEN = 76
 SM_YVIRTUALSCREEN = 77
@@ -117,8 +117,12 @@ def capture(max_dimension: int = 0):
         ratio = max_dimension / float(max(img.size))
         img = img.resize((max(1, int(round(img.size[0] * ratio))),
                           max(1, int(round(img.size[1] * ratio)))), Image.LANCZOS)
+        return img, Frame(left, top, width, height,
+                          img.size[0], img.size[1]).validate()
 
-    return img, Frame(left, top, width, height, img.size[0], img.size[1]).validate()
+    # The un-resized case says so in one word rather than leaving a reader to compare four
+    # numbers and work out that two pairs are equal.
+    return img, full_size(left, top, width, height)
 
 
 def capture_reports_what_it_did() -> str:
