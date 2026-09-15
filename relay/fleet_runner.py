@@ -2043,6 +2043,51 @@ def main():
     ram_box = [ram_floor]                                     # live RAM floor (cockpit-settable)
     eval_disk = None if args.eval_disk_gb < 0 else args.eval_disk_gb
 
+    # ── THE FILE IS THE SETTING, NOT THE MOMENT WE STARTED. Everything above reads
+    # settings.txt exactly once. A run that outlives the operator's next visit to the
+    # settings panel therefore uses numbers they can no longer see or correct, and the
+    # only channel that could have told it -- a live push from a cockpit that happens to
+    # be running -- is missing whenever the cockpit was restarted, rebuilt, or simply not
+    # open. Measured 2026-09-15: a run started 15:08:26, settings saved 15:15, and the
+    # run reserved 4 GB / 1024 MB for its whole life while the panel said 1 GB / 512 MB.
+    #
+    # The follower adopts a key only when the FILE's value CHANGES, so the cockpit's
+    # live overrides (強制開始 zeroing the disk gate) survive until the operator next
+    # moves that knob, and a run nobody touches behaves exactly as it did before.
+    #
+    # IT FOLLOWS EVEN WHEN A CLI FLAG PINNED THE VALUE, and that is deliberate. The
+    # documented chain is "most explicit wins", but between a flag typed when the run
+    # was launched and a knob the operator is moving right now, the one in front of
+    # them is the more explicit statement -- it is the one they are watching for an
+    # effect. The live cockpit push has always overridden a CLI flag for exactly this
+    # reason; a run that ignored the panel because of a flag from an hour ago would be
+    # the same defect this block exists to remove, wearing a different hat.
+    #
+    # on_tick fires every poll_s (1.0 s), so "the operator changes a setting and the
+    # run changes" is a second, not a restart.
+    from relay.settings_follow import Follower
+
+    def _set_disk_floor(v):
+        disk_box[0] = max(0.0, float(v))
+
+    def _set_ram_floor(v):
+        ram_box[0] = max(0.0, float(v))
+
+    def _set_maxtabs(v):
+        # Same split the cockpit's set_maxtabs command makes: under autoscale this knob
+        # is the ceiling, otherwise it is the fixed cap.
+        n = max(1, int(v))
+        if asc_box[0]:
+            asc_box[1] = n
+        else:
+            mc_box[0] = n
+
+    settings_follower = (Follower(_settings_path)
+                         .watch("disk_floor_gb", _set_disk_floor)
+                         .watch("ram_floor_mb", _set_ram_floor)
+                         .watch("maxtabs", _set_maxtabs)
+                         .prime())
+
     # write an initial 'launching' snapshot so the cockpit shows something at once
     _write_atomic(status_path, {"started": started, "updated": started,
                                 "total": len(goals), "done_count": 0, "running": True,
@@ -2245,6 +2290,13 @@ def main():
     _steer_reported = set()
 
     def on_tick(workers):
+        # BEFORE the commands, so that a live cockpit push in this same sweep is the
+        # later word and wins. The operator moving a knob sends both -- the file is
+        # saved and the command is pushed -- and they must not race to a different
+        # answer depending on which the coordinator happened to read first.
+        for _key, _val in settings_follower.poll():
+            print("[settings] %s -> %s (adopted live from the settings panel)"
+                  % (_key, _val), flush=True)
         _drain_commands(workers)
         report_unused_steers(workers, _steer_reported)
         _register_convs(workers)
