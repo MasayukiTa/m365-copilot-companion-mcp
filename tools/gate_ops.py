@@ -62,6 +62,45 @@ def gate_ask(question: str, context: Optional[str] = None, notify: bool = True) 
     locked = require_unlocked()
     if locked:
         return locked
+    token = gate_ask_local(question, context, notify)
+    if not token:
+        return "[gate_ask error: could not create gate]"
+    return (
+        f"token: {token}\n"
+        f"question posted. The human answers with gate_answer(token, ...), "
+        f"or by editing {GATE_DIR / (token + '.json')}. Poll with gate_poll('{token}')."
+    )
+
+
+def gate_ask_local(question: str, context: Optional[str] = None,
+                    notify: bool = True) -> Optional[str]:
+    """Raise a gate from IN-PROCESS code, with no unlock gate. Returns the bare token
+    (or None on failure) rather than gate_ask's formatted human-readable string.
+
+    WHY THIS EXISTS, AND WHY IT IS NOT A HOLE -- same shape as memory_save_local /
+    runlog_append_local (see tools/security.py's refusal text, which names both by
+    example): `gate_ask` requires require_unlocked(), which answers "has the REMOTE
+    caller behind this HTTP request proved possession of the password". A caller
+    running inside this process (the fleet relay, deciding on a WORKER's behalf that a
+    human is needed) has no remote identity and no request, so the gate cannot answer
+    it -- require_unlocked() denies, and unlock() itself needs a request too, so such a
+    caller has no move that works.
+
+    THE INCIDENT THIS FIXES. relay/relay_fleet.py can conclude a worker cannot proceed
+    without a person for reasons that are THEMSELVES about being locked (unlock
+    exhausted after MAX_UNLOCK_ATTEMPTS -- see _inject_unlock). A relay that tried to
+    raise that gate by calling the gated `gate_ask` would be refused for the very
+    reason it is trying to report, and a worker that is stuck because it cannot unlock
+    cannot use a tool that itself requires being unlocked. The relay is not a remote
+    MCP caller -- it is the in-process supervisor that already holds MCP_ALLOWED_BASE
+    and the .env password -- so it asks on the worker's behalf through this local path
+    instead, the same way memory_save_local lets an in-process caller record something
+    memory_save's gate would otherwise refuse.
+
+    fleet_toolset.py's own denylist already says the other half out loud: a WORKER
+    must not call gate_ask as a tool ("a worker must not create the approval it would
+    then be answering"). This function is for the RELAY, not the worker.
+    """
     try:
         _ensure()
         token = "gate_" + uuid.uuid4().hex[:10]
@@ -79,13 +118,24 @@ def gate_ask(question: str, context: Optional[str] = None, notify: bool = True) 
         )
         if notify:
             notify_approval_gate("HITL gate - input needed", question[:180], gate_path)
-        return (
-            f"token: {token}\n"
-            f"question posted. The human answers with gate_answer(token, ...), "
-            f"or by editing {GATE_DIR / (token + '.json')}. Poll with gate_poll('{token}')."
-        )
-    except Exception as e:
-        return f"[gate_ask error: {type(e).__name__}: {e}]"
+        return token
+    except Exception:
+        return None
+
+
+def gate_get(token: str) -> Optional[dict]:
+    """Return the raw gate payload dict for `token`, or None if it does not exist or
+    cannot be read. FOR IN-PROCESS CALLERS that need structured access (has it been
+    answered? what did it say?) rather than gate_poll's human-readable "ANSWERED: ..."
+    string, which would need parsing back apart from an answer that might itself
+    contain a colon or the word ANSWERED."""
+    try:
+        path = GATE_DIR / f"{token}.json"
+        if not path.is_file():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
 
 def gate_poll(token: str) -> str:

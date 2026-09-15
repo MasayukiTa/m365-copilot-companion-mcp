@@ -68,6 +68,13 @@ KEYEVENTF_UNICODE = 0x0004
 
 WHEEL_DELTA = 120
 
+#: How long to leave between a modifier going down and the key that rides it. Measured
+#: rather than chosen: at zero the characters typed into Notepad arrived and the Ctrl+A
+#: that followed did not select them, twice. Small enough that a ten-key combination
+#: costs a tenth of a second; large enough that an application which sets modifier state
+#: on its message pump has seen it.
+MODIFIER_SETTLE_S = 0.04
+
 #: The named keys a caller may press, as virtual key codes. Deliberately a small
 #: fixed vocabulary rather than "any key name": a computer-use loop that can press
 #: arbitrary keys can press Win+L, Alt+F4 and Ctrl+Alt+Del combinations by accident,
@@ -378,12 +385,26 @@ def press(*keys: str) -> None:
             raise InputRefused(
                 "unknown key %r. Known: %s" % (name, ", ".join(sorted(VK))))
         codes.append(vk)
-    batch = []
+    # SENT AS SEPARATE EVENTS WITH THE MODIFIER GIVEN TIME TO SETTLE, not as one batch.
+    #
+    # The first version put every down and every up into a single SendInput call, which
+    # Windows accepts and delivers with no gap at all. Measured 2026-09-15: typing into
+    # Notepad worked -- the characters were visibly in the window -- and the Ctrl+A,
+    # Ctrl+C that followed copied nothing, twice, which the harness then reported as a
+    # typing failure. The PowerShell helper this replaced had 40 ms between the modifier
+    # and the key, and its comment did not say why; this is why.
+    #
+    # An application sees a modifier as a STATE it checks when the key arrives, and some
+    # set that state on a message pump tick rather than synchronously. Zero gap means the
+    # key can be processed before the modifier is considered held, so Ctrl+A arrives as a
+    # bare 'a' -- which in a text box is not a no-op, it types a letter. Delivering them
+    # apart costs single-digit milliseconds and removes a class of silent wrong action.
     for vk in codes:
-        batch.extend(_key_inputs(vk))
+        _send(*_key_inputs(vk))
+        time.sleep(MODIFIER_SETTLE_S)
     for vk in reversed(codes):
-        batch.extend(_key_inputs(vk, up=True))
-    _send(*batch)
+        _send(*_key_inputs(vk, up=True))
+        time.sleep(MODIFIER_SETTLE_S)
 
 
 def release_all_modifiers() -> None:

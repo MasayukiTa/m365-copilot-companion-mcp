@@ -96,6 +96,25 @@ def set_clipboard_text(text):
         _user32.CloseClipboard()
 
 
+#: What an untouched document is called, by locale. Notepad puts the document name in the
+#: caption followed by " - <app name>", and marks an edited one with a leading asterisk.
+#:
+#: THIS LIST WAS WRONG ON ITS FIRST OUTING and refused a document that was in fact empty:
+#: it knew 無題 and Untitled and not タイトルなし, which is what this machine says. A guard
+#: that rejects the good case is a guard that gets switched off, so the names are data and
+#: the comparison strips the application suffix rather than matching the whole caption.
+_EMPTY_DOCUMENT_NAMES = ("", "タイトルなし", "無題", "Untitled", "新規", "New")
+
+
+def _is_empty_document(caption) -> bool:
+    """True when this caption describes a document nobody has typed into yet."""
+    text = (caption or "").strip().lstrip("*").strip()
+    # " - メモ帳" / " - Notepad": the document name is everything before the last dash.
+    if " - " in text:
+        text = text.rsplit(" - ", 1)[0].strip()
+    return text in _EMPTY_DOCUMENT_NAMES
+
+
 def pid_of(hwnd):
     owner = wintypes.DWORD()
     _user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(owner))
@@ -127,6 +146,12 @@ def main():
     window_pid = None
     ok = True
     try:
+        # START FROM AN EMPTY DOCUMENT. Notepad on Windows 11 restores the previous
+        # session, so a fresh window can open holding the text of the last run -- three
+        # runs' worth had accumulated before this was noticed, and any comparison against
+        # what we sent would have been against that pile rather than against our typing.
+        # Ctrl+N gives a new tab; the check below is what makes it a fact rather than a
+        # hope.
         before = {t.hwnd for t in W.top_level_windows(min_side=120)}
         proc = subprocess.Popen(["notepad.exe"])
         win = _new_window_after(before)
@@ -176,18 +201,79 @@ def main():
                     print("   asked %s -> landed %s (off by %d)" % (asked, got, off))
 
         landed = DI.click(frame, x, y)
+        # A restored session shows up in the caption. Ask for a new document and confirm
+        # the caption stops carrying someone else's text before typing anything.
+        restored = W.describe(win.hwnd)
+        if restored and not _is_empty_document(restored.title):
+            print("the window opened holding a restored session (%r) -- asking for a new one"
+                  % (restored.title or "")[:40])
+            DI.press("ctrl", "n")
+            time.sleep(0.9)
+            fresh_win = _new_window_after(before | {win.hwnd}, 6.0) or win
+            win = fresh_win
+            again = W.describe(win.hwnd)
+            if again and not _is_empty_document(again.title):
+                print("NOT MEASURING: could not get an empty document (%r). A comparison "
+                      "against a document that already had text in it would be meaningless."
+                      % (again.title or "")[:40])
+                return 5
+            x = win.left + win.width // 3
+            y = win.top + win.height // 2
+            DI.click(frame, x, y)
+            time.sleep(0.3)
         print("clicked; pointer at %s (asked for (%d, %d), off by %d px)"
               % (landed, x, y, max(abs(landed[0] - x), abs(landed[1] - y))))
+
+        # WHOSE KEYBOARD IS THIS. type_text goes wherever focus is, so a result of "nothing
+        # arrived" has two causes that look identical: the keystrokes were refused, or they
+        # went somewhere else because the operator is using this machine. This harness shares
+        # a desktop with a person, and a measurement that cannot say "I was disturbed"
+        # reports their typing as our defect. Checked immediately before and after, because
+        # focus can move during the typing as well as before it.
+        fg_before = W.foreground_window()
+        if fg_before is None or fg_before.root != win.hwnd:
+            print("DISTURBED: focus is on %s, not the window we opened. Not a result about "
+                  "typing -- somebody else is using this desktop."
+                  % (fg_before.label()[:44] if fg_before else "nothing"))
+            return 3
 
         n = DI.type_text(SAMPLE)
         print("typed %d characters" % n)
         time.sleep(0.3)
 
+        fg_after = W.foreground_window()
+        if fg_after is None or fg_after.root != win.hwnd:
+            print("DISTURBED: focus moved to %s while typing. Not a result about typing."
+                  % (fg_after.label()[:44] if fg_after else "nothing"))
+            return 3
+
+        # TWO WITNESSES, BECAUSE ONE OF THEM IS NOT ABOUT TYPING. The clipboard needs
+        # Ctrl+A, Ctrl+C, the application's own copy handler and the clipboard itself all
+        # to work; when any of those fails it returns "" -- which is indistinguishable
+        # from the characters never arriving. This harness reported INPUT PATH NOT SOUND
+        # on exactly that, twice, while a picture of the window showed the text sitting
+        # in it. A measurement that cannot tell "it did not arrive" from "I cannot read
+        # it" will eventually accuse the thing it is measuring.
+        #
+        # The window's own title is the second witness: Notepad puts the first line of
+        # the document in it, and reading a top-level window's caption needs nothing
+        # from the application.
         DI.press("ctrl", "a")
         DI.press("ctrl", "c")
         time.sleep(0.4)
-        got = clipboard_text() or ""
-        got = got.replace("\r\n", "\n").strip()
+        got = (clipboard_text() or "").replace("\r\n", "\n").strip()
+
+        caption = ""
+        fresh = W.describe(win.hwnd)
+        if fresh:
+            # Notepad marks an edited document with a leading '*' and truncates the rest.
+            caption = (fresh.title or "").lstrip("*").strip()
+        head = SAMPLE[:max(1, len(caption))] if caption else ""
+        if not got and caption and caption.startswith(head[:8]):
+            print("the clipboard came back empty, but the window's title reads %r --" % caption[:40])
+            print("the text DID arrive and the read-back is what failed. Reporting that,")
+            print("not a typing failure.")
+            return 4
 
         print()
         print("  wanted: %r" % SAMPLE)

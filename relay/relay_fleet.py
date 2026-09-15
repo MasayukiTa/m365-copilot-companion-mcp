@@ -829,6 +829,56 @@ LOCKED_MARKERS = ("locked client ip", NO_CONTEXT_REFUSAL.lower(), TOKEN_MISSING_
 # Chosen well above the longest real error and well below a genuine multi-sentence review.
 LOCKED_DOMINANCE_MAX_CHARS = 400
 MAX_UNLOCK_ATTEMPTS = int(os.environ.get("MCP_FLEET_MAX_UNLOCK", "4"))
+
+# ── OPERATOR E, WIRED IN (HITL gate raised BY THE RELAY, not left to STUCK/retry alone) ──
+#
+# tools/gate_ops.py could already pause a loop and ask a human, and fleet_runner.py already
+# surfaced any open gate into status.json's pending_gates for the cockpit to show and answer.
+# Nothing FIRED one: a worker that could not proceed without a person spent its whole retry
+# budget being nudged, then went STUCK with no human ever notified there was a decision to
+# make. Mined incident (.fleet/transcripts/r6aa8fc73_a0_w0.jsonl, read-only, not checked in):
+# the worker asked a precise, answerable question on turn 2 (which of several candidate names
+# an abbreviation it had been given corresponded to, in a database it had already searched
+# exhaustively) and was answered nine more times with a nudge to just try again, as if the
+# problem were a transient blip -- it was never going to resolve without a person naming the
+# term. The three places below that now raise a gate instead of continuing to retry/settle
+# are the three places this module already KNEW a person was needed and said so only in a log
+# line: STUCK-convergence (a worker restating the same conclusion), unlock exhaustion (a
+# worker that cannot proceed without a password/token only a person can supply), and a retry
+# count past which continuing to nudge is no longer plausibly worth it.
+#
+# RAISED FROM HERE, NOT FROM THE WORKER. gate_ask (the MCP tool surface) requires
+# require_unlocked(), and fleet_toolset.py already denies a worker the tool outright
+# ("a worker must not create the approval it would then be answering") -- and the worker most
+# likely to need this, one STUCK because it cannot unlock, is exactly the one that cannot pass
+# that gate: it has no move that works, same failure class tools/gate_ops.py's
+# gate_ask_local docstring documents for memory_save_local. This process (the relay) already
+# holds MCP_ALLOWED_BASE and the .env password and already has the worker's own words, so it
+# asks via gate_ask_local (in-process, no unlock check) on the worker's behalf.
+#
+# NOT max_transient (10, the existing back-stop that still applies if a gate can't be raised
+# at all -- gate_ask_local failing outright, e.g. disk full, must never silently swallow the
+# worker). Chosen at roughly HALF that budget: NET_RETRY_NOPROGRESS_MAX and STUCK_CONVERGENCE
+# above already catch a worker that is visibly repeating itself well before 5 retries, so this
+# is specifically the backstop for a STUCK streak whose wording keeps drifting just enough to
+# dodge STUCK_CONVERGENCE_SIMILARITY (0.7) -- the mined incident shows exactly this shape: no
+# two of turns 2-5 clear that threshold, and the wording only converges (per that constant's
+# own calibration notes) at turns 5-6. 5 retries leaves room for a genuine transient blip to
+# clear (the mined incident's real failure was never transient) while stopping well short of
+# spending the whole budget re-asking a question only a person can answer.
+GATE_AFTER_STUCK_RETRIES = int(os.environ.get("MCP_FLEET_GATE_AFTER_RETRIES", "5"))
+
+#: How long an unanswered HITL gate may hold a worker before it gives up. A question nobody
+#: answers cannot hold a worker forever -- the worker settles STUCK with the question itself
+#: preserved in the reason, so the record says what was asked and that nobody answered, rather
+#: than the worker silently sitting there until max_turns/an operator notices by accident.
+#: 30 MINUTES, THE SAME WINDOW NET_RETRY_WINDOW_S ALREADY USES for "how long is it reasonable
+#: to wait before concluding this needs a terminal decision" -- not a fresh number invented for
+#: this path. Long enough that a person mid-meeting or stepping away briefly still has a real
+#: chance to see the desktop toast and answer; short enough that a run does not sit silently
+#: parked for hours on a question nobody was ever going to see.
+GATE_ANSWER_TIMEOUT_S = float(os.environ.get("MCP_FLEET_GATE_TIMEOUT_S", "1800") or 1800)
+
 #: THE TOKEN IS THE SECOND FACTOR AND THIS TEXT USED TO DENY IT EXISTED. The old wording told
 #: the worker that once unlock succeeded the tools "使えるので" -- just work on that connection.
 #: That is only true while MCP_REQUIRE_UNLOCK_TOKEN is off. With it on, tools/security.py
@@ -2474,6 +2524,7 @@ _PHASE_LABELS = {
     "refuting":    "Reviewing",
     "verifying":   "Verifying",
     "awaiting":    "Needs input",
+    "awaiting_gate": "Needs input (human gate)",
     "done":        "Done",
     "stuck":       "Needs attention",
     "maxturns":    "Needs attention",
@@ -2670,6 +2721,15 @@ class RelayWorker:
         self._signin_surfaced_ok = False  # TRUTHFUL result of that surface() call (see edge_recover.surface)
         self._headed_recovery_done = False  # forced a HEADED companion relaunch once (last resort)
         self._unlock_attempts = 0       # auto-injected unlock(password) turns (write/exec gate)
+        # HITL GATE (operator E, wired in -- see GATE_AFTER_STUCK_RETRIES above): the token of
+        # this worker's OWN standing gate, or None. ONE GATE PER WORKER AT A TIME -- a worker
+        # that has already asked (token set) must not ask again while its question stands; see
+        # _raise_stuck_gate. _gate_question is kept alongside the token so an unanswered gate
+        # can settle STUCK with the question preserved even after the gate file itself is gone
+        # (answered/deleted out from under it) or unreadable.
+        self._gate_token = None
+        self._gate_question = ""
+        self._gate_deadline = 0.0       # epoch time this standing gate settles STUCK unanswered
         # LOCK-AMBIGUITY PROBE (see _decide's handling of _looks_locked_ambiguous()): a reply
         # carries a LOCKED_MARKERS marker but is too long for _looks_locked's dominance rule to
         # trust on its own -- the case that lost r6aa8e10b_a0_w0's whole goal on 2026-09-15
@@ -2904,7 +2964,8 @@ class RelayWorker:
         # phase_events MUST be initialized before `self.status = PENDING` so the setter
         # can append the initial "Queued" event immediately on construction.
         self.phase_events = []
-        self.status = PENDING      # pending | ready | waiting | done | stuck | maxturns | error
+        self.status = PENDING      # pending | ready | waiting | verifying | researching |
+                                   # refuting | awaiting_gate | done | stuck | maxturns | error
         self.outcome = None
         self.reason = ""
         self.last_response = ""
@@ -3016,6 +3077,13 @@ class RelayWorker:
         self.last_norm = None
         # A fresh conversation has no memory of the old one's STUCK streak either.
         self._last_stuck_reason = None
+        # Nor of a standing gate -- a fresh replay only ever starts from a status that isn't
+        # 'awaiting_gate' (raising a gate holds the worker, so no new turn -- and therefore no
+        # policy-refusal replay -- can begin while one stands), but reset defensively rather
+        # than leave a stale token pointing at a question this new conversation never asked.
+        self._gate_token = None
+        self._gate_question = ""
+        self._gate_deadline = 0.0
         self.last_response = ""
         self._continue_count = 0
         self.transient = 0
@@ -3184,7 +3252,18 @@ class RelayWorker:
                 turns=self.turn, outcome=self.outcome, status=self.status,
                 conv_client=ids.get("client", ""), conv_server=ids.get("server", ""),
                 conv_session=ids.get("session", ""),
-                reason=(self.reason or "")[:200])
+                reason=(self.reason or "")[:200],
+                # THE JOIN KEY task_router.py NEEDS AND NEVER GOT. `self.jid` is the
+                # admission-time id task_router.py mints per goal (see the comment at its
+                # assignment above) -- already carried into history.json and the final
+                # sweep snapshot, but never into this per-worker completion ledger, which is
+                # the one record written unconditionally (regardless of whether the cockpit
+                # is open to archive history.json) and appended rather than overwritten. Its
+                # absence here is why a fleet-bound job's true outcome could never be read
+                # back by anything joining on the id task_router.py itself uses -- see
+                # relay/test_a_job_marked_done_reads_as_dispatched_not_finished.py. Empty for
+                # goals that never passed through admission, same as `self.jid` itself.
+                jid=(self.jid or ""))
         except Exception:
             pass
         try:
@@ -3840,6 +3919,101 @@ class RelayWorker:
         self.status = "ready"
         return False
 
+    def _raise_stuck_gate(self, question, trigger):
+        """Ask a human instead of continuing to nudge/settle, carrying the WORKER'S OWN words
+        (`question`) rather than a template -- see GATE_AFTER_STUCK_RETRIES above for the
+        incident this closes. Sets status='awaiting_gate' and returns True on success; returns
+        False (does nothing) if a gate already stands for this worker -- ONE GATE PER WORKER AT
+        A TIME, a worker that has already asked must not ask again while its question stands --
+        or if raising one failed outright (e.g. the gate directory is unwritable), in which
+        case the caller must fall back to its OLD behaviour (settle STUCK / keep retrying)
+        rather than silently losing the worker on a plain Exception.
+
+        NON-BLOCKING, LIKE _poll_research/_poll_refute, NOT LIKE _declare_blocking. An open
+        question is not a synchronous call the sweep thread is inside of -- the round-robin
+        keeps stepping every OTHER worker while this one waits, and on_tick's status.json write
+        (which stamps `updated` on every sweep tick regardless of any one worker's progress)
+        never freezes just because this worker is idle. _declare_blocking's eval_busy_until
+        exists for the OTHER shape (the sweep itself blocked inside one worker's synchronous
+        call) and would be the wrong tool here -- there is nothing to tell the watchdog to wait
+        THROUGH, since the watchdog was never going to stall on this in the first place. What a
+        human looking at the run needs instead is the existing pending_gates surfacing
+        (fleet_runner._pending_gates -> status.json -> FleetCockpit's Bucket C banner), which
+        this reaches for free the moment the gate file lands on disk -- so 'awaiting_gate' is
+        this mechanism's answer to the same question _declare_blocking answers for its own
+        shape: let the observer tell deliberate-and-waiting apart from stuck-in-a-loop.
+        """
+        if self._gate_token:
+            return False
+        try:
+            from tools.gate_ops import gate_ask_local
+        except Exception:
+            return False
+        context = "worker=%s trigger=%s goal=%s" % (
+            self.name, trigger, (self.goal or "")[:200])
+        try:
+            token = gate_ask_local(question, context=context)
+        except Exception:
+            token = None
+        if not token:
+            return False
+        self._gate_token = token
+        self._gate_question = question
+        self._gate_deadline = time.time() + GATE_ANSWER_TIMEOUT_S
+        self.status = "awaiting_gate"
+        self.reason = "🧑 human input requested (%s): %s" % (trigger, question[:160])
+        try:
+            self._tx.metric(self.turn, "gate_raised", token, trigger=trigger)
+        except Exception:
+            pass
+        # FLUSH NOW, not on the next natural tick -- the same reason _declare_blocking flushes
+        # before a blocking call: whoever is watching (the desktop toast already fired inside
+        # gate_ask_local, but the cockpit's own banner reads status.json) should see this the
+        # moment it is true, not whenever the sweep next happens to write it anyway.
+        if self._busy_writer is not None:
+            try:
+                self._busy_writer()
+            except Exception:
+                pass
+        return True
+
+    def _poll_gate(self):
+        """Drive a standing HITL gate (status=='awaiting_gate'). Mirrors _poll_research:
+        non-blocking (None/unanswered -> the round-robin keeps stepping every OTHER worker),
+        and an answer is injected as this worker's NEXT TURN in the SAME conversation
+        (self.job + status='ready') -- it does not restart the goal or lose what came before.
+
+        An unanswered gate cannot hold a worker forever: past GATE_ANSWER_TIMEOUT_S it settles
+        STUCK with the question itself preserved in the reason, so the record says what was
+        asked and that nobody answered -- not a generic timeout with the question already gone.
+        """
+        from tools.gate_ops import gate_get
+        data = gate_get(self._gate_token)
+        if data is not None and data.get("answered"):
+            answer = data.get("answer")
+            question = self._gate_question
+            self._gate_token = None
+            self._gate_question = ""
+            self._gate_deadline = 0.0
+            self.job = self._task_anchor(
+                "人間から次の回答がありました。\n質問: %s\n回答: %s\n"
+                "これを踏まえて作業を続けてください。"
+                % (question, answer if answer not in (None, "") else "(空の回答)"))
+            self.reason = "human answered the standing gate -> resuming"
+            self.status = "ready"
+            return False
+        if time.time() >= self._gate_deadline:
+            question = self._gate_question
+            self._gate_token = None
+            self._gate_question = ""
+            self._gate_deadline = 0.0
+            self.status, self.outcome = "stuck", "STUCK"
+            self.reason = (
+                "human input requested but unanswered after %ds; the question was: %s"
+                % (int(GATE_ANSWER_TIMEOUT_S), question))
+            return True
+        return False               # still waiting; the sweep keeps moving
+
     def _salvage_via_checks(self):
         """Last-chance acceptance salvage for the EXHAUSTION paths (spec 3-3 verify gate,
         applied where the worker would otherwise go terminal NON-done). Before burning a
@@ -4116,19 +4290,30 @@ class RelayWorker:
             # sibling branch that sets self.job sets this too; this one did not.
             self.status = "ready"
             return
-        self.status, self.outcome = "stuck", "STUCK"
         # NAME THE CAUSE THAT ACTUALLY HAPPENS. This listed a rotating backend IP and a wrong
         # password, and on 2026-09-07 it was neither: MCP_REQUIRE_UNLOCK_TOKEN was on, the
         # unlock succeeded, and every following call was refused for arriving without the
         # token. Whoever reads this line is trying to find out why, so the possibility that
         # was true must be in it -- and it is the cheapest one to check.
-        self.reason = ("⚠ unlock を %d 回投入したが解錠が続かない。"
-                       "(1) MCP_REQUIRE_UNLOCK_TOKEN が有効で、unlock_token を後続の "
-                       "call_tool に渡せていない (lock_refusals.jsonl の site が "
-                       "security.py:324 ならこれ)、"
-                       "(2) M365バックエンドの送信元IPが毎回変わる(unlockはIP単位)、"
-                       "(3) MCP_UNLOCK_PASSWORD 不一致。のいずれか。"
-                       % self._unlock_attempts)
+        reason = ("⚠ unlock を %d 回投入したが解錠が続かない。"
+                  "(1) MCP_REQUIRE_UNLOCK_TOKEN が有効で、unlock_token を後続の "
+                  "call_tool に渡せていない (lock_refusals.jsonl の site が "
+                  "security.py:324 ならこれ)、"
+                  "(2) M365バックエンドの送信元IPが毎回変わる(unlockはIP単位)、"
+                  "(3) MCP_UNLOCK_PASSWORD 不一致。のいずれか。"
+                  % self._unlock_attempts)
+        # HITL GATE, NOT AN IMMEDIATE STUCK. Every one of the three causes named above is a
+        # question only a person can answer (flip MCP_REQUIRE_UNLOCK_TOKEN, chase the IP, or
+        # confirm the password) -- exactly operator E's case, and the trap the module-level
+        # comment above GATE_AFTER_STUCK_RETRIES documents: a worker cannot call gate_ask on
+        # its own behalf here, being the one case that most needs it. Falls back to the old
+        # immediate-STUCK behaviour if a gate already stands for this worker or raising one
+        # fails outright, so this can never silently lose a worker to an Exception.
+        if self._raise_stuck_gate(reason, "unlock exhausted after %d attempts"
+                                  % self._unlock_attempts):
+            return
+        self.status, self.outcome = "stuck", "STUCK"
+        self.reason = reason
 
     def _decide(self, resp, _resume=False):
         # LOCK-AMBIGUITY PROBE ANSWER. A LOCK_PROBE_QUESTION was sent as this worker's previous
@@ -4832,12 +5017,32 @@ class RelayWorker:
                     and _stuck_converged(self._last_stuck_reason, reason_text):
                 if self._salvage_via_checks():
                     return
+                # ASK, DON'T JUST SETTLE (operator E, wired in -- see GATE_AFTER_STUCK_RETRIES
+                # above). Two consecutive STUCK replies reaching the same conclusion is exactly
+                # the situation a person, not another nudge, can resolve -- the worker's own
+                # words (reason_text) ARE the question. Falls back to the old immediate-STUCK
+                # settlement if a gate already stands or raising one fails outright.
+                if self._raise_stuck_gate(reason_text, "converged on consecutive STUCK replies"):
+                    return
                 self.status, self.outcome = "stuck", "STUCK"
                 self.reason = ("worker reached the same conclusion on consecutive turns -> "
                                "settling on its own stated reason instead of nudging again: %s"
                                % reason_text)
                 return
             self._last_stuck_reason = reason_text
+            # RETRY-COUNT BACKSTOP (GATE_AFTER_STUCK_RETRIES, see its definition above): the
+            # convergence check just above is the SMARTER catch and normally fires first (the
+            # mined incident's wording only clears STUCK_CONVERGENCE_SIMILARITY at turns 5-6),
+            # but a STUCK streak whose wording keeps drifting just enough to dodge that
+            # threshold must still stop short of burning the whole max_transient budget on a
+            # question only a person can answer. self.transient here is the count of retries
+            # ALREADY SPENT (pre this one) -- >= GATE_AFTER_STUCK_RETRIES - 1 means the NEXT
+            # nudge would be the (GATE_AFTER_STUCK_RETRIES)-th, so ask instead of sending it.
+            if self.transient >= GATE_AFTER_STUCK_RETRIES - 1 \
+                    and self._raise_stuck_gate(
+                        reason_text, "retry budget reached %d/%d un-converged STUCK replies"
+                        % (self.transient, GATE_AFTER_STUCK_RETRIES)):
+                return
             # Under load, an agent STUCK is usually a downstream symptom of a transient
             # tool/network failure (the agent couldn't write a file etc.). Retry the turn
             # (re-prompt to try the tools again) before giving up, up to the budget.
@@ -6131,6 +6336,8 @@ class RelayWorker:
             return self._poll_research()
         if self.status == "refuting":
             return self._poll_refute()
+        if self.status == "awaiting_gate":
+            return self._poll_gate()
         if self.status == "ready":
             if time.time() < self._cooldown_until:
                 return False             # waiting out a transient-retry backoff
@@ -6397,6 +6604,23 @@ def _with_matched_skill(goal_text):
     against embedding procedures in every goal -- it grew one goal from 0 to 2,295 bytes -- and
     for pulling them when needed. This is that, performed by the party that reliably performs
     things. Bodies run 1.4 to 7.8 KB and are added only on a confident, trusted match.
+
+    WHY THE BODY, NOT A POINTER TO IT, EVEN THOUGH A WRONG MATCH CARRIES THE WHOLE BODY.
+    Handing over only the name and description, with an instruction to skill_load the name
+    if it applies, was tried and measured against relay/test_fanout_carries_the_procedure.py.
+    It fails there: turn 1 of a fan-out IS the split decision, made against the procedure's
+    own content (mail-lookup's slicing table, "1ヶ月なら上旬・中旬・下旬の3つ") with no second
+    turn free to call skill_load first -- deferring the body recreates exactly the failure
+    this frame exists to route around, just at skill_load instead of skill_match. SkillStore.
+    match's MIN_MATCH_WORDS and MIN_DISTINCTIVE_WORDS (skills.py) already remove the wrong
+    matches measured so far -- one word's overlapping bigrams counted as several pieces of
+    evidence, and a word every candidate could plausibly use counted as evidence for whichever
+    one happened to be in the store -- so by the time a hit arrives here it has already
+    cleared both bars. The residual those two cannot see (a wrong match built entirely of
+    real, mutually-distinctive-in-this-store content words the right match would also use) is
+    indistinguishable from a correct match on every signal available at this call site, so
+    withholding the body for it would also withhold it for the fixtures above, for no measured
+    gain. See MIN_DISTINCTIVE_WORDS's docstring for that analysis and its own measurement.
 
     Placed AFTER the theme notes and immediately BEFORE the goal: the procedure is how to do
     the thing, so it should be the last thing read before the thing. That position is a

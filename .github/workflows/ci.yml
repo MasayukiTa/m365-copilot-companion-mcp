@@ -552,6 +552,7 @@ jobs:
             relay/test_refuter_unverifiable.py \
             relay/test_retry_trigger.py \
             relay/test_a_nudge_that_repeats_itself_is_not_a_retry.py \
+            relay/test_a_worker_that_needs_a_person_should_say_so.py \
             relay/test_every_refusal_the_server_can_speak_is_one_the_fleet_can_hear.py \
             relay/test_when_a_marker_is_too_long_to_trust_ask_the_worker.py \
             relay/test_unlock_keeps_the_planner.py \

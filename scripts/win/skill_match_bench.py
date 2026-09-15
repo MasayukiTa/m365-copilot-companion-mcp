@@ -68,6 +68,33 @@ CASES = [
     ("メールサーバーの障害原因を調べて", None),      # shares メール, asks something else
     ("銅箔の価格推移をグラフにして", None),          # shares 銅箔, asks something else
     ("会議室を予約して", None),
+    # --- must match NOTHING: the ACTUAL incident, reconstructed as a neutral paraphrase ---
+    #
+    # This is the case the two gates above (MIN_MATCH_WORDS, MIN_DISTINCTIVE_WORDS) exist
+    # for, read read-only from the real goal that caused it and reproduced here without its
+    # material or product names. The real query's overlap with copper-foil-survey was
+    # exactly three tokens: ロッ, ット, 調査. Two of those are the two overlapping bigrams
+    # _match_tokens produces from ONE word, ロット (lot) -- not two pieces of evidence, the
+    # same shape test_a_shared_word_is_not_enough already existed to catch -- and the third,
+    # 調査 (investigate), is not distinctive: mail-lookup's own vocabulary has it too. Before
+    # MIN_MATCH_WORDS / MIN_DISTINCTIVE_WORDS this scored 1.0 and injected copper-foil-survey's
+    # full body. MIN_CONTENT_FRACTION, the fix that preceded these two, did NOT catch it --
+    # all three tokens are real vocabulary, none of them hiragana grammar fragments, so a
+    # content-only filter had nothing to reject. A different, neutral material below stands
+    # in for the real one.
+    ("別材料のロットを調査してほしい", None),
+
+    # --- must match NOTHING (documented residual, not fixed by this bench's gates) ---
+    #
+    # This was written as the reproduction of the incident above before the real goal text
+    # was read, and it is closer in SUBJECT than the real one -- it shares 資材, 保証, 期限
+    # and ロット, all of them distinctive to copper-foil-survey in this five-Skill store --
+    # so MIN_DISTINCTIVE_WORDS=2 does not reject it. That is the residual MIN_DISTINCTIVE_
+    # WORDS's own docstring names: distinctiveness is computed against the Skills actually
+    # trusted today, not against Japanese in general, and a query that happens to share only
+    # words this store has never given to a second Skill will still pass. Left in as a
+    # negative the fixture cannot yet satisfy, rather than deleted for being inconvenient.
+    ("別の資材のロットが保証期限を超えて使われていないか調べたい", None),
 ]
 
 
@@ -107,17 +134,37 @@ CASES = [
 #: match is the expensive one. Measured: lowering MIN_MATCH_TOKENS turns
 #: 来月の打ち合わせを日付順に一覧化して from a miss into a match on desktop-md-inventory,
 #: and a set-only baseline reported that as unchanged.
+#:
+#: UPDATED 2026-09-15 for MIN_MATCH_WORDS / MIN_DISTINCTIVE_WORDS (see skills.py). Two moves
+#: from the previous baseline, in opposite directions, both measured rather than assumed:
+#:
+#:   IMPROVED  来週の打合せの予定を教えて now matches. Its overlap with mail-lookup is
+#:             exactly {予定, 打合} -- two real words -- which cleared MIN_MATCH_TOKENS=3
+#:             only by luck before (whatever else happened to tokenise alongside them) and
+#:             now clears the two-word gates on its own merits.
+#:
+#:   REGRESSED 先月のメールを一覧にして now misses. Its overlap is {メール, 一覧}: メール
+#:             is distinctive (df=1) but 一覧 is not (desktop-md-inventory lists files too),
+#:             so only one of its two words clears MIN_DISTINCTIVE_WORDS=2. This is the same
+#:             shape as the incident the new gates exist to catch -- one distinctive word
+#:             plus one shared one -- and nothing measured here tells the two apart. Between
+#:             identical shapes, the one that used to be a confident wrong match is the one
+#:             worth losing this genuine one to refuse; see MIN_DISTINCTIVE_WORDS's own
+#:             docstring in skills.py for the same measurement from the formula's side.
 KNOWN = {
     "今日の予定を教えて": "miss",
-    "来週の打合せの予定を教えて": "miss",
     "今週の会議を一覧にして": "miss",
     "8月22日の予定表に何が入っているか調べて": "miss",
     "来月の打ち合わせを日付順に一覧化して": "miss",
+    "先月のメールを一覧にして": "miss",
     "予定表に新しい会議を登録して": "wrong",
+    "別の資材のロットが保証期限を超えて使われていないか調べたい": "wrong",
 }
 
-BASELINE_NOTE = ("the calendar half of mail-lookup: 5 lookups missed, 1 creation wrongly "
-                 "matched. See KNOWN above for the two fixes already measured.")
+BASELINE_NOTE = ("the calendar half of mail-lookup (4 lookups missed, 1 creation wrongly "
+                 "matched), plus 先月のメールを一覧にして (traded off against closing the "
+                 "real incident, see above) and the documented residual case that shares "
+                 "only distinctive-in-this-store vocabulary with copper-foil-survey.")
 
 
 def evaluate(store, scorer):
