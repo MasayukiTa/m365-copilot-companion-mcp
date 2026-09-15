@@ -21,7 +21,7 @@
     "relay/socket_route.py": "c6835b06906b5c4ef299e598639e6ac5b79c0d6bbd3287f87ce608acb1a84bec",
     "tools/_untrusted.py": "2fe9c6b36a0188775db7de2b55649df3b6d923b97b104701d81e43a1065b59df",
     "tools/folder_policy.py": "d7b4dc0adcd82e8745bba4be1d2f6feea87f3c373d4bb0cac23121e14ebd2717",
-    "tools/security.py": "16bd02dd983e132af0841168177febc52a9cf5f88da04ee3520c4e22de5eaad5"
+    "tools/security.py": "92831f98e9cd85ab393073582e14dcf45719a34acc4caae37957071784c90594"
   },
   "repo_root": "<repo>"
 }
