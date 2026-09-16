@@ -973,6 +973,15 @@ class CockpitWindow : Window
     // tool path from it without a second HTTP round trip. Empty until the first successful
     // poll, and empty must read as "no evidence" everywhere it is used.
     static string _lastHealthBody = "";
+
+    //: WHEN that body was true, because a payload with no timestamp is indistinguishable from
+    //: a current one. _lastHealthBody was kept for the lifetime of the process and never
+    //: aged: once /health started failing, the last-known fleet_tool_ok went on softening the
+    //: tool dot from red to amber for as long as the cockpit stayed open. The window is the
+    //: same 30 seconds the poll runs on, doubled, so one missed sweep does not blank the dot
+    //: and two do.
+    static double _lastHealthBodyAt = 0;
+    const double HEALTH_BODY_MAX_AGE_S = 60;
     const int HEALTH_DOT_COUNT = 6;
     Border[] _healthDot;           // the 6 colored dots (re-tinted by ApplyHealthToUi)
     FrameworkElement[] _healthSpin;  // rotating in-progress marks, shown instead of a stale color
@@ -1153,6 +1162,9 @@ class CockpitWindow : Window
         if (k == "hs_fix_edge_navigate") return ja ? "エージェントのページを開いています..." : "opening the agent page...";
         if (k == "hs_fix_edge_still") return ja ? "ページを開いても準備完了になりません" : "navigated, but the page is still not ready";
         if (k == "hs_edge_detail_notabs") return ja ? "ブラウザは応答しています。この走行はソケット経路でタブを使わないため、タブが無いのは正常です。" : "The browser is responding. This run uses the socket route and drives no tabs, so having none is expected.";
+        // A SEPARATE SENTENCE FOR A SEPARATE FACT. The message above asserts a socket-route
+        // run, and it was shown on an idle machine where no run existed at all.
+        if (k == "hs_edge_detail_norun") return ja ? "ブラウザは応答しています。走行が無いので、タブについては何も確認していません。" : "The browser is responding. No run is active, so nothing has been checked about tabs.";
         if (k == "hs_signin_old_ok") return ja ? "サインイン記録は有効期限内ですが、取得が古く現在の状態を保証しません。再取得までは未確認です。" : "The sign-in record is unexpired, but it is old and does not attest to the session right now. Unverified until the next capture.";
         if (k == "hs_agent_other_surface") return ja ? "エージェント紐付けの直接の証拠がありません。別サーフェスの直近取得にgpt_idがあるだけで、フリート自身の紐付けは未確認です。" : "No direct evidence that THIS surface is bound to an agent -- only a gpt_id from the last capture on ANOTHER surface. The fleet own binding is unverified.";
         if (k == "hs_srv_detail_stale") return ja ? "サーバは応答していますが、起動時のコードのままでチェックアウトが先に進んでいます。再起動しないと修正は反映されません。起動時HEAD:" : "The server is responding but is still running the code it started on; the checkout has moved past it. Fixes are not live until it restarts. Started at HEAD:";
@@ -1168,13 +1180,23 @@ class CockpitWindow : Window
         if (k == "hs_signin_bad") return ja ? "サインインが必要です（ログイン画面を検出）" : "Sign-in required (login wall detected)";
         if (k == "hs_agent_ok") return ja ? "専用エージェントに接続中" : "Bound to the configured agent";
         if (k == "hs_agent_warn") return ja ? "既定Copilotに落ちている可能性（エージェント未検出）" : "Possible default-Copilot fallback (agent tab not found)";
-        if (k == "hs_agent_bad") return ja ? "実行中ですがM365チャットタブを検出できません" : "Run is active but no M365 chat tab is available";
+        // WAS TAB-ERA TEXT. This dot stopped reading tabs when the socket route landed, so
+        // under that route there is never a chat tab and the one red message on the agent
+        // dot sent the reader looking for something whose absence is normal. The branch
+        // that still reaches this is: route open, no cached binding, no gpt_id anywhere.
+        if (k == "hs_agent_bad") return ja ? "実行中ですが、このサーフェスがエージェントに紐付いている証拠がありません（テンプレート未取得または期限切れ）" : "Run is active, but there is no evidence this surface is bound to an agent (no cached template, or it has expired)";
+        if (k == "hs_agent_unknown_live") return ja ? "実行中ですが取得記録がまだありません。未確認であって失敗ではありません。" : "Run is active but no capture has been recorded yet. Unverified, not failed.";
         // hs_agent_gray no longer means "Edge is down": under the socket route the agent dot
         // is grey when no run is in flight, which is the ordinary idle state.
         if (k == "hs_agent_gray") return ja ? "走行なし" : "No run in flight";
         if (k == "hs_agent_canned") return ja ? "（直近の返答が定型の無回答）" : " (the last reply was the canned non-answer)";
         if (k == "hs_agent_tabs") return ja ? "ソケット経路が閉鎖 — 全ワーカーがタブ（動作するがコスト大）" : "Socket route closed — every worker on a tab (works, costs several times more)";
         if (k == "hs_signin_gray") return ja ? "捕捉の記録なし（走行なし）" : "No capture on record (no run)";
+        // TWO OF THE THREE BRANCHES THAT USED hs_signin_gray DO have a record; it is
+        // merely old, or the token has run out. Saying "no capture on record" there is a
+        // statement a reader can check and find false, which costs more than saying less.
+        if (k == "hs_signin_gray_old") return ja ? "取得記録はありますが古く、走行も無いため現在の状態は未確認です。" : "There is a capture on record, but it is old and no run is active, so the present state is unverified.";
+        if (k == "hs_signin_gray_expired") return ja ? "記録上のトークンは期限切れですが、走行が無いため必要とされていません。" : "The token on record has expired, but no run is asking for one.";
         if (k == "hs_signin_unknown_live") return ja ? "走行中だが捕捉の記録がない" : "A run is live and no capture is on record";
         if (k == "hs_signin_failed_other") return ja ? "直近の捕捉が失敗（サインイン以外の理由）" : "The last capture failed for a reason other than sign-in";
         if (k == "hs_signin_stale") return ja ? "トークンが期限切れ（走行中）" : "The token has expired while a run is live";
@@ -2279,7 +2301,7 @@ class CockpitWindow : Window
         // genuinely up -- the distinction matters for what a person does next.
         string srvBody = HttpBody("http://127.0.0.1:8000/health", 3500);
         bool srvOk = srvBody != null;
-        if (srvOk) _lastHealthBody = srvBody;
+        if (srvOk) { _lastHealthBody = srvBody; _lastHealthBodyAt = NowUnix(); }
         string authFails = HealthField(srvBody, "auth_fail_10m");
         // A BURST, NOT A STRAY. This first read "any non-zero count is amber", which is the
         // same mistake as judging the fleet tool path on a single failure -- caught there by
@@ -2375,7 +2397,22 @@ class CockpitWindow : Window
         else
         {
             string tabs = HttpGetBody("http://127.0.0.1:9222/json/list", 3500);
-            bool onAgent = tabs != null && tabs.IndexOf("m365.cloud.microsoft", StringComparison.OrdinalIgnoreCase) >= 0;
+            // THE DOMAIN IS NOT THE AGENT. This asked whether "m365.cloud.microsoft" appeared
+        // anywhere in the /json/list body, which is satisfied by a tab on the DEFAULT
+        // Copilot -- no connectors, no tenant grounding -- the failure this file elsewhere
+        // renders as a warning badge. It is also satisfied by another agent's tab, and by the
+        // string turning up in a title, a description or a favicon URL of any target, since
+        // nothing filters to "type":"page". The tunnel dot carries a comment about exactly
+        // this class: a 200 proves something answered, not that it was the right something.
+        //
+        // _agentMarkerId is the T_/P_ id parsed from MCP_FLEET_AGENT_URL and is already used
+        // for this judgement elsewhere in this file. When it is unset there is nothing to
+        // check against, and the domain is then the most that can honestly be claimed.
+        bool onDomain = tabs != null
+                     && tabs.IndexOf("m365.cloud.microsoft", StringComparison.OrdinalIgnoreCase) >= 0;
+        bool onAgent = onDomain
+                    && (string.IsNullOrEmpty(_agentMarkerId)
+                        || tabs.IndexOf(_agentMarkerId, StringComparison.OrdinalIgnoreCase) >= 0);
             if (onAgent)
                 SetDot(2, HealthState.Green, T("hs_edge_detail_ok"), now);
             else if (!FleetRunIsLive() || !RunDrivesTabs())
@@ -2401,7 +2438,9 @@ class CockpitWindow : Window
                 // tab at all -- and they shared one detail string, so the strip could not tell
                 // a reader which. The colour is right in both cases; only the sentence was
                 // missing.
-                SetDot(2, HealthState.Green, T("hs_edge_detail_notabs"), now);
+                SetDot(2, HealthState.Green,
+                       T(FleetRunIsLive() ? "hs_edge_detail_notabs" : "hs_edge_detail_norun"),
+                       now);
             else
                 // Amber, not red: the browser is up and one navigation away from usable, which
                 // is exactly what the automatic repair is for.
@@ -2766,8 +2805,13 @@ class CockpitWindow : Window
             // unhealthy. Amber during a run, because then the evidence IS expected.
             SetDot(3, live ? HealthState.Yellow : HealthState.Gray,
                    T(live ? "hs_signin_unknown_live" : "hs_signin_gray"), now);
-            SetDot(4, live ? HealthState.Red : HealthState.Gray,
-                   T(live ? "hs_agent_bad" : "hs_agent_gray"), now);
+            // AMBER FIRST, by this file's own rule two lines up: evidence that is expected
+            // and missing is not evidence of failure. The sign-in dot gets amber in exactly
+            // this situation on the line above; the agent dot jumped to red, and red here
+            // drives a reconnect. A first run on a fresh checkout has no capture record at
+            // all, and neither does one where the status writer swallowed an exception.
+            SetDot(4, live ? HealthState.Yellow : HealthState.Gray,
+                   T(live ? "hs_agent_unknown_live" : "hs_agent_gray"), now);
             return;
         }
 
@@ -2799,7 +2843,23 @@ class CockpitWindow : Window
         // repair that relaunches the browser HEADED, for a refusal that may long since have
         // resolved. Evidence about the past is not evidence about now.
         double capAgeS = (capTs > 0) ? (nowEpoch - capTs) : -1;
-        bool capFresh = capAgeS >= 0 && capAgeS <= SIGNIN_EVIDENCE_MAX_AGE_S;
+        // THE WINDOW COMES FROM THE RECORD, NOT FROM A CONSTANT. A flat 30 minutes was
+        // measured against a token that lives about 64 minutes on this machine (the record on
+        // disk when this was written: at=1789532602, expires_at=1789536451, 3,848s), and
+        // captures happen roughly once per token lifetime -- so for the back half of EVERY
+        // healthy cycle this dot left green for amber and said the session was unverified
+        // when nothing at all was wrong. A dot that is amber through half of normal operation
+        // is one people stop reading, which is the failure this file argues against
+        // repeatedly, arrived at from the other side.
+        //
+        // One token lifetime is exactly one capture cycle, so a run that is still capturing
+        // stays green and one that has stopped goes amber -- which is the question being
+        // asked. A FAILED capture has no expiry to measure, so it keeps the flat 30 minutes:
+        // "evidence about the past is not evidence about now" still governs the red branch,
+        // and the fallback selects itself rather than needing a rule.
+        double tokenLifeS = (expiresAt > 0 && capTs > 0) ? (expiresAt - capTs) : 0;
+        double freshWindowS = tokenLifeS > 0 ? tokenLifeS : SIGNIN_EVIDENCE_MAX_AGE_S;
+        bool capFresh = capAgeS >= 0 && capAgeS <= freshWindowS;
         if (!ok && string.Equals(kind, "signin", StringComparison.OrdinalIgnoreCase) && capFresh)
             SetDot(3, HealthState.Red, T("hs_signin_bad"), now);
         else if (!ok && string.Equals(kind, "signin", StringComparison.OrdinalIgnoreCase))
@@ -2821,11 +2881,11 @@ class CockpitWindow : Window
             // simply not current evidence -- painting an idle machine amber would be the
             // false-alarm half of the same mistake.
             SetDot(3, live ? HealthState.Yellow : HealthState.Gray,
-                   T(live ? "hs_signin_old_ok" : "hs_signin_gray"), now);
+                   T(live ? "hs_signin_old_ok" : "hs_signin_gray_old"), now);
         else if (live)
             SetDot(3, HealthState.Yellow, T("hs_signin_stale"), now);
         else
-            SetDot(3, HealthState.Gray, T("hs_signin_gray"), now);
+            SetDot(3, HealthState.Gray, T("hs_signin_gray_expired"), now);
 
         // AGENT. The template naming an agent is a STRONGER guarantee than the tab sniffing
         // it replaces: a capture whose request names no agent raises NotAnAgentSurface and
@@ -2882,7 +2942,29 @@ class CockpitWindow : Window
             string path = Path.Combine(RepoRoot(), ".fleet", "templates",
                                        "template_" + Sha256Prefix(url) + ".json");
             if (!File.Exists(path)) return false;
-            return File.ReadAllText(path).IndexOf("gptId", StringComparison.Ordinal) >= 0;
+            // EXISTENCE IS NOT THE BINDING, and the comment above used to say it was. The
+            // module that writes this file refuses to return one older than
+            // TEMPLATE_MAX_AGE_S (relay/profile_token.py), and refuses one whose gpt_id is
+            // empty (load_template's "a template without an agent is not a cache hit"). This
+            // dot checked neither, so it could report a binding the route itself would evict
+            // on first use -- and would go on reporting it, because the eviction only happens
+            // when a capture runs, about once per token lifetime.
+            //
+            // Measured when this was written: .fleet/templates held one template 211.7 hours
+            // old, 8.8 days against a 24 hour cap. Dot 3 was given an explicit max age for
+            // exactly this reason ("evidence about the past is not evidence about now"); dot
+            // 4 was not.
+            var tpl = _js.DeserializeObject(File.ReadAllText(path, Encoding.UTF8))
+                      as Dictionary<string, object>;
+            if (tpl == null) return false;
+            double savedAt = NumberField(tpl, "ts");
+            double ageS = NowUnix() - savedAt;
+            if (savedAt <= 0 || ageS > TEMPLATE_MAX_AGE_S) return false;
+            var query = tpl.ContainsKey("query") ? tpl["query"] as Dictionary<string, object>
+                                                 : null;
+            // Non-EMPTY, not merely present. The old substring test asked whether the five
+            // characters "gptId" appeared, which is a question about the file's spelling.
+            return !string.IsNullOrEmpty(StringField(query, "gptId"));
         }
         catch (Exception) { return false; }
     }
@@ -2890,6 +2972,11 @@ class CockpitWindow : Window
     // The same 16 hex characters relay/profile_token.py names its cache files with. If these
     // two ever disagree the lookup finds nothing and the dot reports "not bound" for ever --
     // a silent zero -- so the algorithm is stated in both places rather than assumed.
+    //: A COPY OF relay/profile_token.py's TEMPLATE_MAX_AGE_S, and copies drift, so a test
+    //: fails if the two stop agreeing. Stated here rather than read from the environment
+    //: because the cockpit must not report a binding on terms looser than the route's.
+    const double TEMPLATE_MAX_AGE_S = 24 * 3600;
+
     static string Sha256Prefix(string s)
     {
         using (var sha = System.Security.Cryptography.SHA256.Create())
@@ -3067,7 +3154,11 @@ class CockpitWindow : Window
             // fleet_tool_ok comes from /health (tools/fleet_tool_health.py), derived from the
             // ledger of real calls rather than from a probe. "" or "null" means no calls
             // lately, which is NOT evidence of anything and must not colour the dot.
-            string fleetTool = HealthField(_lastHealthBody, "fleet_tool_ok");
+            // Read through the age gate, not from the field directly: HealthField's contract is
+        // that "" means "no evidence", and a stale body has exactly as much evidence in it.
+        string fleetTool = (_lastHealthBodyAt > 0
+                            && NowUnix() - _lastHealthBodyAt <= HEALTH_BODY_MAX_AGE_S)
+                         ? HealthField(_lastHealthBody, "fleet_tool_ok") : "";
             bool fleetWorking = fleetTool == "true";
             bool fleetFailing = fleetTool == "false";
 

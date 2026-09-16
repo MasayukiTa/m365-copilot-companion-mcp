@@ -255,20 +255,31 @@ function Start-Server {
     # reading it afterwards, as the doctor told them to, sees only the newest launch and quite
     # possibly nothing at all. Carry it into a history file first, newest last, capped so an
     # unattended machine cannot fill its disk with the same stack trace.
-    $srvHist = Join-Path $logDir "server.err.history.log"
-    try {
-        if ((Test-Path $srvErr) -and ((Get-Item $srvErr).Length -gt 0)) {
-            $stamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-            Add-Content -Path $srvHist -Value ("=== launch ending " + $stamp + " ===") -Encoding UTF8
-            Get-Content $srvErr -ErrorAction Stop | Add-Content -Path $srvHist -Encoding UTF8
-            # Trim from the front: the oldest crash is the least useful and the newest must
-            # never be the one that gets dropped.
-            if ((Get-Item $srvHist).Length -gt 262144) {
-                $keep = Get-Content $srvHist -Tail 400 -ErrorAction Stop
-                Set-Content -Path $srvHist -Value $keep -Encoding UTF8
+    # BOTH STREAMS, NOT JUST stderr. Measured 2026-09-16: the server exited six times in
+    # two days and every preserved stderr block holds nothing but the uvicorn startup
+    # banner -- no traceback, no "Shutting down", and Windows Error Reporting logged no
+    # fault for it either. So the process is vanishing silently, and the one stream that
+    # might say why (uvicorn's access log, and anything the server prints) was being
+    # truncated unread on every relaunch. Preserving one stream and discarding the other
+    # left the failure permanently undiagnosable: the reason this comment's own argument
+    # was written for stderr applies word for word to stdout.
+    foreach ($pair in @(@($srvErr, "server.err.history.log"), @($srvOut, "server.out.history.log"))) {
+        $live = $pair[0]
+        $hist = Join-Path $logDir $pair[1]
+        try {
+            if ((Test-Path $live) -and ((Get-Item $live).Length -gt 0)) {
+                $stamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                Add-Content -Path $hist -Value ("=== launch ending " + $stamp + " ===") -Encoding UTF8
+                Get-Content $live -ErrorAction Stop | Add-Content -Path $hist -Encoding UTF8
+                # Trim from the front: the oldest crash is the least useful and the newest
+                # must never be the one that gets dropped.
+                if ((Get-Item $hist).Length -gt 262144) {
+                    $keep = Get-Content $hist -Tail 400 -ErrorAction Stop
+                    Set-Content -Path $hist -Value $keep -Encoding UTF8
+                }
             }
-        }
-    } catch { }
+        } catch { }
+    }
 
     try {
         Start-Process -FilePath $Py -ArgumentList "main.py" -WorkingDirectory $Root `
