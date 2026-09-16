@@ -69,12 +69,6 @@ def close_turn(worker: str, ts: Optional[float] = None) -> None:
             _WINDOWS[str(worker)] = (cur[0], float(ts if ts is not None else time.time()))
 
 
-def forget(worker: str) -> None:
-    """Drop a worker entirely -- it finished, or the run ended."""
-    with _LOCK:
-        _WINDOWS.pop(str(worker), None)
-
-
 def _contains(window: Tuple[float, Optional[float]], ts: float, now: float) -> bool:
     start, end = window
     if ts < start:
@@ -120,12 +114,12 @@ def belongs_to(worker: str, ts: float, now: Optional[float] = None) -> bool:
     return bool(worker) and exclusive_owner(ts, now) == str(worker)
 
 
-def snapshot() -> Dict[str, Tuple[float, Optional[float]]]:
-    """A copy, for logging what the decision was made against."""
-    with _LOCK:
-        return dict(_WINDOWS)
-
-
+#: NOTHING HERE IS BUILT AHEAD OF A CALLER. `forget(worker)` and `snapshot()` were written
+#: with this module and deleted the same day, because CI's unreferenced-symbol guard asked for
+#: a caller or a deletion and neither had one. forget() was redundant besides: a window expires
+#: on its own through GRACE_S and MAX_OPEN_S, so dropping it explicitly bought nothing.
+#: snapshot() was for a log that does not exist yet; if that log is written, it can arrive with
+#: its reader.
 def reset() -> None:
     """Drop everything. For tests, and for a coordinator starting a fresh run."""
     with _LOCK:

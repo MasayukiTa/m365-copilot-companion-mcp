@@ -87,12 +87,6 @@ def test_an_open_window_claims_from_its_start_but_not_forever():
     assert not TW.belongs_to("w0", 100.0 + TW.MAX_OPEN_S + 1)
 
 
-def test_forget_removes_a_worker():
-    TW.open_turn("w0", 100.0)
-    TW.forget("w0")
-    assert TW.exclusive_owner(105.0) is None
-
-
 # ---- the branch in the relay -------------------------------------------------------------
 
 def _refusal(ts, detail="[locked: no valid unlock token for 'x'] ..."):
@@ -169,13 +163,20 @@ def test_the_window_is_closed_when_the_reply_arrives(monkeypatch):
     open-window bound allows. _decide is the moment the reply exists, so it closes there."""
     monkeypatch.setattr(F, "_unlock_password", lambda: "pw-placeholder-not-a-credential")
     w = F.RelayWorker("テスト用のゴール", "w0")
+    # ASSERTED ON THE WIRING, NOT ON A TIMESTAMP. close_turn() stamps the REAL clock, so a
+    # fixture that opens at t=100 and then closes at time.time() puts the two on different
+    # axes -- every fake event then falls inside the closed window and nothing distinguishes
+    # open from closed. Waiting out GRACE_S in a test is the other way and costs 20 seconds.
+    # What matters here is that _decide closes the window at all; the registry's own arithmetic
+    # is covered by the tests above.
+    closed = []
     TW.open_turn("w0", 100.0)
-    assert TW.snapshot()["w0"][1] is None, "the fixture did not leave an open window"
+    monkeypatch.setattr(TW, "close_turn", lambda name, ts=None: closed.append(name))
     try:
         w._decide("ふつうの返答です。")
     except Exception:
         pass          # _decide does much more than this; only the close is under test
-    assert TW.snapshot()["w0"][1] is not None, "the window was left open after the reply"
+    assert closed == ["w0"], "the reply arrived and the window was never closed"
 
 
 # ---- an attempted tool call that never arrived is not "did not finish" --------------------
