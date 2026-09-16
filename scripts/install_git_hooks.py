@@ -13,22 +13,23 @@ solves.
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
+
+from tools.childproc import run as _run   # noqa: E402  -- locale-safe child output
 HOOKS_DIR = ".githooks"
 
 
 def current_hooks_path(repo=REPO):
-    out = subprocess.run(["git", "-C", repo, "config", "--get", "core.hooksPath"],
-                         capture_output=True, text=True)
+    out = _run(["git", "-C", repo, "config", "--get", "core.hooksPath"])
     return out.stdout.strip() if out.returncode == 0 else ""
 
 
 def install(repo=REPO):
-    subprocess.run(["git", "-C", repo, "config", "core.hooksPath", HOOKS_DIR],
-                   check=True, capture_output=True, text=True)
+    _run(["git", "-C", repo, "config", "core.hooksPath", HOOKS_DIR], check=True)
     # Git on POSIX needs the bit; on Windows it is ignored, and setting it anyway keeps a
     # clone made on one platform working on the other.
     hook = os.path.join(repo, HOOKS_DIR, "pre-commit")

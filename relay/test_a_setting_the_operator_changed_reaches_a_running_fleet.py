@@ -27,15 +27,28 @@ import pytest
 from relay.settings_follow import Follower
 
 
+#: The last mtime this helper handed out. MONOTONIC BY CONSTRUCTION, which the real clock is
+#: not at this resolution.
+_LAST_FORCED_MTIME = [0.0]
+
+
 def _write(path, **pairs):
     with open(path, "w", encoding="utf-8") as fh:
         for k, v in pairs.items():
             fh.write("%s=%s\n" % (k, v))
-    # The follower re-reads on (mtime, size). Tests write the same file repeatedly
-    # and can land inside one filesystem timestamp tick, which would make a real
-    # change look unchanged -- so make the stamp move for sure.
+    # The follower re-reads on (mtime, size). Tests write the same file repeatedly and can land
+    # inside one filesystem timestamp tick, which would make a real change look unchanged.
+    #
+    # BUMPING FROM THE FILE'S OWN MTIME WAS NOT ENOUGH, and produced a failure that appeared
+    # roughly one run in several and could not be reproduced on demand. Two writes in the same
+    # tick both yield stamp = T + 10, and `disk_floor_gb=1` and `disk_floor_gb=3` are the same
+    # SIZE -- so the cache key matched exactly and a real change was reported as none. Whether
+    # the two writes share a tick depends on whatever ran before them, which is why the same
+    # test passed alone and failed in company.
     st = os.stat(path)
-    os.utime(path, (st.st_atime, st.st_mtime + 10))
+    forced = max(st.st_mtime, _LAST_FORCED_MTIME[0]) + 10
+    _LAST_FORCED_MTIME[0] = forced
+    os.utime(path, (st.st_atime, forced))
 
 
 @pytest.fixture()
@@ -170,3 +183,62 @@ def test_the_coordinator_follows_the_floors_and_the_tab_cap():
         "a file save made by the same operator action race to a different answer")
     for key in ("disk_floor_gb", "ram_floor_mb", "maxtabs"):
         assert '.watch("%s"' % key in src, "%s went back to being read once at launch" % key
+
+def test_the_helper_moves_the_stamp_even_for_two_writes_in_one_tick(settings):
+    """PINS THE FIX, rather than trusting that ten green runs mean anything.
+
+    The failure it replaces appeared about one run in several, so counting passes could not
+    distinguish "fixed" from "lucky". What can be asserted is the property the tests actually
+    depend on: two writes of the same-sized content must never present the follower with the
+    same cache key, no matter how close together they happen.
+    """
+    _write(settings, disk_floor_gb=1)
+    first = os.stat(settings)
+    _write(settings, disk_floor_gb=3)          # same length, deliberately
+    second = os.stat(settings)
+    assert first.st_size == second.st_size, "this test is only interesting at equal size"
+    assert second.st_mtime > first.st_mtime, (
+        "two writes produced the same stamp; a real change would be invisible to the follower")
+
+
+def test_the_coordinator_wiring_moves_the_boxes_a_run_actually_reads(settings):
+    """THE WIRING, exercised rather than read.
+
+    relay/test_a_setting_the_operator_changed_reaches_a_running_fleet's older coordinator
+    check is source-level and says why: the wiring lived inside a 700-line run(). Reading
+    source cannot catch a callback that writes into a box nothing reads, which gpt-6-astra
+    named as the gap in these tests. fleet_runner.build_settings_follower now has a name, so
+    the file-to-box half can be exercised with the SAME callbacks production uses.
+
+    What is still not proven here is box-to-decision: relay_fleet indexes these list objects
+    at the moment it admits (relay_fleet.py:7978, 7980, 8029, 8067), and that is asserted from
+    source. Saying so is the point -- an untested half named is a different thing from an
+    untested half assumed.
+    """
+    from relay.fleet_runner import build_settings_follower
+
+    disk_box, ram_box, mc_box, asc_box = [6.0], [512.0], [3], [False, 100]
+    _write(settings, disk_floor_gb=6, ram_floor_mb=512, maxtabs=3)
+    f = build_settings_follower(disk_box, ram_box, mc_box, asc_box, path_fn=lambda: settings)
+
+    _write(settings, disk_floor_gb=2, ram_floor_mb=1024, maxtabs=5)
+    f.poll()
+    assert disk_box[0] == 2.0
+    assert ram_box[0] == 1024.0
+    assert mc_box[0] == 5, "with autoscale off, maxtabs is the fixed cap"
+    assert asc_box[1] == 100, "and it must not have moved the autoscale ceiling"
+
+
+def test_under_autoscale_the_tab_knob_moves_the_ceiling_instead(settings):
+    """The same key means two things, which is why its declaration says so. Under autoscale
+    the fixed cap is computed from RAM each loop, so writing it there would be overwritten a
+    second later and the operator's change would appear to do nothing."""
+    from relay.fleet_runner import build_settings_follower
+
+    disk_box, ram_box, mc_box, asc_box = [6.0], [512.0], [3], [True, 100]
+    _write(settings, maxtabs=3)
+    f = build_settings_follower(disk_box, ram_box, mc_box, asc_box, path_fn=lambda: settings)
+    _write(settings, maxtabs=8)
+    f.poll()
+    assert asc_box[1] == 8, "under autoscale the tab knob is the ceiling"
+    assert mc_box[0] == 3, "and the live cap is left to the RAM computation"

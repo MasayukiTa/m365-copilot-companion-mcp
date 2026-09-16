@@ -709,9 +709,12 @@ def _operator_set_a_disk_floor() -> bool:
     autostart default -- the conservative side, since the alternative is inheriting the bench
     reserve and admitting nothing.
     """
+    # Moved next to settings_disk_floor, the function it is about, when the bench
+    # orchestrators turned out to need the same answer. The reasoning above is kept here
+    # because this is where it was learned.
     try:
-        from relay.fleet_runner import settings_disk_floor
-        return float(settings_disk_floor(default=-1.0)) >= 0
+        from relay.fleet_runner import operator_set_a_disk_floor
+        return operator_set_a_disk_floor()
     except Exception:
         return False
 

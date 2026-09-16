@@ -21,7 +21,6 @@ from __future__ import annotations
 import io
 import os
 import re
-import subprocess
 import sys
 
 import pytest
@@ -32,6 +31,7 @@ if REPO not in sys.path:
 
 from tools import settings_keys as SK            # noqa: E402
 from tools import settings_path as SP            # noqa: E402
+from tools.childproc import run as _run         # noqa: E402  -- locale-safe child output
 
 
 def _read(rel, encoding="utf-8"):
@@ -45,16 +45,29 @@ def _write_settings(path, **pairs):
 
 
 # ------------------------------------------------------------------ the watch list agrees
-def test_every_key_the_follower_watches_is_declared_live():
-    """The follower is the only thing that can change a RUNNING fleet's number. A key it
-    watches but that the table calls per_job would tell an operator to restart for nothing;
-    the reverse would tell them to wait for a change that never comes."""
+def _watched_keys():
     src = _read("relay/fleet_runner.py")
-    watched = set(re.findall(r'\.watch\(\s*"([a-z_]+)"', src))
+    return set(re.findall(r'\.watch\(\s*"([a-z_]+)"', src))
+
+
+def test_every_key_the_follower_watches_is_declared_live():
+    """A key the follower watches but the table calls sweep_start would tell an operator to
+    restart for nothing."""
+    watched = _watched_keys()
     assert watched, "no Follower.watch calls found -- this test lost its subject"
     for key in sorted(watched):
         assert SK.effect(key) == SK.LIVE, \
             "%s is watched by the follower but declared %r" % (key, SK.effect(key))
+
+
+def test_every_key_declared_live_is_actually_watched():
+    """THE OTHER DIRECTION, which the first version of this file did not have. Checking only
+    "watched implies live" lets a key be declared live and never wired -- and that failure is
+    the one an operator experiences, because it promises a change that never arrives. Both
+    directions are assertable now that LIVE means the follower and each_gate is separate."""
+    for key in SK.names_with_effect(SK.LIVE):
+        assert key in _watched_keys(), \
+            "%s is declared live but nothing watches it; a change would never reach a run" % key
 
 
 # ------------------------------------------------------------------ live means live
@@ -78,17 +91,38 @@ def _reader_rate():
     return rate_ceiling()
 
 
-@pytest.mark.parametrize("key,first,second,reader", [
-    ("disk_floor_gb", "1", "9", _reader_disk),
-    ("ram_floor_mb", "512", "3072", _reader_ram),
-    ("maxtabs", "2", "7", _reader_maxtabs),
-    ("rate_ceiling_rpm", "40", "90", _reader_rate),
-])
-def test_a_key_declared_live_is_seen_again_without_a_restart(key, first, second, reader,
-                                                             tmp_path, monkeypatch):
+#: The reader whose return value an operator would see change, per key that claims to follow
+#: the file. A registry rather than a literal parameter list: a key declared live with no
+#: entry here FAILS the next test instead of quietly not being checked, which is how the
+#: first version of this file agreed with the declaration by being silent about it.
+_LIVE_READERS = {
+    "disk_floor_gb": (_reader_disk, "1", "9"),
+    "ram_floor_mb": (_reader_ram, "512", "3072"),
+    "maxtabs": (_reader_maxtabs, "2", "7"),
+    "rate_ceiling_rpm": (_reader_rate, "40", "90"),
+}
+
+#: job_approval_mode follows the file too, but its reader short-circuits under pytest and is
+#: checked in a subprocess below; it is not a gap, it is a different harness.
+_CHECKED_ELSEWHERE = {"job_approval_mode"}
+
+
+def test_every_following_key_has_a_reader_this_file_exercises():
+    """Otherwise the behavioural check covers whatever someone remembered to list."""
+    should = set(SK.names_with_effect(SK.LIVE)) | set(SK.names_with_effect(SK.EACH_GATE))
+    missing = sorted(should - set(_LIVE_READERS) - _CHECKED_ELSEWHERE)
+    assert not missing, ("these keys claim to follow the file but nothing here reads them: %r"
+                         % missing)
+
+
+@pytest.mark.parametrize("key", sorted(_LIVE_READERS))
+def test_a_key_declared_live_is_seen_again_without_a_restart(key, tmp_path, monkeypatch):
     """The operator moves the knob while the fleet runs. Nothing restarts. The next read must
-    see it -- that is the whole claim the word 'live' makes."""
-    assert SK.effect(key) == SK.LIVE, "this test only applies to live keys"
+    see it -- that is the whole claim these boundaries make."""
+    reader, first, second = _LIVE_READERS[key]
+    assert SK.effect(key) in (SK.LIVE, SK.EACH_GATE), \
+        "%s is declared %r; this test is about keys that follow the file" % (key,
+                                                                             SK.effect(key))
     path = tmp_path / "settings.txt"
     monkeypatch.setattr(SP, "NEW_PATH", str(path))
     _write_settings(str(path), **{key: first})
@@ -103,7 +137,7 @@ def test_the_approval_mode_is_live_outside_the_test_harness(tmp_path):
     whenever PYTEST_CURRENT_TEST is set, so a workstation's saved preference cannot leak into
     a test run. That safeguard also makes the liveness unobservable in-process, so this asks a
     SUBPROCESS, which is the only honest way to check the production path."""
-    assert SK.effect("job_approval_mode") == SK.LIVE
+    assert SK.effect("job_approval_mode") == SK.EACH_GATE
     path = tmp_path / "settings.txt"
     script = (
         "import sys; sys.path.insert(0, %r)\n"
@@ -119,8 +153,7 @@ def test_the_approval_mode_is_live_outside_the_test_harness(tmp_path):
     )
     env = {k: v for k, v in os.environ.items() if k != "PYTEST_CURRENT_TEST"}
     env.pop("TASK_JOB_APPROVAL_MODE", None)
-    out = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
-                         env=env, cwd=REPO, timeout=120)
+    out = _run([sys.executable, "-c", script], env=env, cwd=REPO, timeout=120)
     assert out.returncode == 0, out.stderr[-2000:]
     said = out.stdout.strip().splitlines()[-1].split()
     assert said == ["bypass", "default"], \
