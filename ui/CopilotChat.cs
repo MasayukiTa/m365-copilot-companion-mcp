@@ -196,6 +196,7 @@ class ChatWindow : Window
         if (k == "send_unknown_conv") return ja ? "この会話の送信先を特定できません。会話を開き直してください。" : "Can't identify where to send this — please reopen the conversation.";
         // ── fleet conversations: the message goes to the fleet, not to the bridge page ──
         if (k == "fleet_steer_sent")  return ja ? "実行中のワーカーに追加指示を渡しました。次のターンから反映されます。" : "Handed to the running worker -- it takes effect on its next turn.";
+        if (k == "fleet_goal_empty") return ja ? "/goal のあとに内容がありません。新しいゴールの本文を書いてください。" : "/goal was given with no text. Write the new goal after it.";
         if (k == "fleet_follow_sent") return ja ? "この会話の続きとして、新しいワーカーに引き継ぎました（同じ会話を継続します）。" : "Queued as a follow-up: a new worker will continue this same conversation.";
         if (k == "fleet_follow_idle") return ja ? "フリートが起動していないため、次の走行で拾われます（同じ会話の続きとして投入済み）。" : "No fleet is running, so this waits for the next one -- queued as a continuation of this conversation.";
         if (k == "fleet_no_goal")     return ja ? "この会話を識別するゴール本文が記録されていないため、続きを投入できません。" : "This conversation has no recorded goal text to identify it, so it can't be continued.";
@@ -4829,6 +4830,36 @@ class ChatWindow : Window
         AddUser(text);
         c.Messages.Add(new Msg("U", text));
         string live = LiveWorkerFor(c);
+
+        // AN ESCAPE FROM THE STEER, BECAUSE ONLY THE PERSON TYPING KNOWS WHICH IT IS.
+        //
+        // While a worker is live, everything typed here becomes a steer -- see the branch
+        // below, which is deliberate and right for "keep going, but do it this way". It is
+        // wrong for "here is a different job", and until 2026-09-16 there was no way to say
+        // the second thing from this window.
+        //
+        // What that cost, observed live: a screen-inspection goal was running when an
+        // unrelated git-history question was typed into its conversation. One worker then
+        // held two tasks. The card showed the first goal's title above the second task's
+        // result; the refuter, holding only the original goal, ruled it unmet; the worker
+        // argued back about "an additional request from the user" to a judge that had never
+        // been told there was one; and it oscillated between the two for the rest of the run.
+        // The new task never appeared in the goal list either, because it never became a goal.
+        //
+        // The default is unchanged -- typing still steers. `/goal ` in front routes to the
+        // follow-up path below instead, which already exists and is strictly better for a new
+        // task: its own worker, its own card, its own judge, and resume_conv keeps it in this
+        // same conversation. Slash commands are an established idiom in these composers
+        // (docs/ADVANCED.md lists the goal-box set), so this adds a verb rather than a mode.
+        const string NEW_GOAL_PREFIX = "/goal ";
+        bool forceNewGoal = text.StartsWith(NEW_GOAL_PREFIX, StringComparison.OrdinalIgnoreCase);
+        if (forceNewGoal)
+        {
+            text = text.Substring(NEW_GOAL_PREFIX.Length).Trim();
+            if (text.Length == 0) { AddAssistant(T("fleet_goal_empty")); StickToEnd(); return; }
+            live = "";      // fall through to the follow-up goal path
+        }
+
         if (live.Length > 0)
         {
             var it = new Dictionary<string, object>(); it["worker"] = live; it["text"] = text;
@@ -4848,7 +4879,13 @@ class ChatWindow : Window
             return;
         }
         var g = new Dictionary<string, object>();
-        g["text"] = (_lang == 0
+        // A FOLLOW-UP AND A NEW JOB NEED DIFFERENT FRAMING, and this path had only one.
+        // The wrapper below says "build on the work so far and answer only this", which is
+        // right for "also tell me X about what you just did" and wrong for "here is a
+        // different task" -- it would hand the new worker a goal that points at somebody
+        // else's work. `/goal` means the second thing, so it travels as the goal itself.
+        // resume_conv still keeps it in this conversation; only the framing differs.
+        g["text"] = forceNewGoal ? text : (_lang == 0
             ? "【ユーザーからの追加指示】" + text + "\n直前までの作業内容を踏まえ、この追加指示に対してだけ答えてください。最初からやり直す必要はありません。完了なら DONE、無理なら FAIL と理由を書いてください。"
             : "[follow-up from the user] " + text + "\nAnswer only this follow-up, building on the work so far. Do not start over. Write DONE when finished, or FAIL and why.");
         // THE CONVERSATION BY ITS ID, WHICH THIS ROW HAS HAD ALL ALONG. `ConvUrl` is

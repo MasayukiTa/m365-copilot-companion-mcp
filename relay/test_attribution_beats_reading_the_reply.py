@@ -176,3 +176,34 @@ def test_the_window_is_closed_when_the_reply_arrives(monkeypatch):
     except Exception:
         pass          # _decide does much more than this; only the close is under test
     assert TW.snapshot()["w0"][1] is not None, "the window was left open after the reply"
+
+
+# ---- an attempted tool call that never arrived is not "did not finish" --------------------
+
+def test_a_reply_that_writes_out_an_invocation_is_recognised():
+    """MEASURED: 14 of 18 assistant turns in one run contained `<invoke name=` written out as
+    prose. Not one of those blocks reached the gateway. The worker was filed STUCK as "no DONE
+    after 6 continue nudges (stopped to avoid degrading the model)", which names the wrong
+    thing entirely -- it was not failing to finish, its calls were landing nowhere, and a
+    nudge to continue is advice for a different problem."""
+    assert F._tried_to_call_a_tool('court <invoke name="x-call_tool"> <parameter name="n">y')
+    assert F._tried_to_call_a_tool("<invoke name='screenshot'>")
+    assert not F._tried_to_call_a_tool("ウィンドウを6件確認しました。次に進みます。")
+    assert not F._tried_to_call_a_tool("")
+
+
+def test_the_landing_check_does_not_claim_the_positive(monkeypatch, tmp_path):
+    """_no_tool_call_landed answers only the NEGATIVE form -- nothing from anybody arrived --
+    because attribution is not available in general (see turn_windows).
+
+    IT IS NO LONGER WHAT GATES THE BRANCH, and that is the point of this test. The first
+    version required it, and on the run it was written for 19 calls DID land and 18 succeeded,
+    so the condition was never true and the branch never fired while 8 of the last 10 turns
+    re-emitted the same non-executing invocation. Kept because it is honest about what it can
+    say; not used as a gate, because what it can say is not the question."""
+    import tools.fleet_tool_health as H
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("", encoding="utf-8")
+    monkeypatch.setattr(H, "LEDGER", empty)
+    assert F._no_tool_call_landed(1.0) is True
+    assert F._no_tool_call_landed(0.0) is False, "no turn time means no claim"

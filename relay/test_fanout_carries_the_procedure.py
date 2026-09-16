@@ -102,7 +102,15 @@ def test_an_ordinary_worker_is_unchanged():
     """
     w = F.RelayWorker(MAIL_GOAL, "w0", fanout=False)
     assert w.fanout is False
-    assert "MARKER-SLICING-RULE" in w.job
+    # CHANGED 2026-09-16: it used to get the whole body and this line asserted that. The
+    # operator pointed at a live turn where a goal whose entire task was "press the Windows
+    # key, then Win+R" carried 2,251 characters of keyboard manual, inside a 7,850-character
+    # turn sent FOUR TIMES byte-identically while exactly one reply came back -- named as the
+    # same failure the tool catalogue had, and fixed the same way. Measured on that goal:
+    # 2,310 characters become 345. The fan-out case keeps the body, and its own test says why.
+    assert "MARKER-SLICING-RULE" not in w.job, "the whole body is being pushed again"
+    assert "mail-split-drill" in w.job, "the procedure was not named at all"
+    assert "skill_load" in w.job, "named a procedure without saying how to open it"
 
 
 def test_the_match_is_not_run_twice_per_worker():
@@ -112,9 +120,9 @@ def test_the_match_is_not_run_twice_per_worker():
     calls = []
     real = F._with_matched_skill
 
-    def counted(goal_text):
+    def counted(goal_text, want_body=True):
         calls.append(goal_text)
-        return real(goal_text)
+        return real(goal_text, want_body=want_body)
 
     F._with_matched_skill = counted
     try:
