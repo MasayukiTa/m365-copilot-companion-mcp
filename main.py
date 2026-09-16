@@ -1,5 +1,6 @@
 import os
 import time
+from pathlib import Path
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
@@ -293,6 +294,57 @@ mcp = FastMCP(
     ),
 )
 
+def _git_head_sha(repo_root=None):
+    """The commit the checkout is on, read from .git without invoking git.
+
+    A file read rather than a subprocess: /health may be polled every few seconds and must
+    stay non-blocking, which is the property main.py's own docstring protects. Returns "" on
+    anything unexpected -- a detached head, a worktree, no .git at all -- because an empty
+    SHA means "unknown", which classify_staleness already treats as indeterminate rather
+    than as a pass or a failure.
+    """
+    try:
+        root = Path(repo_root) if repo_root else Path(__file__).resolve().parent
+        head = (root / ".git" / "HEAD").read_text(encoding="utf-8").strip()
+        if head.startswith("ref:"):
+            ref = head.split(" ", 1)[1].strip()
+            p = root / ".git" / ref
+            if p.is_file():
+                return p.read_text(encoding="utf-8").strip()
+            # A packed ref: the loose file is absent once git has packed it.
+            packed = root / ".git" / "packed-refs"
+            if packed.is_file():
+                for line in packed.read_text(encoding="utf-8").splitlines():
+                    if line.endswith(" " + ref):
+                        return line.split(" ", 1)[0].strip()
+            return ""
+        return head
+    except Exception:
+        return ""
+
+
+#: Captured once, at import: the commit this process actually started on. Comparing it to the
+#: SHA read at request time is what makes "stale" checkable rather than assumed.
+_BOOT_HEAD = _git_head_sha()
+_BOOT_PID = os.getpid()
+_BOOT_TS = time.time()
+
+
+def _server_identity():
+    """Which process is answering, and whether its code matches the checkout."""
+    try:
+        from scripts.stale_server_check import classify_staleness
+        state = classify_staleness(_BOOT_HEAD, _git_head_sha(), True)
+    except Exception:
+        state = "unknown"
+    return {
+        "server_pid": _BOOT_PID,
+        "server_uptime_s": round(time.time() - _BOOT_TS, 1),
+        "server_head": _BOOT_HEAD[:12],
+        "server_code": state,   # current | stale | unknown
+    }
+
+
 @mcp.custom_route("/health", methods=["GET"])
 async def health(_request: Request) -> JSONResponse:
     """Liveness probe that NEVER touches a blocking tool.
@@ -309,6 +361,18 @@ async def health(_request: Request) -> JSONResponse:
     is visible to the supervisor/cockpit without grepping logs. get_summary() never
     raises, so this can't turn a healthy-loop probe into a 500."""
     payload = {"status": "ok"}
+    # WHO IS ANSWERING, AND IS IT RUNNING THE CODE ON DISK.
+    #
+    # A server that is already running keeps executing what it imported at startup. A pull
+    # lands new code, /health still answers 200, and every dot stays green while the checkout
+    # and the live process silently disagree -- scripts/doctor.ps1:690 describes exactly this
+    # and checks it, but the cockpit's Server dot never did. On 2026-09-16 the process serving
+    # all morning had started at 20:36 the previous evening, before every fix of that night,
+    # and it was reported as healthy because 200 is all anyone looked at.
+    #
+    # The decision itself is scripts/stale_server_check.classify_staleness -- pure and
+    # pytest-covered -- so this cannot drift from what those tests assert.
+    payload.update(_server_identity())
     payload.update(_auth_stats_summary())
     payload.update(_tool_probe_summary())
     # TWO TOOL PATHS, TWO FIELDS. tool_ok comes from the BRIDGE's idle self-probe and says

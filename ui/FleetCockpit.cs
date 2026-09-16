@@ -1152,6 +1152,11 @@ class CockpitWindow : Window
         if (k == "hs_tun_detail_none") return ja ? "MCP_TUNNEL_URL が .env に未設定です" : "MCP_TUNNEL_URL is not set in .env";
         if (k == "hs_fix_edge_navigate") return ja ? "エージェントのページを開いています..." : "opening the agent page...";
         if (k == "hs_fix_edge_still") return ja ? "ページを開いても準備完了になりません" : "navigated, but the page is still not ready";
+        if (k == "hs_edge_detail_notabs") return ja ? "ブラウザは応答しています。この走行はソケット経路でタブを使わないため、タブが無いのは正常です。" : "The browser is responding. This run uses the socket route and drives no tabs, so having none is expected.";
+        if (k == "hs_signin_old_ok") return ja ? "サインイン記録は有効期限内ですが、取得が古く現在の状態を保証しません。再取得までは未確認です。" : "The sign-in record is unexpired, but it is old and does not attest to the session right now. Unverified until the next capture.";
+        if (k == "hs_agent_other_surface") return ja ? "エージェント紐付けの直接の証拠がありません。別サーフェスの直近取得にgpt_idがあるだけで、フリート自身の紐付けは未確認です。" : "No direct evidence that THIS surface is bound to an agent -- only a gpt_id from the last capture on ANOTHER surface. The fleet own binding is unverified.";
+        if (k == "hs_srv_detail_stale") return ja ? "サーバは応答していますが、起動時のコードのままでチェックアウトが先に進んでいます。再起動しないと修正は反映されません。起動時HEAD:" : "The server is responding but is still running the code it started on; the checkout has moved past it. Fixes are not live until it restarts. Started at HEAD:";
+        if (k == "hs_tun_detail_other") return ja ? "トンネルは応答していますが、このマシンで動いているサーバとは別のプロセスに繋がっています。pid:" : "The tunnel is responding, but it reaches a DIFFERENT process than the server running on this machine. pid:";
         if (k == "hs_tool_detail_fleet_down") return ja ? "ブリッジ側はツールを呼べていますが、フリート側のツール呼び出しが連続失敗しています。作業を実行する経路はこちらです。" : "The bridge can call tools, but the FLEET path is failing repeatedly. That is the path that does the work.";
         if (k == "hs_tool_detail_bridge_only_down") return ja ? "落ちているのはブリッジのチャット経路だけで、フリートのツール呼び出しは成功しています。ツール全体が不通ではありません。" : "Only the bridge chat path is down; fleet tool calls are succeeding. This is not a total tool outage.";
         if (k == "hs_tool_detail_never") return ja ? "自己診断がまだ一度も結果を書いていない（ブリッジ未起動か診断側の不具合）" : "the self-probe has never written a result (bridge not started, or the probe is broken)";
@@ -2277,11 +2282,22 @@ class CockpitWindow : Window
         if (srvOk) _lastHealthBody = srvBody;
         string authFails = HealthField(srvBody, "auth_fail_10m");
         bool authStorm = authFails.Length > 0 && authFails != "0";
+        // STALE CODE IS NOT A HEALTHY SERVER, and 200 cannot tell you. A running process keeps
+        // executing what it imported at startup; a pull lands new code and every dot stays
+        // green while the checkout and the live process disagree. doctor.ps1:690 has checked
+        // this for a while; this dot never did. On 2026-09-16 the process serving all morning
+        // had started the previous evening, before every fix of that night, and was reported
+        // healthy. server_code is computed by the server itself via the pure, pytest-covered
+        // scripts/stale_server_check.classify_staleness.
+        string codeState = HealthField(srvBody, "server_code");
         if (!srvOk)
             SetDot(0, HealthState.Red, T("hs_srv_detail_bad"), now);
         else if (authStorm)
             SetDot(0, HealthState.Yellow,
                    T("hs_srv_detail_auth") + " (" + authFails + ")", now);
+        else if (codeState == "stale")
+            SetDot(0, HealthState.Yellow,
+                   T("hs_srv_detail_stale") + " (" + HealthField(srvBody, "server_head") + ")", now);
         else
             SetDot(0, HealthState.Green, T("hs_srv_detail_ok"), now);
 
@@ -2304,9 +2320,28 @@ class CockpitWindow : Window
             string turl = origin + "/health";
             // 6s, not the local 4s budget: this is a remote round-trip (devtunnels region)
             // that on a corporate machine also traverses the system proxy -- 4s false-reds it.
-            bool tunOk = HttpOk(turl, 6000);
-            SetDot(1, tunOk ? HealthState.Green : HealthState.Red,
-                   T(tunOk ? "hs_tun_detail_ok" : "hs_tun_detail_bad"), now);
+            // REACHING *A* SERVER IS NOT REACHING *THIS* SERVER. A 200 through the tunnel
+            // proves something answered; it does not prove the tunnel forwards to the process
+            // this machine is running. A tunnel left pointing at a previous host, or at a
+            // second instance, answers 200 all day while the agent talks to the wrong server
+            // and nothing on this strip disagrees.
+            //
+            // /health now names the process (server_pid). Comparing it to the pid loopback
+            // just reported turns "something answered" into "the thing I meant answered".
+            // Both sides empty means an older server build on one end -- no evidence, so it
+            // does not colour anything.
+            string tunBody = HttpBody(turl, 6000);
+            bool tunOk = tunBody != null;
+            string tunPid = HealthField(tunBody, "server_pid");
+            string locPid = HealthField(srvBody, "server_pid");
+            bool pidsDisagree = tunPid.Length > 0 && locPid.Length > 0 && tunPid != locPid;
+            if (!tunOk)
+                SetDot(1, HealthState.Red, T("hs_tun_detail_bad"), now);
+            else if (pidsDisagree)
+                SetDot(1, HealthState.Yellow,
+                       T("hs_tun_detail_other") + " (" + tunPid + " != " + locPid + ")", now);
+            else
+                SetDot(1, HealthState.Green, T("hs_tun_detail_ok"), now);
         }
 
         // 2) Edge: CDP answers, AND a tab is actually on the agent.
@@ -2349,7 +2384,13 @@ class CockpitWindow : Window
                 // Whether workers can actually reach the agent is the AGENT dot's question, and
                 // that one was already moved off the tab list when the socket route landed. This
                 // dot answers for the browser.
-                SetDot(2, HealthState.Green, T("hs_edge_detail_ok"), now);
+                //
+                // ITS OWN WORDING, THOUGH. Both green branches are correct and they mean
+                // different things -- a tab sitting on the agent, versus a run that needs no
+                // tab at all -- and they shared one detail string, so the strip could not tell
+                // a reader which. The colour is right in both cases; only the sentence was
+                // missing.
+                SetDot(2, HealthState.Green, T("hs_edge_detail_notabs"), now);
             else
                 // Amber, not red: the browser is up and one navigation away from usable, which
                 // is exactly what the automatic repair is for.
@@ -2754,8 +2795,22 @@ class CockpitWindow : Window
             SetDot(3, HealthState.Yellow, T("hs_signin_old"), now);
         else if (!ok)
             SetDot(3, HealthState.Yellow, T("hs_signin_failed_other"), now);
-        else if (lifeLeft > 0)
+        else if (lifeLeft > 0 && capFresh)
             SetDot(3, HealthState.Green, T("hs_signin_ok"), now);
+        else if (lifeLeft > 0)
+            // THE RULE THE PARAGRAPH ABOVE ARGUES FOR, APPLIED TO SUCCESSES TOO. "Evidence
+            // about the past is not evidence about now" was written for failures and only
+            // ever gated failures: an ok=true capture with a far-future expires_at read as
+            // green forever, however old the record, because nothing re-verifies the session.
+            // A token can be revoked by tenant policy or a sign-out elsewhere and this dot
+            // would not notice until some later capture happened to fail.
+            //
+            // Amber while a run is live, because then the evidence IS expected and its
+            // absence matters. Grey when idle, because nothing is asking and an old record is
+            // simply not current evidence -- painting an idle machine amber would be the
+            // false-alarm half of the same mistake.
+            SetDot(3, live ? HealthState.Yellow : HealthState.Gray,
+                   T(live ? "hs_signin_old_ok" : "hs_signin_gray"), now);
         else if (live)
             SetDot(3, HealthState.Yellow, T("hs_signin_stale"), now);
         else
@@ -2781,7 +2836,16 @@ class CockpitWindow : Window
         else if (FleetAgentIsBound())
             SetDot(4, HealthState.Green, T("hs_agent_ok"), now);
         else if (!string.IsNullOrEmpty(gptId))
-            SetDot(4, HealthState.Green, T("hs_agent_ok"), now);
+            // THIS FALLBACK IS THE FIELD THE CHECK ABOVE EXISTS TO DISTRUST. Read
+            // FleetAgentIsBound's own comment: capture_status.json's gpt_id is "the LAST
+            // capture on ANY surface", the route also captures for side agents, and "the last
+            // event about somebody else is not evidence about you". Then this line took that
+            // same field as sufficient for GREEN, reintroducing precisely what the primary
+            // check was built to avoid.
+            //
+            // It is kept, because a non-empty gpt_id is not nothing -- some surface did bind
+            // to some agent. It is amber, because it is not evidence about THIS one.
+            SetDot(4, HealthState.Yellow, T("hs_agent_other_surface"), now);
         else
             SetDot(4, HealthState.Red, T("hs_agent_bad"), now);
     }
