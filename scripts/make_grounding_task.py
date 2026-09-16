@@ -125,14 +125,19 @@ def main(argv=None):
 
     items = []
     too_easy = []
+    # EVERY REASON A TARGET IS DROPPED, because a refusal that names one of four causes sends
+    # the reader after the wrong one.
+    dropped = {"buried": 0, "off the captured frame": 0, "too small once clipped": 0}
     for t, name, occluders in targets:
         # Only ask about something that is actually visible: a target buried under another
         # window cannot be found in the picture, and scoring it would measure the desktop's
         # arrangement rather than the model.
         cx, cy = t.centre
         if any(o.contains(cx, cy) for o in occluders):
+            dropped["buried"] += 1
             continue
         if not frame.contains_screen(cx, cy):
+            dropped["off the captured frame"] += 1
             continue
         ix0, iy0 = frame.to_image(t.left, t.top)
         ix1, iy1 = frame.to_image(t.right, t.bottom)
@@ -146,6 +151,7 @@ def main(argv=None):
         ix1 = max(0.0, min(ix1, frame.image_width))
         iy1 = max(0.0, min(iy1, frame.image_height))
         if ix1 - ix0 < args.min_side / frame.scale or iy1 - iy0 < args.min_side / frame.scale:
+            dropped["too small once clipped"] += 1
             continue        # what remains visible is too small to ask about honestly
         rect = [round(ix0, 1), round(iy0, 1), round(ix1, 1), round(iy1, 1)]
         chance = chance_of_a_blind_hit(rect, frame.image_width, frame.image_height)
@@ -164,10 +170,16 @@ def main(argv=None):
             "chance": round(chance, 5),
         })
 
+    reasons = dict(dropped)
+    reasons["bigger than %.0f%% of the picture" % (100.0 * args.max_chance)] = len(too_easy)
     if not items:
-        print("nothing askable on this screen: %d target(s) seen, %d of them cover more than "
-              "%.0f%% of the picture and would be hit blind."
-              % (len(targets), len(too_easy), 100.0 * args.max_chance))
+        print("nothing askable on this screen. %d target(s) seen:" % len(targets))
+        for why, n in sorted(reasons.items(), key=lambda kv: -kv[1]):
+            if n:
+                print("   %3d  %s" % (n, why))
+        print()
+        print("A screen with several distinct, fully visible, medium-sized windows is what")
+        print("this needs. One maximised window over everything else has nothing to ask about.")
         return 2
 
     task = {
@@ -189,12 +201,12 @@ def main(argv=None):
     print(task["capture"])
     print(frame.describe())
     print("wrote %s  (%d target(s), split=%s)" % (task_path, len(items), args.split))
-    if too_easy:
-        print("withheld %d target(s) a blind answer would hit more than %.0f%% of the time "
-              "(largest: %s at %.0f%%)"
-              % (len(too_easy), 100.0 * args.max_chance,
-                 max(too_easy, key=lambda p: p[1])[0],
-                 100.0 * max(p[1] for p in too_easy)))
+    withheld = sum(reasons.values())
+    if withheld:
+        print("withheld %d of %d target(s):" % (withheld, len(targets)))
+        for why, n in sorted(reasons.items(), key=lambda kv: -kv[1]):
+            if n:
+                print("   %3d  %s" % (n, why))
     print()
     print("Ask about ONE of these at a time. The question names the thing and nothing else --")
     print("no position words, no size, no colour; those are the answer, not the question:")
