@@ -311,6 +311,17 @@ async def health(_request: Request) -> JSONResponse:
     payload = {"status": "ok"}
     payload.update(_auth_stats_summary())
     payload.update(_tool_probe_summary())
+    # TWO TOOL PATHS, TWO FIELDS. tool_ok comes from the BRIDGE's idle self-probe and says
+    # nothing about the fleet; on 2026-09-16 it was red -- truthfully -- while fleet workers
+    # made 84 successful tool calls in an hour and a goal finished DONE. Anything that read
+    # tool_ok as "tool access" was reading one path of four. fleet_tool_ok is the other
+    # busy path, derived from the ledger of real calls rather than from a probe, and its
+    # None means "no calls lately", which is not a failure.
+    try:
+        from tools.fleet_tool_health import get_summary as _fleet_tool_summary
+        payload.update(_fleet_tool_summary())
+    except Exception:
+        pass
     return JSONResponse(payload)
 
 
