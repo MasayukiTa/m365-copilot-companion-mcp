@@ -628,6 +628,44 @@ def settings_autoretry():
     return (on and cap > 0), cap
 
 
+def build_settings_follower(disk_box, ram_box, mc_box, asc_box, path_fn=None):
+    """Wire the settings file to the live boxes a running fleet reads.
+
+    NAMED RATHER THAN INLINE so it can be exercised. It lived inside run(), which is 700 lines
+    and cannot be called in a test, so the only available check was to read the source for a
+    `.watch(` -- and source cannot catch a callback that writes into a box nothing reads.
+    gpt-6-astra named that gap while reviewing tools/settings_keys.py. With this callable, the
+    file-to-box half is a behavioural test; box-to-decision stays source-level, because
+    relay_fleet indexes these same list objects at the moment it decides.
+
+    The boxes are the live values themselves, shared with run_relay_fleet -- not copies. That
+    is the whole mechanism: the sweep reads disk_box[0] each time it admits, so writing here
+    changes the next decision without anything restarting.
+    """
+    from relay.settings_follow import Follower
+
+    def _set_disk_floor(v):
+        disk_box[0] = max(0.0, float(v))
+
+    def _set_ram_floor(v):
+        ram_box[0] = max(0.0, float(v))
+
+    def _set_maxtabs(v):
+        # Same split the cockpit's set_maxtabs command makes: under autoscale this knob
+        # is the ceiling, otherwise it is the fixed cap.
+        n = max(1, int(v))
+        if asc_box[0]:
+            asc_box[1] = n
+        else:
+            mc_box[0] = n
+
+    return (Follower(path_fn or _settings_path)
+            .watch("disk_floor_gb", _set_disk_floor)
+            .watch("ram_floor_mb", _set_ram_floor)
+            .watch("maxtabs", _set_maxtabs)
+            .prime())
+
+
 def settings_maxtabs(default=DEFAULT_MAX_CONCURRENT):
     """The user's chosen concurrency from settings.txt (`maxtabs=N`). Under autoscale this is
     the DEFAULT/start cap; with autoscale off it's the fixed cap. Falls back to `default`."""
@@ -751,6 +789,27 @@ def settings_disk_floor(default=None):
         from relay.relay_fleet import DEFAULT_DISK_FLOOR_GB
         default = DEFAULT_DISK_FLOOR_GB
     return _settings_float("disk_floor_gb", default)
+
+
+def operator_set_a_disk_floor():
+    """Has the operator chosen a disk floor, or is there nothing to respect?
+
+    `settings_disk_floor` substitutes a default when the key is absent, so it cannot answer
+    this on its own: a sentinel default is passed and a negative result means "no line in
+    settings.txt". ANY real choice counts, including 0 -- the cockpit clamps that control to
+    0..100 and therefore offers 0, so treating it as "unset" would substitute a number for one
+    the operator picked.
+
+    Callers use this to decide whether to pass --disk-floor-gb at all, because passing the
+    flag BEATS the file (CLI > settings > env) and a run that ignores the panel while the panel
+    keeps displaying its number is the defect class this repository has spent a week removing.
+
+    Never raises. An unreadable settings file reads as "nothing chosen".
+    """
+    try:
+        return float(settings_disk_floor(default=-1.0)) >= 0
+    except Exception:
+        return False
 
 
 def settings_ram_floor(default=2048.0):
@@ -2240,28 +2299,7 @@ def main():
     #
     # on_tick fires every poll_s (1.0 s), so "the operator changes a setting and the
     # run changes" is a second, not a restart.
-    from relay.settings_follow import Follower
-
-    def _set_disk_floor(v):
-        disk_box[0] = max(0.0, float(v))
-
-    def _set_ram_floor(v):
-        ram_box[0] = max(0.0, float(v))
-
-    def _set_maxtabs(v):
-        # Same split the cockpit's set_maxtabs command makes: under autoscale this knob
-        # is the ceiling, otherwise it is the fixed cap.
-        n = max(1, int(v))
-        if asc_box[0]:
-            asc_box[1] = n
-        else:
-            mc_box[0] = n
-
-    settings_follower = (Follower(_settings_path)
-                         .watch("disk_floor_gb", _set_disk_floor)
-                         .watch("ram_floor_mb", _set_ram_floor)
-                         .watch("maxtabs", _set_maxtabs)
-                         .prime())
+    settings_follower = build_settings_follower(disk_box, ram_box, mc_box, asc_box)
 
     # write an initial 'launching' snapshot so the cockpit shows something at once
     _write_atomic(status_path, {"started": started, "updated": started,

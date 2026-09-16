@@ -325,7 +325,6 @@ def fleet_cmd(goals_path, max_concurrent, effort, state_dir=None,
            "--goals-file", goals_path,
            "--max-concurrent", str(max_concurrent),
            "--max-turns", str(max_turns if max_turns is not None else FLEET_MAX_TURNS),
-           "--disk-floor-gb", "0",
            # A BENCHMARK GOAL IS NOT SPLIT. The goals file is the unit being scored: a split
            # replaces one scored goal with children the grader never reads and a merge that
            # arrives after scoring, so the parent's row comes back empty. Named here rather
@@ -333,11 +332,35 @@ def fleet_cmd(goals_path, max_concurrent, effort, state_dir=None,
            # measures must not change because a default did.
            "--no-fanout",
            "--effort", effort]
+    # THE DISK GATE GOES OFF ONLY WHEN NOBODY HAS CHOSEN OTHERWISE. This was a hard-coded "0"
+    # among the literals with no comment, while the lines above defend --no-fanout at length.
+    cmd += _bench_disk_floor_args()
     if state_dir:
         cmd += ["--state-dir", state_dir]
     if resilience_profile and resilience_profile != "off":
         cmd += ["--resilience-profile", resilience_profile, "--max-fresh-replays", "1"]
     return cmd
+
+
+def _bench_disk_floor_args():
+    """["--disk-floor-gb", "0"] unless the operator has chosen a floor.
+
+    A bench run wants the disk gate out of the way: it is measuring a model, not admission,
+    and a run that defers on headroom produces an empty row rather than a result. On an eval
+    host there is no settings.txt, so this returns the flag and nothing changes.
+
+    On the owner's WORKSTATION it returns nothing, because passing the flag beats the file and
+    a run that ignores the panel while the panel keeps displaying its number is exactly the
+    defect class this repository spent a week removing -- and because the standing rule there
+    is to free disk rather than to lower the floor.
+    """
+    try:
+        from relay.fleet_runner import operator_set_a_disk_floor
+        if operator_set_a_disk_floor():
+            return []
+    except Exception:
+        pass
+    return ["--disk-floor-gb", "0"]
 
 
 def _use_local_review_transport(resilience_profile) -> bool:

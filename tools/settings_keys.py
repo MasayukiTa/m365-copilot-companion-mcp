@@ -16,14 +16,17 @@ timing, "I changed it and nothing happened" is either expected or a failing test
 
 WHAT A DECLARATION MEANS.
 
-  live       the value is re-read while a run is in progress and adopted mid-flight. The
-             evidence must be an actual re-read inside a loop or a watcher -- a value read
-             once and passed around is not live, however often the thing holding it runs.
-  per_job    read once per job or per coordinator launch. A change lands on the NEXT one.
-  at_launch  read once when a long-lived process starts. A change needs that process
-             restarted. Distinguished from per_job because the operator cannot reach it by
-             simply starting another job.
-  ui_only    never read outside the GUI process. It persists a window's own state.
+  live          adopted into a fleet that is ALREADY RUNNING, within about a second. The
+                evidence must be an actual re-read inside a loop or a watcher -- a value read
+                once and passed around is not live, however often the thing holding it runs.
+  each_gate     re-read at every admission or approval decision. Work already in flight keeps
+                going; the next decision uses the new value. Distinguished from live because
+                the two make different promises and only one of them changes running work.
+  sweep_start   read once when a coordinator starts. The next run gets it.
+  bridge_start  read once when the bridge process starts, so it must be restarted. Named for
+                the boundary rather than for who can cross it: starting another job is easy,
+                restarting the bridge is a different act.
+  ui_only       never read outside the GUI process. It persists a window's own state.
 
 THE DEFAULTS ARE PART OF THE DECLARATION, because a default is a fact with as many owners as
 there are readers, and those owners drift. `ram_floor_mb` had THREE: the panel showed 2048,
@@ -40,12 +43,18 @@ from __future__ import annotations
 
 from collections import OrderedDict
 
-LIVE = "live"
-PER_JOB = "per_job"
-AT_LAUNCH = "at_launch"
-UI_ONLY = "ui_only"
+#: THE BOUNDARY A CHANGE CROSSES, not a rough class of it. The first version of this table
+#: used "live" for both the follower and the per-decision reads, which are different promises:
+#: one changes work already in flight, the other only the next decision. gpt-6-astra named
+#: that, and "per_job"/"at_launch", which said who could reach the setting rather than where
+#: it is read.
+LIVE = "live"                  # adopted into a fleet that is already running (~1 s)
+EACH_GATE = "each_gate"        # re-read at every admission or approval decision
+SWEEP_START = "sweep_start"    # read once when a coordinator starts; the next run gets it
+BRIDGE_START = "bridge_start"  # read once when the bridge starts; it must be restarted
+UI_ONLY = "ui_only"            # never read outside the GUI
 
-EFFECTS = (LIVE, PER_JOB, AT_LAUNCH, UI_ONLY)
+EFFECTS = (LIVE, EACH_GATE, SWEEP_START, BRIDGE_START, UI_ONLY)
 
 #: Sentinel for "absent means undecided", which is not the same as "absent means this value".
 #: `fanout` is the only key with it: unset does not mean off, it means the length heuristic in
@@ -94,74 +103,76 @@ KEYS = OrderedDict([
        "Live, but it means different things: with autoscale ON this moves the CEILING, "
        "with autoscale off it is the fixed cap."),
 
-    # ---------------------------------------------------------------- live: read per decision
-    _k("rate_ceiling_rpm", LIVE, 100.0,
+    # ---------------------------------------------------------------- each_gate
+    _k("rate_ceiling_rpm", EACH_GATE, 100.0,
        "relay/relay_fleet.py:rate_ceiling (every admission check)",
        "Read fresh on every admission decision."),
 
-    _k("job_approval_mode", LIVE, "auto",
+    _k("job_approval_mode", EACH_GATE, "auto",
        "tools/approval_policy.py:current_approval_mode (every gate check)",
        "Read fresh at every approval gate, so the panel governs jobs already queued."),
 
-    # ---------------------------------------------------------------- per_job
-    _k("autoscale", PER_JOB, 0,
+    # ---------------------------------------------------------------- sweep_start
+    _k("autoscale", SWEEP_START, 0,
        "relay/fleet_runner.py:settings_autoscale (once, before the sweep)",
        "Takes effect on the NEXT run. Toggling it mid-run does nothing, although it sits "
        "beside knobs that are live."),
 
-    _k("autoscale_max", PER_JOB, 100,
+    _k("autoscale_max", SWEEP_START, 100,
        "relay/fleet_runner.py:settings_autoscale (once, before the sweep)",
        "Takes effect on the NEXT run -- while maxtabs, next to it, moves the same ceiling "
        "live when autoscale is on."),
 
-    _k("autoscale_per_tab_mb", PER_JOB, 700.0,
+    _k("autoscale_per_tab_mb", SWEEP_START, 700.0,
        "relay/fleet_runner.py:settings_per_tab (once, before the sweep)",
        "Written by bench/ram_calib.py's calibration, not by any panel control."),
 
-    _k("effort", PER_JOB, "auto",
+    _k("effort", SWEEP_START, "auto",
        "relay/fleet_runner.py:settings_effort (once, in main)",
        "Takes effect on the NEXT run."),
 
-    _k("autoretry", PER_JOB, 1,
+    _k("autoretry", SWEEP_START, 1,
        "relay/fleet_runner.py:settings_autoretry (once, before the sweep)",
        "Takes effect on the NEXT run."),
 
-    _k("autoretry_max", PER_JOB, 2,
+    _k("autoretry_max", SWEEP_START, 2,
        "relay/fleet_runner.py:settings_autoretry (once, before the sweep)",
-       "Takes effect on the NEXT run. Clamped to 0..3."),
+       "Takes effect on the NEXT run. Clamped to 0..3 here and to 1..3 in the panel: "
+       "0 means off and only the file can say it, because the panel expresses off "
+       "with the autoretry toggle instead."),
 
-    _k("fanout", PER_JOB, UNDECIDED,
+    _k("fanout", SWEEP_START, UNDECIDED,
        "relay/task_router.py:_wants_fanout (once per autostart goal)",
        "Governs goals that arrive through autostart only; a run launched from the cockpit "
        "carries the checkbox as a flag instead. Unset means UNDECIDED -- a length heuristic "
        "decides, it does not mean off."),
 
-    _k("fleet_log_days", PER_JOB, 14.0,
+    _k("fleet_log_days", SWEEP_START, 14.0,
        "relay/fleet_retention.py:apply (once, at coordinator start)",
        "Applied when the next coordinator starts."),
 
-    _k("fleet_store_days", PER_JOB, 30.0,
+    _k("fleet_store_days", SWEEP_START, 30.0,
        "relay/fleet_retention.py:apply (once, at coordinator start)",
        "Applied when the next coordinator starts."),
 
-    _k("fleet_scratch_days", PER_JOB, 14.0,
+    _k("fleet_scratch_days", SWEEP_START, 14.0,
        "relay/fleet_retention.py:apply (once, at coordinator start)",
        "NO PANEL CONTROL WRITES THIS. It is read on every run and can only be set by editing "
        "the file, which the operator is told not to do."),
 
-    _k("fleet_compress_hours", PER_JOB, 6.0,
+    _k("fleet_compress_hours", SWEEP_START, 6.0,
        "relay/fleet_retention.py:apply (once, at coordinator start)",
        "NO PANEL CONTROL WRITES THIS -- same as fleet_scratch_days."),
 
-    # ---------------------------------------------------------------- at_launch
+    # ---------------------------------------------------------------- bridge_start
     # The bridge applies retention once, at startup, deliberately: a timer that deletes
     # conversations while the operator is reading them is worse than a stale setting.
-    _k("session_retention_days", AT_LAUNCH, None,
+    _k("session_retention_days", BRIDGE_START, None,
        "bridge/session_store.py:read_retention via apply_retention",
        "Applied once when the bridge starts; changing it needs the bridge restarted. "
        "None/0 means keep everything."),
 
-    _k("session_max_mb", AT_LAUNCH, None,
+    _k("session_max_mb", BRIDGE_START, None,
        "bridge/session_store.py:read_retention via apply_retention",
        "Applied once when the bridge starts. None/0 means no cap."),
 

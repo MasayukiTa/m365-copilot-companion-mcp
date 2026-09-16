@@ -192,8 +192,11 @@ def _row_identity_guard(rep):
     """
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     try:
-        out = subprocess.run(["git", "-C", repo, "config", "--get", "core.hooksPath"],
-                             capture_output=True, text=True, timeout=20)
+        # BINARY IN, DECODED DELIBERATELY. text=True would decode with the console code page,
+        # and one byte it cannot represent loses the whole answer -- in a tool whose only job
+        # is to report what is true.
+        from tools.childproc import run as _child_run
+        out = _child_run(["git", "-C", repo, "config", "--get", "core.hooksPath"], timeout=20)
         configured = (out.stdout or "").strip()
     except Exception as exc:
         rep.row(UNK, "  identity guard", "could not ask git: %s" % type(exc).__name__)
@@ -359,6 +362,29 @@ def section_fleet(rep):
                                    str(w.get("reason") or "")[:48]))
 
 
+def section_settings(rep):
+    """What each settings control does to a run, grouped by WHEN it lands.
+
+    Deliberately grouped rather than listed per key: fifteen rows of prose is a section people
+    scroll past, and the only question an operator has here is which group a knob is in.
+    """
+    from tools import settings_keys as SK
+    said = {
+        SK.LIVE: "changes a fleet that is ALREADY RUNNING, within about a second",
+        SK.EACH_GATE: "re-read at every admission/approval decision; work in flight continues",
+        SK.SWEEP_START: "read once when a coordinator starts -- the NEXT run gets it",
+        SK.BRIDGE_START: "read once when the bridge starts -- it has to be restarted",
+        SK.UI_ONLY: "window state; nothing outside the GUI reads it",
+    }
+    rep.section("settings -- when a change takes effect")
+    for effect in SK.EFFECTS:
+        keys = SK.names_with_effect(effect)
+        if not keys:
+            continue
+        rep.row(OK, effect, said[effect])
+        rep.row(OK, "", "  " + ", ".join(keys))
+
+
 def section_resources(rep):
     rep.section("resources")
     try:
@@ -400,6 +426,7 @@ def main(argv=None):
     rep.section("endpoints")
     health = _endpoints(rep)
     section_fleet(rep)
+    section_settings(rep)
     section_resources(rep)
     section_recent(rep)
     _crosscheck(rep, settings, health)

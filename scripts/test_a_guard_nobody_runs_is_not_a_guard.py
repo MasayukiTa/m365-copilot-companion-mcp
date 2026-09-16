@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import io
 import os
-import subprocess
 import sys
 
 import pytest
@@ -28,6 +27,8 @@ import pytest
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
+
+from tools.childproc import run as _run   # noqa: E402  -- locale-safe child output
 
 HOOK = os.path.join(REPO, ".githooks", "pre-commit")
 
@@ -40,8 +41,8 @@ def test_the_hook_exists_and_is_tracked():
     """In .git/hooks it would be invisible to review and absent from every fresh clone --
     a rule kept by remembering, wearing a script's clothes."""
     assert os.path.isfile(HOOK), HOOK
-    out = subprocess.run(["git", "-C", REPO, "ls-files", "--error-unmatch",
-                          ".githooks/pre-commit"], capture_output=True, text=True)
+    out = _run(["git", "-C", REPO, "ls-files", "--error-unmatch",
+                ".githooks/pre-commit"])
     assert out.returncode == 0, "the hook is not tracked: %s" % (out.stderr or "").strip()
 
 
@@ -79,7 +80,7 @@ def test_the_installer_points_the_clone_at_the_tracked_hooks(tmp_path):
     repo = tmp_path / "clone"
     (repo / HOOKS_DIR).mkdir(parents=True)
     (repo / HOOKS_DIR / "pre-commit").write_text("#!/bin/sh\n", encoding="utf-8")
-    subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
+    _run(["git", "init", "-q", str(repo)], check=True)
     assert current_hooks_path(str(repo)) == ""
     assert install(str(repo)) == HOOKS_DIR
     assert current_hooks_path(str(repo)) == HOOKS_DIR
@@ -90,8 +91,7 @@ def test_this_clone_has_the_hook_installed():
     protected. CI checks tracked files after the fact; this is about the workstation where a
     commit is actually made, and a red CI job for a developer's unconfigured clone would train
     people to ignore it."""
-    out = subprocess.run(["git", "-C", REPO, "config", "--get", "core.hooksPath"],
-                         capture_output=True, text=True)
+    out = _run(["git", "-C", REPO, "config", "--get", "core.hooksPath"])
     configured = out.stdout.strip()
     if os.environ.get("CI"):
         pytest.skip("CI checks tracked files directly; hooks protect a workstation")

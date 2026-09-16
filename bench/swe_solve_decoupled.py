@@ -121,16 +121,40 @@ def write_goals(insts, spec, goals_path):
     return n
 
 
+def _bench_disk_floor_args():
+    """["--disk-floor-gb", "0"] unless the operator has chosen a floor.
+
+    A bench run wants the disk gate out of the way: it is measuring a model, not admission,
+    and a run that defers on headroom produces an empty row rather than a result. On an eval
+    host there is no settings.txt, so this returns the flag and nothing changes.
+
+    On the owner's WORKSTATION it returns nothing, because passing the flag beats the file and
+    a run that ignores the panel while the panel keeps displaying its number is exactly the
+    defect class this repository spent a week removing -- and because the standing rule there
+    is to free disk rather than to lower the floor.
+    """
+    try:
+        from relay.fleet_runner import operator_set_a_disk_floor
+        if operator_set_a_disk_floor():
+            return []
+    except Exception:
+        pass
+    return ["--disk-floor-gb", "0"]
+
+
 def run_fleet(goals_path, max_concurrent, max_turns, max_transient, effort):
     cmd = [VENVPY, "-m", "relay.fleet_runner", "--goals-file", goals_path,
            "--max-concurrent", str(max_concurrent), "--max-turns", str(max_turns),
-           "--max-transient", str(max_transient), "--disk-floor-gb", "0",
+           "--max-transient", str(max_transient),
            # effort=min => each worker is ONE tab (no refuter/research side-pages), so a cap of N
            # runs N tasks in parallel. auto/ultra reserve ~3 tabs/task (tab_weight), which on a
            # RAM-tight box collapses to 1 task at a time. The strong-scaffold discipline lives in
            # the GOAL TEXT (set via env below), so min still self-tests -- it just drops the
            # external review operators, giving a clean single-shot pass@1.
            "--effort", effort]
+    # See bench/review_run.py: a hard-coded floor of 0 beat the operator's own setting on the
+    # workstation, and changes nothing on an eval host, which has no settings file.
+    cmd += _bench_disk_floor_args()
     log("fleet: %s" % " ".join(cmd[2:]))
     p = subprocess.Popen(cmd, cwd=REPO, env=dict(os.environ))
     p.wait()
