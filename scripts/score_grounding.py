@@ -93,6 +93,20 @@ def main(argv=None):
               % (0.0 if chance >= 1.0 else -math.log(chance, 2)))
     print("         (%.0f px from the centre, on the longer axis -- description, not the test)"
           % dist)
+    # THE ANSWER YOU GIVE WITHOUT LOOKING. Uniform chance does not model it: a target that
+    # straddles the middle of the picture is passed by this answer every time, however small
+    # it is. Recorded per row so a run that keeps landing there can be seen as a run, which
+    # is the only level at which the habit is visible.
+    frame = task.get("frame") or {}
+    iw = float(frame.get("image_width") or 0)
+    ih = float(frame.get("image_height") or 0)
+    centre_tell = None
+    if iw > 0 and ih > 0:
+        centre_tell = max(abs(ax - iw / 2.0), abs(ay - ih / 2.0))
+        near = centre_tell <= 0.02 * max(iw, ih)
+        print("         %.0f px from the MIDDLE OF THE PICTURE%s"
+              % (centre_tell, " -- that is the answer given without looking" if near else ""))
+
     scale = task.get("image_pixel_covers_desktop_px") or 1.0
     if scale and abs(scale - 1.0) > 1e-9:
         print("         one image pixel covers %.2f desktop px, so nothing measured through"
@@ -105,7 +119,8 @@ def main(argv=None):
            # Written into the ROW, not looked up later from the task: the task file can be
            # regenerated from a different screen, and a result whose difficulty has to be
            # reconstructed is a result that will eventually be reconstructed wrongly.
-           "chance": chance}
+           "chance": chance,
+           "px_from_image_centre": (None if centre_tell is None else round(centre_tell, 1))}
     with open(out, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(row, ensure_ascii=False) + "\n")
 
@@ -123,11 +138,23 @@ def main(argv=None):
         print("  whether the answer could have been wrong is unknown.")
     print("held-out so far: %d of %d inside" % (k, n))
     if n:
-        blind = 1.0
-        for r in held:
-            blind *= float(r["chance"]) if r["inside"] else 1.0
-        print("  a blind answerer would have matched this exact run %.2g%% of the time."
-              % (100.0 * blind))
+        # EXPECTED HITS, NOT THE PRODUCT OVER THE HITS. The product was taken over rows that
+        # were inside, so a run with no hits multiplied nothing and printed 100% -- an empty
+        # product dressed as a finding. This holds at every k and n: how many a blind
+        # answerer would have got, against how many were got.
+        expected = sum(float(r["chance"]) for r in held)
+        print("  a blind answerer would average %.2f hit(s) out of %d; this run got %d."
+              % (expected, n, k))
+        if k <= expected:
+            print("  That is not better than not looking.")
+        # A habit is only visible across rows.
+        tells = [r for r in held if r.get("px_from_image_centre") is not None]
+        middling = [r for r in tells if r["px_from_image_centre"] <= 32]
+        if tells and len(middling) >= max(2, len(tells) // 2):
+            print("  %d of %d answers landed within 32 px of the middle of the picture."
+                  % (len(middling), len(tells)))
+            print("  Containment cannot tell that apart from finding the target, so treat")
+            print("  any INSIDE among them as unproven.")
     if n and k == n:
         bound = 0.05 ** (1.0 / n)
         print("  with no failures in %d, the one-sided 95%% lower bound is %.1f%%."
