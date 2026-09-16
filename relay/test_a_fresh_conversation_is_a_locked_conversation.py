@@ -81,14 +81,24 @@ def test_a_replayed_conversation_carries_the_unlock(with_password):
     assert _unlock_text() in w._replay_job()
 
 
-def test_the_goal_is_still_last_and_intact_after_a_recycle(with_password):
-    """RECYCLE_PREFIX ends with a heading that introduces the goal, and the suffix slice in
-    _composed_prefix depends on the composition ending with the goal."""
+def test_the_goal_is_intact_and_nothing_precedes_it_but_context(with_password):
+    """RECYCLE_PREFIX ends with a heading that introduces the goal, so the goal must follow
+    it whole and exactly once.
+
+    THIS ASSERTED endswith(GOAL) AND WOULD HAVE HELD BY ACCIDENT. A compaction note is now
+    appended after the goal, so the job no longer ends with it -- and this test still passed,
+    because a freshly constructed worker has written no transcript yet and the note came back
+    empty. A test that holds only because its fixture is empty is not holding anything.
+
+    The docstring also blamed _composed_prefix's suffix slice, which is wrong: that slice is
+    taken from composed_goal in __init__, not from this job. What actually matters is that
+    the goal arrives once and unbroken, which is what is asserted now."""
     w = F.RelayWorker(GOAL, "w0")
     w._recycles = 1
     job = w._recycle_job()
-    assert job.endswith(GOAL)
     assert job.count(GOAL) == 1, "the goal was sent twice"
+    from relay.copilot_autopilot_relay import RECYCLE_PREFIX
+    assert job.index(RECYCLE_PREFIX) < job.index(GOAL)
 
 
 def test_the_unlock_precedes_the_reset_notice(with_password):
@@ -115,7 +125,7 @@ def test_no_password_means_no_unlock_text_rather_than_a_crash(without_password):
     w = F.RelayWorker(GOAL, "w0")
     w._recycles = 1
     job = w._recycle_job()
-    assert job.endswith(GOAL)
+    assert job.count(GOAL) == 1
     assert "password=" not in job
     w.fresh_replay_count = 1
     assert w._replay_job().endswith(GOAL)

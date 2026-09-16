@@ -126,6 +126,9 @@ jobs:
             relay/test_memory_is_about_the_work.py \
             relay/test_fanout_carries_the_procedure.py \
             relay/test_a_fresh_conversation_is_a_locked_conversation.py \
+            relay/test_attribution_beats_reading_the_reply.py \
+            relay/test_a_compaction_that_launders_a_claim_is_worse_than_none.py \
+            tools/test_a_rule_stated_twice_must_be_pinned_once.py \
             relay/test_fleet_handoff.py \
             relay/test_fanout_family_view.py \
             relay/test_verification_survives_the_archive.py \
