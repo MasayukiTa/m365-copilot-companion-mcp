@@ -180,6 +180,35 @@ def read_settings(path):
 
 
 # --------------------------------------------------------------------------- the sections
+def _row_identity_guard(rep):
+    """Is the pre-commit identity guard armed on THIS clone?
+
+    On 2026-09-17 a `git add -A` staged generated files carrying an employee id and a home
+    path, and the commit was pushed to a public repository; the fix was a history rewrite, the
+    third. The guard could have refused it -- it has refused exactly that file since -- but
+    nothing ran it between staging and committing. .githooks/pre-commit does now, via
+    core.hooksPath, which is one `git config` away from being unset with no visible symptom:
+    commits simply stop being refused, which is indistinguishable from commits being clean.
+    """
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        out = subprocess.run(["git", "-C", repo, "config", "--get", "core.hooksPath"],
+                             capture_output=True, text=True, timeout=20)
+        configured = (out.stdout or "").strip()
+    except Exception as exc:
+        rep.row(UNK, "  identity guard", "could not ask git: %s" % type(exc).__name__)
+        return
+    hook = os.path.join(repo, ".githooks", "pre-commit")
+    if configured == ".githooks" and os.path.isfile(hook):
+        rep.row(OK, "  identity guard", "armed -- a commit staging an employee id or a home "
+                                        "path is refused before it can be pushed")
+    elif configured == ".githooks":
+        rep.row(BAD, "  identity guard", "core.hooksPath is set but %s is missing" % hook)
+    else:
+        rep.row(BAD, "  identity guard", "NOT armed (core.hooksPath=%r). Run: python "
+                                         "scripts/install_git_hooks.py" % configured)
+
+
 def section_context(rep):
     """WHICH MACHINE-VIEW AM I. Everything below is relative to this, so it goes first."""
     rep.section("context -- which view of the filesystem this process has")
@@ -213,6 +242,7 @@ def section_context(rep):
     rep.row(OK, "  floors it carries", "disk=%s GB  ram=%s MB"
             % (info["keys"].get("disk_floor_gb", "(absent)"),
                info["keys"].get("ram_floor_mb", "(absent)")))
+    _row_identity_guard(rep)
     rep.row(OK, "  note", "a DIFFERENT size/mtime from another context means the two are "
                           "not the same file -- that was the 2026-09-16 defect")
     return info
