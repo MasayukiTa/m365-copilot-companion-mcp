@@ -108,9 +108,25 @@ def test_evidence_that_is_expected_and_missing_is_amber_on_both_dots(src):
     assert m.group(1) == "Yellow", "absent evidence is red again on the agent dot"
 
 
+def test_an_unreadable_route_record_is_not_an_open_route(src):
+    """RouteIsClosed's own comment named this silent zero and then returned false on every
+    error path -- the answer that skips the amber branch and asks the binding check a
+    question nobody had established was the right one."""
+    assert "ROUTE_UNKNOWN" in src and "ROUTE_OPEN" in src and "ROUTE_CLOSED" in src
+    body = src[src.index("int RouteState()"):]
+    body = body[:body.index("\n    DateTime RunStartedLocal()")]
+    # A file that does not exist IS an answer: nothing has ever closed the route here.
+    assert "if (!File.Exists(path)) return ROUTE_OPEN;" in body
+    # Everything else that goes wrong is not.
+    assert "return ROUTE_UNKNOWN;" in body
+    assert "return false;" not in body, "an error path answers 'open' again"
+    # And route lines none of the parse could read are the case the comment warned about.
+    assert "routeLines > 0 && parsed == 0" in body
+
+
 @pytest.mark.parametrize("key", [
     "hs_agent_unknown_live", "hs_edge_detail_norun",
-    "hs_signin_gray_old", "hs_signin_gray_expired",
+    "hs_signin_gray_old", "hs_signin_gray_expired", "hs_agent_route_unknown",
 ])
 def test_every_new_message_exists_in_both_languages(key, src):
     """A T() key with no definition renders as the key, which is worse than the wrong

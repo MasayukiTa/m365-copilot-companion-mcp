@@ -190,5 +190,5 @@ def test_a_closed_route_is_amber_and_not_red():
     'working, worth knowing'."""
     src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                             "ui", "FleetCockpit.cs"), encoding="utf-8").read()
-    i = src.index("else if (RouteIsClosed())")
+    i = src.index("else if (RouteState() == ROUTE_CLOSED)")
     assert "HealthState.Yellow" in src[i:i + 900]

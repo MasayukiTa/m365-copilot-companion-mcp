@@ -99,7 +99,9 @@ def test_agent_is_gray_when_no_run_is_live():
 def test_a_closed_route_is_amber_and_says_workers_are_on_tabs():
     """経路が閉じている = タブで走っている。障害ではないので赤ではなく黄。"""
     body = _dots_body()
-    assert "else if (RouteIsClosed())" in body
+    # RouteIsClosed became RouteState() when "I could not read the record" needed
+    # somewhere to go that was not "open". The rule under test is unchanged.
+    assert "else if (RouteState() == ROUTE_CLOSED)" in body
     assert 'T("hs_agent_tabs")' in body
     assert 'SetDot(4, HealthState.Yellow, note, now)' in body
 
@@ -112,7 +114,7 @@ def test_the_canned_answer_sniff_only_annotates_the_amber():
     body = _dots_body()
     # RouteIsClosed の分岐**だけ**を切り出す。文字数窓で見ると、コメントを落とした後は
     # 隣の分岐まで届いてしまい、無関係な SetDot を捕まえて落ちる(実際に落ちた)。
-    blk = body[body.index("else if (RouteIsClosed())"):]
+    blk = body[body.index("else if (RouteState() == ROUTE_CLOSED)"):]
     blk = blk[:blk.index("else if (FleetAgentIsBound())")]
     assert "LooksLikeCannedNonAnswer" in blk, "定型無回答の判定が黄色の分岐の外にある"
     assert 'note += T("hs_agent_canned")' in blk, "注記ではなく色を決めている"

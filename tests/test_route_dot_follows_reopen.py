@@ -32,7 +32,7 @@ def test_the_reopen_is_written_to_the_ledger():
 def test_the_dot_takes_the_newest_route_event():
     """閉鎖1件で即断せず、閉鎖と開放の**新しい方**を採ること。"""
     src = _src("ui", "FleetCockpit.cs")
-    body = src[src.index("bool RouteIsClosed()"):]
+    body = src[src.index("int RouteState()"):]
     body = body[:body.index("\n    DateTime RunStartedLocal()")]
 
     assert "route_reopened" in body, "開放イベントを読んでいない"
@@ -40,7 +40,7 @@ def test_the_dot_takes_the_newest_route_event():
         "閉鎖を1件見つけた時点で true を返している -- その後の開放が読まれない")
     assert re.search(r"closed\s*=\s*isClose", body), \
         "最後に見たイベントで上書きしていない"
-    assert re.search(r"return\s+closed\s*;", body), "走査後の結論を返していない"
+    assert re.search(r"return closed \? ROUTE_CLOSED : ROUTE_OPEN;", body), "走査後の結論を返していない"
 
 
 def test_both_events_carry_the_timestamp_key_the_scan_looks_for():
