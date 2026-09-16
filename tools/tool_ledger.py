@@ -106,18 +106,42 @@ _LOCK_REFUSAL_MAX_CHARS = 400
 #: The keyword must be followed immediately by ":" or "]" so that a document beginning
 #: "[error on page 3: ..." is not a report about itself.
 _NAME = r"(?:[A-Za-z0-9_]+ ){0,2}"
-_FAILURE_SHAPE = re.compile(r"^\[" + _NAME + r"(?:error|failed|timeout|refused)[:\]]")
-_UNAVAILABLE_SHAPE = re.compile(r"^\[" + _NAME + r"unavailable[:\]]")
+_FAILURE_SHAPE = re.compile(r"^\[" + _NAME + r"(?:error|failed|refused)[:\]]"
+                            # "[pwsh_exec timeout after 30s]" as well as "[timeout: ...]".
+                            # Zero rows in the ledger today, but four tools write the spaced
+                            # form and a shape that exists in the source will eventually be
+                            # produced by it.
+                            r"|^\[" + _NAME + r"timeout(?:[:\]]| after )")
+#: AND THE OTHER ORDER. The gateway writes "[call_tool: refused. ...]" and fleet_intake
+#: writes "[fleet_submit: refused -- ...]": the name, then the colon, THEN the word. Seen in
+#: production on 2026-09-16 in a run that was otherwise reading correctly. 36 rows in the
+#: whole ledger, 0.097%, and 34 of them are call_tool.* which the health reader already
+#: excludes as discovery chatter -- so this is completeness, not a fix for a live symptom,
+#: and it is recorded as such rather than as a save.
+#:
+#: Safe against the "[<name>: <prose>]" family that means a lookup found nothing, because
+#: that prose never starts with one of these four words: "[memory_read: no topic found]",
+#: "[which: rg not found on PATH]", "[sqlite_schema: no table named ...]".
+_FAILURE_AFTER_COLON = re.compile(r"^\[[A-Za-z0-9_.]+:\s*(?:error|failed|timeout|refused)\b",
+                                  re.I)
+_UNAVAILABLE_SHAPE = re.compile(r"^\[" + _NAME + r"(?:unavailable|skipped|aborted)[:\]]")
 _REPORT_MAX_CHARS = 600
 
 #: COUNTED, NOT GUESSED, over the whole ledger (37,018 successes carrying a string):
 #:   error 1,789 | timeout 213 | failed 37 | refused 2   -- all filed as successes
 #:   [stdout] / [stderr]  8,216                          -- successful runs, must stay green
 #:   skipped 20, aborted 3                               -- DELIBERATELY NOT HERE
-#: skipped and aborted are the tool doing its job and saying the precondition was not met:
-#: "[replace skipped: old text was not found]" is a correct answer, and colouring it red
-#: would be the same false report in a new place. The line between them is whether the tool
-#: worked, not whether the caller got what they wanted.
+#: skipped and aborted are NEITHER, and the first draft of this rule called them successes.
+#: "[replace skipped: old text was not found]" is a correct answer to a caller's mistake --
+#: but the identical word comes out of an environment fault: a missing executable, an
+#: unavailable mount, an absent credential. The word cannot tell those apart, and the reason
+#: text is free-form, so nothing here can either. Counting them as successes meant every one
+#: of those refreshed green AND reset the consecutive-failure streak, so failure/failure/skip
+#: repeating forever would never have reached red.
+#:
+#: They join the unavailable case instead: not evidence. A path that only ever skips reports
+#: "no evidence", which is exactly what a run of skips supports -- nothing in it says whether
+#: the tool can do its job. Raised by gpt-6-astra against the first draft, and it is right.
 
 
 def _is_report(result, shape) -> bool:
@@ -132,11 +156,14 @@ def _is_report(result, shape) -> bool:
 
 def looks_failed(result) -> bool:
     """True iff `result` IS a tool reporting its own failure, rather than content quoting one."""
-    return _is_report(result, _FAILURE_SHAPE)
+    return _is_report(result, _FAILURE_SHAPE) or _is_report(result, _FAILURE_AFTER_COLON)
 
 
 def looks_unavailable(result) -> bool:
-    """True iff the tool could not run because the machine was not in a state to run it.
+    """True iff nothing happened that says anything about whether the tool path works.
+
+    Covers two cases that read alike to a health indicator: the machine was not in a state to
+    run the tool, and the tool declined because a precondition was not met.
 
     A THIRD STATE, AND THE REASON THIS IS NOT JUST ANOTHER FAILURE. When the workstation is
     locked, no screen can be captured and no click can be delivered -- and the tools are
@@ -246,6 +273,31 @@ def redact_args(arguments, _depth=0) -> dict:
     return out
 
 
+#: When the ledger is moved aside. Its neighbour faulthandler.log has rotated at 8 MB since
+#: the day it was added; this file reached 64 MB without anyone choosing that. The cap is
+#: larger because the ledger is read back -- fleet_tool_health tails it, and measurements are
+#: taken over it -- so a generous single file is worth more here than a small one.
+LEDGER_MAX_BYTES = 128 * 1024 * 1024
+
+
+def _rotate_if_large(path: str) -> None:
+    """Move the ledger aside once, keeping one generation. Never raises.
+
+    ROTATION IS NOT EDITING. The rows are moved intact; none is rewritten, which is the
+    property this file's worth rests on. os.replace is atomic on Windows and POSIX alike, so
+    a reader holding the old path keeps reading a complete file rather than a truncated one.
+    """
+    try:
+        if os.path.getsize(path) < LEDGER_MAX_BYTES:
+            return
+    except OSError:
+        return          # no file yet, or unreadable: nothing to rotate
+    try:
+        os.replace(path, path + ".1")
+    except OSError:
+        pass            # a locked file is a reason to keep appending, not to lose the row
+
+
 def _append(row: dict) -> None:
     """Best effort, never raises. A ledger that can fail a tool call is worse than no ledger."""
     try:
@@ -265,6 +317,7 @@ def _append(row: dict) -> None:
             pass
         with _LOCK:
             os.makedirs(os.path.dirname(path), exist_ok=True)
+            _rotate_if_large(path)
             with open(path, "a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
     except Exception:

@@ -97,6 +97,42 @@ def test_a_process_whose_log_mentions_an_error_still_ran(text):
 @pytest.mark.parametrize("text", [
     "[replace skipped: old text was not found]",
     "[zip_extract aborted: unsafe member path: '../x']",
+])
+def test_a_skip_is_neither_a_failure_nor_a_working_tool(text):
+    """THE FIRST DRAFT CALLED THESE SUCCESSES, and gpt-6-astra was right to attack it.
+
+    "[replace skipped: old text was not found]" is a correct answer to a caller's mistake.
+    The same word comes out of a missing executable, an unavailable mount, an absent
+    credential -- and the reason text is free-form, so nothing can tell those apart. Counting
+    them green meant an environment fault refreshed the dot AND reset the consecutive-failure
+    streak, so failure/failure/skip repeating forever could never reach red.
+    """
+    assert not L.looks_failed(text), "a skip is not a failure"
+    assert L.looks_unavailable(text), "a skip is being counted as a working tool again"
+    assert L.row_ok({"ok": True, "result": {"text": text}}) is False
+    assert L.row_unavailable({"ok": True, "result": {"text": text}}) is True
+
+
+def test_a_path_that_only_skips_reports_no_evidence(tmp_path, monkeypatch):
+    """Which is what a run of skips supports: nothing about whether the tool can do its job."""
+    now = 1_000_000.0
+    rows = []
+    for i in range(6):
+        rows += _pair(i, "replace_in_file", now - 10 * (6 - i), True,
+                      "[replace skipped: old text was not found]")
+    s = _ledger_at(tmp_path, monkeypatch, rows, now)
+    assert s["fleet_tool_ok"] is None, "six skips in a row read as a healthy tool path"
+    assert s["fleet_tool_ok_n"] == 0 and s["fleet_tool_fail_n"] == 0
+
+
+def test_a_timeout_written_with_a_space_is_still_a_timeout():
+    """Four tools write "[name timeout after 30s]" rather than "[timeout: ...]". Zero rows in
+    the ledger carry it today; a shape that exists in the source eventually gets produced."""
+    assert L.looks_failed("[pwsh_exec timeout after 30s]")
+    assert L.looks_failed("[pip_install timeout after 120s]")
+
+
+@pytest.mark.parametrize("text", [
     "[memory_read: no topic found at 'x']",
     "[which: rg not found on PATH]",
     "[OPEN] tok-123  waiting on the operator",
@@ -106,8 +142,27 @@ def test_a_process_whose_log_mentions_an_error_still_ran(text):
     "[error on page 3: bad xref]",
 ])
 def test_a_tool_that_did_its_job_is_not_a_failure(text):
-    """skipped/aborted/not-found are correct answers. Colouring them red is the same lie."""
+    """A lookup that found nothing, a handshake, a marker. Colouring these red is the same
+    lie pointed the other way."""
     assert not L.looks_failed(text), text
+    assert not L.looks_unavailable(text), text
+
+
+def test_a_process_that_printed_and_exited_nonzero_is_still_a_working_tool_path():
+    """RAISED BY gpt-6-astra AND DELIBERATELY NOT ACTED ON, so the reasoning is on record
+    rather than silently overruled.
+
+    The point is correct: "[stdout]" proves output was captured, not that the command
+    succeeded, and _format_output appends "[returncode: N]" when it did not. But the question
+    this ledger answers -- and the only question the health dot asks of it -- is whether a
+    worker can CALL a tool and get an answer. shell_exec that runs a failing command and
+    reports its exit code did its job perfectly. Counting that as a tool-path failure would
+    turn every failing build into an infrastructure outage, which is the class of false report
+    this whole file exists to remove.
+    """
+    ran_and_failed = "[stdout]\nconfigure: error: no acceptable C compiler\n[returncode: 77]"
+    assert not L.looks_failed(ran_and_failed)
+    assert L.row_ok({"ok": True, "result": {"text": ran_and_failed}}) is True
 
 
 # ------------------------------------------------------------------------------- on write
@@ -127,6 +182,30 @@ def test_an_absent_machine_is_written_as_neither(tmp_path, monkeypatch):
 def test_an_explicit_failure_is_never_upgraded(tmp_path, monkeypatch):
     rows = _record(tmp_path, monkeypatch, "fine", ok=False)
     assert rows[-1]["ok"] is False
+
+
+def test_the_ledger_stops_growing_without_losing_a_row(tmp_path, monkeypatch):
+    """64 MB and no ceiling, next to a faulthandler.log that has rotated at 8 MB since the
+    day it was written, on a disk with 5.6 GB left. Rotation is not editing: the rows move
+    intact, which is the property the ledger's worth rests on."""
+    path = tmp_path / "tool_events.jsonl"
+    monkeypatch.setattr(L, "LEDGER_PATH", str(path))
+    monkeypatch.setattr(L, "LEDGER_MAX_BYTES", 2048)
+
+    for i in range(200):
+        L.record_outcome(L.record_call("read_file", {"path": "x" * 40}), ok=True,
+                         result="wrote %d bytes" % i)
+
+    assert path.exists() and path.stat().st_size < L.LEDGER_MAX_BYTES * 2
+    rolled = tmp_path / "tool_events.jsonl.1"
+    assert rolled.exists(), "the ledger grew past its cap without rotating"
+
+    # Every line in both files is still a whole row. A truncating rotation would leave a
+    # half-written one, and a reader that raises on one bad row stops being used.
+    for f in (rolled, path):
+        for line in io.open(str(f), encoding="utf-8"):
+            if line.strip():
+                json.loads(line)
 
 
 def _record(tmp_path, monkeypatch, result, ok=True):
