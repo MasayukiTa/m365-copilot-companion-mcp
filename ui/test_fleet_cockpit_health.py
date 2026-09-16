@@ -82,7 +82,10 @@ def test_an_expired_token_is_not_red_unless_a_run_wants_one():
     """
     body = _dots_body()
     assert 'else if (live)' in body and 'T("hs_signin_stale")' in body
-    assert 'SetDot(3, HealthState.Gray, T("hs_signin_gray"), now)' in body
+    # The key gained a suffix when hs_signin_gray stopped covering three different
+    # situations with one sentence ("No capture on record" was false in two of them).
+    # The rule under test is unchanged: expired token, no run, grey rather than red.
+    assert 'SetDot(3, HealthState.Gray, T("hs_signin_gray_expired"), now)' in body
 
 
 # ---- エージェントのドット ---------------------------------------------------------------------
