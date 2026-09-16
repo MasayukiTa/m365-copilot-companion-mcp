@@ -668,6 +668,26 @@ def reported_stuck(resp: str) -> bool:
     return "STUCK:" in up or "STUCK：" in up
 
 
+#: How long a reply may be and still BE the token-limit error rather than prose about one.
+#: The same two-part rule, and the same 400, as tools/tool_ledger.py::looks_refused and
+#: relay/relay_fleet.py::_looks_locked. Measured: every genuine error in 2,318 transcripts
+#: is 126 characters.
+EXHAUSTED_DOMINANCE_MAX_CHARS = 400
+
+#: Japanese forms of the same platform error. Never observed on this machine -- every
+#: genuine error here carries the ASCII code -- so these are kept as a hypothesis about
+#: other locales and builds, which is exactly what they always were. The difference is that
+#: a hypothesis now has to be stated as a phrase somebody would only write if it happened.
+EXHAUSTED_JP_MARKERS = (
+    "トークンの上限に達",
+    "トークン上限に達",
+    "トークンの上限を超え",
+    "トークン上限を超え",
+    "コンテキストの上限に達",
+    "コンテキスト長の上限",
+)
+
+
 def conversation_exhausted(resp: str) -> bool:
     """True when Copilot itself reports the conversation can no longer continue
     because it ran out of model token budget. The hands-off relay otherwise
@@ -675,17 +695,50 @@ def conversation_exhausted(resp: str) -> bool:
     eventually trips this and EVERY later turn returns the same error. Detecting
     it lets run_relay recycle to a fresh conversation instead of dying.
 
-    Anchored on Copilot's own error code/text (JP + EN) -- kept conservative so a
-    normal answer that merely discusses tokens does not false-fire.
+    TWO PARTS, LIKE EVERY OTHER "IS THIS THE THING OR PROSE ABOUT IT" TEST HERE: a
+    distinctive marker AND dominance. The reply IS the error, it does not mention one.
+    See looks_refused in tools/tool_ledger.py and _looks_locked in relay/relay_fleet.py,
+    which reached the same shape from the same kind of incident.
+
+    THE JAPANESE VOCABULARY RULE IS GONE, and the measurement is why. Over all 2,318
+    transcripts on this machine (5,783 assistant rows) it produced 103 matches and NOT ONE
+    genuine platform error. 100 of them were recycled into a brand-new conversation and 81
+    of those discarded replies ended in DONE -- finished work, thrown away mid-report. An
+    entire fan-out investigating this repo's own unlock-token expiry was destroyed for
+    writing the words トークン and 上限, the 上限 being the 8-token cap in
+    .unlock_state.json. Three of the false positives were SHORTER than the genuine error,
+    so no length bound could have saved this rule: it had no distinctive marker at all,
+    only ordinary vocabulary, and dominance needs a marker to gate.
+
+    What the genuine error actually looks like, 262 of 263 occurrences identical modulo the
+    UUID and timestamp, and every one of them 126 characters:
+
+        エラーが発生しました。
+        エラー コード: ContextTokenLimitExceeded
+        会話 ID: <uuid>
+        時間 (UTC): <iso8601>。
+
+    openaimodeltokenlimit and the English phrasings have never fired here, so their length
+    is unknown; they keep the same bound rather than a guess of their own.
     """
     t = (resp or "")
     low = t.lower()
+    # Dominance, at the constant this repo already uses for the same judgement: 3.2x the
+    # only genuine error ever measured. It is not decoration -- a worker READING a
+    # transcript and quoting ContextTokenLimitExceeded in 2,652 characters of analysis was
+    # recycled for it (r6a9eaee5_a0_w16, turn 11).
+    if len(t.strip()) >= EXHAUSTED_DOMINANCE_MAX_CHARS:
+        return False
     if "openaimodeltokenlimit" in low:
         return True
-    # Defensive variants Copilot has shown for the same condition.
-    if ("トークン" in t and ("上限" in t or "制限" in t or "超え" in t)):
-        return True
     if "maximum context length" in low or "context length exceeded" in low:
+        return True
+    # A PHRASE, NOT TWO NOUNS. Each of these says the limit was REACHED or EXCEEDED, which
+    # is a thing only the platform says about itself. Checked against the false positives
+    # that were actually measured: "unlockトークンの保持場所と失効条件 ... 上限は8個" and
+    # "トークン制限を避け、1枚ずつ処理します" match none of them, and under the old rule
+    # both were recycled.
+    if any(marker in t for marker in EXHAUSTED_JP_MARKERS):
         return True
     # ContextTokenLimitExceeded -- the SAME condition under a different error code, and the
     # one this function did not know. A worker that hit it on 2026-08-26 was not recycled:
