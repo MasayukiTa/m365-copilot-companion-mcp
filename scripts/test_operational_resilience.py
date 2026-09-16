@@ -99,8 +99,13 @@ def test_the_crash_log_survives_the_relaunch_that_would_erase_it():
     sixty times an hour -- and an empty file reads as "no error"."""
     sup = (ROOT / "scripts" / "supervisor.ps1").read_text(encoding="utf-8")
 
+    # BOTH STREAMS. This test asserted the stderr history alone, which is exactly what the
+    # supervisor did -- and the server has now exited six times in two days leaving nothing
+    # in stderr but the startup banner, so the stream that might have said why was being
+    # truncated unread. A test that pins half a rule lets the other half stay missing.
     assert "server.err.history.log" in sup
-    preserve = sup.index("Add-Content -Path $srvHist")
+    assert "server.out.history.log" in sup
+    preserve = sup.index("Add-Content -Path $hist")
     launch = sup.index("-RedirectStandardOutput $srvOut -RedirectStandardError $srvErr")
     assert preserve < launch, "the previous launch is copied out AFTER it has been truncated"
     # bounded, or an unattended machine fills its disk with the same stack trace
