@@ -56,12 +56,6 @@ except Exception:
 
 OK, BAD, UNK = "OK", "BAD", "??"
 
-#: A settings file this size is the one ordinary desktop processes see; the package-redirected
-#: copy is a different size. Neither number is magic -- they are printed, not compared against
-#: a constant -- but the file's identity is what distinguishes the two views, so it is always
-#: shown rather than summarised.
-SETTINGS_REL = os.path.join("copilot-bridge", "settings.txt")
-
 class Report(object):
     """Collects lines so the same run can print text or JSON without computing twice."""
 
@@ -189,13 +183,31 @@ def read_settings(path):
 def section_context(rep):
     """WHICH MACHINE-VIEW AM I. Everything below is relative to this, so it goes first."""
     rep.section("context -- which view of the filesystem this process has")
-    appdata = os.environ.get("APPDATA", "")
-    path = os.path.join(appdata, SETTINGS_REL) if appdata else "(APPDATA unset)"
+    # THROUGH THE RESOLVER, not by hand. This tool built the path itself for an hour --
+    # the eighth copy of a fact that already had seven, which is how the settings defect
+    # became possible at all. tools/settings_path.py owns it.
+    from tools.settings_path import settings_file, old_path, NEW_PATH
+    path = settings_file()
     info, err = read_settings(path)
     if info is None:
         rep.row(UNK, "settings.txt", "%s -- %s" % (path, err))
         return None
     rep.row(OK, "settings.txt", "%s" % info["path"])
+    # DURING THE MIGRATION, BOTH LOCATIONS. A machine part-way across has a file on each side,
+    # and the only symptom of a split is that their identities differ.
+    if path != NEW_PATH:
+        rep.row(UNK, "  migration", "still on the OLD location; the new one does not exist "
+                                    "yet (%s)" % NEW_PATH)
+    other = old_path() if path == NEW_PATH else NEW_PATH
+    try:
+        if os.path.isfile(other):
+            st = os.stat(other)
+            rep.row(UNK, "  other copy", "%s (%d bytes, %s) -- two files exist; whichever a "
+                                         "process reads decides what it believes"
+                    % (other, st.st_size,
+                       time.strftime("%m-%d %H:%M:%S", time.localtime(st.st_mtime))))
+    except OSError:
+        pass
     rep.row(OK, "  identity", "%d bytes, modified %s"
             % (info["size"], time.strftime("%m-%d %H:%M:%S", time.localtime(info["mtime"]))))
     rep.row(OK, "  floors it carries", "disk=%s GB  ram=%s MB"

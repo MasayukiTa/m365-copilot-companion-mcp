@@ -18,10 +18,11 @@ VALID_APPROVAL_MODES = ("default", "auto", "bypass")
 
 
 def settings_path() -> Path:
-    appdata = os.environ.get("APPDATA", "").strip()
-    if appdata:
-        return Path(appdata) / "copilot-bridge" / "settings.txt"
-    return Path.home() / ".copilot-bridge" / "settings.txt"
+    # This module had the ONLY correct fallback of the five copies -- the others produced a
+    # relative path when APPDATA was unset. That behaviour now lives in settings_path.old_path
+    # and is shared, rather than being right in one place by luck.
+    from tools.settings_path import settings_file
+    return Path(settings_file())
 
 
 #: WHAT AN INSTALLATION GETS WITH NO SETTING AND NO ENV VAR.

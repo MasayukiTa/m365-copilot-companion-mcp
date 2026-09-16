@@ -119,8 +119,72 @@ class ChatWindow : Window
         { "archived", true  },   // default collapsed to hide old eval/bench clutter
     };
     string _sidebarStatePath;   // set after _convsPath is known (ctor / timer init)
-    static readonly string SettingsFile = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "copilot-bridge", "settings.txt");
+    //: WHERE THE SETTINGS LIVE, in both places, new first.
+    //:
+    //: %APPDATA% is redirected for a process running inside an MSIX package, so the same
+    //: absolute path resolved to the operator's file from one context and to a private copy
+    //: from another. On 2026-09-16 the panel showed 1 GB while every fleet coordinator
+    //: reserved 4 GB, for a month, and neither side could see the other's file. The
+    //: repository is the one directory every context agrees about.
+    //:
+    //: READS take the new location when it exists and the old one otherwise, so a machine
+    //: mid-migration keeps working and one that never migrates behaves exactly as before.
+    //: WRITES always go to the new location. Kept in step with tools/settings_path.py --
+    //: test_the_settings_path_is_the_same_in_every_language pins the two together.
+    static string SettingsFileNew
+    {
+        get { return Path.Combine(RepoRootForSettings(), ".config", "settings.txt"); }
+    }
+
+    static string SettingsFileOld
+    {
+        get
+        {
+            string app = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            if (string.IsNullOrEmpty(app))
+                return Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                    ".copilot-bridge", "settings.txt");
+            return Path.Combine(app, "copilot-bridge", "settings.txt");
+        }
+    }
+
+    static string SettingsFile
+    {
+        get
+        {
+            try { if (File.Exists(SettingsFileNew)) return SettingsFileNew; } catch (Exception) { }
+            try { if (File.Exists(SettingsFileOld)) return SettingsFileOld; } catch (Exception) { }
+            return SettingsFileNew;
+        }
+    }
+
+    static string SettingsFileForWrite
+    {
+        get
+        {
+            try { Directory.CreateDirectory(Path.GetDirectoryName(SettingsFileNew)); }
+            catch (Exception) { }
+            return SettingsFileNew;
+        }
+    }
+
+    //: The repository root as seen from the running executable: ui\ sits directly under it.
+    static string RepoRootForSettings()
+    {
+        try
+        {
+            string exe = System.Reflection.Assembly.GetExecutingAssembly().Location;
+            string dir = Path.GetDirectoryName(exe);
+            DirectoryInfo d = new DirectoryInfo(dir);
+            while (d != null && !Directory.Exists(Path.Combine(d.FullName, ".fleet")))
+                d = d.Parent;
+            if (d != null) return d.FullName;
+        }
+        catch (Exception) { }
+        return Directory.GetCurrentDirectory();
+    }
+
 
     string T(string k)
     {
@@ -4141,8 +4205,8 @@ class ChatWindow : Window
                     else lines.Add(ln);
                 }
             foreach (var kv in want) if (!seen.Contains(kv.Key)) lines.Add(kv.Key + "=" + kv.Value);
-            Directory.CreateDirectory(Path.GetDirectoryName(SettingsFile));
-            File.WriteAllText(SettingsFile, string.Join("\n", lines.ToArray()) + "\n", new UTF8Encoding(false));
+            Directory.CreateDirectory(Path.GetDirectoryName(SettingsFileForWrite));
+            File.WriteAllText(SettingsFileForWrite, string.Join("\n", lines.ToArray()) + "\n", new UTF8Encoding(false));
         }
         catch { }
     }

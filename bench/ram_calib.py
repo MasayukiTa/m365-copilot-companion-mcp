@@ -23,6 +23,16 @@ INTERVAL = 15
 ALPHA = 0.25  # EWMA recency weight (higher = more recent-biased; to be tuned)
 
 
+
+def _settings_file_for_write():
+    """The shared resolver. This module is the only non-C# WRITER of settings.txt -- it
+    writes the measured per-tab RAM cost back -- so it has to follow the file to its new
+    home or the calibration would land somewhere nothing reads. See tools/settings_path.py.
+    """
+    from tools.settings_path import settings_file_for_write
+    return settings_file_for_write()
+
+
 def edge_ws_mb():
     """RAM of the FLEET Edge only (the :9222 copilot-companion-edge process tree) -- NOT the user's
     other Edge windows, which would otherwise be wrongly attributed to the fleet's tabs. Find the
@@ -96,7 +106,7 @@ def run_done():
 
 
 def settings_path():
-    return os.path.join(os.environ.get("APPDATA", ""), "copilot-bridge", "settings.txt")
+    return _settings_file_for_write()
 
 
 def write_setting(key, value):

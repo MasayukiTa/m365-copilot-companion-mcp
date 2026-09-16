@@ -557,7 +557,11 @@ AUTOSCALE_CEILING_DEFAULT = 100
 
 
 def _settings_path():
-    return os.path.join(os.environ.get("APPDATA", ""), "copilot-bridge", "settings.txt")
+    # ONE RESOLVER, because this path had five copies that did not agree -- and because
+    # the file is moving into the repository, where every context resolves it identically.
+    # See tools/settings_path.py for the 2026-09-16 incident this closes.
+    from tools.settings_path import settings_file
+    return settings_file()
 
 
 def _settings_int(key, default):

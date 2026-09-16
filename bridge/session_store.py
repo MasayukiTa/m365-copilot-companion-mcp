@@ -884,7 +884,8 @@ SETTINGS_KEYS = ("session_retention_days", "session_max_mb")
 
 
 def _settings_path():
-    return os.path.join(os.environ.get("APPDATA", ""), "copilot-bridge", "settings.txt")
+    from tools.settings_path import settings_file      # one resolver; see that module
+    return settings_file()
 
 
 def read_retention():
