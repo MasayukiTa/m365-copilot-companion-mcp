@@ -89,4 +89,7 @@ def screenshot(
         return (f"saved screenshot: {out} ({img.size[0]}x{img.size[1]} px, "
                 f"{out.stat().st_size:,} bytes){note}")
     except Exception as e:
-        return f"[screenshot error: {type(e).__name__}: {e}]"
+        # Same split as screen_ops: this call grabs the screen too, so a locked session
+        # makes it fail for a reason that is not a defect in it.
+        from .screen_ops import _unavailable_or_error
+        return _unavailable_or_error("screenshot", e)

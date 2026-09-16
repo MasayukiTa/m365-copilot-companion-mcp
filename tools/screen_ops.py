@@ -183,7 +183,29 @@ def screen_look(output_path: Optional[str] = None, max_dimension: int = 1600,
                    format(out.stat().st_size, ","), out, block,
                    capture_reports_what_it_did()) + caution)
     except Exception as e:
-        return "[screen_look error: %s: %s]" % (type(e).__name__, e)
+        return _unavailable_or_error("screen_look", e)
+
+
+def _unavailable_or_error(tool: str, exc: BaseException) -> str:
+    """The failure text for a tool that needs a desktop, split by whether one was there.
+
+    Two different words because they have two different readers. `error` is a defect and
+    somebody should look at the code; `unavailable` is a machine nobody is sitting at, and
+    the only fix is a person. Filing the second as the first is how a health indicator comes
+    to report a working system as broken -- and every one of these tools was doing it.
+
+    Only for the paths that genuinely cannot work without the desktop. screen_windows
+    enumerates fine on a locked session, so a failure there is its own.
+    """
+    from . import desktop_input as DI
+
+    try:
+        reason = DI.unreachable_desktop_reason()
+    except Exception:
+        reason = ""          # the probe failing is not evidence about the desktop
+    if reason:
+        return "[%s unavailable: %s]" % (tool, reason)
+    return "[%s error: %s: %s]" % (tool, type(exc).__name__, exc)
 
 
 def screen_click(image: str, x: int, y: int, button: str = "left",
@@ -213,7 +235,7 @@ def screen_click(image: str, x: int, y: int, button: str = "left",
         return ("%s click at image (%d, %d) -> desktop (%d, %d); what was there: %s"
                 % (button, x, y, sx, sy, before.label() if before else "nothing"))
     except Exception as e:
-        return "[screen_click error: %s: %s]" % (type(e).__name__, e)
+        return _unavailable_or_error("screen_click", e)
 
 
 def screen_scroll(image: str, x: int, y: int, clicks: int = -3,
@@ -231,7 +253,7 @@ def screen_scroll(image: str, x: int, y: int, clicks: int = -3,
         return ("scrolled %d notch(es) %s at image (%d, %d) -> desktop (%d, %d)"
                 % (clicks, "horizontally" if horizontal else "vertically", x, y, sx, sy))
     except Exception as e:
-        return "[screen_scroll error: %s: %s]" % (type(e).__name__, e)
+        return _unavailable_or_error("screen_scroll", e)
 
 
 def screen_type(text: str) -> str:
@@ -251,7 +273,7 @@ def screen_type(text: str) -> str:
         n = DI.type_text(text or "")
         return "typed %d character(s)" % n
     except Exception as e:
-        return "[screen_type error: %s: %s]" % (type(e).__name__, e)
+        return _unavailable_or_error("screen_type", e)
 
 
 def screen_press(keys: str) -> str:
@@ -283,7 +305,7 @@ def screen_press(keys: str) -> str:
         DI.press(*parts)
         return "pressed %s" % "+".join(parts)
     except Exception as e:
-        return "[screen_press error: %s: %s]" % (type(e).__name__, e)
+        return _unavailable_or_error("screen_press", e)
 
 
 def screen_windows(limit: int = 30) -> str:
