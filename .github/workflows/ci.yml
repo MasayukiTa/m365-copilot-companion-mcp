@@ -91,6 +91,7 @@ jobs:
             ui/test_a_green_dot_must_have_established_the_thing.py \
             tools/test_a_new_way_to_say_failed_must_be_classified.py \
             relay/test_a_worker_that_wrote_about_limits_was_thrown_away.py \
+            relay/test_a_control_that_does_nothing_is_worse_than_none.py \
             tests/test_a_question_nobody_can_fail_is_not_a_question.py \
             tools/test_fleet_intake.py \
             tools/test_a_locked_out_worker_should_not_clone_its_own_work.py \
