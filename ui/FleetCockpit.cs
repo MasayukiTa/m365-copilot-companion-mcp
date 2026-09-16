@@ -2281,7 +2281,18 @@ class CockpitWindow : Window
         bool srvOk = srvBody != null;
         if (srvOk) _lastHealthBody = srvBody;
         string authFails = HealthField(srvBody, "auth_fail_10m");
-        bool authStorm = authFails.Length > 0 && authFails != "0";
+        // A BURST, NOT A STRAY. This first read "any non-zero count is amber", which is the
+        // same mistake as judging the fleet tool path on a single failure -- caught there by
+        // running it, not caught here. Measured 2026-09-16: one 401 from 127.0.0.1, generated
+        // by this repository is own test suite touching the live server, ambered the most
+        // trusted dot for ten minutes.
+        //
+        // What this dot exists to catch is a key desync (Copilot Studio holding a stale
+        // MCP_API_KEY): every gated call then fails, so the count is dozens within the same
+        // ten-minute window, not one. Three separates that from a stray probe or a single
+        // retry, and is deliberately far below what a real desync produces.
+        int authFailN = 0; int.TryParse(authFails, out authFailN);
+        bool authStorm = authFailN >= 3;
         // STALE CODE IS NOT A HEALTHY SERVER, and 200 cannot tell you. A running process keeps
         // executing what it imported at startup; a pull lands new code and every dot stays
         // green while the checkout and the live process disagree. doctor.ps1:690 has checked

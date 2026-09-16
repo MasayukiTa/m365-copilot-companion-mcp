@@ -925,6 +925,43 @@ def _mentions_being_locked(resp: str) -> bool:
     return any(p.lower() in low for p in _LOCK_PARAPHRASES)
 
 
+#: Markup a model emits when it means to CALL a tool. Seeing it in the reply TEXT means the
+#: call was written out as prose instead of being made -- the reply is the evidence that an
+#: invocation was attempted, and the ledger is the evidence about whether it arrived.
+_INVOKE_MARKUP = ("<invoke name=", "antml:invoke", "<parameter name=")
+
+
+def _no_tool_call_landed(since: float) -> bool:
+    """Did NOTHING at all reach the tool gateway since `since`?
+
+    Deliberately asks about EVERY worker rather than this one. Attribution is not available
+    in general -- relay/turn_windows.py carries the measurement -- but it is not needed for
+    this question in its negative form: if no call from anybody arrived in the window, then
+    this worker's attempted call certainly did not. The positive form would need attribution
+    and is not claimed.
+
+    False on any read failure, because "the ledger could not be read" is not evidence that a
+    call went missing.
+    """
+    if since <= 0:
+        return False
+    try:
+        from tools import fleet_tool_health as _fth
+
+        for rec in _fth._tail_records(_fth.LEDGER, _fth.TAIL_BYTES):
+            if rec.get("event") == "call" and float(rec.get("ts") or 0) >= since:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _tried_to_call_a_tool(resp: str) -> bool:
+    """Does the reply contain an invocation the model wrote out instead of making?"""
+    low = (resp or "")
+    return any(m in low for m in _INVOKE_MARKUP)
+
+
 def _exclusively_refused(worker: str, since: float) -> bool:
     """Did the SERVER refuse a call that could only have been this worker's?
 
@@ -2851,6 +2888,23 @@ class RelayWorker:
         self.conv_url = ""         # filled once the conversation gets its /conversation/<id>
         self.conv_title = ""       # Copilot's auto-generated chat title (best-effort scrape)
         self.steer_msgs = []       # user steering messages to inject on the next turn(s)
+        # AND A RECORD OF THE ONES ALREADY DELIVERED. self.goal is this worker's identity and
+        # must not change (see the note where it is set), but a steer changes what the worker
+        # has been ASKED to do -- and until 2026-09-16 nothing downstream knew that.
+        #
+        # What that cost, observed live: a screen-inspection goal was running when a person
+        # typed an unrelated git-history question into the chat surface bound to that
+        # conversation. The chat sends to a live worker as a steer by construction
+        # (ui/CopilotChat.cs, SendToFleetConversation). The worker did the new task, reported
+        # it, and the refuter -- holding only the ORIGINAL goal -- ruled the goal unmet. The
+        # worker then argued back that the git question "was an additional request from the
+        # user and is complete", to a judge that had never been told there was one. It
+        # oscillated between the two tasks for turns on end.
+        #
+        # Nothing here decides whether a steer SHOULD have been allowed. It makes the
+        # amendment visible to the parts of the system that judge the result, which were
+        # deciding against a contract the human had already changed.
+        self.steers_applied = []
         self._last_was_steer = False   # so the FOLLOWING continue bridges off the steer
         self.max_turns = max_turns
         # autonomy-contract turn budget (None = no contract budget, inert). When set to an
@@ -2889,8 +2943,13 @@ class RelayWorker:
         # applies to every worker -- unlike the coding-discipline block, which is gated on a
         # verification card. theme_text stays the bare goal so the theme bucket is still
         # derived from the goal, not from the contract.
+        # THE BODY ONLY WHERE IT IS THE DECISION. `fanout` here is the caller's request, not
+        # the settled verdict (self.fanout is computed further down and also requires depth 0
+        # and a splittable goal) -- but it is the right gate: a worker that was never asked to
+        # split cannot need the procedure's content to decide a split, so it gets the pointer.
         composed_goal = _with_repo_contract(
-            _with_theme_memory(_with_matched_skill(self.goal), theme_text=self.goal))
+            _with_theme_memory(_with_matched_skill(self.goal, want_body=bool(fanout)),
+                               theme_text=self.goal))
         initial_body, preflight_unlock = _initial_job_with_unlock(composed_goal, plan_mode)
         # Kept for the branches that REBUILD the job for a fresh conversation -- a replay and
         # a token-limit recycle. Both hand the agent a chat with no history at all, so they
@@ -3559,6 +3618,28 @@ class RelayWorker:
                 + head + self._composed_prefix + RECYCLE_PREFIX + self.goal
                 + self._compaction_note())
 
+    def goal_as_amended(self):
+        """The goal a judge should hold: the original, plus every steer a person has sent.
+
+        self.goal stays exactly as it was -- it is the transcript key and this worker's
+        identity, and rewriting it would rename a running conversation. This is the reading
+        used when asking whether the work is done, because that question is about the task as
+        it stands NOW, and a person has changed it.
+
+        Returns self.goal unchanged when nobody has steered, so every existing caller that
+        wants the identity keeps getting exactly what it got before.
+        """
+        try:
+            if not getattr(self, "steers_applied", None):
+                return self.goal
+            parts = ["".join(self.goal or "")]
+            parts.append("\n\n--- 以降は走行中に人が追加した指示です（元のゴールと併せて評価してください） ---")
+            for i, t in enumerate(self.steers_applied, 1):
+                parts.append("%d. %s" % (i, str(t or "").strip()))
+            return "\n".join(parts)
+        except Exception:
+            return self.goal
+
     def _task_anchor(self, nudge):
         """Prepend the worker's task identity to a GENERIC retry/continue/fix nudge so a
         long or retrying conversation can't drift into a different role. A bare
@@ -3600,7 +3681,9 @@ class RelayWorker:
             return
         # a queued steering message preempts the normal CONTINUE/FIX job for this turn
         if self.steer_msgs:
-            self.job = ("【ユーザーからの追加指示】" + self.steer_msgs.pop(0)
+            _steer_text = self.steer_msgs.pop(0)
+            self.steers_applied.append(_steer_text)
+            self.job = ("【ユーザーからの追加指示】" + _steer_text
                         + "\n上記を最優先で踏まえて作業を続行してください。"
                         + CLOSING_INSTRUCTION)
             self._last_was_steer = True
@@ -3715,17 +3798,6 @@ class RelayWorker:
         # When this turn went out. The lock fallback below compares the server's refusal
         # record against it, so only a refusal caused BY THIS TURN counts.
         self._turn_sent_at = time.time()
-        # AND WHO ELSE WAS IN FLIGHT. A refusal is written by the server carrying an MCP
-        # session the relay cannot map to a worker, so "was that refusal mine" has been
-        # answered by reading the worker's own prose. When this worker is the only one with a
-        # turn open, the question has an exact answer instead. relay/turn_windows.py carries
-        # the measurement of how often that holds -- often when the fleet is small, rarely
-        # when it is large.
-        try:
-            from relay import turn_windows as _tw
-            _tw.open_turn(self.name, self._turn_sent_at)
-        except Exception:
-            pass
         # THE QUOTA IS SPENT HERE, and this is the only place it is spent. Microsoft's
         # generative-orchestration limit counts MESSAGES, not the MCP tool calls our gateway
         # sees -- a turn may make none of those, or several, so the tool ledger was never the
@@ -3735,6 +3807,22 @@ class RelayWorker:
             from relay import quota_meter as _qm
             _qm.record_turn(worker=getattr(self, "name", ""), conv=getattr(self, "conv_url", ""),
                             ts=self._turn_sent_at)
+        except Exception:
+            pass
+        # AND WHO ELSE WAS IN FLIGHT. Placed AFTER the quota meter on purpose: a test asserts
+        # the meter sits within 900 characters of `self.turn += 1` -- "the turn is metered
+        # where it is spent" -- and this block was first inserted between them, pushing the
+        # meter out of that window. Widening the test would have removed a real property to
+        # make room for a new one.
+        #
+        # A refusal is written by the server carrying an MCP session the relay cannot map to
+        # a worker, so "was that refusal mine" has been answered by reading the worker's own
+        # prose. When this worker is the only one with a turn open, the question has an exact
+        # answer instead. relay/turn_windows.py carries the measurement of how often that
+        # holds -- often when the fleet is small, rarely when it is large.
+        try:
+            from relay import turn_windows as _tw
+            _tw.open_turn(self.name, self._turn_sent_at)
         except Exception:
             pass
         # a send actually went through -> reset BOTH the generation-wait count and the
@@ -5439,6 +5527,51 @@ class RelayWorker:
             # would otherwise ride the plain CONTINUE branch all the way to max_turns while
             # WE re-send byte-identical nudge text every turn -- the confirmed degradation
             # mechanism. Cap consecutive continues and terminate gracefully instead.
+            # AN ATTEMPTED CALL THAT NEVER ARRIVED IS NOT "DID NOT FINISH".
+            #
+            # Observed live 2026-09-16: 14 of 18 assistant turns contained `<invoke name=`
+            # written out as prose, none of it reaching the gateway, and the worker was filed
+            # STUCK as "no DONE after 6 continue nudges (stopped to avoid degrading the
+            # model)". That reason names the wrong thing entirely. The worker was not failing
+            # to finish; every tool call it made was landing nowhere, and a nudge to continue
+            # is advice for a different problem -- it spent six turns re-emitting the same
+            # broken invocation because nothing ever told it the invocation was the fault.
+            #
+            # The test is conservative on purpose: the reply shows an invocation was
+            # ATTEMPTED, and the ledger shows NOTHING from anybody arrived since this turn
+            # was sent. The negative form needs no attribution, which is just as well,
+            # because attribution is not generally available here.
+            # THE FIRST VERSION OF THIS ALSO REQUIRED THAT NOTHING AT ALL REACHED THE
+            # GATEWAY, AND THAT MADE IT USELESS FOR THE CASE IT WAS WRITTEN FOR. Measured on
+            # the run that prompted it: 19 calls DID land in the window and 18 succeeded --
+            # catalogue, signature, unlock, screen_windows, two shell_exec that actually
+            # answered the git question. Only the malformed blocks landed nowhere. So "zero
+            # calls from anybody" was never true, the branch never fired, and 8 of the last
+            # 10 turns went on re-emitting the same non-executing invocation.
+            #
+            # The markup in the reply IS the evidence. A model that writes <invoke name=...>
+            # with a <parameter name=...> into its prose meant to call something and did not.
+            # A reply merely DISCUSSING the syntax could trip this; the cost of that is one
+            # corrective nudge, against 8 wasted turns for a miss, and the reply is quoted
+            # back so a false positive is visible rather than silent.
+            if _tried_to_call_a_tool(resp):
+                self._unlanded_calls = getattr(self, "_unlanded_calls", 0) + 1
+                if self._unlanded_calls >= 2:
+                    self.status, self.outcome = "stuck", "INFRA_STUCK"
+                    self.reason = (
+                        "⚠ ツール呼び出しが%d ターン連続でゲートウェイに到達していない。"
+                        "返信には呼び出しの記述があるが、台帳には1件も届いていない。"
+                        "**タスクの失敗ではなくツール経路の問題**（ツール名の綴り、"
+                        "コネクタ、または経路）。継続を促しても直らない。"
+                        % self._unlanded_calls)
+                    return
+                self.job = self._task_anchor(
+                    "直前の返信にツール呼び出しの記述がありましたが、その呼び出しはサーバに"
+                    "一件も届いていません。同じ書き方を繰り返さないでください。"
+                    "call_tool(name='') でツール名を確かめ、gateway 経由で呼び直してください。"
+                    + CLOSING_INSTRUCTION)
+                self.status = "ready"
+                return
             self._continue_count += 1
             if self._continue_count >= self.max_continue:
                 if self._salvage_via_checks():
@@ -5641,7 +5774,7 @@ class RelayWorker:
             else:
                 from .refuter import RefuterSession
                 self._refuter_session = RefuterSession(
-                    self._context, self._agent_url or "", self.goal,
+                    self._context, self._agent_url or "", self.goal_as_amended(),
                     self.last_response,
                     unverifiable=not self.checks).start()
             self.status = "refuting"
@@ -5837,7 +5970,7 @@ class RelayWorker:
         # still holding the coding criteria would refute on grounds the others were told do
         # not apply, and a single REFUTED is enough to send the worker back.
         self._refuter_session = RefuterSession(
-            self._context, self._agent_url or "", self.goal,
+            self._context, self._agent_url or "", self.goal_as_amended(),
             self.last_response, lens=lens,
             unverifiable=not self.checks).start()
 
@@ -6747,7 +6880,7 @@ def _ask_to_approve_the_near_miss(store, text):
         pass
 
 
-def _with_matched_skill(goal_text):
+def _with_matched_skill(goal_text, want_body=True):
     """Prepend the approved procedure for this goal, when one matches. Never raises.
 
     WHY THE FRAME DOES THIS. The server orders every worker, as RULE 2, to call skill_match
@@ -6800,6 +6933,31 @@ def _with_matched_skill(goal_text):
         if not hit:
             _ask_to_approve_the_near_miss(store, text)
             return goal_text
+        # A POINTER WHEN THE BODY IS NOT THE DECISION.
+        #
+        # The docstring below argues for sending the whole body, and its measurement is
+        # sound but narrow: turn 1 of a FAN-OUT is the split decision, made against the
+        # procedure's own content, with no second turn free to call skill_load first. That
+        # case needs the body. Nothing measured the other case, and the other case is almost
+        # every worker.
+        #
+        # What it cost, observed 2026-09-16: a goal whose whole task was "press the Windows
+        # key, then Win+R" carried 2,251 characters of keyboard manual, in a 7,850-character
+        # turn that was then sent FOUR TIMES byte-identically while one reply came back. The
+        # operator named it as the same failure as the tool catalogue, which was fixed by
+        # exactly this move -- an index that is cheap to read, with the depth one call away.
+        #
+        # So: fan-out gets the body, everyone else gets the name, the one-line description
+        # and how to open it. skill_load is a single call through a gateway the worker is
+        # already required to use.
+        if not want_body:
+            desc = str(hit.get("description") or "").strip()
+            return ("%s【承認済み手順あり】この作業には承認済みの手順 `%s` が一致しました"
+                    "（score %s）。%s\n必要なら call_tool(name='skill_load', "
+                    "arguments={'name': '%s'}) で全文を読み、その手順どおりに進めてください。"
+                    "\n%s\n\n%s"
+                    % (_SKILL_HEADER, hit["name"], hit.get("score"), desc, hit["name"],
+                       _SKILL_FOOTER if "_SKILL_FOOTER" in globals() else "", goal_text))
         body = store.render(hit["name"], "")
         if not body:
             return goal_text
