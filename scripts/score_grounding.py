@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 
@@ -78,6 +79,18 @@ def main(argv=None):
     print("VERDICT: %s" % ("INSIDE the target -- a click here would reach it"
                            if inside else
                            "OUTSIDE the target -- a click here would go somewhere else"))
+    chance = t.get("chance")
+    if chance is None:
+        print("         THIS RESULT CANNOT BE USED. The task was built before the harness"
+              " measured")
+        print("         how often a blind answer lands inside, so INSIDE here says nothing"
+              " about")
+        print("         whether the picture was read. Rebuild the task and ask again.")
+    else:
+        print("         an answer picked without looking lands inside %.0f%% of the time,"
+              % (100.0 * chance))
+        print("         so one INSIDE is worth about %.1f coin flips."
+              % (0.0 if chance >= 1.0 else -math.log(chance, 2)))
     print("         (%.0f px from the centre, on the longer axis -- description, not the test)"
           % dist)
     scale = task.get("image_pixel_covers_desktop_px") or 1.0
@@ -88,15 +101,33 @@ def main(argv=None):
 
     out = os.path.join(os.path.dirname(os.path.abspath(args.task)), RESULTS)
     row = {"target": t["name"], "answer": [ax, ay], "inside": inside,
-           "centre_dist_px": round(dist, 1), "by": args.by, "split": task.get("split")}
+           "centre_dist_px": round(dist, 1), "by": args.by, "split": task.get("split"),
+           # Written into the ROW, not looked up later from the task: the task file can be
+           # regenerated from a different screen, and a result whose difficulty has to be
+           # reconstructed is a result that will eventually be reconstructed wrongly.
+           "chance": chance}
     with open(out, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     rows = [json.loads(l) for l in open(out, encoding="utf-8") if l.strip()]
     held = [r for r in rows if r.get("split") == "held-out"]
+    # A row with no chance recorded is not a weak data point, it is not a data point: nothing
+    # in it separates a model that read the picture from one that did not.
+    unusable = [r for r in held if r.get("chance") is None]
+    held = [r for r in held if r.get("chance") is not None]
     n, k = len(held), sum(1 for r in held if r["inside"])
     print()
+    if unusable:
+        print("%d earlier held-out row(s) are excluded: no blind-hit rate was recorded, so"
+              % len(unusable))
+        print("  whether the answer could have been wrong is unknown.")
     print("held-out so far: %d of %d inside" % (k, n))
+    if n:
+        blind = 1.0
+        for r in held:
+            blind *= float(r["chance"]) if r["inside"] else 1.0
+        print("  a blind answerer would have matched this exact run %.2g%% of the time."
+              % (100.0 * blind))
     if n and k == n:
         bound = 0.05 ** (1.0 / n)
         print("  with no failures in %d, the one-sided 95%% lower bound is %.1f%%."
