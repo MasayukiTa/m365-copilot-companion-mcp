@@ -102,11 +102,72 @@ def test_a_big_image_comes_back_within_the_budget_or_at_the_readability_floor(tm
     assert out.startswith("data:image/"), out[:120]
     im = Image.open(BytesIO(base64.b64decode(out.split(",", 1)[1])))
     im.load()
+    # THE DISJUNCTION IS CORRECT FOR THIS FIXTURE AND WAS NOT ENOUGH ON ITS OWN. Block noise
+    # does not compress in ANY format once LANCZOS has blurred it, so the floor really is the
+    # right answer here. But "within budget OR at the floor" is also satisfied by "at the
+    # floor and 19% over budget", and that is what production did -- a 1600x900 capture
+    # bottomed out at 400x225 and 142,912 characters, having thrown away 94% of the pixels and
+    # still missed the ceiling, while this test passed every time. The strict property is
+    # asserted below against content that behaves like a real screen.
     within = len(out) <= IO.MAX_DATA_URI_CHARS + 200
     at_floor = max(im.size) <= IO.MIN_DIMENSION
     assert within or at_floor, (
         "returned %d characters at %dx%d -- over budget and not at the floor, so it stopped "
         "shrinking with room left" % (len(out), im.size[0], im.size[1]))
+
+
+def _gradient(tmp_path, size, name="screen.png"):
+    """Content that behaves like a real screen: smooth ramps with local detail.
+
+    This is the shape PNG handles badly and JPEG handles well -- anti-aliased text and window
+    chrome on shaded backgrounds -- and it is the shape the production failure was measured
+    on. Block noise (above) is the opposite and belongs to the floor case.
+    """
+    import random
+
+    from PIL import Image
+
+    rnd = random.Random(99)
+    w, h = size
+    im = Image.new("RGB", size)
+    px = []
+    for y in range(h):
+        for x in range(w):
+            base = (x * 255) // w
+            shade = (y * 90) // h
+            jitter = rnd.randrange(12)
+            px.append((min(255, base + jitter), min(255, shade + jitter),
+                       min(255, 200 - shade + jitter)))
+    im.putdata(px)
+    p = tmp_path / name
+    im.save(str(p), format="PNG")
+    return p
+
+
+def test_a_screen_like_image_meets_the_budget_without_being_destroyed(tmp_path, anywhere):
+    """THE PROPERTY THE PRODUCTION FAILURE VIOLATED, asserted strictly.
+
+    Measured on the real 1600x900 capture that found it: as PNG it needed 400px to approach
+    the budget and STILL missed at 142,912 characters; as JPEG it fits at 800px with 103,224.
+    So the budget is met by changing format, not by shrinking until the picture is gone, and
+    the returned image must be comfortably above the readability floor.
+    """
+    from io import BytesIO
+
+    from PIL import Image
+
+    p = _gradient(tmp_path, (1400, 800))
+    unbounded = len(base64.b64encode(p.read_bytes()))
+    assert unbounded > IO.MAX_DATA_URI_CHARS, (
+        "this fixture does not exercise the budget: %d chars" % unbounded)
+
+    out = IO.read_image(str(p))
+    im = Image.open(BytesIO(base64.b64decode(out.split(",", 1)[1])))
+    im.load()
+    assert len(out) <= IO.MAX_DATA_URI_CHARS + 200, (
+        "returned %d characters at %dx%d" % (len(out), im.size[0], im.size[1]))
+    assert max(im.size) > IO.MIN_DIMENSION * 1.5, (
+        "fitting the budget cost the picture: came back at %dx%d" % im.size)
 
 
 def test_the_budget_binds_where_the_byte_cap_never_did(tmp_path, anywhere):

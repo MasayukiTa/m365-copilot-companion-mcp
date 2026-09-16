@@ -125,6 +125,17 @@ def screen_look(output_path: Optional[str] = None, max_dimension: int = 1600,
             t = hits[0]
             region = (t.left, t.top, t.right, t.bottom)
             picked = t.title or t.cls
+            # AN AMBIGUOUS MATCH IS STILL A MATCH, AND THE CALLER IS NOW TOLD. Taking the
+            # front-most is the right choice -- it is the one a person would mean -- but it
+            # was taken in silence, so an agent asking for "設定" with two such windows open
+            # got one of them and reported on it with no idea the other existed. astra named
+            # this class directly: judging an operation by a window title alone misjudges it.
+            # Naming the runners-up costs a line of text and removes the confident wrong
+            # answer; it does not change which window is captured.
+            if len(hits) > 1:
+                warn.append("%r matched %d windows; captured the front-most (%s). The others: %s"
+                            % (want, len(hits), picked,
+                               ", ".join((h.title or h.cls or "?")[:40] for h in hits[1:4])))
 
             # WHAT THE CROP CANNOT SEE, SAID OUT LOUD.
             #
