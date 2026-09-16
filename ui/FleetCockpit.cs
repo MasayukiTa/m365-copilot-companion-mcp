@@ -969,6 +969,10 @@ class CockpitWindow : Window
     // Index map: 0=server 1=tunnel 2=edge 3=signin 4=agent 5=tool(bridge probe).
     readonly DotState[] _health = { new DotState(), new DotState(), new DotState(), new DotState(), new DotState(), new DotState() };
     readonly object _healthLock = new object();
+    // The last /health body, captured by the Server dot's poll so dot 5 can read the FLEET
+    // tool path from it without a second HTTP round trip. Empty until the first successful
+    // poll, and empty must read as "no evidence" everywhere it is used.
+    static string _lastHealthBody = "";
     const int HEALTH_DOT_COUNT = 6;
     Border[] _healthDot;           // the 6 colored dots (re-tinted by ApplyHealthToUi)
     FrameworkElement[] _healthSpin;  // rotating in-progress marks, shown instead of a stale color
@@ -1140,11 +1144,16 @@ class CockpitWindow : Window
         if (k == "hs_never") return ja ? "未確認" : "not checked yet";
         if (k == "hs_srv_detail_ok") return ja ? "ローカルサーバは応答しています (127.0.0.1:8000)" : "Local server responding (127.0.0.1:8000)";
         if (k == "hs_srv_detail_bad") return ja ? "ローカルサーバが応答しません。start_all.bat を実行してください。" : "Local server not responding. Run start_all.bat.";
+        // Amber, not red: the process IS up and answering. It is telling us its callers are
+        // being rejected, which /health has always reported and this dot never read.
+        if (k == "hs_srv_detail_auth") return ja ? "サーバは応答しているが、直近10分に認証失敗が出ています。MCP_API_KEY の不一致を疑ってください。件数:" : "Server is responding, but reporting auth failures in the last 10 minutes. Suspect an MCP_API_KEY mismatch. Count:";
         if (k == "hs_tun_detail_ok") return ja ? "トンネル経由でサーバに到達できます" : "Server reachable through the tunnel";
         if (k == "hs_tun_detail_bad") return ja ? "トンネルからサーバに到達できません" : "Server not reachable through the tunnel";
         if (k == "hs_tun_detail_none") return ja ? "MCP_TUNNEL_URL が .env に未設定です" : "MCP_TUNNEL_URL is not set in .env";
         if (k == "hs_fix_edge_navigate") return ja ? "エージェントのページを開いています..." : "opening the agent page...";
         if (k == "hs_fix_edge_still") return ja ? "ページを開いても準備完了になりません" : "navigated, but the page is still not ready";
+        if (k == "hs_tool_detail_fleet_down") return ja ? "ブリッジ側はツールを呼べていますが、フリート側のツール呼び出しが連続失敗しています。作業を実行する経路はこちらです。" : "The bridge can call tools, but the FLEET path is failing repeatedly. That is the path that does the work.";
+        if (k == "hs_tool_detail_bridge_only_down") return ja ? "落ちているのはブリッジのチャット経路だけで、フリートのツール呼び出しは成功しています。ツール全体が不通ではありません。" : "Only the bridge chat path is down; fleet tool calls are succeeding. This is not a total tool outage.";
         if (k == "hs_tool_detail_never") return ja ? "自己診断がまだ一度も結果を書いていない（ブリッジ未起動か診断側の不具合）" : "the self-probe has never written a result (bridge not started, or the probe is broken)";
         if (k == "hs_signin_old") return ja ? "サインイン失敗の記録が古く、現在の状態を表していない可能性" : "the sign-in failure on record is old and may not describe the present";
         if (k == "hs_edge_detail_blank") return ja ? "ブラウザは動作中だがエージェントのページが開かれていない" : "browser up, but no agent page open";
@@ -2253,10 +2262,28 @@ class CockpitWindow : Window
     {
         DateTime now = DateTime.UtcNow;
 
-        // 0) Server: GET http://127.0.0.1:8000/health == 200
-        bool srvOk = HttpOk("http://127.0.0.1:8000/health", 3500);
-        SetDot(0, srvOk ? HealthState.Green : HealthState.Red,
-               T(srvOk ? "hs_srv_detail_ok" : "hs_srv_detail_bad"), now);
+        // 0) Server: GET http://127.0.0.1:8000/health, and READ WHAT IT SAYS.
+        //
+        // A 200 means the event loop answered. It does not mean the server is doing its job:
+        // the handler is deliberately non-blocking (main.py:303-309), so it returns 200 while
+        // authentication is failing and while every tool call is refused. Green on the status
+        // code alone is the single most trusted dot reporting the least.
+        //
+        // So: unreachable stays Red, and a reachable server that is REPORTING A PROBLEM about
+        // itself goes Amber rather than Green. Amber, not Red, because the server process is
+        // genuinely up -- the distinction matters for what a person does next.
+        string srvBody = HttpBody("http://127.0.0.1:8000/health", 3500);
+        bool srvOk = srvBody != null;
+        if (srvOk) _lastHealthBody = srvBody;
+        string authFails = HealthField(srvBody, "auth_fail_10m");
+        bool authStorm = authFails.Length > 0 && authFails != "0";
+        if (!srvOk)
+            SetDot(0, HealthState.Red, T("hs_srv_detail_bad"), now);
+        else if (authStorm)
+            SetDot(0, HealthState.Yellow,
+                   T("hs_srv_detail_auth") + " (" + authFails + ")", now);
+        else
+            SetDot(0, HealthState.Green, T("hs_srv_detail_ok"), now);
 
         // 1) Tunnel: read MCP_TUNNEL_URL from ..\.env; GET <url>/health == 200. Gray if none.
         string tunnel = EnvValue("MCP_TUNNEL_URL");
@@ -2953,7 +2980,35 @@ class CockpitWindow : Window
             // Only while it is plausibly still running. A probe that started an hour ago and
             // never recorded a result is not "in progress", it is a prober that died.
             bool probing = probingAgeMin < 20.0;
-            if (ageMin >= 20.0)
+
+            // TWO TOOL PATHS, AND THIS DOT ONLY EVER WATCHED ONE. Everything above comes from
+            // .fleet/tool_probe.json, written solely by the BRIDGE's idle self-probe on its
+            // own Edge profile (CDP :9223). Fleet workers call tools over a different
+            // transport entirely, and on 2026-09-16 this dot was red -- truthfully, the bridge
+            // agent had lost its tool list -- while fleet workers completed 84 tool calls in
+            // an hour and a goal finished DONE with the refuter upholding it. A dot labelled
+            // "Tool" showed red and tool access was fine.
+            //
+            // fleet_tool_ok comes from /health (tools/fleet_tool_health.py), derived from the
+            // ledger of real calls rather than from a probe. "" or "null" means no calls
+            // lately, which is NOT evidence of anything and must not colour the dot.
+            string fleetTool = HealthField(_lastHealthBody, "fleet_tool_ok");
+            bool fleetWorking = fleetTool == "true";
+            bool fleetFailing = fleetTool == "false";
+
+            if (ok && fleetFailing)
+                // The bridge can call tools and the fleet cannot. Green here would hide the
+                // failure of the path that does the work.
+                SetDot(5, HealthState.Yellow, ageTxt + " " + T("hs_tool_detail_fleet_down"), now);
+            else if (!ok && fleetWorking && ageMin < 20.0)
+                // The case that prompted all this. Amber and say which half is down, rather
+                // than red for "tools", which is read as all of them.
+                SetDot(5, HealthState.Yellow, ageTxt + " " + T("hs_tool_detail_bridge_only_down"), now);
+            else if (ageMin >= 20.0 && fleetWorking)
+                // A stale bridge probe while the fleet is demonstrably calling tools is not a
+                // tool outage; it is a probe nobody has run.
+                SetDot(5, HealthState.Yellow, ageTxt + " " + T("hs_tool_detail_bridge_only_down"), now);
+            else if (ageMin >= 20.0)
                 SetDot(5, HealthState.Red, ageTxt + " " + T("hs_tool_detail_stale"), now);
             else if (kind == "checking" || kind == "starting")
                 // A record written by an older prober, which still overwrote the verdict.
@@ -3140,6 +3195,54 @@ class CockpitWindow : Window
     // GET a URL; true iff it returns HTTP 200. Short timeout, fully guarded.
     // Loopback URLs bypass the system proxy: on corporate machines the PAC/proxy can
     // swallow 127.0.0.1 requests, turning a healthy local server into a false-red dot.
+    // THE BODY WAS ALWAYS THERE AND NOBODY READ IT. /health returns status, auth_fail_10m,
+    // tool_ok and fleet_tool_ok (main.py:296-323), and main.py's own docstring says the
+    // endpoint is deliberately non-blocking so it answers 200 even while auth is failing and
+    // every tool call is dying. HttpOk discards the body, so the Server dot was green in
+    // exactly the states the payload was written to expose. Audited 2026-09-16: no consumer
+    // of /health anywhere in the repository parsed the body -- not this file, not doctor.ps1,
+    // not supervisor.ps1, not the relay.
+    //
+    // Returns the body on a 200, or null on any failure, so a caller can tell "unreachable"
+    // from "reachable and complaining". No JSON parser is pulled in for this: the payload is
+    // flat and the two questions asked of it are substring-shaped.
+    static string HttpBody(string url, int timeoutMs)
+    {
+        try
+        {
+            EnsureTls();
+            var req = (HttpWebRequest)WebRequest.Create(url);
+            req.Method = "GET";
+            req.Timeout = timeoutMs;
+            req.ReadWriteTimeout = timeoutMs;
+            req.AllowAutoRedirect = true;
+            if (url.Contains("127.0.0.1") || url.Contains("localhost")) req.Proxy = null;
+            else if (req.Proxy != null) req.Proxy.Credentials = CredentialCache.DefaultCredentials;
+            using (var resp = (HttpWebResponse)req.GetResponse())
+            {
+                if (resp.StatusCode != HttpStatusCode.OK) return null;
+                using (var sr = new StreamReader(resp.GetResponseStream()))
+                    return sr.ReadToEnd();
+            }
+        }
+        catch (Exception) { return null; }
+    }
+
+    // Pull one flat JSON value out without a parser. Returns "" when absent, which every
+    // caller must treat as "no evidence" rather than as a negative -- /health omits fields it
+    // has nothing to say about, and an omission is not a failure.
+    static string HealthField(string body, string key)
+    {
+        if (string.IsNullOrEmpty(body)) return "";
+        int i = body.IndexOf("\"" + key + "\"");
+        if (i < 0) return "";
+        int c = body.IndexOf(':', i);
+        if (c < 0) return "";
+        int e = c + 1;
+        while (e < body.Length && body[e] != ',' && body[e] != '}') e++;
+        return body.Substring(c + 1, e - c - 1).Trim().Trim('"');
+    }
+
     static bool HttpOk(string url, int timeoutMs)
     {
         try
