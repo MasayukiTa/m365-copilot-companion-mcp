@@ -35,6 +35,12 @@ MAX_DATA_URI_CHARS = 120_000
 #: unreadable to save characters is not a saving.
 MIN_DIMENSION = 400
 
+#: JPEG quality for the fallback. 85 keeps screen text legible -- the content this path
+#: actually meets -- while being the difference between 470,444 characters and 103,224
+#: for one 800px capture. Lower starts ringing around glyphs, which is the one thing a
+#: screenshot is read for.
+JPEG_QUALITY = 85
+
 
 
 def _encoded_chars(raw: bytes) -> int:
@@ -43,12 +49,36 @@ def _encoded_chars(raw: bytes) -> int:
 
 
 def _fit_to_character_budget(data: bytes, suffix: str):
-    """Downscale until the base64 fits MAX_DATA_URI_CHARS, or until further shrinking would
-    make the image unreadable.
+    """Bring the encoded size under MAX_DATA_URI_CHARS, losing as little of the picture as
+    possible. Returns (bytes, suffix).
 
-    Returns (bytes, suffix). Pillow absent means the budget cannot be enforced -- the caller
-    gets the original rather than an error, which is the same choice the resize branch makes,
-    because a missing optional dependency should not turn a working tool into a broken one.
+    WHY THE FIRST VERSION FAILED, and it failed in production rather than in a test. It only
+    ever shrank, keeping PNG, and PNG is the wrong format for a screenshot once LANCZOS has
+    blurred its flat runs into gradients. Measured on a real 1600x900 capture:
+
+        1600x900  1,492,444 chars   (PNG, untouched)
+         430x242    157,752         (PNG, aiming at the budget and overshooting)
+         400x225    142,912         (PNG, MIN_DIMENSION reached -- stop)
+
+    So it bottomed out at the readability floor, still 19% over the ceiling, having thrown
+    away 94% of the pixels on the way. Both constants were satisfied and the result was the
+    worst of both: over budget AND unreadable. The unit test passed throughout, because it
+    asserts "within budget OR at the floor" -- a disjunction that is true here and says
+    nothing useful. A live run reading one 1.1 MB file is what found it.
+
+    The same image as JPEG:
+
+         800x450    103,224 chars   (q85) -- inside the budget
+        1024x576    153,880
+         400x225     31,288
+
+    So the answer is not fewer pixels, it is a format that suits the content. At 800px this
+    returns four times the picture AND fits, where the old path returned a quarter of it and
+    did not.
+
+    PNG IS STILL TRIED FIRST and kept whenever it fits, because it is exact: a diagram, a
+    chart or a screenshot of code survives it without ringing around the glyphs. JPEG is the
+    fallback for the case where exactness was going to be lost anyway.
     """
     if _encoded_chars(data) <= MAX_DATA_URI_CHARS:
         return data, suffix
@@ -59,39 +89,81 @@ def _fit_to_character_budget(data: bytes, suffix: str):
     except ImportError:
         return data, suffix
 
-    fmt = "PNG" if suffix == "png" else "JPEG"
     try:
-        for _ in range(8):
-            im = PILImage.open(BytesIO(data))
-            im.load()
-            w, h = im.size
-            longest = max(w, h)
-            if longest <= MIN_DIMENSION:
-                return data, suffix
-            # Aim straight at the budget rather than halving blindly: encoded size scales
-            # roughly with AREA, so the edge ratio is the square root of the size ratio. The
-            # 0.95 keeps a rounding miss from costing another whole round trip through PIL.
-            ratio = (MAX_DATA_URI_CHARS / float(_encoded_chars(data))) ** 0.5 * 0.95
-            target = max(MIN_DIMENSION, int(longest * ratio))
-            if target >= longest:
-                target = max(MIN_DIMENSION, int(longest * 0.85))
-            scale = target / float(longest)
-            out = im.resize((max(1, int(w * scale)), max(1, int(h * scale))),
-                            PILImage.LANCZOS)
+        im = PILImage.open(BytesIO(data))
+        im.load()
+        w, h = im.size
+        longest = max(w, h)
+        rgb = None
+
+        def _at(dim, fmt):
+            """Encode at this longest-edge, or None if it does not fit the budget."""
+            scale = 1.0 if dim >= longest else dim / float(longest)
+            src = im if fmt == "PNG" else (rgb or im.convert("RGB"))
+            out = src if scale >= 1 else src.resize(
+                (max(1, int(w * scale)), max(1, int(h * scale))), PILImage.LANCZOS)
             buf = BytesIO()
-            kwargs = {"optimize": True}
-            if fmt == "JPEG":
-                kwargs["quality"] = 88
-                out = out.convert("RGB")
-            out.save(buf, format=fmt, **kwargs)
-            data = buf.getvalue()
-            suffix = "png" if fmt == "PNG" else "jpeg"
-            if _encoded_chars(data) <= MAX_DATA_URI_CHARS:
-                break
+            if fmt == "PNG":
+                out.save(buf, format="PNG", optimize=True)
+            else:
+                out.save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+            raw = buf.getvalue()
+            if _encoded_chars(raw) > MAX_DATA_URI_CHARS:
+                return None
+            return (out.size[0] * out.size[1], raw, "png" if fmt == "PNG" else "jpeg")
+
+        rgb = im.convert("RGB")
+
+        # THE OBJECTIVE IS PIXELS, NOT THE FIRST THING THAT FITS. The previous rule shrank as
+        # PNG and returned as soon as it was under budget, which on a real 816 KB capture gave
+        # 425x238 -- inside the budget and barely readable, when JPEG at 1024px also fits.
+        # Measured on one 1600x900 screenshot: PNG needs 400px to approach the budget and
+        # still misses it at 142,912 characters, while JPEG fits at 800px with 103,224.
+        #
+        # So every candidate is priced and the biggest survivor wins. PNG is preferred only on
+        # a tie, where it is free exactness: a diagram or a screenshot of code keeps its edges.
+        # ENCODED SIZE FALLS WITH DIMENSION, so walking DOWN and stopping at the first fit
+        # gives that format's largest survivor -- there is no need to price the rest. Pricing
+        # all nine widths in both formats was the first version and cost 1.2 to 3.1 SECONDS
+        # per call, measured on these captures; read_image is called hundreds of times, so
+        # that lands inside every worker's turn.
+        best = None
+        dims = [d for d in (longest, 1600, 1280, 1024, 900, 800, 640, 512, MIN_DIMENSION)
+                if MIN_DIMENSION <= d <= longest]
+        # PNG GETS TWO PROBES, NOT NINE. When PNG cannot fit at any useful size -- the normal
+        # case for a photographic or anti-aliased screen capture -- walking all nine widths
+        # meant nine expensive PNG encodes that were all going to fail, and that alone was the
+        # 1.2-3.1 seconds. Encoded size tracks AREA, so the width that could fit is
+        # longest * sqrt(budget / chars_at_full); if that lands below the readability floor,
+        # PNG is hopeless and is skipped entirely. The estimate is optimistic for PNG (its
+        # compression degrades as resizing blurs flat runs), which is fine: an optimistic
+        # probe that fails costs one encode, and JPEG is right behind it.
+        png_dims = []
+        if (suffix or "").lower() == "png":
+            full = _encoded_chars(data)
+            est = int(longest * ((MAX_DATA_URI_CHARS / float(full)) ** 0.5)) if full else 0
+            png_dims = [d for d in dict.fromkeys([longest, est]) if MIN_DIMENSION <= d <= longest]
+        for fmt, cand in (("PNG", png_dims), ("JPEG", dims)):
+            for dim in cand:
+                got = _at(dim, fmt)
+                if got:
+                    if best is None or got[0] > best[0] or (got[0] == best[0]
+                                                            and got[2] == "png"):
+                        best = got
+                    break       # descending: this is the biggest that fits for this format
+        if best:
+            return best[1], best[2]
+
+        # Nothing fits even at the floor. Return the smallest readable JPEG rather than the
+        # original: over budget is bad, over budget AND huge is worse.
+        scale = MIN_DIMENSION / float(longest)
+        out = rgb.resize((max(1, int(w * scale)), max(1, int(h * scale))), PILImage.LANCZOS)
+        buf = BytesIO()
+        out.save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+        return buf.getvalue(), "jpeg"
     except Exception:
         # A budget is a courtesy, not a guarantee worth failing a read over.
         return data, suffix
-    return data, suffix
 
 
 def read_image(path: str, max_dimension: Optional[int] = 1600) -> str:

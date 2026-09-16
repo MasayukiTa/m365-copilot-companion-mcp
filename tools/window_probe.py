@@ -179,7 +179,16 @@ def top_level_windows(min_side: int = 64) -> List[Target]:
         try:
             if _user32.IsWindowVisible(hwnd):
                 t = describe(int(hwnd))
-                if t and t.width >= min_side and t.height >= min_side and t.title:
+                # A WINDOW WITH NO CAPTION IS STILL A WINDOW. `and t.title` dropped every
+                # untitled one, so screen_windows could not report a surface that has no
+                # caption -- which is exactly the shape of the Start menu, the task view and
+                # most shell UI. A worker pressed the Windows key nine times on 2026-09-15
+                # and checked with screen_windows each time; whatever appeared, this
+                # enumeration could not have shown it, so no number of attempts would ever
+                # have confirmed the press. Measured on this desktop the same day: zero
+                # untitled visible windows at or above the size floor, so admitting them adds
+                # no noise in the ordinary case and stops hiding the extraordinary one.
+                if t and t.width >= min_side and t.height >= min_side:
                     found.append(t)
         except Exception:
             pass

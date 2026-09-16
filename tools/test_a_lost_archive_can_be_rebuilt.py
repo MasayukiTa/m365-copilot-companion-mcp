@@ -199,7 +199,24 @@ def test_the_live_archive_is_loadable_and_resumable():
     unreopenable = [r for r in rows if not _ref(r)]
     assert not unreopenable, "%d of %d rows carry no conversation id" % (
         len(unreopenable), len(rows))
-    # AND NONE OF THEM ROUTES TO THE PAGE. A conv_url that is a real url sends the cockpit
-    # through /switch, which releases the socket and opens a tab.
+    # A PAGE URL IS NOT A DEFECT, AND THIS ASSERTED THAT IT WAS. It read "none of them routes
+    # to the page", on the premise that every fleet conversation is socket-driven and carries
+    # a sess:<guid>. The premise is wrong: relay/socket_route.jsonl records `event=fallback`,
+    # and a worker that fell back really is on a page, so its conv_url really is a URL.
+    # Measured 2026-09-16 on the live archive: 10 rows, 9 sess:, 1 http -- and that one row
+    # belongs to w3, whose socket_route trail reads socket_retry then fallback.
+    #
+    # Converting it to sess: was the obvious repair and is explicitly refused upstream:
+    # _conversation_id_or_empty (relay/relay_fleet.py) is "deliberately strict" about exactly
+    # this, because pulling the guid out of a URL "would make a tab resume silently become a
+    # socket resume -- which loses the page the caller asked for and looks identical when it
+    # works".
+    #
+    # So what is worth asserting is the property, not the spelling: every row can be reopened,
+    # and a row that routes through the page is one that genuinely ran there. A URL with no
+    # conversation id in it would be neither.
     routed = [r for r in rows if str(r.get("conv_url") or "").startswith("http")]
-    assert not routed, "%d rows would resume through /switch (a page path)" % len(routed)
+    for r in routed:
+        assert "/conversation/" in str(r.get("conv_url")), (
+            "a page row whose url names no conversation cannot be reopened at all: %r"
+            % str(r.get("conv_url"))[:80])

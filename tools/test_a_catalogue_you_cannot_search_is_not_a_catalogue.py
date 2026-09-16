@@ -127,3 +127,36 @@ def test_the_most_used_block_survives(tools):
     assert present, "HOT no longer matches any registered tool"
     for n in present[:5]:
         assert n in index, n
+
+
+def test_opening_one_category_costs_far_less_than_the_flat_list(tools):
+    """astra asked the obvious question: does tiering actually save anything end to end, or
+    does the depth come straight back the moment somebody opens a category?
+
+    Measured 2026-09-16 on the real registry -- flat 16,603 characters, index 4,445, largest
+    category 2,270 -- and against the ledger for every session since the index shipped:
+
+        categories opened per session: median 1, max 1, out of 12
+        sessions that opened all 12 : 0
+        sessions that opened 0 or 1 : 16 of 16
+
+    So the real bill is index + one category, and the pathological case astra named (open
+    everything, pay 1.2x the flat list) has not happened once. This pins the shape that makes
+    that true: one category has to be a small fraction of the whole.
+    """
+    index = tc.render_index(tools)
+    flat = tc.render(tools)
+    groups = tc.by_category(tools)
+    worst = max(len(tc.render_category(tools, k)) for k in groups)
+    assert len(index) + worst < len(flat) * 0.55, (
+        "index %d + largest category %d is no longer a saving against %d"
+        % (len(index), worst, len(flat)))
+
+
+def test_no_single_category_is_most_of_the_catalogue(tools):
+    """A category holding nearly everything would make the index a table of contents for one
+    chapter -- tiering in shape only."""
+    groups = tc.by_category(tools)
+    biggest = max(len(v) for v in groups.values())
+    assert biggest < len(tools) * 0.30, (
+        "one category holds %d of %d tools" % (biggest, len(tools)))
