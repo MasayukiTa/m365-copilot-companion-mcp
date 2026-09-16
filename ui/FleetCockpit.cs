@@ -177,14 +177,72 @@ class ApprovalPromptWindow : Window
     static double NowUnix()
     { return (DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds; }
 
-    static string SettingsFile
+    //: WHERE THE SETTINGS LIVE, in both places, new first.
+    //:
+    //: %APPDATA% is redirected for a process running inside an MSIX package, so the same
+    //: absolute path resolved to the operator's file from one context and to a private copy
+    //: from another. On 2026-09-16 the panel showed 1 GB while every fleet coordinator
+    //: reserved 4 GB, for a month, and neither side could see the other's file. The
+    //: repository is the one directory every context agrees about.
+    //:
+    //: READS take the new location when it exists and the old one otherwise, so a machine
+    //: mid-migration keeps working and one that never migrates behaves exactly as before.
+    //: WRITES always go to the new location. Kept in step with tools/settings_path.py --
+    //: test_the_settings_path_is_the_same_in_every_language pins the two together.
+    static string SettingsFileNew
+    {
+        get { return Path.Combine(RepoRootForSettings(), ".config", "settings.txt"); }
+    }
+
+    static string SettingsFileOld
     {
         get
         {
             string app = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            if (string.IsNullOrEmpty(app))
+                return Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                    ".copilot-bridge", "settings.txt");
             return Path.Combine(app, "copilot-bridge", "settings.txt");
         }
     }
+
+    static string SettingsFile
+    {
+        get
+        {
+            try { if (File.Exists(SettingsFileNew)) return SettingsFileNew; } catch (Exception) { }
+            try { if (File.Exists(SettingsFileOld)) return SettingsFileOld; } catch (Exception) { }
+            return SettingsFileNew;
+        }
+    }
+
+    static string SettingsFileForWrite
+    {
+        get
+        {
+            try { Directory.CreateDirectory(Path.GetDirectoryName(SettingsFileNew)); }
+            catch (Exception) { }
+            return SettingsFileNew;
+        }
+    }
+
+    //: The repository root as seen from the running executable: ui\ sits directly under it.
+    static string RepoRootForSettings()
+    {
+        try
+        {
+            string exe = System.Reflection.Assembly.GetExecutingAssembly().Location;
+            string dir = Path.GetDirectoryName(exe);
+            DirectoryInfo d = new DirectoryInfo(dir);
+            while (d != null && !Directory.Exists(Path.Combine(d.FullName, ".fleet")))
+                d = d.Parent;
+            if (d != null) return d.FullName;
+        }
+        catch (Exception) { }
+        return Directory.GetCurrentDirectory();
+    }
+
 
     // True until the FIRST LoadNext() completes. The prompt is normally launched by
     // clicking a toast, so an empty gate list on that first pass means "the thing you
@@ -547,8 +605,8 @@ class ApprovalPromptWindow : Window
                 else lines.Add(line);
             }
             if (!found) lines.Add("job_approval_mode=" + mode);
-            Directory.CreateDirectory(Path.GetDirectoryName(SettingsFile));
-            File.WriteAllText(SettingsFile, string.Join("\n", lines.ToArray()) + "\n", new UTF8Encoding(false));
+            Directory.CreateDirectory(Path.GetDirectoryName(SettingsFileForWrite));
+            File.WriteAllText(SettingsFileForWrite, string.Join("\n", lines.ToArray()) + "\n", new UTF8Encoding(false));
         }
         catch { }
     }
@@ -808,9 +866,58 @@ class CockpitWindow : Window
     System.Collections.Generic.HashSet<string> _hiddenKeys = new System.Collections.Generic.HashSet<string>();
     List<object> _history = new List<object>();
     int _openSeq = 0;
-    static readonly string SettingsFile = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-        "copilot-bridge", "settings.txt");
+    //: The same two-location rule as ApprovalPromptWindow above and tools/settings_path.py.
+    //: This file carried TWO independent copies of the path and the audit found five more
+    //: across the repo -- the fact that had six readers and no owner.
+    static string SettingsFileNew
+    { get { return Path.Combine(RepoRootForSettings(), ".config", "settings.txt"); } }
+
+    static string SettingsFileOld
+    {
+        get
+        {
+            string app = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            if (string.IsNullOrEmpty(app))
+                return Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                    ".copilot-bridge", "settings.txt");
+            return Path.Combine(app, "copilot-bridge", "settings.txt");
+        }
+    }
+
+    static string SettingsFile
+    {
+        get
+        {
+            try { if (File.Exists(SettingsFileNew)) return SettingsFileNew; } catch (Exception) { }
+            try { if (File.Exists(SettingsFileOld)) return SettingsFileOld; } catch (Exception) { }
+            return SettingsFileNew;
+        }
+    }
+
+    static string SettingsFileForWrite
+    {
+        get
+        {
+            try { Directory.CreateDirectory(Path.GetDirectoryName(SettingsFileNew)); }
+            catch (Exception) { }
+            return SettingsFileNew;
+        }
+    }
+
+    static string RepoRootForSettings()
+    {
+        try
+        {
+            string exe = System.Reflection.Assembly.GetExecutingAssembly().Location;
+            DirectoryInfo d = new DirectoryInfo(Path.GetDirectoryName(exe));
+            while (d != null && !Directory.Exists(Path.Combine(d.FullName, ".fleet")))
+                d = d.Parent;
+            if (d != null) return d.FullName;
+        }
+        catch (Exception) { }
+        return Directory.GetCurrentDirectory();
+    }
 
     TextBlock _header, _sub;
     WrapPanel _subChips;   // Feature 2: discrete Pill() chips replacing _sub's single concatenated sentence
@@ -1477,8 +1584,8 @@ class CockpitWindow : Window
                     else lines.Add(ln);
                 }
             if (!found) lines.Add(key + "=" + val);
-            Directory.CreateDirectory(Path.GetDirectoryName(SettingsFile));
-            File.WriteAllText(SettingsFile, string.Join("\n", lines.ToArray()) + "\n", new UTF8Encoding(false));
+            Directory.CreateDirectory(Path.GetDirectoryName(SettingsFileForWrite));
+            File.WriteAllText(SettingsFileForWrite, string.Join("\n", lines.ToArray()) + "\n", new UTF8Encoding(false));
             _settingsMtime = File.GetLastWriteTimeUtc(SettingsFile).Ticks;
         }
         catch (Exception) { }
