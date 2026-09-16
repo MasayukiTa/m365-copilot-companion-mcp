@@ -42,6 +42,31 @@ from tools.screen_capture import capture, capture_reports_what_it_did
 #: its own answer. A window with a title qualifies; an unnamed panel does not.
 MIN_SIDE = 24
 
+#: THE LARGEST SHARE OF THE PICTURE A TARGET MAY COVER AND STILL BE A QUESTION. Scoring by
+#: containment asks "would a click here land on it", which is the right question -- but a
+#: rectangle that covers the whole image is passed by every answer that exists, including a
+#: number picked without looking. The first held-out run on 2026-09-16 scored INSIDE against
+#: a maximised window whose rectangle was 0,0..1600,900: the full image. The result was
+#: recorded, a lower bound was printed next to it, and none of it distinguished a model from
+#: a coin. A ceiling here does not make the scoring stricter; it stops the harness handing
+#: out questions whose answer cannot be wrong.
+MAX_CHANCE = 0.25
+
+
+def chance_of_a_blind_hit(rect_image, image_width, image_height):
+    """How often an answer picked without looking at the picture would land inside.
+
+    This is the null hypothesis the measurement has to beat, and it is per-target: a target
+    covering a quarter of the screen is passed by one blind answer in four, so four such
+    successes are worth about as much as one coin landing heads four times -- which is to
+    say, not nothing, but not what "grounding works" means either.
+    """
+    x0, y0, x1, y1 = rect_image
+    frame_area = float(image_width) * float(image_height)
+    if frame_area <= 0:
+        return 1.0
+    return max(0.0, (x1 - x0)) * max(0.0, (y1 - y0)) / frame_area
+
 
 def _nameable(t: W.Target) -> str:
     """How a person would refer to this on screen, or "" if they could not.
@@ -76,6 +101,8 @@ def main(argv=None):
     ap.add_argument("--max-dimension", type=int, default=1600,
                     help="longest edge of the saved image; the reduction is recorded")
     ap.add_argument("--min-side", type=int, default=MIN_SIDE)
+    ap.add_argument("--max-chance", type=float, default=MAX_CHANCE,
+                    help="drop targets a blind guess would hit more often than this")
     ap.add_argument("--split", choices=["dev", "held-out"], default="dev",
                     help="dev screens may be looked at while building the harness; "
                          "held-out ones may not, and only their results count")
@@ -95,6 +122,7 @@ def main(argv=None):
         return 2
 
     items = []
+    too_easy = []
     for t, name, occluders in targets:
         # Only ask about something that is actually visible: a target buried under another
         # window cannot be found in the picture, and scoring it would measure the desktop's
@@ -117,17 +145,33 @@ def main(argv=None):
         iy1 = max(0.0, min(iy1, frame.image_height))
         if ix1 - ix0 < args.min_side / frame.scale or iy1 - iy0 < args.min_side / frame.scale:
             continue        # what remains visible is too small to ask about honestly
+        rect = [round(ix0, 1), round(iy0, 1), round(ix1, 1), round(iy1, 1)]
+        chance = chance_of_a_blind_hit(rect, frame.image_width, frame.image_height)
+        if chance > args.max_chance:
+            # Too big to be wrong about. Kept out of the task rather than scored leniently,
+            # because a question nobody can fail is not a lenient question, it is not one.
+            too_easy.append((name, chance))
+            continue
         items.append({
             "name": name,
             "class": t.cls,
             # In IMAGE pixels, because that is the frame an answer will be given in.
-            "rect_image": [round(ix0, 1), round(iy0, 1), round(ix1, 1), round(iy1, 1)],
+            "rect_image": rect,
             "rect_screen": [t.left, t.top, t.right, t.bottom],
+            # Carried WITH the target, so the scorer never has to guess what beating it means.
+            "chance": round(chance, 5),
         })
+
+    if not items:
+        print("nothing askable on this screen: %d target(s) seen, %d of them cover more than "
+              "%.0f%% of the picture and would be hit blind."
+              % (len(targets), len(too_easy), 100.0 * args.max_chance))
+        return 2
 
     task = {
         "made_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "split": args.split,
+        "max_chance": args.max_chance,
         "capture": capture_reports_what_it_did(),
         "frame": frame._asdict(),
         "image": png,
@@ -143,6 +187,12 @@ def main(argv=None):
     print(task["capture"])
     print(frame.describe())
     print("wrote %s  (%d target(s), split=%s)" % (task_path, len(items), args.split))
+    if too_easy:
+        print("withheld %d target(s) a blind answer would hit more than %.0f%% of the time "
+              "(largest: %s at %.0f%%)"
+              % (len(too_easy), 100.0 * args.max_chance,
+                 max(too_easy, key=lambda p: p[1])[0],
+                 100.0 * max(p[1] for p in too_easy)))
     print()
     print("Ask about ONE of these at a time. The question names the thing and nothing else --")
     print("no position words, no size, no colour; those are the answer, not the question:")
