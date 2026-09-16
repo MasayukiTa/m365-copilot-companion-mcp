@@ -1186,6 +1186,7 @@ class CockpitWindow : Window
         // that still reaches this is: route open, no cached binding, no gpt_id anywhere.
         if (k == "hs_agent_bad") return ja ? "実行中ですが、このサーフェスがエージェントに紐付いている証拠がありません（テンプレート未取得または期限切れ）" : "Run is active, but there is no evidence this surface is bound to an agent (no cached template, or it has expired)";
         if (k == "hs_agent_unknown_live") return ja ? "実行中ですが取得記録がまだありません。未確認であって失敗ではありません。" : "Run is active but no capture has been recorded yet. Unverified, not failed.";
+        if (k == "hs_agent_route_unknown") return ja ? "ソケット経路の記録が読めず、タブ利用かどうか判定できません。故障ではなく未確認です。" : "The socket route record could not be read, so whether this run drives tabs is unknown. Unverified, not failed.";
         // hs_agent_gray no longer means "Edge is down": under the socket route the agent dot
         // is grey when no run is in flight, which is the ordinary idle state.
         if (k == "hs_agent_gray") return ja ? "走行なし" : "No run in flight";
@@ -2893,7 +2894,12 @@ class CockpitWindow : Window
         // connectors, no tenant grounding, and a fluent answer -- cannot happen unnoticed.
         if (!live)
             SetDot(4, HealthState.Gray, T("hs_agent_gray"), now);
-        else if (RouteIsClosed())
+        else if (RouteState() == ROUTE_UNKNOWN)
+            // Amber, not green: the route's own record could not be read, so whether workers
+            // are on tabs is unknown, and the binding check below would be answering a
+            // different question than the one being asked.
+            SetDot(4, HealthState.Yellow, T("hs_agent_route_unknown"), now);
+        else if (RouteState() == ROUTE_CLOSED)
         {
             // THE CANNED-ANSWER SNIFF SURVIVES HERE AND NOWHERE ELSE. It used to decide the
             // dot's colour, which made a judgement about ONE TURN'S QUALITY into a statement
@@ -3002,12 +3008,21 @@ class CockpitWindow : Window
     // Has the route's one-way breaker tripped DURING THIS RUN? Read from the route's own
     // append-only record. Scanned from the run's start, because a close is per-run: the route
     // is rebuilt with each coordinator, and a close from yesterday says nothing about now.
-    bool RouteIsClosed()
+    //: What RouteState() found. UNKNOWN exists because the alternative is a check that
+    //: reports a healthy open route when it could not read the file at all.
+    const int ROUTE_OPEN = 0;
+    const int ROUTE_CLOSED = 1;
+    const int ROUTE_UNKNOWN = 2;
+
+    int RouteState()
     {
         try
         {
             string path = Path.Combine(RepoRoot(), ".fleet", "socket_route.jsonl");
-            if (!File.Exists(path)) return false;
+            // NO FILE IS A REAL ANSWER, not a failure to read one: nothing has ever closed
+            // the route on this checkout. Only a file that exists and cannot be understood
+            // is unknown.
+            if (!File.Exists(path)) return ROUTE_OPEN;
             string stamp = RunStartedLocal().ToString("yyyy-MM-ddTHH:mm:ss");
             // THE LAST ROUTE EVENT DECIDES, NOT THE FIRST CLOSE. A closed route can now be
             // reopened mid-run (relay/route_reopen.py), and this used to answer "closed" if
@@ -3016,11 +3031,13 @@ class CockpitWindow : Window
             // had already left. Both events carry the same timestamp key, so the scan just
             // keeps the newest one it sees.
             bool closed = false;
+            int routeLines = 0, parsed = 0;
             foreach (string line in File.ReadLines(path))
             {
                 bool isClose = line.IndexOf("route_closed", StringComparison.Ordinal) >= 0;
                 bool isOpen = line.IndexOf("route_reopened", StringComparison.Ordinal) >= 0;
                 if (!isClose && !isOpen) continue;
+                routeLines++;
                 // The record is written by json.dumps, which puts a space after the colon:
                 //   {"ts": 1787270671.84, "at": "2026-08-21T09:04:31", "event": "route_closed"}
                 // Matching without the space finds nothing, and finding nothing here means the
@@ -3032,12 +3049,20 @@ class CockpitWindow : Window
                 int from = i + AtKey.Length;
                 if (from + 19 > line.Length) continue;
                 string at = line.Substring(from, 19);
+                parsed++;
                 if (string.CompareOrdinal(at, stamp) >= 0) closed = isClose;
             }
-            return closed;
+            // ROUTE EVENTS THAT NONE OF THIS COULD READ. The comment above explains why the
+            // marker is copied from a real line rather than composed; this is what happens
+            // when that copy stops matching anyway. Saying "open" there is the silent zero
+            // the comment warns about, stated and then not guarded against.
+            if (routeLines > 0 && parsed == 0) return ROUTE_UNKNOWN;
+            return closed ? ROUTE_CLOSED : ROUTE_OPEN;
         }
         catch (Exception) { }
-        return false;
+        // An unreadable file is not an open route. It is nothing at all, and the dot now has
+        // somewhere to put that.
+        return ROUTE_UNKNOWN;
     }
 
     DateTime RunStartedLocal()
