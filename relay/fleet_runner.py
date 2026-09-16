@@ -547,6 +547,12 @@ def report_status(o):
               "error. Add it there with the status it should mean." % (o,), flush=True)
         return "error"
 
+from tools.settings_keys import default as _settings_default
+
+#: THE default RAM floor, declared in tools/settings_keys.py and shared with the panel and the
+#: admission gates. It had three owners until 2026-09-17; see that module.
+RAM_FLOOR_DEFAULT_MB = float(_settings_default("ram_floor_mb"))
+
 DEFAULT_MAX_CONCURRENT = 3
 
 #: The autoscale ceiling used when the operator has never set one. MUST MATCH the cockpit's
@@ -1841,8 +1847,10 @@ def main():
                     help="autoscale START/default tabs. -1 = the cockpit's maxtabs setting")
     ap.add_argument("--autoscale-max", type=int, default=-1,
                     help="autoscale ceiling (上限, max tabs). -1 = cockpit's autoscale_max")
-    ap.add_argument("--autoscale-headroom-mb", type=int, default=1400,
-                    help="free RAM (MB) to keep for the user's other work while autoscaling")
+    ap.add_argument("--autoscale-headroom-mb", type=int, default=-1,
+                    help="free RAM (MB) to keep for the user's other work. -1 = the declared "
+                         "default in tools/settings_keys.py. An ALIAS for the RAM floor: the "
+                         "live autoscale reads ram_box[0], so this only seeds it.")
     ap.add_argument("--autoscale-per-tab-mb", type=int, default=700,
                     help="RAM budget (MB) assumed per Copilot tab when autoscaling")
     ap.add_argument("--autoscale-up-margin-mb", type=int, default=700,
@@ -2196,12 +2204,16 @@ def main():
         disk_floor_src = SETTINGS_READ_TRACE.get("disk_floor_gb", "(read not traced)")
     disk_box = [disk_floor]                                   # live disk floor (cockpit-settable)
     # ── RAM-floor admission reserve: keep this many MB free for the user. CLI --ram-floor-mb >= 0
-    # -> cockpit settings.txt ram_floor_mb -> --autoscale-headroom-mb (default 1400).
+    # -> cockpit settings.txt ram_floor_mb -> --autoscale-headroom-mb when given -> the ONE
+    # declared default. That last step used to be --autoscale-headroom-mb's own default of
+    # 1400, which is how this knob came to have three defaults that never had to agree.
     if args.ram_floor_mb >= 0:
         ram_floor = args.ram_floor_mb
         ram_floor_src = "parsed namespace held %.0f (flag, default, or assignment)" % args.ram_floor_mb
     else:
-        ram_floor = settings_ram_floor(default=float(args.autoscale_headroom_mb))
+        ram_floor = settings_ram_floor(
+            default=(float(args.autoscale_headroom_mb) if args.autoscale_headroom_mb >= 0
+                     else RAM_FLOOR_DEFAULT_MB))
         ram_floor_src = SETTINGS_READ_TRACE.get("ram_floor_mb", "(read not traced)")
     ram_box = [ram_floor]                                     # live RAM floor (cockpit-settable)
     eval_disk = None if args.eval_disk_gb < 0 else args.eval_disk_gb
@@ -2724,7 +2736,10 @@ def main():
                                       autoscale_per_tab_mb=(settings_per_tab(700.0)
                                                             if args.autoscale_per_tab_mb == 700
                                                             else args.autoscale_per_tab_mb),
-                                      autoscale_headroom_mb=args.autoscale_headroom_mb,
+                                      # the RESOLVED floor, never the raw -1 sentinel: the
+                                      # autoscale reads ram_box[0] anyway, so passing anything
+                                      # else here would be a second number for one fact.
+                                      autoscale_headroom_mb=ram_floor,
                                       autoscale_up_margin_mb=args.autoscale_up_margin_mb,
                                       disk_floor_gb=disk_floor, eval_disk_gb=eval_disk,
                                       disk_box=disk_box, ram_box=ram_box,

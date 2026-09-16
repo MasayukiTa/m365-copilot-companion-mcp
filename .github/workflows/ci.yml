@@ -94,6 +94,7 @@ jobs:
             relay/test_a_control_that_does_nothing_is_worse_than_none.py \
             scripts/test_status_tool_does_not_mislead.py \
             tools/test_one_settings_file_for_every_context.py \
+            tools/test_a_setting_declares_when_it_takes_effect.py \
             tests/test_a_question_nobody_can_fail_is_not_a_question.py \
             tools/test_fleet_intake.py \
             tools/test_a_locked_out_worker_should_not_clone_its_own_work.py \
