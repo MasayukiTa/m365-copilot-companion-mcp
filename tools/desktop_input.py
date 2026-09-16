@@ -274,6 +274,29 @@ def thread_desktop_receives_input():
         return None
 
 
+def unreachable_desktop_reason() -> str:
+    """Why nothing on this desktop can be seen or touched right now, or "" if it can.
+
+    NOT a diagnosis of any particular failure -- a statement about the machine, taken
+    independently of whatever just went wrong. That is what makes it safe to consult from an
+    exception handler: when this returns non-empty, NO screen capture and NO synthetic input
+    can succeed, so it is the explanation for any of their failures rather than a guess at
+    one.
+
+    Deliberately silent (returns "") when the probe cannot answer. A maybe here would be
+    printed into a tool result as though it were a finding, and "possibly locked" is the kind
+    of sentence that gets read as "locked" by the third person to see it.
+    """
+    receiving = thread_desktop_receives_input()
+    if receiving is not False:
+        return ""
+    name = input_desktop_name() or "unreadable"
+    return ("the desktop receiving input is %r, not this thread's -- a locked session, the "
+            "screen saver, the secure desktop during a UAC prompt, or a disconnected "
+            "session. Nothing can be captured or clicked until a person attends the machine; "
+            "%s" % (name, _foreground_description()))
+
+
 def _foreground_description() -> str:
     """Title and class of whatever is in front, or a note that there is nothing."""
     try:

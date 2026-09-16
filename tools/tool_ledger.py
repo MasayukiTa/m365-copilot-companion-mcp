@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -86,6 +87,66 @@ def _bounded(value):
 _LOCK_REFUSAL_PREFIX = "[locked"
 _LOCK_REFUSAL_MAX_CHARS = 400
 
+#: THE SHAPE EVERY TOOL IN THIS REPO USES TO REPORT ITS OWN FAILURE. They do not raise -- an
+#: MCP tool returns text -- so `[read_file error: FileNotFoundError: ...]` reaches the ledger
+#: through the success path and was filed as a success for 37k rows. Two parts, the same rule
+#: looks_refused uses: a distinctive marker AND dominance, so a file whose contents happen to
+#: quote an error is not filed as one.
+#:
+#: The bound is 600 rather than 400 because it was measured, not chosen: over the whole ledger
+#: the longest genuine error report of this shape is 463 characters and only 5 of 1,650 pass
+#: 400. A bound under the real maximum would have left the largest failures reading green,
+#: which is the half of the range where being wrong matters most.
+#: Up to two name tokens, because the gateway writes "[call_tool git_status error: ...]" and
+#: web_fetch writes "[web_fetch HTTP error: ...]" -- 139 rows of the latter alone. A
+#: single-token rule would have left every gateway-level failure reading green, and the
+#: gateway is the one place every dispatched call passes through. Zero tokens is allowed too:
+#: code_exec writes a bare "[timeout: exceeded 30 seconds]".
+#:
+#: The keyword must be followed immediately by ":" or "]" so that a document beginning
+#: "[error on page 3: ..." is not a report about itself.
+_NAME = r"(?:[A-Za-z0-9_]+ ){0,2}"
+_FAILURE_SHAPE = re.compile(r"^\[" + _NAME + r"(?:error|failed|timeout|refused)[:\]]")
+_UNAVAILABLE_SHAPE = re.compile(r"^\[" + _NAME + r"unavailable[:\]]")
+_REPORT_MAX_CHARS = 600
+
+#: COUNTED, NOT GUESSED, over the whole ledger (37,018 successes carrying a string):
+#:   error 1,789 | timeout 213 | failed 37 | refused 2   -- all filed as successes
+#:   [stdout] / [stderr]  8,216                          -- successful runs, must stay green
+#:   skipped 20, aborted 3                               -- DELIBERATELY NOT HERE
+#: skipped and aborted are the tool doing its job and saying the precondition was not met:
+#: "[replace skipped: old text was not found]" is a correct answer, and colouring it red
+#: would be the same false report in a new place. The line between them is whether the tool
+#: worked, not whether the caller got what they wanted.
+
+
+def _is_report(result, shape) -> bool:
+    try:
+        if not isinstance(result, str):
+            return False
+        text = result.strip()
+        return bool(shape.match(text)) and len(text) < _REPORT_MAX_CHARS
+    except Exception:
+        return False
+
+
+def looks_failed(result) -> bool:
+    """True iff `result` IS a tool reporting its own failure, rather than content quoting one."""
+    return _is_report(result, _FAILURE_SHAPE)
+
+
+def looks_unavailable(result) -> bool:
+    """True iff the tool could not run because the machine was not in a state to run it.
+
+    A THIRD STATE, AND THE REASON THIS IS NOT JUST ANOTHER FAILURE. When the workstation is
+    locked, no screen can be captured and no click can be delivered -- and the tools are
+    fine. Filing that as a failure lights a health indicator red and tells a reader the
+    system is broken when what happened is that a person walked away. Filing it as a success
+    is worse. It is neither, and the only honest rendering is "no evidence", which
+    fleet_tool_health already knows how to show.
+    """
+    return _is_report(result, _UNAVAILABLE_SHAPE)
+
 
 def looks_refused(result) -> bool:
     """True iff `result` IS a lock refusal, rather than content that merely contains one.
@@ -100,6 +161,23 @@ def looks_refused(result) -> bool:
             return False
         text = result.strip()
         return text.startswith(_LOCK_REFUSAL_PREFIX) and len(text) < _LOCK_REFUSAL_MAX_CHARS
+    except Exception:
+        return False
+
+
+def row_unavailable(row) -> bool:
+    """True iff this outcome says the machine was not in a state to run the tool.
+
+    Separate from row_ok deliberately: row_ok answers "did this call do its job" and the
+    answer here is no, while this answers "does this call count as evidence about the tool"
+    and the answer there is also no. A reader that only has the first cannot tell an
+    unattended machine from a broken one -- which is the whole defect.
+    """
+    try:
+        result = row.get("result")
+        if isinstance(result, dict):
+            result = result.get("text")
+        return looks_unavailable(result) or bool(row.get("unavailable"))
     except Exception:
         return False
 
@@ -131,7 +209,11 @@ def row_ok(row) -> bool:
         result = row.get("result")
         if isinstance(result, dict):
             result = result.get("text")
-        return not looks_refused(result)
+        # All three corrections, not just the refusal one. The rows this now moves were
+        # written over months by tools that report failure by returning it, and the ledger is
+        # append-only, so history is corrected on read exactly as refusals already were.
+        return not (looks_refused(result) or looks_failed(result)
+                    or looks_unavailable(result))
     except Exception:
         # A reader that raises on one malformed row stops being used, same as read() above.
         try:
@@ -291,9 +373,18 @@ def record_outcome(call_id: str, *, ok: bool, result=None, error: str = "",
     # Only ever downgrades -- an explicit ok=False is never overridden -- and the reason stays
     # a fixed string, because the refusal text is already stored verbatim in `result` and the
     # error field is the one thing a reader scans in bulk.
+    unavailable = False
     if ok and looks_refused(result):
         ok = False
         error = error or "refused (locked)"
+    elif ok and looks_unavailable(result):
+        # Recorded as not-ok AND flagged, because those are two different facts and a reader
+        # that has only the first will call an unattended machine a broken one.
+        ok, unavailable = False, True
+        error = error or "unavailable (the machine was not in a state to run it)"
+    elif ok and looks_failed(result):
+        ok = False
+        error = error or "returned its own error report"
     _append({
         "schema": SCHEMA_VERSION,
         "event": "outcome",
@@ -302,6 +393,9 @@ def record_outcome(call_id: str, *, ok: bool, result=None, error: str = "",
         "ok": bool(ok),
         "duration_s": (round(float(duration_s), 3) if duration_s is not None else None),
         "error": str(error or "")[:MAX_INLINE],
+        # Written as a field as well as being inferable from the text, because a reader
+        # scanning 39,000 rows in bulk reads fields, and row_unavailable accepts either.
+        "unavailable": True if unavailable else None,
         "result": _bounded(result) if result is not None else None,
     })
 

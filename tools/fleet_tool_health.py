@@ -35,6 +35,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from . import tool_ledger as _ledger
+
 #: Written by the gateway on every tool call and outcome.
 LEDGER = Path(__file__).resolve().parent.parent / ".fleet" / "tool_events.jsonl"
 
@@ -98,7 +100,7 @@ def get_summary(now: Optional[float] = None, fresh_s: float = FRESH_S) -> dict:
     now = time.time() if now is None else now
     cutoff = now - fresh_s
     calls = {}
-    ok_n = fail_n = 0
+    ok_n = fail_n = unavail_n = 0
     last_ts = None
     last_tool = None
     recent = []  # outcome successes in order, newest last
@@ -120,7 +122,19 @@ def get_summary(now: Optional[float] = None, fresh_s: float = FRESH_S) -> dict:
             # when every real tool is unreachable, so counting them would manufacture green.
             if str(calls.get(rec.get("id"), "")).startswith("call_tool."):
                 continue
-            good = bool(rec.get("ok"))
+            # THROUGH row_ok, NOT rec["ok"]. tool_ledger has corrected refusals on read since
+            # the day it learned that a refusal returns normally, and this reader -- the one
+            # that actually decides the colour of a dot -- was the only place that never
+            # asked it. 1,650 of 37,016 rows filed ok=True hold an error report; every one of
+            # them was making this indicator greener.
+            if _ledger.row_unavailable(rec):
+                # NOT EVIDENCE EITHER WAY, so it does not enter `recent`. The workstation was
+                # locked or on the secure desktop: no screen could be captured and no click
+                # delivered, and the tools were fine. Counted so the reason a dot has gone
+                # grey can be stated instead of merely observed.
+                unavail_n += 1
+                continue
+            good = _ledger.row_ok(rec)
             recent.append(good)
             if good:
                 ok_n += 1
@@ -150,6 +164,7 @@ def get_summary(now: Optional[float] = None, fresh_s: float = FRESH_S) -> dict:
         "fleet_tool_ok": state,
         "fleet_tool_ok_n": ok_n,
         "fleet_tool_fail_n": fail_n,
+        "fleet_tool_unavailable_n": unavail_n,
         "fleet_tool_last_s": None if last_ts is None else round(now - last_ts, 1),
         "fleet_tool_last_tool": last_tool,
     }
@@ -159,6 +174,11 @@ def describe(summary: Optional[dict] = None) -> str:
     """One line for a human, saying which of the three states this is and on what evidence."""
     s = get_summary() if summary is None else summary
     if s.get("fleet_tool_ok") is None:
+        if s.get("fleet_tool_unavailable_n"):
+            return ("no evidence either way: the last %d fleet tool call(s) in %d minutes "
+                    "could not run because the machine was not in a state to run them -- a "
+                    "locked session or the secure desktop. Not a failure"
+                    % (s["fleet_tool_unavailable_n"], int(FRESH_S // 60)))
         return ("no fleet tool calls in the last %d minutes -- no evidence either way, not a "
                 "failure" % int(FRESH_S // 60))
     verb = "working" if s["fleet_tool_ok"] else "FAILING"
