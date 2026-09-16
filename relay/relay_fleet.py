@@ -26,6 +26,7 @@ state machine so the open ones interleave. No threads, no async.
 from __future__ import annotations
 
 import ctypes
+import io
 import json
 import os
 import re
@@ -924,7 +925,38 @@ def _mentions_being_locked(resp: str) -> bool:
     return any(p.lower() in low for p in _LOCK_PARAPHRASES)
 
 
-def _looks_locked(resp: str, since: float = 0.0) -> bool:
+def _exclusively_refused(worker: str, since: float) -> bool:
+    """Did the SERVER refuse a call that could only have been this worker's?
+
+    The branch that needs no reply text. A refusal carries a timestamp; relay/turn_windows
+    knows which workers had a turn open then; if exactly one did and it is this worker, the
+    refusal is ATTRIBUTED rather than inferred.
+
+    Measured 2026-09-16 across 39 real runs, attributing a session to the worker whose turn
+    window contains all its calls: 100% of sessions resolve uniquely at 2 concurrent workers,
+    31% at 8, 15% at 15, 3% at 96 -- overall 45 of 470, 10%. So this answers often when the
+    fleet is small and rarely when it is large, and it says nothing rather than guessing in
+    between. Every rule below is unchanged and still carries the cases this one declines.
+    """
+    if not worker or since <= 0:
+        return False
+    try:
+        from tools import lock_state as _ls
+        from relay import turn_windows as _tw
+
+        for rec in _ls.matching_records(since):
+            if str(rec.get("detail") or "").startswith(NO_CONTEXT_REFUSAL):
+                # An in-process call, not this worker's HTTP turn.
+                continue
+            ts = float(rec.get("ts") or 0)
+            if ts and _tw.belongs_to(worker, ts):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _looks_locked(resp: str, since: float = 0.0, worker: str = "") -> bool:
     """True iff `resp` looks like the SERVER's require_unlocked() lock error, not a worker's
     prose that merely discusses/quotes the unlock() API (see the FALSE-POSITIVE FIX comment
     above LOCKED_MARKERS for the incident this guards against: a security-review worker
@@ -937,6 +969,9 @@ def _looks_locked(resp: str, since: float = 0.0) -> bool:
          entire (short) tool-call return value; a long analytical response merely mentioning
          unlock(password=...) is not.
     """
+    if _exclusively_refused(worker, since):
+        _note_locked("exclusive-attribution", resp, since, None)
+        return True
     low = (resp or "").lower()
     if any(m in low for m in LOCKED_MARKERS):
         hit = len(resp or "") < LOCKED_DOMINANCE_MAX_CHARS
@@ -3419,6 +3454,70 @@ class RelayWorker:
         return (conversation_start_label(self.name + "-replay%d" % self.fresh_replay_count)
                 + PROTOCOL + ((UNLOCK_PREFIX % pw) if pw else "") + self._composed_goal)
 
+    #: How much of the previous conversation may travel. The recycle exists BECAUSE the last
+    #: conversation ran out of context, so an expensive handover would recreate the condition
+    #: it is recovering from. Measured 2026-09-16: concatenating every assistant turn of the
+    #: longest run on record (74 turns) is 17,888 characters, and a typical run is 14,000 --
+    #: so a cap in the low thousands keeps the note to a fraction of one turn's text while
+    #: still carrying several attempts.
+    COMPACT_MAX_CHARS = 1400
+    COMPACT_MAX_TURNS = 4
+
+    def _compaction_note(self):
+        """What the previous conversation SAID it did, marked as claims rather than facts.
+
+        WHY THIS IS NOT A SUMMARY OF PROGRESS. RECYCLE_PREFIX tells the fresh agent to read
+        its output files and continue, which is correct and is the only part that is
+        verifiable -- disk is ground truth. What is lost is cheaper and still valuable: which
+        approaches were already tried, so the new conversation does not spend its first turns
+        rediscovering a dead end.
+
+        AND IT IS LABELLED, BECAUSE NOTHING IN THE STORE DISTINGUISHES A VERIFIED FINDING FROM
+        AN UNCHECKED CLAIM. The transcript holds opaque prose: a worker that reported success
+        it never achieved is recorded exactly like one that did the work. A summary that
+        presented these as facts would faithfully carry a false claim into a fresh context and
+        give it a second life -- which is worse than dropping it, because the new conversation
+        cannot tell it came from a guess. So the note says what it is, and says to check.
+
+        Reads this worker's own transcript, which needs no attribution: the relay writes one
+        file per worker and no join to an MCP session is involved. Never raises -- a recycle
+        must proceed even if nothing can be read.
+        """
+        try:
+            path = getattr(self, "transcript", "") or ""
+            if not path or not os.path.isfile(path):
+                return ""
+            said = []
+            with io.open(path, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if rec.get("role") == "assistant":
+                        text = str(rec.get("text") or "").strip()
+                        if text:
+                            said.append(text)
+            if not said:
+                return ""
+            # The most recent attempts are the ones worth not repeating.
+            picked, total = [], 0
+            for text in reversed(said[-self.COMPACT_MAX_TURNS:]):
+                room = self.COMPACT_MAX_CHARS - total
+                if room <= 120:
+                    break
+                piece = text if len(text) <= room else text[:room - 1] + "…"
+                picked.append(piece)
+                total += len(piece)
+            picked.reverse()
+            body = "\n---\n".join(picked)
+            return ("\n【前会話が『やった』と述べたこと（未検証）】以下は前の会話の発言そのままで、"
+                    "正しい保証はありません。同じ手を繰り返さないための材料として読み、"
+                    "事実として扱う前に必ずディスク上の実物で確かめてください。\n"
+                    + body + "\n")
+        except Exception:
+            return ""
+
     def _recycle_job(self):
         """The opening turn after a token-limit recycle, which is a BRAND NEW chat.
 
@@ -3451,8 +3550,14 @@ class RelayWorker:
         head = PROTOCOL + ((UNLOCK_PREFIX % pw) if pw else "")
         if pw:
             self._unlock_attempts = 1
+        # The compaction note goes AFTER the goal, not before it: RECYCLE_PREFIX ends with a
+        # heading that introduces the goal, and the invariant that the composition ends with
+        # the goal is what _composed_prefix's suffix slice depends on. Appending after it
+        # keeps the goal intact and contiguous; the note is an addendum, which is also what
+        # it is epistemically.
         return (conversation_start_label(self.name + "-recycle%d" % self._recycles)
-                + head + self._composed_prefix + RECYCLE_PREFIX + self.goal)
+                + head + self._composed_prefix + RECYCLE_PREFIX + self.goal
+                + self._compaction_note())
 
     def _task_anchor(self, nudge):
         """Prepend the worker's task identity to a GENERIC retry/continue/fix nudge so a
@@ -3610,6 +3715,17 @@ class RelayWorker:
         # When this turn went out. The lock fallback below compares the server's refusal
         # record against it, so only a refusal caused BY THIS TURN counts.
         self._turn_sent_at = time.time()
+        # AND WHO ELSE WAS IN FLIGHT. A refusal is written by the server carrying an MCP
+        # session the relay cannot map to a worker, so "was that refusal mine" has been
+        # answered by reading the worker's own prose. When this worker is the only one with a
+        # turn open, the question has an exact answer instead. relay/turn_windows.py carries
+        # the measurement of how often that holds -- often when the fleet is small, rarely
+        # when it is large.
+        try:
+            from relay import turn_windows as _tw
+            _tw.open_turn(self.name, self._turn_sent_at)
+        except Exception:
+            pass
         # THE QUOTA IS SPENT HERE, and this is the only place it is spent. Microsoft's
         # generative-orchestration limit counts MESSAGES, not the MCP tool calls our gateway
         # sees -- a turn may make none of those, or several, so the tool ledger was never the
@@ -4350,6 +4466,17 @@ class RelayWorker:
         self.reason = reason
 
     def _decide(self, resp, _resume=False):
+        # THE TURN CAME BACK, SO THE WINDOW CLOSES. Without this the window stays open and the
+        # worker goes on being a candidate for every later event -- and while it is the only
+        # worker running, exclusivity would then hold spuriously for as long as the open-window
+        # bound allows. Closed here rather than at the send site because this is the moment the
+        # reply exists. _exclusively_refused runs further down and needs the window to still
+        # cover the refusal that arrived just before the reply, which GRACE_S provides.
+        try:
+            from relay import turn_windows as _tw
+            _tw.close_turn(self.name)
+        except Exception:
+            pass
         # LOCK-AMBIGUITY PROBE ANSWER. A LOCK_PROBE_QUESTION was sent as this worker's previous
         # turn (see _looks_locked_ambiguous's handling further down); THIS reply answers it, not
         # the goal. Consumed here, before anything below can treat it as progress: self.last_
@@ -4672,7 +4799,7 @@ class RelayWorker:
         # normal; past the cap STUCK with an actionable reason. Uses _looks_locked() (distinctive
         # marker + dominance) rather than a bare substring match so a long security-review
         # response that merely discusses unlock() is never mistaken for the real lock error.
-        if _looks_locked(resp, getattr(self, "_turn_sent_at", 0.0)):
+        if _looks_locked(resp, getattr(self, "_turn_sent_at", 0.0), self.name):
             self._inject_unlock()
             return
         # LOCK-AMBIGUITY PROBE (widens the above, does not replace it -- _looks_locked's two

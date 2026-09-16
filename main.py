@@ -332,11 +332,22 @@ _BOOT_TS = time.time()
 
 def _server_identity():
     """Which process is answering, and whether its code matches the checkout."""
-    try:
-        from scripts.stale_server_check import classify_staleness
-        state = classify_staleness(_BOOT_HEAD, _git_head_sha(), True)
-    except Exception:
+    # THE RULE IS INLINE, NOT IMPORTED, AND THAT IS DELIBERATE. The canonical statement of it
+    # is scripts/stale_server_check.classify_staleness, and importing it would be the obvious
+    # move -- but tools/deploy_freshness.WATCHED lists the packages whose changes make this
+    # server stale, and a guard asserts it equals what main.py actually imports. Importing
+    # from scripts/ would force "scripts" into that list, and scripts/ is mostly standalone
+    # files this server never loads: every doctor.ps1 edit would then report the server as
+    # stale. That module already records the same mistake being made with bench/.
+    #
+    # Three lines cannot drift far, and they are not left to trust:
+    # tools/test_deploy_freshness.py asserts this function agrees with classify_staleness on
+    # the same inputs, so the two cannot diverge without a test saying so.
+    _now_head = _git_head_sha()
+    if not _BOOT_HEAD or not _now_head:
         state = "unknown"
+    else:
+        state = "current" if _BOOT_HEAD == _now_head else "stale"
     return {
         "server_pid": _BOOT_PID,
         "server_uptime_s": round(time.time() - _BOOT_TS, 1),

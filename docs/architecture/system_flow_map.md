@@ -127,7 +127,10 @@ flowchart TD
     send["send the job text<br/>(page or socket transport)"] --> reply["a Copilot reply arrives"]
     reply --> decide["self._decide(resp)<br/>relay/relay_fleet.py:4113"]
 
-    decide --> lockcheck{"_looks_locked(resp, since)?<br/>relay/relay_fleet.py:873"}
+    decide --> attrib{"_exclusively_refused(worker, since)?<br/>relay/turn_windows.py -- was exactly ONE<br/>worker mid-turn when the server refused?"}
+    attrib -->|"yes: attribution, not inference"| inject
+    attrib -->|"no (0 or several in flight)"| lockcheck
+    decide --> lockcheck{"_looks_locked(resp, since, worker)?<br/>relay/relay_fleet.py -- the PROSE rules,<br/>reached only when attribution is unavailable"}
     lockcheck -->|"marker + short (dominance)"| inject["_inject_unlock()<br/>re-anchor turn: call unlock(password)<br/>from MCP_UNLOCK_PASSWORD in .env<br/>bounded by _unlock_attempts cap"]
     lockcheck -->|"marker but LONG reply<br/>(_looks_locked_ambiguous, :1026)"| probe["send LOCK_PROBE_QUESTION<br/>(:relay_fleet.py ~1060)<br/>next reply answers the probe,<br/>not the goal (self._lock_probe_pending)"]
     probe -->|"answered yes"| inject
@@ -140,7 +143,7 @@ flowchart TD
     classify -->|CONTINUE| nudge["_continue_nudge(count)<br/>relay/relay_fleet.py:2399<br/>counts 1-2: plain CONTINUE_JOB<br/>count 3+: rotating, count-tagged phrase<br/>(never byte-identical past turn 2)"]
     classify -->|"transient failure<br/>(send/timeout/likely-transient STUCK)"| retryt["_retry_transient()<br/>relay/relay_fleet.py:3718<br/>bounded by --max-transient (default 10)"]
     classify -->|"STUCK, converged with<br/>previous STUCK reason<br/>(_stuck_converged, :460)"| terminal_stuck["status=stuck, outcome=STUCK<br/>(same conclusion reworded -> stop asking)"]
-    classify -->|"conversation token limit hit<br/>(conversation_exhausted / memory pressure)"| recycle["open a FRESH conversation,<br/>re-anchor goal from disk state<br/>(_recycle_job), bounded by max_recycles<br/><b>carries UNLOCK_PREFIX</b>: a new chat is a new<br/>MCP session, so the token died with the old one"]
+    classify -->|"conversation token limit hit<br/>(conversation_exhausted / memory pressure)"| recycle["open a FRESH conversation,<br/>re-anchor goal from disk state<br/>(_recycle_job), bounded by max_recycles<br/><b>carries UNLOCK_PREFIX</b>: a new chat is a new<br/>MCP session, so the token died with the old one<br/><b>+ _compaction_note()</b>: the previous chat's own words,<br/>capped at 1,400 chars and labelled UNVERIFIED"]
     recycle --> freshsession["new Mcp-Session-Id -> unauthorized by design<br/>(authorization is per session, tools/security.py:277-345)"]
     replay["_replay_job() -- the other branch that opens<br/>a chat with no history; <b>same unlock</b>"] --> freshsession
 

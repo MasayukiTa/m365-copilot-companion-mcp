@@ -119,14 +119,22 @@ def test_the_canned_answer_sniff_only_annotates_the_amber():
 
 
 def test_agent_is_green_only_on_positive_evidence():
-    """緑になるのは、フリートが agent に束ねられているか、捕捉が agent を名指ししたときだけ。
+    """緑になるのは、フリート自身の紐付けが確認できたときだけ。
 
     「悪い証拠が無い」は緑の理由にならない。それが消えた規則の失敗そのもの。
+
+    2026-09-16、この検査は緑の分岐が2つあることを要求していた。2つ目は
+    capture_status.json の gpt_id への fallback で、FleetAgentIsBound 自身のコメントが
+    「あれは ANY surface の最後の捕捉であり、他人についての出来事は自分についての証拠では
+    ない」と書いている、まさにそのフィールドである。主判定が避けるために作られたものを
+    次の分岐が緑の根拠にしていた。fallback は残す（非空の gpt_id は無ではない）が、
+    黄である。この検査は今それを要求する。
     """
     body = _dots_body()
     assert "else if (FleetAgentIsBound())" in body
     assert "else if (!string.IsNullOrEmpty(gptId))" in body
-    assert body.count('SetDot(4, HealthState.Green, T("hs_agent_ok"), now)') == 2
+    assert body.count('SetDot(4, HealthState.Green, T("hs_agent_ok"), now)') == 1,         "別サーフェスの証拠が再び緑になっている"
+    assert 'SetDot(4, HealthState.Yellow, T("hs_agent_other_surface"), now)' in body
 
 
 def test_agent_is_red_when_nothing_names_an_agent():
