@@ -44,8 +44,14 @@ Build "CopilotChat"  @("CopilotChat.cs","Markdown.cs","Theme.cs")
 
 # 3) Launch both fresh (cockpit first; it will not relaunch a stale chat because we launch the new one).
 if (-not $NoLaunch) {
-    Start-Process (Join-Path $ui "CopilotChat.exe")
-    Start-Process (Join-Path $ui "FleetCockpit.exe")
+    # THROUGH explorer, NOT DIRECTLY -- see the header note. A cockpit started as a child
+    # of an agent session inherits that session's redirected AppData view, so its settings
+    # land in a package-private copy that no coordinator ever reads. explorer.exe runs in
+    # the ordinary desktop context, so a process it opens sees the same files the
+    # operator's desktop shortcut does.
+    Start-Process explorer.exe -ArgumentList (Join-Path $ui "CopilotChat.exe")
+    Start-Process explorer.exe -ArgumentList (Join-Path $ui "FleetCockpit.exe")
+    Start-Sleep -Milliseconds 800
     Start-Sleep -Milliseconds 1200
     Get-Process FleetCockpit,CopilotChat -ErrorAction SilentlyContinue |
         ForEach-Object { Write-Host ("running " + $_.ProcessName + " pid=" + $_.Id + " start=" + $_.StartTime.ToString("HH:mm:ss")) }

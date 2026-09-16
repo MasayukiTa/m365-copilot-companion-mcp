@@ -2270,7 +2270,12 @@ def _note_disk_defer(floor_gb, waiting, notify=None, now=None):
     try:
         now = float(now if now is not None else time.time())
         free = free_disk_gb()
-        floor = float(floor_gb or DEFAULT_DISK_FLOOR_GB)
+        # `or` TREATS A DISABLED GATE AS AN ABSENT ONE. 0.0 is falsy, and 0 is exactly what
+        # 強制開始 writes to turn the disk gate off -- so the message explaining a deferral
+        # claimed a 6 GB floor for a run that had none. disk_admission_ok, the function that
+        # actually decides, already distinguishes them with `is None`; this is the sentence a
+        # person reads, and it was the one that lied.
+        floor = float(DEFAULT_DISK_FLOOR_GB if floor_gb is None else floor_gb)
 
         if _DISK_DEFER_SINCE[0] <= 0.0:
             _DISK_DEFER_SINCE[0] = now

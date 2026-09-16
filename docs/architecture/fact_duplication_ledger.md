@@ -258,3 +258,44 @@ later as "unexamined":
   section) fails if any file path cited in this document no longer exists. It cannot
   detect a stale *line number* or a claim that is wrong about behavior — only a renamed
   or deleted file. Re-reading the cited source is still a human's job.
+
+### 8. How a tool reports its own failure — ~160 writers, one reader, and the reader was wrong
+
+- **The fact**: the shape of the string a tool returns when it fails. No tool in this
+  repo raises; an MCP tool returns text, so a failure arrives as
+  `[read_file error: FileNotFoundError: ...]`.
+- **Writers**: every tool in `tools/`. Surveyed 2026-09-16: 314 returned literals of the
+  form `[<name> error: ...]` across 40+ modules, plus `timeout` (4), `failed` (8),
+  `refused` (8), `skipped` (12), `aborted` (2).
+- **Reader**: `tools/tool_ledger.py::looks_failed` / `looks_unavailable`, and through
+  `row_ok` everything computed over the ledger — including
+  `tools/fleet_tool_health.py`, which colours a dot in the cockpit.
+- **What broke**: the reader knew exactly one shape, `[locked`. Measured over the whole
+  ledger, **2,041 of 37,018 rows filed as successes (5.5%) were failure reports** —
+  1,789 `error`, 213 `timeout`, 37 `failed`, 2 `refused`. Every success rate ever computed
+  over this file was inflated by them, and the health dot read greener the more tools failed.
+- **What stops it now**: `tools/test_a_tool_that_returns_its_failure_still_failed.py`.
+  It pins the recognised shapes, pins the 8,216 `[stdout]` rows that must stay green, and
+  pins the `skipped`/`aborted` rows that are neither.
+- **Still unguarded**: nothing stops a NEW tool inventing a sixth word. The survey above is
+  a snapshot, not a check. A tool that writes `[foo broke: ...]` will read as a success and
+  nothing will say so.
+
+### 9. `TEMPLATE_MAX_AGE_S` — the route refuses what the cockpit was calling live
+
+- **The fact**: how old a cached agent request-template may be and still count.
+- **Writer**: `relay/profile_token.py:188` — `TEMPLATE_MAX_AGE_S`, 24 hours;
+  `load_template` refuses and deletes anything older, and refuses one whose `gpt_id` is
+  empty.
+- **Reader**: `ui/FleetCockpit.cs::FleetAgentIsBound`, which decides whether the agent dot
+  is green.
+- **What broke**: the reader checked only that the file existed and contained the
+  characters `gptId`. `.fleet/templates` held a template **211.7 hours old** — 8.8 days
+  against a 24 hour cap — so the dot would have reported a binding the route evicts on
+  first use, and gone on reporting it, because eviction only happens when a capture runs.
+- **What stops it now**: `ui/test_a_green_dot_must_have_established_the_thing.py::
+  test_the_cockpits_age_limit_is_not_looser_than_the_routes` parses the constant out of
+  both files and fails if the cockpit's ever exceeds the route's. It also fails if either
+  side stops declaring it in a form the other can be compared against, which is the
+  failure mode a cross-language copy actually has.
+

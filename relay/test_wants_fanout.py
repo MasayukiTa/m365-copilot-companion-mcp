@@ -25,6 +25,22 @@ import pytest
 from relay import task_router as TR
 
 
+@pytest.fixture(autouse=True)
+def _nobody_has_chosen(tmp_path, monkeypatch):
+    """The premise of every test below: the operator has not touched the fan-out switch.
+
+    _wants_fanout reads settings.txt, so "nobody has chosen" is a state that has to be
+    arranged. It used to be inherited from whatever this machine's settings.txt happened to
+    contain -- which is not a precondition, it is a coincidence, and it broke the moment the
+    operator set the switch. An empty file makes the premise true by construction.
+    """
+    empty = tmp_path / "settings.txt"
+    empty.write_text("", encoding="utf-8")
+    from relay import fleet_runner as FR
+    monkeypatch.setattr(FR, "_settings_path", lambda: str(empty))
+    monkeypatch.delenv("FLEET_INTAKE_AUTOSTART_FANOUT", raising=False)
+
+
 def test_the_capability_is_on_without_anyone_asking():
     """Including for a batch where nothing looks splittable. Costing nothing is the point: the
     per-goal judge answers NO_SPLIT for these and no turn is spent."""

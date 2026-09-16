@@ -255,6 +255,53 @@ the two languages.
 
 ---
 
+## 6. The health strip — what each dot is allowed to claim
+
+Six dots along the top of `ui/FleetCockpit.cs`. **A general user looks only here and decides
+from it**, so the standard is not "usually right": a dot must never assert something it has
+not established, and "I do not know" must have somewhere to go. Every row below was wrong in
+at least one of those two ways on 2026-09-16 and is recorded with what it rests on now.
+
+```mermaid
+flowchart LR
+    poll["HealthLoop, every ~15s<br/>ui/FleetCockpit.cs PollHealthOnce"] --> h["GET 127.0.0.1:8000/health<br/>main.py:359"]
+    poll --> cdp["GET 127.0.0.1:9222/json/list"]
+    poll --> cap[".fleet/capture_status.json<br/>relay/capture_status.py"]
+    poll --> tpl[".fleet/templates/template_HASH.json<br/>relay/profile_token.py"]
+    poll --> route[".fleet/socket_route.jsonl"]
+    h --> led["fleet_tool_health.get_summary()<br/>tools/fleet_tool_health.py<br/>reads .fleet/tool_events.jsonl"]
+    led --> rowok["tool_ledger.row_ok / row_unavailable<br/>tools/tool_ledger.py"]
+```
+
+| # | dot | green means, and on what evidence | the third state |
+|---|---|---|---|
+| 0 | server | `/health` answered AND its `server_head` matches the checkout (`main.py::_server_identity`) | amber on `server_code: "stale"`, or 3+ auth failures in 10 min |
+| 1 | tunnel | a 200 through the tunnel origin **whose `server_pid` equals the local one** — reaching *a* server is not reaching *this* one | amber when `MCP_TUNNEL_URL` is unset; amber when the pid differs |
+| 2 | edge | `:9222` answered **and** `/json/list` contains `_agentMarkerId`, the `T_`/`P_` id from `MCP_FLEET_AGENT_URL` — not merely the m365 domain, which the default-Copilot fallback also satisfies | falls back to the domain only when no marker is configured; separate message for "no run", which is not the same as "a socket-route run drives no tabs" |
+| 3 | sign-in | an `ok` capture, token not expired, **and** the record no older than `SIGNIN_EVIDENCE_MAX_AGE_S` (5,400s = 1.4 measured token lifetimes) | grey when idle with no record, or an old record, or an expired token — three distinct messages |
+| 4 | agent | a cached template for **this** surface, younger than `TEMPLATE_MAX_AGE_S`, whose `query.gptId` is non-empty. The cap is a copy of `relay/profile_token.py`'s and a test fails if it ever exceeds it | amber when the route record is unreadable, when no capture exists yet, and when only another surface's `gpt_id` is known |
+| 5 | tool | `fleet_tool_ok` from the ledger, read through `row_ok`, and only from a `/health` body less than 60s old | **grey** when there is no evidence: no calls in 15 min, or every recent call was `unavailable`/`skipped` — an unattended machine is not a broken one |
+
+**The rule the ledger enforces underneath dot 5** (`tools/tool_ledger.py`): a tool here
+reports failure by *returning* it, so "the function returned" was never a verdict.
+`[<name> error:`, `timeout`, `failed`, `refused` and `[locked` are failures;
+`[<name> skipped:`/`aborted:`/`unavailable:` are **neither** — a skip says nothing about
+whether the path works, and counting it green also reset the consecutive-failure streak;
+`[stdout]`/`[stderr]` are successes, because a process that ran and printed an error is a
+working tool path reporting a failing command.
+
+### What must be updated here
+
+- **A new dot, or a new branch on an existing one**: add or amend its row, and say what the
+  third state is. A dot with only green and red is itself the finding.
+- **A new word a tool uses to report an outcome**: `tools/test_a_new_way_to_say_failed_must_be_classified.py`
+  fails when two or more modules agree on a word the ledger does not classify. Decide what
+  it means there, then update the paragraph above.
+- **Any threshold in the table**: the numbers are measurements, not preferences. If one
+  changes, the measurement behind it has to change first.
+
+---
+
 ## Staying current
 
 This map is only as good as its last verification pass. What must be updated, and when:

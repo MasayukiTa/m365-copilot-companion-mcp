@@ -33,6 +33,7 @@ MCP_IMPL_AGENT_URL / MCP_FLEET_AGENT_URL in .env (gitignored).
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import sys
@@ -650,16 +651,42 @@ def settings_effort(default="auto"):
     return default
 
 
+#: What the LAST _settings_float call actually did, per key. Not a second read -- the read
+#: that decides is the read that records, because the cockpit rewrites this file in place and
+#: a confirming read is an observation of a different moment.
+SETTINGS_READ_TRACE = {}
+
+
 def _settings_float(key, default):
-    """Read a float `key=N` from the shared settings.txt (cockpit-written). Falls back."""
+    """Read a float `key=N` from the shared settings.txt (cockpit-written). Falls back.
+
+    Records what it saw in SETTINGS_READ_TRACE[key] so a caller can say WHERE its number came
+    from without opening the file again.
+    """
+    p = "?"
     try:
         p = _settings_path()
-        if os.path.isfile(p):
-            for ln in open(p, encoding="utf-8-sig").read().splitlines():
-                if ln.startswith(key + "="):
-                    return float(ln.split("=", 1)[1].strip())
-    except Exception:
-        pass
+        if not os.path.isfile(p):
+            SETTINGS_READ_TRACE[key] = "no file at %s" % p
+            return default
+        for ln in open(p, encoding="utf-8-sig").read().splitlines():
+            if ln.startswith(key + "="):
+                raw = ln.split("=", 1)[1].strip()
+                try:
+                    val = float(raw)
+                except ValueError:
+                    SETTINGS_READ_TRACE[key] = "unparsable line %r in %s" % (ln, p)
+                    return default
+                try:
+                    _st = os.stat(p)
+                    _id = " [size=%d mtime=%.0f]" % (_st.st_size, _st.st_mtime)
+                except Exception:
+                    _id = " [stat failed]"
+                SETTINGS_READ_TRACE[key] = "read %r from %s%s" % (raw, p, _id)
+                return val
+        SETTINGS_READ_TRACE[key] = "no %s= line in %s" % (key, p)
+    except Exception as exc:
+        SETTINGS_READ_TRACE[key] = "%s reading %s: %s" % (type(exc).__name__, p, exc)
     return default
 
 
@@ -675,6 +702,34 @@ def _quota_snapshot():
         return snapshot()
     except Exception:
         return {}
+
+
+def settings_fanout():
+    """The operator's fan-out switch from settings.txt (`fanout=on|off`), or None if unset.
+
+    None is a real answer and not a default: "the operator has not chosen" has to be
+    distinguishable from "the operator chose off", or the caller cannot tell which of its own
+    fallbacks to apply. The cockpit writes this key and honours it for launches from its own
+    button; nothing on the autostart path read it, so the switch did nothing for goals that
+    arrive from the tunnel -- which is most of them.
+    """
+    raw = _settings_text("fanout")
+    if raw is None:
+        return None
+    return raw.strip().lower() in ("1", "on", "true", "yes")
+
+
+def _settings_text(key):
+    """The raw string for `key`, or None when the file has no such line. Never raises."""
+    try:
+        p = _settings_path()
+        if os.path.isfile(p):
+            for ln in open(p, encoding="utf-8-sig").read().splitlines():
+                if ln.startswith(key + "="):
+                    return ln.split("=", 1)[1]
+    except Exception:
+        pass
+    return None
 
 
 def settings_disk_floor(default=None):
@@ -2118,17 +2173,32 @@ def main():
     # ── disk-floor admission reserve: keep this many GB free on C: at all times. Resolution
     # chain (most explicit wins): CLI --disk-floor-gb >= 0 -> cockpit settings.txt
     # disk_floor_gb -> env SWE_DISK_FLOOR_GB (default 6). A 0 floor disables the disk gate.
+    # PROVENANCE, NOT JUST THE VALUE. Printing the winning number and not the branch that
+    # produced it is what made this chain un-debuggable from outside: the panel said 1 GB,
+    # runs reserved 4, and every investigation had to re-derive the chain by hand and still
+    # could not say which step was lying. The raw file read is captured separately from the
+    # resolved value so the log can distinguish "the file said 1 and something overrode it"
+    # from "the file was not read at all".
+    # NOT "CLI". This branch means the parsed namespace holds a non-negative value, which an
+    # argparse default or a pre-populated namespace can produce with nothing on the command
+    # line -- so the label says what was actually observed and leaves the cause open.
     if args.disk_floor_gb >= 0:
         disk_floor = args.disk_floor_gb
+        disk_floor_src = ("parsed namespace held %.1f (a typed flag, an argparse default, or "
+                          "a later assignment -- argv is printed below so they can be told "
+                          "apart)" % args.disk_floor_gb)
     else:
         disk_floor = settings_disk_floor()
+        disk_floor_src = SETTINGS_READ_TRACE.get("disk_floor_gb", "(read not traced)")
     disk_box = [disk_floor]                                   # live disk floor (cockpit-settable)
     # ── RAM-floor admission reserve: keep this many MB free for the user. CLI --ram-floor-mb >= 0
     # -> cockpit settings.txt ram_floor_mb -> --autoscale-headroom-mb (default 1400).
     if args.ram_floor_mb >= 0:
         ram_floor = args.ram_floor_mb
+        ram_floor_src = "parsed namespace held %.0f (flag, default, or assignment)" % args.ram_floor_mb
     else:
         ram_floor = settings_ram_floor(default=float(args.autoscale_headroom_mb))
+        ram_floor_src = SETTINGS_READ_TRACE.get("ram_floor_mb", "(read not traced)")
     ram_box = [ram_floor]                                     # live RAM floor (cockpit-settable)
     eval_disk = None if args.eval_disk_gb < 0 else args.eval_disk_gb
 
@@ -2206,11 +2276,30 @@ def main():
     else:
         print("       max %d tab(s) open at once (close-on-done frees each); free RAM now %d MB"
               % (max_conc, round(avail_phys_mb())))
-    if disk_floor > 0:
-        from relay.relay_fleet import free_disk_gb
-        print("       disk floor: keep >= %.1f GB free on C: (free now %.1f GB); "
-              "admission gated on disk+RAM, continuous (no batch barrier)"
-              % (disk_floor, free_disk_gb()))
+    # PRINTED WHETHER OR NOT THERE IS A FLOOR. The old guard meant a 0 floor -- the disk gate
+    # disabled entirely -- said nothing at all, so the most dangerous configuration was the
+    # quietest one.
+    from relay.relay_fleet import free_disk_gb
+    # THE WHOLE PROVENANCE, ON THE LINE THAT REPORTS THE NUMBER. A run whose floor disagrees
+    # with the panel has been reported three times and "fixed" once; every investigation had
+    # to re-derive the chain from outside because the log printed only the winner.
+    print("       disk floor: keep >= %.1f GB free on C: -- %s (free now %.1f GB)"
+          % (disk_floor, disk_floor_src, free_disk_gb()))
+    print("       RAM floor:  keep >= %.0f MB free -- %s" % (ram_floor, ram_floor_src))
+    # EVERY KEY THIS PROCESS ACTUALLY SEES. If the fleet is reading a different copy of the
+    # settings file than the cockpit writes, then no setting reaches it -- not just the floor
+    # -- and the only way to know is to print what it read, not what we think it read.
+    try:
+        _sp = _settings_path()
+        _raw = io.open(_sp, encoding="utf-8-sig").read()
+        print("       settings   : %s (%d bytes) ->" % (_sp, len(_raw.encode("utf-8"))))
+        for _ln in _raw.splitlines():
+            if _ln.strip():
+                print("                    %s" % _ln)
+    except Exception as _e:
+        print("       settings   : could not be read: %s" % _e)
+    print("       argv       : %r" % (getattr(sys, "orig_argv", None) or sys.argv,))
+    print("       resolver   : %s" % (getattr(_settings_float, "__module__", "?"),))
 
     mc_box = [max_conc]                # live concurrency cap (cockpit can change it)
     add_box = []                       # goals queued mid-run (native chat / cockpit)
