@@ -1,0 +1,36 @@
+#!/bin/sh
+# Refuse a commit that would make identifying content public.
+#
+# WHY A HOOK AND NOT A RULE. scripts/check_no_identifying_names.py already knows how to say
+# "this staged file carries an employee id" and already exits 1 when it does. On 2026-09-17 it
+# said nothing, because it was run BEFORE `git add -A` and never again: at that moment the
+# offending files were untracked, which the guard reports as an advisory WARNING and a clean
+# exit -- correctly, since an untracked file is not public. One `git add -A` later they were,
+# and the commit was pushed. The fix was a history rewrite, for the third time.
+#
+# Nothing about the guard was wrong. What was missing is anything that makes it run at the one
+# moment it can still be cheap: between staging and committing. That moment has no human in it.
+#
+# core.hooksPath points here so the hook is tracked and shared rather than living in .git/,
+# where it is invisible to review and absent on every fresh clone. scripts/install_git_hooks.py
+# sets that config, and a test asserts this file still calls the guard.
+set -e
+
+if [ -x ".venv/Scripts/python.exe" ]; then
+    PY=".venv/Scripts/python.exe"
+elif [ -x ".venv/bin/python" ]; then
+    PY=".venv/bin/python"
+else
+    PY="python"
+fi
+
+# The guard exits 1 for staged offences and 2 when it could not run. BOTH block the commit: a
+# check that cannot run is not a check that passed, and this is the rule that has already cost
+# three history rewrites.
+"$PY" scripts/check_no_identifying_names.py . || {
+    echo ""
+    echo "pre-commit: refused. Caught here the fix is an edit; caught after a push it is a"
+    echo "history rewrite. To commit anyway you must pass --no-verify, which is the thing you"
+    echo "should not do for this particular check."
+    exit 1
+}
