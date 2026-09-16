@@ -1179,7 +1179,7 @@ class CockpitWindow : Window
         if (k == "hs_signin_ok") return ja ? "M365 にサインイン済み（ログイン画面なし）" : "Signed in to M365 (no login wall)";
         if (k == "hs_signin_bad") return ja ? "サインインが必要です（ログイン画面を検出）" : "Sign-in required (login wall detected)";
         if (k == "hs_agent_ok") return ja ? "専用エージェントに接続中" : "Bound to the configured agent";
-        if (k == "hs_agent_warn") return ja ? "既定Copilotに落ちている可能性（エージェント未検出）" : "Possible default-Copilot fallback (agent tab not found)";
+        if (k == "hs_agent_warn") return ja ? "M365のタブはありますが、設定されたエージェントではありません。既定Copilotに落ちている可能性があります（コネクタ無し・テナント接地無しで、それらしく答えます）。" : "An M365 tab is open, but it is not the configured agent -- possibly the default Copilot, which answers fluently with no connectors and no tenant grounding.";
         // WAS TAB-ERA TEXT. This dot stopped reading tabs when the socket route landed, so
         // under that route there is never a chat tab and the one red message on the agent
         // dot sent the reader looking for something whose absence is normal. The branch
@@ -2443,9 +2443,19 @@ class CockpitWindow : Window
                        T(FleetRunIsLive() ? "hs_edge_detail_notabs" : "hs_edge_detail_norun"),
                        now);
             else
-                // Amber, not red: the browser is up and one navigation away from usable, which
-                // is exactly what the automatic repair is for.
-                SetDot(2, HealthState.Yellow, T("hs_edge_detail_blank"), now);
+                // TWO DIFFERENT FAULTS, AND THE WORSE ONE HAD NO MESSAGE. No m365 tab at all
+                // is visible: the run has nowhere to go and the repair navigates. An m365 tab
+                // that is NOT the configured agent is the silent one -- the default Copilot
+                // answers fluently with no connectors and no tenant grounding, which is the
+                // 2026-08-31 failure where two benchmark runs produced patches written from
+                // memory. hs_agent_warn was written for exactly this and had never been
+                // reachable, because until the marker check above the dot could not tell a
+                // wrong tab from the right one.
+                //
+                // Amber for both: the browser is up and one navigation away from usable,
+                // which is what the automatic repair is for.
+                SetDot(2, HealthState.Yellow,
+                       T(onDomain ? "hs_agent_warn" : "hs_edge_detail_blank"), now);
         }
 
         // 5) Tool: independent of the fleet Edge (:9222) probed above -- this reads the BRIDGE's
@@ -2573,7 +2583,10 @@ class CockpitWindow : Window
 
     //: How old a capture may be and still describe the present. Beyond this a sign-in
     //: failure is history, not a fault to act on.
-    const double SIGNIN_EVIDENCE_MAX_AGE_S = 1800.0;
+    //: 1.4x the token lifetime measured on this machine (3,848s), not a round number
+    //: chosen for looking like one. This is the maximum time a broken sign-in may go
+    //: unreported, and it is deliberately independent of the issuer's token policy.
+    const double SIGNIN_EVIDENCE_MAX_AGE_S = 5400.0;
 
     // ── automatic repair, before anyone is asked to click ───────────────────────────────────
     //
@@ -2844,23 +2857,31 @@ class CockpitWindow : Window
         // repair that relaunches the browser HEADED, for a refusal that may long since have
         // resolved. Evidence about the past is not evidence about now.
         double capAgeS = (capTs > 0) ? (nowEpoch - capTs) : -1;
-        // THE WINDOW COMES FROM THE RECORD, NOT FROM A CONSTANT. A flat 30 minutes was
-        // measured against a token that lives about 64 minutes on this machine (the record on
-        // disk when this was written: at=1789532602, expires_at=1789536451, 3,848s), and
-        // captures happen roughly once per token lifetime -- so for the back half of EVERY
-        // healthy cycle this dot left green for amber and said the session was unverified
-        // when nothing at all was wrong. A dot that is amber through half of normal operation
-        // is one people stop reading, which is the failure this file argues against
-        // repeatedly, arrived at from the other side.
+        // HOW LONG A BROKEN SIGN-IN MAY GO UNNOTICED IS OUR REQUIREMENT, NOT THE ISSUER'S.
+        // Two wrong answers were tried here before this one.
         //
-        // One token lifetime is exactly one capture cycle, so a run that is still capturing
-        // stays green and one that has stopped goes amber -- which is the question being
-        // asked. A FAILED capture has no expiry to measure, so it keeps the flat 30 minutes:
-        // "evidence about the past is not evidence about now" still governs the red branch,
-        // and the fallback selects itself rather than needing a rule.
-        double tokenLifeS = (expiresAt > 0 && capTs > 0) ? (expiresAt - capTs) : 0;
-        double freshWindowS = tokenLifeS > 0 ? tokenLifeS : SIGNIN_EVIDENCE_MAX_AGE_S;
-        bool capFresh = capAgeS >= 0 && capAgeS <= freshWindowS;
+        // A flat 30 minutes was never measured against anything. The token on disk when this
+        // was written lived 3,848s (at=1789532602, expires_at=1789536451, about 64 minutes)
+        // and captures happen roughly once per token lifetime, so the back half of EVERY
+        // healthy cycle showed amber "unverified" with nothing wrong -- and a dot that is
+        // amber through half of normal operation is one people stop reading, which is the
+        // failure this file argues against repeatedly, reached from the other side.
+        //
+        // Then the window was taken from the record as (expires_at - at) and called "one
+        // capture cycle". It is not one: now - at <= expires_at - at reduces to
+        // now <= expires_at, which is "green while the token has not expired" -- redundant
+        // with the lifeLeft > 0 already on this branch, and worse, it hands the detection
+        // delay to whoever issues the tokens. If their lifetime became 24 hours, a capture
+        // path that died would stay green for 24 hours and nothing here would have changed.
+        //
+        // So: a constant, because the requirement is ours -- but one with a measurement under
+        // it. 5,400s is 1.4 token lifetimes as measured on this machine, which leaves room
+        // for a capture that comes slightly late without keeping green alive across a whole
+        // missed cycle. Expiry is a separate and additional ceiling (lifeLeft > 0 below), so
+        // green needs both: a token that has not run out AND evidence no older than this.
+        // Neither establishes that the session was not revoked in between; nothing in a
+        // record of past captures can.
+        bool capFresh = capAgeS >= 0 && capAgeS <= SIGNIN_EVIDENCE_MAX_AGE_S;
         if (!ok && string.Equals(kind, "signin", StringComparison.OrdinalIgnoreCase) && capFresh)
             SetDot(3, HealthState.Red, T("hs_signin_bad"), now);
         else if (!ok && string.Equals(kind, "signin", StringComparison.OrdinalIgnoreCase))
@@ -6555,6 +6576,13 @@ class CockpitWindow : Window
         card.Background = CardBg; card.BorderBrush = Border; card.BorderThickness = new Thickness(1);
         card.CornerRadius = new CornerRadius(Theme.RadPopover); card.Padding = new Thickness(16, 12, 16, 16);
         card.Margin = new Thickness(0, 6, 8, 6); card.MinWidth = 280;
+        // AND A CEILING, because MinWidth alone lets the card take the whole host. Every row
+        // here docks its label left and its stepper right, which is right at a panel width and
+        // absurd at half a window: the control ends up a hand's width from the label it
+        // belongs to. 332 = the 300 the notes in this panel already cap themselves at, plus
+        // the 16+16 padding -- so the widest thing inside decides the width, as it should,
+        // and nothing inside is wider than a readable line.
+        card.MaxWidth = 332;
         // soft shadow so the floating panel reads as elevated
         card.Effect = new System.Windows.Media.Effects.DropShadowEffect
         { BlurRadius = 16, ShadowDepth = 2, Opacity = 0.28, Color = C("#000000") };
@@ -6676,6 +6704,7 @@ class CockpitWindow : Window
         col.Children.Add(SettingsStepperRow(T("ram_floor"), _ramFloorVal, rfMinus, rfPlus));
         var hint = new TextBlock(); hint.Text = T("disk_floor_hint"); hint.Foreground = Muted;
         hint.FontSize = 10.5; hint.TextWrapping = TextWrapping.Wrap; hint.Margin = new Thickness(0, 0, 0, 2);
+        hint.MaxWidth = 300;   // the cap its four sibling notes already carry
         col.Children.Add(hint);
 
         // ── FALLBACK: on-demand re-unlock (settings panel, not the worker card). Chosen here

@@ -82,6 +82,17 @@ def test_the_edge_dot_asks_for_the_configured_agent_not_the_domain(src):
     assert "_agentMarkerId" in m.group(0), "the domain alone decides green again"
 
 
+def test_a_tab_on_the_wrong_agent_is_not_the_same_fault_as_no_tab(src):
+    """The dangerous one is the wrong tab: the default Copilot answers fluently with no
+    connectors and no tenant grounding. On 2026-08-31 that produced two benchmark runs of
+    patches written from memory. hs_agent_warn was written for it and was unreachable,
+    because until the marker check the dot could not tell the two apart."""
+    m = re.search(r'SetDot\(2, HealthState\.Yellow,[\s\S]{0,200}?\);', src)
+    assert m, "the amber branch of the edge dot no longer looks the way this test can check"
+    assert "hs_agent_warn" in m.group(0), "both faults share one message again"
+    assert "onDomain" in m.group(0), "the two are not being told apart"
+
+
 def test_the_tool_dot_stops_believing_a_health_body_that_stopped_arriving(src):
     assert "_lastHealthBodyAt" in src
     assert "HEALTH_BODY_MAX_AGE_S" in src
@@ -91,13 +102,32 @@ def test_the_tool_dot_stops_believing_a_health_body_that_stopped_arriving(src):
         "fleet_tool_ok is read straight from the cached body again"
 
 
-def test_the_signin_window_is_taken_from_the_record_not_from_a_constant(src):
-    """A flat 1800s against a ~3,848s token made the dot amber through half of every healthy
-    cycle. One token lifetime is one capture cycle, which is the question being asked."""
-    assert "double tokenLifeS = (expiresAt > 0 && capTs > 0) ? (expiresAt - capTs) : 0;" in src
-    assert "capAgeS <= freshWindowS" in src
-    # The flat constant survives as the fallback for a FAILED capture, which has no expiry.
-    assert "SIGNIN_EVIDENCE_MAX_AGE_S" in src
+def test_the_signin_detection_delay_is_ours_and_is_measured(src):
+    """TWO WRONG ANSWERS PRECEDED THIS ONE, and the second was mine.
+
+    A flat 1,800s against a ~3,848s token left the dot amber through the back half of every
+    healthy cycle. I replaced it with (expires_at - at), calling that "one capture cycle" --
+    but now - at <= expires_at - at reduces to now <= expires_at, which is "green while the
+    token has not expired": the rule I had explicitly rejected, redundant with the lifeLeft
+    check on the same branch, and it handed the maximum detection delay to whoever issues the
+    tokens. If their lifetime became 24 hours, a dead capture path would stay green for 24
+    hours. gpt-6-astra did that algebra; I had not.
+
+    How long a broken sign-in may go unnoticed is a requirement, so it is a constant -- but
+    one with a measurement under it, which the original 1,800s never had.
+    """
+    assert "double tokenLifeS" not in src, \
+        "the window is derived from the record again, which is just 'not yet expired'"
+    assert "capAgeS <= SIGNIN_EVIDENCE_MAX_AGE_S" in src
+
+    m = re.search(r"const double SIGNIN_EVIDENCE_MAX_AGE_S = ([0-9.]+);", src)
+    assert m, "the constant is gone or no longer declared where this test can read it"
+    window = float(m.group(1))
+    # Measured token lifetime on this machine, from the record quoted in the source comment.
+    assert window > 3848, \
+        "the window is shorter than one token lifetime, so a healthy cycle goes amber again"
+    assert window < 2 * 3848, \
+        "the window spans more than one missed capture, so a dead capture path stays green"
 
 
 def test_evidence_that_is_expected_and_missing_is_amber_on_both_dots(src):

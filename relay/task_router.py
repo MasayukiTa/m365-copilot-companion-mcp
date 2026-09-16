@@ -767,6 +767,23 @@ def _wants_fanout(goals) -> bool:
     override = _truthy_env("FLEET_INTAKE_AUTOSTART_FANOUT")
     if override is not None:
         return override
+    # THE SWITCH IN FRONT OF THE OPERATOR COUNTS AS THE OPERATOR SAYING OTHERWISE. The
+    # docstring above promises "yes, unless an operator said otherwise" and then offered only
+    # an environment variable and a kill switch as ways to say it -- while the cockpit has a
+    # fan-out control, writes `fanout=` from it, and honours it for its own launches. On the
+    # autostart path the setting was never read, so settings.txt said off and every
+    # autostarted run carried --fanout. A control that does nothing is worse than no control:
+    # the operator believes the question is settled.
+    #
+    # Unset stays unset: None falls through to the size rule below, so a machine where nobody
+    # has touched the switch behaves exactly as before.
+    try:
+        from relay.fleet_runner import settings_fanout
+        chosen = settings_fanout()
+    except Exception:
+        chosen = None
+    if chosen is not None:
+        return chosen
     if AUTOSTART_FANOUT_MIN_CHARS <= 0:
         return False
     # CAPABILITY, NOT DECISION -- so it is on. This function chooses whether the RUN can fan
