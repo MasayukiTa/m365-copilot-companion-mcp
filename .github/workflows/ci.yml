@@ -87,6 +87,8 @@ jobs:
             tools/test_tool_catalogue.py \
             tools/test_a_cap_in_bytes_never_bound_the_thing_that_broke.py \
             tools/test_an_idle_machine_is_not_a_broken_one.py \
+            tools/test_a_tool_that_returns_its_failure_still_failed.py \
+            tests/test_a_question_nobody_can_fail_is_not_a_question.py \
             tools/test_fleet_intake.py \
             tools/test_a_locked_out_worker_should_not_clone_its_own_work.py \
             tests/test_security_state_is_not_readable.py \

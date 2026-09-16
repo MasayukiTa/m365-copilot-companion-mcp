@@ -35,8 +35,6 @@ import time
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from tools import window_probe as W
-from tools.screen_capture import capture, capture_reports_what_it_did
 
 #: A target has to be nameable in words without naming its position, or the question leaks
 #: its own answer. A window with a title qualifies; an unnamed panel does not.
@@ -68,7 +66,7 @@ def chance_of_a_blind_hit(rect_image, image_width, image_height):
     return max(0.0, (x1 - x0)) * max(0.0, (y1 - y0)) / frame_area
 
 
-def _nameable(t: W.Target) -> str:
+def _nameable(t) -> str:
     """How a person would refer to this on screen, or "" if they could not.
 
     Position words are exactly what must not appear here. "the Save button" is a question;
@@ -81,6 +79,8 @@ def _nameable(t: W.Target) -> str:
 
 
 def _targets(min_side: int):
+    from tools import window_probe as W          # binds ctypes.windll at import
+
     out = []
     above = []
     for top in W.top_level_windows(min_side=max(64, min_side)):
@@ -107,6 +107,8 @@ def main(argv=None):
                     help="dev screens may be looked at while building the harness; "
                          "held-out ones may not, and only their results count")
     args = ap.parse_args(argv)
+
+    from tools.screen_capture import capture, capture_reports_what_it_did
 
     out_dir = args.out or os.path.join(
         os.environ.get("TEMP", "."), "grounding-%s" % time.strftime("%Y%m%d-%H%M%S"))
