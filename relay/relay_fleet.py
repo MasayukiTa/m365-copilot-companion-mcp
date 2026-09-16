@@ -1670,7 +1670,12 @@ def avail_phys_mb() -> float:
 #: exhaustion once wedged the Edge badly enough that the watchdog hard-reset it; 512 is more
 #: permissive than what the fleet has been doing, so a box that starts thrashing should have this
 #: raised rather than the gates re-forked.
-FLEET_RAM_FLOOR_MB = float(os.environ.get("MCP_FLEET_RAM_FLOOR_MB", "512"))
+#: The literal 512 lived here, 1400 lived on --autoscale-headroom-mb and 2048 lived in the
+#: cockpit. One declaration now, in tools/settings_keys.py, which the panel mirrors and a test
+#: pins. The environment override stays: it is how a bench host asks for something else.
+FLEET_RAM_FLOOR_MB = float(os.environ.get(
+    "MCP_FLEET_RAM_FLOOR_MB", str(__import__("tools.settings_keys", fromlist=["default"])
+                                  .default("ram_floor_mb"))))
 
 #: What ONE Copilot tab is budgeted to cost. Separate from the floor because they answer
 #: different questions: the floor is what must remain, this is what the NEXT tab will take.

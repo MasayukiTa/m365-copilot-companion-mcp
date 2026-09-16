@@ -797,7 +797,11 @@ class CockpitWindow : Window
     double _diskFloor = 6.0;   // admission disk floor (GB) -> settings.txt disk_floor_gb=; user-editable
                                // in the settings panel. Persisted via SaveKey AND pushed live to a
                                // running fleet via {"set_disk_floor_gb":N} (fleet_runner.py ~L561).
-    double _ramFloor = 2048.0; // admission RAM floor (MB) -> settings.txt ram_floor_mb=; user-editable.
+    //: MUST MATCH tools/settings_keys.py's declared default for ram_floor_mb. It said 2048
+    //: while the coordinator used 1400 and the admission gates used 512 -- three owners of one
+    //: default, none of them wrong about itself. test_a_setting_declares_when_it_takes_effect
+    //: fails if this drifts again.
+    double _ramFloor = 512.0;  // admission RAM floor (MB) -> settings.txt ram_floor_mb=; user-editable.
                                // The free RAM the autoscale keeps for the user (RAM analog of the disk
                                // floor). Persisted via SaveKey AND pushed live via {"set_ram_floor_mb":N}.
     string _effort = "auto";   // effort mode min|max|ultra|auto -> settings.txt effort= (NEW)
