@@ -894,6 +894,30 @@ def _agent_url() -> str:
             or os.environ.get("MCP_IMPL_AGENT_URL") or "").strip()
 
 
+#: How long to wait before believing a fleet started. Covers the import-and-argparse class
+#: only -- see the comment at the launch site.
+STARTUP_LIVENESS_S = 2.0
+
+
+def _coordinator_log_tail(state_dir, lines=3):
+    """The last few lines of the newest coordinator log, for a launch that did not survive.
+
+    The traceback is already on disk; nothing was reading it. Never raises -- a failure to
+    explain a failure must not become a second failure.
+    """
+    try:
+        import glob as _glob
+        logs = _glob.glob(os.path.join(state_dir, "coordinator_*.log"))
+        if not logs:
+            return ""
+        newest = max(logs, key=lambda p: os.stat(p).st_mtime)
+        with open(newest, encoding="utf-8", errors="replace") as fh:
+            rows = [r.strip() for r in fh.read().splitlines() if r.strip()]
+        return " | ".join(rows[-lines:])[:400]
+    except Exception:
+        return ""
+
+
 def autostart_fleet(goals, state_dir=None, now=None, launcher=None) -> dict:
     """Launch a fleet for `goals` (a list of goal dicts). Returns what happened.
 
@@ -1018,7 +1042,29 @@ def autostart_fleet(goals, state_dir=None, now=None, launcher=None) -> dict:
                 kwargs["creationflags"] = launch_creationflags()
             else:
                 kwargs["start_new_session"] = True
-            pid = subprocess.Popen(cmd, **kwargs).pid
+            proc = subprocess.Popen(cmd, **kwargs)
+            pid = proc.pid
+            # A PID IS NOT A RUN. The Popen used to be discarded here, so nothing could ask
+            # whether the child survived -- and on 2026-09-17 one died a second after launch
+            # while the queue recorded it as started and the task moved to done/. Two seconds
+            # covers the import-and-argparse class: a missing module, a syntax error, an
+            # UnboundLocalError in main(). It does NOT cover a run that comes up and fails
+            # later; the ack receipt and the reconcile pass own that, and this does not
+            # replace them.
+            try:
+                rc = proc.wait(timeout=STARTUP_LIVENESS_S)
+            except subprocess.TimeoutExpired:
+                rc = None                      # still running, which is what we wanted
+            if rc is not None:
+                detail = "the fleet exited %s within %gs of launch" % (rc,
+                                                                       STARTUP_LIVENESS_S)
+                tail = _coordinator_log_tail(sd)
+                if tail:
+                    detail += " -- " + tail
+                rec = {"started_at": now, "pid": pid, "outcome": "died_at_startup",
+                       "error": detail, "goals": goals, "goals_file": goals_file}
+                _write_autostart(sd, rec)
+                return {"ok": False, "detail": detail}
     except Exception as exc:
         rec = {"started_at": now, "pid": None, "outcome": "launch_failed",
                "error": "%s: %s" % (type(exc).__name__, exc),
