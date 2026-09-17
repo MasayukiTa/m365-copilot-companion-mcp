@@ -221,6 +221,17 @@ DELIBERATELY_NOT_REDIRECTED = {
     ("relay.task_router", "FLEET_STATE_DIR"):
         "resolved through the FLEET_STATE_DIR environment variable, which conftest already "
         "points at a per-run temp directory; the .fleet path is only its fallback",
+    # ── surfaced 2026-09-17, the same afternoon the constant was added ───────────────────
+    #
+    # The record of who was turned away at the door. It was written into the operator's live
+    # .fleet/ within minutes of existing -- tools/test_auth_stats.py already called
+    # record_auth_failure -- and four rows carrying no ip, no path and no agent landed in the
+    # file someone would open to find out who was rejected. Caught twice, independently: by
+    # running scripts/status.py and reading what it printed, and by this registry, which is the
+    # systematic form of the same check and did not need anyone to look.
+    ("tools.auth_stats", "_REJECTIONS_FILE"):
+        "resolved through the MCP_AUTH_REJECTIONS_FILE environment variable, which conftest "
+        "points at a per-run temp file; the .fleet path is only its fallback",
     # ── surfaced 2026-09-14 by teaching the walk about `.companion_gates` ────────────────
     #
     # ALREADY REDIRECTED, BY THE VARIABLE RATHER THAN BY THIS TABLE -- the same arrangement as
@@ -554,6 +565,7 @@ _SANDBOX_NAMES = (
     "selfimprove_ledger_pytest_%s.jsonl",
     "selfimprove_hypotheses_pytest_%s.jsonl",
     "fleet_state_pytest_%s",
+    "auth_rejections_pytest_%s.jsonl",
 )
 
 _atexit.register(_drop_this_runs_sandbox)
@@ -621,6 +633,17 @@ _os.environ.setdefault(
 _os.environ.setdefault(
     "FLEET_STATE_DIR",
     _sandbox_path("fleet_state_pytest_%s"))
+
+
+# And the record of WHO was turned away at the door. tools/auth_stats writes it from the request
+# path, and tools/test_auth_stats already called record_auth_failure -- so the moment that
+# function gained a durable sidecar, four rows carrying no ip, no path and no agent appeared in
+# the operator's live .fleet/. A record of nothing, in the file someone would open to find out
+# who was rejected. Found the same afternoon the file was added, by running status.py and
+# reading what it printed.
+_os.environ.setdefault(
+    "MCP_AUTH_REJECTIONS_FILE",
+    _sandbox_path("auth_rejections_pytest_%s.jsonl"))
 
 
 @pytest.fixture(autouse=True)

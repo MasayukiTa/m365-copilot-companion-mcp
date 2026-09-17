@@ -107,6 +107,15 @@ def test_a_failing_transcript_still_never_raises(monkeypatch, capsys):
 # a sanitizer nobody can see; the names are now collected as names and never held a value.
 
 
+#: SKIPPED OFF WINDOWS, AND RUN ON THE WINDOWS JOB INSTEAD -- the rule this repository already
+#: applies to scripts/test_bootstrap.py for the same reason. step_gen_env protects the secret it
+#: writes with DPAPI, which does not exist on the ubuntu runner, so a failure there is a missing
+#: capability rather than a broken assertion. A skip on its own would retire the coverage
+#: silently; it is honest only while ci.yml's windows-install-smoke job names this file.
+needs_dpapi = pytest.mark.skipif(os.name != "nt",
+                                 reason="step_gen_env protects with DPAPI; Windows only")
+
+
 @pytest.fixture()
 def repo_with_env(tmp_path, monkeypatch, transcript):
     """A .env carrying neither secret, so the top-up branch mints both."""
@@ -116,6 +125,7 @@ def repo_with_env(tmp_path, monkeypatch, transcript):
     return env
 
 
+@needs_dpapi
 def test_the_minted_secrets_do_not_reach_the_transcript(repo_with_env, transcript, capsys):
     B.step_gen_env()
     written = repo_with_env.read_text(encoding="utf-8")
@@ -125,6 +135,7 @@ def test_the_minted_secrets_do_not_reach_the_transcript(repo_with_env, transcrip
     assert api[0] not in recorded, "the freshly minted Bearer token is in the transcript"
 
 
+@needs_dpapi
 def test_the_transcript_still_names_the_keys_it_generated(repo_with_env, transcript):
     """Withholding the values must not cost the operator the record of WHICH secrets setup
     created -- that is the line they read when a key they expected is missing."""
@@ -134,6 +145,7 @@ def test_the_transcript_still_names_the_keys_it_generated(repo_with_env, transcr
     assert B.UNLOCK_PASSWORD_PROTECTED_VAR in recorded
 
 
+@needs_dpapi
 def test_the_unlock_password_is_stored_only_in_its_protected_form(repo_with_env, capsys):
     """Not about the transcript: the value printed on screen must not also be sitting in .env.
     If these ever became equal, the show_only work would be protecting a file that already has

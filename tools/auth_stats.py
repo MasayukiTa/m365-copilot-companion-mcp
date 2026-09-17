@@ -200,7 +200,78 @@ _TRACKER = AuthFailureTracker()
 _STATS_FILE = Path(__file__).resolve().parent.parent / ".fleet" / "auth_stats.json"
 
 
-def record_auth_failure(ts: Optional[float] = None, ip: Optional[str] = None) -> None:
+#: Rejections, kept beyond the sliding window so one can be looked into afterwards.
+#:
+#: THE WINDOW IS THE ALARM AND IT IS NOT THE EVIDENCE. Measured 2026-09-17: the dot went amber
+#: on four rejections, and by the time anyone looked the only facts left were "four" and
+#: "127.0.0.1" -- which is what EVERY caller looks like here, because the devtunnel host
+#: forwards from localhost. Ten minutes later the count rolled off and there was nothing to
+#: investigate at all. An alert that cannot be acted on is an alert that teaches people to
+#: clear it, which is the failure this project has been burning down all day in other places.
+#:
+#: What is kept is what distinguishes one caller from another -- the path and the user agent --
+#: and NOTHING that was offered as a credential. The Authorization header is not read here, on
+#: purpose: a file recording failed authentications is the last place a key should land, and a
+#: rejected key is still a key.
+#:
+#: REDIRECTABLE, BECAUSE A NEW SIDECAR THAT IS NOT IS A NEW WAY FOR TESTS TO WRITE INTO THE
+#: OPERATOR'S RECORDS. Measured within minutes of this file being added: tools/test_auth_stats.py
+#: already called record_auth_failure, so four rows appeared in the live .fleet/ carrying no ip,
+#: no path and no agent -- a record of nothing, in the file an operator would open to find out
+#: who was turned away. conftest isolates the gate directories, the job store, the memory store
+#: and two ledgers for exactly this reason; every one of those was added after the same thing
+#: happened. MCP_AUTH_REJECTIONS_FILE joins that list.
+_REJECTIONS_FILE = Path(os.environ.get("MCP_AUTH_REJECTIONS_FILE")
+                        or (Path(__file__).resolve().parent.parent / ".fleet"
+                            / "auth_rejections.jsonl"))
+
+#: Bounded, because this file is written from the request path and the disk on this machine has
+#: already been filled to zero once by a log nobody was bounding.
+_REJECTIONS_MAX_BYTES = 256 * 1024
+
+
+def record_rejection(ts: float, ip: str, path: str = "", agent: str = "") -> None:
+    """Append one rejection to the durable local record. Never raises."""
+    try:
+        _REJECTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if _REJECTIONS_FILE.stat().st_size > _REJECTIONS_MAX_BYTES:
+                # Keep the RECENT half, not the oldest: the question this file answers is
+                # always about the rejection that just happened.
+                keep = _REJECTIONS_FILE.read_text(encoding="utf-8", errors="replace")
+                keep = keep[len(keep) // 2:]
+                keep = keep[keep.find("\n") + 1:]      # never start mid-line
+                _REJECTIONS_FILE.write_text(keep, encoding="utf-8")
+        except OSError:
+            pass
+        row = {"ts": round(float(ts or 0), 3), "ip": str(ip or "")[:64],
+               "path": str(path or "")[:200], "agent": str(agent or "")[:200]}
+        with open(str(_REJECTIONS_FILE), "a", encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def recent_rejections(limit: int = 20) -> list:
+    """The last `limit` rejections, newest last. [] when there is no record."""
+    try:
+        rows = []
+        with open(str(_REJECTIONS_FILE), encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    continue
+        return rows[-int(limit):] if limit else rows
+    except OSError:
+        return []
+
+
+def record_auth_failure(ts: Optional[float] = None, ip: Optional[str] = None,
+                        path: str = "", agent: str = "") -> None:
     """Record one rejected request against the module singleton, then
     best-effort persist the updated summary to .fleet/auth_stats.json.
     Never raises -- called from the request path.
@@ -213,6 +284,7 @@ def record_auth_failure(ts: Optional[float] = None, ip: Optional[str] = None) ->
         _TRACKER.record(ts=ts, ip=ip)
     except Exception:
         pass
+    record_rejection(ts if ts is not None else time.time(), ip or "", path, agent)
     write_snapshot()
 
 

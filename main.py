@@ -1327,7 +1327,19 @@ if __name__ == "__main__":
                                 xff_value = hv.decode("latin-1")
                                 break
                         _, identity_ip = derive_identity(peer_host, xff_value)
-                        record_auth_failure(ip=identity_ip)
+                        # AND WHAT DISTINGUISHES ONE CALLER FROM ANOTHER. The IP alone does
+                        # not: the devtunnel host forwards from localhost, so every caller
+                        # that arrives through it reads as 127.0.0.1. Measured 2026-09-17 --
+                        # four rejections raised the dot and left nothing to investigate.
+                        # The Authorization header is deliberately NOT read: a rejected key
+                        # is still a key, and this record is the last place one should land.
+                        _ua = ""
+                        for (hk, hv) in (scope.get("headers") or []):
+                            if hk.lower() == b"user-agent":
+                                _ua = hv.decode("latin-1")
+                                break
+                        record_auth_failure(ip=identity_ip,
+                                            path=(scope.get("path") or ""), agent=_ua)
                 except Exception:
                     pass
                 await send(message)

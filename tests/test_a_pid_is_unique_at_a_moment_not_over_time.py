@@ -34,6 +34,11 @@ SANDBOX_ENV = (
     "MCP_SELFIMPROVE_LEDGER",
     "MCP_SELFIMPROVE_HYPOTHESES",
     "FLEET_STATE_DIR",
+    # Added 2026-09-17, hours after the list above: tools/auth_stats gained a durable record of
+    # rejected requests, tools/test_auth_stats already called the function that writes it, and
+    # four empty rows landed in the operator's live .fleet/ the same afternoon. Every name on
+    # this list was added after that same thing happened, which is the argument for the list.
+    "MCP_AUTH_REJECTIONS_FILE",
 )
 
 
