@@ -405,6 +405,43 @@ def section_health_strip(rep, stale_after_s=90.0):
                 "%-8s %s" % (d.get("state"), str(d.get("detail") or "")[:150]))
 
 
+def section_auth_rejections(rep, limit=8):
+    """WHO was turned away, not just how many.
+
+    The server dot goes amber on three rejected /mcp calls in ten minutes. On 2026-09-17 it did,
+    and by the time anyone looked the instrument had kept two facts: "four", and "127.0.0.1" --
+    which is what EVERY caller looks like here, because the devtunnel host forwards from
+    localhost. Ten minutes later the window rolled the count off and there was nothing left to
+    open at all.
+
+    The count is the alarm; this is the evidence. Printed here because an instrument fixed
+    without finding its reader is half a fix -- the durable record existed for one afternoon
+    before anything displayed it, and a record nobody reads answers nothing.
+    """
+    rep.section("auth rejections -- who was turned away")
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from tools.auth_stats import recent_rejections
+        rows = recent_rejections(limit)
+    except Exception as exc:
+        rep.row(UNK, "record", "unreadable: %s" % type(exc).__name__)
+        return
+    if not rows:
+        rep.row(OK, "record", "no rejection has been recorded")
+        return
+    rep.row(UNK, "count", "%d recorded (most recent last). The dot reads a 10-minute window; "
+                          "this outlives it." % len(rows))
+    for r in rows:
+        try:
+            when = time.strftime("%m-%d %H:%M:%S", time.localtime(float(r.get("ts") or 0)))
+        except Exception:
+            when = "?"
+        rep.row(UNK, "  " + when,
+                "%s  path=%s  agent=%s" % (str(r.get("ip") or "?"),
+                                           str(r.get("path") or "?"),
+                                           str(r.get("agent") or "(none given)")[:80]))
+
+
 def section_lock_attribution(rep, hours=24.0):
     """Of the lock classifications made recently, how many could only have been that worker's?
 
@@ -519,6 +556,7 @@ def main(argv=None):
     health = _endpoints(rep)
     section_fleet(rep)
     section_health_strip(rep)
+    section_auth_rejections(rep)
     section_lock_attribution(rep)
     section_settings(rep)
     section_resources(rep)
