@@ -51,6 +51,27 @@ MAX_INLINE = 2000
 SECRET_ARGS = {"password", "passwd", "secret", "token", "unlock_token", "api_key", "apikey",
                "authorization", "auth", "credential", "credentials", "private_key"}
 
+#: Tools whose RESULT is the secret, so only its digest and length are kept.
+#:
+#: THE SYMMETRIC HALF OF SECRET_ARGS, AND IT WAS MISSING. The list above stops a secret the
+#: caller HANDED IN; test_ledger_never_writes_a_secret stops one the process HOLDS, by value, at
+#: the point bytes leave. A password this machine RECOVERS is neither: it arrives from inside an
+#: encrypted file, so no name matches it and no held value equals it, and it was written to
+#: .fleet/tool_events.jsonl in clear and kept there. Reported by CodeQL as
+#: py/clear-text-logging-sensitive-data (alert #33).
+#:
+#: Returning the password to whoever asked is the tool's entire purpose and is not the problem.
+#: The problem is the second, silent copy in a file that outlives the session -- and the digest
+#: still answers every question the ledger is actually asked of it: that the call happened, how
+#: long it took, whether it succeeded, and whether two calls returned the same thing.
+SECRET_RESULT_TOOLS = {"office_password_recovery"}
+
+#: call_id -> tool, so record_outcome can tell which tool it is closing. The pairing is always
+#: within one process (both writers call record_call and record_outcome in the same function),
+#: and the map is bounded because an unbounded one in a long-lived server is a leak of its own.
+_CALL_TOOLS = {}
+_CALL_TOOLS_MAX = 4096
+
 _LOCK = threading.Lock()
 
 
@@ -370,6 +391,21 @@ def session_fingerprint() -> str:
     return hashlib.sha256(sid.encode("utf-8", "replace")).hexdigest()[:16]
 
 
+def _remember_tool(call_id: str, tool: str) -> None:
+    """Note which tool a call id belongs to, so the outcome writer can ask."""
+    with _LOCK:
+        if len(_CALL_TOOLS) >= _CALL_TOOLS_MAX:
+            _CALL_TOOLS.clear()      # a bound, not a cache policy: nothing here must be kept
+        _CALL_TOOLS[str(call_id or "")] = str(tool or "")
+
+
+def result_is_secret(call_id: str, tool: str = "") -> bool:
+    """Is this call's result a secret in itself? Answered by tool name, either given or looked
+    up from the call record written moments earlier."""
+    name = str(tool or "") or _CALL_TOOLS.get(str(call_id or ""), "")
+    return name in SECRET_RESULT_TOOLS
+
+
 def record_call(tool: str, arguments=None, *, task: str = "", worker: str = "",
                 turn=None, call_id: str = "", ts: float = None) -> str:
     """Write the CALL record, BEFORE the tool runs. Returns the id to pass to record_outcome.
@@ -405,12 +441,13 @@ def record_call(tool: str, arguments=None, *, task: str = "", worker: str = "",
     }
     if _sess:
         row["session"] = _sess
+    _remember_tool(cid, tool)
     _append(row)
     return cid
 
 
 def record_outcome(call_id: str, *, ok: bool, result=None, error: str = "",
-                   ts: float = None, duration_s: float = None) -> None:
+                   ts: float = None, duration_s: float = None, tool: str = "") -> None:
     """Write the OUTCOME record for a call. Linked by id, never merged into the call record."""
     # A REFUSAL IS NOT A SUCCESS. Every call site passes ok=True whenever the tool returned
     # without raising, and a lock refusal returns normally -- so `write_file` denied for a
@@ -449,8 +486,27 @@ def record_outcome(call_id: str, *, ok: bool, result=None, error: str = "",
         # Written as a field as well as being inferable from the text, because a reader
         # scanning 39,000 rows in bulk reads fields, and row_unavailable accepts either.
         "unavailable": True if unavailable else None,
-        "result": _bounded(result) if result is not None else None,
+        "result": _outcome_result(call_id, tool, result),
     })
+
+
+def _outcome_result(call_id, tool, result):
+    """What goes in the `result` field: the bounded value, or a description of it.
+
+    THE REFUSAL SHAPES ARE STILL READ FIRST, above, because whether a call was refused or
+    unavailable is not secret and a reader that loses that loses the correction this ledger
+    exists to make. Only the text is withheld."""
+    if result is None:
+        return None
+    if not result_is_secret(call_id, tool):
+        return _bounded(result)
+    try:
+        text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False,
+                                                                 default=str)
+    except Exception:
+        text = str(result)
+    return {"withheld": "this tool's result is a secret in itself",
+            "digest": _digest(text), "len": len(text)}
 
 
 def read(path: str = None):

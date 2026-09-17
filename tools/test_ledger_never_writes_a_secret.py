@@ -313,3 +313,73 @@ def test_recording_the_session_cannot_break_a_tool_call(_held, monkeypatch):
     TL.record_call("something", {"a": 1})   # must not raise
     rows = [json.loads(l) for l in io.open(str(_held), encoding="utf-8") if l.strip()]
     assert rows and rows[0]["tool"] == "something"
+
+
+# ---- a secret this machine RECOVERED, which neither line above can see ------------------
+#
+# The two defences in this file are name-based (SECRET_ARGS) and value-based (the held secret).
+# A password recovered from an encrypted file is neither: it is not handed in under a name, and
+# the process does not hold it beforehand, so nothing equals it to redact. It arrived in the
+# ledger in clear and stayed there. CodeQL called it, as py/clear-text-logging-sensitive-data
+# (alert #33); the human reading -- "returning the password IS the tool's job" -- was true about
+# the return value and said nothing about the second copy on disk.
+
+RECOVERED = "PASSWORD FOUND: hunter2-TESTONLY"
+
+
+def test_a_recovered_password_is_not_written_to_the_ledger(_held):
+    cid = TL.record_call("office_password_recovery", {"file_path": "C:/demo/book.xlsx"})
+    TL.record_outcome(cid, ok=True, result=RECOVERED)
+    written = _written(_held)
+    assert "hunter2-TESTONLY" not in written, written
+
+
+def test_what_is_kept_instead_still_answers_the_ledgers_questions(_held):
+    """Withholding must not turn the row into a blank. The ledger is asked whether the call
+    happened, whether it worked, and whether two calls returned the same thing -- a digest and a
+    length answer all three, and a reader must be able to see that something was withheld rather
+    than guess that the tool returned nothing."""
+    cid = TL.record_call("office_password_recovery", {"file_path": "C:/demo/book.xlsx"})
+    TL.record_outcome(cid, ok=True, result=RECOVERED)
+    rows = [json.loads(l) for l in io.open(str(_held), encoding="utf-8") if l.strip()]
+    outcome = [r for r in rows if r.get("event") == "outcome"][0]
+    assert outcome["ok"] is True
+    assert outcome["result"]["withheld"]
+    assert outcome["result"]["len"] == len(RECOVERED)
+    assert len(outcome["result"]["digest"]) == 16
+    # Same input, same digest: "did these two calls return the same thing" still has an answer.
+    cid2 = TL.record_call("office_password_recovery", {"file_path": "C:/demo/other.xlsx"})
+    TL.record_outcome(cid2, ok=True, result=RECOVERED)
+    rows = [json.loads(l) for l in io.open(str(_held), encoding="utf-8") if l.strip()]
+    outcomes = [r for r in rows if r.get("event") == "outcome"]
+    assert outcomes[0]["result"]["digest"] == outcomes[1]["result"]["digest"]
+
+
+def test_every_other_tools_result_is_still_stored_in_full(_held):
+    """The withholding is one named tool, not a new default. A ledger that stopped storing
+    results would silently end every measurement taken over this file."""
+    cid = TL.record_call("read_file", {"path": "C:/demo/notes.txt"})
+    TL.record_outcome(cid, ok=True, result="the quick brown fox")
+    assert "the quick brown fox" in _written(_held)
+
+
+def test_the_tool_name_can_be_given_instead_of_looked_up(_held):
+    """The gateway knows the name and passes it. The lookup exists for callers that do not, and
+    an id the map has forgotten -- it is bounded -- must still be withheld when the name is
+    given."""
+    TL._CALL_TOOLS.clear()
+    TL.record_outcome("an-id-nobody-remembers", ok=True, result=RECOVERED,
+                      tool="office_password_recovery")
+    assert "hunter2-TESTONLY" not in _written(_held)
+
+
+def test_a_refusal_is_still_recognised_through_a_withheld_result(_held):
+    """The corrections record_outcome makes -- refused, unavailable, self-reported failure --
+    are read off the result text BEFORE it is withheld. Losing them would undo the fix this
+    ledger spent a night on, in the name of the fix it is getting now."""
+    cid = TL.record_call("office_password_recovery", {"file_path": "C:/demo/book.xlsx"})
+    TL.record_outcome(cid, ok=True, result="[locked: no valid unlock token for this call]")
+    rows = [json.loads(l) for l in io.open(str(_held), encoding="utf-8") if l.strip()]
+    outcome = [r for r in rows if r.get("event") == "outcome"][0]
+    assert outcome["ok"] is False, "a refusal was filed as a success once the text was withheld"
+    assert "refused" in outcome["error"]
