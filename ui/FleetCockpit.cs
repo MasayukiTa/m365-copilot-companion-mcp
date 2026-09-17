@@ -1388,20 +1388,16 @@ class CockpitWindow : Window
         // run carried on regardless. The route is visible here; the password never is --
         // it is read on the coordinator's machine from its own .env and never appears in
         // the command file this button writes.
-        if (k == "set_reunlock_section") return ja ? "再解錠（フォールバック）" : "Re-unlock (fallback)";
-        if (k == "reunlock_target_hint") return ja
-            ? "対象ワーカー名（例: w0）。空欄なら実行中の全ワーカーへ送ります。"
-            : "Target worker name (e.g. w0). Leave blank for every live worker.";
-        if (k == "reunlock_btn") return ja ? "再解錠を送信" : "Send re-unlock";
-        if (k == "reunlock_hint") return ja
-            ? "自動解錠が効かずロックで止まったワーカーに、解錠指示をもう一度送ります。パスワードは"
-              + "この端末の .env からその場で読まれ、コマンドファイルには一切書き込まれません。"
-            : "Re-sends the unlock instruction to a worker stuck on a lock refusal that automatic "
-              + "recovery missed. The password is read from this machine's .env at the moment it "
-              + "is sent and is never written into the command file.";
-        if (k == "reunlock_sent_all") return ja
-            ? "全ワーカーへ再解錠を送信しました（結果は次の更新で表示）"
-            : "Re-unlock sent to every live worker (result on next refresh)";
+        if (k == "set_approval_section") return ja ? "操作承認" : "Approval policy";
+        if (k == "set_approval_hint") return ja
+            ? "自動=禁止パターンは即拒否・それ以外は通す（推奨）／バイパス=ゲートを掛けない／毎回確認=初見の種類ごとに人に訊く"
+            : "Auto = refuse prohibited patterns outright, pass the rest (recommended) / Bypass = no gate / Confirm = ask a person about every first-seen class";
+        if (k == "set_approval_note") return ja
+            ? "承認ダイアログと同じ設定です。ダイアログは承認待ちのときしか開かないので、落ち着いて見直せる場所にも置いてあります。次の判定から効きます。"
+            : "The same setting the approval dialog carries. That dialog only opens while an approval is being demanded, so the choice lives here too. Takes effect from the next decision.";
+        // The re-unlock control's four strings were removed with it. They described a text box
+        // for typing which worker to rescue -- a question the records can answer and a person
+        // cannot. relay/fleet_runner.py sweep_unclaimed_refusals does the rescuing now.
         if (k == "ui_scale_section") return ja ? "表示サイズ" : "UI scale";
         if (k == "ui_scale") return ja ? "表示サイズ" : "UI scale";
         if (k == "ui_scale_hint") return ja ? "Ctrl+ホイールや Ctrl +/− でも変更できます（Ctrl+0 で自動）。" : "Also change with Ctrl+wheel or Ctrl +/− (Ctrl+0 = auto).";
@@ -6633,13 +6629,11 @@ class CockpitWindow : Window
     }
 
     TextBlock _diskFloorVal;
-    // Re-unlock fallback button (settings panel): target-worker input, send button, and the
-    // note that reports what happened. _reunlockNoteTs dedupes against status.json's
-    // "reunlock" receipt so the note updates once per press rather than once per ~1s poll.
-    TextBox _reunlockTargetInput;
-    Button _reunlockBtn;
-    TextBlock _reunlockNote;
-    double _reunlockNoteTs = 0.0;
+    // The re-unlock control's fields lived here. Removed with the control itself: the harness
+    // asks every sweep whether a logged refusal went unclaimed and delivers the unlock on its
+    // own (relay/fleet_runner.py:sweep_unclaimed_refusals). The receipt it produces still lands
+    // in status.json and is printed by scripts/status.py, where a record belongs -- a panel
+    // note that has to be read while it is on screen is not a record.
     TextBlock SectionHeader(string text)
     {
         var t = new TextBlock(); t.Text = text; t.Foreground = Muted; t.FontSize = 11;
@@ -6955,45 +6949,76 @@ class CockpitWindow : Window
         hint.MaxWidth = 300;   // the cap its four sibling notes already carry
         col.Children.Add(hint);
 
-        // ── FALLBACK: on-demand re-unlock (settings panel, not the worker card). Chosen here
-        // rather than per-card because the button's own point is to keep working when the
-        // automatic path has already failed silently -- which is exactly when a person is
-        // least sure WHICH card, if any, is the stuck one. A panel control reachable the same
-        // way disk floor / RAM floor / reconnect-chat already are needs no card to still be on
-        // screen, no scroll position, and covers the target="" broadcast case (every live
-        // worker) as directly as a single named one. See relay/fleet_runner.py's
-        // apply_reunlock docstring for the incident this exists to answer.
-        col.Children.Add(SectionHeader(T("set_reunlock_section")));
-        var reunlockRow = new StackPanel();
-        reunlockRow.Orientation = Orientation.Horizontal;
-        reunlockRow.Margin = new Thickness(0, 2, 0, 2);
-        _reunlockTargetInput = new TextBox();
-        _reunlockTargetInput.Width = 70;
-        _reunlockTargetInput.FontSize = 12;
-        _reunlockTargetInput.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
-        _reunlockTargetInput.Foreground = Theme.Br(Theme.Text(_dark));
-        _reunlockTargetInput.BorderBrush = Theme.Br(Theme.Border(_dark));
-        _reunlockTargetInput.BorderThickness = new Thickness(1);
-        _reunlockTargetInput.Padding = new Thickness(6, 3, 6, 3);
-        _reunlockTargetInput.VerticalAlignment = VerticalAlignment.Center;
-        _reunlockTargetInput.ToolTip = T("reunlock_target_hint");
-        reunlockRow.Children.Add(_reunlockTargetInput);
-        _reunlockBtn = new Button();
-        _reunlockBtn.Content = T("reunlock_btn");
-        _reunlockBtn.FontSize = 12; _reunlockBtn.FontWeight = FontWeights.SemiBold;
-        _reunlockBtn.Cursor = Cursors.Hand; _reunlockBtn.BorderThickness = new Thickness(1);
-        _reunlockBtn.Padding = new Thickness(12, 4, 12, 4);
-        _reunlockBtn.Margin = new Thickness(6, 0, 0, 0);
-        _reunlockBtn.Template = FlatButtonTemplate();
-        _reunlockBtn.ToolTip = T("reunlock_hint");
-        _reunlockBtn.Click += delegate { RequestReunlock(_reunlockTargetInput.Text); };
-        reunlockRow.Children.Add(_reunlockBtn);
-        col.Children.Add(reunlockRow);
-        _reunlockNote = new TextBlock();
-        _reunlockNote.FontSize = 10.5; _reunlockNote.TextWrapping = TextWrapping.Wrap;
-        _reunlockNote.Foreground = Muted; _reunlockNote.Margin = new Thickness(0, 2, 0, 2);
-        _reunlockNote.Text = T("reunlock_hint");
-        col.Children.Add(_reunlockNote);
+        // ── Approval policy, WHERE IT CAN BE CHANGED WHEN NOBODY IS WAITING.
+        //
+        // The same three choices live in ApprovalPromptWindow, and until now that was the ONLY
+        // place they lived -- so the policy could only be changed at the moment an approval was
+        // being demanded. A setting that is read at every gate (see tools/settings_keys.py:
+        // job_approval_mode is each_gate) could be reconsidered only while someone was being
+        // hurried. That is backwards for an approval control, and the operator said so.
+        //
+        // ONE OWNER FOR THE VALUE. This calls ApprovalPromptWindow's own ReadPolicy/SavePolicy
+        // rather than growing a third reader of job_approval_mode -- five copies of one
+        // settings path is how 2026-09-16 happened, and a policy is a worse thing to have two
+        // opinions about than a path.
+        col.Children.Add(SectionHeader(T("set_approval_section")));
+        var policyRow = new ComboBox();
+        policyRow.FontSize = 12;
+        policyRow.MinWidth = 210;
+        policyRow.HorizontalAlignment = HorizontalAlignment.Left;
+        policyRow.Margin = new Thickness(0, 2, 0, 2);
+        policyRow.Background = BtnBg; policyRow.Foreground = Fg; policyRow.BorderBrush = Border;
+        policyRow.Cursor = Cursors.Hand;
+        policyRow.ToolTip = T("set_approval_hint");
+        // SAME ORDER AND SAME WORDS as the dialog. Two lists that agree on the values and
+        // disagree on the labels teach an operator that they are different settings.
+        var policyVals = new[] { "auto", "bypass", "default" };
+        foreach (string v in policyVals)
+        {
+            string label = v == "auto" ? (_lang == 0 ? "自動（推奨）" : "Auto (recommended)")
+                        : v == "bypass" ? (_lang == 0 ? "バイパス" : "Bypass")
+                        : (_lang == 0 ? "毎回確認（非推奨）" : "Confirm every time (not recommended)");
+            policyRow.Items.Add(new ComboBoxItem { Content = label, Tag = v });
+        }
+        string cur = ApprovalPromptWindow.ReadPolicy();
+        for (int i = 0; i < policyRow.Items.Count; i++)
+        {
+            var it = policyRow.Items[i] as ComboBoxItem;
+            if (it != null && string.Equals((string)it.Tag, cur, StringComparison.OrdinalIgnoreCase))
+            { policyRow.SelectedIndex = i; break; }
+        }
+        if (policyRow.SelectedIndex < 0) policyRow.SelectedIndex = 0;
+        policyRow.SelectionChanged += delegate
+        {
+            var it = policyRow.SelectedItem as ComboBoxItem;
+            if (it == null) return;
+            string v = (string)it.Tag;
+            if (string.Equals(v, ApprovalPromptWindow.ReadPolicy(), StringComparison.OrdinalIgnoreCase)) return;
+            ApprovalPromptWindow.SavePolicy(v);
+        };
+        StyleFlatCombo(policyRow);
+        col.Children.Add(policyRow);
+        var policyNote = new TextBlock();
+        policyNote.Text = T("set_approval_note");
+        policyNote.Foreground = Muted; policyNote.FontSize = 10.5;
+        policyNote.TextWrapping = TextWrapping.Wrap; policyNote.MaxWidth = 300;
+        policyNote.Margin = new Thickness(0, 2, 0, 2);
+        col.Children.Add(policyNote);
+
+        // THE RE-UNLOCK CONTROL WAS REMOVED HERE, DELIBERATELY, AND MUST NOT COME BACK.
+        //
+        // It was a worker-name box and a "send re-unlock" button, for the case its own tooltip
+        // described: a worker stopped by a lock that automatic recovery had not noticed. That
+        // is the harness handing its own failure to a person -- and the person is the part of
+        // this system least able to know which worker, if any, is the stuck one. The operator
+        // said so, twice.
+        //
+        // The hole it covered was real: twice on 2026-09-15 a worker was refused for lock, no
+        // recovery fired, and the run carried on, once producing a deliverable that claimed to
+        // have verified content it had never read. That hole is now closed on the harness side
+        // by relay/fleet_runner.py:sweep_unclaimed_refusals, which asks every sweep whether a
+        // refusal the server logged was picked up by any reader, and delivers the unlock itself
+        // when none was. A button is not needed to answer a question the machine can ask.
 
         // ── Chat: always-available manual bridge reconnect. Unlike the Fix button (only shown
         // when a dot is red/yellow), this fires on demand regardless of the Tool dot's state --
@@ -7743,63 +7768,10 @@ class CockpitWindow : Window
     // processes. `target` blank means every live worker (fleet_runner treats "" the same as the
     // steer broadcast rule it is built on; "*" is accepted there too for the same reason).
     //
-    // This gives immediate LOCAL feedback ("sent") and then RefreshReunlockNote overwrites it
-    // once status.json's "reunlock" receipt lands (~1s later) with whether it actually
-    // delivered or why not -- so "I pressed the button and nothing happened" has an answer
-    // instead of silence, which is the entire reason this exists.
-    void RequestReunlock(string target)
-    {
-        if (!RunIsLive())
-        {
-            if (_reunlockNote != null) _reunlockNote.Text = T("steer_dead");
-            return;
-        }
-        string t = (target ?? "").Trim();
-        var cmd = ReadCommands();
-        cmd["reunlock"] = t;
-        WriteCommands(cmd);
-        bool ja = _lang == 0;
-        if (_reunlockNote != null)
-        {
-            _reunlockNote.Foreground = Muted;
-            _reunlockNote.Text = string.IsNullOrEmpty(t)
-                ? T("reunlock_sent_all")
-                : (ja ? (t + " へ再解錠を送信しました（結果は次の更新で表示）")
-                     : ("Re-unlock sent to " + t + " (result on next refresh)"));
-        }
-    }
-
-    // Reactive counterpart to RequestReunlock: reads status.json's "reunlock" receipt
-    // (apply_reunlock's return value, written by fleet_runner.py) each tick and, the first
-    // time a NEW one appears (deduped on its "ts" against _reunlockNoteTs so the note does not
-    // re-announce the same result on every ~1s poll), replaces the optimistic "sent" note with
-    // the real outcome: delivered-to-whom-and-how-many, or the stated reason it was not --
-    // most importantly "no local unlock password", which used to be indistinguishable from the
-    // button doing nothing at all.
-    void RefreshReunlockNote(Dictionary<string, object> root)
-    {
-        if (_reunlockNote == null || root == null) return;
-        object raw;
-        if (!root.TryGetValue("reunlock", out raw)) return;
-        var r = raw as Dictionary<string, object>;
-        if (r == null) return;
-        double ts = Dbl(r, "ts");
-        if (ts <= _reunlockNoteTs) return;
-        _reunlockNoteTs = ts;
-        bool ok = false;
-        object okRaw;
-        if (r.TryGetValue("ok", out okRaw)) { try { ok = Convert.ToBoolean(okRaw); } catch { } }
-        string target = S(r, "target");
-        int delivered = I(r, "delivered");
-        string reason = S(r, "reason");
-        bool ja = _lang == 0;
-        _reunlockNote.Text = ok
-            ? (ja ? ("再解錠: " + target + " に配信しました（" + delivered + "件）")
-                 : ("Re-unlock: delivered to " + target + " (" + delivered + ")"))
-            : (ja ? ("再解錠 失敗（" + target + "）: " + reason)
-                 : ("Re-unlock failed (" + target + "): " + reason));
-        _reunlockNote.Foreground = ok ? Theme.Br(Theme.Success(_dark)) : Theme.Br(Theme.Danger(_dark));
-    }
+    // The two methods that served the re-unlock control were removed with it. One wrote a
+    // command for a person to send; the other turned the receipt back into a note on a panel.
+    // Neither has a caller now: the harness delivers unlocks itself every sweep, and the
+    // receipt is read where records are read rather than shown while someone is looking.
 
     // Effort selector: ComboBox dropdown for min/max/ultra/auto.
     // Persists effort= to settings.txt; the fleet runner reads it at launch.
@@ -9688,7 +9660,8 @@ class CockpitWindow : Window
         RefreshStoppingState(root);         // FIX B: resolve the optimistic "stopping" state once the sweep confirms it
         UpdateGateBanner(root);             // Bucket C TASK 2: show pending approval gates (blocks worker until answered)
         UpdateCapBanner(root);              // TASK 1: surface the admission-gate wait reactively each tick
-        RefreshReunlockNote(root);          // fallback re-unlock button: replace "sent" with the real receipt
+        // (the re-unlock receipt used to be turned into a panel note here; the harness now
+        //  delivers unlocks itself and the receipt is read from status.json by status.py)
         bool idle = root == null || I(root, "total") == 0
                     || (root.ContainsKey("idle") && Convert.ToBoolean(root["idle"]));
         if (idle)

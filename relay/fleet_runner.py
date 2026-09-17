@@ -451,6 +451,86 @@ def deliver_steers(items, workers, log=None, enqueue=None):
     return delivered
 
 
+#: How long a refusal has to sit unclaimed before the harness acts on it itself. Long enough
+#: that the worker's own recovery -- _looks_locked -> _inject_unlock, which fires when the
+#: REPLY comes back -- gets first refusal, and short enough that a run does not spend minutes
+#: producing work on top of a tool call that never happened.
+UNCLAIMED_REFUSAL_GRACE_S = 45.0
+
+#: The newest refusal already acted on, so a sweep does not re-deliver for the same one.
+_LAST_UNCLAIMED_TS = [0.0]
+
+
+def sweep_unclaimed_refusals(workers, now=None, log=None, deliver=None):
+    """Re-unlock workers for a refusal that NOBODY CLASSIFIED. Replaces the fallback button.
+
+    THERE USED TO BE A BUTTON. The panel carried a "re-unlock" control with a worker-name box,
+    for the case its own tooltip described: a worker stopped by a lock that automatic recovery
+    had not noticed. That is the harness handing its own failure to a person, and the person
+    is the part of this system least able to know WHICH worker, if any, is the stuck one.
+
+    THE HOLE IT COVERED IS REAL, AND MEASURED. Twice on 2026-09-15 a worker was refused for
+    lock, no recovery fired, and the run carried on regardless -- once producing a deliverable
+    that claimed to have verified content it had never been able to read. Automatic recovery
+    is driven by the REPLY (_looks_locked on the text that comes back), so a refusal that never
+    produces a recognisable reply is invisible to it.
+
+    WHAT THIS ASKS INSTEAD, using only records the server already writes: the server logs every
+    refusal; readers log every classification. A refusal with no classification after it, past
+    the grace period, was picked up by nobody. relay/turn_windows says which workers had a turn
+    open at that instant, and those are the ones told to unlock.
+
+    THE COST IS ASYMMETRIC AND THE BIAS FOLLOWS IT. Unlocking a worker that was not locked
+    costs one turn. Not unlocking one that was costs a deliverable that is confidently wrong
+    about work it never did. So an ambiguous window delivers to every candidate rather than
+    guessing between them -- the same broadcast the button offered as an empty target, chosen
+    for a reason rather than typed by someone who could not tell either.
+
+    Returns the list of receipts it produced, newest last. Never raises: a recovery that fell
+    over while recovering would be the failure it exists to prevent, wearing its own clothes.
+    """
+    say = log or (lambda m: print(m, flush=True))
+    send = deliver or apply_reunlock
+    t = float(now if now is not None else time.time())
+    out = []
+    try:
+        from tools import lock_state as _ls
+        from relay import turn_windows as _tw
+        from relay.relay_fleet import NO_CONTEXT_REFUSAL
+
+        since = t - float(getattr(_ls, "DEFAULT_FRESH_SEC", 180.0))
+        claims = _ls.classifications(since, now=t)
+        refusals = [r for r in _ls.matching_records(since, now=t)
+                    if not str(r.get("detail") or "").startswith(NO_CONTEXT_REFUSAL)]
+        live = {getattr(w, "name", "") for w in (workers or [])
+                if getattr(w, "status", "") not in ("done", "stuck", "cancelled")}
+        for rec in refusals:
+            ts = float(rec.get("ts") or 0.0)
+            if ts <= _LAST_UNCLAIMED_TS[0] or (t - ts) < UNCLAIMED_REFUSAL_GRACE_S:
+                continue
+            # CLAIMED means a reader wrote a classification AFTER this refusal landed. The
+            # note carries the record it consumed, but matching on that would fail whenever a
+            # reader consumed a different refusal from the same burst -- and a burst is the
+            # normal case. Ordering is the weaker claim and the true one.
+            if any(float(c.get("ts") or 0.0) >= ts for c in claims):
+                continue
+            cands = [n for n in _tw.candidates(ts) if n in live]
+            if not cands:
+                # No worker had a turn open then: this refusal belongs to something else on
+                # this machine. Delivering to everyone on no evidence is how a recovery starts
+                # causing the noise it was built to quieten.
+                continue
+            _LAST_UNCLAIMED_TS[0] = max(_LAST_UNCLAIMED_TS[0], ts)
+            for name in cands:
+                say("[reunlock] nobody classified the refusal at %.0f; %s had a turn open "
+                    "then -- sending unlock" % (ts, name))
+                out.append(send(name, workers, log=log))
+    except Exception as exc:
+        say("[reunlock] unclaimed-refusal sweep skipped: %s: %s"
+            % (type(exc).__name__, exc))
+    return out
+
+
 def apply_reunlock(target, workers, enqueue=None, log=None):
     """THE FALLBACK BUTTON. Automatic recovery already exists: relay_fleet injects
     `UNLOCK_PREFIX % password` into a worker's FIRST turn whenever a local password is
@@ -2575,6 +2655,12 @@ def main():
             print("[settings] %s -> %s (adopted live from the settings panel)"
                   % (_key, _val), flush=True)
         _drain_commands(workers)
+        # THE BUTTON'S JOB, DONE BY THE HARNESS. A refusal nobody classified used to need a
+        # person to notice and press "re-unlock"; it is asked for here every sweep instead.
+        # See sweep_unclaimed_refusals for the two incidents that bought this.
+        for _receipt in sweep_unclaimed_refusals(workers):
+            if isinstance(_receipt, dict):
+                reunlock_box[0] = _receipt
         report_unused_steers(workers, _steer_reported)
         _register_convs(workers)
         # RUN-RESUME: refresh the completion map so a crash after this sweep can resume

@@ -273,6 +273,67 @@ def matching_records(since: float, now: Optional[float] = None) -> list:
     return out
 
 
+def classifications(since: float, now: Optional[float] = None) -> list:
+    """Every `classified_locked` note a reader wrote at or after `since`. Oldest first.
+
+    THE OTHER HALF OF matching_records, and it exists so a REFUSAL CAN BE ASKED WHETHER
+    ANYONE PICKED IT UP. A refusal that no reader classified is the measured failure behind
+    the fallback button: 2026-09-15, twice in one day, a worker was refused for lock, no
+    recovery fired, and the run carried on -- once producing a deliverable that claimed to
+    have verified content it had never been able to read.
+
+    Reusing the same scan deliberately: the tail-read, the torn-line tolerance and the
+    freshness window were each bought with an incident, and a second copy of them is a second
+    place for those lessons to rot.
+    """
+    rows = _scan(since, now)
+    return [r for r in rows if r.get("event") == "classified_locked"]
+
+
+def _scan(since: float, now: Optional[float] = None) -> list:
+    """Every parseable record in the fresh window, whatever its event.
+
+    matching_records and classifications both filter this. It is private because "every
+    record" is not a question anyone should be asking: a caller that does not say which event
+    it means is a caller that will one day count a reader's own note as evidence, which is the
+    exact mistake matching_records carries a comment about.
+    """
+    try:
+        boundary = float(since)
+    except (TypeError, ValueError):
+        return []
+    if boundary <= 0.0:
+        return []
+    current = float(now if now is not None else time.time())
+    try:
+        with open(_LOG_FILE, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - _LOG_TAIL_BYTES))
+            blob = fh.read()
+    except Exception:
+        return []
+    out = []
+    for line in blob.decode("utf-8", "replace").split(chr(10)):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        try:
+            ts = float(rec.get("ts") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if ts < boundary or (current - ts) > DEFAULT_FRESH_SEC:
+            continue
+        out.append(rec)
+    return out
+
+
 def matching_record(since: float, now: Optional[float] = None) -> dict:
     """The most recent refusal `locked_since` would match, or {} when there is none.
 
