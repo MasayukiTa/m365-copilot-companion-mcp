@@ -31,8 +31,11 @@ def render_math(
         dpi: Image resolution.
         transparent: Save with transparent background.
 
-    Self-verify before reporting done: call read_image on output_path to confirm
-    the formula rendered correctly (no cut-off glyphs or mathtext errors).
+    Self-verify before reporting done, with something that can actually answer: ocr_image
+    on output_path recovers the rendered text, and run_python with PIL answers whether the
+    glyphs reach the edge. read_image cannot: it returns base64 text no model in this stack
+    sees, and a worker that calls it reports a check it did not perform (measured
+    2026-09-17).
     """
     locked = require_unlocked()
     if locked:

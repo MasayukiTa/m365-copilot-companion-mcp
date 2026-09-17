@@ -41,9 +41,12 @@ def create_pptx(path: str, slides: list[dict], title: Optional[str] = None) -> s
         slides: Ordered list of slide spec dicts. Must contain at least one slide.
         title: Optional deck title used for file metadata.
 
-    Self-verify before reporting done: call pptx_export_png on the output, then
-    read_image on a slide or two to confirm layout/content rendered as intended.
-    Regenerate if it looks wrong.
+    Self-verify before reporting done: call pptx_export_png on the output, then check a
+    slide or two with ocr_image (does the text you put there come back?) or run_python with
+    PIL (is anything clipped at the edge?). NOT read_image -- it returns base64 text no model
+    in this stack sees, so a worker that calls it reports a check it did not perform
+    (measured 2026-09-17). To have a model actually look, end the turn with
+    `ANALYZE: <png path> | <what to check>`. Regenerate if it looks wrong.
     """
     locked = require_unlocked()
     if locked:
@@ -88,9 +91,12 @@ def pptx_from_markdown(path: str, markdown: str, title: Optional[str] = None) ->
         markdown: Markdown source text.
         title: Optional deck title used for file metadata.
 
-    Self-verify before reporting done: call pptx_export_png on the output, then
-    read_image on a slide or two to confirm layout/content rendered as intended.
-    Regenerate if it looks wrong.
+    Self-verify before reporting done: call pptx_export_png on the output, then check a
+    slide or two with ocr_image (does the text you put there come back?) or run_python with
+    PIL (is anything clipped at the edge?). NOT read_image -- it returns base64 text no model
+    in this stack sees, so a worker that calls it reports a check it did not perform
+    (measured 2026-09-17). To have a model actually look, end the turn with
+    `ANALYZE: <png path> | <what to check>`. Regenerate if it looks wrong.
     """
     slides = _markdown_to_slide_specs(markdown)
     if not slides:

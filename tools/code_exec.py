@@ -72,8 +72,11 @@ def run_python(
         timeout: Maximum execution time in seconds.
         working_dir: Optional working directory under the allowed base.
 
-    If the script produces an artifact, verify it before declaring success: read_image
-    for a saved plot/image, or verify_python / verify_file_contains for a computed result.
+    If the script produces an artifact, verify it before declaring success. For an IMAGE
+    that means ocr_image for its text, or run_python with PIL for pixel facts -- NOT
+    read_image, which returns base64 text no model in this stack can see (measured
+    2026-09-17: a worker called it and then reported characters that were not there). For a
+    computed result, verify_python / verify_file_contains.
     """
     locked = require_unlocked()
     if locked:
