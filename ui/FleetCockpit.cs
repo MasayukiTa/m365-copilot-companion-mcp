@@ -2599,6 +2599,69 @@ class CockpitWindow : Window
         //      Never the token: an expiry and an audience grant nothing on their own.
         UpdateCaptureDots(now);
         MaybeAutoFix();
+        PublishHealthStrip();
+    }
+
+    //: WRITE THE STRIP DOWN, because until 2026-09-17 it existed only on the screen.
+    //:
+    //: Asked why the server dot was lit, the command-line tool could say the server was
+    //: reachable and that its code was stale -- it says both -- but not what the DOT was
+    //: showing, which is what a person actually looks at. The answer had to be read off a
+    //: tooltip by hand. That is the inversion of "the command line first, then the GUI".
+    //:
+    //: The file's own mtime is half the value: a strip that stopped being swept is a
+    //: different failure from a strip that is all green, and neither was visible before.
+    //: Never raises -- a panel that fell over while publishing its health would be reporting
+    //: the opposite of what happened.
+    void PublishHealthStrip()
+    {
+        try
+        {
+            string dir = Path.Combine(RepoRootForSettings(), ".fleet");
+            Directory.CreateDirectory(dir);
+            var sb = new System.Text.StringBuilder();
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            sb.Append("{\"ts\":").Append(NowUnix().ToString("F3", inv));
+            sb.Append(",\"dots\":[");
+            lock (_healthLock)
+            {
+                for (int i = 0; i < HEALTH_DOT_COUNT; i++)
+                {
+                    if (i > 0) sb.Append(',');
+                    double age = _health[i].Checked == DateTime.MinValue
+                        ? -1.0 : (DateTime.UtcNow - _health[i].Checked).TotalSeconds;
+                    sb.Append("{\"key\":\"").Append(JsonEscape(_healthKeys[i]))
+                      .Append("\",\"state\":\"")
+                      .Append(_health[i].State.ToString().ToLowerInvariant())
+                      .Append("\",\"detail\":\"").Append(JsonEscape(_health[i].Detail ?? ""))
+                      .Append("\",\"checked_age_s\":").Append(age.ToString("F1", inv))
+                      .Append('}');
+                }
+            }
+            sb.Append("]}");
+            string path = Path.Combine(dir, "health_strip.json");
+            string tmp = path + ".tmp";
+            File.WriteAllText(tmp, sb.ToString(), new System.Text.UTF8Encoding(false));
+            if (File.Exists(path)) File.Delete(path);
+            File.Move(tmp, path);
+        }
+        catch (Exception) { }
+    }
+
+    static string JsonEscape(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return "";
+        var sb = new System.Text.StringBuilder(s.Length + 8);
+        foreach (char c in s)
+        {
+            if (c == '"' || c == '\\') { sb.Append('\\').Append(c); }
+            else if (c == '\n') sb.Append("\\n");
+            else if (c == '\r') sb.Append("\\r");
+            else if (c == '\t') sb.Append("\\t");
+            else if (c < ' ') sb.Append("\\u").Append(((int)c).ToString("x4"));
+            else sb.Append(c);
+        }
+        return sb.ToString();
     }
 
     // Is a fleet run in flight.

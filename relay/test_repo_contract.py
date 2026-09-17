@@ -105,6 +105,12 @@ def test_the_composed_body_still_ends_with_the_goal():
 #: reading six characters off a picture is not what that phrase describes, and
 #: read_image was sitting there claiming to do it. Renamed for what it does (attach the
 #: file so the model itself can look), and the next run emitted the line on turn 1.
+#: NARROWED AND REVERTED WITHIN THE HOUR, back to this hash. The narrowing was written
+#: because a run appeared to be sending screenshots to the Analyst for no reason; the
+#: operator then established that the goal was a folder handed over to be examined,
+#: images included, and reading them WAS the task. The sentence was producing good
+#: behaviour and the reason to change it had been withdrawn, so it went back. What was
+#: learned is recorded beside the sentence instead of spent as instruction bytes.
 _PROTOCOL_SHA256 = "245ea0237786483f99698d186564339528e9229477fde34fa2fb4ebabf97538a"
 _PROTOCOL_LEN = 1158
 
