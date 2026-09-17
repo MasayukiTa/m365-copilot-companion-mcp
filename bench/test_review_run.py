@@ -184,7 +184,7 @@ def test_dry_run_prints_exact_fleet_cmd(repo, monkeypatch, capsys):
 
 # --- fleet_cmd(): the verified launch contract, byte for byte ------------------------------
 
-def test_fleet_cmd_shape():
+def test_fleet_cmd_shape(tmp_path, monkeypatch):
     """--no-fanout is part of the shape, not an extra.
 
     A benchmark goal is the unit being scored, and a split replaces it with children the
@@ -192,17 +192,42 @@ def test_fleet_cmd_shape():
     back empty and is recorded as a miss. It is named here because fan-out became ON by
     default on 2026-09-13: this command used to inherit "off" by saying nothing, and saying
     nothing now means on.
+
+    THE SETTINGS ARE ARRANGED, NOT INHERITED. --disk-floor-gb became conditional on
+    2026-09-17 -- the bench no longer overrules a floor the operator chose -- so a test that
+    asserted one shape would pass on a machine with no settings file and fail on the owner's
+    workstation, which has one. That is the same trap that broke four fan-out tests earlier
+    the same day.
     """
+    from tools import settings_path as SP
+    monkeypatch.setattr(SP, "NEW_PATH", str(tmp_path / "absent" / "settings.txt"))
+    monkeypatch.delenv("APPDATA", raising=False)
+
     cmd = fleet_cmd("C:/x/goals.jsonl", 4, "auto")
     assert cmd == [
         review_run.VENVPY, "-m", "relay.fleet_runner",
         "--goals-file", "C:/x/goals.jsonl",
         "--max-concurrent", "4",
         "--max-turns", "40",
-        "--disk-floor-gb", "0",
         "--no-fanout",
         "--effort", "auto",
+        # Appended, not inline, because it is conditional.
+        "--disk-floor-gb", "0",
     ]
+
+
+def test_fleet_cmd_leaves_a_floor_the_operator_chose_alone(tmp_path, monkeypatch):
+    """The other half of the same behaviour. Passing --disk-floor-gb at all BEATS settings.txt
+    (CLI > settings > env), so on a machine where somebody has chosen, the bench must say
+    nothing rather than say zero."""
+    from tools import settings_path as SP
+    path = tmp_path / "settings.txt"
+    path.write_text("disk_floor_gb=1\n", encoding="utf-8")
+    monkeypatch.setattr(SP, "NEW_PATH", str(path))
+    monkeypatch.delenv("APPDATA", raising=False)
+
+    cmd = fleet_cmd("C:/x/goals.jsonl", 4, "auto")
+    assert "--disk-floor-gb" not in cmd
 
 
 def test_deep_run_uses_local_transport_when_execution_profiles_enabled(tmp_path, monkeypatch):
