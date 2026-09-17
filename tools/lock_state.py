@@ -285,8 +285,16 @@ def matching_record(since: float, now: Optional[float] = None) -> dict:
 
 
 def record_classification(branch: str, *, resp_len: int, since: float,
-                          consumed: Optional[dict] = None) -> None:
-    """Note that a reader classified a reply as locked, and on what evidence. Never raises."""
+                          consumed: Optional[dict] = None,
+                          attribution: Optional[dict] = None) -> None:
+    """Note that a reader classified a reply as locked, and on what evidence. Never raises.
+
+    `attribution` says HOW SURE the branch could have been: which workers had a turn open at
+    the instant of the refusal it consumed, and therefore whether the refusal could only have
+    been this one's. Two of the three branches do not use identity at all -- by design, since
+    requiring it silenced them entirely above six workers -- and without this the cost of that
+    choice is invisible per run and survives only as a figure in a docstring.
+    """
     _append_log({
         "ts": time.time(),
         "event": "classified_locked",
@@ -294,6 +302,7 @@ def record_classification(branch: str, *, resp_len: int, since: float,
         "resp_len": int(resp_len),
         "turn_sent_at": float(since or 0.0),
         "consumed": consumed or {},
+        "attribution": attribution or {},
     })
 
 

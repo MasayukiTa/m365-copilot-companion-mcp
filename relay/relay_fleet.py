@@ -1085,7 +1085,7 @@ def _looks_locked(resp: str, since: float = 0.0, worker: str = "") -> bool:
         _recs = [r for r in _ls.matching_records(since)
                  if not str(r.get("detail") or "").startswith(NO_CONTEXT_REFUSAL)]
         if _recs and _mentions_being_locked(resp):
-            _note_locked("paraphrase", resp, since, _recs[-1])
+            _note_locked("paraphrase", resp, since, _recs[-1], worker)
             return True
     except Exception:
         pass
@@ -1143,13 +1143,41 @@ def _looks_locked(resp: str, since: float = 0.0, worker: str = "") -> bool:
             return False
         # Name the record actually decided on, not merely the last one to arrive. The note is
         # the only way to check afterwards whether a classification had evidence behind it.
-        _note_locked("fallback", resp, since, mine[-1])
+        _note_locked("fallback", resp, since, mine[-1], worker)
         return True
     except Exception:
         return False
 
 
-def _note_locked(branch, resp, since, consumed):
+def _attribution_of(consumed, worker=""):
+    """Who ELSE could that refusal have belonged to?
+
+    relay/turn_windows.candidates() already answers this and nothing asked it. A refusal
+    consumed by the prose or fallback branch carries no identity, so the only record of how
+    much was being assumed is the size of the candidate set at that instant. Never raises: a
+    note that cannot be taken must not change what the fleet does.
+    """
+    try:
+        ts = float((consumed or {}).get("ts") or 0)
+        if not ts:
+            return {}
+        from relay import turn_windows as _tw
+        cands = _tw.candidates(ts)
+        return {
+            "worker": str(worker or ""),
+            "candidates": cands,
+            "n_candidates": len(cands),
+            # EXCLUSIVE means the refusal could only have been this worker's. False covers
+            # both "several were in flight" and "nobody was", which are different and are
+            # both distinguishable from the list above.
+            "exclusive": len(cands) == 1 and bool(worker) and cands[0] == str(worker),
+            "session": str((consumed or {}).get("session") or ""),
+        }
+    except Exception:
+        return {}
+
+
+def _note_locked(branch, resp, since, consumed, worker=""):
     """Say which branch classified a reply as locked, and on what evidence. Never raises.
 
     Written because the last incident could not be reconstructed: five workers reported an
@@ -1160,7 +1188,8 @@ def _note_locked(branch, resp, since, consumed):
     try:
         from tools import lock_state
         lock_state.record_classification(branch, resp_len=len(resp or ""), since=since,
-                                         consumed=consumed)
+                                         consumed=consumed,
+                                         attribution=_attribution_of(consumed, worker))
     except Exception:
         pass
 

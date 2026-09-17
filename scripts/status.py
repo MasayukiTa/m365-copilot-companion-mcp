@@ -362,6 +362,55 @@ def section_fleet(rep):
                                    str(w.get("reason") or "")[:48]))
 
 
+def section_lock_attribution(rep, hours=24.0):
+    """Of the lock classifications made recently, how many could only have been that worker's?
+
+    A classification that names a worker without being able to establish it is not wrong on
+    its face -- it is the fleet choosing a visible unlock over a silent lock -- but the rate is
+    what says whether the choice is currently cheap or expensive, and nothing printed it.
+    """
+    from tools import settings_path as _sp          # for REPO, resolved in one place
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        ".fleet", "lock_refusals.jsonl")
+    if not os.path.isfile(path):
+        return
+    cutoff = time.time() - hours * 3600.0
+    total = exclusive = unknown = 0
+    by_branch = {}
+    try:
+        with io.open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or '"classified_locked"' not in line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if float(row.get("ts") or 0) < cutoff:
+                    continue
+                total += 1
+                by_branch[row.get("branch") or "?"] = by_branch.get(row.get("branch") or "?", 0) + 1
+                att = row.get("attribution") or {}
+                if not att:
+                    unknown += 1            # written before the field existed
+                elif att.get("exclusive"):
+                    exclusive += 1
+    except OSError:
+        return
+    if not total:
+        return
+    rep.section("lock attribution -- how often it could be established")
+    pct = 100.0 * exclusive / float(total)
+    rep.row(OK if pct >= 50 else UNK, "last %gh" % hours,
+            "%d classification(s), %d could only have been that worker (%.0f%%)"
+            % (total, exclusive, pct))
+    rep.row(OK, "  by branch", ", ".join("%s=%d" % kv for kv in sorted(by_branch.items())))
+    if unknown:
+        rep.row(UNK, "  no record", "%d were classified before the certainty was recorded"
+                % unknown)
+
+
 def section_settings(rep):
     """What each settings control does to a run, grouped by WHEN it lands.
 
@@ -426,6 +475,7 @@ def main(argv=None):
     rep.section("endpoints")
     health = _endpoints(rep)
     section_fleet(rep)
+    section_lock_attribution(rep)
     section_settings(rep)
     section_resources(rep)
     section_recent(rep)
