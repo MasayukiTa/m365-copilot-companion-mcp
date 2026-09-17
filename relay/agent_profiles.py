@@ -109,6 +109,12 @@ class AgentProfile:
     # RESEARCHER/ANALYST (see _env_agent_url above). Not consumed at runtime by
     # open_agent()/ask_agent() themselves -- purely informational metadata.
     url_is_default: bool = False
+    # How long an UNMARKED block must be before it can be this agent's finished answer.
+    # None means the module default (SUBSTANTIAL_CHARS = 1000), which is a statement about
+    # the Researcher: its status lines are short and can sit still long enough to look
+    # settled. An Analyst asked a direct question answers in one line, so the same floor
+    # made every short ANALYZE time out with the answer already on the screen (2026-09-17).
+    min_report_chars: int | None = None
 
 
 PLAIN = AgentProfile(name="plain", url="", model_picker=None,
@@ -136,6 +142,16 @@ ANALYST = AgentProfile(
     model_picker=None,
     end_timeout_s=900, dwell_s=8.0, appear_timeout_s=180,
     url_is_default=ANALYST_URL_IS_DEFAULT,
+    # AN ANALYST ANSWER IS SHORT, and the answer to "what six characters are on this picture"
+    # can legitimately BE six characters -- so length cannot discriminate here, and a number
+    # chosen to clear one measured example would be fitted to that example. What separates a
+    # status line from an answer is _is_processing (a known progress marker AND under 40
+    # chars), which runs one branch earlier. The 1000-char floor is a second, blunter net for
+    # status phrases whose marker is not listed: cheap for the Researcher, and for the Analyst
+    # it meant no short answer could ever be accepted -- every ANALYZE timed out at 600s with
+    # the answer already on the screen (measured 2026-09-17). 4 rejects stray whitespace and
+    # leaves the discrimination where it is implemented.
+    min_report_chars=4,
 )
 
 PROFILES = {p.name: p for p in (PLAIN, RESEARCHER, ANALYST)}
@@ -317,6 +333,11 @@ _MARKER_HEAD, _MARKER_TAIL = 400, 600
 #: when no completion marker is present. Named because it is one half of a pair:
 #: `_looks_like_clarification` caps at 900, and the gap between them is the
 #: whole point -- see the note there.
+#: How long a block has to be before it can be a finished report, when it carries no
+#: completion marker. A deep-research STATUS line is short and can sit still long enough to
+#: look settled, which is what this floor rejects. It is a statement about the Researcher, so
+#: AgentProfile.min_report_chars overrides it per agent -- see ANALYST, whose answers are one
+#: line and which timed out for 600s with its answer already on the screen.
 SUBSTANTIAL_CHARS = 1000
 
 
@@ -782,7 +803,19 @@ class ResearchSession:
             return self._done
         try:
             if self._t_send and time.time() - self._t_send > self.timeout_s:
-                self._fail("timeout: %ds without a finished report" % int(self.timeout_s))
+                # WHAT WAS ON THE SCREEN IS EVIDENCE. The sub-transcript used to record
+                # "(no report captured)", so an answer that was present but not accepted --
+                # the 2026-09-17 case exactly -- was indistinguishable from an agent that
+                # never replied. Best-effort: a failure to explain a failure must not raise.
+                try:
+                    seen = self.drv.read_last_response() or ""
+                except Exception:
+                    seen = ""
+                self._rejected = seen[:1500]
+                self._fail("timeout: %ds without a finished report%s"
+                           % (int(self.timeout_s),
+                              ("; last block on screen was %d chars" % len(seen)) if seen
+                              else "; nothing was on screen"))
                 return self._done
             if self.drv._answers().count() <= self._count_before:
                 return None
@@ -811,7 +844,13 @@ class ResearchSession:
             # a stable, SUBSTANTIAL block (completion marker OR >=1000 chars) is the finished
             # report; a short stalled status line is not (same gate as _wait_research_done). The
             # marker appears at the report header then the body streams, so require the full dwell.
-            substantial = _report_marker(t) or len(t) >= SUBSTANTIAL_CHARS
+            # getattr THROUGH the session too: unit tests build a ResearchSession with
+            # __new__ and set only the fields they exercise, so self.profile may not exist.
+            # A completion test that raises on a minimal object is a completion test that
+            # fails closed for the wrong reason.
+            _prof = getattr(self, "profile", None)
+            floor = getattr(_prof, "min_report_chars", None) or SUBSTANTIAL_CHARS
+            substantial = _report_marker(t) or len(t) >= floor
             if _settle.unified():
                 # THE ONE RULE. This site had no sample requirement either -- only a dwell,
                 # doubled unconditionally -- so a deep-research report that paused mid-stream

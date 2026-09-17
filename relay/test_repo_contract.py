@@ -100,8 +100,13 @@ def test_the_composed_body_still_ends_with_the_goal():
 # first turn (see the comments at those two edit sites in copilot_autopilot_relay.py). The
 # contract-prefix wiring this file's part (b) tests is unaffected: the contract still lands
 # ahead of the goal, never inside PROTOCOL's tail.
-_PROTOCOL_SHA256 = "d9500bac384e5b2a618001da0291b4b2b86ac557521c841b3b91eb66d4956771"
-_PROTOCOL_LEN = 1147
+#: RE-PINNED 2026-09-17 (+11 chars). ANALYZE was introduced to the worker as データ分析,
+#: so a worker told in its own goal to open a PNG with ANALYZE never emitted one --
+#: reading six characters off a picture is not what that phrase describes, and
+#: read_image was sitting there claiming to do it. Renamed for what it does (attach the
+#: file so the model itself can look), and the next run emitted the line on turn 1.
+_PROTOCOL_SHA256 = "245ea0237786483f99698d186564339528e9229477fde34fa2fb4ebabf97538a"
+_PROTOCOL_LEN = 1158
 
 
 def _protocol():
