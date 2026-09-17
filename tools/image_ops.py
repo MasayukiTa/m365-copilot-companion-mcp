@@ -167,11 +167,25 @@ def _fit_to_character_budget(data: bytes, suffix: str):
 
 
 def read_image(path: str, max_dimension: Optional[int] = 1600) -> str:
-    """Read an image file and return it as a data URI so a vision model can see it.
+    """Read an image file and return it as a base64 data URI -- TEXT, not a picture.
 
-    Use this to verify a chart/diagram/screenshot was generated correctly before
-    reporting completion. The returned string is `data:image/<type>;base64,...`
-    and is directly consumable by vision-capable LLMs.
+    NOTHING IN THIS STACK SEES THE RESULT. The return type is `str`, and FastMCP serialises a
+    str as a text content block; no client here renders that as an image. Measured 2026-09-17:
+    a worker asked to read six characters off a picture called this tool and then answered a
+    string that was not on it, twice, describing both times how it had looked. The refuter
+    caught it both times.
+
+    So do not use this to check what a picture LOOKS like. Use instead:
+
+      * `ocr_image(path)` for text in the picture -- measured on the same file, it returned the
+        six characters exactly.
+      * `run_python` with PIL/numpy for pixel facts -- dimensions, a colour at a point, whether
+        a region is blank. Deterministic, and cheap.
+      * `ANALYZE: <absolute path> | <instruction>` as the last line of your turn, to put the
+        file in front of Copilot itself through a real file attachment. That is the only path
+        in this repository that shows a picture to a model.
+
+    THE COST IS NOT SMALL. Median 142,642 characters per call over 424 calls.
 
     Args:
         path: Image path (.png, .jpg, .jpeg, .gif, .bmp, .webp).

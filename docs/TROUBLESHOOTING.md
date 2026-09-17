@@ -78,7 +78,7 @@ Gitで導入した環境では、`start_all.bat` が起動前に更新を確認�
 |---|---|
 | ツール一覧に出るのに呼ぶとエラー | そのツールの前提タグ（🪟 / 📦）を確認。対応する OS / アプリ / ライブラリを入れるか、その環境では使わない |
 | `odbc_*` が接続不可 | ODBC Driver 18 for SQL Server をインストール、`odbc_drivers` で確認 |
-| `ocr_*` が空を返す | Tesseract と言語データ（`jpn.traineddata` 等）を入れて `which("tesseract")` で確認。または `read_image` で Opus に直接読ませる |
+| `ocr_*` が空を返す | Tesseract と言語データ（`jpn.traineddata` 等）を入れて `which("tesseract")` で確認。`read_image` は代替にならない（base64 のテキストが返るだけで、どのモデルも見ていない。2026-09-17 実測）。どうしても人の目が要るなら `ANALYZE: <絶対パス> | <指示>` で実添付する |
 | `pptx_export_png` 失敗 | ホスト PC に Microsoft PowerPoint がインストールされている必要あり（COM 経由） |
 | `outlook_*` 失敗 | ホストに Outlook 本体が必要。なければ Copilot Studio の純正メールコネクタ側でやる |
 | `render_diagram` で SSL エラー | 社内プロキシが Kroki をブロック。CA bundle を直すか、本ツールを使わず matplotlib でローカル描画させる |
