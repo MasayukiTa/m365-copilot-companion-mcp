@@ -6476,12 +6476,86 @@ class CockpitWindow : Window
     }
 
     // One labeled −/+ stepper row for the settings panel. label on the left, [− value +] on the right.
+    //: WHEN A CONTROL TAKES EFFECT. Mirrors tools/settings_keys.py, which is the declaration;
+    //: test_the_panel_states_the_same_timing_the_declaration_does pins the two together.
+    //:
+    //: This is a copy on purpose. ui/rebuild_ui.ps1 enumerates its .cs files by hand, so a
+    //: shared file added and forgotten breaks a button silently -- a trap this repository has
+    //: already sprung. Copies are allowed; disagreeing copies are not.
+    static string SettingsTiming(string key)
+    {
+        switch (key)
+        {
+            case "disk_floor_gb":
+            case "ram_floor_mb":
+            case "maxtabs":
+                return "live";
+            case "rate_ceiling_rpm":
+            case "job_approval_mode":
+                return "each_gate";
+            case "session_retention_days":
+            case "session_max_mb":
+                return "bridge_start";
+            case "autoscale":
+            case "autoscale_max":
+            case "autoscale_per_tab_mb":
+            case "effort":
+            case "autoretry":
+            case "autoretry_max":
+            case "fanout":
+            case "fleet_log_days":
+            case "fleet_store_days":
+            case "fleet_scratch_days":
+            case "fleet_compress_hours":
+                return "sweep_start";
+            default:
+                return "ui_only";
+        }
+    }
+
+    //: The operator-facing words. Short enough to sit beside a label without wrapping, and
+    //: never "applied" -- the panel writes a file; whether the fleet has read it is a fact the
+    //: panel does not have, and showing the first as the second is the 2026-09-16 misreport.
+    string TimingBadge(string key)
+    {
+        bool ja = _lang == 0;
+        switch (SettingsTiming(key))
+        {
+            case "live":         return ja ? "実行中に反映" : "affects a running fleet";
+            case "each_gate":    return ja ? "次の判定から"   : "from the next decision";
+            case "sweep_start":  return ja ? "次の実行から"   : "from the next run";
+            case "bridge_start": return ja ? "bridge再起動後" : "after a bridge restart";
+            default:             return "";
+        }
+    }
+
     UIElement SettingsStepperRow(string label, TextBlock valueBlock, Button minus, Button plus)
+    {
+        return SettingsStepperRow(label, valueBlock, minus, plus, null);
+    }
+
+    UIElement SettingsStepperRow(string label, TextBlock valueBlock, Button minus, Button plus,
+                                 string settingsKey)
     {
         var row = new DockPanel(); row.Margin = new Thickness(0, 5, 0, 5); row.LastChildFill = false;
         var lbl = new TextBlock(); lbl.Text = label; lbl.Foreground = Fg; lbl.FontSize = 12.5;
         lbl.VerticalAlignment = VerticalAlignment.Center;
         DockPanel.SetDock(lbl, Dock.Left); row.Children.Add(lbl);
+        // WHEN IT TAKES EFFECT, beside the label rather than in a tooltip. Three of these
+        // controls change a fleet that is already running and the rest do not, and nothing on
+        // the screen distinguished them -- so "I changed it and nothing happened" was an
+        // ordinary experience with no way to tell it from a defect.
+        if (!string.IsNullOrEmpty(settingsKey))
+        {
+            string badge = TimingBadge(settingsKey);
+            if (!string.IsNullOrEmpty(badge))
+            {
+                var when = new TextBlock(); when.Text = badge; when.Foreground = Muted;
+                when.FontSize = 10.5; when.Margin = new Thickness(8, 0, 0, 0);
+                when.VerticalAlignment = VerticalAlignment.Center;
+                DockPanel.SetDock(when, Dock.Left); row.Children.Add(when);
+            }
+        }
         var stp = new StackPanel(); stp.Orientation = Orientation.Horizontal;
         stp.VerticalAlignment = VerticalAlignment.Center;
         DockPanel.SetDock(stp, Dock.Right);
@@ -6711,25 +6785,25 @@ class CockpitWindow : Window
         var startPlus = MiniButton("+"); startPlus.Click += delegate { SetMaxTabs(_maxtabs + 1); };
         _maxMinus = startMinus; _maxPlus = startPlus;   // keep refs so PaintChrome re-themes them (mirrors ceiling)
         _maxValue = new TextBlock(); _maxValue.Text = _maxtabs.ToString();
-        col.Children.Add(SettingsStepperRow(T("def_tabs"), _maxValue, startMinus, startPlus));
+        col.Children.Add(SettingsStepperRow(T("def_tabs"), _maxValue, startMinus, startPlus, "maxtabs"));
         // ceiling stepper -- reuses _autoLbl/_autoMinus/_autoValue/_autoPlus via CeilingStepper fields
         var ceilMinus = MiniButton("−"); ceilMinus.Click += delegate { SetAutoMax(_autoMax - 1); };
         var ceilPlus = MiniButton("+"); ceilPlus.Click += delegate { SetAutoMax(_autoMax + 1); };
         _autoValue = new TextBlock(); _autoValue.Text = _autoMax.ToString();
         _autoMinus = ceilMinus; _autoPlus = ceilPlus;   // keep refs so UpdateAutoEnabled can grey them
-        col.Children.Add(SettingsStepperRow(T("max_tabs2"), _autoValue, ceilMinus, ceilPlus));
+        col.Children.Add(SettingsStepperRow(T("max_tabs2"), _autoValue, ceilMinus, ceilPlus, "autoscale_max"));
 
         // ── Conversation retention: days + size cap, both defaulting to "keep everything" ──
         col.Children.Add(SectionHeader(T("set_retention_section")));
         var retDMinus = MiniButton("−"); retDMinus.Click += delegate { SetRetDays(_retDays - (_retDays > 30 ? 30 : 7)); };
         var retDPlus = MiniButton("+"); retDPlus.Click += delegate { SetRetDays(_retDays + (_retDays >= 30 ? 30 : 7)); };
         _retDaysValue = new TextBlock(); _retDaysValue.Text = _retDays == 0 ? T("ret_keep") : _retDays.ToString();
-        col.Children.Add(SettingsStepperRow(T("ret_days"), _retDaysValue, retDMinus, retDPlus));
+        col.Children.Add(SettingsStepperRow(T("ret_days"), _retDaysValue, retDMinus, retDPlus, "session_retention_days"));
 
         var retMMinus = MiniButton("−"); retMMinus.Click += delegate { SetRetMb(_retMb - RetMbStep()); };
         var retMPlus = MiniButton("+"); retMPlus.Click += delegate { SetRetMb(_retMb + RetMbStep()); };
         _retMbValue = new TextBlock(); _retMbValue.Text = _retMb == 0 ? T("ret_keep") : _retMb.ToString();
-        col.Children.Add(SettingsStepperRow(T("ret_mb"), _retMbValue, retMMinus, retMPlus));
+        col.Children.Add(SettingsStepperRow(T("ret_mb"), _retMbValue, retMMinus, retMPlus, "session_max_mb"));
 
         _retNote = new TextBlock();
         _retNote.FontSize = 11; _retNote.TextWrapping = TextWrapping.Wrap;
@@ -6743,7 +6817,7 @@ class CockpitWindow : Window
         var rcPlus = MiniButton("+"); rcPlus.Click += delegate { SetRateCeiling(_rateCeiling + RATE_STEP); };
         _rateCeilingValue = new TextBlock();
         _rateCeilingValue.Text = _rateCeiling == 0 ? T("ret_keep") : _rateCeiling.ToString();
-        col.Children.Add(SettingsStepperRow(T("rate_rpm"), _rateCeilingValue, rcMinus, rcPlus));
+        col.Children.Add(SettingsStepperRow(T("rate_rpm"), _rateCeilingValue, rcMinus, rcPlus, "rate_ceiling_rpm"));
         var rcNote = new TextBlock();
         rcNote.FontSize = 11; rcNote.TextWrapping = TextWrapping.Wrap;
         rcNote.Margin = new Thickness(0, 2, 0, 2); rcNote.MaxWidth = 300;
@@ -6755,12 +6829,12 @@ class CockpitWindow : Window
         var flMinus = MiniButton("−"); flMinus.Click += delegate { SetFleetLogDays(_fleetLogDays - 7); };
         var flPlus = MiniButton("+"); flPlus.Click += delegate { SetFleetLogDays(_fleetLogDays + 7); };
         _fleetLogDaysValue = new TextBlock(); _fleetLogDaysValue.Text = _fleetLogDays.ToString();
-        col.Children.Add(SettingsStepperRow(T("fleet_log_days"), _fleetLogDaysValue, flMinus, flPlus));
+        col.Children.Add(SettingsStepperRow(T("fleet_log_days"), _fleetLogDaysValue, flMinus, flPlus, "fleet_log_days"));
 
         var fsMinus = MiniButton("−"); fsMinus.Click += delegate { SetFleetStoreDays(_fleetStoreDays - 7); };
         var fsPlus = MiniButton("+"); fsPlus.Click += delegate { SetFleetStoreDays(_fleetStoreDays + 7); };
         _fleetStoreDaysValue = new TextBlock(); _fleetStoreDaysValue.Text = _fleetStoreDays.ToString();
-        col.Children.Add(SettingsStepperRow(T("fleet_store_days"), _fleetStoreDaysValue, fsMinus, fsPlus));
+        col.Children.Add(SettingsStepperRow(T("fleet_store_days"), _fleetStoreDaysValue, fsMinus, fsPlus, "fleet_store_days"));
 
         var flNote = new TextBlock();
         flNote.FontSize = 11; flNote.TextWrapping = TextWrapping.Wrap;
@@ -6785,7 +6859,7 @@ class CockpitWindow : Window
         var capMinus = MiniButton("−"); capMinus.Click += delegate { SetAutoRetryMax(_autoRetryMax - 1); };
         var capPlus = MiniButton("+"); capPlus.Click += delegate { SetAutoRetryMax(_autoRetryMax + 1); };
         _autoRetryCapVal = new TextBlock(); _autoRetryCapVal.Text = _autoRetryMax.ToString();
-        col.Children.Add(SettingsStepperRow(T("cap"), _autoRetryCapVal, capMinus, capPlus));
+        col.Children.Add(SettingsStepperRow(T("cap"), _autoRetryCapVal, capMinus, capPlus, "autoretry_max"));
 
         // ── P2 (c): Auto-archive on finish (default OFF) ──
         col.Children.Add(SectionHeader(T("set_archive_section")));
@@ -6807,12 +6881,12 @@ class CockpitWindow : Window
         var dfMinus = MiniButton("−"); dfMinus.Click += delegate { SetDiskFloor(_diskFloor - 1.0); };
         var dfPlus = MiniButton("+"); dfPlus.Click += delegate { SetDiskFloor(_diskFloor + 1.0); };
         _diskFloorVal = new TextBlock(); _diskFloorVal.Text = FmtFloor(_diskFloor);
-        col.Children.Add(SettingsStepperRow(T("disk_floor"), _diskFloorVal, dfMinus, dfPlus));
+        col.Children.Add(SettingsStepperRow(T("disk_floor"), _diskFloorVal, dfMinus, dfPlus, "disk_floor_gb"));
         // RAM floor (MB) -- the free-RAM reserve the autoscale keeps for the user (256 MB steps)
         var rfMinus = MiniButton("−"); rfMinus.Click += delegate { SetRamFloor(_ramFloor - 256.0); };
         var rfPlus = MiniButton("+"); rfPlus.Click += delegate { SetRamFloor(_ramFloor + 256.0); };
         _ramFloorVal = new TextBlock(); _ramFloorVal.Text = ((int)_ramFloor).ToString();
-        col.Children.Add(SettingsStepperRow(T("ram_floor"), _ramFloorVal, rfMinus, rfPlus));
+        col.Children.Add(SettingsStepperRow(T("ram_floor"), _ramFloorVal, rfMinus, rfPlus, "ram_floor_mb"));
         var hint = new TextBlock(); hint.Text = T("disk_floor_hint"); hint.Foreground = Muted;
         hint.FontSize = 10.5; hint.TextWrapping = TextWrapping.Wrap; hint.Margin = new Thickness(0, 0, 0, 2);
         hint.MaxWidth = 300;   // the cap its four sibling notes already carry

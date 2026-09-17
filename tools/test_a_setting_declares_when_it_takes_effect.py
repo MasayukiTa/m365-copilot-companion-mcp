@@ -271,3 +271,59 @@ def test_an_undeclared_key_is_not_silently_given_a_default():
     with pytest.raises(KeyError):
         SK.default("a_key_nobody_declared")
     assert SK.effect("a_key_nobody_declared") is None
+
+# ------------------------------------------------------------------ the panel says it too
+def _panel_timing_map():
+    """Parse SettingsTiming's switch out of the cockpit: case labels fall through to a return."""
+    body = _read("ui/FleetCockpit.cs", encoding="utf-8-sig")
+    i = body.index("static string SettingsTiming(string key)")
+    block = body[i:body.index("string TimingBadge(string key)", i)]
+    mapping, pending = {}, []
+    for line in block.splitlines():
+        line = line.strip()
+        m = re.match(r'case "([a-z_]+)":$', line)
+        if m:
+            pending.append(m.group(1))
+            continue
+        m = re.match(r'return "([a-z_]+)";$', line)
+        if m and pending:
+            for key in pending:
+                mapping[key] = m.group(1)
+            pending = []
+    return mapping
+
+
+def test_the_panel_states_the_same_timing_the_declaration_does():
+    """A control that says "affects a running fleet" while the fleet reads it once at launch
+    is worse than a control that says nothing: it converts an operator's correct observation
+    into a reason to doubt themselves."""
+    panel = _panel_timing_map()
+    assert panel, "SettingsTiming's switch could not be parsed -- this test lost its subject"
+    for key, said in sorted(panel.items()):
+        assert SK.effect(key) == said, \
+            "the panel calls %s %r; the declaration says %r" % (key, said, SK.effect(key))
+
+
+def test_every_key_the_panel_can_change_carries_a_timing():
+    """ui_only is the default arm of that switch, so a key the panel writes and forgets to
+    name silently reads as window state -- the one answer that promises nothing."""
+    written = set()
+    body = _read("ui/FleetCockpit.cs", encoding="utf-8-sig")
+    written |= set(re.findall(r'SaveKey\(\s*"([a-z_]+)"', body))
+    panel = _panel_timing_map()
+    missing = sorted(k for k in written
+                     if SK.effect(k) != SK.UI_ONLY and k not in panel)
+    assert not missing, ("the panel writes these but its own timing switch does not name "
+                         "them, so they fall through to ui_only: %r" % missing)
+
+
+def test_the_panel_never_claims_a_setting_was_applied():
+    """THE 2026-09-16 MISREPORT, in one sentence: the panel knows it wrote a file, and that is
+    not the same fact as the fleet having read it. For a month the screen said 1 GB while every
+    run reserved 4, and nothing on the screen was lying about what it knew."""
+    body = _read("ui/FleetCockpit.cs", encoding="utf-8-sig")
+    i = body.index("string TimingBadge(string key)")
+    block = body[i:i + 1200]
+    for claim in ("適用済", "Applied", "applied"):
+        assert claim not in block, \
+            "TimingBadge says %r -- the panel cannot know the consumer has read the file" % claim
