@@ -878,7 +878,11 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
                 _trace.record(name, _args, True, _out, fn)
             if _ledger is not None and _cid:
                 try:
-                    _ledger.record_outcome(_cid, ok=True, result=_out,
+                    # `tool=name` so the ledger can tell whether this result is a secret in
+                    # itself. It can also look the id up, but the lookup is a convenience for
+                    # callers that do not know; the gateway does, and the one place that knows
+                    # should say so.
+                    _ledger.record_outcome(_cid, ok=True, result=_out, tool=name,
                                            duration_s=time.time() - _t0)
                 except Exception:
                     pass

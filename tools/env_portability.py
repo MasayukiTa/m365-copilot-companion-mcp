@@ -148,21 +148,40 @@ def repair_unlock_password(env_path: str, environ=None) -> dict:
     import shutil
 
     fresh = binascii.hexlify(_os.urandom(8)).decode("ascii")   # same shape setup.ps1 generates
+
+    # THE ONE VALUE NO CALLER CAN SCRUB IS THE ONE THIS FUNCTION INVENTS.
+    #
+    # Every reason string below is built from an exception, and a Python exception routinely
+    # carries the offending value in its message -- `protect_secret(fresh)` most of all, since
+    # `fresh` is its argument. scripts/repair_unlock.py removes .env's values from whatever it
+    # prints, which is the right idea and cannot reach this one: `fresh` was minted here, a
+    # moment ago, and is in no .env anyone parsed. So a failure to protect the new password
+    # could print the new password, on a stream scripts/start_all.ps1 captures into logs, from
+    # a public repository. Flagged as py/clear-text-logging-sensitive-data (alert #32) and it
+    # was not a false positive: the sanitizer downstream was scrubbing the wrong set.
+    #
+    # Redacted here, where the value is known exactly, rather than asking every caller to be
+    # told about a secret it otherwise never sees. No length floor: this is not a guess about
+    # which strings might be secret, it is the secret.
+    def _said(exc):
+        """The exception's text with the new password taken out of it."""
+        return str(exc).replace(fresh, "<redacted:new unlock password>")
+
     try:
         protected = protect_secret(fresh)
     except Exception as exc:
-        return {"acted": False, "reason": "cannot protect a new value here: %s" % exc}
+        return {"acted": False, "reason": "cannot protect a new value here: %s" % _said(exc)}
 
     try:
         with open(env_path, "r", encoding="utf-8-sig") as fh:
             text = fh.read()
     except Exception as exc:
-        return {"acted": False, "reason": "cannot read %s: %s" % (env_path, exc)}
+        return {"acted": False, "reason": "cannot read %s: %s" % (env_path, _said(exc))}
 
     try:
         shutil.copyfile(env_path, env_path + ".before-unlock-repair")
     except Exception as exc:
-        return {"acted": False, "reason": "refusing to edit without a backup: %s" % exc}
+        return {"acted": False, "reason": "refusing to edit without a backup: %s" % _said(exc)}
 
     out, replaced = [], False
     for line in text.splitlines():

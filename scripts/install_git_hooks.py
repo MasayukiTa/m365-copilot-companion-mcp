@@ -32,9 +32,15 @@ def install(repo=REPO):
     _run(["git", "-C", repo, "config", "core.hooksPath", HOOKS_DIR], check=True)
     # Git on POSIX needs the bit; on Windows it is ignored, and setting it anyway keeps a
     # clone made on one platform working on the other.
+    #
+    # 0o700, NOT 0o755. The hook runs as whoever runs `git commit` in this clone, which is the
+    # one account that already owns every file here -- group and other never need to read or
+    # execute it, and a pre-commit hook is a file that runs on every commit, so a writable or
+    # broadly reachable copy of it is a foothold rather than a convenience. Flagged as
+    # py/overly-permissive-file (alert #34) and it was my own line from the same day.
     hook = os.path.join(repo, HOOKS_DIR, "pre-commit")
     try:
-        os.chmod(hook, 0o755)
+        os.chmod(hook, 0o700)
     except OSError:
         pass
     return current_hooks_path(repo)

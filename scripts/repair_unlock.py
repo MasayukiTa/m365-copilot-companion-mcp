@@ -27,7 +27,7 @@ import os
 import sys
 
 
-def _scrub(text: str, env: dict) -> str:
+def _scrub(text: str, env: dict, known_secrets=()) -> str:
     """Exception text with every .env VALUE removed, each replaced by its own key name.
 
     The line below prints the exception raised by repair_unlock_password(env_path, env), and
@@ -42,6 +42,19 @@ def _scrub(text: str, env: dict) -> str:
     uselessness -- and a secret that short is not one.
     """
     out = str(text)
+    # KNOWN SECRETS FIRST, AND WITH NO LENGTH FLOOR. The floor below is right for the blanket
+    # sweep -- it is guessing which of .env's values are worth redacting, and a two-character
+    # value matches everywhere -- and it is wrong for a value we have been told IS the secret.
+    #
+    # This argument exists because the sweep was scrubbing the wrong set entirely. `env` is the
+    # .env as it was parsed, and repair_unlock_password's whole job is to mint a password that
+    # is in no .env anybody parsed, so the one value most in need of removal was the one value
+    # this function could never see. The mint site now redacts its own (tools/env_portability),
+    # and this takes whatever comes back out, so neither half is trusted alone.
+    for v in known_secrets:
+        v = str(v or "")
+        if v and v in out:
+            out = out.replace(v, "<redacted:secret>")
     for key, val in sorted((env or {}).items(), key=lambda kv: -len(str(kv[1] or ""))):
         v = str(val or "")
         if len(v) >= 6 and v in out:
@@ -75,7 +88,8 @@ def main() -> int:
     # quoted the offending value would put it on this stream just as surely as printing
     # `password` did. Scrubbing at the boundary means the later prints do not each have to
     # remember; the cost is one pass over a short string.
-    reason = _scrub(str(result.get("reason") or ""), env)
+    reason = _scrub(str(result.get("reason") or ""), env,
+                    known_secrets=(result.get("password"),))
     if not result.get("acted"):
         print("noop:%s" % reason)
         return 0
