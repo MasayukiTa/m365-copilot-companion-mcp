@@ -95,6 +95,32 @@ def _targets(min_side: int):
     return out
 
 
+def task_paths(out_dir):
+    """(picture, answers) for a task directory. The picture is alone in its own folder.
+
+    SEPARATE BY CONSTRUCTION, because they used to be siblings. task.json lists rect_image for
+    every target, so naming the picture to a worker named the answers -- measured 2026-09-17,
+    when a worker asked to locate a window read the rectangle out of task.json and returned its
+    exact centre. Nothing about that answer distinguishes it from having looked.
+
+    Hiding the file would not have worked: an agent that can list a directory can list a
+    longer name, and dropping the rectangles would break the scorer, which needs them.
+
+    THE TRUTH IS A SIBLING OF THE TASK DIRECTORY, NOT A PARENT OF THE PICTURE. One level of
+    separation only defeats a listing; `..` defeats it, and any agent with read access has
+    `..`. Walking up from the picture now yields a directory containing one folder, and
+    walking up again yields the temp root, where the truth is one entry among many.
+
+    THIS IS NOT SECRECY, and pretending otherwise would be the same class of error as the leak
+    itself. An agent that goes looking will find it. What this buys is that the lazy path --
+    list the directory you were handed -- no longer returns the answer, so a worker that
+    produces the exact rectangle centre has to have searched for it, and that search is in its
+    transcript where a reader can see it.
+    """
+    return (os.path.join(out_dir, "stimulus", "screen.png"),
+            os.path.join(out_dir + "-truth", "task.json"))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out", default="", help="directory to write the task into")
@@ -114,8 +140,17 @@ def main(argv=None):
         os.environ.get("TEMP", "."), "grounding-%s" % time.strftime("%Y%m%d-%H%M%S"))
     os.makedirs(out_dir, exist_ok=True)
 
+    # THE ANSWERS DO NOT SIT BESIDE THE QUESTION. task.json lists rect_image for every target,
+    # and it used to live in this directory next to screen.png -- so naming the image to a
+    # worker named the answers. Measured 2026-09-17: asked where a window was, a worker read
+    # the rectangle out of task.json and returned its exact centre, which is indistinguishable
+    # from grounding in the answer alone. The stimulus now gets a directory containing one
+    # file; a listing beside the image yields the image.
+    png, task_path = task_paths(out_dir)
+    os.makedirs(os.path.dirname(png), exist_ok=True)
+    os.makedirs(os.path.dirname(task_path), exist_ok=True)
+
     img, frame = capture(max_dimension=args.max_dimension)
-    png = os.path.join(out_dir, "screen.png")
     img.save(png, optimize=True)
 
     targets = _targets(args.min_side)
@@ -194,13 +229,15 @@ def main(argv=None):
         "image_pixel_covers_desktop_px": round(frame.scale, 3),
         "targets": items,
     }
-    task_path = os.path.join(out_dir, "task.json")
     with open(task_path, "w", encoding="utf-8") as fh:
         json.dump(task, fh, ensure_ascii=False, indent=1)
 
     print(task["capture"])
     print(frame.describe())
     print("wrote %s  (%d target(s), split=%s)" % (task_path, len(items), args.split))
+    print("ASK ABOUT: %s" % png)
+    print("   -- that directory holds the picture and nothing else. Do not give a worker the")
+    print("      path of this task file: it lists every answer.")
     withheld = sum(reasons.values())
     if withheld:
         print("withheld %d of %d target(s):" % (withheld, len(targets)))
