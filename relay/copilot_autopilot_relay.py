@@ -355,7 +355,12 @@ PROTOCOL = (
     "パスは必ず「/」区切り(例 C:/dir/file)、バックスラッシュ禁止(\\t等に化ける)。"
     "ファイル/画像/データの大量処理は1ターンに1件だけ処理し、都度ディスク(Excel等)に保存して次へ"
     "(まとめて読むと OpenAIModelTokenLimit で失敗)。各ターン冒頭で保存済み状態を見て未処理の続きから。"
-    "深い調査は行頭 `RESEARCH: 内容`、データ分析は `ANALYZE: 絶対パス | 指示`。"
+    # ANALYZE IS THE ONLY WAY A MODEL SEES A FILE. It attaches the real file to the page, so
+    # it is what you use when the answer is IN a picture or a spreadsheet rather than about
+    # one. Called "データ分析" until 2026-09-17, when a worker told in its own goal to open a
+    # PNG with ANALYZE never emitted one: reading characters off an image is not what that
+    # phrase describes, and read_image was sitting there claiming to do it.
+    "深い調査は行頭 `RESEARCH: 内容`、画像や表を実際に見るには `ANALYZE: 絶対パス | 指示`(実添付)。"
     "各ターン最終行に必ず: 続行=CONTINUE、完了(検証も通過)=DONE、行き詰まり=STUCK: 理由。"
     # TRIMMED 2026-09-15: dropped the standalone "STUCK を出す前に必ず call_tool(name='') で
     # 一覧を見直し...確かめること。ツールを一度も叩かずに STUCK と書いてはならない。" sentence.
