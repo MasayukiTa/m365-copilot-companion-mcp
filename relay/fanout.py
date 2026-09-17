@@ -28,6 +28,8 @@ import json
 
 import hashlib
 import re
+from typing import Any          # `dict[Any, dict]` below; a local annotation is not evaluated,
+                                # so this missing import never raised and was never noticed.
 
 from relay.planner import _clean_step, extract_plan
 from relay.control_markers import CLOSING_INSTRUCTION

@@ -1361,11 +1361,38 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
     return _snap
 
 
+#: How long to keep trying to replace a status file a reader is holding open. The cockpit
+#: polls status.json about once a second and holds it for a few milliseconds; a second of
+#: retries covers that by a wide margin without turning a real permission problem into a hang.
+_REPLACE_DEADLINE_S = 1.0
+
+
 def _write_atomic(path, payload):
+    """Write `payload` as JSON, replacing `path` atomically.
+
+    RETRIED, BECAUSE A READER CAN REFUSE THE REPLACEMENT. os.replace is atomic on Windows and
+    POSIX both -- and on Windows it is also DENIED while another process holds the destination
+    open without FILE_SHARE_DELETE. The cockpit reads this file about once a second, so the
+    collision is not bad luck; it is a reader that is always there. Measured 2026-09-17: a
+    coordinator died before its first turn on WinError 5 replacing status.json, and the queue
+    recorded the run as started.
+
+    The deadline is short and the exception is re-raised after it. A status file that truly
+    cannot be written is a real failure -- a fleet with no status is a fleet the panel shows
+    as dead -- so this turns a lost race into a delay, never into a silent skip.
+    """
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False)
-    os.replace(tmp, path)   # atomic on Windows + POSIX
+    deadline = time.time() + _REPLACE_DEADLINE_S
+    while True:
+        try:
+            os.replace(tmp, path)   # atomic on Windows + POSIX
+            return
+        except PermissionError:
+            if time.time() >= deadline:
+                raise
+            time.sleep(0.05)
 
 
 # ── RUN-RESUME ledger ──────────────────────────────────────────────────────────
@@ -2299,7 +2326,6 @@ def main():
     #
     # on_tick fires every poll_s (1.0 s), so "the operator changes a setting and the
     # run changes" is a second, not a restart.
-    settings_follower = build_settings_follower(disk_box, ram_box, mc_box, asc_box)
 
     # write an initial 'launching' snapshot so the cockpit shows something at once
     _write_atomic(status_path, {"started": started, "updated": started,
@@ -2356,6 +2382,12 @@ def main():
     print("       resolver   : %s" % (getattr(_settings_float, "__module__", "?"),))
 
     mc_box = [max_conc]                # live concurrency cap (cockpit can change it)
+    # BUILT HERE, AFTER EVERY BOX EXISTS. This used to be an inline block 56 lines up,
+    # where four closures referenced these lists lazily and the ordering never mattered.
+    # Extracting it turned those closures into arguments, and arguments are resolved at
+    # the call: every fleet run died at startup with UnboundLocalError on mc_box, while
+    # the queue recorded each one as started. Order is checkable; deferral was not.
+    settings_follower = build_settings_follower(disk_box, ram_box, mc_box, asc_box)
     add_box = []                       # goals queued mid-run (native chat / cockpit)
     pause_box = [False]                # cockpit pause toggle: freeze the fleet without losing
                                        # state (e.g. across a network switch); resume to continue

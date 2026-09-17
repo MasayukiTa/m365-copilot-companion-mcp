@@ -47,6 +47,19 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
+      # A NAME THAT DOES NOT EXIST IS NOT A STYLE PROBLEM. On 2026-09-17 a block moved out
+      # of a 700-line main() turned four closures into four arguments; a closure resolves when
+      # it fires, an argument resolves at the call, and the box it needed was assigned 56 lines
+      # later. Every fleet run died at startup and the whole suite stayed green, because
+      # nothing calls main(). F821 finds that at the call line in under a second.
+      - name: Install the linter used for the undefined-name gate
+        run: pip install ruff==0.4.1
+
+      - name: No undefined names (F821) in tracked Python
+        shell: bash
+        run: |
+          git ls-files '*.py' -z | xargs -0 ruff check --select F821 --isolated
+
       - name: Audit hermetic test manifest
         run: python scripts/check_ci_test_manifest.py
 
@@ -97,6 +110,8 @@ jobs:
             tools/test_a_setting_declares_when_it_takes_effect.py \
             scripts/test_a_guard_nobody_runs_is_not_a_guard.py \
             bench/test_a_bench_must_not_overrule_the_operators_floor.py \
+            tests/test_a_name_that_does_not_exist_is_not_a_style_problem.py \
+            relay/test_a_panel_reading_a_file_must_not_kill_the_run.py \
             tests/test_a_question_nobody_can_fail_is_not_a_question.py \
             tools/test_fleet_intake.py \
             tools/test_a_locked_out_worker_should_not_clone_its_own_work.py \

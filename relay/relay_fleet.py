@@ -6994,9 +6994,15 @@ def _with_matched_skill(goal_text, want_body=True):
             return ("%s【承認済み手順あり】この作業には承認済みの手順 `%s` が一致しました"
                     "（score %s）。%s\n必要なら call_tool(name='skill_load', "
                     "arguments={'name': '%s'}) で全文を読み、その手順どおりに進めてください。"
-                    "\n%s\n\n%s"
+                    # THE FOOTER WAS ALWAYS EMPTY. This read
+                    # `_SKILL_FOOTER if "_SKILL_FOOTER" in globals() else ""`, and nothing
+                    # anywhere defines _SKILL_FOOTER -- so the guard's true branch was
+                    # unreachable, and the guard was the only thing keeping an undefined name
+                    # from being noticed. Written as the empty line it has always produced,
+                    # so the rendered text is byte-identical.
+                    "\n\n\n%s"
                     % (_SKILL_HEADER, hit["name"], hit.get("score"), desc, hit["name"],
-                       _SKILL_FOOTER if "_SKILL_FOOTER" in globals() else "", goal_text))
+                       goal_text))
         body = store.render(hit["name"], "")
         if not body:
             return goal_text
