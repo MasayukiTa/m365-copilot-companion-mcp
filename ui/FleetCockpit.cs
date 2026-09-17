@@ -1062,7 +1062,15 @@ class CockpitWindow : Window
     // writing 26 MB a day.
     int _fleetLogDays = 14;    // settings.txt fleet_log_days=
     int _fleetStoreDays = 30;  // settings.txt fleet_store_days=   (run transcripts)
+    //: MUST MATCH tools/settings_keys.py's declared defaults, which
+    //: test_the_panel_shows_the_same_default_the_fleet_uses pins. relay/fleet_retention.py
+    //: read both of these on every run while no control here wrote either, so the panel's
+    //: starting value is the only number an operator ever saw for them -- and until today
+    //: there was no panel value at all.
+    int _fleetScratchDays = 14;     // settings.txt fleet_scratch_days=
+    int _fleetCompressHours = 6;    // settings.txt fleet_compress_hours=
     TextBlock _fleetLogDaysValue, _fleetStoreDaysValue;
+    TextBlock _fleetScratchDaysValue, _fleetCompressHoursValue;
 
     // ── P0 HEALTH STRIP ─────────────────────────────────────────────────────────────
     // Six infra dots (Server/Tunnel/Edge/Sign-in/Agent/Tool) in the header, always visible,
@@ -1364,6 +1372,8 @@ class CockpitWindow : Window
         if (k == "set_fleetret_section") return ja ? "作業ディレクトリの保持" : "Working directory retention";
         if (k == "fleet_log_days") return ja ? "ログ(日)" : "Logs (days)";
         if (k == "fleet_store_days") return ja ? "実行記録(日)" : "Run records (days)";
+        if (k == "fleet_scratch_days") return ja ? "作業ファイル(日)" : "Scratch files (days)";
+        if (k == "fleet_compress_hours") return ja ? "圧縮まで(時間)" : "Compress after (h)";
         if (k == "fleet_ret_note") return ja
             ? "終わった走行のログのみ。会話は消えません。新しい分は圧縮して残します。"
             : "Finished runs' logs only -- conversations are not touched. Newer ones are compressed, not deleted.";
@@ -1518,6 +1528,10 @@ class CockpitWindow : Window
                     _fleetLogDays = Math.Max(1, Math.Min(3650, v));
                 else if (ln.StartsWith("fleet_store_days=") && int.TryParse(ln.Substring(17).Trim(), out v))
                     _fleetStoreDays = Math.Max(1, Math.Min(3650, v));
+                else if (ln.StartsWith("fleet_scratch_days=") && int.TryParse(ln.Substring(19).Trim(), out v))
+                    _fleetScratchDays = Math.Max(1, Math.Min(3650, v));
+                else if (ln.StartsWith("fleet_compress_hours=") && int.TryParse(ln.Substring(21).Trim(), out v))
+                    _fleetCompressHours = Math.Max(1, Math.Min(720, v));
                 else if (ln.StartsWith("disk_floor_gb="))
                 {
                     double df;
@@ -6786,6 +6800,24 @@ class CockpitWindow : Window
         if (_fleetStoreDaysValue != null) _fleetStoreDaysValue.Text = _fleetStoreDays.ToString();
     }
 
+    void SetFleetScratchDays(int v)
+    {
+        _fleetScratchDays = Math.Max(1, Math.Min(3650, v));
+        SaveKey("fleet_scratch_days", _fleetScratchDays.ToString());
+        if (_fleetScratchDaysValue != null) _fleetScratchDaysValue.Text = _fleetScratchDays.ToString();
+    }
+
+    void SetFleetCompressHours(int v)
+    {
+        // A FLOOR OF ONE HOUR, not zero. Compressing a run's files the moment it finishes
+        // would fight whatever is still reading them, and "0" reads as "off" to an operator
+        // while relay/fleet_retention.py would take it literally.
+        _fleetCompressHours = Math.Max(1, Math.Min(720, v));
+        SaveKey("fleet_compress_hours", _fleetCompressHours.ToString());
+        if (_fleetCompressHoursValue != null)
+            _fleetCompressHoursValue.Text = _fleetCompressHours.ToString();
+    }
+
     void PaintRetentionNote()
     {
         if (_retNote == null) return;
@@ -6892,6 +6924,23 @@ class CockpitWindow : Window
         var fsPlus = MiniButton("+"); fsPlus.Click += delegate { SetFleetStoreDays(_fleetStoreDays + 7); };
         _fleetStoreDaysValue = new TextBlock(); _fleetStoreDaysValue.Text = _fleetStoreDays.ToString();
         col.Children.Add(SettingsStepperRow(T("fleet_store_days"), _fleetStoreDaysValue, fsMinus, fsPlus, "fleet_store_days"));
+
+        // TWO KEYS THE PANEL READ BUT NEVER WROTE. relay/fleet_retention.py has asked for
+        // fleet_scratch_days and fleet_compress_hours on every run since it was written; no
+        // control here ever set them, so the only way to choose was to edit settings.txt by
+        // hand -- which is the one thing an operator is told not to do. A setting reachable
+        // only by breaking the rule about settings is a setting nobody has.
+        var fscMinus = MiniButton("−"); fscMinus.Click += delegate { SetFleetScratchDays(_fleetScratchDays - 7); };
+        var fscPlus = MiniButton("+"); fscPlus.Click += delegate { SetFleetScratchDays(_fleetScratchDays + 7); };
+        _fleetScratchDaysValue = new TextBlock(); _fleetScratchDaysValue.Text = _fleetScratchDays.ToString();
+        col.Children.Add(SettingsStepperRow(T("fleet_scratch_days"), _fleetScratchDaysValue,
+                                            fscMinus, fscPlus, "fleet_scratch_days"));
+
+        var fchMinus = MiniButton("−"); fchMinus.Click += delegate { SetFleetCompressHours(_fleetCompressHours - 1); };
+        var fchPlus = MiniButton("+"); fchPlus.Click += delegate { SetFleetCompressHours(_fleetCompressHours + 1); };
+        _fleetCompressHoursValue = new TextBlock(); _fleetCompressHoursValue.Text = _fleetCompressHours.ToString();
+        col.Children.Add(SettingsStepperRow(T("fleet_compress_hours"), _fleetCompressHoursValue,
+                                            fchMinus, fchPlus, "fleet_compress_hours"));
 
         var flNote = new TextBlock();
         flNote.FontSize = 11; flNote.TextWrapping = TextWrapping.Wrap;

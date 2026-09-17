@@ -194,6 +194,63 @@ function Test-ServerUp {
 }
 
 
+# A SERVER RUNNING CODE THE CHECKOUT HAS MOVED PAST, restarted by the thing that owns its
+# lifecycle instead of by whoever happens to look at the panel.
+#
+# A running process keeps executing what it imported at startup. Every commit therefore turns
+# the cockpit's server dot amber and leaves it amber until a person notices and restarts --
+# three times on 2026-09-17 alone, each time after the operator pointed at it. That is the
+# machine asking a human to do something the machine can decide: the server reports
+# `server_code` itself (scripts/stale_server_check.classify_staleness), and whether anything is
+# in flight is readable from .fleet/status.json and the bridge.
+#
+# ONLY WHEN NOTHING IS RUNNING. Restarting mid-run takes the tool path away from a live worker,
+# which is a worse failure than stale code. Idle means: no fleet run, and the bridge reporting
+# neither a turn nor busy. Anything unreadable counts as BUSY -- an unknown state must never
+# authorise a restart.
+#
+# AND ONLY AFTER IT PERSISTS. Two consecutive checks, so a commit landing between the health
+# read and the idle read does not cycle a server that was about to be used anyway.
+$script:StaleStreak = 0
+function Invoke-StaleServerCycle {
+    try {
+        $req = [System.Net.WebRequest]::Create("http://127.0.0.1:$Port/health")
+        $req.Method = "GET"; $req.Timeout = 5000; $req.ReadWriteTimeout = 5000
+        $resp = $req.GetResponse()
+        $body = (New-Object System.IO.StreamReader($resp.GetResponseStream())).ReadToEnd()
+        $resp.Close()
+    } catch {
+        $script:StaleStreak = 0
+        return
+    }
+    if ($body -notmatch '"server_code"\s*:\s*"stale"') { $script:StaleStreak = 0; return }
+
+    $busy = $true
+    try {
+        $statusPath = Join-Path $Root ".fleet\status.json"
+        $fleetRunning = $false
+        if (Test-Path $statusPath) {
+            $fleetRunning = ((Get-Content $statusPath -Raw) -match '"running"\s*:\s*true')
+        }
+        $breq = [System.Net.WebRequest]::Create("http://127.0.0.1:8765/status")
+        $breq.Method = "GET"; $breq.Timeout = 5000; $breq.ReadWriteTimeout = 5000
+        $bresp = $breq.GetResponse()
+        $bbody = (New-Object System.IO.StreamReader($bresp.GetResponseStream())).ReadToEnd()
+        $bresp.Close()
+        $bridgeBusy = ($bbody -match '"turn_running"\s*:\s*true') -or ($bbody -match '"busy"\s*:\s*true')
+        $busy = $fleetRunning -or $bridgeBusy
+    } catch {
+        $busy = $true          # unreadable is busy, deliberately
+    }
+    if ($busy) { $script:StaleStreak = 0; return }
+
+    $script:StaleStreak++
+    if ($script:StaleStreak -lt 2) { return }
+    $script:StaleStreak = 0
+    Write-Log "server is running stale code and nothing is in flight -- cycling it so the checkout's fixes are live"
+    Start-Server
+}
+
 function Test-PortListening {
     # Is ANYTHING accepting connections on the port? Distinguishes "has not bound yet" from
     # "bound and not answering", which Test-ServerUp alone cannot: both arrive as $false.
@@ -664,6 +721,7 @@ while ($true) {
 
     if (Test-ServerUp) {
         $serverMiss = 0
+        Invoke-StaleServerCycle
     } else {
         # DO NOT KILL A SERVER THAT IS STILL STARTING. main.py takes 10-25 seconds just to
         # import (fastmcp alone is ~19s) before it binds, and longer while the machine is

@@ -242,6 +242,11 @@ def test_the_declared_default_is_the_one_the_code_uses():
     ("_maxtabs", "maxtabs"),
     ("_autoMax", "autoscale_max"),
     ("_rateCeiling", "rate_ceiling_rpm"),
+    # Added with their controls on 2026-09-17. Until then the panel had no value for these at
+    # all, so "the number an operator reads off the screen" did not exist and could not be
+    # compared with what the fleet uses.
+    ("_fleetScratchDays", "fleet_scratch_days"),
+    ("_fleetCompressHours", "fleet_compress_hours"),
 ])
 def test_the_panel_shows_the_same_default_the_fleet_uses(field, key):
     """The panel's own default is what an operator reads off the screen on a machine that has

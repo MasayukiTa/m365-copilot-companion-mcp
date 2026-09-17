@@ -155,14 +155,18 @@ KEYS = OrderedDict([
        "relay/fleet_retention.py:apply (once, at coordinator start)",
        "Applied when the next coordinator starts."),
 
+    # THESE TWO HAD NO WRITER until 2026-09-17. fleet_retention asked for both on every run
+    # and no control set either, so the only way to choose was to edit settings.txt by hand --
+    # the one thing an operator is told not to do. A setting reachable only by breaking the
+    # rule about settings is a setting nobody has.
     _k("fleet_scratch_days", SWEEP_START, 14.0,
        "relay/fleet_retention.py:apply (once, at coordinator start)",
-       "NO PANEL CONTROL WRITES THIS. It is read on every run and can only be set by editing "
-       "the file, which the operator is told not to do."),
+       "Applied when the next coordinator starts."),
 
     _k("fleet_compress_hours", SWEEP_START, 6.0,
        "relay/fleet_retention.py:apply (once, at coordinator start)",
-       "NO PANEL CONTROL WRITES THIS -- same as fleet_scratch_days."),
+       "Applied when the next coordinator starts. Floored at 1 hour in the panel: compressing "
+       "a run's files the moment it ends fights whatever is still reading them."),
 
     # ---------------------------------------------------------------- bridge_start
     # The bridge applies retention once, at startup, deliberately: a timer that deletes
