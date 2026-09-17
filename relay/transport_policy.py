@@ -39,15 +39,42 @@ pass it: both transports were asked about a calendar entry created earlier that 
 verified independently, and BOTH named it. A route without Work IQ cannot invent an entry it
 has never seen.
 
-So the fear was right and the target was wrong. What survives as FIXED is the one property
-measured to force a tab, and it is not a guess about text at all: an ATTACHMENT. The Analyst
-puts a local file into a real <input type=file>, and a socket has nowhere to put a file. It is
-knowable from a parameter the caller already set, so it needs no classifier and can never be
-wrong in the silent direction.
+So the fear was right and the target was wrong. What survives as FIXED is an ATTACHMENT: the
+Analyst puts a local file into a real <input type=file>, so a task carrying one is routed to a
+tab. It is knowable from a parameter the caller already set, so it needs no classifier and can
+never be wrong in the silent direction.
 
-It sits ABOVE the version table rather than inside a version, because it is not a policy. A
-version table exists to let two opinions be compared; there is no second opinion about where a
-file can be put.
+THE REASON RECORDED HERE USED TO BE "A SOCKET HAS NOWHERE TO PUT A FILE". THAT IS FALSE, AND
+WAS NEVER OBSERVED -- it was inferred from the UI plus one incident where the bridge attached
+to a page it had already released and the file silently vanished (which is about a released
+page, not about the wire). Measured 2026-09-17 by recording the page's own frames during an
+ANALYZE:
+
+    POST https://substrate.office.com/m365Copilot/UploadFile   (multipart, scenario=UploadImage)
+
+    and the OUTGOING ChatHub frame then carried
+
+    "messageAnnotations":[{"id":"0-wjp-d3-...","messageAnnotationMetadata":{"@type":"File",
+      "fileType":"png","fileName":"monthly.png"},"messageAnnotationType":"ImageFile"}]
+
+The protocol has a field for it. The bytes go over HTTP and an ID rides the socket; the
+<input type=file> is the UI's door, not the protocol's requirement.
+
+THE BEHAVIOUR IS KEPT ANYWAY, and that is not timidity. Knowing a request's shape is not
+knowing we can make it: the audience of the token we hold, the conversationId the upload
+wants, and the lifetime of the returned id are all unestablished, and establishing them means
+using a credential -- an operator's decision, not a side effect of correcting a comment. Until
+that is done, an attachment still goes to a tab.
+
+WHAT IS AT STAKE IF IT IS PURSUED. The socket was measured at 255 seconds against 673-809 for
+the same Researcher work in a tab, and its completion arrives as a protocol frame rather than
+being inferred from text that lies -- the same inference that made every short Analyst answer
+time out for 600 seconds until 2026-09-17. The Analyst is the only profile still on the
+fragile half, and this is the reason.
+
+It sits ABOVE the version table rather than inside a version because it is not a preference to
+be compared. That remains true of the ROUTING. It was never true of the explanation, and a
+sentence that says "there is no second opinion" is the one most worth checking.
 
 FALLBACKS ARE NOT ALL LABELS
 

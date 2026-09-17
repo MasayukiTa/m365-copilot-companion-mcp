@@ -362,6 +362,49 @@ def section_fleet(rep):
                                    str(w.get("reason") or "")[:48]))
 
 
+def section_health_strip(rep, stale_after_s=90.0):
+    """What the COCKPIT'S DOTS ARE SHOWING, read from the panel rather than recomputed.
+
+    On 2026-09-17 the operator asked why the server dot was lit and this tool could not say.
+    It knew the server was reachable and that its code was stale -- it prints both -- but the
+    dot is what a person looks at before deciding anything, and it existed only on the screen.
+    The answer had to be read off a tooltip by hand, which is the inversion of the rule this
+    repository works by: the command line first, the GUI after.
+
+    NOT A SECOND OPINION. The cross-checks below still compute their own view. Two views that
+    can disagree is the point -- a disagreement is exactly the defect class that cost a month
+    in September, and it is only visible when both are written down.
+    """
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        ".fleet", "health_strip.json")
+    if not os.path.isfile(path):
+        rep.section("health strip -- what the panel is showing")
+        rep.row(UNK, "strip", "not published (%s). An older cockpit does not write it; "
+                              "rebuild ui/ to get it." % path)
+        return
+    try:
+        age = time.time() - os.stat(path).st_mtime
+        strip = json.loads(io.open(path, encoding="utf-8").read())
+    except Exception as exc:
+        rep.section("health strip -- what the panel is showing")
+        rep.row(BAD, "strip", "unreadable: %s" % type(exc).__name__)
+        return
+
+    rep.section("health strip -- what the panel is showing")
+    # A STRIP THAT STOPPED BEING SWEPT IS A DIFFERENT FAILURE from a strip full of green, and
+    # before this file existed neither was visible from here.
+    if age > stale_after_s:
+        rep.row(BAD, "strip age", "%.0f s old -- the cockpit is not sweeping, so every colour "
+                                  "below is whatever it was when it stopped" % age)
+    else:
+        rep.row(OK, "strip age", "%.0f s old" % age)
+    worst = {"red": BAD, "yellow": UNK, "gray": UNK, "checking": UNK}
+    for d in strip.get("dots") or []:
+        mark = worst.get(str(d.get("state")), OK)
+        rep.row(mark, "  " + str(d.get("key", "?")),
+                "%-8s %s" % (d.get("state"), str(d.get("detail") or "")[:150]))
+
+
 def section_lock_attribution(rep, hours=24.0):
     """Of the lock classifications made recently, how many could only have been that worker's?
 
@@ -475,6 +518,7 @@ def main(argv=None):
     rep.section("endpoints")
     health = _endpoints(rep)
     section_fleet(rep)
+    section_health_strip(rep)
     section_lock_attribution(rep)
     section_settings(rep)
     section_resources(rep)

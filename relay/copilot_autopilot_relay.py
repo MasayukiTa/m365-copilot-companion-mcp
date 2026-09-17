@@ -360,6 +360,16 @@ PROTOCOL = (
     # one. Called "データ分析" until 2026-09-17, when a worker told in its own goal to open a
     # PNG with ANALYZE never emitted one: reading characters off an image is not what that
     # phrase describes, and read_image was sitting there claiming to do it.
+    # WHICH ROUTE FOR WHICH PICTURE, measured 2026-09-17. A SCREENSHOT needs the Analyst:
+    # ocr_image on a desktop capture came back as unreadable noise, and read_image returns
+    # base64 text nothing sees. CLEAN TEXT on a plain background is the opposite -- ocr_image
+    # read it exactly, for a fraction of the cost of opening a page. Budgeted with RESEARCH at
+    # max_research (3 per worker, relay_fleet.py:5411).
+    #
+    # This line was narrowed to "only when no local tool can get it" and reverted within the
+    # hour: the run that prompted it was examining a folder it had been handed, images and all,
+    # and reading them was the task. The sentence was producing good behaviour and the reason
+    # to change it had been withdrawn.
     "深い調査は行頭 `RESEARCH: 内容`、画像や表を実際に見るには `ANALYZE: 絶対パス | 指示`(実添付)。"
     "各ターン最終行に必ず: 続行=CONTINUE、完了(検証も通過)=DONE、行き詰まり=STUCK: 理由。"
     # TRIMMED 2026-09-15: dropped the standalone "STUCK を出す前に必ず call_tool(name='') で
