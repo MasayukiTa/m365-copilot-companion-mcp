@@ -454,8 +454,12 @@ def _no_desktop_toasts(monkeypatch):
 #
 # Set BEFORE tools.gate_ops is imported, which is why it is at module scope in conftest
 # rather than in a fixture -- the module reads the variable once, at import.
+import atexit as _atexit
 import os as _os
+import shutil as _shutil
 import tempfile as _tempfile
+import time as _time
+import uuid as _uuid
 
 # NO WINDOWS OPEN ON THE OPERATOR'S DESKTOP DURING A TEST RUN.
 #
@@ -475,9 +479,89 @@ import tempfile as _tempfile
 # session, not for the phases pytest happens to label.
 _os.environ.setdefault("MCP_SUPPRESS_GUI", "1")
 
+# A PID IS UNIQUE AT A MOMENT AND NOT OVER TIME, AND EVERY PATH BELOW USED ONE ALONE.
+#
+# Windows recycles process ids freely, and these directories were never removed, so a pytest
+# process that drew a pid some earlier run had already used started life inside that run's
+# sandbox -- holding its files and, for the gate directories, its ANSWERS.
+#
+# Measured 2026-09-17, chasing an intermittent failure of
+# tools/test_contract_activation.py::test_activate_then_approve_then_pass_is_the_full_hitl_cycle:
+# 179 companion_gates_pytest_* directories in the temp folder, 147 of them holding the same
+# answered gate file this test writes -- `{"answer": "approved"}` for "delete: demo scratch
+# file". When the pid landed on one of those, check_op found the old approval on its FIRST call
+# and returned None, and the test that exists to prove an unanswered gate refuses the operation
+# watched it sail through. The test was right and the sandbox was lying.
+#
+# This is not only a test-hygiene point. The same collision hands a run the previous run's job
+# store, memory store and hash-chained ledgers, and a stale "approved" is precisely the answer
+# that must never be inherited.
+#
+# So: one tag per RUN, not per pid, and the run removes its own sandbox when it exits. The
+# random half is what makes it unique over time; the pid is kept because it is what makes a
+# directory readable while the run is still going.
+_RUN_TAG = "%d_%s" % (_os.getpid(), _uuid.uuid4().hex[:8])
+
+
+def _sandbox_path(name):
+    return _os.path.join(_tempfile.gettempdir(), name % _RUN_TAG)
+
+
+def _drop_this_runs_sandbox():
+    """Remove what this run created. Confined to the temp directory and to the exact prefixes
+    set below, so it can never reach anything a person put there."""
+    for name in _SANDBOX_NAMES:
+        p = _sandbox_path(name)
+        try:
+            if _os.path.isdir(p):
+                _shutil.rmtree(p, ignore_errors=True)
+            elif _os.path.isfile(p):
+                _os.remove(p)
+        except OSError:
+            pass
+
+
+def _drop_abandoned_sandboxes(older_than_s=24 * 3600.0):
+    """And the ones left by runs that were killed before they could clean up -- a suite that is
+    interrupted is normal, so "the exit hook handles it" is not a complete answer. Only entries
+    matching these prefixes, only in the temp directory, only when a day has passed."""
+    now, tmp = _time.time(), _tempfile.gettempdir()
+    prefixes = tuple(n.split("%s")[0] for n in _SANDBOX_NAMES)
+    try:
+        entries = _os.listdir(tmp)
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.startswith(prefixes):
+            continue
+        p = _os.path.join(tmp, entry)
+        try:
+            if now - _os.path.getmtime(p) < older_than_s:
+                continue
+            if _os.path.isdir(p):
+                _shutil.rmtree(p, ignore_errors=True)
+            else:
+                _os.remove(p)
+        except OSError:
+            pass
+
+
+_SANDBOX_NAMES = (
+    "companion_gates_pytest_%s",
+    "skills_gates_pytest_%s",
+    "skills_state_pytest_%s.sqlite3",
+    "local_jobs_pytest_%s.sqlite3",
+    "selfimprove_ledger_pytest_%s.jsonl",
+    "selfimprove_hypotheses_pytest_%s.jsonl",
+    "fleet_state_pytest_%s",
+)
+
+_atexit.register(_drop_this_runs_sandbox)
+_drop_abandoned_sandboxes()
+
 _os.environ.setdefault(
     "MCP_GATE_DIR",
-    _os.path.join(_tempfile.gettempdir(), "companion_gates_pytest_%d" % _os.getpid()))
+    _sandbox_path("companion_gates_pytest_%s"))
 
 # THE SAME QUEUE, REACHED BY A SECOND DOOR NOBODY CLOSED. relay/skills.py writes its approval
 # questions through its OWN gate directory, not gate_ops', and MCP_GATE_DIR does not move it.
@@ -491,7 +575,7 @@ _os.environ.setdefault(
 # an escape hatch, and the owner is looking at a backlog of decisions of which zero are real.
 _os.environ.setdefault(
     "MCP_SKILLS_GATE_DIR",
-    _os.path.join(_tempfile.gettempdir(), "skills_gates_pytest_%d" % _os.getpid()))
+    _sandbox_path("skills_gates_pytest_%s"))
 
 # And the skills state DB behind the same object. Its tests DO point this at a tmp_path
 # themselves -- measured: the live store holds 9 rows and every one names a real skill directory,
@@ -499,7 +583,7 @@ _os.environ.setdefault(
 # "the tests remember to set it" is exactly the guarantee the gate directory also had.
 _os.environ.setdefault(
     "MCP_SKILLS_STATE_DB",
-    _os.path.join(_tempfile.gettempdir(), "skills_state_pytest_%d.sqlite3" % _os.getpid()))
+    _sandbox_path("skills_state_pytest_%s.sqlite3"))
 
 # The local job store, which is a record and not a cache: relay/local_job_store.py defaults to
 # <repo>/.jobs/jobs.sqlite3 and MCP_LOCAL_JOB_DB is its override. Measured 2026-09-14: of 451
@@ -508,7 +592,7 @@ _os.environ.setdefault(
 # reason to leave it.
 _os.environ.setdefault(
     "MCP_LOCAL_JOB_DB",
-    _os.path.join(_tempfile.gettempdir(), "local_jobs_pytest_%d.sqlite3" % _os.getpid()))
+    _sandbox_path("local_jobs_pytest_%s.sqlite3"))
 
 # Same reason, different file: relay.selfimprove.ledger appends to a hash-chained record in the
 # operator's home directory. A test run that wrote there would manufacture entries in the one
@@ -516,7 +600,7 @@ _os.environ.setdefault(
 # cannot have those entries removed afterwards without breaking the chain.
 _os.environ.setdefault(
     "MCP_SELFIMPROVE_LEDGER",
-    _os.path.join(_tempfile.gettempdir(), "selfimprove_ledger_pytest_%d.jsonl" % _os.getpid()))
+    _sandbox_path("selfimprove_ledger_pytest_%s.jsonl"))
 
 # And the HYPOTHESIS ledger, which is a different file and a worse thing to pollute: it
 # records what an experiment predicted BEFORE it looked, and its value rests entirely on
@@ -525,8 +609,7 @@ _os.environ.setdefault(
 # failing for two days -- were test runs.
 _os.environ.setdefault(
     "MCP_SELFIMPROVE_HYPOTHESES",
-    _os.path.join(_tempfile.gettempdir(), "selfimprove_hypotheses_pytest_%d.jsonl"
-                  % _os.getpid()))
+    _sandbox_path("selfimprove_hypotheses_pytest_%s.jsonl"))
 
 
 # And the PROJECT MEMORY store, which is the third production record a test run was found
@@ -537,7 +620,7 @@ _os.environ.setdefault(
 # a primed body was recorded as if it were a fresh goal.
 _os.environ.setdefault(
     "FLEET_STATE_DIR",
-    _os.path.join(_tempfile.gettempdir(), "fleet_state_pytest_%d" % _os.getpid()))
+    _sandbox_path("fleet_state_pytest_%s"))
 
 
 @pytest.fixture(autouse=True)
