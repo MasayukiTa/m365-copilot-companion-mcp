@@ -1,6 +1,36 @@
+"""The approval mode, arranged rather than inherited.
+
+THESE TESTS SET %APPDATA% AND NOTHING ELSE, which was enough while the shared settings file
+lived under %APPDATA%. It moved into the repository on 2026-09-17 (the panel and the fleet had
+been reading two different files at one absolute path for a month), and the resolver prefers
+the new location WHEN IT EXISTS. So the moment a real settings file appeared on this machine,
+every test here quietly started reading the operator's own choices: the first one to notice
+failed with `assert 'auto' == 'bypass'` -- 'auto' being what the operator had just selected in
+the panel, half a minute earlier.
+
+That is the third time today a test read the machine instead of its fixture. The rule it
+keeps re-teaching: a test that arranges only part of the environment is a test that inherits
+the rest, and what it inherits is invisible until the day it differs.
+"""
 from pathlib import Path
 
+import pytest
+
 from tools import approval_policy
+from tools import settings_path
+
+
+@pytest.fixture(autouse=True)
+def _settings_are_arranged(monkeypatch, tmp_path: Path):
+    """Point BOTH locations at this test's tmp directory.
+
+    Autouse because the next test added here will set %APPDATA% and forget the other half --
+    that is exactly what happened, and a fixture is the only version of this rule that holds
+    without being remembered.
+    """
+    monkeypatch.setattr(settings_path, "NEW_PATH",
+                        str(tmp_path / "repo" / ".config" / "settings.txt"))
+    monkeypatch.setenv("APPDATA", str(tmp_path))
 
 
 def test_env_default_when_no_ui_setting(monkeypatch, tmp_path: Path):

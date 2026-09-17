@@ -267,3 +267,12 @@ relay/selfimprove/*.lock
 # string reached a public repository for the third time. The generator is the source; this
 # is its output.
 scripts/win/_selfimprove_nightly_hidden.vbs
+
+# THE OPERATOR'S OWN SETTINGS. The shared settings file moved here from %APPDATA% on
+# 2026-09-17 because the repository is the one directory every context resolves identically
+# -- the panel and the fleet had been reading two different files at one absolute path for a
+# month. Moving it inside the checkout fixes that and creates a new hazard in the same step:
+# it is now one `git add` from a public repository, and it carries a person's choices, not
+# code. Nothing in it is employee-id-shaped, so the pre-commit identity guard would NOT stop
+# it; this line is the thing that does.
+.config/
