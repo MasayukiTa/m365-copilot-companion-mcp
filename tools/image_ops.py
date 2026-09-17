@@ -183,7 +183,13 @@ def read_image(path: str, max_dimension: Optional[int] = 1600) -> str:
         a region is blank. Deterministic, and cheap.
       * `ANALYZE: <absolute path> | <instruction>` as the last line of your turn, to put the
         file in front of Copilot itself through a real file attachment. That is the only path
-        in this repository that shows a picture to a model.
+        in this repository that shows a picture to a model -- AND IT IS NOT A STRONG ONE.
+        relay/agent_profiles.ANALYST has `model_picker=None`: it runs on the Analyst agent's
+        default model and cannot be switched, and spec §5 already requires its numeric claims
+        to be ground-verified locally. It has been measured transcribing text off an image
+        faithfully, which says nothing about reasoning. For "where exactly is this control" or
+        "which application is this" there is no strong path here today; see
+        docs/architecture/showing_a_picture_to_a_model.md.
 
     THE COST IS NOT SMALL. Median 142,642 characters per call over 424 calls.
 
