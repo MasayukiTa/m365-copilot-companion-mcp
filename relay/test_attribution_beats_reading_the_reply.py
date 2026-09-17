@@ -193,18 +193,3 @@ def test_a_reply_that_writes_out_an_invocation_is_recognised():
     assert not F._tried_to_call_a_tool("")
 
 
-def test_the_landing_check_does_not_claim_the_positive(monkeypatch, tmp_path):
-    """_no_tool_call_landed answers only the NEGATIVE form -- nothing from anybody arrived --
-    because attribution is not available in general (see turn_windows).
-
-    IT IS NO LONGER WHAT GATES THE BRANCH, and that is the point of this test. The first
-    version required it, and on the run it was written for 19 calls DID land and 18 succeeded,
-    so the condition was never true and the branch never fired while 8 of the last 10 turns
-    re-emitted the same non-executing invocation. Kept because it is honest about what it can
-    say; not used as a gate, because what it can say is not the question."""
-    import tools.fleet_tool_health as H
-    empty = tmp_path / "empty.jsonl"
-    empty.write_text("", encoding="utf-8")
-    monkeypatch.setattr(H, "LEDGER", empty)
-    assert F._no_tool_call_landed(1.0) is True
-    assert F._no_tool_call_landed(0.0) is False, "no turn time means no claim"

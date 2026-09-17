@@ -90,7 +90,8 @@ def python_side_changed(changed_paths) -> bool:
     return any(is_server_code_path(p) for p in changed_paths if p and p.strip())
 
 
-def classify_staleness(started_head, current_head, server_running: bool) -> str:
+def classify_staleness(started_head, current_head, server_running: bool,
+                       watched_changed=None) -> str:
     """One word describing the running server vs the checkout.
 
     * ``"no_server"``  -- nothing is running, so there is nothing to be stale.
@@ -104,6 +105,24 @@ def classify_staleness(started_head, current_head, server_running: bool) -> str:
     Pure: the caller supplies both SHAs and the liveness flag. ``current_head`` being
     missing is itself ``unknown`` -- without a HEAD to compare to, nothing can be
     concluded.
+
+    ``watched_changed`` SEPARATES "THE COMMIT MOVED" FROM "THIS SERVER'S CODE MOVED".
+    A different SHA was the whole rule until 2026-09-17, so a commit touching only docs, only
+    the cockpit, or only tests turned the server dot amber and told the operator that fixes
+    were not live -- when nothing the server loads had changed at all. Measured that day: the
+    dot went amber three times in an afternoon, every time for a commit, and each time a person
+    had to notice and clear it. A dot that is amber for reasons the reader knows are irrelevant
+    is a dot that stops being read, which is the failure it exists to prevent.
+
+    The distinction was already in this repository and unused here: tools/deploy_freshness
+    knows which paths the server imports (WATCHED, pinned against main.py's real imports), and
+    decide_post_update_action twenty lines below already answers "noop -- no server code
+    changed" for docs-only updates.
+
+      * ``None``  -- the caller could not tell. The SHA rule stands, which is the conservative
+                     side: reporting stale when it might be is better than the reverse.
+      * ``False`` -- nothing the server imports changed. A different SHA is then not staleness.
+      * ``True``  -- something it imports changed. Stale, as before.
     """
     if not server_running:
         return "no_server"
@@ -111,7 +130,11 @@ def classify_staleness(started_head, current_head, server_running: bool) -> str:
     cur = (current_head or "").strip()
     if not sh or not cur:
         return "unknown"
-    return "current" if sh == cur else "stale"
+    if sh == cur:
+        return "current"
+    if watched_changed is False:
+        return "current"
+    return "stale"
 
 
 def decide_post_update_action(python_changed: bool, fleet_running: bool) -> str:

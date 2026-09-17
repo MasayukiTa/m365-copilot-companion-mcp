@@ -931,31 +931,13 @@ def _mentions_being_locked(resp: str) -> bool:
 _INVOKE_MARKUP = ("<invoke name=", "antml:invoke", "<parameter name=")
 
 
-def _no_tool_call_landed(since: float) -> bool:
-    """Did NOTHING at all reach the tool gateway since `since`?
-
-    Deliberately asks about EVERY worker rather than this one. Attribution is not available
-    in general -- relay/turn_windows.py carries the measurement -- but it is not needed for
-    this question in its negative form: if no call from anybody arrived in the window, then
-    this worker's attempted call certainly did not. The positive form would need attribution
-    and is not claimed.
-
-    False on any read failure, because "the ledger could not be read" is not evidence that a
-    call went missing.
-    """
-    if since <= 0:
-        return False
-    try:
-        from tools import fleet_tool_health as _fth
-
-        for rec in _fth._tail_records(_fth.LEDGER, _fth.TAIL_BYTES):
-            if rec.get("event") == "call" and float(rec.get("ts") or 0) >= since:
-                return False
-        return True
-    except Exception:
-        return False
-
-
+#: DO NOT ADD A "DID ANY CALL LAND IN THE WINDOW" TEST BACK ALONGSIDE THIS. A helper doing
+#: exactly that stood here until 2026-09-17 with a passing test and no caller. The appeal is
+#: real -- the negative form needs no attribution, since a window with no calls from anybody
+#: contains none of this worker's either -- but it was measured against the run it was written
+#: for and the window held 19 landed calls, 18 of them successful. Only the malformed blocks
+#: landed nowhere, so the conjunction was false exactly when it was needed. The reply's markup
+#: is the whole of the evidence; adding the ledger back only makes the branch unreachable again.
 def _tried_to_call_a_tool(resp: str) -> bool:
     """Does the reply contain an invocation the model wrote out instead of making?"""
     low = (resp or "")
@@ -5552,6 +5534,15 @@ class RelayWorker:
             self.status, self.outcome = "stuck", "STUCK"
             self.reason = "no progress for %d turns" % (self.no_progress + 1)
             return
+        # THE COUNTER BELOW SAYS "連続" AND NOTHING USED TO MAKE THAT TRUE. _unlanded_calls
+        # was only ever incremented, so a worker that wrote a stray invocation once, recovered,
+        # and wrote another one thirty turns later was filed INFRA_STUCK reading
+        # "2 ターン連続" -- a number that never described anything that happened. A streak
+        # counter needs the turn that breaks the streak to clear it, and the turn that breaks
+        # it is any turn whose reply carries no unlanded invocation, whichever branch it then
+        # takes. Reset here, above the branch, so no path can forget.
+        if not _tried_to_call_a_tool(resp):
+            self._unlanded_calls = 0
         if "FAIL" in last_line:
             self.job = self._task_anchor(FIX_JOB)
             self._continue_count = 0   # real progress signal -> the continue streak resets

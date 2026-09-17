@@ -46,17 +46,76 @@ def test_main_agrees_with_the_canonical_staleness_rule(main_mod):
     from scripts.stale_server_check import classify_staleness
 
     real_boot, real_head = main._BOOT_HEAD, main._git_head_sha
+    real_watched = main._watched_code_changed
     try:
         # Every combination that matters: agreeing, disagreeing, and each side unreadable.
         # "unknown" is a real state -- a detached head or a worktree reads as empty -- and it
         # must not collapse into either a pass or a failure.
+        #
+        # AND BOTH VALUES OF "DID THIS SERVER'S OWN CODE CHANGE", added 2026-09-17. A different
+        # SHA used to be the whole rule, so a docs-only or cockpit-only commit reported the
+        # server as stale and told the operator its fixes were not live -- three times in one
+        # afternoon, each needing a person to clear it. Both statements of the rule now take
+        # that into account and must still agree on every combination of the two.
         for boot, now in (("aaa", "aaa"), ("aaa", "bbb"), ("", "bbb"), ("aaa", ""), ("", "")):
-            main._BOOT_HEAD = boot
-            main._git_head_sha = (lambda repo_root=None, _v=now: _v)
-            assert main._server_identity()["server_code"] == \
-                classify_staleness(boot, now, True), (boot, now)
+            for watched in (True, False):
+                main._BOOT_HEAD = boot
+                main._git_head_sha = (lambda repo_root=None, _v=now: _v)
+                main._watched_code_changed = (lambda _v=watched: _v)
+                main._watched_cache["changed"] = None      # the cache must not answer for it
+                assert main._server_identity()["server_code"] == \
+                    classify_staleness(boot, now, True, watched_changed=watched), \
+                    (boot, now, watched)
     finally:
         main._BOOT_HEAD, main._git_head_sha = real_boot, real_head
+        main._watched_code_changed = real_watched
+        main._watched_cache["changed"] = None
+
+
+def test_a_commit_that_touches_nothing_the_server_loads_is_not_stale(main_mod):
+    """THE CASE THAT MADE THIS CHANGE. A docs-only commit moves HEAD and changes nothing the
+    running process imports; saying "fixes are not live until it restarts" is then false, and
+    the person reading it learns to discount the dot."""
+    main = main_mod
+    real_boot, real_head = main._BOOT_HEAD, main._git_head_sha
+    real_watched = main._watched_code_changed
+    try:
+        main._BOOT_HEAD = "aaa"
+        main._git_head_sha = (lambda repo_root=None: "bbb")
+        main._watched_code_changed = (lambda: False)
+        main._watched_cache["changed"] = None
+        assert main._server_identity()["server_code"] == "current"
+        # ...and the opposite half, so this is not merely "it says current now".
+        main._watched_code_changed = (lambda: True)
+        main._watched_cache["changed"] = None
+        assert main._server_identity()["server_code"] == "stale"
+    finally:
+        main._BOOT_HEAD, main._git_head_sha = real_boot, real_head
+        main._watched_code_changed = real_watched
+        main._watched_cache["changed"] = None
+
+
+def test_an_unreadable_answer_still_reports_stale(main_mod):
+    """Conservative where it matters: if the filesystem cannot be consulted, the SHA rule's
+    answer stands. Reporting stale when it might be is the right side of a question about
+    whether a fix is live."""
+    main = main_mod
+    real_newer = None
+    try:
+        import tools.deploy_freshness as DF
+        real_newer = DF.newer_than
+
+        def _boom(*_a, **_k):
+            raise OSError("cannot walk the tree")
+
+        DF.newer_than = _boom
+        main._watched_cache["changed"] = None
+        assert main._watched_code_changed() is True
+    finally:
+        if real_newer is not None:
+            import tools.deploy_freshness as DF
+            DF.newer_than = real_newer
+        main._watched_cache["changed"] = None
 
 
 def test_the_identity_block_names_the_process_and_its_uptime(main_mod):
