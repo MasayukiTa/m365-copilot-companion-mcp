@@ -171,6 +171,14 @@ Notes:
 - STUCK is not one outcome: `INFRA_STUCK` (sign-in wall / dead agent), plain `STUCK`
   (genuine dead end), and `VERIFY_FAILED` (DONE claimed, local checks disagree) are
   distinguished so a fleet-level retriage can treat them differently.
+- **An attempted call that never arrived is not "did not finish".** When a reply writes an
+  invocation out as prose instead of making it (`_tried_to_call_a_tool`,
+  `relay/relay_fleet.py`), the worker is nudged about the route rather than about finishing,
+  and two consecutive such turns end it as `INFRA_STUCK`. The streak is cleared by any reply
+  without that markup, so the "連続" in the operator's message describes real consecutive
+  turns. Deliberately does **not** also require an empty tool ledger: that conjunction was
+  measured against the run it was written for and 19 calls had landed, which is why the
+  first version never fired.
 
 ---
 
@@ -275,7 +283,7 @@ flowchart LR
 
 | # | dot | green means, and on what evidence | the third state |
 |---|---|---|---|
-| 0 | server | `/health` answered AND its `server_head` matches the checkout (`main.py::_server_identity`) | amber on `server_code: "stale"`, or 3+ auth failures in 10 min |
+| 0 | server | `/health` answered AND the running process is on code the checkout still has (`main.py::_server_identity`). A moved HEAD alone is not enough: when the SHAs differ it asks `_watched_code_changed()`, so a docs- or cockpit-only commit stays green and only a change under `tools/deploy_freshness.WATCHED` turns it amber | amber on `server_code: "stale"`, or 3+ auth failures in 10 min |
 | 1 | tunnel | a 200 through the tunnel origin **whose `server_pid` equals the local one** — reaching *a* server is not reaching *this* one | amber when `MCP_TUNNEL_URL` is unset; amber when the pid differs |
 | 2 | edge | `:9222` answered **and** `/json/list` contains `_agentMarkerId`, the `T_`/`P_` id from `MCP_FLEET_AGENT_URL` — not merely the m365 domain, which the default-Copilot fallback also satisfies | falls back to the domain only when no marker is configured; separate message for "no run", which is not the same as "a socket-route run drives no tabs" |
 | 3 | sign-in | an `ok` capture, token not expired, **and** the record no older than `SIGNIN_EVIDENCE_MAX_AGE_S` (5,400s = 1.4 measured token lifetimes) | grey when idle with no record, or an old record, or an expired token — three distinct messages |

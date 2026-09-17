@@ -330,6 +330,36 @@ _BOOT_PID = os.getpid()
 _BOOT_TS = time.time()
 
 
+#: Answer cached for this long. /health is polled about once a second by the cockpit and by
+#: the supervisor, and the answer can only change when a watched file is written -- so asking
+#: the filesystem every time would be work nobody reads.
+_WATCHED_CACHE_S = 5.0
+_watched_cache = {"at": 0.0, "changed": None}
+
+
+def _watched_code_changed():
+    """Has a file THIS SERVER IMPORTS changed since it started?
+
+    tools/deploy_freshness already owns the list -- WATCHED, pinned by its own test against
+    main.py's real imports -- and newer_than() answers with mtimes rather than a subprocess,
+    which is what keeps /health non-blocking (see _git_head_sha for why that matters).
+
+    UNREADABLE MEANS CHANGED. If this cannot be determined, the SHA rule should stand, and the
+    SHA rule's answer here is "stale"; reporting stale when it might be is the conservative
+    side of a question about whether a fix is live.
+    """
+    now = time.time()
+    if _watched_cache["changed"] is not None and (now - _watched_cache["at"]) < _WATCHED_CACHE_S:
+        return _watched_cache["changed"]
+    try:
+        from tools.deploy_freshness import newer_than
+        changed = bool(newer_than(_BOOT_TS))
+    except Exception:
+        changed = True
+    _watched_cache["at"], _watched_cache["changed"] = now, changed
+    return changed
+
+
 def _server_identity():
     """Which process is answering, and whether its code matches the checkout."""
     # THE RULE IS INLINE, NOT IMPORTED, AND THAT IS DELIBERATE. The canonical statement of it
@@ -346,8 +376,16 @@ def _server_identity():
     _now_head = _git_head_sha()
     if not _BOOT_HEAD or not _now_head:
         state = "unknown"
+    elif _BOOT_HEAD == _now_head:
+        state = "current"
     else:
-        state = "current" if _BOOT_HEAD == _now_head else "stale"
+        # A DIFFERENT COMMIT IS NOT THE SAME AS DIFFERENT CODE. Until 2026-09-17 it was the
+        # whole rule, so a commit touching only docs, only the cockpit or only tests reported
+        # this server as stale and told the operator its fixes were not live -- while nothing
+        # it imports had changed. Three times in one afternoon, each needing a person to
+        # notice and clear it. A dot amber for a reason its reader knows is irrelevant is a
+        # dot that stops being read.
+        state = "stale" if _watched_code_changed() else "current"
     return {
         "server_pid": _BOOT_PID,
         "server_uptime_s": round(time.time() - _BOOT_TS, 1),
