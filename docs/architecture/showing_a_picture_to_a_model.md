@@ -13,12 +13,12 @@ This is the durable copy.
 | text on a plain background | `ocr_image(path)` | returned the six characters exactly, on the file `read_image` was fabricating about. Cheap. |
 | pixel facts — size, a colour at a point, whether a region is blank | `run_python` with PIL/numpy | deterministic |
 | what the picture SHOWS — layout, coordinates, which application is on screen | `ANALYZE: <abs path> \| <instruction>` as the last line of a turn | the only path in this repository that puts a file in front of a model. **See the caveat below — it is not a strong one.** |
-| nothing | `read_image(path)` | returns a base64 data URI as TEXT. **Nothing in this stack renders it.** |
+| the picture itself | `read_image(path)` | **fixed 2026-09-18**: returns an IMAGE content block, which a vision-capable MCP client renders. Until then it returned a base64 data URI as TEXT and nothing rendered it. Not measured through the fleet's browser UI. |
 
-### `read_image` returns something no one sees
+### `read_image` returned something no one saw, until the return TYPE was fixed
 
-`read_image` is typed `-> str`; FastMCP serialises a `str` as a text content block, and no
-client here turns that into a picture. The return value *looks* successful, which is the
+`read_image` WAS typed `-> str`; FastMCP serialises a `str` as a text content block, and no
+client turned that into a picture. The return value *looked* successful, which is the
 problem: on 2026-09-17 a worker asked to read six characters off an image called it and then
 answered a string that was not on the image — **twice**, describing both times how it had
 looked. The refuter caught both. `ocr_image` on the same file returned the six characters.
@@ -28,10 +28,21 @@ p90 1,166,294, max 1,762,326. Seventeen calls in one 34-minute run is the observ
 of eighteen worker transcripts in one run died of conversation token limits. Still in live use:
 445 calls in the last 7 days, 12 in the last 24 hours (measured 2026-09-18).
 
-`tools/test_a_cap_in_bytes_never_bound_the_thing_that_broke.py` pins the `data:image/` prefix
-in three places. It was written for a different defect — `MAX_BYTES` caps the FILE at 8 MB,
-about 10.7 million characters of base64, so it had never once been the binding constraint —
-so changing the return value means deciding what those three assertions should say instead.
+**The fix, 2026-09-18.** It returns a `fastmcp.utilities.types.Image`, which FastMCP
+serialises as an IMAGE content block. The first conclusion drawn — make it refuse and point at
+the alternatives — was wrong: that removes a capability because its plumbing is broken, which
+makes the broken plumbing permanent. A visual path is not optional, because computer-use
+decides where to click and a one-pixel error is a miss, so nothing built on OCR or on pixel
+arithmetic replaces seeing the screen.
+
+`tools/test_a_cap_in_bytes_never_bound_the_thing_that_broke.py` used to pin the `data:image/`
+prefix in three places. It was written for a different defect — `MAX_BYTES` caps the FILE at
+8 MB, about 10.7 million characters of base64, so it had never once been the binding
+constraint — and it now reads the same quantities off the image block, because an ImageContent
+carries the bytes base64-encoded and the ceiling bounds the same currency either way.
+
+**Not measured through the fleet's own workers**, who reach this through a browser UI this
+repository does not control. For them `ocr_image` and `ANALYZE` remain the measured answers.
 
 ### THE ANALYST CAVEAT — read this before recommending `ANALYZE` for a judgement
 
