@@ -166,32 +166,45 @@ def _fit_to_character_budget(data: bytes, suffix: str):
         return data, suffix
 
 
-def read_image(path: str, max_dimension: Optional[int] = 1600) -> str:
-    """Read an image file and return it as a base64 data URI -- TEXT, not a picture.
+def read_image(path: str, max_dimension: Optional[int] = 1600):
+    """Read an image file and return it AS A PICTURE, for a client that can see one.
 
-    NOTHING IN THIS STACK SEES THE RESULT. The return type is `str`, and FastMCP serialises a
-    str as a text content block; no client here renders that as an image. Measured 2026-09-17:
-    a worker asked to read six characters off a picture called this tool and then answered a
-    string that was not on it, twice, describing both times how it had looked. The refuter
-    caught it both times.
+    THE DEFECT WAS THE RETURN TYPE, NOT THE TOOL. This was annotated `-> str` and returned a
+    base64 data URI. FastMCP serialises a `str` as a TEXT content block, so what arrived was a
+    wall of base64 that nothing renders -- while looking, to the model that called it, exactly
+    like a successful read. Measured 2026-09-17: a worker asked to read six characters off a
+    picture called this and then answered a string that was not on it, twice, describing both
+    times how it had looked. The refuter caught both.
 
-    So do not use this to check what a picture LOOKS like. Use instead:
+    The conclusion drawn from that at first was "stop using this tool", and that was wrong.
+    A visual path is not optional: computer-use decides where to click, and a one-pixel error
+    is a miss, so nothing built on OCR or on pixel arithmetic can replace seeing the screen.
+    Removing the tool would have made the broken plumbing permanent. It now returns a
+    `fastmcp.utilities.types.Image`, which FastMCP serialises as an IMAGE content block.
 
-      * `ocr_image(path)` for text in the picture -- measured on the same file, it returned the
-        six characters exactly.
+    WHAT THIS DOES AND DOES NOT FIX. A vision-capable MCP client now receives a picture. The
+    fleet's own workers reach this through a browser UI whose handling of an image block is not
+    something this repository controls or has measured -- so for those, `ocr_image` remains the
+    measured answer for text, and `ANALYZE` the measured answer for "what does this show", with
+    the Analyst caveat below. Do not assume this change reaches them until it is measured.
+
+    Still true, and still the right tool for those questions:
+
+      * `ocr_image(path)` for text on a plain background -- measured on the same file this was
+        fabricating about, it returned the six characters exactly. Cheaper than an image.
       * `run_python` with PIL/numpy for pixel facts -- dimensions, a colour at a point, whether
-        a region is blank. Deterministic, and cheap.
+        a region is blank. Deterministic, and cheapest of all.
       * `ANALYZE: <absolute path> | <instruction>` as the last line of your turn, to put the
-        file in front of Copilot itself through a real file attachment. That is the only path
-        in this repository that shows a picture to a model -- AND IT IS NOT A STRONG ONE.
-        relay/agent_profiles.ANALYST has `model_picker=None`: it runs on the Analyst agent's
-        default model and cannot be switched, and spec §5 already requires its numeric claims
-        to be ground-verified locally. It has been measured transcribing text off an image
-        faithfully, which says nothing about reasoning. For "where exactly is this control" or
-        "which application is this" there is no strong path here today; see
+        file in front of Copilot itself through a real file attachment. NOT A STRONG PATH:
+        relay/agent_profiles.ANALYST has `model_picker=None`, so it runs on the Analyst agent's
+        default model and cannot be switched to Claude, and spec §5 already requires its
+        numeric claims to be ground-verified locally. It has been measured transcribing text
+        off an image faithfully, which says nothing about reasoning. See
         docs/architecture/showing_a_picture_to_a_model.md.
 
-    THE COST IS NOT SMALL. Median 142,642 characters per call over 424 calls.
+    THE COST IS STILL NOT SMALL, and the budget below still applies: an image is not free
+    because it is no longer text. Median 142,642 characters per call over 424 calls as a data
+    URI, which is what the downscaling exists to bound.
 
     Args:
         path: Image path (.png, .jpg, .jpeg, .gif, .bmp, .webp).
@@ -246,9 +259,19 @@ def read_image(path: str, max_dimension: Optional[int] = 1600) -> str:
                 f"[read_image error: image is {len(data):,} bytes after resize; "
                 f"limit {MAX_BYTES:,}. Lower max_dimension.]"
             )
-        mime = mimetypes.guess_type(f"f.{suffix}")[0] or f"image/{suffix}"
-        b64 = base64.b64encode(data).decode("ascii")
-        return f"data:{mime};base64,{b64}"
+        # AN IMAGE CONTENT BLOCK, NOT A STRING. FastMCP turns this into an ImageContent;
+        # returning the data URI as a str is what made the result invisible.
+        try:
+            from fastmcp.utilities.types import Image as _FastMCPImage
+            return _FastMCPImage(data=data, format=("png" if suffix == "png" else "jpeg"))
+        except ImportError:
+            # Without FastMCP there is no content block to build, and a data URI is at least
+            # the bytes. Says so, because a caller that cannot see it must not read this as a
+            # picture it merely failed to look at.
+            mime = mimetypes.guess_type(f"f.{suffix}")[0] or f"image/{suffix}"
+            b64 = base64.b64encode(data).decode("ascii")
+            return f"[read_image: no image content block available here; bytes follow as a " \
+                   f"data URI, which nothing renders] data:{mime};base64,{b64}"
     except Exception as e:
         return f"[read_image error: {type(e).__name__}: {e}]"
 

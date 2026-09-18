@@ -889,8 +889,15 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
             if _note:
                 # The caller guessed a name and we ran it anyway; say so, or it
                 # learns nothing and guesses the same way next time.
+                #
+                # ONLY WHEN THE RESULT IS TEXT. str(_out) on a non-text result turns it into a
+                # repr -- an Image content block would arrive as "<Image object at 0x...>",
+                # which is the same class of defect as the one read_image was just fixed for:
+                # a result that looks like an answer and carries nothing.
+                if not isinstance(_out, str):
+                    return _out
                 try:
-                    return _note + chr(10) + str(_out)
+                    return _note + chr(10) + _out
                 except Exception:
                     return _out
             return _out
