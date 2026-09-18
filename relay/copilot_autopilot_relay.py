@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+import io
 import os
 import random
 import re
@@ -1199,22 +1200,82 @@ def _adjust_backoff(ok, turn_elapsed, backoff_s, base_elapsed,
     return max(0.0, backoff_s - backoff_step_s * 0.5), base_elapsed, "healthy"
 
 
-def default_notify(title: str, body: str) -> None:
-    """Best-effort Windows toast; never raises into the control loop."""
-    # DIAGNOSTIC (2026-07 notification-source hunt): record who fired every toast --
-    # timestamp, pid, process argv, and the caller stack -- so a freshly-spawned fleet
-    # self-identifies as the emitter instead of us guessing from process trees.
+#: Toast emitters already seen in THIS process, so the watchdog below writes each one once.
+_NOTIFY_SEEN = set()
+_NOTIFY_LOG_MAX_BYTES = 256 * 1024
+
+#: WHERE THE WATCHDOG WRITES, AS A NAME RATHER THAN AN EXPRESSION INSIDE THE FUNCTION.
+#: It was built from __file__ at each call, which put the path out of reach of anything that
+#: wanted to move it -- a test could only redirect it by reassigning the module's __file__,
+#: and the repository's own isolation registry (relay/test_live_record_isolation.py) cannot
+#: see a path that does not exist as a constant. Every other operator record here is a
+#: module-level name for exactly that reason. MCP_NOTIFY_SOURCE_LOG overrides it.
+NOTIFY_SOURCE_LOG = os.environ.get("MCP_NOTIFY_SOURCE_LOG") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".fleet",
+    "_notify_source.log")
+
+
+def _record_notify_source(title: str) -> None:
+    """Write down WHO fired a toast, the first time each emitter is seen in this process.
+
+    WHY IT EXISTS. Commit e658a43 (2026-07-04), "catches any future false toast": a
+    freshly-spawned fleet names itself as the emitter instead of anyone guessing from process
+    trees. Timestamp, pid, argv and the caller stack.
+
+    ONCE PER EMITTER, NOT ONCE PER TOAST. It wrote an eight-frame stack every time, unbounded.
+    Measured 2026-09-18: 20,622 lines and 1.5 MB describing FOUR distinct titles and SIXTEEN
+    distinct stack frames, with "default_notify <- run_relay_fleet <- main" recorded 1,340
+    times. A small answer space, fully enumerated, re-derived on every single toast.
+
+    Not merely wasteful here. tools/tool_ledger bounds itself and says why -- "a ledger cannot
+    become the thing that fills the disk, which on this machine is the binding constraint, and
+    has already stopped a benchmark run once" -- and this had no bound at all. A disk reaching
+    zero on this machine has truncated source files mid-write.
+
+    The watch itself is unchanged in the way that matters: a NEW emitter, a title or a call
+    path never seen before, is still written in full the moment it appears. Only the repetition
+    stops. The seen-set is per process on purpose -- a fresh process is a fresh context, and
+    re-stating its emitters once is cheap and occasionally the thing you want to see.
+
+    SEPARATE FROM default_notify SO IT CAN BE TESTED. conftest replaces default_notify with an
+    inert stub for every test, and rightly: a test must never fire a real desktop toast. That
+    also made the recording unreachable from a test, so it was verified by reading the source
+    and by watching the live file -- neither of which catches a regression. This writes a file
+    and fires nothing, so it is safe to call directly.
+
+    Never raises: it runs on the path that tells a person what happened.
+    """
     try:
-        import os as _os, sys as _sys, time as _t, traceback as _tb
-        _line = "%s pid=%s argv=%r title=%r\n%s" % (
-            _t.strftime("%H:%M:%S"), _os.getpid(), _sys.argv[:4], title,
-            "".join(_tb.format_stack(limit=8)))
-        _p = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
-                           ".fleet", "_notify_source.log")
+        import hashlib as _h, os as _os, sys as _sys, time as _t, traceback as _tb
+        _stack = "".join(_tb.format_stack(limit=8))
+        _sig = _h.sha256(("%s|%s" % (title, _stack)).encode("utf-8", "replace")).hexdigest()[:16]
+        if _sig in _NOTIFY_SEEN:
+            return
+        _NOTIFY_SEEN.add(_sig)
+        _line = "%s pid=%s argv=%r title=%r sig=%s\n%s" % (
+            _t.strftime("%H:%M:%S"), _os.getpid(), _sys.argv[:4], title, _sig, _stack)
+        _p = NOTIFY_SOURCE_LOG
+        _d = _os.path.dirname(_p)
+        if _d:
+            _os.makedirs(_d, exist_ok=True)
+        try:
+            if _os.path.getsize(_p) > _NOTIFY_LOG_MAX_BYTES:
+                # Keep the RECENT half: a watchdog is asked about what just appeared.
+                _keep = io.open(_p, encoding="utf-8", errors="replace").read()
+                _keep = _keep[len(_keep) // 2:]
+                _keep = _keep[_keep.find("\n") + 1:]
+                io.open(_p, "w", encoding="utf-8").write(_keep)
+        except OSError:
+            pass
         with open(_p, "a", encoding="utf-8") as _f:
             _f.write(_line + "-" * 60 + "\n")
     except Exception:
         pass
+
+
+def default_notify(title: str, body: str) -> None:
+    """Best-effort Windows toast; never raises into the control loop."""
+    _record_notify_source(title)
     try:
         from tools.notify_ops import notify_desktop
         notify_desktop(title, body[:240])

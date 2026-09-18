@@ -39,6 +39,8 @@ SANDBOX_ENV = (
     # four empty rows landed in the operator's live .fleet/ the same afternoon. Every name on
     # this list was added after that same thing happened, which is the argument for the list.
     "MCP_AUTH_REJECTIONS_FILE",
+    "MCP_NOTIFY_SOURCE_LOG",
+    "MCP_BRIDGE_UNDELIVERED_FILE",
 )
 
 

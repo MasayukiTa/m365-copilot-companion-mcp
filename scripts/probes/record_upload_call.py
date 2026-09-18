@@ -15,12 +15,24 @@ type=file> is the UI's door, not the protocol's requirement.
 WHAT THIS RECORDS: the multipart field list, so the request shape is known, and what
 UploadFile RETURNS, since that is where the annotation id must come from.
 
-WHAT IT DELIBERATELY DOES NOT RECORD: anything about the token. An earlier draft decoded the
-Authorization header for its audience, to judge whether the credential the relay already holds
-would be accepted at this path. Discarding the bytes afterwards does not change what that is,
-and whether to establish it is the operator's decision rather than mine. The request shape
-answers what the protocol needs; it does not answer what authorises it, and those are
-different questions that should be asked separately.
+WHAT IT RECORDS ABOUT AUTH, AND WHAT IT WILL NOT. An earlier draft decoded the Authorization
+header for its audience. Discarding the bytes afterwards does not change what that is, so the
+decoding went and the SHAPE stayed: header names, whether an Authorization header is present,
+and -- added 2026-09-18 -- its scheme word and whether a Cookie header rides along. No header
+VALUE is written, no token is decoded, and the raw CDP event, which carries every header and
+every cookie, is never stored.
+
+WHY THE SHAPE IS WORTH HAVING. On 2026-09-18 a probe was built and a 403 interpreted as "the
+audience we hold does not cover this path" while it had never been established that the page
+uses a bearer token for this call at all. If it is cookie-authenticated, the whole "which
+audience" framing is a question about an answer nobody had. Presence is not proof either way --
+a cookie riding along does not mean cookies satisfied the server, and a bearer header does not
+mean it was the deciding credential -- but it is enough to tell an experiment worth running
+from one built on an assumption.
+
+AND NONE OF THIS HAS BEEN CAPTURED YET. Two runs of this recorder wrote start/watching/stop and
+nothing else, because it is passive and no upload happened inside the window. The upload has to
+be produced: run an ANALYZE while this is up.
 """
 import io
 import json
@@ -93,9 +105,24 @@ def watch(t):
                     body = req.get("postData") or ""
                     fields = [s.split('"')[1] for s in body.split("name=") if '"' in s][:20]
                     pending[p.get("requestId")] = url
+                    # THE SCHEME WORD ONLY, AND NEVER WHAT FOLLOWS IT. "Bearer" or "Basic"
+                    # tells an experiment which question it is asking; the rest is the
+                    # credential. Cookie presence is a bool for the same reason: it separates
+                    # "the page may not use a token at all" from "it does" without carrying
+                    # anything that could authenticate anybody.
+                    _auth = ""
+                    _cookie = False
+                    for _k, _v in hdrs.items():
+                        _lk = _k.lower()
+                        if _lk == "authorization":
+                            _auth = str(_v or "").strip().split(" ")[0][:16]
+                        elif _lk == "cookie":
+                            _cookie = True
                     _write({"event": "upload_request", "ts": time.time(), "url": url[:200],
                             "header_names": sorted(hdrs.keys()),
-                            "has_authorization": any(k.lower()=="authorization" for k in hdrs),
+                            "has_authorization": bool(_auth),
+                            "authorization_scheme": _auth,
+                            "cookie_header_present": _cookie,
                             "multipart_fields": fields,
                             "body_len": len(body),
                             "body_head": body[:1500]})
