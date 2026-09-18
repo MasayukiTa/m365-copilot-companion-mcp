@@ -120,9 +120,21 @@ def test_two_different_messages_do_not_share_a_budget(bridge):
     assert len(queued) == 2
 
 
-def test_recording_a_loss_cannot_raise_on_the_failure_path(bridge, monkeypatch):
-    """This runs while something has already gone wrong. It must not add a second failure."""
+def test_recording_a_loss_cannot_raise_on_the_failure_path(bridge, monkeypatch, tmp_path):
+    """This runs while something has already gone wrong. It must not add a second failure.
+
+    THE FIRST VERSION PASSED FOR THE WRONG REASON AND LEFT LITTER. It handed
+    os.path.join("no", "such", "dir", "x.jsonl") meaning "a path that cannot be written" --
+    but _record_undelivered calls os.makedirs(exist_ok=True), so the path was created, the
+    write SUCCEEDED, and the assertion that nothing raised was about a happy path. It also
+    created no/such/dir/ in the repository root, which is how it was noticed.
+
+    A directory where a file must go is genuinely unwritable on every platform this runs on,
+    and it is inside tmp_path so nothing is left behind either way."""
     B, _, _ = bridge
-    monkeypatch.setattr(B, "UNDELIVERED_PATH", os.path.join("no", "such", "dir", "x.jsonl"))
+    blocked = tmp_path / "undeliverable"
+    blocked.mkdir()                      # a DIRECTORY at the path the writer wants for a file
+    monkeypatch.setattr(B, "UNDELIVERED_PATH", str(blocked))
     B._DRAIN_ATTEMPTS[("s1", "x")] = 99
     assert B._retry_or_record("s1", "x", "boom") is False      # must not raise
+    assert blocked.is_dir(), "the writer replaced the directory instead of failing"

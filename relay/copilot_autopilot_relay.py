@@ -90,6 +90,13 @@ from tools.gate_ops import stop_check                     # operator E: kill-swi
 # cannot answer anything about a caller with no remote identity.
 from tools.memory_ops import memory_load
 from tools.memory_ops import memory_save_local as memory_save   # cross-session history
+from tools.memory_ops import MAX_VALUE_CHARS as _MEMORY_MAX_CHARS
+
+#: How much of a turn response is kept for cross-session recall. Derived from the
+#: store's own limit, less room for the marker that announces a cut, so the value can
+#: never be refused for length AND a reader can always tell a whole turn from a
+#: shortened one.
+_MEMORY_TURN_CHARS = _MEMORY_MAX_CHARS - 200
 # THE LOCAL VARIANT for the same reason as memory_save above: sixteen call sites in this
 # file, every return value discarded, and the gate denying all of them because this process
 # has no HTTP request. The audit runlog has never been written.
@@ -2335,7 +2342,25 @@ def run_relay(
 
         runlog_append(run_id, {"turn": turn, "job_excerpt": job[:160],
                                "response_excerpt": resp[:500]})
-        memory_save(f"relay.{run_id}.turn{turn}", resp[:4000], scope="relay",
+        # THE CUT SAYS IT IS A CUT, AND THE BOUND IS THE STORE'S OWN.
+        #
+        # This was `resp[:4000]`, silently, into a store whose purpose is cross-session
+        # recall -- so a later session pulling relay.<id>.turnN would read a response cut
+        # mid-thought as the whole thing. Worse, memory_save ALREADY REFUSES a value over
+        # MAX_VALUE_CHARS (16,000) with an explicit error, which is the right behaviour;
+        # pre-cutting to 4,000 meant that guard could never fire. A caller that shortens
+        # data to stay under a limit it will never reach has replaced a loud refusal with
+        # a quiet loss.
+        #
+        # Found 2026-09-18 by sweeping the failure class after tripping it three times in
+        # one day: a 4,000-char cap destroyed a ChatHub frame, a 400-char cap produced a
+        # three-field transcription of a six-field request, and a 60-char cap ended a
+        # job's provenance mid-sentence. The rule is evidence_trace's own.
+        _kept = resp
+        if len(resp) > _MEMORY_TURN_CHARS:
+            _kept = resp[:_MEMORY_TURN_CHARS] + (
+                "\n[cut: kept %d of %d characters]" % (_MEMORY_TURN_CHARS, len(resp)))
+        memory_save(f"relay.{run_id}.turn{turn}", _kept, scope="relay",
                     tags=["relay", run_id])
         print(f"[relay turn {turn}] {resp[:160].replace(chr(10), ' ')}")
 

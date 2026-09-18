@@ -363,6 +363,22 @@ def _watched_code_changed():
     return changed
 
 
+#: When this process first observed itself to be stale, or None while it is current.
+#:
+#: WHY A DURATION AND NOT JUST A STATE. Every commit that touches a watched package
+#: makes the running server genuinely stale, so on a machine where an agent is
+#: improving the code all day the dot is amber almost all of the time -- and a dot that
+#: is amber in the normal working state distinguishes nothing. The operator said it
+#: plainly on 2026-09-18: if that is the condition, the colour is a false report.
+#:
+#: The fact is still true and still worth reporting; what was wrong was treating it as
+#: something a PERSON must act on. The supervisor cycles the server itself once the
+#: fleet is idle (scripts/supervisor.ps1, Invoke-StaleServerCycle). So the actionable
+#: condition is not 'stale' -- it is 'stale for longer than the machine should have
+#: needed', which means the cycle could not run or did not work.
+_STALE_SINCE = None
+
+
 def _server_identity():
     """Which process is answering, and whether its code matches the checkout."""
     # THE RULE IS INLINE, NOT IMPORTED, AND THAT IS DELIBERATE. The canonical statement of it
@@ -389,11 +405,25 @@ def _server_identity():
         # notice and clear it. A dot amber for a reason its reader knows is irrelevant is a
         # dot that stops being read.
         state = "stale" if _watched_code_changed() else "current"
+    # HOW LONG, so a reader can tell a commit that landed a moment ago from a server
+    # nothing has been able to cycle. Stamped on the first observation and cleared the
+    # moment it is current again -- not persisted, because a restart IS the thing that
+    # clears it and a value surviving one would describe the previous process.
+    global _STALE_SINCE
+    now = time.time()
+    if state == "stale":
+        if _STALE_SINCE is None:
+            _STALE_SINCE = now
+    else:
+        _STALE_SINCE = None
     return {
         "server_pid": _BOOT_PID,
         "server_uptime_s": round(time.time() - _BOOT_TS, 1),
         "server_head": _BOOT_HEAD[:12],
         "server_code": state,   # current | stale | unknown
+        # None while current. Seconds since this process first saw itself stale.
+        "server_stale_for_s": (None if _STALE_SINCE is None
+                               else round(now - _STALE_SINCE, 1)),
     }
 
 

@@ -170,8 +170,26 @@ class RequestTemplate:
                 return str(models[0])
         return ""
 
-    def frame_for(self, text, *, session_id, request_id, started):
-        """The captured frame with this turn's values written into it, and nothing else."""
+    def frame_for(self, text, *, session_id, request_id, started, annotations=None):
+        """The captured frame with this turn's values written into it, and nothing else.
+
+        `annotations` is the one addition, and it is NOT a composed field. The page puts
+        `messageAnnotations` inside `message`, beside `messageType`, and that is where this
+        writes it. The shape is transcribed from a CDP capture on 2026-09-17:
+
+            [{"id": "<docId returned by UploadFile>",
+              "messageAnnotationMetadata": {"@type": "File", "annotationType": "File",
+                                           "fileType": "png", "fileName": "..."},
+              "messageAnnotationType": "ImageFile"}]
+
+        The server echoed that frame back with messageAnnotationSource "UserAnnotated" and
+        turnCount 1, so the shape is observed rather than guessed -- which matters here more
+        than usual, because this module already records that a COMPOSED frame was measured
+        REJECTED while the captured shape was accepted.
+
+        Omitted entirely when there are none: a frame carrying an empty list is a different
+        frame from one carrying no key at all, and the accepted capture carried no key.
+        """
         f = json.loads(json.dumps(self.frame))
         f["sessionId"] = session_id
         f["clientCorrelationId"] = request_id
@@ -188,6 +206,8 @@ class RequestTemplate:
         msg["requestId"] = request_id
         if isinstance(msg.get("clientInfo"), dict):
             msg["clientInfo"]["clientSessionId"] = session_id
+        if annotations:
+            msg["messageAnnotations"] = annotations
         return f
 
 
@@ -247,7 +267,8 @@ def _local_time_zone():
 def chat_frames(text: str, *, session_id: str, conversation_id: str, request_id: str,
                 started: bool = True, tone: str = "magic", locale: str = "ja-JP",
                 gpt_id: str = "", gpt_source: str = "MOS3",
-                template: "RequestTemplate" = None, invocation_id: str = "0") -> str:
+                template: "RequestTemplate" = None, invocation_id: str = "0",
+                annotations=None) -> str:
     """The chat frame and the metrics frame, in one send, as the protocol expects.
 
     WITH A TEMPLATE the frame is the client's own, with this turn's ids and text written in and
@@ -271,7 +292,7 @@ def chat_frames(text: str, *, session_id: str, conversation_id: str, request_id:
     """
     if template is not None:
         args = template.frame_for(text, session_id=session_id, request_id=request_id,
-                                  started=started)
+                                  started=started, annotations=annotations)
         chat = {"type": 4, "target": "chat", "invocationId": str(invocation_id), "arguments": [args]}
         metrics = {"type": 1, "target": "Metrics", "arguments": [{"Timestamps": {}}]}
         return json.dumps(chat, ensure_ascii=False) + RS + json.dumps(metrics) + RS
@@ -566,7 +587,7 @@ class Conversation:
         return h
 
     def ask(self, text: str, *, connect, run_tool=None, catalogue=None, protocol="",
-            started=None, on_text=None, on_progress=None):
+            started=None, on_text=None, on_progress=None, annotations=None):
         """One turn: connect, send, read frames until the turn completes, return the answer.
 
         `connect(url, headers, timeout_s)` is supplied by the caller and must return an object
@@ -586,6 +607,7 @@ class Conversation:
         answer, rounds = "", 0
         while True:
             answer = self._one_exchange(payload, connect=connect, started=started,
+                                        annotations=annotations,
                                         on_text=on_text, on_progress=on_progress)
             started = False
             self.turns += 1
@@ -604,7 +626,7 @@ class Conversation:
         return ST.strip_calls(answer) if catalogue else answer
 
     def _one_exchange(self, payload: str, *, connect, started: bool, on_text=None,
-                      on_progress=None) -> str:
+                      on_progress=None, annotations=None) -> str:
         """Send one payload and read until the turn completes. Returns the reply text.
 
         `on_text` sees the answer as it grows, so a caller that shows progress does not have
@@ -618,7 +640,8 @@ class Conversation:
                                   conversation_id=self.conversation_id,
                                   request_id=request_id, started=started,
                                   gpt_id=self.gpt_id, template=self.template,
-                                  invocation_id=str(self.turns)))
+                                  invocation_id=str(self.turns),
+                                  annotations=annotations))
             # DELTAS ACCUMULATE, SNAPSHOTS REPLACE. Keeping them apart is what stops the same
             # answer being counted once per channel it arrives on.
             deltas, final, result, seen = [], "", "", 0

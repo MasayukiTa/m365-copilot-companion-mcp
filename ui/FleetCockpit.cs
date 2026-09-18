@@ -1257,6 +1257,29 @@ class CockpitWindow : Window
         return t;
     }
 
+    //: How long a server may be stale before it is worth a colour.
+    //:
+    //: The supervisor checks roughly every 30 s and requires the condition to persist across
+    //: TWO consecutive checks before it cycles, and it only cycles while the fleet is idle. Ten
+    //: minutes is comfortably past a healthy cycle and still short enough that a person who
+    //: needs to know finds out in the same sitting. Below it, staleness is a fact in the detail
+    //: line; above it, the machine has had its chance and failed.
+    const double STALE_AMBER_AFTER_S = 600.0;
+
+    static bool StaleLongEnoughToMatter(string srvBody)
+    {
+        string raw = HealthField(srvBody, "server_stale_for_s");
+        // AN OLDER SERVER DOES NOT PUBLISH THIS, and absence must not read as zero -- that would
+        // make every stale server green forever, which is the opposite failure and a worse one.
+        // Unknown is treated as "worth a colour", the same way an unreadable state is elsewhere.
+        if (string.IsNullOrEmpty(raw) || raw == "null") return true;
+        double secs;
+        if (!double.TryParse(raw, System.Globalization.NumberStyles.Float,
+                             System.Globalization.CultureInfo.InvariantCulture, out secs))
+            return true;
+        return secs >= STALE_AMBER_AFTER_S;
+    }
+
     static string ResolvePath(string path)
     {
         if (!string.IsNullOrEmpty(path)) return path;
@@ -1377,6 +1400,10 @@ class CockpitWindow : Window
         if (k == "hs_signin_old_ok") return ja ? "サインイン記録は有効期限内ですが、取得が古く現在の状態を保証しません。再取得までは未確認です。" : "The sign-in record is unexpired, but it is old and does not attest to the session right now. Unverified until the next capture.";
         if (k == "hs_agent_other_surface") return ja ? "エージェント紐付けの直接の証拠がありません。別サーフェスの直近取得にgpt_idがあるだけで、フリート自身の紐付けは未確認です。" : "No direct evidence that THIS surface is bound to an agent -- only a gpt_id from the last capture on ANOTHER surface. The fleet own binding is unverified.";
         if (k == "hs_srv_detail_stale") return ja ? "サーバは応答していますが、起動時のコードのままでチェックアウトが先に進んでいます。再起動しないと修正は反映されません。起動時HEAD:" : "The server is responding but is still running the code it started on; the checkout has moved past it. Fixes are not live until it restarts. Started at HEAD:";
+        // THE SAME FACT, NOT PRESENTED AS SOMETHING TO DO. Shown on a GREEN dot while the
+        // supervisor still has its chance to cycle the server; the line above is for when
+        // it has had that chance and the server is still stale.
+        if (k == "hs_srv_detail_stale_recent") return ja ? "サーバは応答しています。チェックアウトが先に進んでいますが、フリートがアイドルになれば自動で入れ替わります。人の操作は不要です。" : "The server is responding. The checkout has moved past it, and it will be cycled automatically once the fleet is idle. Nothing for you to do.";
         if (k == "hs_tun_detail_other") return ja ? "トンネルは応答していますが、このマシンで動いているサーバとは別のプロセスに繋がっています。pid:" : "The tunnel is responding, but it reaches a DIFFERENT process than the server running on this machine. pid:";
         if (k == "hs_tool_detail_fleet_down") return ja ? "ブリッジ側はツールを呼べていますが、フリート側のツール呼び出しが連続失敗しています。作業を実行する経路はこちらです。" : "The bridge can call tools, but the FLEET path is failing repeatedly. That is the path that does the work.";
         if (k == "hs_tool_detail_bridge_only_down") return ja ? "落ちているのはブリッジのチャット経路だけで、フリートのツール呼び出しは成功しています。ツール全体が不通ではありません。" : "Only the bridge chat path is down; fleet tool calls are succeeding. This is not a total tool outage.";
@@ -2540,9 +2567,22 @@ class CockpitWindow : Window
         else if (authStorm)
             SetDot(0, HealthState.Yellow,
                    T("hs_srv_detail_auth") + " (" + authFails + ")", now);
-        else if (codeState == "stale")
+        else if (codeState == "stale" && StaleLongEnoughToMatter(srvBody))
             SetDot(0, HealthState.Yellow,
                    T("hs_srv_detail_stale") + " (" + HealthField(srvBody, "server_head") + ")", now);
+        else if (codeState == "stale")
+            // GREEN, AND IT SAYS WHY. A commit that touches a watched package makes the running
+            // server genuinely stale, so on a machine where an agent improves the code all day
+            // this was amber almost all of the time -- and a colour that is on in the normal
+            // working state distinguishes nothing. The operator put it plainly on 2026-09-18:
+            // "if that is the condition, the colour is only a false report."
+            //
+            // The FACT is still true and still shown, in the detail line. What was wrong was
+            // treating it as something a person must act on: the supervisor cycles the server
+            // itself once the fleet is idle. So the colour now marks the case a person can do
+            // something about -- stale for longer than the machine should have needed, meaning
+            // the cycle could not run or did not work.
+            SetDot(0, HealthState.Green, T("hs_srv_detail_stale_recent"), now);
         else
             SetDot(0, HealthState.Green, T("hs_srv_detail_ok"), now);
 

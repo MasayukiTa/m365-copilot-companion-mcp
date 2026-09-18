@@ -109,56 +109,112 @@ and the outgoing ChatHub frame then carried:
 So the bytes go over HTTP and an **id rides the socket**. The `<input type=file>` is the UI's
 door, not the protocol's requirement.
 
-### Still open — and one attempt that proved nothing
+### Answered, 2026-09-18: **200**, and the token was never the problem
 
-Does the token the relay already captures get past that door? It has audience
-`substrate.office.com/sydney` — the same host as `UploadFile`, a different path.
+The page's own `UploadFile` request, re-issued with **only** the `Authorization` header swapped
+for the token `relay/profile_token` captures:
 
-A probe on 2026-09-18 returned **403**, and that result establishes nothing. It differed from
-the observed request in three ways at once: the token's source, an invented `conversationId`,
-and the body shape. **The page sends the bytes as a base64 data URI in a text field named
-`FileBase64`; the probe sent a binary file part named `file`.** A refusal of a request nobody
-makes says nothing about the request everybody makes.
+```
+HTTP 200
+{"docId":"0-ejp-d1-...","fileSanitizer":"ImageSanitizerBingAI",
+ "result":{"value":"Success","message":"Success"}}
+```
 
-That mistake was avoidable without anyone pointing it out. The field list had been in the CDP
-recording since 2026-09-17 and was never written anywhere a later reader would meet it — this
-document said only "multipart, scenario=UploadImage" and called the field list "the remaining
-work", when it was sitting in the recording. So the probe was built from recollection and there
-was nothing to check the 403 against.
+The credential is not what blocks the socket route. The `docId` is what rides the socket as
+`messageAnnotations[0].id` — and that response was captured for the first time the same day,
+which is also when "the page uploaded successfully" stopped being an inference from a POST plus
+a later annotation.
 
-It is data now: **`scripts/probes/uploadfile_observed.json`** holds the request exactly as the
-page made it, and `can_we_upload.py` builds from that file. A test asserts the two agree, so the
-probe can no longer drift from the observation.
+**Three attempts, and the first two were reported as answers.** Both returned 403 and neither
+was about the credential:
 
-**What is actually known:** the endpoint accepts uploads from this machine and this account —
-the page did it, successfully. **What is not:** which credential the page used (the recorder
-deliberately does not read the `Authorization` header) and what `UploadFile` returns (35 `post`
-events were captured and no response bodies, so the returned id has still never been seen here).
+| # | what differed from the page's request | result |
+|---|---|---|
+| 1 | binary part named `file`, invented `conversationId`, our token | 403 |
+| 2 | the right three fields, a real `conversationId`, our token | 403 |
+| 3 | **nothing but the token** — the page's own bytes and headers | **200** |
 
-The next experiment is one variable at a time, starting from the observed shape.
+What #1 and #2 were missing: `optionsSets` **three times**, and seventeen of the eighteen
+headers the page sends — including `x-anchormailbox`, which routes the request, and
+`origin`/`referer`, which many Microsoft endpoints check.
 
-### The two probes
+The three-field list came from a **400-character truncated** `body_head`, and a test had been
+written to pin agreement with it — a guard holding a probe to an incomplete record. Auth shape,
+measured rather than assumed: **Bearer, no cookie.**
 
-Both live in `scripts/probes/`.
+**Reconstructing the request is what failed, every time.** The lesson is in the probe's shape,
+not in a comment: `replay_upload_with_our_token.py` captures the page's request and re-issues
+it. The page's own credential is replaced before the request is built, never read and never
+written; the forwarded headers stay in memory because several identify the account.
 
-- `record_upload_call.py` — **passive.** Attaches to CDP (`http://127.0.0.1:9222`), watches
-  every page target's frames, and records the multipart field list and what `UploadFile`
-  returns. Records nothing about the token: an earlier draft decoded the `Authorization`
-  header to judge its audience, and discarding the bytes afterwards does not change what that
-  is. Runs for 1200 s by default (`record_upload_call.py <seconds>`). **It captures nothing
-  unless an upload happens inside the window — run an `ANALYZE` to produce one.** Two runs
-  recorded `start`/`watching`/`stop` and nothing else, for exactly this reason.
-- `can_we_upload.py` — **active, and the one that answers the open question.** Captures a token
-  through the repository's own `relay/profile_token.token_via_light_page` (open a light page,
-  watch our own outgoing requests, close it), POSTs one generated 240×90 PNG to `UploadFile`
-  with `scenario=UploadImage` and an invented `conversationId`, and prints the status and the
-  response shape with token-shaped fields removed. The token lives in a local variable for the
-  length of one request and is never written down. Nothing is sent to a model, no conversation
-  is created, no page is left open.
+**Not asked, and 200 does not answer:** how long a `docId` lives, and whether an annotation sent
+over the socket is accepted. Until those, an attachment still goes to a tab — now because two
+specific questions are open, not because the door was thought to be shut.
+
+### Answered end to end, 2026-09-18: the socket carries an attachment
+
+An image carrying a randomly generated phrase was uploaded through the page's own request with
+**only** the `Authorization` header swapped, its `docId` was sent as `messageAnnotations` on a
+socket turn, and the reply read the phrase back. It appears in no filename, no path and no
+prompt, so it can only have come from the pixels.
+
+So all three questions that kept attachments on a tab are measured:
+
+| question | answer |
+|---|---|
+| does the protocol have a place for it | yes — 2026-09-17, and the server echoed it back as `UserAnnotated` |
+| does our credential open `UploadFile` | yes — HTTP 200, `result.value: "Success"` |
+| does a model on the socket **see** it | yes — it read the phrase back |
+
+`relay/transport_policy`'s `ATTACHMENT` rule is retired. `needs_tab()` returns False for
+everything, and the call stays ahead of every version because **the ordering is the asset**: a
+structural veto found later must bind versions that already exist, including evolved ones.
+
+**The annotation was added to the CAPTURED template, not composed into a frame.** That
+distinction is the whole reason it worked — this protocol rejects a composed frame and accepts
+the client's own, which `relay/chathub.py` had already measured on 2026-08-20.
+
+**The first attempt was scored wrong, and the way it was wrong is worth keeping.** The probe drew
+six random characters inside a box — a CAPTCHA — and the model refused on exactly those grounds.
+That refusal was proof the picture had arrived, and the probe called it a failure because its
+only test was "is the token in the reply". A model cannot refuse an image it never received.
+
+### The probes
+
+All live in `scripts/probes/`, and `test_the_probe_matches_the_recording.py` holds them to the
+observation.
+
+- **`observe_real_upload.py`** — makes the page do it, with a listener attached. Opens the
+  Analyst surface, puts a file into its own `<input type=file>` exactly as
+  `relay/agent_profiles.upload_file` does, and stops: no turn is sent, no question asked,
+  nothing reaches a model. Records header *names*, whether an `Authorization` header is present
+  and its **scheme word only**, whether a `Cookie` header rides along, the multipart field
+  names, and the response status and body. No header value, no token decoded, and the raw CDP
+  event — which carries every header and every cookie — is never stored. Prints tab counts
+  before and after and closes its page in a `finally`, because one endpoint touched carelessly
+  here once lit a self-feeding loop that reached 40 Edge processes and 4.3 GB.
+
+- **`replay_upload_with_our_token.py`** — the one-variable experiment, and the only one whose
+  result means anything. Captures the page's own request — bytes and headers, as sent — and
+  re-issues exactly that with the `Authorization` header replaced and nothing else. The page's
+  own credential is replaced *before* the request is built, so it is never read, logged or
+  re-sent; the other headers pass through in memory and are not written to disk, because
+  several identify the account. What lands in the output file is the status, the body with
+  token-shaped keys scrubbed, and the names of the headers forwarded.
+
+- **`record_upload_call.py`** — the original passive recorder, kept because it watches every
+  page rather than one. It captures nothing unless an upload happens inside its window, which
+  is why two runs wrote `start`/`watching`/`stop` and nothing else. `observe_real_upload.py`
+  supersedes it for this question by producing the upload itself.
+
+`can_we_upload.py` was **removed**. It reconstructed the request, and reconstruction is what
+produced two 403s that were reported as answers. Keeping a probe that cannot answer beside one
+that can is how the wrong one gets run.
 
 ### On the permission classifier
 
-`record_upload_call.py` is **not** blocked — measured 2026-09-18: it started and attached to a
-CDP target under auto mode. An earlier report that "the UploadFile verification is blocked by
-the classifier" conflated the two scripts. `can_we_upload.py` is the one that captures a
-credential, and it is the one that drew the "Credential Exploration" verdict.
+The active probes capture a credential, and the auto-mode classifier refuses them as
+`[Credential Exploration]`. That is the right shape to refuse by default; it was lifted by
+explicit instruction on 2026-09-18. The passive `record_upload_call.py` is **not** refused —
+an earlier report that "the UploadFile verification is blocked by the classifier" conflated the
+two.
