@@ -53,6 +53,14 @@ MAX_GOAL_CHARS = 4000
 #: accepting work that will never run.
 MAX_PENDING = 50
 
+#: Appended by _clean when it cuts, so a short field is never mistaken for a short answer.
+_TRUNCATED = "\u2026[cut]"
+
+#: What `source` is allowed to say. It was 60, which is under the length of a single sentence
+#: naming a worker and an IP -- and that is exactly what a real one said. `note` has had 500
+#: all along for text a person reads; provenance is not less important than a note.
+MAX_SOURCE_CHARS = 300
+
 
 #: AN ADDRESS IN THE PROVENANCE LINE IS THE AGENT TALKING ABOUT THE PERSON, and it is the one
 #: field here the agent composes rather than relays. Measured 2026-09-10: asked over a plain
@@ -71,8 +79,25 @@ _ADDRESS_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 
 def _clean(text, limit: int) -> str:
-    """Collapse whitespace, drop any address, and cap. Never raises."""
-    return " ".join(_ADDRESS_RE.sub("<address redacted>", str(text or "")).split())[:limit]
+    """Collapse whitespace, drop any address, cap -- and SAY SO when the cap bites.
+
+    A silent cut is how a record stops being a record. Measured 2026-09-18 on a real archived
+    job: `origin.source` ended mid-sentence at "...はローカル書込・実行ツールが", because the
+    caller had named the requesting worker AND the client IP and 60 characters does not hold
+    both. Nothing in the file said it had been cut, so it read as a caller that had trailed
+    off rather than as a field too small for what it is asked to carry.
+
+    This repository already states the rule elsewhere -- evidence_trace records a truncated
+    argument list AS truncated, "silently keeping the first 4,000 characters means a
+    destination named at character 4,001 is not merely missed, it is missed by a check that
+    then reports nothing wrong". Same rule, same reason.
+    """
+    out = " ".join(_ADDRESS_RE.sub("<address redacted>", str(text or "")).split())
+    if limit and len(out) > limit:
+        # The marker is inside the budget, so the result still honours `limit`.
+        cut = max(0, limit - len(_TRUNCATED))
+        return out[:cut] + _TRUNCATED
+    return out
 
 
 def _pending_count() -> int:
@@ -323,7 +348,7 @@ def fleet_submit(goal: str, note: str = "", source: str = "") -> str:
         # not the same authority as a person typing into the cockpit, and the consumer is
         # entitled to treat it differently. Recording it here means the difference survives
         # into the queue instead of being lost at the door.
-        "origin": {"via": "mcp", "source": _clean(source or "agent", 60)},
+        "origin": {"via": "mcp", "source": _clean(source or "agent", MAX_SOURCE_CHARS)},
     }
     try:
         TR.ensure_dirs()

@@ -1739,6 +1739,14 @@ def run_job(job, now_ts=None):
     # deleted. A distinction that does not reach the audit trail is not a distinction.
     if job.get("origin"):
         rec["origin"] = job["origin"]
+    # AND `created`, WHICH IS THE OTHER HALF OF EVERY QUESTION ts_done CAN ANSWER. The comment
+    # above rescued `origin` and stopped one field short. A done record carrying only ts_done
+    # cannot say how long the job waited before anything picked it up -- the difference between
+    # a queue that drains and one that does not -- and the pending file holding `created` is
+    # deleted at this same moment. Found 2026-09-18 reading a real archived job: its `created`
+    # was absent, so it read as 1970-01-01 and the wait was unrecoverable.
+    if job.get("created"):
+        rec["created"] = job["created"]
     try:
         if dest == "local":
             job_type = job.get("type")
