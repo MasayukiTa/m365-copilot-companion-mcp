@@ -1946,6 +1946,27 @@ def _deliver_waiting_goals(now_ts=None, state_dir=None):
         rec = {"id": jid, "type": "fleet_goal", "destination": "fleet", "ts_done": now_ts,
                "status": status, "result": dict(result or {}, delivered_late=True),
                "error": None}
+        # PROVENANCE, THE SECOND TIME. run_job already rescues `origin` and `created` across
+        # the moment a job becomes a record, with the reason written beside it: "a distinction
+        # that does not reach the audit trail is not a distinction". This writer is the OTHER
+        # place a done-record is built, and it built one from scratch -- so a goal delivered
+        # late read origin=null, which says "nobody knows where this came from" about a job
+        # whose origin was on disk the whole time.
+        #
+        # Measured 2026-09-18: cli1789703602_14000_0.delivered.json carried origin=null while
+        # cli1789703602_14000_0.json, written by the earlier pass for the SAME id, carried
+        # {"via": "cli", "source": "...fleet_runner.py --goals-file ..."}.
+        #
+        # The pending file is already gone by here -- it is deleted the moment delivery
+        # succeeds, a few lines up -- so the earlier done-record is where to look.
+        try:
+            with open(_p("done", "%s.json" % jid), encoding="utf-8") as fh:
+                earlier = json.load(fh) or {}
+            for field in ("origin", "created"):
+                if earlier.get(field) and not rec.get(field):
+                    rec[field] = earlier[field]
+        except Exception:
+            pass
         try:
             with open(_p("done", "%s.delivered.json" % jid), "w", encoding="utf-8") as fh:
                 json.dump(rec, fh, ensure_ascii=False, indent=2)

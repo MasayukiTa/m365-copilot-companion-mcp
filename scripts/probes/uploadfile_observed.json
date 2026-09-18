@@ -1,36 +1,82 @@
 {
-  "_what": "The UploadFile request as the PAGE actually made it, transcribed from a CDP recording. This file exists so a probe cannot invent the shape and so a disagreement is visible instead of being argued about.",
-  "_recorded": "2026-09-17T13:37:57+09:00",
-  "_recording": "ws_frames_1789619751.jsonl, event=post, target=80E8571B1E3678EA03CCF1986448A4E9",
-  "_why_it_matters": "On 2026-09-18 a probe was written from memory instead of from this, sent the file as a BINARY part named 'file', got 403, and the 403 was read as 'the audience does not cover this path'. Three things differed from the real request at once, so the result isolated nothing. The observed field list had been sitting in the recording the whole time.",
+  "_what": "The UploadFile request and response as the PAGE actually makes them, captured with a listener attached. Data, so a probe cannot invent the shape and a disagreement is visible instead of argued about.",
+  "_recorded": "2026-09-18, scripts/probes/observe_real_upload.py",
+  "_supersedes": "A first version of this file, transcribed on 2026-09-18 from a 400-character truncated body_head in a 2026-09-17 CDP recording. It listed THREE fields and missed optionsSets entirely, and a test was then written to pin agreement with it -- a guard holding a probe to an incomplete record. Anything built against that version would have been wrong again in a new way. A truncated observation is not an observation of the whole.",
 
   "method": "POST",
   "url": "https://substrate.office.com/m365Copilot/UploadFile",
   "content_type": "multipart/form-data",
+  "body_len_observed": 1254,
+
   "fields": [
-    {
-      "name": "scenario",
-      "kind": "text",
-      "observed_value": "UploadImage"
-    },
+    {"name": "scenario", "kind": "text", "observed_value": "UploadImage"},
     {
       "name": "conversationId",
       "kind": "text",
-      "observed_value": "7851f5a8-5404-42e3-9257-dc24c7471070",
-      "note": "A REAL conversation the page was in. A probe that invents one is changing a second variable."
+      "note": "A REAL conversation the page is in. The RESPONSE echoes one back, which is how the id can be tied to a conversation."
     },
     {
       "name": "FileBase64",
       "kind": "text",
-      "observed_value_prefix": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAABEwAAAHMCAIAAABA",
-      "note": "NOT a binary file part. The bytes travel as a base64 DATA URI inside an ordinary text field, complete with the 'data:image/png;base64,' prefix."
+      "observed_value_prefix": "data:image/png;base64,",
+      "note": "NOT a binary file part. The bytes travel as a base64 DATA URI inside an ordinary text field, prefix included."
+    },
+    {
+      "name": "optionsSets",
+      "kind": "text",
+      "repeated": 3,
+      "note": "REPEATED THREE TIMES -- the field appears three times in one body, not once with three values. Missed by the first transcription because the body was truncated at 400 characters. Values are not recorded here: they are feature flags that change with the client build, so a probe should copy them from a live capture rather than hardcode a snapshot."
     }
   ],
 
-  "what_was_not_recorded": [
-    "The Authorization header, deliberately: the recorder does not read it. So which audience the PAGE used for this call is still unknown, and that is the open question -- not whether the endpoint works, which it demonstrably does.",
-    "The response. The recorder captured 35 'post' events and no response bodies, so the id that UploadFile returns has still never been seen here."
-  ],
+  "auth": {
+    "authorization_present": true,
+    "authorization_scheme": "Bearer",
+    "cookie_header_present": false,
+    "note": "MEASURED, not assumed. The call is bearer-authenticated and sends no cookie, so 'which audience does the token need' is a well-formed question about this endpoint -- which had NOT been established when a 403 was first interpreted that way. The token value is never read or recorded."
+  },
 
-  "follow_on": "The outgoing ChatHub frame after a successful upload carried: messageAnnotations[0] = {id, messageAnnotationMetadata: {@type: File, fileType: png, fileName}, messageAnnotationType: ImageFile}."
+  "request_header_names": [
+    ":authority", ":method", ":path", ":scheme", "accept", "accept-encoding",
+    "accept-language", "authorization", "content-length", "content-type", "origin",
+    "priority", "referer", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+    "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "user-agent",
+    "x-anchormailbox", "x-edge-shopping-flag", "x-gptid", "x-scenario", "x-variants"
+  ],
+  "_header_note": "A probe sending only Authorization differs in far more than the credential. x-anchormailbox in particular routes the request; origin and referer are checked by many Microsoft endpoints. Values are deliberately not transcribed -- some identify the account -- so a probe must copy them from a live capture, not from this file.",
+
+  "response": {
+    "status": 200,
+    "body_shape": {
+      "fileName": "<server-assigned, e.g. 896e1986bf.png>",
+      "fileSize": "<int>",
+      "fileType": ".png",
+      "isLongContext": false,
+      "docId": "0-ejp-d1-<32 hex>",
+      "userId": "<uuid>",
+      "fileSanitizer": "ImageSanitizerBingAI",
+      "conversationId": "<uuid, echoed back>",
+      "result": {"value": "Success", "message": "Success", "serviceVersion": "<x.y.z>"}
+    },
+    "note": "CAPTURED FOR THE FIRST TIME on 2026-09-18. Before this, zero response bodies had ever been seen here, and 'the page successfully uploaded' was an inference from a POST plus a later annotation. It is now a reading: result.value == 'Success'."
+  },
+
+  "docid_is_the_annotation_id": {
+    "response_docId": "0-ejp-d1-<32 hex>",
+    "annotation_id_seen_2026_09_17": "0-wjp-d3-...",
+    "note": "Same shape, so the response's docId is what rides the socket as messageAnnotations[0].id. That provenance was unproven while no response had been captured."
+  },
+
+  "follow_on_frame": "messageAnnotations[0] = {id, messageAnnotationMetadata: {@type: File, fileType: png, fileName}, messageAnnotationType: ImageFile}",
+
+  "answered_2026_09_18": {
+    "question": "Is the token the relay captures (audience substrate.office.com/sydney) accepted here?",
+    "answer": "YES. The page's own request re-issued with ONLY the Authorization swapped returned 200 and result.value 'Success'.",
+    "how": "scripts/probes/replay_upload_with_our_token.py -- it captures the page's bytes and headers and re-issues them. Two earlier probes RECONSTRUCTED the request, both got 403, and both were reported as answers about the credential. They were answers about the reconstruction: one sent a binary part named 'file', both omitted optionsSets x3, and both sent ONE header where the page sends eighteen."
+  },
+
+  "what_is_still_unknown": [
+    "How long a docId remains usable.",
+    "Whether an annotation carrying a docId is accepted when the frame is sent over the socket rather than by the page. A 200 from UploadFile does not answer this, and until it does an attachment still goes to a tab."
+  ]
 }

@@ -2751,6 +2751,10 @@ class CockpitWindow : Window
             // the same files. That distinction is the whole value: a reader comparing this
             // against .fleet/tasks/pending can see the display and the truth disagree.
             var qj = ReadQueuedJobs();
+            // WHERE IT LOOKED. A panel that reports "nothing queued" without saying where
+            // it looked cannot be checked against the queue on disk -- which is the one
+            // comparison this publication exists to make possible.
+            sb.Append(",\"queue_dir\":\"").Append(JsonEscape(TasksDir())).Append('"');
             sb.Append(",\"queued_count\":").Append(qj.Count.ToString(inv));
             sb.Append(",\"queued\":[");
             for (int qi = 0; qi < qj.Count && qi < 20; qi++)
@@ -11104,7 +11108,7 @@ class CockpitWindow : Window
                     : "They are on the queue. Progress appears here once a coordinator starts.",
                 Foreground = Muted, FontSize = 12.5, TextWrapping = TextWrapping.Wrap,
                 TextAlignment = TextAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center,
-                Margin = new Thickness(0, 0, 0, 10) });
+                Margin = new Thickness(0, 0, 0, 12) });
             foreach (QueuedJob qj in queued)
             {
                 string age = qj.AgeS < 90 ? string.Format("{0:0}s", qj.AgeS)
