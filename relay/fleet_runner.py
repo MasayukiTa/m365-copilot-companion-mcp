@@ -1046,6 +1046,68 @@ def _read_goals_file(path):
     return goals
 
 
+#: A CLI SUBMISSION USED TO LEAVE NO TRACE UNTIL IT HAD ALREADY SUCCEEDED.
+#:
+#: tools/fleet_submit writes .fleet/tasks/pending/<id>.json BEFORE anything runs, which is why
+#: the cockpit can show a queued job the moment it is submitted. `fleet_runner.py -g "..."`
+#: wrote nothing until the run was under way: no queue entry, no history row, and -- if it died
+#: before argparse, on a bad path or the wrong interpreter -- not even a coordinator log. From
+#: the screen and from every record on disk, a submission that failed early was indistinguish-
+#: able from a command nobody typed.
+#:
+#: Reported 2026-09-18: a goal was submitted through the CLI, was not on the fleet, was not in
+#: the history, and could not be found anywhere. The contract in docs/agent_contract.md says
+#: work that cannot be confirmed in the GUI does not count as working -- and this route could
+#: not be confirmed at all, by construction.
+#:
+#: So the goals are written into the SAME channel fleet_submit uses, at the first moment they
+#: are known, and removed when the run actually starts and the goals ledger takes over. A run
+#: that never starts leaves them behind, which is the point: an unclaimed entry on the screen
+#: is the difference between "refused" and "never happened".
+def _record_cli_submission(state_dir, goals, argv):
+    """Write one visible queue entry per CLI goal. Returns their paths. Never raises."""
+    import json as _j
+    import time as _t
+
+    out = []
+    try:
+        pend = os.path.join(state_dir, "tasks", "pending")
+        os.makedirs(pend, exist_ok=True)
+        stamp = int(_t.time())
+        for n, g in enumerate(goals or []):
+            text = " ".join(str(g if isinstance(g, str) else (g or {}).get("text", "")).split())
+            if not text:
+                continue
+            jid = "cli%d_%d_%d" % (stamp, os.getpid(), n)
+            rec = {
+                "id": jid,
+                "type": "fleet_goal",
+                "payload": {"goal": text},
+                "created": _t.time(),
+                # SAME SHAPE AS fleet_submit's, so one reader serves both routes and the
+                # difference in authority stays legible.
+                "origin": {"via": "cli", "source": " ".join(str(a) for a in (argv or [])[:6])[:300]},
+            }
+            p = os.path.join(pend, "%s.json" % jid)
+            tmp = p + ".tmp"
+            with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+                _j.dump(rec, fh, ensure_ascii=False, indent=1)
+            os.replace(tmp, p)
+            out.append(p)
+    except Exception:
+        pass
+    return out
+
+
+def _clear_cli_submission(paths):
+    """Drop the queue entries once the run has really started. Never raises."""
+    for p in paths or []:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
 def _read_goals(args):
     """Goals come from -g flags and/or a goals file. See _read_goals_file() for
     the goals-file line format and the fragmented-prompt guard it applies."""
@@ -2104,6 +2166,12 @@ def main():
     # which launcher started this process. Best-effort -- never crashes on failure.
     _setup_coordinator_log(args.state_dir)
 
+    # VISIBLE BEFORE ANYTHING CAN REFUSE IT. See _record_cli_submission: until this existed, a
+    # goal given on the command line appeared nowhere until the run was already going, so a run
+    # that died on a precondition left the operator unable to tell it from a command never
+    # typed. Cleared at run start, where the goals ledger takes over.
+    _cli_queue_paths = _record_cli_submission(args.state_dir, _read_goals(args), sys.argv)
+
     # RETENTION RUNS ONCE, HERE, AND NOT ON A TIMER -- the same reasoning as the session
     # store's pass: a sweep that can fire mid-run is a sweep that can delete the transcript
     # being written to. Placed AFTER the coordinator log is opened so this run's own log is
@@ -2289,6 +2357,9 @@ def main():
     # record `--resume` can relaunch from. Reset the done-map to empty for this run so a
     # previous run's completions never mask this run's goals. Best-effort (never crashes).
     _write_goals_ledger(args.state_dir, goals, started)
+    # The run is under way and its goals are in the ledger and about to be in status.json, so
+    # the queue entries written at startup have done their job.
+    _clear_cli_submission(_cli_queue_paths)
     try:
         _write_atomic(os.path.join(args.state_dir, LAST_RUN_DONE), {})
     except Exception as e:

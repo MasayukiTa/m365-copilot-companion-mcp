@@ -271,6 +271,7 @@ jobs:
             tools/test_auth_stats.py \
             tools/test_an_alert_you_cannot_act_on.py \
             tools/test_a_record_that_was_cut_must_say_it_was_cut.py \
+            tools/test_provenance_survives_both_writers.py \
             tools/test_tool_probe.py \
             tools/test_skill_registration.py \
             scripts/test_settle_stage0_replay.py \
