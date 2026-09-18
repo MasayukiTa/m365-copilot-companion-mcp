@@ -148,3 +148,98 @@ def test_the_server_instructions_no_longer_say_no_gateway():
     assert "call_tool(name='fleet_submit'" in text, "the gateway route is not spelled out"
     assert "docs/agent_contract.md" in text, "the instructions do not point at the contract"
     assert "QUEUED, not started" in text, "a job id must not read as a landing"
+
+
+# ---- the recorded CLI route ---------------------------------------------------------------
+#
+# Launching relay/fleet_runner.py -g "..." is not submitting: the runner writes nothing until
+# the run is under way, so a CLI submission was invisible and an early death left no trace at
+# all. scripts/submit_goal.py goes through fleet_submit, which writes the queue entry before
+# anything can refuse the job -- measured on screen two seconds after the command returned.
+
+
+def test_the_cli_front_door_goes_through_fleet_submit():
+    """THE POINT OF IT. Anything that builds its own queue entry, or starts a runner, is back
+    to the route that could not be seen."""
+    src = _read(os.path.join(REPO, "scripts", "submit_goal.py"))
+    assert "from tools.fleet_intake import fleet_submit" in src
+    assert "fleet_runner" not in src.split('"""', 2)[-1], \
+        "the front door is starting a runner instead of queueing"
+
+
+def test_the_front_door_does_not_split_an_instruction_into_words():
+    """A shell that splits an unquoted instruction would otherwise queue one job per word, and
+    fleet_submit's duplicate guard cannot catch it because the fragments differ."""
+    import scripts.submit_goal as SG
+
+    calls = []
+    real = None
+    try:
+        import tools.fleet_intake as FI
+        real = FI.fleet_submit
+
+        def _fake(goal="", note="", source=""):
+            calls.append(goal)
+            return "queued deadbeef -- fake"
+
+        FI.fleet_submit = _fake
+        rc = SG.main(["one", "two", "three"])
+    finally:
+        if real is not None:
+            import tools.fleet_intake as FI
+            FI.fleet_submit = real
+    assert rc == 0, rc
+    assert calls == ["one two three"], calls
+
+
+def test_the_front_door_reports_a_refusal_as_a_failure():
+    """fleet_submit refuses by RETURNING a string, not by raising. Exiting 0 on a refusal is
+    how a caller concludes the job is queued when the queue said no."""
+    import scripts.submit_goal as SG
+
+    real = None
+    try:
+        import tools.fleet_intake as FI
+        real = FI.fleet_submit
+        FI.fleet_submit = lambda goal="", note="", source="": \
+            "[fleet_submit: refused -- this reads as the goal already queued]"
+        rc = SG.main(["do the thing"])
+    finally:
+        if real is not None:
+            import tools.fleet_intake as FI
+            FI.fleet_submit = real
+    assert rc == 1, "a refusal exited %r" % rc
+
+
+def test_the_front_door_fills_in_a_source_when_none_is_given():
+    """origin.source is the only record of where an instruction came from, and an empty one is
+    the answer nobody can act on."""
+    import scripts.submit_goal as SG
+
+    seen = {}
+    real = None
+    try:
+        import tools.fleet_intake as FI
+        real = FI.fleet_submit
+
+        def _fake(goal="", note="", source=""):
+            seen["source"] = source
+            return "queued deadbeef -- fake"
+
+        FI.fleet_submit = _fake
+        SG.main(["do the thing"])
+    finally:
+        if real is not None:
+            import tools.fleet_intake as FI
+            FI.fleet_submit = real
+    assert seen.get("source"), "no source was passed"
+    assert seen["source"].startswith("cli"), seen["source"]
+
+
+def test_the_contract_names_the_front_door_and_warns_off_the_runner():
+    doc = _read(CONTRACT)
+    assert "scripts/submit_goal.py" in doc
+    assert "is not submitting" in doc, "the contract does not say what the runner is not"
+    # And the freshness caveat, so an absence in the published strip is not read as an absence
+    # on screen.
+    assert "fresher than the published report" in doc
