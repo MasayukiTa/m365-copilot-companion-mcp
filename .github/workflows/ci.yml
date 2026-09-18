@@ -645,6 +645,7 @@ jobs:
             bench/test_grade_reasons.py \
             scripts/test_bootstrap_transcript.py \
             scripts/probes/test_the_probe_matches_the_recording.py \
+            scripts/probes/test_a_cut_observation_must_announce_the_cut.py \
             scripts/test_devtunnel_download.py \
             tests/test_ledger_attribution_reaches_the_ledger.py
 
