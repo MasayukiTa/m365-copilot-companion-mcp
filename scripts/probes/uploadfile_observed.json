@@ -1,0 +1,36 @@
+{
+  "_what": "The UploadFile request as the PAGE actually made it, transcribed from a CDP recording. This file exists so a probe cannot invent the shape and so a disagreement is visible instead of being argued about.",
+  "_recorded": "2026-09-17T13:37:57+09:00",
+  "_recording": "ws_frames_1789619751.jsonl, event=post, target=80E8571B1E3678EA03CCF1986448A4E9",
+  "_why_it_matters": "On 2026-09-18 a probe was written from memory instead of from this, sent the file as a BINARY part named 'file', got 403, and the 403 was read as 'the audience does not cover this path'. Three things differed from the real request at once, so the result isolated nothing. The observed field list had been sitting in the recording the whole time.",
+
+  "method": "POST",
+  "url": "https://substrate.office.com/m365Copilot/UploadFile",
+  "content_type": "multipart/form-data",
+  "fields": [
+    {
+      "name": "scenario",
+      "kind": "text",
+      "observed_value": "UploadImage"
+    },
+    {
+      "name": "conversationId",
+      "kind": "text",
+      "observed_value": "7851f5a8-5404-42e3-9257-dc24c7471070",
+      "note": "A REAL conversation the page was in. A probe that invents one is changing a second variable."
+    },
+    {
+      "name": "FileBase64",
+      "kind": "text",
+      "observed_value_prefix": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAABEwAAAHMCAIAAABA",
+      "note": "NOT a binary file part. The bytes travel as a base64 DATA URI inside an ordinary text field, complete with the 'data:image/png;base64,' prefix."
+    }
+  ],
+
+  "what_was_not_recorded": [
+    "The Authorization header, deliberately: the recorder does not read it. So which audience the PAGE used for this call is still unknown, and that is the open question -- not whether the endpoint works, which it demonstrably does.",
+    "The response. The recorder captured 35 'post' events and no response bodies, so the id that UploadFile returns has still never been seen here."
+  ],
+
+  "follow_on": "The outgoing ChatHub frame after a successful upload carried: messageAnnotations[0] = {id, messageAnnotationMetadata: {@type: File, fileType: png, fileName}, messageAnnotationType: ImageFile}."
+}

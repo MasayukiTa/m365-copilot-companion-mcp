@@ -60,11 +60,24 @@ ANALYZE:
 The protocol has a field for it. The bytes go over HTTP and an ID rides the socket; the
 <input type=file> is the UI's door, not the protocol's requirement.
 
-THE BEHAVIOUR IS KEPT ANYWAY, and that is not timidity. Knowing a request's shape is not
-knowing we can make it: the audience of the token we hold, the conversationId the upload
-wants, and the lifetime of the returned id are all unestablished, and establishing them means
-using a credential -- an operator's decision, not a side effect of correcting a comment. Until
-that is done, an attachment still goes to a tab.
+THE BEHAVIOUR IS KEPT, AND THE AUDIENCE QUESTION IS STILL OPEN. A probe was run on
+2026-09-18 and returned 403, and that 403 establishes nothing, because it differed from the
+observed request in THREE ways at once: the token's source, an invented conversationId, and --
+the one that matters -- the body shape. The page sends the bytes as a base64 DATA URI in a text
+field named `FileBase64`; the probe sent a binary part named `file`. A refusal of a request
+nobody makes is not evidence about the request everybody makes.
+
+The failure was avoidable from inside. The observed field list was in the recording the whole
+time and had not been written down anywhere a later reader would meet it, so the probe was built
+from memory and there was nothing to check the 403 against. It is written down now, as data:
+scripts/probes/uploadfile_observed.json, and scripts/probes/can_we_upload.py builds its request
+from that file rather than from anyone's recollection.
+
+WHAT IS ACTUALLY KNOWN: the endpoint accepts uploads from this machine and this account -- the
+page did it, successfully, on 2026-09-17. WHAT IS NOT: which credential the page used, because
+the recorder deliberately does not read the Authorization header, and what UploadFile returns,
+because no response body was ever captured. Until an upload is made with the observed shape and
+a real conversation, an attachment still goes to a tab.
 
 WHAT IS AT STAKE IF IT IS PURSUED. The socket was measured at 255 seconds against 673-809 for
 the same Researcher work in a tab, and its completion arrives as a protocol frame rather than

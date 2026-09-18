@@ -109,20 +109,33 @@ and the outgoing ChatHub frame then carried:
 So the bytes go over HTTP and an **id rides the socket**. The `<input type=file>` is the UI's
 door, not the protocol's requirement.
 
-### What is still unanswered
+### Still open — and one attempt that proved nothing
 
 Does the token the relay already captures get past that door? It has audience
-`substrate.office.com/sydney` — the same host as `UploadFile`, a different path. Until that is
-answered the routing stays as it is.
+`substrate.office.com/sydney` — the same host as `UploadFile`, a different path.
 
-Readings, decided in advance so the result cannot be talked into being a pass:
+A probe on 2026-09-18 returned **403**, and that result establishes nothing. It differed from
+the observed request in three ways at once: the token's source, an invented `conversationId`,
+and the body shape. **The page sends the bytes as a base64 data URI in a text field named
+`FileBase64`; the probe sent a binary file part named `file`.** A refusal of a request nobody
+makes says nothing about the request everybody makes.
 
-- **200/201** — the relay can upload. The id in the response is what a socket frame carries in
-  `messageAnnotations`, and the Analyst can leave the tab behind.
-- **401/403** — the audience does not cover this path. Not a dead end: the next question is
-  which audience does, which is a different experiment.
-- **400** — authorised, and the body is wrong. That is a **pass** on the question being asked;
-  the multipart field list is then the remaining work.
+That mistake was avoidable without anyone pointing it out. The field list had been in the CDP
+recording since 2026-09-17 and was never written anywhere a later reader would meet it — this
+document said only "multipart, scenario=UploadImage" and called the field list "the remaining
+work", when it was sitting in the recording. So the probe was built from recollection and there
+was nothing to check the 403 against.
+
+It is data now: **`scripts/probes/uploadfile_observed.json`** holds the request exactly as the
+page made it, and `can_we_upload.py` builds from that file. A test asserts the two agree, so the
+probe can no longer drift from the observation.
+
+**What is actually known:** the endpoint accepts uploads from this machine and this account —
+the page did it, successfully. **What is not:** which credential the page used (the recorder
+deliberately does not read the `Authorization` header) and what `UploadFile` returns (35 `post`
+events were captured and no response bodies, so the returned id has still never been seen here).
+
+The next experiment is one variable at a time, starting from the observed shape.
 
 ### The two probes
 

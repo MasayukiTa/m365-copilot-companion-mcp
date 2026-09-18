@@ -1215,7 +1215,7 @@ def _queue_input_locked(sid, text):
 #: Retried, then recorded. Retried because the cause was a transient-looking write to a closed
 #: socket and a fresh attempt is usually right; recorded rather than retried forever because a
 #: message that cannot be delivered must not sit in front of the next one.
-UNDELIVERED_PATH = os.path.join(
+UNDELIVERED_PATH = os.environ.get("MCP_BRIDGE_UNDELIVERED_FILE") or os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".fleet",
     "bridge_undelivered.jsonl")
 

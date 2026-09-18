@@ -232,6 +232,12 @@ DELIBERATELY_NOT_REDIRECTED = {
     ("tools.auth_stats", "_REJECTIONS_FILE"):
         "resolved through the MCP_AUTH_REJECTIONS_FILE environment variable, which conftest "
         "points at a per-run temp file; the .fleet path is only its fallback",
+    ("relay.copilot_autopilot_relay", "NOTIFY_SOURCE_LOG"):
+        "resolved through the MCP_NOTIFY_SOURCE_LOG environment variable, which conftest "
+        "points at a per-run temp file; the .fleet path is only its fallback",
+    ("bridge.copilot_bridge", "UNDELIVERED_PATH"):
+        "resolved through the MCP_BRIDGE_UNDELIVERED_FILE environment variable, which conftest "
+        "points at a per-run temp file; the .fleet path is only its fallback",
     # ── surfaced 2026-09-14 by teaching the walk about `.companion_gates` ────────────────
     #
     # ALREADY REDIRECTED, BY THE VARIABLE RATHER THAN BY THIS TABLE -- the same arrangement as
@@ -566,6 +572,8 @@ _SANDBOX_NAMES = (
     "selfimprove_hypotheses_pytest_%s.jsonl",
     "fleet_state_pytest_%s",
     "auth_rejections_pytest_%s.jsonl",
+    "notify_source_pytest_%s.log",
+    "bridge_undelivered_pytest_%s.jsonl",
 )
 
 _atexit.register(_drop_this_runs_sandbox)
@@ -644,6 +652,21 @@ _os.environ.setdefault(
 _os.environ.setdefault(
     "MCP_AUTH_REJECTIONS_FILE",
     _sandbox_path("auth_rejections_pytest_%s.jsonl"))
+
+
+# And the toast watchdog's record of WHO fired a notification. It gained a name on 2026-09-18 --
+# it had been built from __file__ inside the function, where nothing could move it -- and a path
+# that only exists as an expression is one relay/test_live_record_isolation.py cannot see.
+_os.environ.setdefault(
+    "MCP_NOTIFY_SOURCE_LOG",
+    _sandbox_path("notify_source_pytest_%s.log"))
+
+
+# And the bridge's record of a message it could not deliver, added the same day. Its own test
+# redirects it; the point of this list is that the NEXT test does not have to remember.
+_os.environ.setdefault(
+    "MCP_BRIDGE_UNDELIVERED_FILE",
+    _sandbox_path("bridge_undelivered_pytest_%s.jsonl"))
 
 
 @pytest.fixture(autouse=True)

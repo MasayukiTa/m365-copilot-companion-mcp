@@ -34,6 +34,8 @@ removed.
 """
 from __future__ import annotations
 
+import io
+import json
 import os
 import sys
 import uuid
@@ -48,6 +50,26 @@ AGENT = (os.environ.get("MCP_FLEET_AGENT_URL")
          or "https://m365.cloud.microsoft/chat/?titleId=T_02140b8c-f551-675b-516a-4c7d2b08867e")
 
 PNG = os.path.join(os.environ.get("TEMP", "."), "upload_probe.png")
+
+#: The request as the page actually made it. Data, so a probe cannot invent the shape.
+OBSERVED = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploadfile_observed.json")
+
+#: Where the bridge reports the conversation it is currently on. /status is a read; it is not
+#: one of the page-grabbing endpoints.
+BRIDGE_STATUS = os.environ.get("MCP_BRIDGE_STATUS_URL", "http://127.0.0.1:8765/status")
+
+
+def _live_conversation_id():
+    """(id, True) when the running bridge names a conversation, ("", False) otherwise."""
+    try:
+        import json as _j
+        import urllib.request as _u
+        with _u.urlopen(BRIDGE_STATUS, timeout=5) as fh:
+            conv = (_j.loads(fh.read().decode("utf-8")) or {}).get("conversation") or ""
+        return (str(conv), True) if conv else ("", False)
+    except Exception:
+        return ("", False)
+
 
 
 def _make_png():
@@ -75,14 +97,52 @@ def main():
             return 2
         print("token captured (life %.0f s). Not printed, not stored." % PT.token_life_s(token))
 
-        # The multipart shape the page used, as far as the recording showed it: a scenario and
-        # a conversationId alongside the file. The conversationId is invented here on purpose --
-        # if the endpoint objects to it, that is a 400 and the auth question is still answered.
+        # A REAL CONVERSATION WHEN ONE IS AVAILABLE. The first version invented a uuid4 and
+        # called it harmless -- "if the endpoint objects to it, that is a 400" -- which assumed
+        # the endpoint checks the body before the conversation. Nothing established that, and a
+        # refusal aimed at a conversation that does not exist looks exactly like a refusal aimed
+        # at the credential. The live bridge knows one; ask it rather than guess.
+        conversation_id, real_conv = _live_conversation_id()
+        if not conversation_id:
+            conversation_id, real_conv = str(uuid.uuid4()), False
+
+        # THE SHAPE COMES FROM THE RECORDING, NOT FROM MEMORY.
+        #
+        # This sent `files={"file": <binary part>}` until 2026-09-18 and got 403, and the 403
+        # was read as an answer about the token's audience. It was not: the page does not send
+        # a binary part at all. It puts the bytes in an ordinary TEXT field named `FileBase64`,
+        # as a complete `data:image/png;base64,...` URI. The probe was refused for a request
+        # nobody makes, which says nothing about the request everybody makes.
+        #
+        # The field list had been sitting in the CDP recording since 2026-09-17 and had never
+        # been written down, so there was nothing to check the result against. It is data now
+        # -- uploadfile_observed.json beside this file -- and the request is built from it, so
+        # the two cannot drift apart. scripts/probes/test_the_probe_matches_the_recording.py
+        # pins that they agree.
+        import base64
         import requests
-        files = {"file": (os.path.basename(path), open(path, "rb"), "image/png")}
-        data = {"scenario": "UploadImage", "conversationId": str(uuid.uuid4())}
+
+        observed = json.loads(io.open(OBSERVED, encoding="utf-8").read())
+        names = [f["name"] for f in observed["fields"]]
+        b64 = base64.b64encode(open(path, "rb").read()).decode("ascii")
+        data = {
+            "scenario": "UploadImage",
+            "conversationId": conversation_id,
+            "FileBase64": "data:image/png;base64," + b64,
+        }
+        missing = [n for n in names if n not in data]
+        if missing:
+            print("REFUSING: the recording names fields this probe does not send: %s" % missing)
+            return 2
+        extra = [n for n in data if n not in names]
+        if extra:
+            print("REFUSING: this probe sends fields the recording does not: %s" % extra)
+            return 2
+        print("fields: %s (from %s)" % (names, os.path.basename(OBSERVED)))
+        print("conversationId: %s" % ("a REAL one from the live bridge" if real_conv
+                                      else "INVENTED -- this is a second changed variable"))
         r = requests.post(UPLOAD_URL, headers={"Authorization": "Bearer " + token},
-                          data=data, files=files, timeout=45)
+                          data=data, timeout=45)
         body = (r.text or "")[:1200]
         for k in ("token", "Token", "secret", "Authorization"):
             if k in body:
@@ -94,8 +154,9 @@ def main():
             print("READING: the relay CAN upload. Whatever id this returned is what a socket")
             print("         frame would carry in messageAnnotations.")
         elif r.status_code in (401, 403):
-            print("READING: the audience we hold does not open this path. Not a dead end --")
-            print("         the next question is which audience does.")
+            print("READING: refused. This narrows things ONLY if the shape and the conversation")
+            print("         above both matched the recording -- otherwise it says nothing about")
+            print("         the credential, which is the mistake made on 2026-09-18.")
         elif r.status_code == 400:
             print("READING: authorised, and the body is wrong. The auth question is ANSWERED;")
             print("         the field list is the remaining work.")
