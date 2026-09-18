@@ -60,24 +60,36 @@ ANALYZE:
 The protocol has a field for it. The bytes go over HTTP and an ID rides the socket; the
 <input type=file> is the UI's door, not the protocol's requirement.
 
-THE BEHAVIOUR IS KEPT, AND THE AUDIENCE QUESTION IS STILL OPEN. A probe was run on
-2026-09-18 and returned 403, and that 403 establishes nothing, because it differed from the
-observed request in THREE ways at once: the token's source, an invented conversationId, and --
-the one that matters -- the body shape. The page sends the bytes as a base64 DATA URI in a text
-field named `FileBase64`; the probe sent a binary part named `file`. A refusal of a request
-nobody makes is not evidence about the request everybody makes.
+THE AUDIENCE QUESTION IS ANSWERED, 2026-09-18: THE TOKEN WE ALREADY HOLD IS ACCEPTED.
 
-The failure was avoidable from inside. The observed field list was in the recording the whole
-time and had not been written down anywhere a later reader would meet it, so the probe was built
-from memory and there was nothing to check the 403 against. It is written down now, as data:
-scripts/probes/uploadfile_observed.json, and scripts/probes/can_we_upload.py builds its request
-from that file rather than from anyone's recollection.
+    the page's own UploadFile request, re-issued with ONLY the Authorization header swapped
+    for the token relay/profile_token captures  ->  HTTP 200
+    {"docId": "0-ejp-d1-...", "fileSanitizer": "ImageSanitizerBingAI",
+     "result": {"value": "Success", "message": "Success"}}
 
-WHAT IS ACTUALLY KNOWN: the endpoint accepts uploads from this machine and this account -- the
-page did it, successfully, on 2026-09-17. WHAT IS NOT: which credential the page used, because
-the recorder deliberately does not read the Authorization header, and what UploadFile returns,
-because no response body was ever captured. Until an upload is made with the observed shape and
-a real conversation, an attachment still goes to a tab.
+So the socket route is not blocked by the credential, and the docId in that response is what a
+frame carries as messageAnnotations[0].id -- the response was captured for the first time on the
+same day, which is also when "the page uploaded successfully" stopped being an inference from a
+POST plus a later annotation.
+
+IT TOOK THREE ATTEMPTS AND THE FIRST TWO WERE REPORTED AS ANSWERS. Both returned 403 and both
+were about the request, not the credential:
+
+    1  a binary multipart part named "file", an invented conversationId, our token
+    2  the right three fields, a real conversationId, our token
+       -- still wrong: the real body has SIX fields, not three (scenario, conversationId,
+          FileBase64, and optionsSets THREE TIMES), and the probe sent ONE header where the
+          page sends eighteen, among them x-anchormailbox, which routes the request.
+
+The three-field list came from a 400-character truncated body_head, and a test had been written
+to pin agreement with it -- a guard holding a probe to an incomplete record. Reconstructing the
+request is what failed, every time. scripts/probes/replay_upload_with_our_token.py does not
+reconstruct it: it captures the page's bytes and headers and re-issues them, replacing the
+credential and nothing else, which is the only reason its result means anything.
+
+WHAT IS STILL NOT ASKED, and 200 does not answer: how long a docId lives, and whether an
+annotation sent over the socket is accepted. Until those, an attachment still goes to a tab --
+now because two specific questions are open, not because the door was thought to be shut.
 
 WHAT IS AT STAKE IF IT IS PURSUED. The socket was measured at 255 seconds against 673-809 for
 the same Researcher work in a tab, and its completion arrives as a protocol frame rather than
@@ -102,22 +114,47 @@ import re
 
 TAB, SOCKET = "tab", "socket"
 
-#: FIXED. Not read from any genome, and `evolvable_fields()` refuses to return it.
+#: RETIRED 2026-09-18. It said "a socket has nowhere to put a local file", and a socket has
+#: one. Kept as a name because the reason it went is worth more than the rule was.
 #:
-#: The whole rule. Measured across twenty socket turns and eight request classes as the only
-#: property that structurally forces a tab -- see the module note for why the previous rule
-#: (anything mentioning an M365 surface) was removed rather than narrowed.
-ATTACHMENT = "attachment: a socket has nowhere to put a local file"
+#: The rule survived one correction already: its REASON was rewritten on 2026-09-17 when a
+#: CDP recording showed the protocol carries an attachment -- bytes to UploadFile over HTTP,
+#: the returned id riding the socket in messageAnnotations -- while the BEHAVIOUR was kept,
+#: because knowing a request's shape is not knowing we can make it. Three questions stood
+#: between the two, and all three are now answered by measurement:
+#:
+#:   the protocol has a place for it   observed 2026-09-17; the page's own frame carried
+#:                                     messageAnnotations and the server echoed it back with
+#:                                     messageAnnotationSource "UserAnnotated"
+#:   our credential opens UploadFile   measured 2026-09-18: HTTP 200, result.value "Success",
+#:                                     by replaying the page's own request with ONLY the
+#:                                     Authorization header swapped
+#:   a model on the socket SEES it     measured 2026-09-18: an image carrying a randomly
+#:                                     generated phrase was uploaded, its docId sent as an
+#:                                     annotation on a socket turn, and the reply read the
+#:                                     phrase back. It appears in no filename, no path and no
+#:                                     prompt, so it could only have come from the pixels.
+#:
+#: A rule whose premise has been measured false is not made safer by leaving it in place; it
+#: is a routing decision nobody can explain. So an attachment no longer forces a tab.
+ATTACHMENT = "attachment: retired -- a socket carries one (measured 2026-09-18)"
 
 
 def needs_tab(upload_path: str = "") -> bool:
     """True when this task cannot be carried by a socket, whatever any policy prefers.
 
-    Takes the caller's own parameter, NOT the goal text. Reading the text is what the removed
-    rule did, and the measurement says the text carries no signal about this: goals that name
-    mail, calendars and SharePoint were carried by the socket, with ground truth to prove it.
+    NOTHING RETURNS TRUE TODAY, and the function stays because the SHAPE is the valuable
+    part: a structural veto applied before any policy, that no genome can reach. The
+    attachment was the last thing in it, and it left by measurement rather than by
+    preference -- see ATTACHMENT above.
+
+    Still takes the caller's own parameter rather than the goal text. Reading the text is
+    what the FIRST removed rule did, and the measurement says the text carries no signal:
+    goals naming mail, calendars and SharePoint were carried by the socket with ground
+    truth to prove it. If a genuine structural veto is found later it belongs here, as a
+    parameter, not as a pattern over prose.
     """
-    return bool(upload_path)
+    return False
 
 
 #: A fallback reason matching any of these is the ROUTE's failure, not the goal's. Kept as
@@ -273,9 +310,13 @@ def evolvable_fields() -> tuple:
 def choose(goal: str, *, kind="", knobs=None, explore=False, upload_path="") -> str:
     """The transport for one goal, under whichever version the active harness names.
 
-    THE STRUCTURAL RULE IS APPLIED FIRST, so no version -- present or future, hand-written or
-    evolved -- can send an attachment over a socket. A version that could would not be a worse
-    policy; it would be a broken one.
+    THE STRUCTURAL VETO IS STILL APPLIED FIRST, and as of 2026-09-18 it vetoes nothing: the
+    attachment rule was retired when all three of its open questions were measured. The call
+    stays ahead of every policy because that ordering is the point -- a veto found later must
+    bind versions that already exist, including evolved ones.
+
+    `upload_path` is still accepted and still passed through, so a caller that names a file
+    keeps saying so and a future veto has its parameter waiting.
     """
     if needs_tab(upload_path):
         return TAB

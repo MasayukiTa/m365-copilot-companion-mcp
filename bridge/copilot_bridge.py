@@ -1226,6 +1226,11 @@ _DRAIN_ATTEMPTS = {}
 _DRAIN_ATTEMPTS_MAX = 512
 _DRAIN_MAX_TRIES = 2
 
+#: How much of an undelivered message is kept. Generous, because the record exists so
+#: the operator can see WHAT was lost; bounded, because this is written from the request
+#: path. A cut is announced in the row, beside `text_len`.
+_UNDELIVERED_TEXT_CHARS = 20000
+
 
 def _record_undelivered(sid, text, why):
     """Say where a message went. Never raises -- this runs on the failure path."""
@@ -1233,8 +1238,17 @@ def _record_undelivered(sid, text, why):
         d = os.path.dirname(UNDELIVERED_PATH)
         if d:
             os.makedirs(d, exist_ok=True)
+        # THE MESSAGE IS THE WHOLE POINT OF THIS FILE, so a cut in it must be visible.
+        # Written silently at [:2000] when this record was added earlier the same day --
+        # the very failure class the sweep was looking for, in the code written to fix a
+        # different instance of it.
+        _text = str(text or "")
         row = {"ts": time.time(), "sid": str(sid or ""), "why": str(why)[:300],
-               "text": str(text or "")[:2000]}
+               "text_len": len(_text),
+               "text": _text if len(_text) <= _UNDELIVERED_TEXT_CHARS else (
+                   _text[:_UNDELIVERED_TEXT_CHARS]
+                   + "\n[cut: kept %d of %d characters]"
+                     % (_UNDELIVERED_TEXT_CHARS, len(_text)))}
         with open(UNDELIVERED_PATH, "a", encoding="utf-8", newline="\n") as fh:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
     except Exception:

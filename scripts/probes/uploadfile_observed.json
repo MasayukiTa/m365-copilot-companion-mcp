@@ -95,8 +95,7 @@
     "how": "scripts/probes/replay_upload_with_our_token.py -- it captures the page's bytes and headers and re-issues them. Two earlier probes RECONSTRUCTED the request, both got 403, and both were reported as answers about the credential. They were answers about the reconstruction: one sent a binary part named 'file', both omitted optionsSets x3, and both sent ONE header where the page sends eighteen."
   },
   "what_is_still_unknown": [
-    "How long a docId remains usable.",
-    "Whether an annotation carrying a docId is accepted when the frame is sent over the socket rather than by the page. A 200 from UploadFile does not answer this, and until it does an attachment still goes to a tab."
+    "How long a docId remains usable. Two uploads of the same bytes returned different ids, so an id is per-upload; nothing has measured how long one lives."
   ],
   "socket_annotation": {
     "_question": "Is an annotation carrying a docId accepted when the frame goes over the socket?",
@@ -105,12 +104,14 @@
       "echoed_back": "The following webSocketFrameReceived carried the same id with messageAnnotationSource:'UserAnnotated' and turnCount:1.",
       "reading": "The server ACCEPTS an annotated frame on this socket. That is about the PAGE's send, with the page's own frame and credential -- not about ours."
     },
-    "why_it_is_not_enough_to_act_on": [
-      "THE CAPTURED FRAME IS TRUNCATED AND THEREFORE NOT A TEMPLATE. declared len 4811, captured 4000, cut by 811 characters, and it does not parse as JSON. The recorder wrote payload[:4000]. This is the same defect as the 400-character body_head that produced three wrong UploadFile probes on 2026-09-18: a truncated observation is not an observation.",
-      "relay/chathub.py sends the CLIENT'S OWN captured template with this turn's ids and text written in, and its docstring records that a COMPOSED frame was measured REJECTED on 2026-08-20 while the captured shape was accepted (result=Success). So the annotation cannot be composed into a frame -- it has to come from a template that carries it.",
-      "No template in this repository carries messageAnnotations today."
-    ],
-    "what_would_answer_it": "Re-capture the page's annotated frame WITHOUT truncation (the recorder's cap must exceed the frame, which was 4811 characters here), turn it into a RequestTemplate, and send one turn through it with a docId from UploadFile written in. Producing the capture needs a real message sent WITH an attachment -- attaching alone produces the UploadFile POST but no chat frame.",
-    "docid_lifetime": "NOT MEASURED, and it cannot be measured before the above: 'how long does a docId stay usable' has no meaning until there is a way to use one. Two uploads of the same bytes returned different docIds (0-ejp-d1-149e4084... and 0-ejp-d1-9717cadd...), so an id is per-upload rather than per-file."
+    "what_would_answer_it": "ANSWERED -- see answered_2026_09_18. The truncated 4,000-character capture was never needed: the annotation was added to the CAPTURED template rather than composed into a frame, which is a different thing from the composed frame this protocol rejects.",
+    "docid_lifetime": "NOT MEASURED, and it cannot be measured before the above: 'how long does a docId stay usable' has no meaning until there is a way to use one. Two uploads of the same bytes returned different docIds (0-ejp-d1-149e4084... and 0-ejp-d1-9717cadd...), so an id is per-upload rather than per-file.",
+    "answered_2026_09_18": {
+      "question": "Does an annotation carrying a docId reach a model that can SEE the picture, when the turn goes over our socket?",
+      "answer": "YES.",
+      "how": "scripts/probes/send_image_over_socket.py -- an image carrying a randomly generated phrase was uploaded through the page's own request with only the Authorization swapped, its docId was sent as messageAnnotations on a socket turn, and the reply read the phrase back. The phrase appears in no filename, no path and no prompt, so it can only have come from the pixels.",
+      "first_attempt_was_scored_wrong": "The first image was six random characters inside a drawn box -- a CAPTCHA -- and the model refused on exactly those grounds. That refusal was PROOF the picture had arrived, and the probe scored it a failure because its only test was 'is the token in the reply'. Both readings are recorded separately now: a model cannot refuse an image it never got.",
+      "consequence": "relay/transport_policy's ATTACHMENT rule is retired. needs_tab() returns False for everything; the call stays ahead of every version because the ORDERING is the asset, not the rule that used to sit in it."
+    }
   }
 }

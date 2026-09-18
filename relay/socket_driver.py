@@ -136,7 +136,7 @@ class CopilotSocketDriver:
             time.sleep(poll_s)
         return True
 
-    def send(self, text, gen_wait_s=None, **_kw):
+    def send(self, text, gen_wait_s=None, annotations=None, **_kw):
         """Start a turn. Returns as soon as it is running, exactly as the tab driver does.
 
         `gen_wait_s` is accepted and ignored: it exists because the tab driver must not block
@@ -157,11 +157,14 @@ class CopilotSocketDriver:
             self._last = ""
             self._turn_seq += 1
             self._turn_answered = False
-        self._thread = threading.Thread(target=self._run_turn, args=(text,),
+        # ANNOTATIONS RIDE WITH THE TEXT. Passed explicitly rather than through **_kw,
+        # which this signature swallows -- a caller that attached an image and had it
+        # silently dropped would get a turn that looks fine and answers about nothing.
+        self._thread = threading.Thread(target=self._run_turn, args=(text, annotations),
                                         name="socket-turn", daemon=True)
         self._thread.start()
 
-    def _run_turn(self, text):
+    def _run_turn(self, text, annotations=None):
         def on_text(sofar):
             with self._lock:
                 self._partial = sofar
@@ -233,6 +236,7 @@ class CopilotSocketDriver:
                         os.environ["MCP_SOCKET_FORCE_FAIL"] = "%d:%s" % (left - 1, _why)
                         raise ChatHubError(_why)
             answer = self.conv.ask(text, connect=self._connect, on_text=on_text,
+                                   annotations=annotations,
                                    on_progress=on_progress,
                                    catalogue=self._catalogue, protocol=self._protocol,
                                    run_tool=self._run_tool)
