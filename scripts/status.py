@@ -398,6 +398,35 @@ def section_health_strip(rep, stale_after_s=90.0):
                                   "below is whatever it was when it stopped" % age)
     else:
         rep.row(OK, "strip age", "%.0f s old" % age)
+    # WHAT THE PANEL SAYS IT IS SHOWING FOR THE QUEUE.
+    #
+    # A job submitted to the fleet was invisible on the cockpit until a worker existed, and
+    # EmptyState() said "タスクはまだありません" in the meantime -- not slow, false. The rule
+    # here is that work which cannot be confirmed in the GUI does not count as working, so the
+    # display was also the only thing standing between a submission and any verification of it.
+    #
+    # This is the PANEL'S OWN report, published beside the dots, not a second count computed
+    # from .fleet/tasks. That is the point: a reader can compare this line against the queue on
+    # disk and see the display and the truth disagree. Absent from an older cockpit binary,
+    # which is said rather than shown as zero.
+    if "queued_count" not in strip:
+        rep.row(UNK, "  queue", "not published -- rebuild ui/ to get it")
+    else:
+        qn = strip.get("queued_count") or 0
+        if qn:
+            rep.row(UNK, "  queue", "%d job(s) submitted and not yet picked up -- the panel is "
+                                    "showing them" % qn)
+            for q in (strip.get("queued") or [])[:8]:
+                try:
+                    age = float(q.get("age_s") or 0)
+                except Exception:
+                    age = 0.0
+                rep.row(UNK, "    " + str(q.get("id") or "?"),
+                        "%-11s %4.0fs  %s" % (str(q.get("where") or "?"), age,
+                                              str(q.get("goal_head") or "")[:90]))
+        else:
+            rep.row(OK, "  queue", "empty -- nothing submitted is waiting")
+
     worst = {"red": BAD, "yellow": UNK, "gray": UNK, "checking": UNK}
     for d in strip.get("dots") or []:
         mark = worst.get(str(d.get("state")), OK)
