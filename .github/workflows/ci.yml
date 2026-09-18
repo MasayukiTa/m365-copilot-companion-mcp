@@ -112,6 +112,7 @@ jobs:
             bench/test_a_bench_must_not_overrule_the_operators_floor.py \
             tests/test_a_name_that_does_not_exist_is_not_a_style_problem.py \
             tests/test_a_pid_is_unique_at_a_moment_not_over_time.py \
+            tests/test_a_submission_you_cannot_see_is_not_submitted.py \
             relay/test_a_panel_reading_a_file_must_not_kill_the_run.py \
             scripts/test_the_answers_must_not_sit_beside_the_question.py \
             tools/test_a_tool_must_not_promise_a_model_can_see.py \

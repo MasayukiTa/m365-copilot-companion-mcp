@@ -128,6 +128,8 @@ ui/_buildcheck/
 # the unreached burn-down: what the 86 remaining entries are and how to finish.
 # Tracked because losing it means triaging all of them a third time.
 !/docs/unreached_burndown.md
+# the contract an agent reads before deciding whether its work landed
+!/docs/agent_contract.md
 /docs/validation/
 # scratch probes / b64 dumps / one-off data created during eval sessions
 /bench/_k*.py

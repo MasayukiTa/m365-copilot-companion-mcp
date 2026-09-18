@@ -1167,6 +1167,96 @@ class CockpitWindow : Window
         base.OnClosed(e);
     }
 
+    // ── the TASK QUEUE, which this window never looked at ──────────────────────────────────
+    //
+    // This panel reads .fleet/status.json and nothing else -- the runner's snapshot of WORKERS.
+    // A job submitted through fleet_submit lands in .fleet/tasks/pending/<id>.json and has no
+    // worker until a coordinator starts, so for the whole gap between "on disk" and "a worker
+    // exists" the queue was invisible here and EmptyState() said "タスクはまだありません" --
+    // which was not slow, it was false. The operator watching this screen could not tell a
+    // submission that landed from one that vanished, and the standing rule in this project is
+    // that what cannot be confirmed in the GUI does not count as working. So a submitted job
+    // could not be verified at all.
+    //
+    // A worker held at status "pending" ("待機列") is a DIFFERENT state -- the admission gate
+    // holding a worker that exists -- and the two are shown apart on purpose.
+    class QueuedJob
+    {
+        public string Id;
+        public string Goal;
+        public double AgeS;
+        public string Where;       // "pending" = nothing has claimed it; "for_fleet" = handed off
+    }
+
+    static string TasksDir()
+    {
+        string exeDir = AppDomain.CurrentDomain.BaseDirectory;          // ...\ui\
+        return Path.GetFullPath(Path.Combine(exeDir, "..", ".fleet", "tasks"));
+    }
+
+    List<QueuedJob> ReadQueuedJobs()
+    {
+        var outList = new List<QueuedJob>();
+        // NEVER THROWS INTO THE TICK. This runs every 700 ms beside the status read; a torn or
+        // half-written job file must not take the window down, and an unreadable queue is
+        // reported as an empty one rather than as a crash.
+        try
+        {
+            string root = TasksDir();
+            string pend = Path.Combine(root, "pending");
+            if (Directory.Exists(pend))
+            {
+                foreach (string f in Directory.GetFiles(pend, "*.json"))
+                {
+                    var j = new QueuedJob { Where = "pending", Id = Path.GetFileNameWithoutExtension(f) };
+                    try
+                    {
+                        var o = _js.DeserializeObject(File.ReadAllText(f, Encoding.UTF8))
+                                as Dictionary<string, object>;
+                        if (o != null)
+                        {
+                            object pay;
+                            if (o.TryGetValue("payload", out pay))
+                            {
+                                var pd = pay as Dictionary<string, object>;
+                                if (pd != null) j.Goal = S(pd, "goal");
+                            }
+                            if (string.IsNullOrEmpty(j.Goal)) j.Goal = S(o, "goal");
+                        }
+                    }
+                    catch (Exception) { }
+                    try { j.AgeS = (DateTime.UtcNow - File.GetLastWriteTimeUtc(f)).TotalSeconds; }
+                    catch (Exception) { }
+                    outList.Add(j);
+                }
+            }
+            string handed = Path.Combine(root, "for_fleet");
+            if (Directory.Exists(handed))
+            {
+                foreach (string f in Directory.GetFiles(handed, "*.txt"))
+                {
+                    var j = new QueuedJob { Where = "for_fleet",
+                                            Id = Path.GetFileNameWithoutExtension(f) };
+                    try { j.Goal = File.ReadAllText(f, Encoding.UTF8); } catch (Exception) { }
+                    try { j.AgeS = (DateTime.UtcNow - File.GetLastWriteTimeUtc(f)).TotalSeconds; }
+                    catch (Exception) { }
+                    outList.Add(j);
+                }
+            }
+        }
+        catch (Exception) { }
+        outList.Sort(delegate (QueuedJob a, QueuedJob b) { return b.AgeS.CompareTo(a.AgeS); });
+        return outList;
+    }
+
+    static string OneLine(string text, int cap)
+    {
+        string t = (text ?? "").Replace("\r", " ").Replace("\n", " ").Trim();
+        while (t.Contains("  ")) t = t.Replace("  ", " ");
+        if (t.Length > cap) t = t.Substring(0, cap) + "…";
+        return t;
+    }
+
     static string ResolvePath(string path)
     {
         if (!string.IsNullOrEmpty(path)) return path;
@@ -2647,6 +2737,30 @@ class CockpitWindow : Window
                       .Append("\",\"checked_age_s\":").Append(age.ToString("F1", inv))
                       .Append('}');
                 }
+            }
+            sb.Append(']');
+            // AND THE QUEUE THIS PANEL IS SHOWING.
+            //
+            // The rule in this project is that work which cannot be confirmed in the GUI does
+            // not count as working, and a job submitted to the fleet was invisible here until a
+            // worker existed. The display is fixed; this is how the claim is CHECKABLE without
+            // asking someone to describe their screen -- the same reason the dots above are
+            // published, added the day before for the same complaint.
+            //
+            // It is the panel reporting what IT rendered, not a second opinion computed from
+            // the same files. That distinction is the whole value: a reader comparing this
+            // against .fleet/tasks/pending can see the display and the truth disagree.
+            var qj = ReadQueuedJobs();
+            sb.Append(",\"queued_count\":").Append(qj.Count.ToString(inv));
+            sb.Append(",\"queued\":[");
+            for (int qi = 0; qi < qj.Count && qi < 20; qi++)
+            {
+                if (qi > 0) sb.Append(',');
+                sb.Append("{\"id\":\"").Append(JsonEscape(qj[qi].Id ?? ""))
+                  .Append("\",\"where\":\"").Append(JsonEscape(qj[qi].Where ?? ""))
+                  .Append("\",\"age_s\":").Append(qj[qi].AgeS.ToString("F1", inv))
+                  .Append(",\"goal_head\":\"").Append(JsonEscape(OneLine(qj[qi].Goal, 90)))
+                  .Append("\"}");
             }
             sb.Append("]}");
             string path = Path.Combine(dir, "health_strip.json");
@@ -10971,16 +11085,55 @@ class CockpitWindow : Window
         var outer = new Border { Margin = new Thickness(0, 80, 0, 0) };
         var block = new StackPanel { MaxWidth = 520, HorizontalAlignment = HorizontalAlignment.Center };
 
-        block.Children.Add(new TextBlock {
-            Text = _lang == 0 ? "タスクはまだありません" : "No fleet tasks",
-            Foreground = Fg, FontSize = 15, FontWeight = FontWeights.SemiBold,
-            HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 0, 0, 6) });
-        block.Children.Add(new TextBlock {
-            Text = _lang == 0 ? "複数のタスクを並行で走らせ、ここで進捗を確認します。"
-                              : "Run several tasks in parallel, then monitor progress here.",
-            Foreground = Muted, FontSize = 12.5, TextWrapping = TextWrapping.Wrap,
-            TextAlignment = TextAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center,
-            Margin = new Thickness(0, 0, 0, 16) });
+        // A SUBMITTED JOB IS NOT "NO TASKS". status.json describes workers, and a job that has
+        // been queued has none until a coordinator starts -- so this said "no fleet tasks"
+        // while the queue held work, and an operator could not tell a submission that landed
+        // from one that went nowhere.
+        var queued = ReadQueuedJobs();
+        if (queued.Count > 0)
+        {
+            block.Children.Add(new TextBlock {
+                Text = _lang == 0
+                    ? string.Format("投入済み {0} 件 — まだどのワーカーも受け取っていません", queued.Count)
+                    : string.Format("{0} submitted — no worker has picked them up yet", queued.Count),
+                Foreground = Fg, FontSize = 15, FontWeight = FontWeights.SemiBold,
+                HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 0, 0, 6) });
+            block.Children.Add(new TextBlock {
+                Text = _lang == 0
+                    ? "キューには入っています。コーディネータが起動すると進捗がここに出ます。"
+                    : "They are on the queue. Progress appears here once a coordinator starts.",
+                Foreground = Muted, FontSize = 12.5, TextWrapping = TextWrapping.Wrap,
+                TextAlignment = TextAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center,
+                Margin = new Thickness(0, 0, 0, 10) });
+            foreach (QueuedJob qj in queued)
+            {
+                string age = qj.AgeS < 90 ? string.Format("{0:0}s", qj.AgeS)
+                                          : string.Format("{0:0}m", qj.AgeS / 60.0);
+                string whereTxt = qj.Where == "for_fleet"
+                    ? (_lang == 0 ? "受け渡し済" : "handed off")
+                    : (_lang == 0 ? "未着手" : "unclaimed");
+                block.Children.Add(new TextBlock {
+                    Text = string.Format("• [{0}] {1}  ({2}, {3})", qj.Id, OneLine(qj.Goal, 70),
+                                         whereTxt, age),
+                    Foreground = Fg, FontSize = 12, TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(0, 0, 0, 4) });
+            }
+            block.Children.Add(new TextBlock {
+                Text = "", Margin = new Thickness(0, 0, 0, 12) });
+        }
+        else
+        {
+            block.Children.Add(new TextBlock {
+                Text = _lang == 0 ? "タスクはまだありません" : "No fleet tasks",
+                Foreground = Fg, FontSize = 15, FontWeight = FontWeights.SemiBold,
+                HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 0, 0, 6) });
+            block.Children.Add(new TextBlock {
+                Text = _lang == 0 ? "複数のタスクを並行で走らせ、ここで進捗を確認します。"
+                                  : "Run several tasks in parallel, then monitor progress here.",
+                Foreground = Muted, FontSize = 12.5, TextWrapping = TextWrapping.Wrap,
+                TextAlignment = TextAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center,
+                Margin = new Thickness(0, 0, 0, 16) });
+        }
 
         string[] suggestions = _lang == 0
             ? new string[] { "失敗テストを修正", "UIの問題をレビュー", "READMEを更新", "フォルダのタスクを実行" }
