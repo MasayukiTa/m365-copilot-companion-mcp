@@ -73,6 +73,37 @@ worker row once a coordinator picks it up. Before 2026-09-18 it appeared only on
 existed, and the panel said "タスクはまだありません" in the meantime — which was not slow, it
 was false.
 
+### From a shell: `scripts/submit_goal.py`, and NOT the runner
+
+```
+python scripts/submit_goal.py "the whole instruction, standalone"
+python scripts/submit_goal.py --source "night shift" --file goals.txt
+```
+
+**Launching `relay/fleet_runner.py -g "..."` is not submitting.** The runner is the thing that
+runs; using it as a submission channel is what made a CLI submission invisible. It writes
+nothing until the run is already under way — no queue entry, so the cockpit cannot show it, no
+history row, and if the process dies before argparse (a bad path, the wrong interpreter, a
+failed import) not even a coordinator log. Reported 2026-09-18: a goal went in that way, was
+not on the fleet, was not in the history, and could not be found anywhere.
+
+`submit_goal.py` calls the same `fleet_submit` the tool route uses, so the queue entry exists
+before anything can refuse the job. Measured: on screen two seconds after the command returned.
+A run that never starts leaves the entry there — which is the whole difference between
+"refused" and "never happened".
+
+The runner still records a queue entry for `-g` goals as of 2026-09-18, so that route is no
+longer silent once argparse is reached. It is still the wrong door: nothing covers a process
+that dies before argparse, and nothing needs to.
+
+### A caution about reading the panel's own report
+
+`.fleet/health_strip.json` carries what the cockpit is displaying, including the queue and the
+directory it read. The window's own tick is 700 ms; the file is republished roughly every ten
+seconds. **So the screen is fresher than the published report.** A missing entry in the file is
+not evidence that the screen is missing it — wait for the next publication before concluding
+anything from an absence there.
+
 ### `source` is not decoration
 
 `source=<who asked>` travels with the job into `.fleet/tasks/done/<id>.json` as
