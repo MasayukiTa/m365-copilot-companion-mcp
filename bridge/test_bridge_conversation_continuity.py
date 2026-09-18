@@ -51,7 +51,15 @@ def test_session_store_has_no_get_so_nothing_may_call_it():
 
     with io.open(os.path.join(REPO, "bridge", "copilot_bridge.py"), encoding="utf-8") as fh:
         src = fh.read()
-    assert "S.get(" not in src, "存在しない S.get を呼んでいる箇所が残っている"
+    # WORD-BOUNDED, BECAUSE THE SUBSTRING MATCHES ANY IDENTIFIER ENDING IN "S".
+    # `_DRAIN_ATTEMPTS.get(key, 0)` -- an ordinary dict read -- tripped this on
+    # 2026-09-18, and the shape of that false positive is the point: the guard was
+    # asserting about every name in the file, not about session_store. A guard that
+    # fires on unrelated code gets satisfied by contorting the unrelated code, which
+    # is how a check stops meaning what it says.
+    stray = re.search(r"(?<![A-Za-z0-9_])S\.get\(", src)
+    assert not stray, "存在しない S.get を呼んでいる箇所が残っている: %r" % (
+        src[max(0, stray.start() - 60):stray.end() + 20] if stray else "")
 
 
 def test_the_conversation_id_is_read_with_the_function_that_exists():

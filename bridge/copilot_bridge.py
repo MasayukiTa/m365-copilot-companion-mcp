@@ -1202,6 +1202,65 @@ def _queue_input_locked(sid, text):
         S.queue_input(sid, text)
 
 
+#: A message that could not be delivered is written here rather than dropped.
+#:
+#: drain_pending_once POPS EVERY ITEM UP FRONT, so anything not delivered has to be put back
+#: explicitly. The wrong-session branch below does that, with a comment saying the first
+#: version of it lost messages and a test caught it -- and the two branches beside it, "the
+#: turn raised" and "the turn returned nothing", did not. Measured 2026-09-18: the operator
+#: sent, got {"ok":true,"promotion_attempted":true}, and the message existed nowhere
+#: afterwards. It had been popped, the turn had raised, and the exception handler logged and
+#: moved on.
+#:
+#: Retried, then recorded. Retried because the cause was a transient-looking write to a closed
+#: socket and a fresh attempt is usually right; recorded rather than retried forever because a
+#: message that cannot be delivered must not sit in front of the next one.
+UNDELIVERED_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".fleet",
+    "bridge_undelivered.jsonl")
+
+#: (sid, text) -> attempts so far. In process only, and deliberately: a bridge restart forgets,
+#: which is the right default because a fresh process has a fresh page and the message deserves
+#: another try. Bounded so a long-lived bridge cannot grow it without limit.
+_DRAIN_ATTEMPTS = {}
+_DRAIN_ATTEMPTS_MAX = 512
+_DRAIN_MAX_TRIES = 2
+
+
+def _record_undelivered(sid, text, why):
+    """Say where a message went. Never raises -- this runs on the failure path."""
+    try:
+        d = os.path.dirname(UNDELIVERED_PATH)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        row = {"ts": time.time(), "sid": str(sid or ""), "why": str(why)[:300],
+               "text": str(text or "")[:2000]}
+        with open(UNDELIVERED_PATH, "a", encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _retry_or_record(sid, item, why):
+    """Put a failed message back, or -- once it has had its tries -- write down that it is gone.
+
+    Returns True when it was re-queued, False when it was recorded as undelivered."""
+    key = (str(sid or ""), str(item or "")[:200])
+    if len(_DRAIN_ATTEMPTS) >= _DRAIN_ATTEMPTS_MAX:
+        _DRAIN_ATTEMPTS.clear()      # a bound, not a cache policy
+    tries = _DRAIN_ATTEMPTS.get(key, 0) + 1
+    _DRAIN_ATTEMPTS[key] = tries
+    if tries < _DRAIN_MAX_TRIES:
+        try:
+            _queue_input_locked(sid, item)
+            return True
+        except Exception:
+            pass
+    _DRAIN_ATTEMPTS.pop(key, None)
+    _record_undelivered(sid, item, why)
+    return False
+
+
 def drain_pending_once(sid, pop_fn=None, max_n=50):
     """Pop up to `max_n` queued inputs for `sid` via `pop_fn` (defaults to _next_pending, which
     is INPUT_LOCK-guarded) and return them as a list, oldest-first. Pure w.r.t. control flow --
@@ -4774,7 +4833,8 @@ class Handler(BaseHTTPRequestHandler):
                         _settle_reset_trace(t0, final, stable_text, gen_active)
                         stable_text, stable_since = final, time.time()
                     time.sleep(0.3)
-                    self._ping()             # detect Esc/Stop disconnect promptly
+                    if stream_out:
+                        self._ping()         # detect Esc/Stop disconnect promptly
                     # An EMPTY clean body is not a new answer -- it is a failed read. Falling
                     # back to the RAW last message here was the bug: the raw text carries the
                     # "<agent> said:" heading and the avatar's alt text, so it never equals the
@@ -4792,7 +4852,21 @@ class Handler(BaseHTTPRequestHandler):
                 # (placeholder->answer cursor corruption, leaked loading lines).
                 return _answer_clean() or final
             time.sleep(0.3)
-            self._ping()                     # detect Esc/Stop disconnect promptly
+            # GUARDED, LIKE EVERY OTHER WRITE IN THIS LOOP. `stream_out=False` was honoured by
+            # each self._sse(...) above and missed here -- and this is the one that writes
+            # unconditionally, because its whole job is to poke the client and see if the poke
+            # raises. On the no-stream path there is no client: the promoted /send answered its
+            # HTTP request and returned before this thread started, so self.wfile is the
+            # finished socket of a request nobody is reading.
+            #
+            # Measured 2026-09-18 in .setup/logs/bridge.log: every promoted /send died 0.3 s
+            # into this loop with "OSError: [WinError 10038] an operation was attempted on
+            # something that is not a socket", before any answer could be read. The endpoint
+            # had already replied {"ok":true,"promotion_attempted":true} and the message was
+            # gone from the queue, so the store showed a session with turns:0 and an empty
+            # conv_url and nothing anywhere said why.
+            if stream_out:
+                self._ping()                 # detect Esc/Stop disconnect promptly
         # outer-loop timeout end: same authoritative-final read
         return _answer_clean()
 
@@ -5292,11 +5366,22 @@ class Handler(BaseHTTPRequestHandler):
                     # to persist, and the next queued item may still be fine.
                     logger.warning("drain_pending_queue: consent not auto-approved for sid=%s",
                                    logsafe(sid))
+                    _retry_or_record(sid, item, "consent not auto-approved")
                     continue
                 if final:
                     _persist_exchange(sid, item, final)
-            except Exception:
+                else:
+                    # A TURN THAT RETURNED NOTHING IS NOT A TURN THAT HAPPENED, and this fell
+                    # off the end of the loop with the message already popped.
+                    logger.warning("drain_pending_queue: the turn produced no answer for "
+                                   "sid=%s", logsafe(sid))
+                    _retry_or_record(sid, item, "the turn produced no answer")
+            except Exception as exc:
                 logger.warning("drain_pending_queue: queued send failed for sid=%s", logsafe(sid), exc_info=True)
+                # AND THE MESSAGE IS NOT GONE. Logging it was the whole of the old handling,
+                # so a failure here consumed the operator's instruction and left a log line
+                # nobody was reading -- see UNDELIVERED_PATH above for the measurement.
+                _retry_or_record(sid, item, "%s: %s" % (type(exc).__name__, exc))
 
 
 def _agent_tab_matches(pg, base_url):
