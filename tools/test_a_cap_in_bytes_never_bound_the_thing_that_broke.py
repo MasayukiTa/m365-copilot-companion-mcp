@@ -40,6 +40,38 @@ from tools import image_ops as IO  # noqa: E402
 PIL = pytest.importorskip("PIL.Image", reason="the budget needs Pillow to resize")
 
 
+# ---- reading the result, whatever shape it arrives in ------------------------------------
+#
+# read_image returned a `data:image/...;base64,...` STRING until 2026-09-18, and these tests
+# measured that string's length because that was the currency the caller spent. The string was
+# the defect: FastMCP serialises a str as a TEXT block, so the picture was never a picture, and
+# a worker that called it answered about an image it had not seen. It returns a
+# fastmcp.utilities.types.Image now.
+#
+# The BUDGET IS THE SAME QUANTITY. An ImageContent block carries the bytes base64-encoded, so
+# what these tests bound -- how much of the conversation one call costs -- is the base64 length
+# either way. Read it off whichever shape came back rather than restating the ceiling.
+
+def _payload_bytes(out):
+    """The image bytes, from an Image content block or from a legacy data URI."""
+    data = getattr(out, "data", None)
+    if data is not None:
+        return data
+    assert isinstance(out, str), "unexpected read_image return: %r" % type(out)
+    assert "base64," in out, out[:200]
+    return base64.b64decode(out.split("base64,", 1)[1])
+
+
+def _payload_chars(out):
+    """What one call costs, in the currency the ceiling is written in."""
+    return len(base64.b64encode(_payload_bytes(out)))
+
+
+def _is_image_result(out):
+    """It came back as something a client can render, not as text pretending to be one."""
+    return getattr(out, "data", None) is not None
+
+
 def _write(tmp_path, size, name="shot.png", block=4):
     """An image that compresses roughly like a screenshot, which is what is being bounded.
 
@@ -99,8 +131,8 @@ def test_a_big_image_comes_back_within_the_budget_or_at_the_readability_floor(tm
 
     p = _write(tmp_path, (1400, 788))
     out = IO.read_image(str(p))
-    assert out.startswith("data:image/"), out[:120]
-    im = Image.open(BytesIO(base64.b64decode(out.split(",", 1)[1])))
+    assert _is_image_result(out), "read_image returned text, not a picture: %r" % type(out)
+    im = Image.open(BytesIO(_payload_bytes(out)))
     im.load()
     # THE DISJUNCTION IS CORRECT FOR THIS FIXTURE AND WAS NOT ENOUGH ON ITS OWN. Block noise
     # does not compress in ANY format once LANCZOS has blurred it, so the floor really is the
@@ -109,11 +141,11 @@ def test_a_big_image_comes_back_within_the_budget_or_at_the_readability_floor(tm
     # bottomed out at 400x225 and 142,912 characters, having thrown away 94% of the pixels and
     # still missed the ceiling, while this test passed every time. The strict property is
     # asserted below against content that behaves like a real screen.
-    within = len(out) <= IO.MAX_DATA_URI_CHARS + 200
+    within = _payload_chars(out) <= IO.MAX_DATA_URI_CHARS + 200
     at_floor = max(im.size) <= IO.MIN_DIMENSION
     assert within or at_floor, (
         "returned %d characters at %dx%d -- over budget and not at the floor, so it stopped "
-        "shrinking with room left" % (len(out), im.size[0], im.size[1]))
+        "shrinking with room left" % (_payload_chars(out), im.size[0], im.size[1]))
 
 
 def _gradient(tmp_path, size, name="screen.png"):
@@ -162,10 +194,10 @@ def test_a_screen_like_image_meets_the_budget_without_being_destroyed(tmp_path, 
         "this fixture does not exercise the budget: %d chars" % unbounded)
 
     out = IO.read_image(str(p))
-    im = Image.open(BytesIO(base64.b64decode(out.split(",", 1)[1])))
+    im = Image.open(BytesIO(_payload_bytes(out)))
     im.load()
-    assert len(out) <= IO.MAX_DATA_URI_CHARS + 200, (
-        "returned %d characters at %dx%d" % (len(out), im.size[0], im.size[1]))
+    assert _payload_chars(out) <= IO.MAX_DATA_URI_CHARS + 200, (
+        "returned %d characters at %dx%d" % (_payload_chars(out), im.size[0], im.size[1]))
     assert max(im.size) > IO.MIN_DIMENSION * 1.5, (
         "fitting the budget cost the picture: came back at %dx%d" % im.size)
 
@@ -177,7 +209,7 @@ def test_the_budget_binds_where_the_byte_cap_never_did(tmp_path, anywhere):
     unbounded = len(base64.b64encode(p.read_bytes()))
     assert unbounded > IO.MAX_DATA_URI_CHARS, (
         "this image does not exercise the budget: %d chars" % unbounded)
-    assert len(IO.read_image(str(p))) < unbounded
+    assert _payload_chars(IO.read_image(str(p))) < unbounded
 
 
 def test_a_small_image_is_returned_untouched(tmp_path, anywhere):
@@ -185,8 +217,11 @@ def test_a_small_image_is_returned_untouched(tmp_path, anywhere):
     degraded for nothing."""
     p = _write(tmp_path, (200, 120))
     out = IO.read_image(str(p))
-    raw = base64.b64encode(p.read_bytes()).decode("ascii")
-    assert raw in out, "a small image was re-encoded when it already fitted"
+    # BYTE-FOR-BYTE, which is what "untouched" means. Compared on the bytes rather than
+    # on a base64 substring now that the result is an image block instead of a data URI
+    # -- the question ("was it re-encoded?") and the answer are unchanged.
+    assert _payload_bytes(out) == p.read_bytes(), \
+        "a small image was re-encoded when it already fitted"
 
 
 def test_what_comes_back_is_still_a_decodable_image(tmp_path, anywhere):
@@ -197,7 +232,7 @@ def test_what_comes_back_is_still_a_decodable_image(tmp_path, anywhere):
 
     p = _write(tmp_path, (1400, 788))
     out = IO.read_image(str(p))
-    payload = out.split(",", 1)[1]
+    payload = base64.b64encode(_payload_bytes(out)).decode("ascii")
     im = Image.open(BytesIO(base64.b64decode(payload)))
     im.load()
     assert max(im.size) >= IO.MIN_DIMENSION
@@ -216,8 +251,8 @@ def test_it_stops_shrinking_rather_than_returning_something_unreadable(tmp_path,
         IO.MAX_DATA_URI_CHARS = 500
         p = _write(tmp_path, (1400, 788), block=1)
         out = IO.read_image(str(p))
-        assert out.startswith("data:image/")
-        im = Image.open(BytesIO(base64.b64decode(out.split(",", 1)[1])))
+        assert _is_image_result(out)
+        im = Image.open(BytesIO(_payload_bytes(out)))
         im.load()
         assert max(im.size) >= IO.MIN_DIMENSION
     finally:
@@ -255,4 +290,4 @@ def test_a_missing_pillow_returns_the_image_rather_than_an_error(tmp_path, anywh
     monkeypatch.setattr(IO, "_fit_to_character_budget", _no_pil)
     p = _write(tmp_path, (1400, 788))
     out = IO.read_image(str(p))
-    assert out.startswith("data:image/"), out[:120]
+    assert _is_image_result(out), "read_image returned text, not a picture: %r" % type(out)
