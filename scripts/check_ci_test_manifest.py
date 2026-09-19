@@ -34,7 +34,13 @@ EXCLUDED = {
     # that reads a gitignored .fleet artifact absent from a fresh checkout. Those four should
     # be fixed and moved back, not left here; they are parked, not resolved.
     "bench/test_pro_batching.py":
-        "reads this machine's real free disk and RAM to size batches; asserts concrete concurrencies (>=3) that a CI runner does not have",
+        "MEASURED ON THE RUNNER 2026-09-20, after this exclusion was doubted and tested rather "
+        "than argued: FLEET_FLOOR_GIB comes from settings_disk_floor() and reads >5.6 GiB "
+        "there (not the 3.0 fallback that was assumed), so concurrency_for collapses to 1 and "
+        "four tests fail -- js at 8.0 GiB free wants >=3 and gets 1, python<js becomes 1<1, "
+        "and batch width stays [1,1,1,1,1]. One more reads .fleet/swe/pro_slice50_full.json, "
+        "which is gitignored and absent in a fresh checkout. Registering it in ci.yml turned "
+        "main red; the exclusion is live, not stale",
     "bench/test_swe_run_facts.py":
         "Windows path semantics (separator and case-insensitive joins); run by windows-install-smoke",
     "relay/test_acceptance_contract.py":
