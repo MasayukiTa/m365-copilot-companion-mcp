@@ -2345,6 +2345,31 @@ def disk_admission_ok(floor_gb=None, eval_gb=None, free_gb=None, building=0, res
     return (free - reserve) >= floor
 
 
+def admits_another_tab(active_open: int, projected_peak: int, tab_weight: int,
+                       cap) -> bool:
+    """True when one more worker fits the LIVE tab budget. `cap` is `mc_box[0]`.
+
+    WHY THIS HAS A NAME NOW. The settings path is file -> box -> decision. The first half
+    got a name (`fleet_runner.build_settings_follower`) and a behavioural test; the second
+    stayed inside a 700-line run(), so the only thing holding it was a source assertion --
+    and relay/test_a_setting_the_operator_changed_reaches_a_running_fleet.py said so in as
+    many words rather than implying it was covered. A source assertion cannot catch a cap
+    that is read from the wrong place, or compared the wrong way round.
+
+    THE FIRST CLAUSE IS NOT A ROUNDING DETAIL. With `active_open == 0` the fleet admits one
+    worker whatever the cap says, because a cap that can reach zero would otherwise stop the
+    fleet permanently with work queued and nothing running -- and `mc_box[0]` is written by
+    the RAM autoscale, which genuinely can drive it down. `max(1, cap)` is the same guard
+    from the other side, for the case where something is already open.
+
+    Kept as a free function taking numbers, not a method on the run: the whole point is to
+    be callable without a browser, a clock, or a worker.
+    """
+    if active_open == 0:
+        return True
+    return projected_peak + tab_weight <= max(1, cap)
+
+
 def ram_target_cap(open_now, current_cap, ceiling,
                    per_tab_mb=None, headroom_mb=None, floor=1, up_margin_mb=0):
     """RAM-aware live concurrency target (autoscale). Recomputed each loop: given how many
@@ -8049,10 +8074,9 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         # tab_weight charges 1 for a tab and 0 for a socket, ram_room_for_tab gates each lazy
         # side-page at the moment it opens, and the autoscale sets mc_box from free RAM. Adding a
         # count-based gate on top of those charges sockets for something they do not use.
-        while pending and (_active_open() == 0
-                           or _projected_peak()
-                              + pending[0].tab_weight(assume_socket=_socket_open_now())
-                              <= max(1, mc_box[0])):
+        while pending and admits_another_tab(
+                _active_open(), _projected_peak(),
+                pending[0].tab_weight(assume_socket=_socket_open_now()), mc_box[0]):
             # SPACING, AND IT SITS HERE BECAUSE THERE ARE TWO WAYS OUT OF THIS LOOP.
             # The first version of this guard was placed next to `pending.pop(0)` in the flat
             # branch, and the per-repo branch a few lines above pops with `pending.pop(pick)`

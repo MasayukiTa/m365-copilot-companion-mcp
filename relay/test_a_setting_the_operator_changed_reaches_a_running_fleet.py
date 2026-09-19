@@ -27,28 +27,12 @@ import pytest
 from relay.settings_follow import Follower
 
 
-#: The last mtime this helper handed out. MONOTONIC BY CONSTRUCTION, which the real clock is
-#: not at this resolution.
-_LAST_FORCED_MTIME = [0.0]
-
-
-def _write(path, **pairs):
-    with open(path, "w", encoding="utf-8") as fh:
-        for k, v in pairs.items():
-            fh.write("%s=%s\n" % (k, v))
-    # The follower re-reads on (mtime, size). Tests write the same file repeatedly and can land
-    # inside one filesystem timestamp tick, which would make a real change look unchanged.
-    #
-    # BUMPING FROM THE FILE'S OWN MTIME WAS NOT ENOUGH, and produced a failure that appeared
-    # roughly one run in several and could not be reproduced on demand. Two writes in the same
-    # tick both yield stamp = T + 10, and `disk_floor_gb=1` and `disk_floor_gb=3` are the same
-    # SIZE -- so the cache key matched exactly and a real change was reported as none. Whether
-    # the two writes share a tick depends on whatever ran before them, which is why the same
-    # test passed alone and failed in company.
-    st = os.stat(path)
-    forced = max(st.st_mtime, _LAST_FORCED_MTIME[0]) + 10
-    _LAST_FORCED_MTIME[0] = forced
-    os.utime(path, (st.st_atime, forced))
+# MOVED TO conftest.write_settings. The reasoning that was written here lives beside the
+# code now, because on 2026-09-19 a second module was written for the other half of this
+# mechanism, its helper was re-derived from scratch, and it reproduced the exact failure
+# this one was fixed for -- one run in several, only in company. Two monotonic counters
+# that must not drift apart are one counter.
+from conftest import write_settings as _write
 
 
 @pytest.fixture()

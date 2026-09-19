@@ -493,6 +493,7 @@ jobs:
             relay/selfimprove/test_stdin_arg.py \
             relay/test_agent_profiles_research_reason.py \
             relay/test_socket_attachment.py \
+            relay/test_the_box_reaches_the_decision.py \
             relay/test_fleet_lock_evidence.py \
             relay/test_refuter_socket.py \
             scripts/test_workload_multiturn.py \
