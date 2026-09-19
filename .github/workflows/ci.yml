@@ -212,6 +212,7 @@ jobs:
             tools/test_the_gate_can_be_turned_on.py \
             tools/test_a_counter_that_gates_a_switch_is_read.py \
             tools/test_the_refusal_ledger_can_name_why.py \
+            tools/test_send_failure_report.py \
             tools/test_a_declared_field_is_a_written_field.py \
             tools/test_a_name_defined_twice_is_still_reported.py \
             tools/test_a_name_defined_twice_can_still_be_attributed.py \
