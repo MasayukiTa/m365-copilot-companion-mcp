@@ -64,7 +64,6 @@ NO_CALLER_NO_TEST = {
     "relay/selfimprove/episode_record.py::compact",              # revealed 2026-09-13
     "tools/security.py::get_client_ip",                          # 12 lines
     "scripts/collect_lens_corpus.py::all_inconclusive",          # 8 lines
-    "bench/companionbench/job_authority.py::free_port",          # 7 lines
     "scripts/collect_lens_corpus.py::load_corpus",               # 7 lines
     "relay/autonomy_gate.py::constraints_text",                  # 5 lines
     "tools/security.py::is_trusted_local",                       # 3 lines

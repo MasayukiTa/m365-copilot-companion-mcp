@@ -900,3 +900,32 @@ def write_settings(path, **pairs):
     forced = max(st.st_mtime, _LAST_FORCED_MTIME[0]) + 10
     _LAST_FORCED_MTIME[0] = forced
     os.utime(path, (st.st_atime, forced))
+
+
+# THE THIRD TIME A TEST-ONLY HELPER WAS RE-DERIVED RATHER THAN SHARED, and the first two are
+# written up above (code_only, write_settings). `bench/companionbench/job_authority.py` carried
+# a `free_port` whose own docstring said "Only for tests that need to point at nothing" -- and
+# no test used it, while tests/test_checkpoint_port_probe.py defined its own byte-identical
+# copy. A helper that only tests call does not belong in production code: it is invisible to
+# the people who would reuse it, and it shows up in the unreached inventory as a function
+# nobody calls, which is exactly what it was.
+#
+# conftest is the right address for the same reason it was right for code_only: the unreached
+# scanner does not read conftest or test_*.py, so a helper here is not a permanent entry in an
+# inventory of dead code.
+
+def free_port():
+    """A loopback port with nothing bound: bind to 0, read what the OS chose, close.
+
+    INHERENTLY RACY AND THAT IS THE POINT OF SAYING SO. The port is free at the moment it is
+    closed and nothing holds it afterwards, so this answers "a number that was free just now",
+    which is what a probe pointing at nothing needs and is NOT a reservation.
+    """
+    import socket
+
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
