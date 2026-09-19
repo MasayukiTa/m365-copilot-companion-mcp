@@ -15,6 +15,7 @@ that pattern layers on top of this fixture without conflict, since this
 fixture's stub is just a (harmless) no-op capture, not the real emitter.
 """
 import io
+import os
 import pytest
 
 
@@ -866,3 +867,36 @@ def code_only(path: str) -> str:
         pass
     return "\n".join("" if (i + 1) in blank else l
                       for i, l in enumerate(lines) if not l.lstrip().startswith("#"))
+
+
+# ---- writing a settings file a Follower will actually notice ---------------------------------
+#
+# WHY IT IS SHARED. relay/settings_follow.py re-reads on (mtime, size). Tests write the same
+# file repeatedly and can land inside one filesystem timestamp tick, and two values of the same
+# LENGTH (`maxtabs=2` / `maxtabs=4`) leave the size identical -- so a real change is reported as
+# no change. Bumping from the file's OWN mtime is not enough: two writes in one tick both land
+# on T + delta.
+#
+# That was found, written up and fixed inside one test module on 2026-09-16, with a comment
+# saying it "appeared roughly one run in several and could not be reproduced on demand" and that
+# "the same test passed alone and failed in company". On 2026-09-19 a second test module was
+# written for the other half of the same mechanism, its author (me) wrote the helper again from
+# scratch, and reproduced that exact failure -- one run in several, only when the two files ran
+# together. The second time in one day that a discipline living in one file was re-derived
+# wrongly somewhere else; see code_only above for the first.
+#
+# So the monotonic counter is module-level HERE, shared by every caller, which is the only
+# version of it that cannot drift apart.
+
+_LAST_FORCED_MTIME = [0.0]
+
+
+def write_settings(path, **pairs):
+    """Write `key=value` lines and force a stamp no earlier reader can mistake for the old one."""
+    with io.open(path, "w", encoding="utf-8", newline="\n") as fh:
+        for k, v in pairs.items():
+            fh.write("%s=%s\n" % (k, v))
+    st = os.stat(path)
+    forced = max(st.st_mtime, _LAST_FORCED_MTIME[0]) + 10
+    _LAST_FORCED_MTIME[0] = forced
+    os.utime(path, (st.st_atime, forced))
