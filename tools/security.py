@@ -410,6 +410,13 @@ def _maybe_touch_session(ip: str, sess: str) -> None:
         return state
 
     _update_state(_add)
+    # AFTER the write, not inside `_add`: `_update_state` may run its callback more than once,
+    # and a ledger is only honest if a row means the table really changed. See
+    # lock_state.record_granted -- the sessions table is capped and keeps only the latest
+    # touch, so "never authorized" and "authorized then evicted" are indistinguishable from
+    # the refusal side alone. This is the other half of that join, and the throttle above is
+    # what keeps it bounded.
+    lock_state.record_granted(ip, sess, via="token")
 
 
 def _token_matches(entry: dict, presented: str) -> bool:
@@ -642,6 +649,11 @@ def unlock(password: str) -> str:
         return state
 
     _update_state(_add)
+    if sess:
+        # The password matched, so this is an authorization event in its own right -- the same
+        # one `_touch_session` records in the capped table above, written where it cannot be
+        # evicted. Recorded here rather than in `_add` for the reason given at the other site.
+        lock_state.record_granted(ip, sess, via="password")
     # The refusal that prompted this unlock is now history; drop it so a reader
     # checking "was a call just refused?" is not answered by a stale record.
     lock_state.clear()

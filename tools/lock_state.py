@@ -182,6 +182,165 @@ def record_locked(client_ip: str = "", detail: str = "", ts: Optional[float] = N
         pass
 
 
+#: How long a recorded session authorization still counts, mirroring
+#: `tools.security._session_ttl_s()`. Duplicated as a DEFAULT rather than imported because
+#: security.py is frozen and delegation-excluded: a reader in this file must not be able to
+#: drag that module into an import cycle on the refusal path. `explain_refusals` takes the
+#: value as an argument so a caller who knows better can say so.
+DEFAULT_SESSION_TTL_S = 1800.0
+
+
+def record_granted(client_ip: str = "", session: str = "", via: str = "",
+                   ts: Optional[float] = None) -> None:
+    """Note that `session` just became (or stayed) authorized for `client_ip`. Never raises.
+
+    WHY THIS EXISTS -- and it is the answer to a question this ledger could not previously be
+    read hard enough to settle. Measured 2026-09-19 over the 543 refusals here that carry a
+    session: 0 of 447 sessions ever saw `client_ip` change, and 0 of 543 were authorized,
+    inside TTL, and refused anyway. Both standing hypotheses died. What remained was 476
+    refusals with no record of authorization at all -- and THAT number cannot be split from
+    the refusal side alone, because `state[ip]["sessions"]` is capped (512) and holds only the
+    most recent touch. "Never unlocked" and "unlocked, then evicted or aged out" leave exactly
+    the same trace there: nothing.
+
+    So the unlock side keeps its own append-only record, and the split falls out of the two
+    together without any new state to keep:
+
+        no grant row before the refusal          -> never authorized
+        grant row inside the TTL                 -> EVICTED (it would have been honoured)
+        grant row older than the TTL             -> aged out
+
+    THE SAME FILE, NOT A SECOND ONE. `_append_log` already stamps `event`, and a grant written
+    beside the refusal it explains needs no join key, no second redirect in
+    conftest.LIVE_RECORD_REDIRECTS, and no second pruning policy. A reader that wants only
+    refusals filters on `event`, which `matching_records` and every other reader here already
+    had to do from the day `event` was added.
+
+    NOT THROTTLED HERE. The throttle lives at the call site (`security._maybe_touch_session`
+    writes at most once per quarter-TTL per session), because the thing worth recording is a
+    WRITE to the sessions table, not a call that found the table already fresh. Recording the
+    latter would make this file grow with traffic and say nothing more.
+    """
+    if not session:
+        return
+    # GUARDED, THOUGH `_append_log` ALREADY SWALLOWS ITS OWN FAILURES. This sits on the unlock
+    # path, where "never raises" has to survive `_append_log` ITSELF being the broken thing --
+    # a swapped implementation, an import that starts raising. `record_locked` guards `_session`
+    # for exactly this reason and says so; the same argument applies one call further out.
+    try:
+        _append_log({
+            "ts": float(ts if ts is not None else time.time()),
+            "event": "granted",
+            "client_ip": str(client_ip or "")[:64],
+            "session": str(session)[:64],
+            "via": str(via or "")[:32],
+        })
+    except Exception:
+        pass
+
+
+def _rows(path=None):
+    """Every well-formed row of the ledger, oldest first. Unreadable lines are skipped.
+
+    A ledger that raises on one bad line answers nothing about the other six thousand.
+    """
+    target = Path(path) if path is not None else _LOG_FILE
+    try:
+        with open(target, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except Exception:
+        return []
+    out = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(row, dict):
+            out.append(row)
+    return out
+
+
+def explain_refusals(path=None, ttl_s: float = DEFAULT_SESSION_TTL_S,
+                     warmup_s: Optional[float] = None) -> dict:
+    """Split every session-carrying refusal into why the session did not save it.
+
+    Returns counts plus `unexplained`, which is the number this is judged by: a refusal whose
+    session HAS a grant inside the TTL should have been honoured, so a non-zero `evicted` is a
+    real finding about the cap and not a shrug.
+
+    `never_authorized` shrinks only as grants accumulate, so it is reported with `since` --
+    the timestamp of the first grant row. EVERY refusal older than that is necessarily
+    "unknown" rather than "never authorized", and counting those two together is exactly the
+    mistake this whole exercise was undertaken to stop making. They are separate fields.
+
+    `warmup_s` DEFAULTS TO ONE TTL AND IS SEPARATE FROM `ttl_s` BECAUSE THEY ARE TWO RULES.
+    One says how a refusal is classified once the record can speak; the other says when the
+    record can speak at all. Writing the tests found this: a fixture holding a single grant
+    after a single refusal exercised both at once and the expectation was wrong in a way that
+    read as a bug in the classifier. Pass 0 to ask only the first question.
+    """
+    if warmup_s is None:
+        warmup_s = ttl_s
+    rows = _rows(path)
+    grants = {}
+    first_grant = None
+    for row in rows:
+        if row.get("event") != "granted":
+            continue
+        sess = row.get("session")
+        if not sess:
+            continue
+        ts = row.get("ts")
+        if not isinstance(ts, (int, float)):
+            continue
+        if first_grant is None or ts < first_grant:
+            first_grant = ts
+        grants.setdefault((str(row.get("client_ip") or ""), str(sess)), []).append(float(ts))
+    for key in grants:
+        grants[key].sort()
+
+    out = {"refusals_with_session": 0, "evicted": 0, "aged_out": 0,
+           "never_authorized": 0, "before_the_record": 0, "since": first_grant}
+    for row in rows:
+        if row.get("event") == "granted":
+            continue
+        sess = row.get("session")
+        if not sess:
+            continue
+        ts = row.get("ts")
+        if not isinstance(ts, (int, float)):
+            continue
+        out["refusals_with_session"] += 1
+        if first_grant is None or ts < (first_grant + warmup_s):
+            # THE GRANT RECORD DID NOT EXIST YET, OR WAS NOT YET WARM. Saying anything else
+            # about these would be inventing a measurement out of the absence of an
+            # instrument -- the exact move this whole change was made to stop.
+            #
+            # `+ ttl_s` IS NOT PADDING. A session authorized five minutes before recording
+            # began is honoured for another twenty-five, and during those twenty-five minutes
+            # a refusal of it has no grant row through no fault of the session. Classifying
+            # that as `never_authorized` would report the instrument's own start-up as a
+            # finding, and it would land on exactly the population being investigated. One
+            # TTL after the first grant, every still-honoured authorization has necessarily
+            # been recorded at least once (the refresh throttle is a QUARTER of a TTL), so
+            # from there on an absent grant row is a fact about the session.
+            out["before_the_record"] += 1
+            continue
+        prior = [g for g in grants.get((str(row.get("client_ip") or ""), str(sess)), [])
+                 if g <= ts]
+        if not prior:
+            out["never_authorized"] += 1
+        elif (ts - prior[-1]) < ttl_s:
+            out["evicted"] += 1
+        else:
+            out["aged_out"] += 1
+    return out
+
+
 def read_state() -> dict:
     """Last recorded refusal, or {} when there is none / it is unreadable."""
     try:
@@ -442,15 +601,26 @@ def _cli() -> None:
     NOT `matching_records` (plural). That one answers "which refusals could have been mine",
     which is a decision a caller makes; this prints what happened. Both are wanted, and only
     the plural had a caller.
+
+    `explain` splits the session-carrying refusals by WHY the session did not save them,
+    joining them against the `granted` rows `record_granted` writes into this same file. It
+    exists because the measurement it replaces could not be made: on 2026-09-19 the two
+    standing hypotheses were killed outright (0 of 447 sessions changed IP, 0 of 543 were
+    authorized-and-refused) and the 476 that remained were unsplittable from the refusal side
+    alone. This is the reader for the record that makes them splittable.
     """
     import sys
 
     argv = sys.argv[1:]
     cmd = argv[0] if argv else "show"
-    if cmd not in ("show", "token-gap", "recent"):
+    if cmd not in ("show", "token-gap", "recent", "explain"):
         print(json.dumps({
-            "error": "usage: python -m tools.lock_state [show|token-gap|recent [seconds]]"}))
+            "error": "usage: python -m tools.lock_state "
+                     "[show|token-gap|recent [seconds]|explain]"}))
         raise SystemExit(2)
+    if cmd == "explain":
+        print(json.dumps(explain_refusals(), ensure_ascii=False))
+        return
     if cmd == "token-gap":
         print(json.dumps(token_gap_report(), ensure_ascii=False))
         return
