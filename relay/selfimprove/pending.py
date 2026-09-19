@@ -30,6 +30,8 @@ import os
 import sys
 import time
 
+from . import stdin_arg as _stdin_arg
+
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 #: Runtime state, deliberately untracked: entries quote proposed diffs to the files the
@@ -243,26 +245,16 @@ def _cli(argv=None) -> int:
     ap.add_argument("--drop", metavar="ID", default="",
                     help="mark a queued decision as not going to happen")
     ap.add_argument("--authorization", default="",
-                    help="the operator's decision, quoted verbatim. \"-\" reads it from "
-                         "stdin, which is how the dashboard passes it: a command line cannot "
-                         "carry every character a person might type")
+                    help="the operator's decision, quoted verbatim. "
+                         + _stdin_arg.help_suffix())
     ap.add_argument("--kind", default="",
                     help="how it was given: preset (a phrase they chose) or typed")
     args = ap.parse_args(argv)
 
-    # VERBATIM MEANS VERBATIM. The dashboard used to substitute an apostrophe for every double
-    # quote before putting the text on a command line, so a decision containing one was
-    # recorded as something the operator had not written -- while the dialog promised, in as
-    # many words, that nothing would be summarised or reworded. Reading it from stdin removes
-    # the quoting problem rather than escaping around it.
-    if str(args.authorization) == "-":
-        try:
-            # The raw buffer, decoded as UTF-8. sys.stdin.read() uses the locale encoding,
-            # which on this machine is cp932 -- so reading it that way would corrupt exactly
-            # the text this path exists to carry through unaltered.
-            args.authorization = sys.stdin.buffer.read().decode("utf-8", "replace")
-        except Exception:
-            args.authorization = ""
+    # MOVED, NOT DROPPED. The reasoning that was written here lives in
+    # relay/selfimprove/stdin_arg.py, next to the code -- because frozen.py took the same
+    # flag, was called the same way, and never implemented it.
+    args.authorization = _stdin_arg.resolve(args.authorization)
 
     if args.approve or args.resolve or args.drop:
         pid = args.approve or args.resolve or args.drop

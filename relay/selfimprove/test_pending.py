@@ -267,13 +267,29 @@ def test_the_words_can_be_read_from_stdin(monkeypatch, queue):
 
 def test_stdin_is_decoded_as_utf8_and_not_as_the_console_encoding(monkeypatch):
     """sys.stdin.read() uses the locale encoding, which on this machine is cp932 -- reading it
-    that way would corrupt exactly the text this path exists to carry unaltered."""
-    import inspect
-    src = inspect.getsource(P._cli)
-    assert 'sys.stdin.buffer.read().decode("utf-8"' in src
-    # The comment names the wrong way by name; the CODE must not use it.
-    code = chr(10).join(l.split("#")[0] for l in src.splitlines())
-    assert "sys.stdin.read()" not in code
+    that way would corrupt exactly the text this path exists to carry unaltered.
+
+    RE-POINTED, NOT DELETED. This asserted the decode appeared in the SOURCE OF `_cli`, and the
+    implementation moved to relay/selfimprove/stdin_arg.py -- because frozen.py took the same
+    flag, was called the same way by the same dashboard, and never implemented it, so every
+    re-signing recorded the literal "-" as the operator's words. A test pinned to where code
+    lives fails when code is moved for a good reason; one pinned to what comes out does not.
+    So it now measures the OUTPUT, through pending's own CLI, which is strictly stronger."""
+    pid = P.add(["a/b.py"], "a reason")
+    words = "\u518d\u7f72\u540d\u3069\u3046\u305e"          # 再署名どうぞ
+
+    class _Utf8Stdin:
+        def __init__(self):
+            self.buffer = self
+
+        def read(self):
+            return words.encode("utf-8")
+
+    monkeypatch.setattr(P.sys, "stdin", _Utf8Stdin())
+    assert P._cli(["--approve", pid, "--authorization", "-"]) == 0
+    got = [i for i in P.items(include_resolved=True) if i["id"] == pid][0]
+    assert got["authorization"] == words, \
+        "read with the locale encoding somewhere: %r" % got["authorization"]
 
 
 def test_the_dashboard_no_longer_rewrites_quotes():

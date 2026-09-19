@@ -30,7 +30,6 @@ NO NETWORK, NO BROWSER, NO ENDPOINT. This reads files.
 """
 from __future__ import annotations
 
-import ast
 import io
 import json
 import os
@@ -39,6 +38,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 OBSERVED = os.path.join(HERE, "uploadfile_observed.json")
 REPLAY = os.path.join(HERE, "replay_upload_with_our_token.py")
 RECORDER = os.path.join(HERE, "observe_real_upload.py")
+ANALYZE = os.path.join(HERE, "analyze_over_socket.py")
 
 
 def _observed():
@@ -48,37 +48,14 @@ def _observed():
 def _code(path):
     """Source with comments AND docstrings removed, so prose cannot satisfy or trip a check.
 
-    THE THIRD SUBSTRING-VERSUS-PROSE FALSE POSITIVE IN ONE DAY. First a guard forbidding
-    `S.get(` fired on `_DRAIN_ATTEMPTS.get(`. Then a check forbidding a reconstructed binary
-    part matched the COMMENT explaining that very mistake, so it was narrowed to skip comment
-    lines. Then it matched the module DOCSTRING, which also explains the mistake -- because the
-    whole point of these files is that they write down what went wrong, and a text search
-    cannot tell an explanation from the thing explained.
+    THE IMPLEMENTATION MOVED TO tools/source_text.py. It lived here as a private helper after
+    the third substring-versus-prose false positive in one day, and a FOURTH then happened in a
+    check written afterwards, in another file, because a discipline that has to be re-derived
+    per file gets re-derived wrongly. One implementation, imported.
+    """
+    from tools.source_text import code_only
 
-    Docstrings are removed by parsing rather than by pattern, since the pattern is what keeps
-    failing. Other string literals stay: the checks below look for real code such as
-    `headers["Authorization"] = ...`, which is a literal in an assignment, not prose."""
-    src = io.open(path, encoding="utf-8", errors="replace").read()
-    lines = src.splitlines()
-    blank = set()
-    try:
-        tree = ast.parse(src)
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef,
-                                     ast.ClassDef)):
-                continue
-            body = getattr(node, "body", None) or []
-            if not body:
-                continue
-            first = body[0]
-            if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
-                    and isinstance(first.value.value, str)):
-                end = getattr(first, "end_lineno", first.lineno)
-                blank.update(range(first.lineno, end + 1))
-    except SyntaxError:
-        pass
-    return "\n".join("" if (i + 1) in blank else l
-                     for i, l in enumerate(lines) if not l.lstrip().startswith("#"))
+    return code_only(path)
 
 
 # ---- the observation is complete ----------------------------------------------------------
@@ -181,6 +158,23 @@ def test_a_success_does_not_claim_the_tab_can_be_dropped():
     accepted are separate, and were not asked."""
     code = _code(REPLAY)
     assert "this probe did not ask them" in code
+
+
+# ---- the ANALYZE probe reads the flag that survives the session --------------------------
+
+def test_the_analyze_probe_does_not_read_a_flag_that_close_clears():
+    """IT SCORED A PASS AS A FAILURE ONCE. `_finish()` calls `close()`, which sets
+    `socket = False` and drops the page -- so after the loop a finished socket run and a
+    finished tab run are indistinguishable. The probe read those and reported that the socket
+    wiring had not taken effect, in a run whose own log showed the upload succeeding and whose
+    report contained the phrase that exists only in the image.
+
+    `transport` is set when the turn goes out and is never cleared. This pins the reading, not
+    the plumbing: relay/test_agent_profiles_research_reason.py pins that the field survives."""
+    code = _code(ANALYZE)
+    assert 'getattr(s, "transport", "")' in code, "the probe is not reading transport"
+    assert "s.socket" not in code, "the probe is back to reading a flag close() clears"
+    assert "s.page is not None" not in code
 
 
 # ---- the recorder keeps the auth shape and nothing more ------------------------------------

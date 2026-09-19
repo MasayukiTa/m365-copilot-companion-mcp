@@ -605,6 +605,14 @@ class ResearchSession:
         #: passes no RAM gate, which is the point: measured today, ram_room_for_tab() was False
         #: and the fleet would have solved WITHOUT its research rather than waiting for one.
         self.socket = False
+        #: WHICH TRANSPORT ACTUALLY CARRIED THE TURN -- "socket", "tab", or "" if none did.
+        #: `self.socket` cannot answer this once the session is over: close() sets it False
+        #: and clears the page, so a finished socket deep-dive and a finished tab one look
+        #: identical afterwards. A probe read those flags after _finish() and reported that
+        #: the socket wiring had not taken effect, while the same run's log showed the
+        #: upload succeeding and the answer coming back -- the instrument was wrong, not the
+        #: code. Set when the query goes out and never cleared.
+        self.transport = ""
         #: Asked once. A capture costs a real turn on a real tab, so retrying it every poll
         #: would spend more than the tab it is trying to avoid.
         self._socket_tried = False
@@ -682,10 +690,19 @@ class ResearchSession:
         backend sends a completion frame and the turn is over by protocol.
         """
         self._socket_tried = True
-        if self.upload_path:
-            # The Analyst reads a local file from a real <input type=file>. See
-            # relay/transport_policy.py -- the one property measured to force a tab.
-            return False
+        # AN ATTACHMENT NO LONGER ENDS THE ATTEMPT HERE.
+        #
+        # This returned False for anything with an upload_path, on the premise
+        # transport_policy carried: "a socket has nowhere to put a local file". Both were
+        # retired on 2026-09-18, and retiring the POLICY alone changed nothing, because
+        # THIS is what the fleet consults -- a policy module can only decide what somebody
+        # asks it. Two places held the same rule and did not know about each other.
+        #
+        # The bytes go to UploadFile over HTTP and the id rides the socket as
+        # messageAnnotations. Measured: an image carrying a randomly generated phrase was
+        # uploaded, its docId sent on a socket turn, and the reply read the phrase back --
+        # it is in no filename, no path and no prompt, so the pixels are its only source.
+        _annotations = None
         try:
             from relay.relay_fleet import _socket_route
 
@@ -704,10 +721,27 @@ class ResearchSession:
                 frame_timeout_s=300.0)
             if drv is None:
                 return False
+            if self.upload_path:
+                # AFTER the route has a token, because the upload needs one, and BEFORE
+                # the turn goes out, because the Analyst needs the data before the
+                # question.
+                #
+                # A FAILED UPLOAD FALLS BACK TO A TAB, and that is not timidity: the tab
+                # path below names the failure it prevents -- "an instruction about a file
+                # that is not there comes back as a confident answer about nothing" -- and
+                # sending the question annotation-less would reintroduce exactly that.
+                from relay.socket_attachment import annotation_for
+
+                _annotations = annotation_for(self.context, url, self.upload_path,
+                                              route.token_for(url),
+                                              log=lambda m: print(m, flush=True))
+                if not _annotations:
+                    return False
             self.page, self.drv, self.socket = None, drv, True
             self._count_before = 0
             self.drv._count_before = 0
-            self.drv.send(self.query)
+            self.drv.send(self.query, annotations=_annotations)
+            self.transport = "socket"
             self._pending_open = False
             self._t_send = time.time()
             return True
@@ -727,12 +761,11 @@ class ResearchSession:
             if not open_agent(self.page, self.profile):
                 self._fail("the %s surface did not open" % self.profile.name); return
             if self.upload_path:
-                # AND THIS IS WHY THE ANALYST CANNOT USE A SOCKET: the file goes into a real
-                # <input type=file>, and a socket has nowhere to put one. Measured across
-                # twenty socket turns and eight request classes, it is the ONLY property found
-                # so far that structurally forces a tab -- and it is knowable here, from a
-                # parameter the caller already set, rather than predicted from request text.
-                # relay/transport_policy.py owns the transport decision; this belongs in it.
+                # THIS IS THE FALLBACK NOW, NOT THE ONLY WAY. It read "and this is why the
+                # Analyst cannot use a socket: a socket has nowhere to put a local file" --
+                # which was never measured and is false. _try_socket() above uploads the
+                # file and sends its id as messageAnnotations; a tab is what happens when
+                # that upload does not come back with one.
                 # THE ANALYST NEEDS THE DATA BEFORE THE QUESTION. A failed upload must end the
                 # session rather than send an instruction about a file that is not there --
                 # which would come back as a confident answer about nothing.
@@ -746,6 +779,7 @@ class ResearchSession:
             self._count_before = self.drv._answers().count()
             self.drv._count_before = self._count_before
             self.drv.send(self.query)
+            self.transport = "tab"
             self._pending_open = False
             self._t_send = time.time()   # reset the clock to when the query actually went out
         except Exception as exc:

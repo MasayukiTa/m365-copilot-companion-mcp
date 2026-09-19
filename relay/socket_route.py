@@ -261,6 +261,17 @@ class SocketRoute:
     def template_for(self, agent_url=None):
         return (self._entries.get(self._key(agent_url)) or {}).get("template")
 
+    def token_for(self, agent_url=None) -> str:
+        """The bearer this route holds, for a caller that must speak HTTP alongside it.
+
+        driver_for() hands the CONVERSATION a supplier rather than a token, because a
+        refresh mid-goal has to reach a conversation that is already running. An
+        attachment upload is not like that: it is one request, made once, before the turn
+        it belongs to -- so it takes the value, and a stale one simply gets an HTTP
+        refusal that relay/socket_attachment turns into a tab.
+        """
+        return (self._entries.get(self._key(agent_url)) or {}).get("token") or ""
+
     def needs_refresh(self, agent_url=None) -> bool:
         if self.template_for(agent_url) is None:
             return True
