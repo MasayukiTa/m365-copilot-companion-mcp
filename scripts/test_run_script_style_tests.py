@@ -103,21 +103,53 @@ def test_a_genuinely_slow_suite_is_reported_not_raised(fake_root):
 
 
 def test_the_run_continues_past_a_timeout(fake_root, monkeypatch, capsys):
-    """THE POINT OF THE FIX. One slow suite must not stop the other nineteen from running."""
+    """THE POINT OF THE FIX. One slow suite must not stop the other nineteen from running.
+
+    IT USED TO MEASURE THE MACHINE, AND THIS FILE ALREADY KNEW BETTER. The old version ran
+    both suites for real with `TIMEOUT_S = 8`, so the QUIET_ASCII suite had to finish the
+    wrapper's measured 2.4s of fixed startup (1.76s of it tools.trace_ops) inside eight
+    seconds. On an idle machine it did. On 2026-09-19, in a 5,819-test run with everything
+    else competing for the same CPU, it did not -- one failure in one full run, passing alone
+    every time afterwards.
+
+    The comment at the bottom of this file describes a test that was REMOVED for exactly this:
+    "a wall-clock assertion on a shared machine measures the machine. It passed on CI and on
+    an idle machine, and failed when the full suite was running around it." One test was
+    deleted for the property and the one next to it kept it. Raising the eight would have been
+    the same bet with longer odds -- the mechanism does the same thing again, just less often.
+
+    SO THE CLAIM IS SEPARATED FROM THE CLOCK. What this asserts is control flow: `main()` must
+    keep going after a suite reports failure, and must report the run as failed. `run_one` is
+    stubbed, so no wall-clock bound is involved and the assertion cannot be decided by load.
+    That the real `run_one` DOES time out a hanging suite is
+    `test_a_genuinely_slow_suite_is_reported_not_raised` above, where the suite sleeps 120s
+    against a 2s bound and no race exists: a hang never finishes, however fast the machine is.
+    That test measures nothing about this machine's speed, which is the difference.
+    """
     slow = _suite(fake_root, "a_sleepy.py", HANGS)
     fast = _suite(fake_root, "b_quick.py", QUIET_ASCII)
     monkeypatch.setattr(R, "SUITES", {slow: None, fast: None})
-    # 8s, NOT 2s. Every suite now launches through scripts/run_isolated.py, which imports the
-    # modules in conftest.LIVE_RECORD_REDIRECTS so it can point them at a temp directory before
-    # the suite runs -- measured 2.4s of fixed startup, 1.76s of it tools.trace_ops. At 2s the
-    # QUIET_ASCII suite timed out on the wrapper alone and this test failed saying the gate had
-    # stopped at the slow suite, which it had not. The bound is checked for real in
-    # scripts/test_a_script_suite_writes_where_a_test_writes.py rather than left implicit here.
-    monkeypatch.setattr(R, "TIMEOUT_S", 8)
-    assert R.main() == 1
+
+    # THE STUB IS CHECKED AGAINST THE REAL SIGNATURE. A stub that silently stops matching what
+    # it stands in for turns this into a test of itself.
+    import inspect
+    assert list(inspect.signature(R.run_one).parameters)[:2] == ["rel", "expected"]
+
+    seen = []
+
+    def _fake_run_one(rel, expected, timeout=None):
+        seen.append(rel)
+        if rel == slow:
+            return False, "TIMED OUT after %ss: %s" % (R.TIMEOUT_S, rel)
+        return True, "%s ok" % rel
+
+    monkeypatch.setattr(R, "run_one", _fake_run_one)
+
+    assert R.main() == 1, "a failing suite no longer fails the run"
     printed = capsys.readouterr().out
     assert "TIMED OUT" in printed
     assert "b_quick.py ok" in printed, "the gate stopped at the slow suite again"
+    assert seen == [slow, fast], "the second suite was never reached: %s" % seen
 
 
 def test_a_failing_suite_still_fails(fake_root):
