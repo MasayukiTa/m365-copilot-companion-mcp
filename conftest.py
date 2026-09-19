@@ -65,6 +65,19 @@ LIVE_RECORD_REDIRECTS = {
     # whose result depends on the machine it runs on. Redirecting costs nothing and
     # removes that whole class.
     "tools.fleet_tool_health": {"LEDGER": "tool_events.jsonl"},
+    # THE SAME ARGUMENT, THREE MORE TIMES, 2026-09-20. These readers were written for ledgers
+    # that had been accumulating for weeks with nothing consuming them; all three only read,
+    # and all three are redirected for the reason directly above -- their tests pass an
+    # explicit path, but the DEFAULT is the operator's live file, so the first test that calls
+    # `report()` with no argument would assert against whatever the machine happened to be
+    # doing that hour.
+    #
+    # relay/test_live_record_isolation.py caught all three the moment they landed, which is
+    # the registry doing precisely what it was built for: it named tools.auth_stats within
+    # minutes of that constant existing, and it named these within one CI run.
+    "tools.send_failure_report": {"DEFAULT_LOG": "send_failures.jsonl"},
+    "tools.page_count_report": {"DEFAULT_LOG": "page_counts.jsonl"},
+    "tools.judge_report": {"DEFAULT_LOG": "judge.jsonl"},
     "relay.selfimprove.pending": {"QUEUE_PATH": "pending_decisions.jsonl"},
     "relay.selfimprove.record_summary": {"CACHE_PATH": "record_summaries.json"},
     "relay.capture_status": {"STATUS_PATH": "capture_status.json"},
