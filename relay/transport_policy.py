@@ -87,9 +87,25 @@ request is what failed, every time. scripts/probes/replay_upload_with_our_token.
 reconstruct it: it captures the page's bytes and headers and re-issues them, replacing the
 credential and nothing else, which is the only reason its result means anything.
 
-WHAT IS STILL NOT ASKED, and 200 does not answer: how long a docId lives, and whether an
-annotation sent over the socket is accepted. Until those, an attachment still goes to a tab --
-now because two specific questions are open, not because the door was thought to be shut.
+TWO QUESTIONS WERE OPEN HERE. ONE IS ANSWERED AND THIS PARAGRAPH SAID OTHERWISE FOR A DAY.
+
+"Whether an annotation sent over the socket is accepted" -- YES, measured 2026-09-19 end to
+end: `transport=socket`, the tab count went 1 -> 1 (no tab was opened for the attachment), and
+the reply read the phrase "どんぐり84" back off the image. `relay/socket_attachment.py`
+uploads the bytes over HTTP and `relay/agent_profiles.py::_try_socket` sends the resulting
+docId as a `messageAnnotations` entry on the socket frame.
+
+So "an attachment still goes to a tab" stopped being true, and the sentence stayed. It is
+worth naming why, because the same shape is the reason the fix took two days: the rule lived
+in TWO places. `ATTACHMENT` below was retired on 2026-09-18 and NOTHING CHANGED, because the
+copy the fleet actually consulted was a private guard inside `_try_socket`
+(`if self.upload_path: return False`). Retiring a rule that is not the deciding copy looks
+exactly like fixing it -- right up until you measure. Prose that outlives the behaviour it
+describes is the same failure one level down.
+
+STILL OPEN, AND GENUINELY: how long a docId lives. It is measurable but nothing caches a
+docId today -- every attachment uploads immediately before the frame that carries it -- so
+the answer changes no decision now. It would matter the moment something reuses one.
 
 WHAT IS AT STAKE IF IT IS PURSUED. The socket was measured at 255 seconds against 673-809 for
 the same Researcher work in a tab, and its completion arrives as a protocol frame rather than
