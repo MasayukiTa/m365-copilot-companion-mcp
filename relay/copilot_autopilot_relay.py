@@ -106,7 +106,8 @@ from tools.runlog_ops import runlog_summarize
 class ConversationClosed(RuntimeError):
     """Raised by send() when the target tab/composer is already gone (the
     conversation ended) BEFORE we even try to submit. This is the TargetClosedError
-    race seen in 28/72 send_failures records: the agent turn finished, the page was
+    race seen in 28 of the first 72 send_failures records (0.19% over the whole log --
+    see _page_alive): the agent turn finished, the page was
     torn down, and the relay then tried to send into a dead target -- burning the full
     3-attempt retry budget every time. run_relay treats this as TERMINAL (no transient
     retry), since retrying a closed target can never succeed. Subclasses RuntimeError
@@ -189,8 +190,9 @@ COPILOT_SELECTORS = {
     # The Send button. Pressing Enter in this rich editor does NOT reliably submit
     # (the text just sits in the composer) -- clicking this button does.
     #
-    # LIVE DOM (companion Edge, 2026-06-13, read-only CDP scrape + 72 send_failures
-    # records): when the composer holds text, the button renders as
+    # LIVE DOM (companion Edge, 2026-06-13, read-only CDP scrape + the 72 send_failures
+    # records that existed THAT DAY; the log holds 15,606 now): when the composer holds
+    # text, the button renders as
     #   <button aria-label="送信" ...>           (JP locale, visible, enabled)
     # in the same 40x40 toolbar slot that holds the dictation / voice buttons when
     # the composer is EMPTY (so the button simply does not exist until text is typed
@@ -1466,11 +1468,26 @@ class CopilotWebDriver:
         """Cheap liveness probe: is the tab still open AND the composer still present?
 
         Used as an early dead-check before a send so a conversation that ended (the
-        page/composer was torn down -- the TargetClosedError race seen in
-        send_failures.jsonl, 28/72) is treated as terminal IMMEDIATELY instead of
-        burning the full 3-attempt x 12s retry budget against a dead target. Any
-        exception (incl. TargetClosedError from page.is_closed/evaluate) -> not alive.
-        Never raises."""
+        page/composer was torn down -- the TargetClosedError race) is treated as terminal
+        IMMEDIATELY instead of burning the full 3-attempt x 12s retry budget against a dead
+        target. Any exception (incl. TargetClosedError from page.is_closed/evaluate) ->
+        not alive. Never raises.
+
+        THE RATE THIS WAS JUSTIFIED WITH, AND THE RATE THE WHOLE RECORD SHOWS. This said
+        "28/72" -- 39%, hand-counted on 2026-06-13, the day of the incident that prompted it
+        and repeated in four other places in this file. Measured 2026-09-20 over the entire
+        log (`python -m tools.send_failure_report`): 29 of 15,606, or 0.19%.
+
+        THE RULE STANDS AND THE SENTENCE DID NOT. Fast-failing a genuinely closed page is
+        right whenever it happens, and the cost avoided is real, so nothing here changes. What
+        was wrong was the shape of the claim: a bare "28/72" with no window reads as a
+        standing property of send failures, and across three months it is not one. A rate
+        quoted without its window is a baseline quoted without its date.
+
+        AND THIS RULE MOVES ITS OWN NUMBER, which is why the two are not a before/after: once
+        a dead page is caught before the send, fewer sends reach the point that writes one of
+        those rows at all. tools/send_failure_report states that limit rather than implying a
+        clean comparison it cannot make."""
         try:
             if self.page.is_closed():
                 return False
@@ -1661,7 +1678,8 @@ class CopilotWebDriver:
         # EARLY DEAD-CHECK: if the tab/composer is already gone (conversation ended),
         # do NOT enter the type/arm/click retry loop -- it would just throw
         # TargetClosedError on every probe and waste the full 3x12s budget (the
-        # TargetClosedError race, 28/72 of send_failures). Fail fast and terminally so
+        # TargetClosedError race, 28 of the first 72 send_failures -- see _page_alive for
+        # what that rate is and is not). Fail fast and terminally so
         # run_relay records a STUCK instead of spinning. This is a pure read; never
         # types or clicks.
         if not self._page_alive():
