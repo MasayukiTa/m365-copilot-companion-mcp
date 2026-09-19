@@ -57,7 +57,6 @@ NO_CALLER_NO_TEST = {
     "tools/judge_backend.py::ask_human_async",                   # 18 lines
     "relay/selfimprove/guards.py::launch_detached",              # 16 lines
     "tools/security.py::get_client_ip",                          # 12 lines
-    "scripts/collect_lens_corpus.py::all_inconclusive",          # 8 lines
     "scripts/collect_lens_corpus.py::load_corpus",               # 7 lines
     "relay/autonomy_gate.py::constraints_text",                  # 5 lines
     "tools/security.py::is_trusted_local",                       # 3 lines
