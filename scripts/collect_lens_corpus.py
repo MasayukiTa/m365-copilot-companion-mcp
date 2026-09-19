@@ -530,15 +530,6 @@ def collect(*, cdp_url, agent_url, episodes, agent, out_path, lenses=None,
     return {"rows": rows, "skipped": skipped, "lenses": lenses}
 
 
-def load_corpus(path) -> list:
-    rows = []
-    for line in io.open(path, encoding="utf-8"):
-        line = line.strip()
-        if line:
-            rows.append(json.loads(line))
-    return rows
-
-
 def load_operator_env(path=None):
     """Read .env into the environment without printing any of it.
 

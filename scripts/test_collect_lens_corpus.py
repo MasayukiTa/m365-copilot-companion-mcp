@@ -202,14 +202,27 @@ def test_the_retry_count_is_recorded():
     assert '"attempts": attempt + 1' in src
 
 
+def _collect_body():
+    """`collect` の本体だけ。**次の top-level `def` までで切る。**
+
+    以前は `src.index("def load_corpus(")` を終端にしていた — つまり、たまたま次に
+    置かれている無関係な関数の名前に2つのテストが依存していた。その `load_corpus` は
+    呼出元のない写し（`analyze_lens_corpus.load` と同一）で、消そうとした瞬間に
+    このテストが壊れた。**検査が、検査対象と関係のないものに固定されていた。**
+    """
+    src = Path(CL.__file__).read_text(encoding="utf-8")
+    start = src.index("def collect(")
+    nxt = src.find(chr(10) + "def ", start)
+    return src[start:nxt if nxt != -1 else len(src)]
+
+
 def test_the_workdir_outlives_the_lens_run():
     """実測(2026-08-20)でレビュアが逐語でこう答えた:
     「invoice.txt と total.txt が実在せず、報告された計算は事実として確認できない」。
     採点直後に workdir を消し、その12行あとでレンズに検証を頼んでいた。
     誠実なレビュアの正解は常に INCONCLUSIVE になり、語彙がそれを UNCLEAR に丸め、
     全政策が同点のコーパスができる。パネルを死体の上で回していた。"""
-    src = Path(CL.__file__).read_text(encoding="utf-8")
-    body = src[src.index("def collect("):src.index("def load_corpus(")]
+    body = _collect_body()
     first_lens = body.index("run_lenses(cdp_url")
     first_rm = body.index("shutil.rmtree(workdir")
     assert first_lens < first_rm, "レンズより前に workdir を消している"
@@ -218,8 +231,7 @@ def test_the_workdir_outlives_the_lens_run():
 def test_every_exit_from_a_candidate_releases_its_workdir():
     """本体には continue が複数ある。末尾に片付けを置くと、
     スキップのたびに workdir が残る。"""
-    src = Path(CL.__file__).read_text(encoding="utf-8")
-    body = src[src.index("def collect("):src.index("def load_corpus(")]
+    body = _collect_body()
     i = body.index("shutil.rmtree(workdir")
     assert "finally:" in body[:i], "finally を通らない片付けになっている"
 
