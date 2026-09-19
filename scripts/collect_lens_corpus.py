@@ -301,10 +301,6 @@ def verdicts_only(detail) -> dict:
     return {lens: d["verdict"] for lens, d in detail.items()}
 
 
-def all_unclear(detail) -> bool:
-    return all(d["verdict"] == A.UNCLEAR for d in detail.values())
-
-
 def harness_faults(detail) -> list:
     """Lenses whose UNCLEAR is a hole rather than an answer.
 
