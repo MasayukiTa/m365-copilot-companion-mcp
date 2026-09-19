@@ -288,6 +288,17 @@ REASONS: dict[str, tuple[str, str]] = {
     # thing; the alternative on offer was writing 77 sentences from guesswork, and the two
     # entries that got that treatment (`all_inconclusive`, `fleet_is_running`) did not
     # survive their own triage.
+    # NOT WIRED ON PURPOSE, decided 2026-09-19 while fixing the defect it looks like it should
+    # have fixed. `diagnose_after_fresh_replay`'s TRANSIENT branch was unreachable because
+    # every caller passed `fresh_was_transient_error=False` as a literal, and this predicate
+    # was written to compute that argument. Calling it would have made a THIRD copy of a
+    # judgement relay_fleet already holds in five marker families (transient/agent-dead,
+    # tool-unreachable, canned-nonanswer, admin-block, throttle) which overlap
+    # review_resilience.TRANSIENT_MARKERS and diverge from it in both directions. The path
+    # that settles a worker has already decided, and its decision is in `outcome` -- better
+    # evidence than matching the same strings a third time. Written up where the fix is.
+    "relay/review_resilience.py::looks_like_transient_error":
+        ("deliberate", "relay/test_a_worker_that_dies_after_a_fresh_replay_says_why.py"),
     "relay/autonomy_gate.py::judge_autonomy": ("deliberate", "docs/unreached_burndown.md"),
     "relay/autonomy_gate.py::constraints_text": ("deliberate", "docs/unreached_burndown.md"),
 }
