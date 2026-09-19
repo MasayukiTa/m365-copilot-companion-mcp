@@ -294,6 +294,26 @@ def report(results_dir: str = None) -> str:
     runs = load(results_dir)
     lines = ["archive: %d runs, %d from the current instrument"
              % (len(runs), sum(1 for r in runs if r["current_instrument"]))]
+    # THE SPAN, IN THE ONE TABLE A HUMAN READS. `revisions` was written to answer exactly the
+    # question this report exists for -- its docstring says it "reports the span and a human
+    # decides" -- and nothing called it, so the human it defers to was never shown anything to
+    # decide on. The count above says how many runs came from the current instrument; it does
+    # not say what the others came from, which is the part that determines whether they may be
+    # pooled at all.
+    spans = revisions(runs)
+    if len(spans) > 1:
+        # "IN ARCHIVE ORDER", NOT "OLDEST FIRST". `load` returns runs sorted by FILENAME and
+        # its docstring calls that "newest last"; that holds only while the names sort the way
+        # the clock does. `_ts_of` computes the real key and nothing orders by it. Restating
+        # the stronger claim here would spread it rather than test it, so this says what is
+        # actually guaranteed and leaves the ordering question where it already lives.
+        lines.append("  spans %d revisions, in archive order: %s"
+                     % (len(spans), ", ".join(r[:12] for r in spans)))
+        lines.append("  A series crossing a change to the route, the fleet or the sampler is "
+                     "not one series. Which of these changes matter is yours to judge; this "
+                     "does not split the columns for you.")
+    elif spans:
+        lines.append("  one revision throughout: %s" % spans[0][:12])
     for goals in sorted({r["goals"] for r in runs}):
         for version in sorted({r["version"] for r in runs}):
             for null in (True, False):
