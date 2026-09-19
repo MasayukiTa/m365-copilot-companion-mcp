@@ -43,7 +43,22 @@ import warnings
 from collections import defaultdict
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ROOTS = ("relay", "bench", "tools", "bridge", "scripts")
+#: Where this scan looks. DEFINITIONS come only from non-test files here; REFERENCES are
+#: counted from every file here, test or not.
+#:
+#: `tests` WAS MISSING AND THAT MADE THE INSTRUMENT LIE IN THE DANGEROUS DIRECTION.
+#: Measured 2026-09-19: `tools/golden.py::run_trajectory` reported "refs in tests: 0" while
+#: `tests/test_golden.py` -- a file that exists for nothing else, four tests, registered in CI
+#: -- references it five times. The whole directory was skipped here, so no file under it was
+#: ever read for either purpose, and the column that answers "is anything checking this?"
+#: answered no for every function the `tests/` suite covers.
+#:
+#: The burndown's rule for this tool is "a false 'reached' is worse than a false 'unreached'",
+#: because a row that disappears is never read. This is the same rule one column over: a false
+#: "nothing tests it" does not hide the row, it argues for deleting what the row names. The
+#: inventory put run_trajectory in NO_CALLER_NO_TEST -- "nothing calls them and nothing checks
+#: them" -- on the strength of a number the scan could not have computed.
+ROOTS = ("relay", "bench", "tools", "bridge", "scripts", "tests")
 SKIP_DIRS = {"__pycache__", ".git", ".venv", "node_modules"}
 
 #: Names something other than this repository calls: the interpreter, BaseHTTPRequestHandler,
@@ -148,7 +163,18 @@ def tracked_files():
 
 
 def is_test(rel):
-    base = rel.rsplit("/", 1)[-1]
+    """Whether this file is test code -- so its definitions are skipped and its references
+    count as "refs in tests" rather than as production callers.
+
+    A DIRECTORY COUNTS, NOT ONLY A FILENAME. `tests/_srcprobe.py` is a helper the suite
+    imports; by name alone it reads as production code, and once `tests/` entered ROOTS its
+    two public functions would have been reported as unreached -- a test helper listed as dead
+    production code, which is the same category error that put `free_port` in the inventory.
+    """
+    parts = rel.split("/")
+    if "tests" in parts[:-1]:
+        return True
+    base = parts[-1]
     return base.startswith("test_") or base == "conftest.py"
 
 
