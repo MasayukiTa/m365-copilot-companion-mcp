@@ -266,6 +266,26 @@ REASONS: dict[str, tuple[str, str]] = {
         ("revealed", "docs/unreached_burndown.md"),
     "relay/selfimprove/coreset.py::summarise":
         ("revealed", "docs/unreached_burndown.md"),
+
+    # KEPT UNWIRED, AND THE DECISION HAS A LOCATION NOW. This table's own comment names
+    # judge_autonomy as the cautionary case -- "'we decided' with no location is how
+    # judge_autonomy came to sit here for weeks with nobody able to say who had decided
+    # what" -- and the decision had in fact been written down since then, at
+    # docs/unreached_burndown.md:332: its STOP/ASK VOCABULARY is live, in
+    # task_router._static_risk and contract_gate; its VERDICT is not, because the fleet
+    # gates per job and this judges a whole run. Two different questions, and only the
+    # first one is the fleet's.
+    #
+    # `constraints_text` renders what `judge_autonomy` decided, so it is unreachable for
+    # exactly the same reason and not for one of its own. Listing it without saying so
+    # invites someone to wire the renderer and conclude the gate is live.
+    #
+    # NOT INFERENCE, which is what this table refuses. The pointer is a path that says the
+    # thing; the alternative on offer was writing 77 sentences from guesswork, and the two
+    # entries that got that treatment (`all_inconclusive`, `fleet_is_running`) did not
+    # survive their own triage.
+    "relay/autonomy_gate.py::judge_autonomy": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/autonomy_gate.py::constraints_text": ("deliberate", "docs/unreached_burndown.md"),
 }
 
 #: The inventory as it stood when the reason requirement went in. See the file's own header.
