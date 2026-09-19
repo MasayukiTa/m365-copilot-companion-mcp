@@ -59,7 +59,6 @@ NO_CALLER_NO_TEST = {
     "bench/skill_use_log.py::compare_runs",                      # 23 lines
     "tools/judge_backend.py::ask_human_async",                   # 18 lines
     "relay/selfimprove/guards.py::launch_detached",              # 16 lines
-    "relay/selfimprove/run_archive.py::revisions",               # 14 lines
     "bridge/session_store.py::compact",                          # revealed 2026-09-13
     "relay/selfimprove/episode_record.py::compact",              # revealed 2026-09-13
     "tools/security.py::get_client_ip",                          # 12 lines
