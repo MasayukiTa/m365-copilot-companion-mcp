@@ -53,14 +53,10 @@ from tools import unreached as U  # noqa: E402
 NO_CALLER_NO_TEST = {
     # Forged by the tool foundry, registered by a directory walk. See REASONS below.
     "tools/auto/office_password_recovery.py::office_password_recovery",
-    "relay/lean_capture.py::capture_fn",                           # 10 lines, revealed 2026-09-14
-    "tools/golden.py::run_trajectory",                           # 64 lines
     "relay/autonomy_gate.py::judge_autonomy",                    # 54 lines
     "bench/skill_use_log.py::compare_runs",                      # 23 lines
     "tools/judge_backend.py::ask_human_async",                   # 18 lines
     "relay/selfimprove/guards.py::launch_detached",              # 16 lines
-    "bridge/session_store.py::compact",                          # revealed 2026-09-13
-    "relay/selfimprove/episode_record.py::compact",              # revealed 2026-09-13
     "tools/security.py::get_client_ip",                          # 12 lines
     "scripts/collect_lens_corpus.py::all_inconclusive",          # 8 lines
     "scripts/collect_lens_corpus.py::load_corpus",               # 7 lines
@@ -74,6 +70,20 @@ NO_CALLER_NO_TEST = {
 #: Called by nothing outside tests. Tests referencing a function say it was worth writing; they
 #: do not say anything reaches it in production.
 NO_CALLER_BUT_TESTED = {
+    # MOVED OUT OF NO_CALLER_NO_TEST 2026-09-19, AFTER THE INSTRUMENT WAS FIXED. That set says
+    # "nothing calls them and nothing checks them" and for these four the second half was
+    # false. `tests/` was not in tools/unreached.ROOTS, so no file under it was read for any
+    # purpose and the "refs in tests" column answered 0 for everything the tests/ suite covers:
+    # run_trajectory reported 0 against the five references in tests/test_golden.py, a file
+    # that exists for nothing else. capture_fn's OWN DOCSTRING names the two tests in
+    # tests/test_lean_capture.py that assert through it -- the prose knew and the inventory
+    # said the opposite. The two `compact`s needed no fix to the scan at all; they were simply
+    # filed in the wrong set by hand, which is what test_the_two_sets_agree_with_the_scan now
+    # stops.
+    "tools/golden.py::run_trajectory",                              # 64 lines, 4 test refs
+    "relay/lean_capture.py::capture_fn",                            # 10 lines, 7 test refs
+    "bridge/session_store.py::compact",                             # 6 test refs
+    "relay/selfimprove/episode_record.py::compact",                 # 6 test refs
     # DEAD SUBGRAPHS, revealed 2026-09-14 by iterating the scan to a fixed point. Each was held
     # off the list by a caller that is itself unreached, so a reference count said "someone
     # names this" while nothing could get there. Not new code.
@@ -439,3 +449,61 @@ def test_the_inventory_only_names_files_the_repository_tracks():
     have = set(files)
     missing = sorted(k for k in BASELINE if k.split("::")[0] not in have)
     assert not missing, "the inventory names untracked files: %s" % ", ".join(missing)
+
+
+def test_the_two_sets_agree_with_the_scan_about_what_is_tested():
+    """THE SPLIT WAS HAND-ASSIGNED AND FOUR ENTRIES WERE ON THE WRONG SIDE.
+
+    `NO_CALLER_NO_TEST` opens with "nothing calls them and nothing checks them" and calls
+    itself "the starkest" -- which is an argument for deletion, made in the inventory's own
+    voice. Being wrong in that direction is not a quiet inaccuracy.
+
+    Two of the four were wrong because the instrument could not see: `tests/` was missing from
+    `tools/unreached.ROOTS`, so the "refs in tests" column answered 0 for everything that
+    suite covers -- `tools/golden.py::run_trajectory` against the five references in
+    tests/test_golden.py, a file that exists for nothing else. The other two were simply filed
+    in the wrong set by a person, with the correct count printed beside them all along.
+
+    So the split stops being a judgement anybody has to remember to make. It is the scan's
+    number, checked here.
+    """
+    rows = U.scan()
+    if rows is None:
+        pytest.skip("git could not list the tracked files here")
+    test_refs = {r[0]: r[5] for r in rows}
+    tested_but_filed_as_untested = sorted(
+        k for k in NO_CALLER_NO_TEST if test_refs.get(k, 0) > 0)
+    assert not tested_but_filed_as_untested, (
+        "listed as unchecked, but the scan finds tests referencing them -- move to "
+        "NO_CALLER_BUT_TESTED: %s"
+        % ", ".join("%s (%d)" % (k, test_refs[k]) for k in tested_but_filed_as_untested))
+    untested_but_filed_as_tested = sorted(
+        k for k in NO_CALLER_BUT_TESTED if k in test_refs and test_refs[k] == 0)
+    assert not untested_but_filed_as_tested, (
+        "listed as checked, and no test references them: %s"
+        % ", ".join(untested_but_filed_as_tested))
+
+
+def test_the_scan_reads_the_tests_directory_at_all():
+    """The missing root, pinned directly. A count that is silently zero for a whole directory
+    reads exactly like a real measurement, which is why it survived.
+    """
+    assert "tests" in U.ROOTS
+    rows = U.scan()
+    if rows is None:
+        pytest.skip("git could not list the tracked files here")
+    test_refs = {r[0]: r[5] for r in rows}
+    assert test_refs.get("tools/golden.py::run_trajectory", 0) > 0, \
+        "tests/test_golden.py exists for this function and the scan cannot see it"
+
+
+def test_a_helper_under_tests_is_not_reported_as_dead_production_code():
+    """`tests/_srcprobe.py` is imported by the suite and is named like production code. Once
+    `tests/` entered ROOTS its public functions would have been listed as unreached unless
+    `is_test` recognised the DIRECTORY -- a test helper filed as dead production code, which
+    is the category error that put job_authority.free_port in this inventory in the first
+    place."""
+    assert U.is_test("tests/_srcprobe.py")
+    assert U.is_test("tests/sub/helper.py")
+    assert not U.is_test("tools/golden.py")
+    assert not U.is_test("relay/tests_support.py")
