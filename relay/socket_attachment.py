@@ -63,8 +63,6 @@ def annotation_for(context, agent_url, upload_path, token, *, log=None):
             say("[socket_attachment] no token; cannot upload")
             return None
 
-        import requests
-
         captured = {}
         page = context.new_page()
         try:
@@ -100,6 +98,12 @@ def annotation_for(context, agent_url, upload_path, token, *, log=None):
         if not captured:
             say("[socket_attachment] the page's own upload request was never seen")
             return None
+
+        # IMPORTED HERE, NOT AT THE TOP OF THE FUNCTION. It was above the page block, so on a
+        # machine without it every failure in this function came back as ModuleNotFoundError
+        # -- including failures that had nothing to do with HTTP. An import belongs where the
+        # work it does begins.
+        import requests
 
         headers = dict(captured["headers"])
         headers["Authorization"] = "Bearer " + token

@@ -88,8 +88,9 @@ def _src():
     """CODE ONLY. The docstring of that module explains the six multipart fields the page
     sends, including `FileBase64` -- so a check forbidding a rebuilt body matched the
     paragraph describing the mistake it forbids. Fourth time in one day for that class; see
-    tools/source_text.py, which is why it is one shared implementation now."""
-    from tools.source_text import code_only
+    conftest.code_only, which is why it is one shared implementation now -- and it lives in
+    conftest because only tests use it."""
+    from conftest import code_only
 
     return code_only(_MODULE)
 

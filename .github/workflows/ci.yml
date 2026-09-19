@@ -648,7 +648,7 @@ jobs:
             bench/test_attempt_budget.py \
             bench/test_grade_reasons.py \
             scripts/test_bootstrap_transcript.py \
-            tools/test_source_text.py \
+            test_code_only.py \
             scripts/probes/test_the_probe_matches_the_recording.py \
             scripts/probes/test_a_cut_observation_must_announce_the_cut.py \
             scripts/test_devtunnel_download.py \
