@@ -142,6 +142,7 @@ jobs:
             tests/test_golden.py \
             tests/test_listing_counts.py \
             tests/test_child_output_decoding.py \
+            bench/test_skill_use_log.py \
             bench/test_capture_survives_a_non_cp932_patch.py \
             bench/test_a_partial_stage_is_not_a_lost_chunk.py \
             bench/test_a_benchmark_episode_is_not_split.py \
