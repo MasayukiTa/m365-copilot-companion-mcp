@@ -112,21 +112,24 @@ def test_the_reason_is_kept_so_a_silent_lens_can_be_told_from_an_unsure_one():
     assert "verdict, _reason = got" not in src, "reason を捨てると診断が消える"
 
 
-def test_all_unclear_still_reports_what_it_reports():
-    """**名前が古い設計のまま残っていた。** 元は
+def test_a_verdict_that_is_not_unclear_survives_the_flattening():
+    """**この関数は名前が古い設計のまま残っていた。** 元は
     `test_an_all_silent_panel_becomes_a_skip_not_a_row` — 全員が黙った盤は捨てる、という
-    主張。**すぐ下の `test_a_candidate_every_lens_found_unclear_is_kept` が正反対を言う。**
-    本体は述語しか触っていないので、設計が逆になっても緑のままだった: 名前が判断を
-    主張し、本体は主張していなかった。
+    主張で、**すぐ下の `test_a_candidate_every_lens_found_unclear_is_kept` が正反対を言う。**
+    本体は述語 `all_unclear` しか触っていなかったので、判断のほうが逆になっても緑のまま
+    だった: 名前が設計を主張し、本体は主張していなかった。
 
-    述語自体は生きている（`harness_faults` の入力の一部）ので、述語の性質として残す。"""
+    **`all_unclear` 自体もその後消した。** 最後の production の消費者は calibrate 側の
+    skip 判断で、それは `harness_faults` を使う規則に揃えた。残っていた参照はこの述語を
+    説明するテストだけ — テストしか使わない述語を「テストのために残す」のは、この
+    リポジトリが何度も外してきた正当化の形。残すべき断言は下の `harness_faults` 側にある。
+
+    ここに残すのは flattening の性質だけ: UNCLEAR でない評決が潰れないこと。"""
     detail = {"correctness": {"verdict": "UNCLEAR", "reason": ""},
-              "edge": {"verdict": "UNCLEAR", "reason": ""},
+              "edge": {"verdict": "UPHELD", "reason": ""},
               "security": {"verdict": "UNCLEAR", "reason": ""}}
-    assert CL.all_unclear(detail)
-    detail["edge"]["verdict"] = "UPHELD"
-    assert not CL.all_unclear(detail)
-    assert CL.verdicts_only(detail)["edge"] == "UPHELD"
+    assert CL.verdicts_only(detail) == {"correctness": "UNCLEAR", "edge": "UPHELD",
+                                        "security": "UNCLEAR"}
 
 
 # ---- 穴と、答えとしての UNCLEAR は別物 ------------------------------------------------------------
@@ -137,7 +140,7 @@ def test_a_candidate_every_lens_found_unclear_is_kept():
     detail = {ln: {"verdict": "UNCLEAR", "elapsed_s": 200.0,
                    "reason": "the nudge budget ran out without a parseable verdict"}
               for ln in ("correctness", "edge", "security")}
-    assert CL.all_unclear(detail)
+    assert all(d["verdict"] == "UNCLEAR" for d in detail.values())
     assert CL.harness_faults(detail) == [], "レビュアの答えを障害として扱っている"
     assert CL.timed_out_lenses(detail) == []
 
@@ -255,7 +258,7 @@ def test_the_skip_reason_names_the_lens_that_could_not_be_asked():
     assert src.count('"why": "lens(es) could not be asked: %s" % starved') == 2
 
 
-def test_all_inconclusive_is_gone_rather_than_sitting_unwired():
+def test_neither_retired_predicate_is_still_around():
     """**撤去であって、配線し忘れではない。** その docstring は「以前は捨てられていた:
     語彙に INCONCLUSIVE が無く UNCLEAR に丸められ、`all_unclear` が不完全な盤として
     行を捨てていた」と、既に直った欠陥を説明していた。語彙には INCONCLUSIVE があり、
@@ -265,3 +268,7 @@ def test_all_inconclusive_is_gone_rather_than_sitting_unwired():
     別の場所にある。`bridge/session_store.py::latest_attached` を「配線されていない関数」
     として残さず消したのと同じ判断。"""
     assert not hasattr(CL, "all_inconclusive")
+    # `all_unclear` went the same way and for a sharper reason: after the calibrate site was
+    # brought in line with its two siblings it had NO production consumer at all, and the only
+    # references left were tests describing the predicate itself.
+    assert not hasattr(CL, "all_unclear")
