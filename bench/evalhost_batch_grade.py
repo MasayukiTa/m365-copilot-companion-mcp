@@ -35,8 +35,16 @@ def _supported_flags():
     """The long options this installed harness accepts, from its own --help. Empty on any
     failure, which makes the caller fall back to the minimal, always-supported set."""
     try:
+        # encoding + errors, NOT bare text=True. text=True decodes with the locale, which on
+        # a Windows host is cp932; one byte the harness prints that cp932 cannot represent
+        # raises, the except below returns an EMPTY set, and the caller reads that as "this
+        # harness supports nothing" and drops --cache_level. Grading a second time then takes
+        # an hour instead of minutes, and nothing anywhere says why. Same shape as the
+        # powershell count in relay/selfimprove/guards.py, where a decode failure returned 0
+        # and 0 read as "no problem".
         h = subprocess.run([sys.executable, "-m", "swebench.harness.run_evaluation", "--help"],
-                           capture_output=True, text=True, timeout=120)
+                           capture_output=True, text=True, timeout=120,
+                           encoding="utf-8", errors="replace")
         return set(re.findall(r"--[A-Za-z][A-Za-z0-9_-]*", (h.stdout or "") + (h.stderr or "")))
     except Exception:
         return set()
@@ -53,9 +61,15 @@ if "--cache_level" in _flags:
     # Instance-level caching is why grading a second time is minutes rather than an hour on a
     # host with the disk for it. Kept when the harness still offers it.
     cmd += ["--cache_level", "instance"]
-r = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True)
+# THE GRADING RUN ITSELF. A decode failure here does not degrade the result, it ENDS it:
+# subprocess.run raises before the report is ever read, and a batch that graded fine is
+# reported as a grading failure.
+r = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True,
+                   encoding="utf-8", errors="replace")
 run_out_text = (r.stdout or "") + "\n---ERR---\n" + (r.stderr or "")
-with open(os.path.join(workdir, "run.out"), "w") as f:
+# And the transcript is written as UTF-8 rather than as whatever the host encodes by
+# default, so the file a person opens afterwards says what the harness said.
+with open(os.path.join(workdir, "run.out"), "w", encoding="utf-8", errors="replace") as f:
     f.write(run_out_text)
 
 out = {"resolved": [], "unresolved": [], "error": [], "empty": [], "report": ""}
@@ -63,7 +77,7 @@ out = {"resolved": [], "unresolved": [], "error": [], "empty": [], "report": ""}
 cands = glob.glob(os.path.join(workdir, "*." + run_id + ".json")) + glob.glob(os.path.join(workdir, "*.json"))
 for rep in cands:
     try:
-        d = json.load(open(rep))
+        d = json.load(open(rep, encoding="utf-8"))
         if isinstance(d, dict) and ("resolved_ids" in d or "unresolved_ids" in d):
             out["resolved"] = d.get("resolved_ids", []) or []
             out["unresolved"] = d.get("unresolved_ids", []) or []
@@ -89,12 +103,13 @@ if not out["resolved"] and not out["unresolved"] and not out["error"] and not ou
 vdir = "/mnt/c/wsl-setup/verdicts"
 os.makedirs(vdir, exist_ok=True)
 dest = os.path.join(vdir, run_id + ".batchresult.json")
-json.dump(out, open(dest, "w"))
+json.dump(out, open(dest, "w", encoding="utf-8"), ensure_ascii=False)
 # THE SAME DURABILITY PROBLEM, for the raw output: copy run.out next to the batchresult.json
 # BEFORE the workdir can be cleaned up, so a caller that wants the full (not 4000-char-truncated)
 # log can scp %s/verdicts/<run_id>.run.out reliably too.
 try:
-    with open(os.path.join(vdir, run_id + ".run.out"), "w") as f:
+    with open(os.path.join(vdir, run_id + ".run.out"), "w",
+              encoding="utf-8", errors="replace") as f:
         f.write(run_out_text)
 except Exception:
     pass
