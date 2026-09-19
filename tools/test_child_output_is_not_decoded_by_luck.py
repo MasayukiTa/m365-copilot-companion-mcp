@@ -48,8 +48,8 @@ _CALLS = frozenset({"run", "Popen", "check_output", "check_call", "call"})
 
 #: Files that still decode child output with the local code page, with how many sites each.
 #:
-#: 2026-09-12: the sweep began at 59 files / 100 sites and ends here at TWO FILES, and the two
-#: that remain are not debt that was skipped -- they are debt that must not be paid inside a
+#: 2026-09-12: the sweep began at 59 files / 100 sites and stopped at TWO FILES, and the two
+#: that remained were not debt that was skipped -- they were debt that must not be paid inside a
 #: sweep. Both are in the self-improvement FROZEN SET (relay/selfimprove/frozen.py's
 #: FROZEN_MANIFEST, checksummed in frozen_baseline.json), and relay/selfimprove/test_frozen.py
 #: refuses any edit to them with the reason: "a run whose judge changed produces numbers nobody
@@ -58,8 +58,20 @@ _CALLS = frozenset({"run", "Popen", "check_output", "check_call", "call"})
 #: The decode fix is correct on its own terms for both -- guards.py's powershell count lost to
 #: the code page returns 0, which reads as "no problem" -- and it ships with a DELIBERATE
 #: RE-FREEZE and its own record, not as a line in a sweep, and least of all with an A/B queued.
+#:
+#: 2026-09-19: `bench/evalhost_batch_grade.py` WAS paid that way and is gone from this list.
+#: Two sites, both with the asymmetry that made them worth a re-freeze of their own: the
+#: `--help` probe's decode failure returned an EMPTY feature set, which the caller read as
+#: "this harness supports nothing" and dropped `--cache_level`, turning a minutes-long regrade
+#: into an hour with nothing anywhere saying why; the grading run's decode failure did not
+#: degrade a result but ENDED one, raising before the report was read so that a batch which
+#: graded fine was reported as a grading failure. Re-signed on the dashboard, authority ledger
+#: seq 120.
+#:
+#: THE ENTRY WAS NOT REMOVED WITH THE FIX, AND CI CAUGHT IT -- which is the half of this
+#: ratchet that makes the other half worth having. An inventory that keeps a paid entry reads
+#: as the current state while being a historical one.
 BASELINE = {
-    "bench/evalhost_batch_grade.py": {"c60b6befb5f2", "e326dcedd6f9"},
     "relay/selfimprove/guards.py": {"6581ea26a400"},
 }
 
