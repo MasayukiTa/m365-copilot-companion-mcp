@@ -70,7 +70,7 @@ def test_the_two_causes_get_different_outcomes():
     """コネクタが証明済みなら REFUSED、そうでなければ INFRA_STUCK。
     同じ結末に丸めると、言い換えれば済む話にブラウザ再起動を勧め続けることになる。"""
     import inspect
-    src = inspect.getsource(F.RelayWorker._decide)
+    src = inspect.getsource(F.RelayWorker._decide_impl)
     assert "connector_proof_source()" in src, "判定が原因を分けていない"
     assert '"REFUSED"' in src, "拒否という結末が無い"
     i = src.index("connector_proof_source()")
@@ -157,7 +157,7 @@ def test_the_infra_message_labels_its_guess_as_a_guess():
     branch measures it -- it only knows no tool call arrived. A reader took that sentence for a
     finding and reported it as the root cause, which cost a full investigation."""
     import inspect
-    src = inspect.getsource(F.RelayWorker._decide)
+    src = inspect.getsource(F.RelayWorker._decide_impl)
     # _decide names INFRA_STUCK ten times, 23k characters apart. index() takes the first,
     # so the window landed nowhere near the branch under test and the test failed for a
     # reason unrelated to what it checks. Scan every occurrence.

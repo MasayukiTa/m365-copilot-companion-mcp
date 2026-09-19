@@ -215,7 +215,7 @@ def test_the_split_marker_is_inert_outside_fanout_mode():
     """
     w = F.RelayWorker(MAIL_GOAL, "w0", fanout=False)
     assert w.fanout is False, "an ordinary worker is not in fanout mode"
-    src = inspect.getsource(F.RelayWorker._decide)
+    src = inspect.getsource(F.RelayWorker._decide_impl)
 
     # ANCHORED ON THE GATE, NOT ON A DISTANCE TO IT. This measured the characters between the
     # gate and the first `fanout_ready`, which said nothing about nesting and broke the moment
@@ -243,7 +243,7 @@ def test_a_worker_that_is_in_fanout_mode_was_given_the_marker_anyway():
 
 def test_the_plan_marker_has_the_same_two_properties():
     from relay import planner
-    src = inspect.getsource(F.RelayWorker._decide)
+    src = inspect.getsource(F.RelayWorker._decide_impl)
     i = src.find("plan_ready")
     assert i != -1
     assert "self.plan_mode" in src[max(0, i - 400):i]
