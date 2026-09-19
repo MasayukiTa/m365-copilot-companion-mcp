@@ -54,7 +54,6 @@ NO_CALLER_NO_TEST = {
     # Forged by the tool foundry, registered by a directory walk. See REASONS below.
     "tools/auto/office_password_recovery.py::office_password_recovery",
     "relay/autonomy_gate.py::judge_autonomy",                    # 54 lines
-    "bench/skill_use_log.py::compare_runs",                      # 23 lines
     "tools/judge_backend.py::ask_human_async",                   # 18 lines
     "relay/selfimprove/guards.py::launch_detached",              # 16 lines
     "tools/security.py::get_client_ip",                          # 12 lines
@@ -81,6 +80,7 @@ NO_CALLER_BUT_TESTED = {
     # filed in the wrong set by hand, which is what test_the_two_sets_agree_with_the_scan now
     # stops.
     "tools/golden.py::run_trajectory",                              # 64 lines, 4 test refs
+    "bench/skill_use_log.py::compare_runs",                         # 24 lines, 4 test refs
     "relay/lean_capture.py::capture_fn",                            # 10 lines, 7 test refs
     "bridge/session_store.py::compact",                             # 6 test refs
     "relay/selfimprove/episode_record.py::compact",                 # 6 test refs
@@ -95,7 +95,6 @@ NO_CALLER_BUT_TESTED = {
     "tools/coding_ops.py::worktree_add",                            # 29 lines
     "relay/selfimprove/guards.py::classify_outcome",                # 21 lines
     "bench/companionbench/shadow_rules.py::verdict",                # 20 lines
-    "bench/skill_use_log.py::observe",                              # 16 lines
     "tools/env_portability.py::parse_env",                          # 14 lines
     "relay/project_memory.py::entry_authority",                     # 11 lines
     "bench/companionbench/shadow_rules.py::old_verdict",            # 9 lines
@@ -225,7 +224,6 @@ REASONS: dict[str, tuple[str, str]] = {
         ("revealed", "docs/unreached_burndown.md"),
     "bench/companionbench/shadow_rules.py::verdict":
         ("revealed", "docs/unreached_burndown.md"),
-    "bench/skill_use_log.py::observe": ("revealed", "docs/unreached_burndown.md"),
     "tools/env_portability.py::parse_env": ("revealed", "docs/unreached_burndown.md"),
     "relay/project_memory.py::entry_authority": ("revealed", "docs/unreached_burndown.md"),
     "bench/companionbench/shadow_rules.py::old_verdict":
