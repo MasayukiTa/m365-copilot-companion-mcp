@@ -24,6 +24,11 @@ pytest>=9.1.1
 # alone is enough. (Was missing here, which broke a fresh install of the bridge/fleet.)
 playwright>=1.61.0
 pillow>=12.3.0
+# The attachment upload replays the page's own multipart request with only the
+# Authorization header swapped (relay/socket_attachment.py). It was imported and never
+# declared: this machine happened to have it, and a fresh install would have fallen back
+# to a tab for every attachment with nothing saying why.
+requests>=2.32.0
 # Office / COM + OCR helper tools (Windows). Optional: only the outlook_*/pptx_export/ocr_pdf tools
 # need these; pdf2image also needs the Poppler binary on PATH.
 pywin32>=312; sys_platform == "win32"

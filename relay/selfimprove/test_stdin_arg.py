@@ -108,7 +108,7 @@ def test_pending_resolves_it_before_recording(monkeypatch, tmp_path):
 def test_neither_cli_reads_the_flag_without_resolving_it():
     """The pair above would both pass if a THIRD caller of this flag appeared and skipped the
     step -- which is exactly how this happened the first time. Cheap, and it names the rule."""
-    from tools.source_text import code_only
+    from conftest import code_only
 
     here = os.path.dirname(os.path.abspath(__file__))
     for name in ("frozen.py", "pending.py"):

@@ -1,17 +1,23 @@
 # -*- coding: utf-8 -*-
-"""tools/source_text.code_only: 説明文を検査に混ぜない。
+"""conftest.code_only: 説明文を検査に混ぜない。
 
 この関数は「コードについての検査」が**説明で満たされたり弾かれたりしない**ことだけを
-担っている。2026-09-18 に同じクラスの誤検知を1日で4回踏み、4回目は3回目の修正が1つの
-テストファイル内の private ヘルパだったために起きた。だから共有モジュールになり、
-だから**それ自身にテストが要る** — ガードは機能と同じ根拠を必要とする。
+担っている。同じクラスの誤検知を2日で4回踏み、4回目は3回目の修正が1つのテストファイル内の
+private ヘルパだったために起きた。だから1つに集約され、**それ自身にテストが要る** —
+ガードは機能と同じ根拠を必要とする。
+
+置き場所が `tools/` から `conftest.py` へ動いた理由も測定の結果:
+`tools/test_nothing_new_is_built_without_a_caller.py` が
+「non-test コードから一度も参照されていない」と正しく拒否した。呼び出し元は2つとも
+テストで、この関数はソースについての検査にしか使われない。免除を書くのではなく、
+テストだけが使うヘルパをテスト基盤へ移した（スキャナは conftest.py と test_*.py を見ない）。
 """
 from __future__ import annotations
 
 import io
 import os
 
-from tools.source_text import code_only
+from conftest import code_only
 
 
 def _w(tmp_path, text):
@@ -70,7 +76,7 @@ def test_a_file_that_does_not_parse_still_loses_its_comments(tmp_path):
 
 
 def test_it_reads_this_repository_s_real_module():
-    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    here = os.path.dirname(os.path.abspath(__file__))
     out = code_only(os.path.join(here, "relay", "socket_attachment.py"))
     assert "FileBase64" not in out, "本番モジュールの説明文が検査に混ざる"
     assert 'headers["Authorization"] = "Bearer " + token' in out

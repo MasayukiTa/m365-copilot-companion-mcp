@@ -48,12 +48,12 @@ def _observed():
 def _code(path):
     """Source with comments AND docstrings removed, so prose cannot satisfy or trip a check.
 
-    THE IMPLEMENTATION MOVED TO tools/source_text.py. It lived here as a private helper after
+    THE IMPLEMENTATION MOVED TO conftest.code_only. It lived here as a private helper after
     the third substring-versus-prose false positive in one day, and a FOURTH then happened in a
     check written afterwards, in another file, because a discipline that has to be re-derived
     per file gets re-derived wrongly. One implementation, imported.
     """
-    from tools.source_text import code_only
+    from conftest import code_only
 
     return code_only(path)
 
