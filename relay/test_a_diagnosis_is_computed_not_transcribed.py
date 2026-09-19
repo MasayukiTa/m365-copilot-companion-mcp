@@ -118,10 +118,25 @@ def test_the_causes_are_no_longer_written_by_hand():
     assert "diagnose_after_fresh_replay(" in SRC
 
 
-def test_both_settle_paths_go_through_it():
+def test_every_settle_path_goes_through_it():
     """The literal appeared TWICE -- the settle path and the refute-then-settle path -- and a
-    fix that changed one would have left the other transcribing."""
-    assert SRC.count("_apply_diagnosis(") == 4, SRC.count("_apply_diagnosis(")
+    fix that changed one would have left the other transcribing.
+
+    FOUR CALL SITES NOW (plus the definition), AND THE FOURTH IS THE ONE THAT MATTERED.
+    2026-09-19: the three that existed all passed `fresh_was_transient_error=False` as a
+    LITERAL, so two of `diagnose_after_fresh_replay`'s four answers -- TRANSIENT and UNKNOWN
+    -- could not occur in production at all, and `review_resilience.looks_like_transient_error`
+    (written to compute that argument) had no caller anywhere. This file had already found the
+    same defect one level up, in the answers; the arguments were still transcribed.
+
+    The fourth site is not a fourth settle path. It is `_decide`'s wrapper, which observes the
+    transition into a terminal state and covers all EIGHTEEN of the INFRA_STUCK give-ups at
+    once. A line at each of those would have been the defect restated: the nineteenth would be
+    missed exactly as these were.
+    """
+    assert SRC.count("_apply_diagnosis(") == 5, SRC.count("_apply_diagnosis(")
+    assert "fresh_was_transient_error=transient" in SRC, \
+        "the transient argument is a literal again, and two answers just went unreachable"
 
 
 def test_recording_cannot_fail_the_settle_it_describes(monkeypatch):

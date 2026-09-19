@@ -4599,7 +4599,76 @@ class RelayWorker:
         self.status, self.outcome = "stuck", "STUCK"
         self.reason = reason
 
+    #: Terminal outcomes that mean "the infrastructure, not the task". Named rather than
+    #: matched on the word STUCK because `STUCK` alone covers both a worker the agent gave up
+    #: on and a worker the network gave up on, and those are different diagnoses.
+    _INFRA_OUTCOMES = ("INFRA_STUCK",)
+
     def _decide(self, resp, _resume=False):
+        """Decide, then record WHY if this turn ended the worker after a fresh replay.
+
+        A WRAPPER RATHER THAN A LINE AT EACH GIVE-UP, and that is the whole point. The
+        diagnosis used to be applied at three call sites, all of them passing
+        `fresh_was_transient_error=False` as a literal -- so two of
+        `review_resilience.diagnose_after_fresh_replay`'s four answers could not occur at all:
+        TRANSIENT (the fresh conversation died on infrastructure) and UNKNOWN (it died on
+        something this cannot name). `looks_like_transient_error`, the function written to
+        compute that argument, had no caller anywhere in the repository.
+
+        The file has EIGHTEEN places that settle a worker as INFRA_STUCK and more that settle
+        it as STUCK. Adding the call to each is the defect restated: the next one added would
+        be missed exactly as these were, and nothing would say so. `_decide` is the one
+        funnel they all sit inside, so the transition is observed here instead.
+
+        IT DOES NOT RE-READ THE TEXT. `looks_like_transient_error(resp)` would be a THIRD copy
+        of a judgement this file already makes -- relay_fleet has five marker families
+        (transient/agent-dead, tool-unreachable, canned-nonanswer, admin-block, throttle) that
+        overlap with review_resilience.TRANSIENT_MARKERS and diverge from it in both
+        directions. The path that settled the worker already decided, and what it decided is
+        in `outcome`. That is better evidence than matching the same strings a third time.
+        """
+        before = self.status
+        try:
+            return self._decide_impl(resp, _resume=_resume)
+        finally:
+            # A RECORD MUST NOT BE ABLE TO FAIL THE THING IT DESCRIBES -- same contract as
+            # _apply_diagnosis, which this calls into.
+            try:
+                self._diagnose_terminal_give_up(before)
+            except Exception:
+                pass
+
+    def _diagnose_terminal_give_up(self, status_before):
+        """Apply the diagnosis when THIS turn ended a worker that had already replayed fresh.
+
+        Three guards, each excluding something that would make the record wrong rather than
+        merely noisy:
+
+        * `fresh_replay_count` -- with no fresh replay there is no "the identical task in a
+          second conversation", and every answer the diagnosis gives is about that comparison.
+        * `recovery_cause` already set -- the refusal and success paths diagnose themselves
+          with what they know; this must never overwrite a better-informed answer with a
+          weaker one.
+        * the worker was not already terminal -- `_decide` can be re-entered (`_resume`), and
+          a settle that happened on an earlier turn was not caused by this one.
+        """
+        if not getattr(self, "fresh_replay_count", 0):
+            return
+        if getattr(self, "recovery_cause", ""):
+            return
+        if status_before in TERMINAL or self.status not in TERMINAL:
+            return
+        if self.status in ("done", "content_refused"):
+            return          # those paths own their own diagnosis
+        # `transient > 0` is the session's own count of retries it spent believing the failure
+        # would pass. A plain STUCK with none spent was never treated as transient by the code
+        # that settled it, and saying TRANSIENT here would contradict that.
+        transient = (self.outcome in self._INFRA_OUTCOMES
+                     or (self.outcome == "STUCK" and getattr(self, "transient", 0) > 0))
+        self._apply_diagnosis(fresh_was_refusal=False, fresh_succeeded=False,
+                              fresh_was_transient_error=transient)
+
+    def _decide_impl(self, resp, _resume=False):
         # THE TURN CAME BACK, SO THE WINDOW CLOSES. Without this the window stays open and the
         # worker goes on being a candidate for every later event -- and while it is the only
         # worker running, exclusivity would then hold spuriously for as long as the open-window
