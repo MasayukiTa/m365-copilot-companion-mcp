@@ -301,16 +301,6 @@ def verdicts_only(detail) -> dict:
     return {lens: d["verdict"] for lens, d in detail.items()}
 
 
-def all_inconclusive(detail) -> bool:
-    """Every lens looked and said it could not judge. That is an OBSERVATION, not a fault.
-
-    It used to be discarded: the verdict vocabulary had no INCONCLUSIVE, so the collector
-    rounded it to UNCLEAR and `all_unclear` threw the row away as an incomplete panel. A panel
-    where all three reviewers answered honestly was the one shape being deleted.
-    """
-    return bool(detail) and all(d["verdict"] == A.INCONCLUSIVE for d in detail.values())
-
-
 def all_unclear(detail) -> bool:
     return all(d["verdict"] == A.UNCLEAR for d in detail.values())
 
@@ -474,9 +464,22 @@ def collect(*, cdp_url, agent_url, episodes, agent, out_path, lenses=None,
             for episode, style, prompt, reply, grade, is_bad, twin in \
                     known_bad_functional_rows(episodes):
                 detail = run_lenses(cdp_url, agent_url, prompt, reply, lenses)
-                if timed_out_lenses(detail) or all_unclear(detail):
+                # THE SAME DECISION AS THE OTHER TWO SITES, WHICH IT WAS NOT. This asked
+                # `all_unclear(detail)` and threw the row away as an "incomplete panel" --
+                # exactly what `harness_faults` was written to stop, still happening at one of
+                # the three places that make this call. Its docstring: "A CANDIDATE WHERE
+                # EVERY LENS SAID UNCLEAR IS DATA, and an earlier version of this threw it
+                # away. If three reviewers were asked and none produced a verdict, that is a
+                # real property of the candidate -- every policy scores the same on it,
+                # correctly. What cannot be scored is a lens that was never asked."
+                #
+                # A panel is incomplete when a lens could not be ASKED, not when it answered
+                # "I cannot tell". This site could not tell those apart; the other two have
+                # been able to since the sessions started saying why.
+                starved = sorted(set(timed_out_lenses(detail)) | set(harness_faults(detail)))
+                if starved:
                     skipped.append({"candidate_id": twin + ("#bad" if is_bad else "#good"),
-                                    "why": "incomplete panel"})
+                                    "why": "lens(es) could not be asked: %s" % starved})
                     continue
                 rows.append({
                     "candidate_id": "%s#%s" % (twin, "bad" if is_bad else "good"),

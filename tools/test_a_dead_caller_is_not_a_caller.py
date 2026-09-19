@@ -190,11 +190,25 @@ def test_it_reaches_a_fixed_point_well_inside_the_bound():
     assert len(rows) > 80, "the iteration is reporting no more than a single pass did"
 
 
-def test_the_three_confirmed_subgraphs_are_reported():
+def test_the_confirmed_subgraphs_that_are_still_dead_are_reported():
     """PINNED BY NAME, because each was found by hand and each would go quiet again if the
-    iteration were removed."""
+    iteration were removed.
+
+    `bench/skill_use_log.py::observe` WAS THE THIRD AND IS NOT PINNED ANY MORE, because it is
+    no longer an example of anything. It was reachable only from `compare_runs`, which nothing
+    called; on 2026-09-19 it gained a live caller (`report`, the reader that log had gone
+    three weeks without) and the scan correctly stopped reporting it. Holding a fixed instance
+    in a list of expected findings is the same defect the encoding inventory was caught with
+    the same day: an entry that was paid keeps reading as the current state.
+
+    WHAT IS PINNED IS THE MECHANISM, NOT THE CENSUS. Two genuinely dead subgraphs remain and
+    they still exercise it. If both are ever fixed, the honest move is another live example or
+    a constructed one -- not keeping these names after they stop being true.
+    """
     rows = {r[0] for r in U.scan()}
     for name in ("tools/coding_ops.py::worktree_add",
-                 "tools/coding_ops.py::worktree_remove",
-                 "bench/skill_use_log.py::observe"):
+                 "tools/coding_ops.py::worktree_remove"):
         assert name in rows, "%s is hidden behind its dead caller again" % name
+    assert "bench/skill_use_log.py::observe" not in rows, (
+        "observe is unreached again -- `report` was the caller that took it off this list, "
+        "and a pin that silently comes back true is not evidence")

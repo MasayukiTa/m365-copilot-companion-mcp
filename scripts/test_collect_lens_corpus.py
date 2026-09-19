@@ -112,7 +112,14 @@ def test_the_reason_is_kept_so_a_silent_lens_can_be_told_from_an_unsure_one():
     assert "verdict, _reason = got" not in src, "reason を捨てると診断が消える"
 
 
-def test_an_all_silent_panel_becomes_a_skip_not_a_row():
+def test_all_unclear_still_reports_what_it_reports():
+    """**名前が古い設計のまま残っていた。** 元は
+    `test_an_all_silent_panel_becomes_a_skip_not_a_row` — 全員が黙った盤は捨てる、という
+    主張。**すぐ下の `test_a_candidate_every_lens_found_unclear_is_kept` が正反対を言う。**
+    本体は述語しか触っていないので、設計が逆になっても緑のままだった: 名前が判断を
+    主張し、本体は主張していなかった。
+
+    述語自体は生きている（`harness_faults` の入力の一部）ので、述語の性質として残す。"""
     detail = {"correctness": {"verdict": "UNCLEAR", "reason": ""},
               "edge": {"verdict": "UNCLEAR", "reason": ""},
               "security": {"verdict": "UNCLEAR", "reason": ""}}
@@ -212,3 +219,49 @@ def test_every_exit_from_a_candidate_releases_its_workdir():
     body = src[src.index("def collect("):src.index("def load_corpus(")]
     i = body.index("shutil.rmtree(workdir")
     assert "finally:" in body[:i], "finally を通らない片付けになっている"
+
+
+# ---- 同じ判断が3箇所にあり、1箇所だけ古い規則のままだった ----------------------------------------
+
+def test_no_site_throws_a_row_away_merely_because_every_lens_was_unsure():
+    """**`harness_faults` が止めるために書かれたことが、3箇所のうち1箇所でまだ起きていた。**
+
+    その docstring は明示している: 「全レンズが UNCLEAR の候補はデータであり、以前の版は
+    それを捨てていた。3本とも聞かれて誰も評決を出せなかったなら、それは候補の性質で、
+    どの方策も同じ点になるのが正しい。点をつけられないのは**聞かれなかった**レンズのほう」。
+
+    それでも calibrate 側の分岐は `timed_out_lenses(detail) or all_unclear(detail)` で
+    「incomplete panel」として捨てていた。**盤が不完全なのはレンズを聞けなかったときで、
+    レンズが「判断できない」と答えたときではない。** 他の2箇所は sessions が理由を書く
+    ようになった時点でこれを区別できるようになっており、ここだけ取り残されていた。
+
+    実行テストにはできない（CDP とブラウザが要る）ので、判断の形をソースで押さえる。
+    このファイルは既に同じ手を使っている（`test_the_reason_is_kept_...`）。
+    """
+    src = Path(CL.__file__).read_text(encoding="utf-8")
+    assert "or all_unclear(detail)" not in src, \
+        "a row is being skipped because every lens was unsure, not because one was unasked"
+    # 3箇所すべてが同じ規則を使っている
+    assert src.count(
+        "starved = sorted(set(timed_out_lenses(detail)) | set(harness_faults(detail)))") == 3, \
+        "the three keep/discard sites no longer make the same decision the same way"
+
+
+def test_the_skip_reason_names_the_lens_that_could_not_be_asked():
+    """「incomplete panel」は、どのレンズがなぜ落ちたのかを読み手から隠す。
+    他の2箇所は最初から名前を書いていた。"""
+    src = Path(CL.__file__).read_text(encoding="utf-8")
+    assert '"why": "incomplete panel"' not in src
+    assert src.count('"why": "lens(es) could not be asked: %s" % starved') == 2
+
+
+def test_all_inconclusive_is_gone_rather_than_sitting_unwired():
+    """**撤去であって、配線し忘れではない。** その docstring は「以前は捨てられていた:
+    語彙に INCONCLUSIVE が無く UNCLEAR に丸められ、`all_unclear` が不完全な盤として
+    行を捨てていた」と、既に直った欠陥を説明していた。語彙には INCONCLUSIVE があり、
+    捨てる判断は `harness_faults` が答える。
+
+    **満たされ済みの目的を述べる述語を残すと、守りがそこに在ると読まれる。** 実際には
+    別の場所にある。`bridge/session_store.py::latest_attached` を「配線されていない関数」
+    として残さず消したのと同じ判断。"""
+    assert not hasattr(CL, "all_inconclusive")
