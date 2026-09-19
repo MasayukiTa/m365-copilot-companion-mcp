@@ -26,6 +26,11 @@ import shutil
 import sys
 from typing import Iterable
 
+# Relative: this module is run as `python -m relay.selfimprove.frozen` and imported as
+# part of the package, and an absolute import here would need the repo root on sys.path
+# in both cases.
+from . import stdin_arg as _stdin_arg
+
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Repo-relative paths that form the frozen judge / constitution. Missing files at runtime are not an
@@ -815,8 +820,18 @@ def _main(argv: list[str] | None = None) -> int:
                          "missing was why and on whose decision")
     ap.add_argument("--authorization", default="",
                     help="the operator's instruction, quoted verbatim, that specified this "
-                         "act. A paraphrase is the actor's own reading of its mandate")
+                         "act. A paraphrase is the actor's own reading of its mandate. "
+                         + _stdin_arg.help_suffix())
     args = ap.parse_args(argv)
+
+    # THE "-" CONVENTION, WHICH THIS FILE TOOK THE FLAG FOR AND NEVER IMPLEMENTED.
+    # relay/selfimprove/pending.py had it and documented it as "how the dashboard passes
+    # it"; the dashboard calls BOTH the same way. So every re-signing made from the
+    # dashboard wrote the literal string "-" into the ledger as the operator's
+    # authorisation -- a real approval, recorded as a placeholder, in the one field this
+    # ledger exists to hold. It was visible on screen as a chip reading "-" and read by
+    # nobody as the absence it was.
+    args.authorization = _stdin_arg.resolve(args.authorization)
 
     if args.revoke:
         try:

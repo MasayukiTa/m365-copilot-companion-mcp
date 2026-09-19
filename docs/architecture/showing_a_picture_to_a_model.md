@@ -170,6 +170,34 @@ So all three questions that kept attachments on a tab are measured:
 everything, and the call stays ahead of every version because **the ordering is the asset**: a
 structural veto found later must bind versions that already exist, including evolved ones.
 
+### Retiring the rule changed nothing, because the rule existed twice
+
+The commit that retired `ATTACHMENT` was measured afterwards and **the fleet still opened a tab
+for every attachment.** The same rule had a second, independent copy — `if self.upload_path:
+return False` at the top of `ResearchSession._try_socket` in `relay/agent_profiles.py` — and that
+is the one the fleet actually consults. A policy module can only decide what somebody asks it.
+
+This is the day's own failure mode applied to a fix: something success-shaped (a retired rule, a
+green suite, a routing decision that now reads "socket") hiding a behaviour that had not moved.
+The wiring is what makes it real:
+
+- `relay/socket_attachment.annotation_for(context, agent_url, upload_path, token)` opens a page,
+  lets **the page** make its own `UploadFile` request, captures the bytes and headers, re-issues
+  them with our token, and returns the `messageAnnotations` list. Captured, never rebuilt — a
+  probe that reconstructed that request returned three 403s in one afternoon that were each
+  reported as an answer about the credential.
+- `SocketRoute.token_for(agent_url)` hands over the bearer the route already holds. `driver_for`
+  gives the *conversation* a supplier rather than a token, because a refresh mid-goal must reach
+  a running conversation; an upload is one request made once, so it takes the value.
+- `_try_socket` calls it **after** the route has a token and **before** the turn goes out, and
+  **returns False when it comes back empty** — the tab path then runs as it always did. Sending
+  the question without the file would reintroduce the exact failure the tab path already names:
+  *an instruction about a file that is not there comes back as a confident answer about nothing.*
+
+The test that pinned the old rule (`test_the_analyst_never_asks_for_a_socket`) is **re-pointed,
+not deleted**: a test that fixes a retired rule is the only thing that would notice the rule
+coming back.
+
 **The annotation was added to the CAPTURED template, not composed into a frame.** That
 distinction is the whole reason it worked — this protocol rejects a composed frame and accepts
 the client's own, which `relay/chathub.py` had already measured on 2026-08-20.

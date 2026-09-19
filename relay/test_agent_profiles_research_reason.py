@@ -333,10 +333,12 @@ class _FakeDrv:
         self.failed = ""
         self.closed = False
         self.sent = []
+        self.annotations = []
         self._count_before = 0
 
-    def send(self, text, **_kw):
+    def send(self, text, annotations=None, **_kw):
         self.sent.append(text)
+        self.annotations.append(annotations)
 
     def _answers(self):
         return types.SimpleNamespace(count=lambda: len(self.sent))
@@ -369,6 +371,9 @@ class _Route:
         self.asked.append({"agent_url": agent_url, "model": model,
                            "turn_timeout_s": turn_timeout_s})
         return self.driver
+
+    def token_for(self, url=None):
+        return "tok-abc"
 
     def note_failure(self, why):
         self.failures.append(why)
@@ -409,13 +414,93 @@ def test_it_asks_for_its_own_agent_and_its_own_model(monkeypatch):
     assert asked["turn_timeout_s"] == 617.0, "socket が予算を独り占めしている"
 
 
-def test_the_analyst_never_asks_for_a_socket(monkeypatch):
-    """アップロードは <input type=file> に入る。socket に置き場は無い。"""
-    route = _Route(driver=_FakeDrv())
+def test_the_analyst_now_takes_a_socket_and_the_file_rides_with_it(monkeypatch):
+    """この関数は「アップロードがあるなら socket は無い」を固定していた。
+
+    その前提は 2026-09-18 に反証された（バイト列は UploadFile へ、id は
+    messageAnnotations で socket に乗る）。**消さずに向きを変える**: 退場した規則を
+    固定していたテストを削ると、逆向きに戻ったときに誰も気づかない。
+
+    同じ規則が transport_policy にも居て、そちらだけ引退させても**挙動は1ミリも
+    変わらなかった** -- 決めていたのはこちらだったため。だからここで測る。"""
+    drv = _FakeDrv()
+    route = _Route(driver=drv)
+    import relay.socket_attachment as SA
+    seen = {}
+
+    def _ann(ctx, url, path, token, log=None):
+        seen.update({"url": url, "path": path, "token": token})
+        return [{"id": "doc-1"}]
+
+    monkeypatch.setattr(SA, "annotation_for", _ann)
+    monkeypatch.setattr(AP, "open_agent",
+                        lambda *a, **k: pytest.fail("タブを開いてはならない"))
+    s = _session_for_socket(route, monkeypatch, upload_path=r"C:\d.csv")
+    assert s._try_socket() is True
+    assert s.socket is True and s.page is None
+    assert drv.annotations == [[{"id": "doc-1"}]], "ファイルを置き去りにして送った"
+    # トークンは経路が持っているものであること。別口で取りに行くと、経路が更新
+    # されたあとに古い資格情報でアップロードしにいく。
+    assert seen["token"] == "tok-abc"
+    assert seen["path"] == r"C:\d.csv"
+
+
+def test_an_upload_that_fails_falls_back_to_a_tab_and_sends_nothing(monkeypatch):
+    """届かなかったファイルについての質問は、何も無いことについての自信ある答えで
+    返ってくる -- タブ側の実装が既に名指ししている故障。socket 側でそれを再導入
+    しないことを固定する。注釈が無いなら、ターンは出さずにタブへ降りる。"""
+    drv = _FakeDrv()
+    route = _Route(driver=drv)
+    import relay.socket_attachment as SA
+    monkeypatch.setattr(SA, "annotation_for", lambda *a, **k: None)
     s = _session_for_socket(route, monkeypatch, upload_path=r"C:\d.csv")
     assert s._try_socket() is False
-    assert route.asked == [], "そもそも尋ねてもいけない"
-    assert s.socket is False
+    assert drv.sent == [], "ファイル無しで質問だけ送ってはならない"
+    assert s.socket is False and s._pending_open is True
+
+
+def test_which_transport_carried_the_turn_survives_the_session_ending(monkeypatch):
+    """`socket` は終わったあとの問いに答えられない。close() が False にしてページも捨てる
+    ので、**socket で終わった走行とタブで終わった走行が見分けられなくなる**。
+
+    実際にそれで誤読した: プローブが `_finish()` のあとに socket/page を読み、「配線は
+    効いていない」と報告した。同じ走行のログにはアップロード成功と、画像にしか無い語句を
+    読み返した返信が出ていた。壊れていたのは計器のほうだった。"""
+    drv = _FakeDrv()
+    route = _Route(driver=drv)
+    s = _session_for_socket(route, monkeypatch)
+    assert s.transport == "", "送る前から経路を名乗っている"
+    assert s._try_socket() is True
+    assert s.transport == "socket"
+    s.close()
+    assert s.socket is False, "close() の挙動そのものは変えていない"
+    assert s.transport == "socket", "終わった途端に経路が分からなくなった"
+
+
+def test_a_tab_says_so_too(monkeypatch):
+    """片方だけ記録すると、空文字が「タブ」と「一度も送っていない」の両方を意味する。"""
+    import types as _t
+
+    s = AP.ResearchSession(object(), "しらべて")
+    s.page = _t.SimpleNamespace(close=lambda: None)
+    monkeypatch.setattr(AP, "open_agent", lambda *a, **k: True)
+    monkeypatch.setattr(AP, "set_model", lambda *a, **k: None)
+    drv = _FakeDrv()
+    import relay.copilot_autopilot_relay as CAR
+    monkeypatch.setattr(CAR, "CopilotWebDriver", lambda page: drv)
+    s.context = _t.SimpleNamespace(new_page=lambda: s.page)
+    s._do_open()
+    assert s.transport == "tab", "タブで送ったのに経路が空のまま"
+
+
+def test_a_task_without_a_file_never_touches_the_upload_path(monkeypatch):
+    """添付の無い仕事にアップロードを走らせると、実タブ1枚と数十秒を毎回払う。"""
+    route = _Route(driver=_FakeDrv())
+    import relay.socket_attachment as SA
+    monkeypatch.setattr(SA, "annotation_for",
+                        lambda *a, **k: pytest.fail("添付が無いのに上げに行った"))
+    s = _session_for_socket(route, monkeypatch)
+    assert s._try_socket() is True
 
 
 def test_a_route_that_offers_nothing_falls_through_to_the_tab(monkeypatch):

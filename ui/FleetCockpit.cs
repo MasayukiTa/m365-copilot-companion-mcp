@@ -1086,7 +1086,19 @@ class CockpitWindow : Window
     enum HealthState { Gray = 0, Green = 1, Yellow = 2, Red = 3, Checking = 4 }
     class DotState { public HealthState State = HealthState.Gray; public string Detail = ""; public DateTime Checked = DateTime.MinValue; }
     // Index map: 0=server 1=tunnel 2=edge 3=signin 4=agent 5=tool(bridge probe).
-    readonly DotState[] _health = { new DotState(), new DotState(), new DotState(), new DotState(), new DotState(), new DotState() };
+    // SIZED BY THE COUNT, never by however many literals somebody typed. This was six
+    // `new DotState()` in a row. Adding a seventh dot compiled cleanly, and the first
+    // poll threw IndexOutOfRange from SetDot(6, ...) -- which took the whole window down
+    // at startup, so the cockpit did not appear at all and the exit code was the only
+    // evidence. A length kept in step by hand is one that will eventually not be.
+    readonly DotState[] _health = NewDotStates();
+
+    static DotState[] NewDotStates()
+    {
+        var a = new DotState[HEALTH_DOT_COUNT];
+        for (int i = 0; i < a.Length; i++) a[i] = new DotState();
+        return a;
+    }
     readonly object _healthLock = new object();
     // The last /health body, captured by the Server dot's poll so dot 5 can read the FLEET
     // tool path from it without a second HTTP round trip. Empty until the first successful
@@ -1101,7 +1113,13 @@ class CockpitWindow : Window
     //: and two do.
     static double _lastHealthBodyAt = 0;
     const double HEALTH_BODY_MAX_AGE_S = 60;
-    const int HEALTH_DOT_COUNT = 6;
+    // SEVEN. The seventh is the frozen set, and it is here rather than only on the
+    // self-improvement dashboard because of what happened without it: the set went adrift,
+    // the self-improvement loop could not run, and the only places that said so were a card
+    // at the bottom of a window somebody had to open and scroll, and a failing test. The
+    // operator went looking for it and could not find it. A fact that stops the system has
+    // to be where people already look.
+    const int HEALTH_DOT_COUNT = 7;
     Border[] _healthDot;           // the 6 colored dots (re-tinted by ApplyHealthToUi)
     FrameworkElement[] _healthSpin;  // rotating in-progress marks, shown instead of a stale color
     TextBlock[] _healthLbl;        // the 6 labels (re-textable on language toggle)
@@ -1544,6 +1562,18 @@ class CockpitWindow : Window
         // ── 6th health dot "Tool": bridge self-probe (.fleet/tool_probe.json), see the class-field
         // comment near HEALTH_DOT_COUNT for what this axis covers and why it's separate from Agent.
         if (k == "hs_tool") return ja ? "ツール" : "Tool";
+        if (k == "hs_frozen") return ja ? "凍結セット" : "Frozen set";
+        if (k == "hs_frozen_ok") return ja
+            ? "判定器は承認済みの内容と一致しています。自己改善ループは走れます。"
+            : "The judge matches what was approved. The self-improvement loop can run.";
+        if (k == "hs_frozen_drift") return ja
+            ? "凍結セットが承認済みの内容と違います。自己改善ループは走りません。クリックで自己改善ダッシュボードを開き、そこで再署名できます: "
+            : "The frozen set differs from what was approved, so the self-improvement loop will not run. Click to open the dashboard and re-sign there: ";
+        if (k == "hs_frozen_none") return ja
+            ? "基準ファイルがありません。照合できていないので、一致しているとは言えません。"
+            : "No baseline on disk. Nothing has been compared, so nothing can be called intact.";
+        if (k == "hs_frozen_hint") return ja ? "クリックで自己改善ダッシュボードを開く"
+                                             : "Click to open the self-improvement dashboard";
         if (k == "hs_tool_detail_ok") return ja ? "ツール呼び出し確認 OK" : "tool call confirmed OK";
         if (k == "hs_tool_detail_consent") return ja ? "consent待ち（再接続で解消可）" : "consent pending (reconnect can clear this)";
         if (k == "hs_tool_detail_down") return ja ? "応答なし(再接続が必要)" : "no response (reconnect needed)";
@@ -2289,7 +2319,7 @@ class CockpitWindow : Window
         var row = new StackPanel { Orientation = Orientation.Horizontal,
                                    HorizontalAlignment = HorizontalAlignment.Left,
                                    VerticalAlignment = VerticalAlignment.Center };
-        string[] keys = { "hs_server", "hs_tunnel", "hs_edge", "hs_signin", "hs_agent", "hs_tool" };
+        string[] keys = { "hs_server", "hs_tunnel", "hs_edge", "hs_signin", "hs_agent", "hs_tool", "hs_frozen" };
         for (int i = 0; i < HEALTH_DOT_COUNT; i++)
         {
             var wrap = new Border();
@@ -2314,6 +2344,19 @@ class CockpitWindow : Window
             _healthSpin[i] = spin;
             _healthLbl[i] = lbl;
             _healthDotWrap[i] = wrap;
+            // THE DOT IS THE DOOR. The thing it reports on is acted upon in a window that
+            // had to be found first; a dot that names a problem and cannot be followed is
+            // half a report. Only this one, because the other six have no single window to
+            // send anybody to and inventing one per dot would be guessing.
+            if (keys[i] == "hs_frozen")
+            {
+                wrap.Cursor = Cursors.Hand;
+                wrap.Background = Brushes.Transparent;   // else the hit test misses the gaps
+                wrap.MouseLeftButtonUp += delegate
+                {
+                    try { new SelfImproveDashboardWindow().Show(); } catch (Exception) { }
+                };
+            }
             row.Children.Add(wrap);
         }
 
@@ -2435,14 +2478,29 @@ class CockpitWindow : Window
             }
             if (_healthSpin != null && _healthSpin[i] != null)
                 _healthSpin[i].Visibility = checking ? Visibility.Visible : Visibility.Collapsed;
-            if (snap[i].State == HealthState.Red || snap[i].State == HealthState.Yellow) anyBad = true;
+            // THE FIX PILL SPEAKS FOR THE DOTS IT CAN ACT ON, AND THE FROZEN SET IS NOT
+            // ONE OF THEM. RunFix restarts processes; a frozen set that differs is waiting
+            // for a person to approve a change, and no restart will ever alter that. Left
+            // in, the pill appeared the moment this dot went amber and its button did
+            // nothing at all -- RunFix reads dots 0..5, so the target mask came out 0 and
+            // the remedy chain fell through every branch. An offer to fix that fixes
+            // nothing is worse than no offer: it spends the one action a person trusts.
+            // This dot carries its own way forward -- click it and the dashboard opens.
+            if (_healthKeys[i] != "hs_frozen"
+                && (snap[i].State == HealthState.Red || snap[i].State == HealthState.Yellow))
+                anyBad = true;
             if (_healthDotWrap[i] != null)
             {
                 string when = snap[i].Checked == DateTime.MinValue
                     ? T("hs_never")
                     : snap[i].Checked.ToLocalTime().ToString("HH:mm:ss");
                 string detail = string.IsNullOrEmpty(snap[i].Detail) ? T("hs_checking") : snap[i].Detail;
-                _healthDotWrap[i].ToolTip = T(_healthKeys[i]) + ": " + detail + "\n" + T("hs_lastcheck") + when;
+                // The one dot that goes somewhere says so on hover. ApplyHealthToUi
+                // rewrites every tooltip each pass, so setting it once at construction
+                // would have been silently thrown away.
+                _healthDotWrap[i].ToolTip = T(_healthKeys[i]) + ": " + detail + "\n"
+                    + T("hs_lastcheck") + when
+                    + (_healthKeys[i] == "hs_frozen" ? "\n" + T("hs_frozen_hint") : "");
             }
         }
         if (_fixBtn != null)
@@ -2460,7 +2518,7 @@ class CockpitWindow : Window
         if (!anyBad && !_fixRunning && _fixNote != null && _fixNote.Text.Length > 0)
             _fixNote.Text = "";
     }
-    static readonly string[] _healthKeys = { "hs_server", "hs_tunnel", "hs_edge", "hs_signin", "hs_agent", "hs_tool" };
+    static readonly string[] _healthKeys = { "hs_server", "hs_tunnel", "hs_edge", "hs_signin", "hs_agent", "hs_tool", "hs_frozen" };
 
     // Start (once) the background poll thread. Re-entrant-safe: only spawns if not already alive.
     // BuildChrome (and RebuildChrome) call this; a language flip rebuilds chrome but the thread keeps
@@ -2738,6 +2796,36 @@ class CockpitWindow : Window
         //      and audience, the agent the template names, and whether the capture worked.
         //      Never the token: an expiry and an audience grant nothing on their own.
         UpdateCaptureDots(now);
+
+        // 6) Frozen set. Computed HERE, from the baseline json and the files on disk, by the
+        //    same method the dashboard uses -- shared rather than reimplemented, because two
+        //    implementations of one comparison disagreeing is worse than one of them not
+        //    existing.
+        //
+        //    GREEN IS NOT THE NORMAL STATE BY CONSTRUCTION HERE, and that matters: the last
+        //    dot added to this strip was amber whenever the running server was behind the
+        //    checkout, which on a machine where an agent edits code all day is nearly always,
+        //    and a colour that is on in the normal working state teaches its reader to clear
+        //    it. This one is amber only while an approval is genuinely owed: the loop re-signs
+        //    as part of its own cycle, so a matching set IS the resting state.
+        try
+        {
+            int nFrozen; List<string> drift; bool anchorOk;
+            bool ok = SelfImproveDashboardWindow.FrozenMatches(out nFrozen, out drift,
+                                                               out anchorOk);
+            if (ok)
+                SetDot(6, HealthState.Green, T("hs_frozen_ok") + " (" + nFrozen + ")", now);
+            else if (drift.Count == 1 && drift[0] == "NO_BASELINE")
+                // NOT GREY. Grey means "no evidence expected", and a missing baseline is
+                // evidence that is expected and absent -- the failure mode where a check
+                // reports intact because it compared nothing.
+                SetDot(6, HealthState.Red, T("hs_frozen_none"), now);
+            else
+                SetDot(6, HealthState.Yellow,
+                       T("hs_frozen_drift") + string.Join(", ", drift.ToArray()), now);
+        }
+        catch (Exception) { SetDot(6, HealthState.Gray, T("hs_frozen_none"), now); }
+
         MaybeAutoFix();
         PublishHealthStrip();
     }

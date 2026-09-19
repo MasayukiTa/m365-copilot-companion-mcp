@@ -137,6 +137,13 @@ TAB, SOCKET = "tab", "socket"
 #:
 #: A rule whose premise has been measured false is not made safer by leaving it in place; it
 #: is a routing decision nobody can explain. So an attachment no longer forces a tab.
+#:
+#: AND RETIRING IT HERE CHANGED NOTHING, WHICH IS THE PART WORTH REMEMBERING. The same rule
+#: existed a second time, as `if self.upload_path: return False` inside ResearchSession.
+#: _try_socket, and THAT is what the fleet consults -- this module can only decide what
+#: somebody asks it. The commit that retired the rule here was measured afterwards and the
+#: fleet still opened a tab for every attachment. A policy module is not where behaviour
+#: lives; if a rule is removed here, the callers must be swept for a private copy of it.
 ATTACHMENT = "attachment: retired -- a socket carries one (measured 2026-09-18)"
 
 

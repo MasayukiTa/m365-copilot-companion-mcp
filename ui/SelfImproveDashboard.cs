@@ -192,6 +192,23 @@ class SelfImproveDashboardWindow : Window
             : "Revoked. The frozen set differing now is the expected state.";
         if (k == "auth_revoke_no") return ja ? "取り消せませんでした" : "Could not revoke";
         if (k == "auth_nothing")  return ja ? "取り消せる再署名がありません" : "No re-signing to withdraw";
+        // THE ACT, not a command to go and run elsewhere. See BuildAuthority.
+        if (k == "auth_resign")   return ja ? "ここで再署名する" : "Re-sign here";
+        if (k == "auth_resign_t") return ja ? "凍結セットを今の内容で承認する"
+                                            : "Approve the frozen set as it now stands";
+        if (k == "auth_resign_why") return ja
+            ? "凍結セットが不一致の間、自己改善ループは走れません。今の内容でよければ"
+              + "ここで再署名できます。あなたが書いた文がそのまま台帳に残ります。"
+              + "取り消しは下の「記録と取り消し」から。"
+            : "While the frozen set differs the self-improvement loop cannot run. If the "
+              + "files are right as they stand, re-sign here; what you write is kept in the "
+              + "ledger word for word. The undo is under Records and undo, below.";
+        if (k == "auth_r1")       return ja
+            ? "この変更は意図したもの。今の内容で承認する。"
+            : "This change was intended. Approve the set as it stands.";
+        if (k == "auth_r2")       return ja
+            ? "内容を確認した。判定器の守りは変わっていないので承認する。"
+            : "I have read the change; it does not weaken the judge. Approve.";
 
         // no-data friendly message
         if (k == "nodata_title") return ja ? "まだデータがありません" : "No data yet";
@@ -942,7 +959,15 @@ class SelfImproveDashboardWindow : Window
     }
 
     // the frozen set, recomputed here from the baseline json and the files on disk
-    bool FrozenMatches(out int checkedCount, out List<string> differing, out bool anchorOk)
+    //
+    // STATIC ON PURPOSE. The cockpit publishes the always-visible health strip and has no
+    // dashboard window to ask; before this, the only place the frozen set was ever compared
+    // was inside a card at the bottom of a window somebody had to open. A second
+    // implementation over there would be a second thing to keep in step, and the two
+    // disagreeing is worse than neither existing. The only instance member it used was a
+    // stateless serializer.
+    internal static bool FrozenMatches(out int checkedCount, out List<string> differing,
+                              out bool anchorOk)
     {
         checkedCount = 0; differing = new List<string>(); anchorOk = false;
         try
@@ -950,8 +975,8 @@ class SelfImproveDashboardWindow : Window
             string root = RepoRoot();
             string bp = Path.Combine(root, "relay", "selfimprove", "frozen_baseline.json");
             if (!File.Exists(bp)) { differing.Add("NO_BASELINE"); return false; }
-            var doc = (Dictionary<string, object>)_js.DeserializeObject(
-                File.ReadAllText(bp, Encoding.UTF8));
+            var doc = (Dictionary<string, object>)(new JavaScriptSerializer()
+                .DeserializeObject(File.ReadAllText(bp, Encoding.UTF8)));
             object sumsObj; doc.TryGetValue("checksums", out sumsObj);
             var sums = sumsObj as Dictionary<string, object>;
             if (sums == null) { differing.Add("NO_CHECKSUMS"); return false; }
@@ -1042,6 +1067,68 @@ class SelfImproveDashboardWindow : Window
             okLine.TextWrapping = TextWrapping.Wrap;
             okLine.Margin = new Thickness(0, head.Children.Count > 0 ? 8 : 10, 0, 0);
             col.Children.Add(okLine);
+        }
+
+        // -- AND SOMEWHERE TO ACT, right under the chip that says something is wrong.
+        //
+        //    The pending card learned this once already, in its own comment: "a card that only
+        //    offers copy states that a decision is waiting without offering anywhere to make
+        //    it". This card said the frozen set was adrift and offered nothing at all, so every
+        //    re-signing went through a terminal -- and an approval made in a terminal is not on
+        //    the screen that exists to hold approvals. That is how the operator came to be
+        //    looking for this and not finding it.
+        //
+        //    IT IS NOT A SHORTCUT. It runs the same CLI with the same flags, so a re-signing
+        //    that reaches the files the standing delegation excludes is refused here exactly as
+        //    it is from a shell, and the refusal is shown rather than swallowed.
+        //
+        //    Rendered only when the set differs: there is nothing to press in the normal state,
+        //    and a button that is always there is one more thing to read past.
+        if (!intact)
+        {
+            var why = MuteRow(T("auth_resign_why"));
+            why.Margin = new Thickness(0, 12, 0, 0);
+            col.Children.Add(why);
+
+            string files  = string.Join(", ", differing.ToArray());
+            string theCmd = "python -m relay.selfimprove.frozen --snapshot --force"
+                          + " --reason \"" + files.Replace("\"", "'") + "\""
+                          + " --authorization \"" + (_lang == 0 ? "<あなたの言葉>" : "<your words>") + "\"";
+
+            var acts = new StackPanel();
+            acts.Orientation = Orientation.Horizontal;
+            acts.Margin = new Thickness(0, 8, 0, 0);
+
+            var go = new Button();
+            go.Content = T("auth_resign");
+            go.Padding = new Thickness(16, 5, 16, 5);
+            go.Margin  = new Thickness(0, 0, 8, 0);
+            string theFiles = files;
+            go.Click += delegate
+            {
+                string kind;
+                string said = AskForDecision(T("auth_resign_t"),
+                                             new string[] { T("auth_r1"), T("auth_r2") },
+                                             out kind);
+                if (said == null) return;              // closed, nothing done
+                CarryOutFrozenResign("re-signed on the dashboard: " + theFiles, said);
+                ForceRender();
+            };
+            acts.Children.Add(go);
+
+            // The command stays as the second way in. Somebody working from a shell, or on a
+            // machine where this window will not open, still needs the line.
+            var cp = new Button();
+            cp.Content = T("pending_copy");
+            cp.Padding = new Thickness(12, 5, 12, 5);
+            var cpRef = cp; string cmdRef = theCmd;
+            cp.Click += delegate
+            {
+                try { Clipboard.SetText(cmdRef); cpRef.Content = T("pending_copied"); }
+                catch (Exception) { }
+            };
+            acts.Children.Add(cp);
+            col.Children.Add(acts);
         }
 
         var toggle = new TextBlock();
@@ -2021,7 +2108,12 @@ class SelfImproveDashboardWindow : Window
     // standing delegation excludes is refused exactly as it is from a shell -- and the refusal
     // is shown rather than swallowed, because an approval that silently did nothing is the
     // failure this whole change is about.
-    void CarryOutFrozenResign(string pid, string words)
+    // TAKES THE REASON, NOT AN ID. It was written for the pending card, where the id WAS
+    // the reason ("decision <pid>"). The authority card has no card and no id -- the
+    // frozen set is simply adrift -- and a helper that can only name a queue row is a
+    // helper only that queue can use, which is why re-signing anything else still meant a
+    // terminal.
+    void CarryOutFrozenResign(string reasonText, string words)
     {
         try
         {
@@ -2032,8 +2124,11 @@ class SelfImproveDashboardWindow : Window
             // --authorization - reads the words from stdin, for the same reason RecordDecision
             // does: quoting them into argv mangled quotes and broke on newlines, and these are
             // the words a ledger promises are unaltered.
+            // The reason is quoted into argv, so a quote inside it would end the argument
+            // early and hand the rest to the parser as flags. The WORDS never go this way --
+            // they are read from stdin, unaltered, because the ledger promises that.
             psi.Arguments = "-m relay.selfimprove.frozen --snapshot --force"
-                          + " --reason \"approved on the dashboard (decision " + pid + ")\""
+                          + " --reason \"" + (reasonText ?? "").Replace("\"", "'") + "\""
                           + " --authorization -";
             psi.RedirectStandardInput  = true;
             psi.WorkingDirectory       = root;
@@ -2254,7 +2349,9 @@ class SelfImproveDashboardWindow : Window
                     // the Skill approvals are. The words they just typed are the
                     // authorization, so the ledger quotes the person who decided rather than
                     // a second invocation nobody recorded.
-                    if (theAction == "frozen_resign") CarryOutFrozenResign(theId, said);
+                    if (theAction == "frozen_resign")
+                        CarryOutFrozenResign("approved on the dashboard (decision "
+                                             + theId + ")", said);
                     ForceRender();
                 };
                 actions.Children.Add(yes);

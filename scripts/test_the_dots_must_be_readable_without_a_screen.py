@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import os
 import sys
 
@@ -133,13 +134,64 @@ def test_the_cockpit_actually_publishes_it():
     assert "PublishHealthStrip();" in body, "defined but never called from the sweep"
 
 
+def _cockpit_source():
+    return io.open(os.path.join(REPO, "ui", "FleetCockpit.cs"),
+                   encoding="utf-8-sig", errors="replace").read()
+
+
+def _declared_dot_count(body):
+    m = re.search(r"const int HEALTH_DOT_COUNT = (\d+);", body)
+    assert m, "HEALTH_DOT_COUNT is gone; this test no longer knows what to expect"
+    return int(m.group(1))
+
+
+def _declared_keys(body):
+    m = re.search(r"_healthKeys = \{([^}]*)\}", body)
+    assert m, "_healthKeys is gone"
+    return re.findall(r'"([^"]+)"', m.group(1))
+
+
+def test_the_count_and_the_names_agree_in_the_source():
+    """THE SIZES MUST COME FROM ONE PLACE. Adding a seventh dot compiled cleanly and threw
+    IndexOutOfRange on the first poll, because the DotState array was six `new DotState()` in a
+    row while the count said seven -- and the whole window died at startup, so the symptom was
+    an exit code and an empty desktop. Nothing in the build could have caught it; this can."""
+    body = _cockpit_source()
+    n = _declared_dot_count(body)
+    keys = _declared_keys(body)
+    assert len(keys) == n, "HEALTH_DOT_COUNT is %d but %d names are published" % (n, len(keys))
+    assert len(set(keys)) == len(keys), "two dots share a name: %r" % keys
+    # And the array is BUILT to the count rather than typed out, which is what stops the next
+    # dot from doing this again.
+    assert "new DotState[HEALTH_DOT_COUNT]" in body, \
+        "the dot-state array is back to a hand-written list of literals"
+
+
+def test_the_fix_pill_does_not_offer_to_fix_the_frozen_set():
+    """RunFix restarts processes. A frozen set that differs is waiting on a person, and no
+    restart changes it -- so when this dot went amber the pill appeared and its button did
+    nothing at all (RunFix reads dots 0..5, so the target mask came out 0). An offer to fix
+    that fixes nothing spends the one action a person trusts."""
+    body = _cockpit_source()
+    assert 'if (_healthKeys[i] != "hs_frozen"' in body, \
+        "the frozen dot is raising the Fix pill again"
+
+
 @pytest.mark.skipif(not os.path.isfile(STRIP), reason="no cockpit has published a strip here")
 def test_the_published_strip_parses_and_names_every_dot():
     """Against the real file when one exists: the format the reader assumes is the format the
-    panel writes."""
+    panel writes.
+
+    THE EXPECTED COUNT IS READ FROM THE PANEL, not typed here. It was `== 6`, and a seventh dot
+    turned this into a failing test about a change that was correct -- a guard that has to be
+    edited every time the thing it guards grows teaches people to edit it without looking."""
     d = json.loads(io.open(STRIP, encoding="utf-8").read())
     dots = d.get("dots") or []
-    assert len(dots) == 6, "the strip has six dots; %d were published" % len(dots)
+    body = _cockpit_source()
+    want = _declared_dot_count(body)
+    assert len(dots) == want, "the panel declares %d dots; %d were published" % (want, len(dots))
+    assert [r.get("key") for r in dots] == _declared_keys(body), \
+        "the published names are not the panel's own list, in its order"
     for row in dots:
         assert row.get("key") and row.get("state")
         assert row["state"] in ("green", "yellow", "red", "gray", "checking"), row["state"]
