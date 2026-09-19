@@ -490,6 +490,7 @@ jobs:
             relay/selfimprove/test_fallback_rule.py \
             relay/selfimprove/test_planner_evaluator.py \
             relay/selfimprove/test_route_campaign_wiring.py \
+            relay/selfimprove/test_an_approved_card_closes_when_it_is_carried_out.py \
             relay/selfimprove/test_stdin_arg.py \
             relay/test_agent_profiles_research_reason.py \
             relay/test_socket_attachment.py \

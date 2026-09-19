@@ -80,9 +80,31 @@ def _session() -> str:
     before any successful unlock in the same session (the designed first-call refusal) and 164
     happen AFTER one, spread p50 461s / p90 1359s / max 2710s from that unlock. The max exceeds
     the 30-minute session TTL and is explained; the median is well inside it and is not. The
-    leading hypothesis is that the forwarded IP changes under a stable session -- authorisation
-    is recorded in state[ip]["sessions"], so an identity change loses it -- and this field is
-    what would confirm or kill that, since the two are then in one row.
+    leading hypothesis was that the forwarded IP changes under a stable session -- authorisation
+    is recorded in state[ip]["sessions"], so an identity change loses it.
+
+    THE FIELD DID ITS JOB AND THE HYPOTHESIS IS DEAD. Measured 2026-09-19 over the 543 refusals
+    in .fleet/lock_refusals.jsonl that carry this field:
+
+        sessions whose client_ip changed              0 of 447
+        authorised, inside TTL, and still refused     0 of 543
+        authorised AFTER the refusal                 67   (the designed first call)
+        no record of authorisation at all           476
+
+    So the forwarded IP is stable under a session here, and the session fallback is not failing
+    to fire -- among the rows that carry a session there was nothing for it to rescue.
+
+    THE 476 CANNOT BE SPLIT FURTHER FROM THIS DATA, and saying which it is would be a guess:
+    state[ip]["sessions"] is capped and holds only the most recent touch, so "never unlocked"
+    and "unlocked, then evicted or aged out of the table" look identical from here. Answering
+    that needs the unlock side to keep its own append-only record; it is not answerable by
+    reading this one harder.
+
+    WHY `session_state` READS THE SAME ON EVERY ROW. All 548 say "unrecognized-or-expired" and
+    none says "none", which has the shape of a column that is always the same and therefore
+    broken -- and it is not. A session id was available on every one of these calls, and in
+    every one the session genuinely was not authorised at that moment. The constant is the
+    measurement, not the instrument.
 
     OBSERVATION ONLY. Nothing branches on it.
     """
