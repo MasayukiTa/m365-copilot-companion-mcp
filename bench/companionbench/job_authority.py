@@ -51,7 +51,6 @@ import hmac
 import json
 import os
 import secrets
-import socket
 import shutil
 import subprocess
 import sys
@@ -330,11 +329,3 @@ class JobAuthority:
             "  対象ジョブ: %s\n"
             % (self.url, self.agent_token, ", ".join(AGENT_OPERATIONS), job_id))
 
-
-def free_port() -> int:
-    """An unused loopback port. Only for tests that need to point at nothing."""
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port

@@ -36,13 +36,11 @@ def _checkpoint():
     return mod
 
 
-def _free_port():
-    """A port with nothing bound: bind, read the number, close."""
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
+# MOVED TO conftest.free_port. The identical function also sat in
+# bench/companionbench/job_authority.py, where its docstring said "Only for tests" and no test
+# used it -- so the copy that was used and the copy that was documented were different objects
+# in different files. One implementation now, at the address test-only helpers live at.
+from conftest import free_port as _free_port          # noqa: E402
 
 
 def test_a_bound_port_reads_as_listening():
