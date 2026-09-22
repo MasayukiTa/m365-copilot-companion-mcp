@@ -3974,11 +3974,28 @@ class Handler(BaseHTTPRequestHandler):
                 "promotion_attempted": True,
                 "page_busy": consumer_running,
                 "queue_depth": depth,
+                # THE FIELD WAS FIXED AND THE SENTENCE WENT ON MAKING THE SAME CLAIM. The key
+                # above was renamed from "promoted" to "promotion_attempted" precisely because
+                # this reply cannot know the outcome -- and the note still read "a turn is
+                # being run for it now", which is the same assertion in prose.
+                #
+                # It is not always true. `_promote` runs on another thread and can fail
+                # outright: with the page-owner thread down, run_on_page_thread raises
+                # immediately ("the page-owner thread is not running, so this job would never
+                # be serviced"), the exception is logged, and the message stays queued. The
+                # operator was told a turn had started. Measured 2026-09-22 by standing this
+                # handler up with no page thread: ok, queued, page_busy false, and that note.
+                #
+                # So the note now describes the ATTEMPT, which is the only thing this reply
+                # is in a position to describe, and names both ways it can come to nothing.
                 "note": ("queued, and a turn will be run for it as soon as the page is free "
                          "(something is using it right now). If it is still busy in %d seconds "
                          "this stays queued." % int(SEND_PROMOTION_WAIT_S)
                          if consumer_running else
-                         "queued, and a turn is being run for it now."),
+                         "queued, and a turn has been requested for it. That happens on "
+                         "another thread, so this reply cannot say it started: if the page "
+                         "thread is not running, or the page is still busy in %d seconds, "
+                         "the message stays queued." % int(SEND_PROMOTION_WAIT_S)),
             })
             return
         if parsed.path == "/history":      # scrape ALL turns of a conversation in order
