@@ -690,6 +690,54 @@ jobs:
       - name: Run script-style suites
         run: python scripts/run_script_style_tests.py
 
+      # THE EXCLUSIONS, RUN WHERE THEY ARE EXCLUDED. REPORTING, NOT GATING.
+      #
+      # scripts/check_ci_test_manifest.py keeps eleven files out of the hermetic suite, each
+      # with a written reason, and its own comment says four of the eight added in one batch
+      # are "test-side portability defects -- meant to be fixed and returned; parked here, not
+      # solved". Nobody has been able to tell which, because the reasons are about LINUX and
+      # they were only ever re-read on Windows.
+      #
+      # Reading was already shown to be a poor substitute: on 2026-09-19 three exclusions
+      # looked stale to a careful read, one of them was registered on that basis, and the
+      # runner turned main red -- FLEET_FLOOR_GIB came back above 5.6 where 3.0 had been
+      # assumed. So this runs them and prints what happens, and gates nothing.
+      #
+      # A file that PASSES here is the interesting result: its reason has expired and it can
+      # be moved back into the hermetic list with evidence rather than with an argument. A
+      # file that fails prints the actual failure, which is the measurement that was missing.
+      # That asymmetry is the whole design -- an exclusion list nobody can re-check becomes
+      # permanent by default.
+      - name: Excluded tests (reporting, not gating)
+        continue-on-error: true
+        run: |
+          python - <<'PY'
+          import importlib.util, subprocess, sys
+          spec = importlib.util.spec_from_file_location("m", "scripts/check_ci_test_manifest.py")
+          m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+          files = sorted(m.EXCLUDED)
+          print("running %d excluded file(s) on this runner\n" % len(files))
+          verdict = {}
+          for rel in files:
+              r = subprocess.run([sys.executable, "-m", "pytest", "-q", "--no-header",
+                                  "-p", "no:cacheprovider", rel],
+                                 capture_output=True, text=True)
+              tail = [l for l in (r.stdout or "").splitlines() if l.strip()][-1:] or ["(no output)"]
+              verdict[rel] = (r.returncode, tail[0][:120])
+          print("=" * 72)
+          for rel, (rc, line) in verdict.items():
+              print("%-4s %-52s %s" % ("PASS" if rc == 0 else "fail", rel, line))
+          passing = [r for r, (rc, _) in verdict.items() if rc == 0]
+          print("=" * 72)
+          if passing:
+              print("THESE PASSED HERE, so their exclusion reason has expired and they can be")
+              print("registered in the hermetic list with evidence:")
+              for rel in passing:
+                  print("   " + rel)
+          else:
+              print("none passed; every exclusion still describes something real on this runner")
+          PY
+
   windows-install-smoke:
     runs-on: windows-latest
     timeout-minutes: 20
