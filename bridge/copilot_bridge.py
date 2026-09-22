@@ -2784,7 +2784,8 @@ def _outer_read_trace(t0, cleaned, final, partial):
     times a second, to be discarded on the next line.
     """
     try:
-        age = time.time() - t0
+        now = time.time()
+        age = now - t0
         if age < _SETTLE_RESET_TRACE_AFTER_S:
             return
         if callable(cleaned):
@@ -2795,12 +2796,25 @@ def _outer_read_trace(t0, cleaned, final, partial):
                 return
         except OSError:
             pass
+        # TWO FACTS, BECAUSE ONE OF THEM ANSWERED NOTHING FOR THREE MONTHS. `final_is_proc`
+        # is `_is_proc(final)`, and `_is_proc("")` is True by design -- empty text means the
+        # turn is still going, which is right where this predicate gates the STREAM. As a
+        # recorded column it collapses "there was no text" into "a processing marker matched",
+        # and measured over all 13,694 rows of this file, `final_is_proc == (final_len == 0)`
+        # held every single time: not one row was ever a real marker hit. Anyone tuning
+        # PROCESSING_MARKERS against this trace was tuning a branch it never reached.
+        #
+        # The column stays -- old rows mean what they meant -- and `final_marker_hit` is the
+        # question it was supposed to be answering: a marker matched TEXT THAT EXISTS.
+        _final = final or ""
         rec = {
+            "ts": now,
             "age_s": round(age, 1),
             "clean_len": len(cleaned or ""), "clean_tail": (cleaned or "")[-70:],
-            "final_len": len(final or ""), "final_tail": (final or "")[-70:],
+            "final_len": len(_final), "final_tail": _final[-70:],
             "partial_len": len(partial or ""),
-            "final_is_proc": bool(_is_proc(final or "")),
+            "final_is_proc": bool(_is_proc(_final)),
+            "final_marker_hit": bool(_final.strip()) and bool(_is_proc(_final)),
         }
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "a", encoding="utf-8") as fh:
