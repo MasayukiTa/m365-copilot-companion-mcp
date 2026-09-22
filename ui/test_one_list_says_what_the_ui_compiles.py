@@ -53,17 +53,17 @@ OWNER = "ui/rebuild_ui.ps1"
 _INVOKES_CSC = re.compile(r'&\s*"?\$csc\b|%CSC%|\[\s*CSC\s*,|csc\.exe"?\s+/nologo', re.I)
 
 #: Evidence that a file DERIVES the list: it PARSES the owner's Build lines, or it RUNS the
-#: owner (or something that does).
+#: owner (or a tool that already reads it).
 #:
 #: NOT "the file mentions rebuild_ui.ps1", which is what this checked first. Every one of the
 #: four stale copies carried a comment pointing at the real build -- that is how they described
 #: themselves while restating the list underneath. Mutation-tested: pointing
 #: .github/scripts/build-csharp-codeql.ps1 at a different file left this GREEN, because the
 #: prose in its own header still named the owner. A guard satisfied by a comment checks comments.
-#: The Build-line pattern itself, as LITERAL TEXT. A file that parses the owner has to contain
-#: this; prose about the owner does not.
+#:
+#: So the marker is the Build-line pattern itself, as LITERAL TEXT: a file that parses the owner
+#: contains it, and prose about the owner does not.
 _PARSES = r'Build\s+"([A-Za-z0-9_]+)"'
-#: ...or it runs the owner, or a tool that already reads it.
 _RUNS_OWNER = re.compile(r'(-File|&|python|powershell)[^\n]*(rebuild_ui\.ps1|ui_build_check\.py)',
                          re.I)
 

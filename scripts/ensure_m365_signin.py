@@ -62,6 +62,21 @@ def tabs(port: int):
         return None
 
 
+def _bare(url: str) -> str:
+    """scheme://host/path -- the identifying part, without the query string.
+
+    A sign-in URL's query carries `login_hint=` (an e-mail address) and state tokens, and this
+    goes to a console and into screenshots.
+    """
+    try:
+        p = urllib.parse.urlsplit(url)
+    except Exception:
+        return "(unparseable url)"
+    if not p.scheme and not p.netloc:
+        return "(unparseable url)"
+    return "%s://%s%s" % (p.scheme, p.netloc, p.path)
+
+
 def state(port: int):
     """(ready, reason).
 
@@ -75,10 +90,23 @@ def state(port: int):
     """
     t = tabs(port)
     if t is None:
-        return None, "companion Edge is not answering on :%d" % port
+        # NOT "companion Edge". This function is asked about :9223 (the bridge) and :9224 (the
+        # evaluation browser) too, and naming the wrong browser in the reason sends the reader
+        # to look at a process that is fine.
+        return None, "no Edge is answering on :%d" % port
     urls = [x.get("url") or "" for x in t]
-    if any(LOGIN_RE.search(u) for u in urls):
-        return False, "a sign-in page is open"
+    walls = [u for u in urls if LOGIN_RE.search(u)]
+    if walls:
+        # NAME THE TAB. "a sign-in page is open" is not enough to act on, and on 2026-09-23 it
+        # was the whole of what the operator's screen said while the same FAIL kept coming back
+        # on a machine this box cannot reproduce. Which URL it is settles what the person is
+        # looking at: login.microsoftonline is a real wall, an /adfs/ bounce is a different
+        # story, and a stale tab left over from an earlier attempt is a third.
+        #
+        # SCHEME, HOST AND PATH ONLY. The query string of a sign-in URL carries login_hint=
+        # (the account's e-mail address) and assorted state tokens, and this line is printed on
+        # a console and pasted into screenshots.
+        return False, "a sign-in page is open: %s" % ", ".join(sorted({_bare(u) for u in walls}))
     m365 = [u for u in urls if re.search(r"m365|copilot", u, re.I)]
     if m365:
         # AN M365 TAB IS NOT PROOF ON ITS OWN. If every m365 tab is still on an
@@ -91,6 +119,39 @@ def state(port: int):
     return None, "no M365 page open, so nothing to judge from (the fleet opens no tabs)"
 
 
+def _report_every_profile(primary_port: int):
+    """One `PROFILE:` line per managed Edge, because each one is a separate sign-in.
+
+    THE OWNER ASKED THE RIGHT QUESTION, 2026-09-23: ":9222 と :9223 で建てるので、その片方に
+    しか入れていない、ということはないか". Structurally, yes it can be. Edge locks a
+    user-data-dir to one process, so the companion (:9222), the bridge (:9223) and the
+    evaluation browser (:9224) MUST have distinct profiles to run at once -- and distinct
+    profiles mean distinct cookie jars. Signing in on one signs in exactly one.
+
+    Everything here checked :9222 and nothing else, so a bridge sitting on a login wall was
+    invisible: the doctor's `Bridge Edge running (:9223)` row says the process answers CDP, not
+    that it can reach Copilot.
+
+    THE PORT LIST COMES FROM relay.edge_recover.MANAGED_EDGE_PROFILES, never from a copy here.
+    That constant's own docstring records the same omission happening FOUR times -- "each time
+    a profile was added and the places that enumerate profiles were not swept" -- and a literal
+    list in this file would have been the fifth. If it cannot be imported, say so and check
+    nothing, rather than checking a subset and reporting it as the whole.
+    """
+    try:
+        from relay import edge_recover
+        profiles = dict(edge_recover.MANAGED_EDGE_PROFILES)
+    except Exception as exc:
+        print("  PROFILE: (could not read the managed profile list: %s)" % exc)
+        return
+    for port in sorted(profiles):
+        ready, why = state(port)
+        verdict = "signed_in" if ready else ("sign_in_needed" if ready is False else "cannot_tell")
+        print("  PROFILE: %d %s %s%s (%s)"
+              % (port, profiles[port], verdict,
+                 " [primary]" if port == primary_port else "", why))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--port", type=int, default=9222)
@@ -99,7 +160,14 @@ def main(argv=None):
     ap.add_argument("--check-only", action="store_true",
                     help="report and exit; never surface the window. For the health check, so "
                          "there is ONE definition of 'signed in' rather than two that drift.")
+    ap.add_argument("--all", action="store_true",
+                    help="also report EVERY managed Edge profile, not just --port. Each profile "
+                         "is a separate browser with its own user-data-dir, so each has its own "
+                         "sign-in state.")
     a = ap.parse_args(argv)
+
+    if a.all:
+        _report_every_profile(a.port)
 
     # READ THE TABS THAT EXIST; DO NOT MAKE ONE. A previous version opened a page through
     # /json/new to settle the tab-less case and left about:blank tabs behind in a browser the

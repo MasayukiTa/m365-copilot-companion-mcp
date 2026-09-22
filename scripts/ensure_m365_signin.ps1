@@ -36,4 +36,27 @@ $code = $LASTEXITCODE
 if ($code -ne 0) {
     Write-Host "  (sign-in not completed yet -- the health check below will show it)"
 }
+
+# AND SAY WHICH BROWSERS ARE COVERED. Everything above signs in ONE profile: the companion on
+# :9222. The bridge (:9223) and the evaluation browser (:9224) each have their own
+# --user-data-dir -- Edge locks a profile to a single process, so concurrent browsers require
+# distinct profiles -- which means their own cookies and their own sign-in.
+#
+# The owner asked on 2026-09-23 whether a sign-in could have gone into one of the two and not
+# the other. It can, and nothing said so: quickstart's step reported the companion and stopped.
+# A person who has just signed in should see, on the same screen, which browsers that covered.
+#
+# REPORTED, NOT DRIVEN. Surfacing a second browser to sign it in during setup is a window
+# nobody asked for; doctor carries the per-profile rows with the command to fix each one.
+$report = (& $py $script --port $Port --check-only --all 2>&1 | Out-String)
+$rows = @()
+foreach ($line in ($report -split "`r?`n")) {
+    if ($line -match '^\s*PROFILE:\s+(\d+)\s+(\S+)\s+(\w+)') {
+        $rows += ("    :{0}  {1,-24} {2}" -f $Matches[1], $Matches[2], $Matches[3])
+    }
+}
+if ($rows.Count -gt 0) {
+    Write-Host "  Sign-in state per browser profile (each has its own cookies):"
+    $rows | ForEach-Object { Write-Host $_ }
+}
 exit 0
