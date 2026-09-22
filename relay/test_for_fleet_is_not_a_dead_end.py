@@ -58,9 +58,17 @@ def _record_handoffs(monkeypatch, status="awaiting_fleet"):
     """Replace fleet_handoff with a recorder. Nothing here may start a real fleet."""
     seen = []
 
-    def _fake(goal, jid, state_dir=None):
+    def _fake(goal, jid, state_dir=None, **kw):
+        # **kw, so a field added to the real handoff cannot make this double the thing that
+        # fails. It broke exactly that way when `priority` was threaded through the three
+        # delivery routes: a signature the double did not know turned into a TypeError inside
+        # the delivery loop, which reads as "the loop is broken" and is not.
         seen.append(jid)
+        _fake.last_kw = dict(kw)
         return status, {"handoff": "for_fleet/%s.txt" % jid, "note": "test"}
+
+    _fake.last_kw = {}
+    _record_handoffs.last = _fake
 
     monkeypatch.setattr(tr, "fleet_handoff", _fake)
     return seen
