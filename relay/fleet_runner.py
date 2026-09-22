@@ -1947,6 +1947,22 @@ def goals_from_command(cmd) -> list:
                 # and quietly started a fresh conversation instead.
                 if it.get("follow_up_to"):
                     g["follow_up_to"] = it["follow_up_to"]
+                # THE CONVERSATION'S ID, AND THE COMMENT ABOVE MISSED IT. That paragraph was
+                # written to carry `follow_up_to` through, and `resume_conv` -- the field that
+                # makes `follow_up_to` a fallback rather than the mechanism -- was left out of
+                # the same list. So the chat window read the durable id off the transcript,
+                # put it on the item (ui/CopilotChat.cs, "THE CONVERSATION BY ITS ID"), and
+                # this function dropped it; RelayWorker then matched the conversation by GOAL
+                # TEXT and printed "That is a guess -- the caller should carry resume_conv"
+                # about a caller that was carrying it. Identity by wording is what
+                # docs/incidents/20260912_a_fleet_conversation_could_be_read_and_never_answered.md
+                # was closed on, and the close did not reach this hop.
+                #
+                # The goals-file path never had this bug: it appends the whole dict, so the
+                # cockpit's Continue button worked while the same follow-up typed into the
+                # chat window did not. One feature, two routes, one of them silently guessing.
+                if it.get("resume_conv"):
+                    g["resume_conv"] = it["resume_conv"]
                 out.append(g)
             elif isinstance(it, str) and it:
                 out.append({"text": it, "priority": False})
