@@ -4696,7 +4696,24 @@ class ChatWindow : Window
                 ShowRecoveryBanner(T("send_offline"), T("retry_start_stack"), delegate
                 {
                     HideBanner();
-                    try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(Path.Combine(RepoRoot(), "start_all.bat")) { UseShellExecute = true }); }
+                    // wscript + the VBS, NOT start_all.bat, AND NOT UseShellExecute. This
+                    // process is WPF and has no console of its own, so shell-executing a .bat
+                    // makes Windows give cmd.exe a brand new one -- a black window on the
+                    // operator's desktop, which is the single thing start_all.bat's own header
+                    // says it was rewritten to stop ("No console lingers"). The bat's entire
+                    // body is this same wscript line, so calling it directly loses nothing.
+                    // FleetCockpit.RunStartAll already does exactly this; this site was the
+                    // one copy that did not.
+                    try
+                    {
+                        var psi = new System.Diagnostics.ProcessStartInfo();
+                        psi.FileName = "wscript.exe";
+                        psi.Arguments = "\"" + Path.Combine(RepoRoot(), "scripts", "start_all_hidden.vbs") + "\"";
+                        psi.WorkingDirectory = RepoRoot();
+                        psi.UseShellExecute = false;
+                        psi.CreateNoWindow = true;
+                        System.Diagnostics.Process.Start(psi);
+                    }
                     catch { }
                 });
                 return;
