@@ -1969,6 +1969,22 @@ def _deliver_waiting_goals(now_ts=None, state_dir=None):
     fleet_handoff already makes the same liveness check itself, and falls through to AUTOSTART
     when it fails, so the guard bought nothing except the dead end.
 
+    THERE IS NO CLAIM HERE, AND WHAT MAKES THAT SAFE IS SOMEWHERE ELSE. dispatch_once takes
+    its work with an atomic rename into running/, so two routers cannot both get the same job.
+    This loop only reads the file and delivers, deleting it afterwards, so two routers running
+    together WOULD hand the same goal over twice. What prevents that is not in this module:
+    scripts/supervisor.ps1:139 holds `Global\m365-copilot-companion-supervisor` as a
+    single-instance mutex and runs this with --once, sequentially.
+
+    So the exposure is a second router started BY HAND while the supervisor is up -- which is
+    a documented thing to do -- and it is written down here rather than guarded because a
+    claim needs a restore path for a delivery that fails and a recovery for one that dies
+    mid-claim. That is machinery for a case the mutex already covers, and this repository has
+    paid for machinery built ahead of the caller that needed it. An unstated dependency,
+    though, is how the console-window defect survived: everything downstream of
+    supervisor.ps1 was windowless because it started the tree with -WindowStyle Hidden, and
+    nothing said so, so each new launch site inherited safety it did not know it had.
+
     ONE COLD HANDOFF PER PASS. Removing the guard alone would let N waiting files each attempt
     an autostart within a single pass, and autostart_status cannot deduplicate them: a launch
     takes seconds to become live, so every file in the same pass still reads "nothing in
