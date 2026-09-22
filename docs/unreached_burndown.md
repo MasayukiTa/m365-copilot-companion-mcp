@@ -214,6 +214,35 @@ and `mechanism_telemetry::patch_hash` — and they are listed under *What left t
 above. A name belongs here when a caller for it exists somewhere in the design and is simply
 missing; that is the shape worth doing next, so the heading stays.
 
+**One more left it on 2026-09-22: `authority_ledger::verify`.** It was filed as *revealed*,
+which is the weakest verdict — nobody had looked. Looking took one grep: the authority ledger
+is a hash chain, `verify` walks the links, and nothing anywhere called it. A chain nobody
+walks is a decoration, and appends were landing on a history that might already be broken
+while each one printed a tail asserting a continuity it no longer had. `frozen._record_rebless`
+now verifies before it appends — reporting, not refusing, because refusing to re-sign a damaged
+ledger removes the record of whatever is damaging it. The live ledger verifies clean, 125
+records.
+
+### Triaged by hand, 2026-09-22: `provenance::adjudicate` has no situation here
+
+82 lines, 18 test references, and no caller. It resolves **competing claims about ONE fact**,
+and its docstring is emphatic that the disagreement is the product rather than the winner:
+*"the verifier and the solver disagreed" is the signal this whole benchmark exists to catch.*
+
+Checked where such claims would be built. `relay/provenance` is imported in four places, and
+between them they use `normalise`, `require_authority_for_evolution` and nothing else.
+`bench/companionbench/security_experiment.py` constructs evidence lists, but one claim at a
+time — the attacked and unattacked arms each return a single `{"kind", "authority"}` entry
+about a different thing, which is the caller error `adjudicate` refuses to answer, not a
+conflict. `outranks` reads as used, and is not: every other occurrence of that word in the
+tree is prose.
+
+**Verdict: no opportunity — the genuine kind.** Nothing in this repository produces two claims
+about one fact, so there is no site to wire and wiring one would mean inventing the conflict
+first. Recorded rather than deleted: the function is the shape the design wants the day a
+verifier and a solver are both asked about the same value, and its tests say what it will do
+then. What would change this is a caller that has two answers and currently picks one.
+
 ### Triaged to a verdict: the refusal taxonomy
 
 `relay/review_resilience.py` defines four refusal detectors and one diagnosis. `relay_fleet`
