@@ -236,6 +236,38 @@ def test_an_explicit_resume_conv_wins_over_the_lookup(monkeypatch):
     assert w.resume_conv == "given-directly"
 
 
+def test_the_command_channel_carries_resume_conv_to_the_worker(monkeypatch):
+    """**THE HOP THAT WAS MISSING, AND THE ONE NOBODY EXECUTED.**
+
+    `test_an_explicit_resume_conv_wins_over_the_lookup` above proves the worker honours the
+    field, and `ui/test_a_fleet_conversation_can_be_answered.py` proves the chat window sets
+    it -- but that second one asserts on the C# SOURCE TEXT. Both were green while
+    `fleet_runner.goals_from_command` dropped the field in between them, so every follow-up
+    typed into a fleet conversation fell back to matching by goal text: re-run or re-word the
+    goal and the answer lands in a conversation that never heard the question.
+
+    Two assertions, because either alone can pass while the join is broken. The first is that
+    the field survives the normaliser. The second is the one that matters: hand the worker
+    what the normaliser produced while the text lookup offers a DIFFERENT conversation, and
+    the supplied id must win. Without it, a normaliser that dropped the field would still
+    look right whenever the guess happened to agree.
+    """
+    from relay import fleet_runner as FR
+
+    out = FR.goals_from_command({"add_goal": [{
+        "text": "and now summarise it",
+        "follow_up_to": "tidy the docs",
+        "resume_conv": "sess:11111111-2222-3333-4444-555555555555",
+    }]})
+    assert out and out[0].get("resume_conv") == \
+        "sess:11111111-2222-3333-4444-555555555555", \
+        "the command channel dropped the conversation id the caller carried"
+
+    w = _worker_with(out[0], monkeypatch, found="a-conversation-the-lookup-guessed")
+    assert w.resume_conv == "sess:11111111-2222-3333-4444-555555555555", \
+        "the worker fell back to matching by goal text although an id was supplied"
+
+
 def test_a_follow_up_with_nothing_recorded_says_so(monkeypatch, capsys):
     """A follow-up that silently became a fresh conversation is the failure being fixed, and
     it answers plausibly either way."""
