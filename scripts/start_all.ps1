@@ -1344,6 +1344,36 @@ if ($script:startupFailures.Count -gt 0) {
 # "could not tell" stays silent in both: the fleet is websocket-driven and opens no tabs, so a
 # signed-in machine looks identical to one with no tab, and reporting that would send somebody to
 # fix what is not broken.
+function Report-OtherProfileSignIns {
+    <#
+      EVERY MANAGED EDGE, NOT JUST :9222 -- and SAY SO, do not fix it here.
+
+      Each managed browser runs on its own --user-data-dir (Edge locks a profile to one
+      process, so running them at once REQUIRES distinct profiles), and a distinct profile is a
+      distinct cookie jar. Signing in on the companion signs in the companion. The owner asked
+      whether a sign-in could have landed in one of the two browsers and not the other, on
+      2026-09-23: structurally, yes, and until now nothing looked.
+
+      REPORTED, NOT ESCALATED. Surfacing a second browser to sign it in is exactly what the
+      comment above spent 751 MB learning not to do at startup. A line the operator can act on
+      is the whole job here; doctor carries the same rows with the command.
+
+      "cannot_tell" stays silent, for the reason this file already gives: a healthy machine has
+      no M365 tab, so that is the normal answer and not evidence of anything.
+    #>
+    param([string] $Report)
+    if (-not $Report) { return }
+    foreach ($line in ($Report -split "`r?`n")) {
+        $m = [regex]::Match($line, '^\s*PROFILE:\s+(\d+)\s+(\S+)\s+(\w+)(\s+\[primary\])?\s*\((.*)\)\s*$')
+        if (-not $m.Success) { continue }
+        if ($m.Groups[4].Success -and $m.Groups[4].Value) { continue }
+        if ($m.Groups[3].Value -ne "sign_in_needed") { continue }
+        Write-Host ("[m365] {0} (:{1}) is on a sign-in page -- it is a SEPARATE browser profile, so the companion's sign-in does not cover it. {2}" `
+            -f $m.Groups[2].Value, $m.Groups[1].Value, $m.Groups[5].Value) -ForegroundColor Yellow
+        $script:startupFailures += ("M365 sign-in needed on " + $m.Groups[2].Value + " (:" + $m.Groups[1].Value + ")")
+    }
+}
+
 try {
     $signinPs = Join-Path $scriptDir "ensure_m365_signin.ps1"
     if ((Test-Path $signinPs) -and (-not $CoreOnly)) {
@@ -1354,8 +1384,9 @@ try {
             # codes are 0 signed in / 1 a sign-in wall is open / 2 could not tell.
             $signinPy = Join-Path $scriptDir "ensure_m365_signin.py"
             $pyExe = Join-Path $root ".venv\Scripts\python.exe"
+            $signinReport = ""
             if ((Test-Path $signinPy) -and (Test-Path $pyExe)) {
-                & $pyExe $signinPy --port 9222 --check-only | Out-Null
+                $signinReport = (& $pyExe $signinPy --port 9222 --check-only --all 2>&1 | Out-String)
             } else {
                 $global:LASTEXITCODE = 2
             }
@@ -1363,6 +1394,7 @@ try {
                 Write-Host "[m365] a sign-in is needed, and a background start cannot show it." -ForegroundColor Yellow
                 $script:startupFailures += "M365 sign-in needed (background start could not prompt)"
             }
+            Report-OtherProfileSignIns $signinReport
         } else {
             # ASK FIRST; SURFACE ONLY ON A REAL WALL. Running the full helper here opened a
             # HEADED companion Edge on m365.cloud.microsoft/chat and left it running: measured
@@ -1379,14 +1411,16 @@ try {
             # it already does on the -NoUi path above.
             $signinPy = Join-Path $scriptDir "ensure_m365_signin.py"
             $pyExe = Join-Path $root ".venv\Scripts\python.exe"
+            $signinReport = ""
             if ((Test-Path $signinPy) -and (Test-Path $pyExe)) {
-                & $pyExe $signinPy --port 9222 --check-only | Out-Null
+                $signinReport = (& $pyExe $signinPy --port 9222 --check-only --all 2>&1 | Out-String)
             } else {
                 $global:LASTEXITCODE = 2
             }
             if ($LASTEXITCODE -eq 1) {
                 & powershell -NoProfile -ExecutionPolicy Bypass -File ('"{0}"' -f $signinPs) -TimeoutSeconds 180 | Out-Null
             }
+            Report-OtherProfileSignIns $signinReport
         }
     }
 } catch {

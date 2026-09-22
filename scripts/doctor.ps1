@@ -557,7 +557,7 @@ $signinScript = Join-Path $repo "scripts\ensure_m365_signin.py"
 $signinCode = 2
 $signinOut = ""
 try {
-    $signinOut = (& $signinPy $signinScript --check-only 2>&1 | Out-String)
+    $signinOut = (& $signinPy $signinScript --check-only --all 2>&1 | Out-String)
     $signinCode = $LASTEXITCODE
 } catch { $signinCode = 2; $signinOut = "" }
 
@@ -575,9 +575,40 @@ if ($signinVerdict -eq "cannot_tell") {
         $detail `
         -Info
 } else {
+    # CARRY THE REASON ONTO THE SCREEN. The fix line alone ("run quickstart.bat again") is the
+    # same sentence whether a real login page is open or something else went wrong, and on
+    # 2026-09-23 a repeat of this FAIL arrived as a screenshot with nothing on it to act on --
+    # the checker knew WHICH tab was the wall and the doctor was throwing that away.
+    $signinWhy = ""
+    if ($signinOut -match "(?m)^\s*sign-in needed \((.+)\)\s*$") { $signinWhy = $Matches[1] }
+    $signinFix = "run quickstart.bat again -- it opens the sign-in window for you and waits. You only need to sign in once; it persists across restarts."
+    if ($signinWhy) { $signinFix = "$signinWhy. $signinFix" }
     Check "m365_signin" "M365 signed in on the companion Edge" `
         { $signinVerdict -eq "signed_in" } `
-        "run quickstart.bat again -- it opens the sign-in window for you and waits. You only need to sign in once; it persists across restarts."
+        $signinFix
+}
+
+# EVERY MANAGED EDGE, NOT JUST :9222. Each one runs on its OWN --user-data-dir -- Edge locks a
+# profile to a single process, so concurrent browsers REQUIRE distinct profiles -- and a
+# distinct profile is a distinct cookie jar. Signing in on the companion signs in the companion
+# and nothing else, and until 2026-09-23 nothing here looked at the others: the "Bridge Edge
+# running (:9223)" row above says the process answers CDP, not that it can reach Copilot.
+#
+# The rows are built from what the checker prints, and the checker takes its port list from
+# relay.edge_recover.MANAGED_EDGE_PROFILES. No list of ports lives in this file; that constant's
+# docstring records four separate outages caused by exactly such a copy.
+foreach ($line in ($signinOut -split "`r?`n")) {
+    $m = [regex]::Match($line, '^\s*PROFILE:\s+(\d+)\s+(\S+)\s+(\w+)(\s+\[primary\])?\s*\((.*)\)\s*$')
+    if (-not $m.Success) { continue }
+    if ($m.Groups[4].Success -and $m.Groups[4].Value) { continue }   # the primary has its own row above
+    $pPort = $m.Groups[1].Value
+    $pName = $m.Groups[2].Value
+    $pVerdict = $m.Groups[3].Value
+    if ($pVerdict -eq "cannot_tell") { continue }   # not running, or no page to judge from
+    Check "m365_signin_$pPort" "M365 signed in on $pName (:$pPort)" `
+        { $pVerdict -eq "signed_in" } `
+        "$($m.Groups[5].Value). This is a SEPARATE browser profile from the companion Edge, so signing in there did not sign in here: powershell -File scripts\start_companion_edge.ps1 -Port $pPort -Profile $pName -Foreground -Url https://m365.cloud.microsoft/chat" `
+        -Optional
 }
 
 # 5. Bridge Edge (:9223) -- optional, only for conversation history/scrape

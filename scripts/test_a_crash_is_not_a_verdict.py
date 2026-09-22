@@ -93,6 +93,51 @@ def test_a_missing_verdict_is_reported_as_undetermined():
         "the message no longer distinguishes a crash from a real sign-in wall"
 
 
+def test_a_wall_says_which_tab_it_is():
+    """**2026-09-23、同じ FAIL がもう一度届いた。** 画面には
+    `[FAIL] M365 signed in on the companion Edge / fix: run quickstart.bat again` しかなく、
+    しかも `Companion Edge running (:9222)` は OK — つまり「届かないから判定不能」ではなく
+    **本物の壁か例外**の二択なのに、どちらかを決める材料が一つも出ていなかった。
+
+    チェッカーはどのタブが壁かを知っている。出さないのは捨てているだけ。"""
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+    import ensure_m365_signin as m
+    saved = m.tabs
+    try:
+        m.tabs = lambda port: [{"url": "https://login.microsoftonline.com/common/oauth2/v2.0/"
+                                       "authorize?login_hint=someone@example.com&state=abc"}]
+        ready, why = m.state(9222)
+    finally:
+        m.tabs = saved
+    assert ready is False
+    assert "login.microsoftonline.com" in why, why
+
+
+def test_the_named_tab_carries_no_query_string():
+    """**その行はコンソールに出て、スクリーンショットに写る。** サインインURLのクエリには
+    `login_hint=`（アカウントのメールアドレス）と各種トークンが載る。"""
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+    import ensure_m365_signin as m
+    saved = m.tabs
+    try:
+        m.tabs = lambda port: [{"url": "https://login.microsoftonline.com/common/oauth2/"
+                                       "authorize?login_hint=someone@example.com&state=abc"}]
+        _, why = m.state(9222)
+    finally:
+        m.tabs = saved
+    assert "login_hint" not in why, why
+    assert "example.com" not in why, why
+    assert "?" not in why, why
+
+
+def test_the_doctor_puts_the_reason_on_the_screen():
+    """理由を知っていて捨てるなら、知らないのと同じ。"""
+    assert "sign-in needed \\((.+)\\)" in DOCTOR, \
+        "the doctor no longer lifts the checker's reason out of the checker's output"
+    assert "$signinFix = \"$signinWhy. $signinFix\"" in DOCTOR, \
+        "the reason is extracted and then not put into the message the operator reads"
+
+
 def test_the_tab_less_reason_is_not_printed_twice():
     """**報告された見た目の欠陥。** 理由が既に文になっているのに、同じ文で包んでいた:
     `... nothing to judge from (no M365 page open, so nothing to judge from (...))`"""
