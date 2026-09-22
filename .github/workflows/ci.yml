@@ -286,6 +286,7 @@ jobs:
             tools/test_a_cap_below_the_guard_silences_the_guard.py \
             tools/test_a_dot_on_in_the_normal_state_is_not_a_signal.py \
             tools/test_tool_probe.py \
+            tools/test_a_failure_count_without_a_denominator_is_not_a_rate.py \
             tools/test_skill_registration.py \
             scripts/test_settle_stage0_replay.py \
             scripts/test_collect_lens_corpus.py \

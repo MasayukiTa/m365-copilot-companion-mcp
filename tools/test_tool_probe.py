@@ -181,7 +181,20 @@ def test_record_probe_writes_expected_json_shape(monkeypatch, tmp_path):
     tool_probe.record_probe(True, "answer", detail="12個", ts=42.0)
     assert probe_file.is_file()
     on_disk = json.loads(probe_file.read_text(encoding="utf-8"))
-    assert on_disk == {"ts": 42.0, "ok": True, "kind": "answer", "detail": "12個"}
+    # THE PUBLISHED FIELDS, NOT THE WHOLE FILE. This was an equality check, which pinned the
+    # key SET and not the contract it cites. The contract is that /health and the cockpit read
+    # this shape -- and both read it BY KEY: get_summary pulls ts/ok/kind/alive/inbound, and
+    # FleetCockpit.PollToolProbeOnce reads the same names. Neither compares the whole object,
+    # so a field they do not know is invisible to them, exactly as add_goal_to_live_fleet
+    # records about its own readers.
+    #
+    # Equality made that guard fail on an ADDITION rather than on a change, which is the
+    # failure mode this repository hit twice today in other files. What must not happen is a
+    # published field changing meaning or disappearing; that is what is checked now.
+    for key, want in (("ts", 42.0), ("ok", True), ("kind", "answer"), ("detail", "12個")):
+        assert on_disk[key] == want, key
+    assert "alive" not in on_disk and "inbound" not in on_disk, \
+        "an unasked-for judgement appeared: None must stay absent, not become False"
 
 
 def test_record_probe_defaults_ts_to_wallclock(monkeypatch, tmp_path):
@@ -692,11 +705,17 @@ def test_journal_probe_failure_does_not_alter_tool_probe_json_contract(monkeypat
     tool_probe.journal_probe_failure(False, "error", "the full stale-token reply text",
                                       expected_token="deadbeefcafe", ts=7.0)
 
-    # tool_probe.json: exact same shape record_probe has always produced -- no new keys, no
-    # change to existing ones, `detail` still whatever the caller passed (unaffected by the
-    # journal call that ran right alongside it).
+    # THE POINT HERE IS THAT THE JOURNAL DOES NOT REACH INTO THIS FILE. The published fields
+    # are exactly what record_probe put there and `detail` is still whatever the caller
+    # passed, unaffected by the journal call that ran right alongside it. It was an equality
+    # check, which also forbade record_probe adding anything of its OWN -- a different claim,
+    # and not the one this test is about. See test_record_probe_writes_expected_json_shape.
     on_disk = json.loads(probe_file.read_text(encoding="utf-8"))
-    assert on_disk == {"ts": 7.0, "ok": False, "kind": "error", "detail": "stale token seen"}
+    for key, want in (("ts", 7.0), ("ok", False), ("kind", "error"),
+                      ("detail", "stale token seen")):
+        assert on_disk[key] == want, key
+    assert "reply" not in on_disk and "expected_token" not in on_disk, \
+        "the journal's own fields leaked into the probe-state file"
 
     # The journal is a SEPARATE file with its own shape -- confirms the two never merge/collide.
     assert journal.exists()
