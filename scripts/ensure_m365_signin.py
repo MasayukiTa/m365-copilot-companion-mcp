@@ -108,12 +108,22 @@ def main(argv=None):
     ready, why = state(a.port)
     if ready:
         print("  [ OK ] M365 already signed in on the companion Edge (%s)" % why)
+        if a.check_only:
+            print("VERDICT: signed_in")
         return 0
     if a.check_only:
         # The health check asks a question; it does not take the window. 2 = could not tell,
         # which the caller must not report as "not signed in" -- that sends somebody to do
         # something they cannot do.
+        #
+        # AND A VERDICT LINE, BECAUSE AN EXIT CODE CANNOT SAY "I CRASHED". 1 means "I looked
+        # and there is a sign-in wall"; a traceback also exits 1, and scripts/doctor.ps1 maps
+        # everything that is neither 0 nor 2 onto "M365 signed in: FAIL -- run quickstart.bat
+        # again". So any unexpected exception here becomes a confident instruction to redo a
+        # sign-in that may be perfectly fine. The reader takes this line when it is present and
+        # falls back to "could not tell" when it is not, which is what a crash should read as.
         print("  sign-in needed (%s)" % why if ready is False else "  cannot tell (%s)" % why)
+        print("VERDICT: %s" % ("sign_in_needed" if ready is False else "cannot_tell"))
         return 1 if ready is False else 2
     if ready is None and tabs(a.port) is None:
         # NOT a sign-in failure. Saying "sign in" when the browser is not running sends the
@@ -127,7 +137,13 @@ def main(argv=None):
         # above and report the browser as not running, so setup ended without ever offering a
         # sign-in, the wrapper turned the 2 into a 0, and doctor logged it as INFO. Opening the
         # page is the whole point of this path; if they are already signed in it costs a tab.
-        print("  no M365 page is open yet, so there is nothing to judge from (%s)." % why)
+        # THE REASON ALREADY SAYS THIS. `why` for the tab-less case is "no M365 page open, so
+        # nothing to judge from (the fleet opens no tabs)", and wrapping it in a sentence that
+        # says the same thing printed it twice, nested, on the operator's screen:
+        #   "no M365 page is open yet, so there is nothing to judge from (no M365 page open,
+        #    so nothing to judge from (the fleet opens no tabs))"
+        # The parenthetical is for reasons that ADD something; this one is the whole sentence.
+        print("  %s." % why)
     else:
         print("  M365 sign-in is needed (%s)." % why)
     print("  Opening the page and bringing the companion Edge window to the front...")
