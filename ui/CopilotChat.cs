@@ -2725,7 +2725,7 @@ class ChatWindow : Window
     }
 
     // Repo root: this exe runs from <repo>\ui, so one level up is <repo> -- same convention
-    // already used for .fleet\status.json / .fleet\commands.json below.
+    // already used for .fleet\status.json / .fleet\commands.d below.
     string RepoRoot() { return Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..")); }
 
     [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
@@ -4879,33 +4879,39 @@ class ChatWindow : Window
         return "";
     }
 
-    // Merge one key into .fleet/commands.json without dropping what is already queued there.
-    // The fleet consumes the whole file, so a blind overwrite would eat another writer's
-    // pending commands -- EnqueueToFleet already reads-then-appends for the same reason.
+    // Send ONE command ({key: [item]}) to the running fleet, as a file of its own.
+    //
+    // This used to read all of .fleet/commands.json, append to `key` and write the file back --
+    // and so did EnqueueToFleet below, and so did FleetCockpit.cs's ReadCommands/WriteCommands.
+    // FleetCockpit.exe and CopilotChat.exe are SEPARATELY BUILT PROCESSES (ui/rebuild_ui.ps1),
+    // so no amount of care inside one of them could order the other: whichever wrote second
+    // deleted the other's queued command, and a lost add_goal/steer looks exactly like one that
+    // was never sent. FleetCommands.Write drops each command into .fleet/commands.d/ under a
+    // unique name instead, which removes the read-modify-write rather than trying to guard it.
+    // See ui/FleetCommands.cs.
     bool AppendCommand(string key, object item)
     {
-        try
-        {
-            string cp = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", ".fleet", "commands.json"));
-            var cmd = new Dictionary<string, object>();
-            if (File.Exists(cp))
-            {
-                try { var ex = _cjs.DeserializeObject(File.ReadAllText(cp, Encoding.UTF8)) as Dictionary<string, object>; if (ex != null) cmd = ex; } catch { }
-            }
-            var items = new List<object>();
-            if (cmd.ContainsKey(key) && cmd[key] is object[]) foreach (var o in (object[])cmd[key]) items.Add(o);
-            items.Add(item);
-            cmd[key] = items;
-            File.WriteAllText(cp, _cjs.Serialize(cmd), new System.Text.UTF8Encoding(false));  // no BOM (Python reads this)
-            return true;
-        }
-        catch { return false; }
+        var items = new List<object>();
+        items.Add(item);
+        var patch = new Dictionary<string, object>();
+        patch[key] = items;
+        return FleetCommands.Write(FleetStateDir(), patch);
+    }
+
+    // The .fleet state dir, beside the exe's parent. The command channel lives under it.
+    static string FleetStateDir()
+    {
+        return Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", ".fleet"));
     }
 
     // Put `text` to the fleet conversation `c`. Live worker -> a steer on its next turn.
-    // Otherwise -> a goal carrying follow_up_to, which RelayWorker.__init__ resolves through
-    // socket_route.conversation_for_goal into the conversation that goal ran in, so the new
-    // worker continues THIS conversation instead of starting one that never heard it.
+    // Otherwise -> a goal carrying resume_conv, the conversation's own durable id, which
+    // RelayWorker.__init__ uses directly. follow_up_to is the FALLBACK, for a row captured
+    // before guids were recorded: the fleet then matches on the goal's TEXT, which is a guess
+    // and says so in its own log line. This comment used to describe that fallback as the
+    // mechanism, which stopped being true when resume_conv was added below -- and stayed
+    // wrong for as long as relay/fleet_runner.goals_from_command was silently dropping the
+    // field, so the guess really was what ran.
     void SendToFleetConversation(Conversation c, string text)
     {
         AddUser(text);
@@ -5015,24 +5021,16 @@ class ChatWindow : Window
         catch { return new int[] { 0, 0, 0 }; }
     }
 
+    // THE THIRD COPY OF THE SAME WRITER, now gone. This had its own read-append-write of
+    // commands.json, racing AppendCommand above and FleetCockpit.exe's writer; worse, it wrote
+    // Encoding.UTF8 -- WITH a BOM -- while the other two wrote none, so the encoding of the
+    // shared channel depended on which button was pressed last. Both now go through
+    // FleetCommands.Write: one file per command, utf-8 without a BOM, always.
     void EnqueueToFleet(string text, bool priority)
     {
-        try
-        {
-            string cp = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", ".fleet", "commands.json"));
-            var cmd = new Dictionary<string, object>();
-            if (File.Exists(cp))
-            {
-                try { var ex = _cjs.DeserializeObject(File.ReadAllText(cp, Encoding.UTF8)) as Dictionary<string, object>; if (ex != null) cmd = ex; } catch { }
-            }
-            var adds = new List<object>();
-            if (cmd.ContainsKey("add_goal") && cmd["add_goal"] is object[]) foreach (var o in (object[])cmd["add_goal"]) adds.Add(o);
-            var item = new Dictionary<string, object>(); item["text"] = text; item["priority"] = priority;
-            adds.Add(item);
-            cmd["add_goal"] = adds;
-            File.WriteAllText(cp, _cjs.Serialize(cmd), Encoding.UTF8);
-        }
-        catch { }
+        var item = new Dictionary<string, object>();
+        item["text"] = text; item["priority"] = priority;
+        AppendCommand("add_goal", item);
     }
 
     // ── #2 research-intent detection + confirm bar ───────────────────────────────

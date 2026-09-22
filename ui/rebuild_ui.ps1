@@ -39,8 +39,12 @@ function Build($name, $sources) {
     $f = Get-Item $out
     Write-Host ("BUILD OK: {0,-13} {1} bytes  {2}" -f $name, $f.Length, $f.LastWriteTime.ToString("HH:mm:ss"))
 }
-Build "FleetCockpit" @("FleetCockpit.cs","SelfImproveDashboard.cs","Theme.cs")
-Build "CopilotChat"  @("CopilotChat.cs","Markdown.cs","Theme.cs")
+# FleetCommands.cs is in BOTH lists on purpose: it is the single writer of the fleet command
+# channel and both binaries send commands. Leaving it out of one list is not a build error --
+# that binary just fails to compile, or worse, a future split would let one of them fall back
+# to its own writer again, which is the race this file exists to remove.
+Build "FleetCockpit" @("FleetCockpit.cs","SelfImproveDashboard.cs","Theme.cs","FleetCommands.cs")
+Build "CopilotChat"  @("CopilotChat.cs","Markdown.cs","Theme.cs","FleetCommands.cs")
 
 # 3) Launch both fresh (cockpit first; it will not relaunch a stale chat because we launch the new one).
 if (-not $NoLaunch) {
