@@ -531,6 +531,7 @@ jobs:
             relay/test_signin_residue_reaper.py \
             relay/test_socket_conversation_identity.py \
             bridge/test_send_contract.py \
+            bridge/test_the_bridge_http_surface_runs.py \
             bridge/test_a_promoted_send_has_nobody_to_ping.py \
             scripts/test_transport_series.py \
             tests/test_process_lookup_does_not_match_itself.py \

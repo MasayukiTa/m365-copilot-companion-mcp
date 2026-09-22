@@ -8,8 +8,13 @@ message. The queue is drained only by a running /goal loop at its next turn boun
 indefinitely: one has been in this machine's store since 07-07, in a session still marked
 active, which is exactly what "I typed into main and nothing happened" looks like from inside.
 
-Source-level, like the sibling bridge suites: copilot_bridge.py imports Playwright at module
-scope and cannot be imported on a runner.
+Source-level -- AND THE REASON GIVEN FOR THAT WAS STALE. This said "copilot_bridge.py
+imports Playwright at module scope and cannot be imported on a runner", and every bridge
+suite copied it. Measured 2026-09-22: the module imports in 2.6 s, starts no server and
+leaves one thread; the only `from playwright.sync_api import ...` is inside a function.
+The claim outlived whatever made it true and took the whole suite's ability to EXECUTE
+with it. bridge/test_the_bridge_http_surface_runs.py now stands the real Handler up on
+a spare port. What stays here is what is genuinely easier to read than to run.
 
 Run: pytest -q bridge/test_send_contract.py
 """
@@ -42,7 +47,21 @@ def test_the_reply_does_not_claim_an_outcome_it_cannot_know():
     # The comment explains what the key used to be called; the CODE must not use it.
     code = chr(10).join(l.split("#")[0] for l in body.splitlines())
     assert '"promoted"' not in code
-    assert "a turn is being run for it now" in body
+    # THIS LINE USED TO REQUIRE THE SENTENCE THAT MADE THE CLAIM. It read
+    # `assert "a turn is being run for it now" in body` -- the note the reply returned when
+    # nothing held the lock. The field had been renamed from "promoted" for asserting an
+    # outcome this reply cannot know, and the prose went on asserting it: _promote runs on
+    # another thread and fails outright when the page-owner thread is down, leaving the
+    # message queued and the operator told a turn had started. Measured 2026-09-22 against a
+    # handler stood up with no page thread.
+    #
+    # So this test pinned the defect in place, the same way
+    # ui/test_a_fleet_conversation_can_be_answered.py required the read-modify-write it was
+    # meant to guard against. It now asserts the absence of the claim; that the note is
+    # ACCURATE is checked by running the endpoint, in
+    # bridge/test_the_bridge_http_surface_runs.py.
+    assert "is being run for it now" not in body
+    assert "stays queued" in body
 
 
 def test_a_send_always_attempts_a_turn():
