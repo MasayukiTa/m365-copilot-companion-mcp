@@ -55,8 +55,18 @@ def tracked_python(repo=REPO, include_tests: bool = False) -> list:
     reports files that are not part of the repository -- which is the difference between a
     local result and what CI will see.
     """
+    # DECIDED, NOT BASELINED -- and this module's own launch is how the ratchet first proved
+    # it works. The baseline was generated while this file was still untracked, and
+    # `tracked_python` enumerates through `git ls-files`, so the scanner could not see itself:
+    # committing it made its own subprocess.run appear as a new undecided site and CI went red
+    # on the very test it belongs to. A scanner that cannot see itself until it is committed
+    # is worth knowing about; the answer here is the one the failure message asks for, which
+    # is to state a policy rather than to add a row. `git ls-files` prompts for nothing and
+    # its output is captured, so it is the unattended case headless_creationflags is for.
+    from tools import childproc
     out = subprocess.run(["git", "-C", repo, "ls-files", "*.py"],
-                         capture_output=True)
+                         capture_output=True,
+                         creationflags=childproc.headless_creationflags())
     rels = [l.strip() for l in (out.stdout or b"").decode("utf-8", "replace").splitlines()
             if l.strip()]
     if include_tests:
