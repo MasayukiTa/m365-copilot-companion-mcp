@@ -5722,6 +5722,22 @@ class RelayWorker:
                         "**タスクの失敗ではなくツール経路の問題**（ツール名の綴り、"
                         "コネクタ、または経路）。継続を促しても直らない。"
                         % self._unlanded_calls)
+                    # NEVER OBSERVED, AND THAT IS WHY IT IS RECORDED. Scanned 2026-09-22: 78
+                    # durable worker records and 470 status rows on this machine, zero
+                    # INFRA_STUCK and zero occurrences of this reason. The branch declares an
+                    # INFRASTRUCTURE fault -- the tool path is broken, not the task -- so the
+                    # first time it is right about that is worth knowing, and a status field
+                    # that a live snapshot overwrites each sweep is not where anybody would
+                    # find out. Same reason as refusal_recovery beside it: not a reader, a
+                    # signal.
+                    try:
+                        _mt.record("unlanded_calls", run_id=getattr(self, "run_id", ""),
+                                   instance=self.name, turn=getattr(self, "turn", None),
+                                   configured=True, config_source="always on",
+                                   eligible=True, triggered=True, executed=True,
+                                   extra={"consecutive": self._unlanded_calls})
+                    except Exception:
+                        pass
                     return
                 self.job = self._task_anchor(
                     "直前の返信にツール呼び出しの記述がありましたが、その呼び出しはサーバに"
