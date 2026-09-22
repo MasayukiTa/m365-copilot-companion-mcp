@@ -839,7 +839,7 @@ def _write_autostart(state_dir, rec: dict) -> None:
 OWNER_PID_GRACE_S = 3600.0
 
 
-def _still_owned(path: str) -> bool:
+def _still_owned(path: str, alive_cache=None) -> bool:
     """Is this pending entry still held by a live process that wrote it about itself?
 
     `relay/fleet_runner.py` writes one entry per CLI goal the moment it is known, so a
@@ -872,7 +872,18 @@ def _still_owned(path: str) -> bool:
         age = 0.0
     if age > OWNER_PID_GRACE_S:
         return False
-    return _pid_alive(pid)
+    # ONE LIVENESS QUERY PER PID PER PASS. `_pid_alive` shells out to tasklist, measured at
+    # 316 ms here, and a CLI run records ONE ENTRY PER GOAL -- all of them owned by the same
+    # process. Asking once per entry made a ten-goal run cost 3.2 s of every pass, against a
+    # --poll-s default of 2.0: the router would have spent its life in tasklist. The cache is
+    # a dict handed in by the caller and thrown away with the pass, so it cannot go stale and
+    # no test has to know it exists.
+    if alive_cache is None:
+        return _pid_alive(pid)
+    key = str(pid)
+    if key not in alive_cache:
+        alive_cache[key] = _pid_alive(pid)
+    return alive_cache[key]
 
 
 def _pid_alive(pid) -> bool:
@@ -1888,12 +1899,13 @@ def dispatch_once(now_ts=None):
     so this call always returns promptly regardless of approval-gate state."""
     ensure_dirs()
     out = []
+    alive_cache = {}                       # one liveness query per pid per pass
     for name in sorted(os.listdir(_p("pending", ""))):
         if not name.endswith(".json"):
             continue
         src = _p("pending", name)
         claimed = _p("running", name)
-        if _still_owned(src):
+        if _still_owned(src, alive_cache):
             continue
         try:
             os.replace(src, claimed)   # atomic claim; if another router grabbed it, this raises

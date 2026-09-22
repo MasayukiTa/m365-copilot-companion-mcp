@@ -105,6 +105,26 @@ def test_an_unparseable_entry_is_not_stranded_by_this(router):
     assert not os.path.isfile(p)
 
 
+def test_the_liveness_query_is_asked_once_per_pass(router, monkeypatch):
+    """**この検査そのものが、入れた側の回帰になりかけた。**
+
+    `_pid_alive` は `tasklist` を起動する — この箱で**実測 316ms**。そして CLI の記録は
+    **goal 1件につき entry 1件**で、全部が同じプロセスのもの。entry ごとに聞くと、
+    10件の run で**1パス 3.2秒**かかる。`--poll-s` の既定は 2.0 なので、ルータは
+    tasklist の中で一生を過ごすことになっていた。
+
+    1パス1問い合わせに畳む。キャッシュはパスと一緒に捨てられる辞書なので、
+    古くなりようがない。
+    """
+    calls = []
+    monkeypatch.setattr(router, "_pid_alive", lambda pid: calls.append(pid) or True)
+    for i in range(8):
+        _pending(router, "cli_%d" % i, owner_pid=os.getpid())
+    router.dispatch_once()
+    assert len(calls) == 1, "asked the OS %d times for one process" % len(calls)
+    assert all(_still_pending(router, "cli_%d" % i) for i in range(8))
+
+
 def test_the_writer_and_the_reader_agree_on_the_field_name(tmp_path):
     """**書き手と読み手が別モジュールにいる。** 片方だけ名前を変えても、上の検査は
     自分で書いた entry しか見ていないので通ってしまう。実際に書かせて確かめる。"""
