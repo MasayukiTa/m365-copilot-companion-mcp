@@ -542,6 +542,31 @@ def _record_rebless(args, before, after) -> None:
     """
     try:
         from relay.selfimprove import authority_ledger as _led
+        # CHECK THE CHAIN BEFORE ADDING TO IT. The ledger is hash-linked so that a record
+        # cannot be altered without breaking its successors -- and `verify`, the function that
+        # checks those links, had no caller anywhere in the repository. A chain nobody walks
+        # is a decoration: it would have gone on accepting appends onto a broken history and
+        # printing a tail that asserts a continuity it no longer has.
+        #
+        # Reported, not enforced, and deliberately so. Refusing to re-sign because the ledger
+        # is damaged would take the one action that records what happened and make it
+        # unavailable exactly when something has happened -- and the damage may be the very
+        # thing the operator is re-signing about. Saying it out loud, above the tail that is
+        # about to be printed, is the honest half.
+        #
+        # verify()'s own docstring says what an OK does NOT mean: a ledger rewritten from some
+        # point and re-chained verifies clean, and so does one whose tail was removed. This
+        # catches tampering that did not bother to re-chain, which is the cheap kind.
+        try:
+            _ok, _problems = _led.verify()
+            if not _ok:
+                print("WARNING: the authority ledger does not verify before this record:")
+                for _p in _problems[:5]:
+                    print("  - %s" % _p)
+                print("  (appending anyway -- refusing would remove the record of whatever "
+                      "is happening, which is the opposite of what this ledger is for)")
+        except Exception:
+            pass
         old = (before or {}).get("checksums", {})
         new = (after or {}).get("checksums", {})
         changed = {rel: {"before": old.get(rel), "after": new.get(rel)}

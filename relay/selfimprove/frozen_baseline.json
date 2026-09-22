@@ -12,7 +12,7 @@
     "docs/SECURITY.md": "cc35a60b69133f7d0a446bdea46381b65fb33df68a02f47c7cf603f050d9db74",
     "relay/selfimprove/authority_ledger.py": "82c365a34fc13c7e910724859be7819ce9fcd48a276e2d4fa4c8688555c95621",
     "relay/selfimprove/decision.py": "a92fc06ca9f5ea51f5aac47c2aeaf93ed7cf66d2bf8068e2b39df976894c3f5c",
-    "relay/selfimprove/frozen.py": "37d820b444266fc5c52d95b2ee973ccd62ac28b8cdfd9fc4ff2e15fae2acc673",
+    "relay/selfimprove/frozen.py": "f2d2cfc3bc886a4f57e560176f0111b6d00ad31bdd1d4d220c3cf40758f158b0",
     "relay/selfimprove/guards.py": "e773aed9d0e3736530e844d52f3b4e3f15d1d0406001bd9e82dffe84a4157302",
     "relay/selfimprove/harness_tree.py": "f10903a544d5fbb0270f8be5034976c87e33c8c5537f2596c9c183969abe76e6",
     "relay/selfimprove/manifest.py": "4e9c776bce316557f9f531a9f18638f29a6b55a4011a4a5f8ee81f76bc2b146b",

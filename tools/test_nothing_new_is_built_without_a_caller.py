@@ -102,7 +102,10 @@ NO_CALLER_BUT_TESTED = {
     "relay/selfimprove/planner_evaluator.py::preflight",           # 39 lines, revealed 2026-09-14
     "relay/outcomes.py::tally",                                    # 35 lines, revealed 2026-09-14
     "relay/selfimprove/solver_feedback.py::tally",                 # 27 lines, revealed 2026-09-14
-    "relay/selfimprove/authority_ledger.py::verify",               # 25 lines, revealed 2026-09-14
+    # WIRED 2026-09-22, so it leaves the inventory. relay/selfimprove/frozen._record_rebless
+    # now walks the chain before extending it: a hash-linked ledger whose verifier nobody
+    # called was accepting appends onto a history that might already be broken, and
+    # printing a tail that asserts a continuity it no longer had.
     "relay/selfimprove/decision.py::summarise",                    # 21 lines, revealed 2026-09-14
     "relay/selfimprove/apply.py::apply_genome",                    # 20 lines, revealed 2026-09-14
     "relay/turn_outcome.py::summarise",                            # 13 lines, revealed 2026-09-14
@@ -251,8 +254,6 @@ REASONS: dict[str, tuple[str, str]] = {
     "relay/outcomes.py::tally":
         ("revealed", "docs/unreached_burndown.md"),
     "relay/selfimprove/solver_feedback.py::tally":
-        ("revealed", "docs/unreached_burndown.md"),
-    "relay/selfimprove/authority_ledger.py::verify":
         ("revealed", "docs/unreached_burndown.md"),
     "relay/selfimprove/decision.py::summarise":
         ("revealed", "docs/unreached_burndown.md"),
