@@ -39,12 +39,17 @@ function Invoke-Csc {
     }
 }
 
+# EVERY reference either UI binary needs, given to both. The per-target split that used to live
+# here (Forms for the cockpit only) was a second place to keep a fact, and an unused /r: costs
+# csc nothing. CodeQL wants the sources compiled, not a minimal reference set.
 $wpfRefs = @(
     (Join-Path $wpf "PresentationFramework.dll"),
     (Join-Path $wpf "PresentationCore.dll"),
     (Join-Path $wpf "WindowsBase.dll"),
     (Join-Path $fw "System.Xaml.dll"),
-    (Join-Path $fw "System.Web.Extensions.dll")
+    (Join-Path $fw "System.Web.Extensions.dll"),
+    (Join-Path $fw "System.Windows.Forms.dll"),
+    (Join-Path $fw "System.IO.Compression.dll")
 )
 
 $manifest = Join-Path $ui "app.manifest"
@@ -53,25 +58,56 @@ if (Test-Path $manifest) {
     $manifestArgs = @("/win32manifest:$manifest")
 }
 
-Invoke-Csc `
-    -Name "CopilotChat" `
-    -References $wpfRefs `
-    -ExtraArgs $manifestArgs `
-    -Sources @(
-        (Join-Path $ui "CopilotChat.cs"),
-        (Join-Path $ui "Markdown.cs"),
-        (Join-Path $ui "Theme.cs")
-    )
+function Get-UiTargets {
+    <#
+      READ THE REAL BUILD'S LIST; DO NOT COPY IT.
 
-Invoke-Csc `
-    -Name "FleetCockpit" `
-    -References ($wpfRefs + (Join-Path $fw "System.Windows.Forms.dll")) `
-    -ExtraArgs $manifestArgs `
-    -Sources @(
-        (Join-Path $ui "FleetCockpit.cs"),
-        (Join-Path $ui "SelfImproveDashboard.cs"),
-        (Join-Path $ui "Theme.cs")
-    )
+      This file used to restate which .cs go into each binary, and the copy went stale the first
+      time a shared source was added: ui/FleetCommands.cs went into rebuild_ui.ps1's two Build
+      lines and nowhere else, and this step failed on main with
+      "CS0103: The name 'FleetCommands' does not exist in the current context" -- after a local
+      run that was green, because nothing local compiles C#.
+
+      bench/ui_build_check.py had already been fixed exactly this way, with the reason written
+      out: "READ FROM THE REAL BUILD, NOT COPIED FROM IT ... The same omission-by-hand has
+      broken this project's UI before." The answer was in the repository; this file was not
+      using it. ui/rebuild_ui.ps1 produces the shipped binaries, so its Build lines are the one
+      definition.
+
+      An unreadable list is a HARD FAILURE, never an empty one: compiling nothing would report
+      a clean CodeQL result for a UI that was never looked at.
+    #>
+    $path = Join-Path $ui "rebuild_ui.ps1"
+    $targets = @()
+    foreach ($line in (Get-Content -LiteralPath $path -Encoding UTF8)) {
+        $m = [regex]::Match($line, '^\s*Build\s+"([A-Za-z0-9_]+)"\s+@\((.*)\)\s*$')
+        if ($m.Success) {
+            $srcs = @()
+            foreach ($s in [regex]::Matches($m.Groups[2].Value, '"([^"]+\.cs)"')) {
+                $srcs += $s.Groups[1].Value
+            }
+            $targets += , @($m.Groups[1].Value, $srcs)
+        }
+    }
+    if ($targets.Count -eq 0) {
+        throw "no Build lines found in $path -- refusing to compile a source list I cannot read, because passing here would mean nothing"
+    }
+    return $targets
+}
+
+foreach ($t in (Get-UiTargets)) {
+    $name = $t[0]
+    $sources = @()
+    foreach ($s in $t[1]) {
+        $sources += (Join-Path $ui $s)
+    }
+    Write-Host ("  {0} <- {1}" -f $name, ($t[1] -join ", "))
+    Invoke-Csc `
+        -Name $name `
+        -References $wpfRefs `
+        -ExtraArgs $manifestArgs `
+        -Sources $sources
+}
 
 Invoke-Csc `
     -Name "VirtualDesktop11" `
