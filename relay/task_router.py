@@ -1985,8 +1985,11 @@ def _deliver_waiting_goals(now_ts=None, state_dir=None):
     its work with an atomic rename into running/, so two routers cannot both get the same job.
     This loop only reads the file and delivers, deleting it afterwards, so two routers running
     together WOULD hand the same goal over twice. What prevents that is not in this module:
-    scripts/supervisor.ps1:139 holds `Global\m365-copilot-companion-supervisor` as a
-    single-instance mutex and runs this with --once, sequentially.
+    scripts/supervisor.ps1:139 holds `Global\\m365-copilot-companion-supervisor` as a
+    single-instance mutex and runs this with --once, sequentially. (The doubled backslash is
+    the docstring escaping itself -- the mutex name has one. Writing it with one made this
+    an invalid escape sequence, which tools/test_a_backslash_in_a_literal_means_what_it_says
+    caught on a commit that changed nothing but prose.)
 
     So the exposure is a second router started BY HAND while the supervisor is up -- which is
     a documented thing to do -- and it is written down here rather than guarded because a
