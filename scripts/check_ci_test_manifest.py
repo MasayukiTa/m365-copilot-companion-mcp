@@ -52,10 +52,18 @@ EXCLUDED = {
     "tools/test_instructions_do_not_accumulate_cases.py":
         "asserts that skills/ is non-empty, but skills/ is gitignored on purpose "
         "(data, never code), so a fresh checkout has none by design",
-    "tests/test_integration_evidence.py":
-        "same source-walk, same separator assumption",
-    "tests/test_outcome_enum_closed.py":
-        "walks the source tree for assignments and misses them under Linux path separators, reporting DONE as never produced. A test-side portability bug, not a code defect",
+    # tests/test_integration_evidence.py AND tests/test_outcome_enum_closed.py WERE HERE
+    # AND ARE GONE, 2026-09-22. Their reasons said the source walk missed assignments
+    # under Linux path separators. On 2026-09-19 a careful read of both said the same
+    # thing -- one of them handles both separators explicitly -- and that read was NOT
+    # acted on, because "no portability problem is visible in the source" is not "it runs
+    # on Linux", and the pro_batching exclusion had just proved the difference by turning
+    # main red.
+    #
+    # The reporting step added to the ubuntu job runs every excluded file there and
+    # prints the outcome. First run: 13 passed and 21 passed. So the reasons had expired,
+    # and these two are registered on evidence instead of on an argument. The read was
+    # also WRONG IN DEGREE -- it suspected three stale exclusions and two were.
     "tools/test_judge_live_roundtrip.py":
         "live round trip against a running judge; no service in CI",
 }
