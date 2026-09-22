@@ -311,12 +311,17 @@ def _duplicate_of(text: str):
     return best
 
 
-def fleet_submit(goal: str, note: str = "", source: str = "") -> str:
+def fleet_submit(goal: str, note: str = "", source: str = "",
+                 priority: bool = False) -> str:
     """Queue a goal for this machine's worker fleet. Returns the job id.
 
     goal: the whole instruction, standalone -- whatever runs it will not see this
     conversation. note: context for the human reviewing the queue; never executed.
     source: where the instruction came from.
+    priority: jump the fleet's pending queue when a slot frees up. NOT a way to run sooner
+    than the machine can -- the fleet still waits for a free worker slot, and a priority goal
+    simply goes to the front of the line rather than the back. Default false, because a door
+    where everything is urgent has no priority at all.
 
     QUEUED, NOT STARTED. Nothing runs because this was called.
     """
@@ -342,7 +347,13 @@ def fleet_submit(goal: str, note: str = "", source: str = "") -> str:
     job = {
         "id": jid,
         "type": "fleet_goal",
-        "payload": {"goal": text, "note": _clean(note, 500)},
+        # `priority` IS ON THE PAYLOAD, BESIDE THE GOAL, because that is where the router
+        # reads a job's own fields. It travels to the fleet through every one of the three
+        # delivery paths -- joining a live run, starting one, and waiting in for_fleet/ --
+        # which is the part that had to be built rather than declared: the waiting path stored
+        # the goal as a bare .txt, so a field added here without touching it would have been
+        # dropped exactly the way resume_conv was.
+        "payload": {"goal": text, "note": _clean(note, 500), "priority": bool(priority)},
         "created": time.time(),
         # PROVENANCE TRAVELS WITH THE JOB. This arrived over a tunnel from an agent, which is
         # not the same authority as a person typing into the cockpit, and the consumer is

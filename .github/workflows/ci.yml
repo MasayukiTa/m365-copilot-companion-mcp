@@ -166,6 +166,7 @@ jobs:
             relay/test_a_compaction_that_launders_a_claim_is_worse_than_none.py \
             tools/test_a_rule_stated_twice_must_be_pinned_once.py \
             relay/test_fleet_handoff.py \
+            relay/test_priority_survives_every_delivery_route.py \
             relay/test_fanout_family_view.py \
             relay/test_verification_survives_the_archive.py \
             relay/test_fleet_autostart.py \

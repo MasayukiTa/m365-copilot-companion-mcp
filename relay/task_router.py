@@ -1284,7 +1284,31 @@ def recover_failed_autostart(state_dir=None, now=None) -> list:
     return restored
 
 
-def _write_for_fleet(jid, goal) -> bool:
+def read_for_fleet(text: str) -> tuple:
+    """A parked file's contents as (goal, priority). The inverse of `_write_for_fleet`.
+
+    OLD FILES ARE PLAIN TEXT AND MUST KEEP WORKING. Anything already sitting in for_fleet/
+    when this shipped is a bare goal, and so is every goal parked without a field worth
+    carrying -- which is nearly all of them. Only a goal that HAS something to carry is
+    written as JSON, so the format stays the cheap one by default and the reader tells them
+    apart by looking.
+
+    A goal whose own text begins with a brace is not mistaken for one: the parse has to
+    succeed AND produce a mapping with a `text` in it, and anything else falls back to
+    treating the whole contents as the goal, which is what it is.
+    """
+    body = text or ""
+    if body.lstrip().startswith("{"):
+        try:
+            obj = json.loads(body)
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict) and isinstance(obj.get("text"), str):
+            return obj["text"], bool(obj.get("priority"))
+    return body, False
+
+
+def _write_for_fleet(jid, goal, priority: bool = False) -> bool:
     """Put a waiting goal on disk so a reader never sees half of one. Returns whether it landed.
 
     THE EMPTY CHECK WAS NOT A TORN-WRITE CHECK. `_deliver_waiting_goals` skips a file whose
@@ -1302,9 +1326,14 @@ def _write_for_fleet(jid, goal) -> bool:
     ensure_dirs()
     path = _p("for_fleet", "%s.txt" % jid)
     tmp = _p("for_fleet", "%s.tmp" % jid)
+    # JSON ONLY WHEN THERE IS SOMETHING TO CARRY. A parked goal used to be its text and
+    # nothing else, so any field the door accepts was lost the moment no fleet was running --
+    # the same goal delivered a second later kept it. `read_for_fleet` reads both shapes.
+    body = json.dumps({"text": goal, "priority": True}, ensure_ascii=False) if priority \
+        else goal
     try:
         with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(goal)
+            fh.write(body)
     except OSError:
         return False
     until = time.time() + 2.0
@@ -1325,17 +1354,25 @@ def _write_for_fleet(jid, goal) -> bool:
     return False
 
 
-def _park_in_for_fleet(goal, jid):
+def _park_in_for_fleet(goal, jid, priority=False):
     """Write the goal into for_fleet/<jid>.txt so a waiting goal is visible on disk, not just
     named in a status string. Returns the handoff path label either way. Best-effort: a goal
     the queue cannot see is the very failure this module exists to prevent, but if the write
     itself fails the caller still reports "waiting" rather than a false "delivered"."""
-    _write_for_fleet(jid, goal)
+    _write_for_fleet(jid, goal, priority=priority)
     return "for_fleet/%s.txt" % jid
 
 
-def fleet_handoff(goal: str, jid: str, state_dir=None):
-    """Deliver a fleet-bound goal. Returns the (status, result) the job record should carry."""
+def fleet_handoff(goal: str, jid: str, state_dir=None, priority: bool = False):
+    """Deliver a fleet-bound goal. Returns the (status, result) the job record should carry.
+
+    `priority` HAS TO SURVIVE ALL THREE ROUTES OR IT IS A LIE ON ONE OF THEM. A goal leaves
+    here by joining a live run, by starting one, or by waiting in for_fleet/ -- and the third
+    stored nothing but the goal's text, so a field added at the door and not here would be
+    silently dropped by whichever route the machine happened to take. That is the shape
+    resume_conv had: set at one end, read at the other, lost in between, and working on one
+    path while guessing on another.
+    """
     if not (goal or "").strip():
         return "error", {"handoff": "for_fleet/%s.txt" % jid, "detail": "empty goal"}
     if fleet_is_live(state_dir):
@@ -1345,7 +1382,7 @@ def fleet_handoff(goal: str, jid: str, state_dir=None):
             os.remove(_ack_path(jid, state_dir))
         except OSError:
             pass
-        add_goal_to_live_fleet(goal, state_dir, jid=jid)
+        add_goal_to_live_fleet(goal, state_dir, priority=priority, jid=jid)
         # RECORD THE OPEN CLAIM so a later pass can check it. "dispatched" is written to done/
         # now, but done/ is terminal -- nothing re-reads it -- so on its own it can never be
         # corrected when the fleet turns out to have died inside the stale-status window. This
@@ -1356,6 +1393,11 @@ def fleet_handoff(goal: str, jid: str, state_dir=None):
         try:
             with open(_p("awaiting_ack", "%s.json" % jid), "w", encoding="utf-8") as _mf:
                 json.dump({"id": jid, "goal": goal, "ts": time.time(),
+                           # CARRIED SO THE RE-QUEUE IS NOT A DEMOTION. _reconcile_landings
+                           # re-parks from this marker when the ack never arrives, and a goal
+                           # that came back from a lost delivery is not less urgent than it
+                           # was when it left.
+                           "priority": bool(priority),
                            "ack": _ack_path(jid, state_dir)}, _mf, ensure_ascii=False)
         except OSError:
             pass
@@ -1374,20 +1416,21 @@ def fleet_handoff(goal: str, jid: str, state_dir=None):
             # above -- _read_goals_file() keeps a JSON-object goal line verbatim, so this
             # survives into the cold-started fleet's Worker unchanged. Without it, a goal
             # delivered via autostart could never be joined back to its admission record.
-            out = autostart_fleet([{"text": goal, "jid": jid}], state_dir)
+            out = autostart_fleet([{"text": goal, "jid": jid,
+                                    "priority": bool(priority)}], state_dir)
             if out.get("ok"):
                 return "dispatched", {"handoff": "for_fleet/%s.txt" % jid,
                                       "delivered": "autostart",
                                       "note": "started a fleet for this goal (pid %s)"
                                               % out.get("pid")}
-            return "awaiting_fleet", {"handoff": _park_in_for_fleet(goal, jid),
+            return "awaiting_fleet", {"handoff": _park_in_for_fleet(goal, jid, priority),
                                       "note": "autostart could not start a fleet: %s"
                                               % out.get("detail")}
-        return "awaiting_fleet", {"handoff": _park_in_for_fleet(goal, jid), "note": why}
+        return "awaiting_fleet", {"handoff": _park_in_for_fleet(goal, jid, priority), "note": why}
     # SAYS IT IS WAITING, rather than "dispatched". The old wording claimed delivery for a
     # file nobody read, and a status that overstates what happened is how a queue goes
     # unnoticed for months.
-    return "awaiting_fleet", {"handoff": _park_in_for_fleet(goal, jid),
+    return "awaiting_fleet", {"handoff": _park_in_for_fleet(goal, jid, priority),
                               "note": "no fleet run is in flight; the goal waits for one"}
 
 
@@ -1468,7 +1511,8 @@ def _reconcile_landings(now_ts=None, state_dir=None):
         requeued = False
         if (goal or "").strip():
             try:
-                requeued = _write_for_fleet(jid, goal)
+                requeued = _write_for_fleet(jid, goal,
+                                            priority=bool(marker.get("priority")))
             except OSError:
                 pass
         rec = {"id": jid, "type": "fleet_goal", "destination": "fleet", "ts_done": now_ts,
@@ -1877,10 +1921,15 @@ def run_job(job, now_ts=None):
             # that was delivered leaves no file, because its done/ record already says
             # "dispatched" and names how; a goal that was not leaves one, and every drain pass
             # tries the waiting ones again while a fleet is live.
-            goal = (job.get("payload") or {}).get("goal") or (job.get("payload") or {}).get("text", "")
-            rec["status"], rec["result"] = fleet_handoff(goal, jid)
+            payload = job.get("payload") or {}
+            goal = payload.get("goal") or payload.get("text", "")
+            prio = bool(payload.get("priority"))
+            rec["status"], rec["result"] = fleet_handoff(goal, jid, priority=prio)
             if rec["status"] != "dispatched":
-                _write_for_fleet(jid, goal)
+                # fleet_handoff already parked it on every non-dispatched path, carrying the
+                # priority with it; this second write is the belt to that braces and must
+                # carry the same field or it would overwrite the parked copy with a poorer one.
+                _write_for_fleet(jid, goal, priority=prio)
         else:  # claude
             with open(_p("for_claude", "%s.json" % jid), "w", encoding="utf-8") as f:
                 json.dump(job, f, ensure_ascii=False, indent=2)
@@ -2022,7 +2071,7 @@ def _deliver_waiting_goals(now_ts=None, state_dir=None):
         path = _p("for_fleet", name)
         try:
             with open(path, encoding="utf-8") as fh:
-                goal = fh.read()
+                goal, parked_priority = read_for_fleet(fh.read())
         except OSError:
             continue
         jid = name[:-4]
@@ -2038,7 +2087,7 @@ def _deliver_waiting_goals(now_ts=None, state_dir=None):
             if offered_cold:
                 continue                   # one cold start per pass -- see the docstring
             offered_cold = True
-        status, result = fleet_handoff(goal, jid, state_dir)
+        status, result = fleet_handoff(goal, jid, state_dir, priority=parked_priority)
         if status != "dispatched":
             continue                       # still no run; leave it waiting
         # DELETED ONLY AFTER DELIVERY SUCCEEDS. Removing it first would lose the goal if the
