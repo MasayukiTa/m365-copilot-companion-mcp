@@ -1267,14 +1267,51 @@ def recover_failed_autostart(state_dir=None, now=None) -> list:
         if not text:
             continue
         jid = uuid.uuid4().hex[:12]
-        try:
-            with open(_p("for_fleet", "%s.txt" % jid), "w", encoding="utf-8", newline="\n") as fh:
-                fh.write(text)
+        if _write_for_fleet(jid, text):
             restored.append(jid)
-        except OSError:
-            pass
     _write_autostart(sd, dict(rec, outcome="never_became_live", restored=restored))
     return restored
+
+
+def _write_for_fleet(jid, goal) -> bool:
+    """Put a waiting goal on disk so a reader never sees half of one. Returns whether it landed.
+
+    THE EMPTY CHECK WAS NOT A TORN-WRITE CHECK. `_deliver_waiting_goals` skips a file whose
+    contents are blank, which catches a write that had not started -- and nothing caught one
+    that had started and not finished. All four writers used a plain `open(..., "w")`, so a
+    reader arriving mid-write got a PREFIX of the goal, which is not blank, and handed the
+    fleet an instruction that stops in the middle of a sentence. A truncated goal is worse
+    than a missing one: it looks like something the operator wrote.
+
+    Same shape as `write_command`: a `.tmp` beside it, then `os.replace`, which is atomic on
+    NTFS. The reader already ignores anything that is not `.txt`, so a writer mid-flight is
+    invisible for free. The rename is retried briefly because Windows refuses it while another
+    process holds the target open -- measured there, and the same reason it is retried there.
+    """
+    ensure_dirs()
+    path = _p("for_fleet", "%s.txt" % jid)
+    tmp = _p("for_fleet", "%s.tmp" % jid)
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(goal)
+    except OSError:
+        return False
+    until = time.time() + 2.0
+    while True:
+        try:
+            os.replace(tmp, path)
+            return True
+        except PermissionError:
+            if time.time() > until:
+                break
+            time.sleep(0.02)
+        except OSError:
+            break
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    return False
 
 
 def _park_in_for_fleet(goal, jid):
@@ -1282,12 +1319,7 @@ def _park_in_for_fleet(goal, jid):
     named in a status string. Returns the handoff path label either way. Best-effort: a goal
     the queue cannot see is the very failure this module exists to prevent, but if the write
     itself fails the caller still reports "waiting" rather than a false "delivered"."""
-    ensure_dirs()
-    try:
-        with open(_p("for_fleet", "%s.txt" % jid), "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(goal)
-    except OSError:
-        pass
+    _write_for_fleet(jid, goal)
     return "for_fleet/%s.txt" % jid
 
 
@@ -1425,9 +1457,7 @@ def _reconcile_landings(now_ts=None, state_dir=None):
         requeued = False
         if (goal or "").strip():
             try:
-                with open(_p("for_fleet", "%s.txt" % jid), "w", encoding="utf-8") as fh:
-                    fh.write(goal)
-                requeued = True
+                requeued = _write_for_fleet(jid, goal)
             except OSError:
                 pass
         rec = {"id": jid, "type": "fleet_goal", "destination": "fleet", "ts_done": now_ts,
@@ -1839,8 +1869,7 @@ def run_job(job, now_ts=None):
             goal = (job.get("payload") or {}).get("goal") or (job.get("payload") or {}).get("text", "")
             rec["status"], rec["result"] = fleet_handoff(goal, jid)
             if rec["status"] != "dispatched":
-                with open(_p("for_fleet", "%s.txt" % jid), "w", encoding="utf-8") as f:
-                    f.write(goal)
+                _write_for_fleet(jid, goal)
         else:  # claude
             with open(_p("for_claude", "%s.json" % jid), "w", encoding="utf-8") as f:
                 json.dump(job, f, ensure_ascii=False, indent=2)
