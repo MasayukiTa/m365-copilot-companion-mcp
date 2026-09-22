@@ -1029,19 +1029,42 @@ _SEND_STAGE_AFTER_S = float(os.environ.get("MCP_SEND_STAGE_AFTER_S", "5"))
 _SEND_STAGE_PATH = os.path.join(".fleet", "send_stage.jsonl")
 
 
+#: Whether the "this log has stopped" line has already been written. Module state, because
+#: the alternative is one such line per slow send for the rest of the machine's life.
+_SEND_STAGE_CAPPED_SAID = False
+
+
 def _send_stage(t0, name, **extra):
     """One line per send() milestone once the send is already slow. Never raises."""
+    global _SEND_STAGE_CAPPED_SAID
     try:
         import json as _json
-        age = time.time() - t0
+        now = time.time()
+        age = now - t0
         if age < _SEND_STAGE_AFTER_S:
             return
         try:
             if os.path.getsize(_SEND_STAGE_PATH) > 2_000_000:
+                # SILENCE AND HEALTH USED TO LOOK THE SAME. Past the cap this returned, and a
+                # log that stops recording slow sends is indistinguishable from a machine that
+                # stopped having them -- which is the reading anyone would take, because it is
+                # the good news. One line, once, so the file says why it ends.
+                if not _SEND_STAGE_CAPPED_SAID:
+                    _SEND_STAGE_CAPPED_SAID = True
+                    with open(_SEND_STAGE_PATH, "a", encoding="utf-8") as fh:
+                        fh.write(_json.dumps(
+                            {"ts": now, "stage": "log_capped",
+                             "note": "past 2 MB; nothing after this line was recorded, so the "
+                                     "absence of later entries is this cap and not a quiet "
+                                     "machine"}, ensure_ascii=False) + chr(10))
                 return
         except OSError:
             pass
-        rec = {"age_s": round(age, 1), "stage": name}
+        # ts, NOT ONLY age_s. The absolute time was in hand -- `now` is what age_s is computed
+        # FROM -- and throwing it away left 519 rows that cannot be placed beside
+        # send_failures.jsonl, an incident, or each other. A duration answers "how slow"; only
+        # a timestamp answers "when", and "when" is the question every correlation starts with.
+        rec = {"ts": now, "age_s": round(age, 1), "stage": name}
         rec.update(extra)
         os.makedirs(os.path.dirname(_SEND_STAGE_PATH), exist_ok=True)
         with open(_SEND_STAGE_PATH, "a", encoding="utf-8") as fh:
