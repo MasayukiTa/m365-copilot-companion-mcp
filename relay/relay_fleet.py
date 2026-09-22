@@ -3167,6 +3167,34 @@ class RelayWorker:
             # reads first, and "identical task refused in two independent conversations" was
             # already the third branch's text typed out by hand.
             self.reason = d.reason
+            # THE TRIP-WIRE FOR A MOMENT NOBODY IS WATCHING FOR. The standing note about
+            # these fields says, correctly, not to build a reader yet -- measured 2026-09-20,
+            # every recovery_cause/result/state across 549 files and 1,574 worker records is
+            # empty and every fresh_replay_count is 0, because the mechanism is off by default
+            # and only bench/review_run.py turns it on. It then says the first non-empty value
+            # is when to build one.
+            #
+            # And nothing was going to say when that arrived. The fields travel three layers
+            # into a final snapshot that no UI, script or analysis reads, so the first real
+            # recovery would have landed in a file nobody opens, and the note would have gone
+            # on saying "not yet" indefinitely. That is the shape of a watcher that only
+            # reports changes and therefore cannot see a death -- here, cannot see a birth.
+            #
+            # One row in the ledger that IS read, written only when a cause is actually
+            # produced. Not a reader for the fields: a signal that the day to build one has
+            # come.
+            if self.recovery_cause:
+                try:
+                    _mt.record("refusal_recovery", run_id=getattr(self, "run_id", ""),
+                               instance=self.name, turn=getattr(self, "turn", None),
+                               configured=True, config_source="resilience_profile",
+                               config_value={"max_fresh_replays":
+                                             getattr(self, "max_fresh_replays", None)},
+                               eligible=True, triggered=True, executed=True,
+                               extra={"cause": self.recovery_cause,
+                                      "result": self.recovery_result})
+                except Exception:
+                    pass
         except Exception:
             pass
 

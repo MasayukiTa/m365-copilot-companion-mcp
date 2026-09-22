@@ -586,6 +586,7 @@ jobs:
             relay/test_an_invariant_has_a_call_site.py \
             relay/test_a_contract_is_checked_against_its_own_hash.py \
             relay/test_a_diagnosis_is_computed_not_transcribed.py \
+            relay/test_the_first_recovery_will_announce_itself.py \
             relay/test_the_timeout_record_names_its_own_clock.py \
             relay/test_the_prompt_asks_for_what_the_parser_reads.py \
             relay/test_mechanism_telemetry.py \
