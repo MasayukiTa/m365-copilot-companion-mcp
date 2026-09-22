@@ -56,7 +56,14 @@ MECHANISMS = ("fanout", "refuter", "panel", "veto", "retry", "bestofn", "skill",
               # is indistinguishable from any other goal. Measured while asking: 6 of 2,041
               # recorded goals carry the follow-up framing, so the neighbouring path IS used,
               # which is what made "and this one?" worth being able to answer.
-              "new_task_escape")
+              "new_task_escape",
+              # The refusal-recovery diagnosis. Registered 2026-09-22 as a TRIP-WIRE, not as a
+              # reader: measured 2026-09-20, every recovery_cause/result/state on this machine
+              # is empty and every fresh_replay_count is 0, and the standing decision is to
+              # build a reader when the first non-empty value appears. Nothing was going to
+              # announce that, because those fields land in a snapshot no UI or script opens.
+              # A row here is how the day gets noticed.
+              "refusal_recovery")
 
 
 def patch_hash(text):
