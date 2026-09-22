@@ -138,6 +138,22 @@ def funnel(rows, mechanism=None):
         trig = [r for r in elig if r.get("triggered")]
         exe = [r for r in trig if r.get("executed")]
         chg = [r for r in exe if r.get("changed_decision")]
+        # NOT REACHED IS NOT THE SAME AS ANSWERED NO, AND THIS FUNCTION USED TO SAY IT WAS.
+        # `record`'s own docstring sets the rule -- None means the step above stopped and the
+        # step was never reached, False means it was reached and the answer was no -- and adds
+        # that "collapsing those two is how a mechanism that is switched off comes to look
+        # like one that ran and did nothing". Every line above collapses them, because a None
+        # is falsy, and `stops_at` then reported the wrong stop.
+        #
+        # Measured on the live ledger 2026-09-22: `effort` had configured=416 and eligible=0,
+        # which read as "solving a problem that does not occur here". It is not. All 416 of
+        # those rows carry eligible=None -- eligibility was never determined, because that
+        # block records what was CONFIGURED at run start and nothing later writes the step.
+        # Same for refuter and fanout: 416 each, undetermined, exactly the same number,
+        # because one call site records all three the same way. Half of every "ineligible"
+        # row in the ledger is this.
+        undet = len([r for r in conf if r.get("eligible") is None])
+        said_no = len([r for r in conf if r.get("eligible") is False])
         out[m] = {
             "records": len(rs),
             "configured": len(conf),
@@ -145,10 +161,20 @@ def funnel(rows, mechanism=None):
             "triggered": len(trig),
             "executed": len(exe),
             "changed_decision": len(chg),
+            # The two halves of what used to be one number. A reader that only sees
+            # "eligible: 0" cannot tell a mechanism that never gets an opportunity from one
+            # whose opportunity is never assessed, and those call for opposite work: the
+            # first is a mechanism to retire, the second is an instrument to finish.
+            "eligibility_undetermined": undet,
+            "eligibility_said_no": said_no,
             # Where it stops is the finding. A mechanism with configured=0 was never given a
-            # chance; one with eligible=0 is solving a problem that does not occur here; one
-            # with changed_decision=0 ran and made no difference.
+            # chance; one with eligible=0 AND eligibility_said_no>0 is solving a problem that
+            # does not occur here; one with changed_decision=0 ran and made no difference.
+            #
+            # "not assessed" is its own stop and was previously reported as "no opportunity",
+            # which is a claim about the world made out of a gap in the record.
             "stops_at": ("never configured" if not conf else
+                         "not assessed" if not elig and not said_no else
                          "no opportunity" if not elig else
                          "did not trigger" if not trig else
                          "did not execute" if not exe else

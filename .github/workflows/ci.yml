@@ -586,6 +586,7 @@ jobs:
             relay/test_the_timeout_record_names_its_own_clock.py \
             relay/test_the_prompt_asks_for_what_the_parser_reads.py \
             relay/test_mechanism_telemetry.py \
+            relay/test_a_step_never_reached_is_not_a_step_that_said_no.py \
             relay/test_a_measured_timeout_is_not_a_guess.py \
             relay/test_the_repeat_signal_leaves_a_record.py \
             relay/test_one_goal_splits_once.py \
