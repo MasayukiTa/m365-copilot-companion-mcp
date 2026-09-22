@@ -260,6 +260,7 @@ jobs:
             relay/test_a_kept_for_claim_names_a_real_consumer.py \
             scripts/test_the_audit_sees_the_tree_that_will_be_pushed.py \
             scripts/test_the_loop_has_something_that_starts_it.py \
+            scripts/test_a_crash_is_not_a_verdict.py \
             scripts/test_a_script_suite_writes_where_a_test_writes.py \
             scripts/test_change_scope_keeps_the_four_apart.py \
             tools/test_a_backfilled_conversation_is_the_right_one.py \

@@ -544,20 +544,39 @@ Check "edge_companion" "Companion Edge running (:9222 fleet/agent)" `
 $signinPy = Join-Path $repo ".venv\Scripts\python.exe"
 if (-not (Test-Path $signinPy)) { $signinPy = "python" }
 $signinScript = Join-Path $repo "scripts\ensure_m365_signin.py"
+# READ THE VERDICT, NOT THE EXIT CODE. 1 means "I looked and found a sign-in wall" -- and a
+# traceback also exits 1. This branch mapped everything that was neither 0 nor 2 onto
+# "M365 signed in: FAIL -- run quickstart.bat again", so any unexpected exception in the
+# checker became a confident instruction to redo a sign-in that may be perfectly fine. The
+# operator hit exactly that contradiction on 2026-09-22: quickstart printed "[ OK ] signed in.
+# Continuing." and this line then said FAIL.
+#
+# ensure_m365_signin --check-only now prints "VERDICT: signed_in|sign_in_needed|cannot_tell"
+# as its last line. A missing verdict means the checker did not get far enough to have one,
+# which is "could not tell" -- never "not signed in".
 $signinCode = 2
+$signinOut = ""
 try {
-    & $signinPy $signinScript --check-only *> $null
+    $signinOut = (& $signinPy $signinScript --check-only 2>&1 | Out-String)
     $signinCode = $LASTEXITCODE
-} catch { $signinCode = 2 }
+} catch { $signinCode = 2; $signinOut = "" }
 
-if ($signinCode -eq 2) {
+$signinVerdict = "cannot_tell"
+if ($signinOut -match "VERDICT:\s*(\w+)") { $signinVerdict = $Matches[1] }
+
+if ($signinVerdict -eq "cannot_tell") {
+    $detail = if ($signinOut -match "VERDICT:") {
+        "the companion Edge did not answer, so this could not be checked; the Edge checks above say why"
+    } else {
+        "the sign-in checker did not report a verdict (exit $signinCode) -- it failed before deciding, which is NOT the same as 'not signed in'. Run it directly to see why: python scripts\ensure_m365_signin.py --check-only"
+    }
     Check "m365_signin" "M365 sign-in state (could not be determined)" `
         { $false } `
-        "the companion Edge did not answer, so this could not be checked; the Edge checks above say why" `
+        $detail `
         -Info
 } else {
     Check "m365_signin" "M365 signed in on the companion Edge" `
-        { $signinCode -eq 0 } `
+        { $signinVerdict -eq "signed_in" } `
         "run quickstart.bat again -- it opens the sign-in window for you and waits. You only need to sign in once; it persists across restarts."
 }
 
