@@ -1087,6 +1087,19 @@ def _record_cli_submission(state_dir, goals, argv):
                 # SAME SHAPE AS fleet_submit's, so one reader serves both routes and the
                 # difference in authority stays legible.
                 "origin": {"via": "cli", "source": " ".join(str(a) for a in (argv or [])[:6])[:300]},
+                # WHOSE ENTRY THIS STILL IS. These land in tasks/pending/, which is not a
+                # display surface -- it is task_router's inbox, and dispatch_once claims every
+                # .json in it. So writing one here to make the submission VISIBLE also offered
+                # it for dispatch, and the window is everything between this line and
+                # _clear_cli_submission: reading goals, bringing Edge up, the whole startup.
+                # The router polls every couple of seconds. Measured artifact in the tree:
+                # cli1789703602_14000_0.delivered.json, a CLI entry the router delivered.
+                #
+                # The distinction that was missing is "still mine" versus "abandoned", and
+                # this pid is it. The router skips an entry whose owner is alive and takes one
+                # whose owner is gone -- which is the recovery the comment above this function
+                # actually wanted: a run that never starts must not leave the goal stranded.
+                "owner_pid": os.getpid(),
             }
             p = os.path.join(pend, "%s.json" % jid)
             tmp = p + ".tmp"

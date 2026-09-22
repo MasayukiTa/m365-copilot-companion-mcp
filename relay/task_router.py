@@ -833,6 +833,48 @@ def _write_autostart(state_dir, rec: dict) -> None:
         pass
 
 
+#: How long an `owner_pid` is believed. A pid is not a durable identity -- Windows reuses
+#: them -- so after this the entry is treated as abandoned whatever the pid says. An hour is
+#: far longer than any fleet startup and far shorter than a pid recycles in practice.
+OWNER_PID_GRACE_S = 3600.0
+
+
+def _still_owned(path: str) -> bool:
+    """Is this pending entry still held by a live process that wrote it about itself?
+
+    `relay/fleet_runner.py` writes one entry per CLI goal the moment it is known, so a
+    submission is visible before anything can refuse it -- but tasks/pending/ is not a display
+    surface, it is this module's inbox, and dispatch_once claims everything in it. Without
+    this the router could deliver a goal into a live fleet while the process that wrote it was
+    starting up to run the same goal itself. Measured artifact: a cli*.delivered.json beside
+    the cli*.json the same run wrote.
+
+    ABANDONED IS THE CASE THAT MUST STILL WORK. A run that dies during startup leaves its
+    entry behind with a dead pid, and taking it then is the whole point of recording it -- an
+    unclaimed entry is the difference between "refused" and "never happened". So this answers
+    "still mine", not "mine at all".
+
+    UNREADABLE MEANS NOT OWNED. A file that vanished (another router claimed it) or will not
+    parse must fall through to the claim, where the rename decides and a parse error becomes
+    a done-record. Refusing to claim on a read failure would strand it silently instead.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            job = json.load(fh) or {}
+    except Exception:
+        return False
+    pid = job.get("owner_pid")
+    if not pid:
+        return False
+    try:
+        age = time.time() - float(job.get("created") or 0.0)
+    except Exception:
+        age = 0.0
+    if age > OWNER_PID_GRACE_S:
+        return False
+    return _pid_alive(pid)
+
+
 def _pid_alive(pid) -> bool:
     """Whether a launched runner is still around. Windows has no os.kill(0), so ask the OS."""
     try:
@@ -1822,6 +1864,8 @@ def dispatch_once(now_ts=None):
             continue
         src = _p("pending", name)
         claimed = _p("running", name)
+        if _still_owned(src):
+            continue
         try:
             os.replace(src, claimed)   # atomic claim; if another router grabbed it, this raises
         except OSError:
