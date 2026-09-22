@@ -135,12 +135,32 @@ def test_a_conversation_with_no_recorded_goal_says_so_instead_of_guessing():
 
 # ── the command file is shared, so writing to it must not eat anything ─────────────────────
 
-def test_the_command_file_is_merged_rather_than_overwritten():
-    """.fleet/commands.json is consumed whole and has more than one writer (EnqueueToFleet,
-    the cockpit, task_router). A blind write would drop whatever is already queued."""
+def test_the_writer_does_not_read_modify_write_a_shared_file():
+    """THIS TEST USED TO REQUIRE THE DEFECT IT WAS GUARDING AGAINST.
+
+    It read `assert "ReadAllText(cp" in body` -- the merge -- on the reasoning that
+    .fleet/commands.json has several writers and a blind write would drop whatever was already
+    queued. The reasoning was right and the remedy was not reachable: FleetCockpit.exe and
+    CopilotChat.exe are separately built processes, so a merge inside one of them could never
+    order the other, and whichever wrote second still deleted the first's command. Making that
+    merge mandatory pinned a race in place.
+
+    On 2026-09-22 both binaries moved to one file per command in .fleet/commands.d/, which
+    removes the read-modify-write instead of guarding it -- and THIS TEST FAILED THE FIX. A
+    source assertion naming yesterday's design does not protect the property; it protects the
+    spelling, and it fails on the improvement rather than on the bug.
+
+    So it now asserts the property's SHAPE only: nothing here reads the shared file back.
+    The property itself is proved by executing both sides --
+    ui/test_the_ui_and_the_fleet_agree_on_the_command_channel.py compiles the real writer and
+    checks that two commands sent in a row both arrive.
+    """
     body = _block(_code(), "bool AppendCommand(")
-    assert "ReadAllText(cp" in body and "items.Add(item)" in body
-    assert "UTF8Encoding(false)" in body, "a BOM here is read by Python on the other side"
+    assert "ReadAllText" not in body, (
+        "the writer reads the shared command file back before writing, which is the "
+        "read-modify-write two separate processes cannot make safe")
+    assert "FleetCommands.Write" in body, (
+        "the writer no longer goes through the one command writer both binaries compile")
 
 
 # ── the conversation carries what it needs to be addressed ────────────────────────────────
