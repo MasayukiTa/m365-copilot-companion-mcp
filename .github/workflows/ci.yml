@@ -195,6 +195,7 @@ jobs:
             ui/test_state_is_not_a_turn_in_the_conversation.py \
             relay/test_the_prompt_carries_a_location_not_a_catalogue.py \
             relay/test_a_follow_up_carries_the_conversation_id.py \
+            relay/test_a_verb_that_leaves_no_trace_cannot_be_asked_about.py \
             relay/test_a_cli_goal_is_not_dispatched_while_its_own_run_is_starting.py \
             ui/test_deployed_cockpit_matches_its_source.py \
             ui/test_an_approval_button_always_moves_the_queue.py \

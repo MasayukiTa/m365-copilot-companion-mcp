@@ -1992,6 +1992,13 @@ def goals_from_command(cmd) -> list:
                 # chat window did not. One feature, two routes, one of them silently guessing.
                 if it.get("resume_conv"):
                     g["resume_conv"] = it["resume_conv"]
+                # WHICH VERB SENT IT, carried for the same reason as the four above and with
+                # the same hazard in mind: a field set at one end and dropped here is what
+                # made resume_conv a guess for weeks. The chat window sets this only for a
+                # `/goal ` submission, and the fleet records it as a mechanism -- so this is
+                # a field with a reader before it had a writer's second line.
+                if it.get("new_task"):
+                    g["new_task"] = True
                 out.append(g)
             elif isinstance(it, str) and it:
                 out.append({"text": it, "priority": False})
@@ -2661,6 +2668,20 @@ def main():
             # native chat / cockpit queued a new goal into the running fleet
             for g in goals_from_command(cmd):
                 add_box.append(g)
+                # THE ONE PLACE A `/goal ` SUBMISSION IS STILL VISIBLE. The command file is
+                # deleted the moment it is read, and after that this goal looks like any
+                # other -- which is why "has anyone ever used /goal" was unanswerable rather
+                # than merely unanswered. Recorded where the item arrives, not where the
+                # worker starts, because the verb is a property of the submission.
+                if g.get("new_task"):
+                    try:
+                        from relay import mechanism_telemetry as _mt
+                        _mt.record("new_task_escape", configured=True,
+                                   config_source="chat window `/goal ` prefix",
+                                   eligible=True, triggered=True, executed=True,
+                                   extra={"has_resume_conv": bool(g.get("resume_conv"))})
+                    except Exception:
+                        pass
             # pause / resume the whole fleet: {"pause": true} freezes it in place (no new
             # turns, no new tabs), {"pause": false} resumes. Handy right before a network
             # switch so in-flight work isn't lost. Takes effect on the next sweep.
