@@ -128,8 +128,13 @@ class RealInjector(Injector):
 
     def orphan_detached_child(self) -> None:
         # REAL: spawn a nested detached child of an already-detached driver to reproduce
-        # the mid-run reap; assert guards.launch_detached for top-level + blocking
-        # children otherwise keeps the child alive.
+        # the mid-run reap; assert the blocking-child shape keeps the worker progressing.
+        #
+        # THIS USED TO NAME `guards.launch_detached`, which had no caller anywhere and was
+        # deleted 2026-09-19. A deferred scenario that names a mechanism keeps that name
+        # alive as though it were the plan, so whoever implements F6 would have reached for
+        # a function that is gone -- and for a flag (DETACHED_PROCESS) that
+        # relay/task_router.py measured as harmful and test_fleet_autostart.py now fails on.
         raise NotImplementedError(self._DEFERRED)
 
 
@@ -300,7 +305,7 @@ SCENARIOS: Dict[str, Scenario] = {
         name="nested-detach-orphan",
         failure_id="F6",
         description="A detached child of an already-detached driver gets reaped mid-run; "
-                    "launch_detached / blocking-children must keep the worker progressing.",
+                    "the blocking-child shape must keep the worker progressing.",
         inject=lambda inj: inj.orphan_detached_child(),
         recovered=lambda p: p.fleet_progressing(),
     ),

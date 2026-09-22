@@ -55,10 +55,7 @@ NO_CALLER_NO_TEST = {
     "tools/auto/office_password_recovery.py::office_password_recovery",
     "relay/autonomy_gate.py::judge_autonomy",                    # 54 lines
     "tools/judge_backend.py::ask_human_async",                   # 18 lines
-    "relay/selfimprove/guards.py::launch_detached",              # 16 lines
-    "tools/security.py::get_client_ip",                          # 12 lines
     "relay/autonomy_gate.py::constraints_text",                  # 5 lines
-    "tools/security.py::is_trusted_local",                       # 3 lines
     "relay/review_resilience.py::looks_like_capability_failure", # 2 lines
     "relay/review_resilience.py::looks_like_output_filter",      # 2 lines
     "relay/review_resilience.py::looks_like_transient_error",    # 2 lines
