@@ -703,6 +703,30 @@ jobs:
       - name: Run Windows path tests
         run: python -m pytest -q tools/test_file_ops.py
 
+      # NON-BLOCKING ON PURPOSE, AND THIS IS THE REPORT, NOT THE GATE.
+      #
+      # These two files skip on the ubuntu job by construction: one needs a real console
+      # allocation and the other needs csc.exe. That leaves them running nowhere, verified by
+      # whoever last touched them and nobody else -- green by omission, which this repository
+      # has a whole audit script about.
+      #
+      # They are not made blocking yet because THIS runner is not the machine they were
+      # measured on. A GitHub Windows runner has no interactive desktop, and whether a
+      # console allocated there reports itself as VISIBLE is a question about that
+      # environment, not about the code. Registering a file on the strength of an assumption
+      # about the runner is exactly how main went red on 2026-09-19 (bench/test_pro_batching
+      # was added believing FLEET_FLOOR_GIB would fall back to 3.0; the runner read >5.6 and
+      # four tests failed). So: run them, print the outcome, gate nothing.
+      #
+      # WHAT TO DO WITH THE RESULT. If this step passes on a few runs, drop
+      # continue-on-error and it becomes a real gate. If it fails, the log says how the
+      # runner differs -- which is the measurement that was missing -- and either the test
+      # gains a skip for that condition or it stays here as a report.
+      - name: Windows-only tests (reporting, not gating)
+        continue-on-error: true
+        run: |
+          python -m pytest -rsx tools/test_a_windowless_launch_really_has_no_window.py ui/test_the_ui_and_the_fleet_agree_on_the_command_channel.py
+
       # The keyboard table lives here rather than on the ubuntu job because
       # tools/desktop_input.py binds ctypes.windll.user32 at import, so the module cannot
       # be imported at all on Linux. The test sends no input: every assertion is about the
