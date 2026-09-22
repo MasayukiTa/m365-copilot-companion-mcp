@@ -195,6 +195,11 @@ BLANK_BY_DESIGN = {
     ("tools/skill_ops.py", "skill"):
         "runs in the MCP SERVER process; no worker identity crosses the gateway, which is the "
         "same gap tool_ledger records by leaving `task` empty and attributing by path instead",
+    ("relay/fleet_runner.py", "new_task_escape"):
+        "recorded where the command ARRIVES, before any worker is assigned -- run_id here is "
+        "derived from a worker's transcript name (`_run_id_of`) and there is no worker yet. "
+        "The verb is a property of the submission, not of the sweep that later picks it up, "
+        "so a blank id is the honest answer rather than a gap",
 }
 
 _MECH_NAME = re.compile(r'_mt\.record\(\s*"([a-z_]+)"')
