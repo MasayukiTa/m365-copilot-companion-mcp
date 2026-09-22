@@ -718,6 +718,26 @@ jobs:
           import importlib.util, subprocess, sys
           spec = importlib.util.spec_from_file_location("m", "scripts/check_ci_test_manifest.py")
           m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+          # A FILE THAT RUNS SOMEWHERE ELSE IS NOT A FINDING. The first version of this printed
+          # "fail" beside tools/test_trace.py (script-style: pytest collects nothing from it, by
+          # design) and scripts/test_prune_edge_cache.py (run by windows-install-smoke), both of
+          # whose reasons SAY where they run. Calling those failures buries the two rows that
+          # actually mean something -- the same mistake as an exclusion audit that cannot tell
+          # which step a path belongs to.
+          try:
+              scripted = m.script_style_suites()
+          except Exception:
+              scripted = set()
+          # NAMED ANYWHERE IN THE WORKFLOW COUNTS. script_style_suites() only knows the files
+          # the script-style RUNNER walks, and tools/test_trace.py is invoked directly by its
+          # own step (`python tools/test_trace.py`), so the first version of this classified a
+          # file the workflow runs by hand as running nowhere. An excluded path cannot be in
+          # the hermetic list -- the audit above fails if it is -- so appearing in this file at
+          # all means some step runs it.
+          wf = open(".github/workflows/ci.yml", encoding="utf-8").read()
+          elsewhere = {r for r in m.EXCLUDED
+                       if r in scripted or r in wf
+                       or "windows-install-smoke" in (m.EXCLUDED[r] or "")}
           files = sorted(m.EXCLUDED)
           print("running %d excluded file(s) on this runner\n" % len(files))
           verdict = {}
@@ -726,19 +746,22 @@ jobs:
                                   "-p", "no:cacheprovider", rel],
                                  capture_output=True, text=True)
               tail = [l for l in (r.stdout or "").splitlines() if l.strip()][-1:] or ["(no output)"]
-              verdict[rel] = (r.returncode, tail[0][:120])
-          print("=" * 72)
+              verdict[rel] = (r.returncode, tail[0][:110])
+          print("=" * 78)
           for rel, (rc, line) in verdict.items():
-              print("%-4s %-52s %s" % ("PASS" if rc == 0 else "fail", rel, line))
-          passing = [r for r, (rc, _) in verdict.items() if rc == 0]
-          print("=" * 72)
+              tag = "runs elsewhere" if rel in elsewhere else ("PASS HERE" if rc == 0 else "fails here")
+              print("%-14s %-50s %s" % (tag, rel, line))
+              print("%-14s   reason: %s" % ("", (m.EXCLUDED[rel] or "")[:100]))
+          passing = [r for r, (rc, _) in verdict.items() if rc == 0 and r not in elsewhere]
+          print("=" * 78)
           if passing:
-              print("THESE PASSED HERE, so their exclusion reason has expired and they can be")
-              print("registered in the hermetic list with evidence:")
+              print("THESE PASSED HERE AND RUN NOWHERE ELSE, so their exclusion reason has")
+              print("expired and they can be registered in the hermetic list with evidence:")
               for rel in passing:
                   print("   " + rel)
           else:
-              print("none passed; every exclusion still describes something real on this runner")
+              print("nothing to move: every exclusion either still fails here or runs in")
+              print("another job, and the reason printed above says which")
           PY
 
   windows-install-smoke:
