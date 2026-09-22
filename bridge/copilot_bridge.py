@@ -2809,17 +2809,36 @@ def _outer_read_trace(t0, cleaned, final, partial):
         pass
 
 
+#: Whether the "this log has stopped" line has already been written. See its use.
+_SETTLE_RESET_CAPPED_SAID = False
+
+
 def _settle_reset_trace(t0, final, stable_text, gen_active):
+    global _SETTLE_RESET_CAPPED_SAID
     try:
-        age = time.time() - t0
+        now = time.time()
+        age = now - t0
         if age < _SETTLE_RESET_TRACE_AFTER_S:
             return
         try:
             if os.path.getsize(_SETTLE_RESET_TRACE_PATH) > _SETTLE_RESET_TRACE_MAX_BYTES:
+                # A LOG THAT STOPS QUIETLY READS AS GOOD NEWS. Past the cap this returned, so
+                # the absence of later entries meant either "the settle no longer resets" or
+                # "the file filled up", and nothing on disk said which. One line, once.
+                if not _SETTLE_RESET_CAPPED_SAID:
+                    _SETTLE_RESET_CAPPED_SAID = True
+                    with open(_SETTLE_RESET_TRACE_PATH, "a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(
+                            {"ts": now, "event": "log_capped",
+                             "note": "size limit reached; nothing after this line was "
+                                     "recorded"}, ensure_ascii=False) + chr(10))
                 return
         except OSError:
             pass
         rec = {
+            # ts, NOT ONLY age_s -- the absolute time is what age_s was computed from, and
+            # without it these rows cannot be placed beside anything else that happened.
+            "ts": now,
             "age_s": round(age, 1), "gen_active": bool(gen_active),
             "final_len": len(final or ""), "stable_len": len(stable_text or ""),
             "final_tail": (final or "")[-80:], "stable_tail": (stable_text or "")[-80:],
