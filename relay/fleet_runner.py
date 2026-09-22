@@ -1839,10 +1839,26 @@ def read_commands(state_dir) -> list:
     nothing merges, so nothing can clobber, and a writer needs no lock at all -- it only has to
     land its own file atomically.
 
-    The legacy commands.json is still read, and must stay read: the shipped cockpit binaries
-    write it, and they are built separately from this file. With the Python writers moved to
-    commands.d/ the cockpit is its only writer, so its lack of a lock stops mattering -- one
-    writer cannot race itself.
+    The legacy commands.json is still read, and must stay read: a shipped cockpit binary
+    predating the migration writes it, and those are built separately from this file.
+
+    THIS PARAGRAPH USED TO SAY THE LACK OF A LOCK STOPPED MATTERING BECAUSE "the cockpit is
+    its only writer -- one writer cannot race itself". THAT WAS FALSE, and write_command's own
+    docstring said so the whole time: the lock "could not fix it for ui/CopilotChat.cs, which
+    writes the same file from a separately built binary". Counted 2026-09-22: THREE hand-rolled
+    read-modify-writers across TWO processes -- ui/FleetCockpit.cs (ReadCommands/WriteCommands,
+    a dozen callers), ui/CopilotChat.cs AppendCommand, and ui/CopilotChat.cs EnqueueToFleet,
+    which also wrote a BOM where the other two did not. Two docstrings in one system
+    contradicted each other and the optimistic one was the wrong one.
+
+    What it cost, if it had not been found: a lost add_goal or steer, indistinguishable from
+    one never sent; an already-consumed command put back by a writer that read before the
+    os.remove below and wrote after it, which is a duplicate goal; and a torn File.WriteAllText
+    destroyed rather than preserved, because the legacy branch removes an unparseable file
+    instead of renaming it .bad the way the commands.d branch does.
+
+    The C# writers were migrated to commands.d/ on 2026-09-22, which is what actually removes
+    the race -- a lock was never available across those two binaries.
 
     A file that will not parse is renamed .bad rather than deleted, so it stops being retried
     forever without the instruction in it being destroyed. `.tmp` files are a writer mid-flight
