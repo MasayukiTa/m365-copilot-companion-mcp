@@ -44,10 +44,26 @@ import pytest
 _UI = os.path.dirname(os.path.abspath(__file__))
 _EXE = os.path.join(_UI, "FleetCockpit.exe")
 
-#: The .cs files build_cockpit.bat / rebuild_ui.ps1 compile into FleetCockpit.exe. Read from the
-#: build scripts' own list rather than globbed, so a new source file added to the build is a
-#: deliberate edit here and an unrelated .cs in ui/ does not make every run look stale.
-_SOURCES = ("FleetCockpit.cs", "SelfImproveDashboard.cs", "Theme.cs")
+#: The .cs files that compile into FleetCockpit.exe, PARSED OUT OF rebuild_ui.ps1 -- the script
+#: that actually produces the binary -- rather than restated here.
+#:
+#: The comment this replaces said the list was "read from the build scripts' own list", and it
+#: was not: it was a copy, and on 2026-09-22 it went stale like every other copy when
+#: ui/FleetCommands.cs was added to the build. Four files carried this same list; this one said
+#: it did not have to.
+def _sources_for(target: str) -> tuple:
+    path = os.path.join(_UI, "rebuild_ui.ps1")
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            m = re.match(r'\s*Build\s+"([A-Za-z0-9_]+)"\s+@\((.*)\)\s*$', line)
+            if m and m.group(1) == target:
+                return tuple(re.findall(r'"([^"]+\.cs)"', m.group(2)))
+    raise AssertionError(
+        "no Build line for %r in %s -- this test cannot say which sources belong to the binary, "
+        "and guessing would let it pass on the wrong set" % (target, path))
+
+
+_SOURCES = _sources_for("FleetCockpit")
 
 #: The archive writer's own assignments: `e["<name>"] = ...` inside FleetCockpit.cs. Derived
 #: from the source instead of hand-listed so a field added tomorrow is covered without anyone

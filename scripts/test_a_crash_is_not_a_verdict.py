@@ -27,20 +27,26 @@ from __future__ import annotations
 import io
 import os
 import re
-import subprocess
 import sys
 
 import pytest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
+from tools import childproc  # noqa: E402
+
 SCRIPT = os.path.join(REPO, "scripts", "ensure_m365_signin.py")
 DOCTOR = io.open(os.path.join(REPO, "scripts", "doctor.ps1"),
                  encoding="utf-8", errors="replace").read()
 
 
 def _run(*args):
-    r = subprocess.run([sys.executable, SCRIPT] + list(args),
-                       capture_output=True, text=True, timeout=120)
+    """**Not `text=True`.** This file exists to say that a crash is not a verdict, and a
+    locale decode is the way to lose the crash AND the verdict together: `text=True` decodes
+    the child with cp932 here, so one non-cp932 byte takes the whole of stdout, leaving the
+    reader to guess from an exit code -- the exact reading this file forbids the doctor.
+    `tools/test_child_output_is_not_decoded_by_luck.py` caught this on CI."""
+    r = childproc.run([sys.executable, SCRIPT] + list(args), timeout=120)
     return r.returncode, (r.stdout or "") + (r.stderr or "")
 
 

@@ -1,6 +1,9 @@
 """Compile both WPF C# sources to TEMP exes (does not touch the running CopilotChat.exe /
 FleetCockpit.exe) to verify they build cleanly. Reports csc errors verbatim."""
-import os, re, subprocess
+import os, re, sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from tools import childproc  # noqa: E402
 
 FW = r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319"
 CSC = os.path.join(FW, "csc.exe")
@@ -40,11 +43,15 @@ targets = _targets_from_rebuild_script()
 for _name, _srcs in targets:
     print("target", _name, "=", ", ".join(_srcs))
 
+failed = []
 for name, srcs in targets:
     cmd = [CSC, "/nologo", "/target:winexe", "/out:" + os.path.join(OUT, name + ".exe")]
     cmd += ["/r:" + r for r in refs]
     cmd += [os.path.join(UI, s) for s in srcs]
-    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+    # `text=True, errors="replace"` decoded csc with the local code page and the error line came
+    # back as mojibake on this machine -- "error CS0103: 蜷榊燕 'FleetCommands' ..." -- which is
+    # the whole content of the report. A check whose finding cannot be read has not reported it.
+    r = childproc.run(cmd)
     print("=" * 60)
     print(name, "rc=", r.returncode)
     out = (r.stdout or "") + (r.stderr or "")
@@ -54,3 +61,15 @@ for name, srcs in targets:
             print("  ", l.strip())
     else:
         print("   clean (no errors/warnings)")
+    if r.returncode != 0:
+        failed.append(name)
+
+# AND IT HAS TO BE ABLE TO FAIL. This printed "rc= 1" and then exited 0, so every caller -- a
+# shell, a CI step, ui/_buildcheck.bat, a person reading $? -- saw a pass. A check that reports
+# a break only in prose is a check nobody can wire up, and on 2026-09-22 this one would have
+# caught ui/FleetCommands.cs missing from a build list before CI did, had anyone been able to
+# read its verdict. Printing is not reporting.
+if failed:
+    raise SystemExit("UI BUILD CHECK FAILED: " + ", ".join(failed))
+print("=" * 60)
+print("all %d target(s) built" % len(targets))
