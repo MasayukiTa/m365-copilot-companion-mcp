@@ -199,6 +199,7 @@ jobs:
             ui/test_deployed_cockpit_matches_its_source.py \
             ui/test_an_approval_button_always_moves_the_queue.py \
             ui/test_a_fleet_conversation_can_be_answered.py \
+            ui/test_a_ledger_the_ui_writes_has_no_byte_order_mark.py \
             ui/test_the_ui_and_the_fleet_agree_on_the_command_channel.py \
             ui/test_a_setting_that_is_off_is_said_out_loud.py \
             ui/test_fleet_cockpit_health.py \
