@@ -149,23 +149,26 @@ def _parse_request(req) -> tuple[bool, str]:
     return derive_identity(peer, xff)
 
 
-def get_client_ip() -> str:
-    """Return the identity IP for the current request (used for unlock lookup).
-
-    Kept for backward-compat with callers that just need the IP string.
-    For security decisions (is_genuine_local) use _parse_request() directly.
-    """
-    try:
-        req = get_http_request()
-    except Exception:
-        return ""
-    _, ip = _parse_request(req)
-    return ip
-
-
-def is_trusted_local(ip: str) -> bool:
-    """Legacy helper — do NOT use for security decisions; use _parse_request()."""
-    return ip in TRUSTED_LOCAL_PEERS
+# TWO LEGACY HELPERS REMOVED HERE, 2026-09-19. Both had zero callers and both said so in
+# their own way:
+#
+#   get_client_ip()    "Kept for backward-compat with callers that just need the IP string."
+#                      There were none. relay/test_a_kept_for_claim_names_a_real_consumer.py
+#                      carried it as the ONE outstanding frozen-file claim, reported rather
+#                      than failed, because correcting prose is not worth a re-signing of the
+#                      security baseline on its own. That reasoning was right and it expired:
+#                      this file was being re-signed anyway, so the cheapest correct moment
+#                      to remove a false claim arrived.
+#
+#   is_trusted_local() "Legacy helper -- do NOT use for security decisions."
+#                      A short, inviting name that warns against itself is worse than no
+#                      helper: the next caller reaches for it and silently skips the
+#                      X-Forwarded-For handling that `_parse_request` exists to do. Nothing
+#                      used it, so nothing is lost and the invitation is gone.
+#
+# `_parse_request(get_http_request())` is the one way to ask who is calling, which is what
+# derive_identity's docstring already asked for: "add call sites against derive_identity()
+# instead, so there remains exactly one place that decides how the IP is derived."
 
 
 def is_unlocked(ip: str) -> bool:

@@ -83,11 +83,19 @@ def select_fresh_slice(spec_path, n, burned, seed):
 def _run_solve_arm(spec_path, targets_file, preds_dir, tag, toggle, on, chunk, conc, turns, floor):
     """Run one solve arm to completion as a BLOCKING child of this driver.
 
-    loop.py is itself the durable, detached parent (launched via Start-Process / launch_detached),
-    so the solve orchestrator runs as a normal tracked child here -- the same parent/child shape that
-    survived for hours in the manual runs. (An earlier version launched the arm *detached from this
-    already-detached driver*; the double-detach orphaned it and it was reaped mid-run.) Returns
-    (rc, env_log); rc==0 and a fresh done marker mean the arm finished cleanly.
+    loop.py is itself the durable parent, so the solve orchestrator runs as a normal tracked child
+    here -- the same parent/child shape that survived for hours in the manual runs. (An earlier
+    version launched the arm *detached from this already-detached driver*; the double-detach
+    orphaned it and it was reaped mid-run.) Returns (rc, env_log); rc==0 and a fresh done marker
+    mean the arm finished cleanly.
+
+    THIS USED TO SAY "launched via Start-Process / launch_detached" AND THE SECOND HALF WAS NEVER
+    TRUE. `guards.launch_detached` had no caller anywhere in the repository for as long as it
+    existed and was deleted on 2026-09-19; a reader here would have believed a mechanism was in
+    place that was not. The durability this driver has comes from whatever started it -- the
+    PowerShell supervisor's restart loop when it runs under one -- and NOT from a detach flag.
+    The load-bearing half of this docstring is the sentence in brackets, which is a measured
+    failure and is unchanged: the arm must stay a blocking child of this process.
     """
     env_log = os.path.join(SWEDIR, "solve_decoupled_%s.log" % tag)
     for p in (os.path.join(SWEDIR, "solve_decoupled_%s.lock" % tag),

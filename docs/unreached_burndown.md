@@ -931,3 +931,91 @@ catalogue when nudged toward one?) and was swept into commit `0bfb871` by a broa
 along with a home path that made the identity guard red. The forged artifact itself is kept
 deliberately — the self-assessment is the reason it exists — but nothing decided it should be
 tracked; a wide `git add` decided that.
+
+---
+
+## 2026-09-19/20: nine rows answered, and the instrument was wrong again
+
+**The scan could not see `tests/`.** `tools/unreached.ROOTS` listed relay, bench, tools, bridge
+and scripts. Not tests. No file under that directory was read for any purpose, so the "refs in
+tests" column answered **0 for every function the tests/ suite covers** — and a silently-zero
+column for a whole directory reads exactly like a measurement, which is why it lasted.
+
+`tools/golden.py::run_trajectory` reported 0 against the **five** references in
+`tests/test_golden.py`, a file that exists for nothing else, four tests, registered in CI. It
+was filed in `NO_CALLER_NO_TEST`, whose comment reads *"nothing calls them and nothing checks
+them"* and calls itself the starkest — an argument for deletion, made in the inventory's own
+voice. `relay/lean_capture.py::capture_fn` was filed there too, and **its own docstring names
+the two tests in `tests/test_lean_capture.py` that assert through it**: the prose knew and the
+inventory said the opposite.
+
+> This file's standing rule is *"a false 'reached' is worse than a false 'unreached'"*, because
+> a row that disappears is never read. This is that rule one column over, and the failure is
+> worse rather than quieter: **a false "nothing tests it" does not hide the row, it argues for
+> deleting what the row names.**
+
+Two of the four misfiled entries needed no fix to the scan at all — they were put on the wrong
+side by hand with the correct count printed beside them. So the split is no longer a judgement
+anybody has to remember to make: `test_the_two_sets_agree_with_the_scan` checks it against the
+number. `is_test` now recognises the *directory*, so `tests/_srcprobe.py` — a helper the suite
+imports, named like production code — does not become an inventory entry the moment `tests/`
+becomes readable.
+
+### What left the baseline
+
+| entry | outcome |
+|---|---|
+| `relay/review_resilience.py::looks_like_transient_error` | **kept, unwired, with a reason.** It was written to compute `fresh_was_transient_error`, and every caller of `diagnose_after_fresh_replay` passed that as the literal `False` — so TRANSIENT and UNKNOWN, two of its four answers, could not occur. The fix went in at `_decide`'s wrapper (eighteen `INFRA_STUCK` settle sites; a line at each would be the defect restated), and it does NOT call this predicate: relay_fleet already holds the same judgement in five marker families that overlap `TRANSIENT_MARKERS` and diverge from it both ways. The path that settled the worker already decided, and its decision is in `outcome` |
+| `bench/companionbench/job_authority.py::free_port` | **deleted.** Docstring said "Only for tests" and no test used it, while `tests/test_checkpoint_port_probe.py` carried its own byte-identical copy. Third test-only helper re-derived rather than shared; moved to `conftest.py`, where the scanner does not look and a helper is not a permanent inventory row |
+| `relay/selfimprove/run_archive.py::revisions` | **wired.** Its docstring says it "reports the span and a human decides" — and the only table a human reads, `report()`, never called it, so the human it defers to was shown nothing to decide on |
+| `bench/skill_use_log.py::observe` | **wired.** It was called as `observe(s, e, path) if False else {…}` — the call disabled by a literal with a narrower copy of its result typed out beside it. The copy existed to avoid re-reading the file per window; `observe` now takes the rows |
+| `bench/skill_use_log.py::compare_runs` | moved to `NO_CALLER_BUT_TESTED`; still unreached, now tested |
+| `scripts/collect_lens_corpus.py::all_inconclusive` | **deleted.** It described a defect a different mechanism had already fixed. A predicate whose stated purpose is already served reads as though the protection lives there |
+| `scripts/collect_lens_corpus.py::all_unclear` | **deleted.** Its last production consumer was a keep/discard site that made the same call two ways from its siblings; once that was brought in line, the only references left were tests describing the predicate — "kept for the tests" is the justification this repository keeps removing |
+| `scripts/collect_lens_corpus.py::load_corpus` | **deleted.** Identical to `analyze_lens_corpus.load`, which has callers. Sharing would mean the analyzer importing the collector — and with it `bench.companionbench.episode`, `calibration` and `fleet_agent` — to read one jsonl |
+| `tools/security.py::get_client_ip` / `is_trusted_local` | **deleted** (pending a re-signing). See below |
+| `relay/selfimprove/guards.py::launch_detached` | **deleted** (pending a re-signing). See below |
+
+### The one outstanding "Kept for" claim, and why it stopped being outstanding
+
+`tools/security.py::get_client_ip` said *"Kept for backward-compat with callers that just need
+the IP string"* and there were none. `relay/test_a_kept_for_claim_names_a_real_consumer.py`
+held it as the single known exception, **reported rather than failed**, because correcting
+prose in a frozen file means an operator re-signs the security baseline — not a trade worth
+making for a sentence.
+
+That reasoning never became wrong. **Its premise expired**: the file was being re-signed for an
+unrelated change, so removing the false claim cost nothing extra — and the function went with
+it rather than the sentence, because there was no consumer to describe correctly.
+`is_trusted_local` went at the same time: *"Legacy helper — do NOT use for security decisions"*,
+zero callers, and a short inviting name. **A helper that warns against itself is worse than no
+helper**, because the next caller reaches for it and silently skips the X-Forwarded-For handling
+`_parse_request` exists to do.
+
+### A function two modules said was keeping them alive
+
+`relay/selfimprove/guards.py::launch_detached` had no caller anywhere, and yet:
+
+* `relay/selfimprove/loop.py` — *"loop.py is itself the durable, detached parent (launched via
+  Start-Process / launch_detached)"*
+* `relay/soak.py` F6 — *"launch_detached / blocking-children must keep the worker progressing"*,
+  in a scenario that is itself `NotImplementedError`
+
+A reader of either believed a mechanism was in place. The durability those processes do have
+comes from the PowerShell supervisor's `while ($true)` loop under a global mutex.
+
+**And the flag it used is one this repository measured and rejected.** `relay/task_router.py`
+chooses `CREATE_NO_WINDOW` and explicitly not `DETACHED_PROCESS`, with the finding beside it —
+a console application started by a process with no console gets a brand new one, so *"every
+goal sent from a phone popped a black window on a desktop nobody was sitting at"* — and
+`relay/test_fleet_autostart.py` fails if it comes back. That comment also settles the premise
+this function rested on: *"Detachment was never what kept the child alive: Windows does not
+kill children when a parent exits unless they share a job object."* Wiring it would have
+re-introduced a flag under test elsewhere for being harmful, to solve a problem the same
+comment says it does not solve.
+
+It was also in `relay/selfimprove/__init__.__all__`, which is why **"no caller" and "not public
+API" were two different facts about it**. The scan counts `ast.Name`/`ast.Attribute` and says in
+its own header that a name reached through "a table of handler strings" is invisible to it.
+`__all__` is such a table: the declaration that this was part of the package's surface never
+made anything call it, and nothing ever did.

@@ -12,7 +12,6 @@ without re-deriving the discipline.
   4. classify_outcome /
      partition_outcomes    -- separate infra faults from real misses; only real feed diagnosis
   5. proc_alive /
-     launch_detached /
      done_after_last_start -- process discipline learned the hard way this session
 """
 from __future__ import annotations
@@ -302,22 +301,42 @@ def _proc_alive_cim(cmdline_substr: str) -> int:
         return 0
 
 
-def launch_detached(args: list[str], cwd: str, stdout_path: str, stderr_path: str) -> int:
-    """Launch a durable background process that survives this shell / the harness reaper.
-
-    The python equivalent of `Start-Process -WindowStyle Hidden`: a new process group, detached, no
-    console. Git Bash `nohup &` and harness `run_in_background`+`exec` both got reaped this session;
-    this does not. Returns the child pid.
-    """
-    creationflags = 0
-    if os.name == "nt":
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "DETACHED_PROCESS", 0)
-    os.makedirs(os.path.dirname(stdout_path) or ".", exist_ok=True)
-    out = open(stdout_path, "ab")
-    err = open(stderr_path, "ab")
-    p = subprocess.Popen(args, cwd=cwd, stdout=out, stderr=err, stdin=subprocess.DEVNULL,
-                         creationflags=creationflags, close_fds=True)
-    return p.pid
+# `launch_detached` WAS HERE AND IS GONE, 2026-09-19. It launched a background process with
+# CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS, and its docstring reported a real measurement:
+# "Git Bash `nohup &` and harness `run_in_background`+`exec` both got reaped this session;
+# this does not."
+#
+# NOTHING EVER CALLED IT, and two modules' prose said otherwise, which is why it is worth a
+# paragraph rather than a silent deletion:
+#
+#   relay/selfimprove/loop.py  "loop.py is itself the durable, detached parent (launched via
+#                               Start-Process / launch_detached)"
+#   relay/soak.py F6           "launch_detached / blocking-children must keep the worker
+#                               progressing" -- a scenario that is itself NotImplemented
+#
+# A reader of either believed a mechanism was in place. It was not, and the durability those
+# processes do have comes from somewhere else entirely: the PowerShell supervisor's
+# `while ($true)` restart loop under a global mutex (scripts/supervisor.ps1), and the bridge's
+# own keepalive loop.
+#
+# THE FLAG IT USED IS ONE THIS REPOSITORY MEASURED AND REJECTED. relay/task_router.py chooses
+# CREATE_NO_WINDOW and explicitly not DETACHED_PROCESS, with the finding written beside it --
+# a console application started by a process with no console gets a brand new one, so "every
+# goal sent from a phone popped a black window on a desktop nobody was sitting at" -- and
+# relay/test_fleet_autostart.py fails if DETACHED_PROCESS comes back. That comment also
+# settles the premise this function rested on: "Detachment was never what kept the child
+# alive: Windows does not kill children when a parent exits unless they share a job object."
+#
+# So the row was answered by deleting, not by wiring: wiring it would have re-introduced a
+# flag under test elsewhere for being harmful, to solve a problem the same comment says it
+# does not solve. It also does not belong in a module of ENFORCING GUARDS, where its presence
+# meant every edit to a process-launch utility required re-signing the judge.
+#
+# IT WAS IN `relay/selfimprove/__init__.__all__`, which is why "no caller" and "not public
+# API" were two different facts about it. The unreached scan counts ast.Name/ast.Attribute
+# references and says so in its own header: a name reached through "a table of handler
+# strings" is invisible to it. `__all__` is such a table. So the declaration that this was
+# part of the package's surface never made anything call it, and nothing ever did.
 
 
 def done_after_last_start(log_path: str, start_marker: str, done_marker: str) -> bool:

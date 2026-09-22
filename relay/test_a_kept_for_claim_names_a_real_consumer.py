@@ -72,9 +72,18 @@ try:
 except Exception:                                  # pragma: no cover - import-order safety
     FROZEN_MANIFEST = []
 
-#: The one outstanding frozen-file claim, 2026-09-14. `get_client_ip` says "Kept for
-#: backward-compat with callers that just need the IP string", and there are none.
-KNOWN_FROZEN = {"tools/security.py::get_client_ip"}
+#: EMPTY SINCE 2026-09-19, AND THE REASON IT WAS EVER NON-EMPTY IS WORTH KEEPING. It held
+#: `tools/security.py::get_client_ip`, which said "Kept for backward-compat with callers that
+#: just need the IP string" while there were none. It was reported rather than failed because
+#: tools/security.py is frozen, so correcting prose meant an operator re-signing the security
+#: baseline -- not a trade worth making for a sentence.
+#:
+#: That reasoning did not become wrong; its premise expired. The file was being re-signed for
+#: an unrelated change, so removing the false claim cost nothing extra, and the function went
+#: with it rather than the sentence: there was no consumer to describe correctly.
+#:
+#: STILL PINNED, EMPTY. A new frozen-file claim must fail rather than quietly join a list.
+KNOWN_FROZEN: set[str] = set()
 
 
 def _docstring(rel, name):

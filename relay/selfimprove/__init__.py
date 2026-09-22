@@ -13,7 +13,6 @@ from .guards import (
     classify_outcome,
     partition_outcomes,
     proc_alive,
-    launch_detached,
     done_after_last_start,
 )
 from .archive import (
@@ -87,7 +86,6 @@ __all__ = [
     "classify_outcome",
     "partition_outcomes",
     "proc_alive",
-    "launch_detached",
     "done_after_last_start",
     "Archive",
     "genome_id",
