@@ -5460,6 +5460,7 @@ class RelayWorker:
         # turn, and continue. Capped per worker (max_research); past the cap, tell it to proceed.
         rq = extract_research(resp)
         if rq and self._context is not None and self.max_research > 0:
+            self._record_effort_budget("research")
             if self.research_count >= self.max_research:
                 self.job = ("これ以上は調査を依頼できません（上限到達）。今ある情報で進めるか、"
                             "無理なら最後の行に STUCK: 理由 と書いてください。")
@@ -5490,6 +5491,7 @@ class RelayWorker:
         az = extract_analyze(resp)
         if az and self._context is not None and self.max_research > 0:
             apath, ainstr = az
+            self._record_effort_budget("analyze")
             if self.research_count >= self.max_research:
                 self.job = ("これ以上は分析を依頼できません（上限到達）。自前ツールで分析するか、"
                             "無理なら最後の行に STUCK: 理由 と書いてください。")
@@ -5921,6 +5923,52 @@ class RelayWorker:
     #: still reported an unchecked self-report. That is the gap this closes.
     VERIFY_CLAIM_AGAINST_LEDGER = (os.environ.get("MCP_VERIFY_CLAIM", "1").strip().lower()
                                    not in ("", "0", "no", "off", "false"))
+
+    def _record_effort_budget(self, kind):
+        """The `effort` mechanism, recorded at the one moment it decides anything.
+
+        WHAT IT WAS BEFORE. `effort` was written to mechanisms.jsonl exactly once per run, at
+        start, as configured=True with the two budgets as its config_value -- and nothing ever
+        wrote the eligibility step. Measured 2026-09-22: 416 records, configured 416, and the
+        funnel reported eligible=0, whose own comment glosses that as "solving a problem that
+        does not occur here". It is not. All 416 carried eligible=None, which is "never
+        assessed", and reading a gap in the record as a fact about the world is what the
+        summary was corrected for in the same pass as this.
+
+        AND THE BUDGET HAS ACTUALLY BITTEN. Counted over 34,594 recorded fleet turns: 5 turns
+        asked RESEARCH and 13 asked ANALYZE, across 10 workers -- and one of those workers
+        asked five times against a cap of three, with another landing exactly on it. So this
+        is not a mechanism waiting for its situation; it is one that has fired in production
+        and left nothing in the ledger, which is why answering "did the budget ever bite"
+        needed the archaeology above rather than a query.
+
+        ONE HELPER, TWO CALL SITES, rather than a line at each outcome. The research and
+        analyze branches share a budget and each has its own cap check, so a line per outcome
+        would be four -- and the fifth, added later, would be the one that is missed. That is
+        the argument `_decide` makes about its eighteen give-ups, applied at the size where it
+        is still small.
+
+        Never raises: a mechanism record must not be able to fail the mechanism.
+        """
+        try:
+            blocked = self.research_count >= self.max_research
+            _mt.record("effort", run_id=getattr(self, "run_id", ""), instance=self.name,
+                       turn=getattr(self, "turn", None),
+                       configured=True, config_source="run",
+                       config_value={"max_research": self.max_research,
+                                     "max_refute": self.max_refute},
+                       # The request arrived and a budget governs it: that is the opportunity.
+                       eligible=True,
+                       # TRIGGERED MEANS THE BUDGET REFUSED, not that a delegation happened.
+                       # This mechanism is the cap, so its firing is the refusal; the
+                       # delegation going ahead is the budget NOT being reached.
+                       triggered=bool(blocked),
+                       not_triggered_reason=("" if blocked else
+                                             "within budget (%d of %d used)"
+                                             % (self.research_count, self.max_research)),
+                       extra={"kind": kind, "used": self.research_count})
+        except Exception:
+            pass
 
     def _settle_done(self):
         """THE ONLY PLACE THIS WORKER BECOMES DONE.
