@@ -29,9 +29,10 @@ incidents lost.
 from __future__ import annotations
 
 import locale
+import os
 import subprocess
 
-__all__ = ["decode", "run"]
+__all__ = ["decode", "run", "headless_creationflags"]
 
 
 def decode(raw) -> str:
@@ -89,3 +90,35 @@ def run(cmd, **kw):
     except AttributeError:          # capture_output=False -> both are None already
         pass
     return proc
+
+
+def headless_creationflags() -> int:
+    """`creationflags` for a child that must never put a window on the desktop.
+
+    A VALUE, NOT A DEFAULT, and that is the whole design. `CREATE_NO_WINDOW` does not mean
+    "the parent's console, hidden" -- it means the child gets NO console attachment, so
+    anything that reads through CONIN$, prompts for an ssh passphrase or a git credential, or
+    expects a terminal, stops working. Making it the default for `run` would change the I/O
+    contract of every caller in this repository to fix a window-allocation defect in a few of
+    them. Callers that are unattended by construction ask for it by name; nothing else is
+    touched.
+
+    WHY THIS IS NEEDED AT ALL: measured 2026-09-19, a console program started by a parent with
+    NO CONSOLE allocates a brand new one, which Windows Terminal then shows -- a black window
+    on an unattended desktop (PID 18152, class CASCADIA_HOSTING_WINDOW_CLASS). Any launch
+    whose parent is `wscript.exe`, a WPF process, or a scheduled task is in that position.
+    `capture_output=True` does not help: it redirects the pipes and never touches console
+    allocation.
+
+    `CREATE_NEW_PROCESS_GROUP` IS DELIBERATELY NOT HERE, although the one call site that
+    predates this function pairs the two. It creates a group with Ctrl+C handling initially
+    disabled, and `GenerateConsoleCtrlEvent` requires the recipient to share the sender's
+    console -- which a windowless child does not have. So it cannot be a graceful-stop channel
+    here, and it is not being used as one: `CTRL_BREAK_EVENT`, `CTRL_C_EVENT`, `send_signal`
+    and `GenerateConsoleCtrlEvent` appear in ZERO tracked files (measured 2026-09-22).
+    Shutdown is `taskkill /T` and file flags. A flag that buys nothing and disables a signal
+    path is not a default.
+    """
+    if os.name != "nt":
+        return 0
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0)
