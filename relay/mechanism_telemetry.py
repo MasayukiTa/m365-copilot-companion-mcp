@@ -48,7 +48,15 @@ MECHANISMS = ("fanout", "refuter", "panel", "veto", "retry", "bestofn", "skill",
               # REGISTERED, because summarise() walks this tuple -- an unregistered
               # mechanism still gets written (record() says so deliberately) but never
               # appears in any summary, which is an instrument with no reader.
-              "tree_moved_after_verify")
+              "tree_moved_after_verify",
+              # The chat window's `/goal ` verb, which turns what would have been a steer into
+              # a new task in the same conversation. Registered 2026-09-22 because the standing
+              # question about it -- has anyone ever used it -- had no answer anywhere: the
+              # command is consumed and deleted, and once the item is gone a `/goal` submission
+              # is indistinguishable from any other goal. Measured while asking: 6 of 2,041
+              # recorded goals carry the follow-up framing, so the neighbouring path IS used,
+              # which is what made "and this one?" worth being able to answer.
+              "new_task_escape")
 
 
 def patch_hash(text):

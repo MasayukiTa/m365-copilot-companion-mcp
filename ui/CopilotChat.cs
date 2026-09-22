@@ -4994,6 +4994,13 @@ class ChatWindow : Window
             g["resume_conv"] = c.ConvUrl;
         g["follow_up_to"] = goal;
         g["priority"] = true;
+        // SAY WHICH VERB SENT THIS. A `/goal ` submission and an ordinary follow-up leave the
+        // same shape behind once the command file is consumed, so "has anyone ever used
+        // /goal" had no answer anywhere -- the standing list carried it as a mechanism that
+        // may never have fired, with no way to find out. The fleet turns this into one
+        // mechanisms.jsonl row; without it the question stays unanswerable however long it
+        // is asked.
+        if (forceNewGoal) g["new_task"] = true;
         bool ok = AppendCommand("add_goal", g);
         if (!ok) { AddAssistant(T("fleet_send_failed")); StickToEnd(); return; }
         AddAssistant(FleetState()[0] == 1 ? T("fleet_follow_sent") : T("fleet_follow_idle"));
