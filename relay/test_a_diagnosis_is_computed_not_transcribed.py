@@ -128,6 +128,8 @@ def test_every_settle_path_goes_through_it():
     -- could not occur in production at all, and `review_resilience.looks_like_transient_error`
     (written to compute that argument) had no caller anywhere. This file had already found the
     same defect one level up, in the answers; the arguments were still transcribed.
+    (That predicate was deleted on 2026-09-22: `_decide` supplies the argument from the
+    outcome the settling path already decided, so nothing was left for it to compute.)
 
     The fourth site is not a fourth settle path. It is `_decide`'s wrapper, which observes the
     transition into a terminal state and covers all EIGHTEEN of the INFRA_STUCK give-ups at

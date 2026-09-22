@@ -101,14 +101,25 @@ OUTPUT_FILTER_MARKERS = (
     "content filter blocked the response",
 )
 
-TRANSIENT_MARKERS = (
-    "予期しないエラー",
-    "システムエラー",
-    "something went wrong",
-    "unexpected error",
-    "try again later",
-    "network error",
-)
+# TRANSIENT_MARKERS AND looks_like_transient_error WERE HERE AND ARE GONE, 2026-09-22.
+#
+# The function had no caller anywhere in the repository for as long as it existed, and the
+# module that would have been its caller had already written down why it never would be:
+# relay/relay_fleet.py, in _decide, says calling it "would be a THIRD copy of a judgement this
+# file already makes", because relay_fleet carries five live marker families
+# (transient/agent-dead, tool-unreachable, canned-nonanswer, admin-block, throttle) whose
+# vocabulary overlaps this one and diverges from it in both directions. The path that settled
+# a worker has already decided, and what it decided is in `outcome` -- better evidence than
+# matching the same strings a third time.
+#
+# docs/unreached_burndown.md reached the same verdict from the other side and called it
+# DUPLICATE, with relay_fleet.TRANSIENT_ERROR_MARKERS a live superset of these six strings.
+# Two independent routes to "delete", so it is deleted rather than left listed: an unwired
+# detector beside four wired ones reads as a family with a gap, and the next person to reach
+# for it would be re-introducing the third copy this repository already refused once.
+#
+# The three comments elsewhere that named TRANSIENT_MARKERS to explain that divergence now
+# name the live family instead, so nothing points at a symbol that is not here.
 
 
 def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
@@ -128,8 +139,6 @@ def looks_like_output_filter(text: str) -> bool:
     return _contains_any(text, OUTPUT_FILTER_MARKERS)
 
 
-def looks_like_transient_error(text: str) -> bool:
-    return _contains_any(text, TRANSIENT_MARKERS)
 
 
 def diagnose_after_fresh_replay(

@@ -27,12 +27,15 @@
 
 ## なぜ本文を読み直さないか
 
-`looks_like_transient_error(resp)` を呼べば、**この判断の3つ目の写し**ができる。
+本文をここで突き合わせれば、**この判断の3つ目の写し**ができる。
 relay_fleet は既に5つのマーカー族（transient/agent-dead・tool-unreachable・
-canned-nonanswer・admin-block・throttle）で同じことを、しかも `review_resilience` の
-`TRANSIENT_MARKERS` と双方向にずれた語彙で判定している。**worker を終わらせた経路は
-既に判定を下していて、その結論は `outcome` に入っている。** 同じ文字列を3回目に
-突き合わせるより、それを読むほうが強い証拠。
+canned-nonanswer・admin-block・throttle）で同じことを判定していて、そのうち
+`TRANSIENT_ERROR_MARKERS` は `review_resilience` が同じ目的で持っていた6語の
+**上位集合**だった。**worker を終わらせた経路は既に判定を下していて、その結論は
+`outcome` に入っている。** 同じ文字列を3回目に突き合わせるより、それを読むほうが強い証拠。
+
+（`review_resilience.looks_like_transient_error` と `TRANSIENT_MARKERS` は
+2026-09-22 に削除された。理由はこの段落そのもので、削除より先に書かれていた。）
 """
 from __future__ import annotations
 
