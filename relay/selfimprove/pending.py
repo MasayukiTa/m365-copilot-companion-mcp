@@ -274,9 +274,50 @@ def _cli(argv=None) -> int:
     for r in rows:
         print("%s  [%s]  %s" % (r.get("id"), r.get("status"), ", ".join(r.get("files") or [])))
         print("    %s" % (r.get("reason") or ""))
+        gone = _premise_gone(r)
+        if gone:
+            print("    NOTE: %s" % gone)
         if r.get("command"):
             print("    $ %s" % r["command"])
     return 0
+
+
+def _premise_gone(row) -> str:
+    """Why this card may no longer be asking anything, or "" if it still is.
+
+    A card is queued when named files drift from the frozen baseline, and the drift can end
+    without the card being answered -- somebody re-signs for another reason, or reverts the
+    code. The question then has no subject left, and the entry goes on demanding a decision
+    about a condition that is gone. Measured 2026-09-22: card 931997c4df88 asks about
+    relay/selfimprove/frozen.py, which has matched its baseline since the re-signing earlier
+    that day.
+
+    THIS DOES NOT CLOSE IT, AND THAT IS THE WHOLE CARE HERE. `resolve` still only touches
+    APPROVED cards, because closing an open one is this process answering on the operator's
+    behalf -- the rule frozen.py states beside its own resolver. "The thing you were asked
+    about is no longer true" is a fact, not an answer, so it is printed and the decision stays
+    theirs. Never raises: a listing must not fail because the baseline cannot be read.
+    """
+    if row.get("status") != OPEN:
+        return ""
+    files = [str(f) for f in (row.get("files") or [])]
+    if not files:
+        return ""
+    try:
+        from relay.selfimprove import frozen as _frozen
+
+        base = (_frozen.load_baseline() or {}).get("checksums") or {}
+        if not base:
+            return ""
+        now = _frozen.compute_checksums()
+        drifting = [f for f in files if f in base and now.get(f) != base.get(f)]
+        if drifting:
+            return ""
+        return ("none of the files this names differs from the baseline any more, so the "
+                "change it asks about has already been settled some other way. Left open "
+                "deliberately -- deciding it is yours, not this program's.")
+    except Exception:
+        return ""
 
 
 if __name__ == "__main__":
