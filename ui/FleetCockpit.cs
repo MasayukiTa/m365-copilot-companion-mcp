@@ -3,9 +3,9 @@
 // relay/fleet_runner.py drives N autonomous Copilot conversations at once and writes a
 // live snapshot to .fleet/status.json after every round-robin sweep. This window tails
 // that JSON and renders one live card per goal. You can also release a running one from
-// here (writes .fleet/commands.json, which the fleet consumes -> stops + frees its tab).
+// here (writes one command file into .fleet/commands.d/, which the fleet consumes -> stops + frees its tab).
 //
-//   [ fleet_runner.py ] <--(commands.json)-- [ this ]
+//   [ fleet_runner.py ] <--(commands.d/)--- [ this ]
 //                       --(status.json)----->
 //
 // Icons are Google Material Symbols, rendered as vector geometry from
@@ -860,7 +860,10 @@ class CockpitWindow : Window
     // gear-popup live value label + stepper refs (re-themed nowhere else; rebuilt each open)
     TextBlock _uiScaleVal;
 
-    readonly string _statusPath, _commandsPath, _historyPath, _openPath;
+    // _fleetDir is the .fleet state dir. It replaced _commandsPath when the cockpit stopped
+    // writing commands.json directly: commands now go one-per-file into <_fleetDir>/commands.d
+    // through FleetCommands.Write. Nothing here needs the old aggregate path any more.
+    readonly string _statusPath, _fleetDir, _historyPath, _openPath;
     string _convsPath, _hiddenPath, _resumeDismissPath, _clearedLogPath;
     System.Collections.Generic.HashSet<string> _archivedKeys = new System.Collections.Generic.HashSet<string>();
     // Persistent "cleared" set: keys of TERMINAL cards the user dismissed via Clear. Survives
@@ -1142,7 +1145,7 @@ class CockpitWindow : Window
     {
         _statusPath = ResolvePath(path);
         string dir = Path.GetDirectoryName(_statusPath);
-        _commandsPath = Path.Combine(dir, "commands.json");
+        _fleetDir = dir;
         _historyPath = Path.Combine(dir, "history.json");
         _openPath = Path.Combine(dir, "open.json");
         _convsPath = Path.Combine(dir, "conversations.json");
@@ -5376,7 +5379,7 @@ class CockpitWindow : Window
     // A2-2: Send a steer from the bottom composer. Parses "W2: ..." prefix to target a specific
     // worker; otherwise broadcasts to the first running worker (or ALL via broadcast if no live
     // specific worker is found -- the relay picks the right one). Reuses RequestSteer() exactly
-    // as the per-card SteerRow does: writes {"steer":[{worker,text},...]} into commands.json.
+    // as the per-card SteerRow does: writes {"steer":[{worker,text},...]} as its own command file.
     void TrySendSteer()
     {
         string text = (_goalInput != null ? _goalInput.Text : "").Trim();
@@ -8022,9 +8025,9 @@ class CockpitWindow : Window
     }
 
     // Disk floor (GB) setter: clamp, persist via SaveKey, refresh the panel value, AND push the new
-    // floor LIVE to a running fleet via {"set_disk_floor_gb":N} through the SAME merge-with-existing
-    // ReadCommands->WriteCommands path Pause/ForceStart use, so the runner (fleet_runner.py ~L561)
-    // picks it up on its next ~1s poll. Mirrors how 強制開始 writes the floor live.
+    // floor LIVE to a running fleet via {"set_disk_floor_gb":N} through the SAME one-file-per-command
+    // writer Pause/ForceStart use, so the runner (fleet_runner.py ~L561) picks it up on its next ~1s
+    // poll. Mirrors how 強制開始 writes the floor live.
     void SetDiskFloor(double v)
     {
         _diskFloor = Math.Max(0.0, Math.Min(100.0, Math.Round(v, 1)));
@@ -8032,9 +8035,7 @@ class CockpitWindow : Window
         if (_diskFloorVal != null) _diskFloorVal.Text = FmtFloor(_diskFloor);
         if (RunIsLive())
         {
-            var cmd = ReadCommands();
-            cmd["set_disk_floor_gb"] = _diskFloor;
-            WriteCommands(cmd);
+            SendCommand(Cmd1("set_disk_floor_gb", _diskFloor));
         }
     }
 
@@ -8049,15 +8050,13 @@ class CockpitWindow : Window
         if (_ramFloorVal != null) _ramFloorVal.Text = ((int)_ramFloor).ToString();
         if (RunIsLive())
         {
-            var cmd = ReadCommands();
-            cmd["set_ram_floor_mb"] = _ramFloor;
-            WriteCommands(cmd);
+            SendCommand(Cmd1("set_ram_floor_mb", _ramFloor));
         }
     }
 
-    // THE FALLBACK BUTTON. Writes {"reunlock": "<name-or-empty>"} through the SAME merge-with-
-    // existing ReadCommands->WriteCommands path SetDiskFloor/SetRamFloor use, so it cannot
-    // clobber a concurrent close/steer/set_maxtabs. CARRIES NO SECRET: fleet_runner.py's
+    // THE FALLBACK BUTTON. Writes {"reunlock": "<name-or-empty>"} through the SAME command writer
+    // SetDiskFloor/SetRamFloor use -- one file per command, so it cannot clobber a concurrent
+    // close/steer/set_maxtabs. CARRIES NO SECRET: fleet_runner.py's
     // apply_reunlock reads the unlock password locally, on the coordinator's own machine, from
     // that machine's .env -- never from this file, which is plain text read by several
     // processes. `target` blank means every live worker (fleet_runner treats "" the same as the
@@ -8397,9 +8396,9 @@ class CockpitWindow : Window
         }
     }
 
-    // Fleet-wide controls: Pause/Resume toggle + Stop-all. Both write into commands.json
-    // via WriteCommands, merging with ReadCommands first so a queued close/steer/add isn't
-    // clobbered. fleet_runner._drain_commands consumes {"pause":bool}/{"stop":true} each sweep.
+    // Fleet-wide controls: Pause/Resume toggle + Stop-all. Both send their own single-key
+    // command file through FleetCommands.Write, so neither can clobber a queued close/steer/add.
+    // fleet_runner._drain_commands consumes {"pause":bool}/{"stop":true} each sweep.
     UIElement FleetControls()
     {
         var group = new StackPanel(); group.Orientation = Orientation.Horizontal;
@@ -8428,13 +8427,11 @@ class CockpitWindow : Window
         _pauseBtn.Click += delegate
         {
             // Pause only means something to a LIVE fleet. With no live consumer the command would
-            // sit unread in commands.json while the label lied "Resume" -- so do nothing then (the
+            // sit unread in commands.d/ while the label lied "Resume" -- so do nothing then (the
             // button is also disabled per-tick by RefreshPauseEnabled, this is belt-and-suspenders).
             if (!RunIsLive()) { if (_paused) { _paused = false; PaintPause(); } return; }
             _paused = !_paused;
-            var cmd = ReadCommands();
-            cmd["pause"] = _paused;
-            WriteCommands(cmd);
+            SendCommand(Cmd1("pause", _paused));
             PaintPause();
         };
         group.Children.Add(_pauseBtn);
@@ -8460,9 +8457,7 @@ class CockpitWindow : Window
         }
         _stopBtn.Click += delegate
         {
-            var cmd = ReadCommands();
-            cmd["stop"] = true;
-            WriteCommands(cmd);
+            SendCommand(Cmd1("stop", true));
             // FIX B: immediate optimistic feedback -- don't wait for the ~700ms sweep to show
             // anything changed. Flip the button into its "stopping" state and dim every
             // non-terminal card NOW; RefreshStoppingState (called each OnTick) clears this the
@@ -8647,7 +8642,7 @@ class CockpitWindow : Window
     }
 
     // true iff a run is currently LIVE: running, not idle, AND its status is fresh enough that the
-    // fleet_runner is provably still consuming commands.json (so steer/retry/pause actually land).
+    // fleet_runner is provably still consuming commands.d/ (so steer/retry/pause actually land).
     bool RunIsLive()
     {
         try { return Liveness(ReadStatus()) == 1; }
@@ -8674,7 +8669,7 @@ class CockpitWindow : Window
         SaveKey("maxtabs", _maxtabs.ToString());
         if (_maxValue != null) _maxValue.Text = _maxtabs.ToString();
         // FIX D: the same stepper gesture must behave the same whether autoscale is ON or OFF.
-        // RequestSetMaxtabs writes into commands.json via the SAME live-apply mechanism
+        // RequestSetMaxtabs writes a command file via the SAME live-apply mechanism
         // RequestSetAutoscale (and the old "Apply now" banner button) already used -- there is no
         // technical reason the non-autoscale path needs a separate negotiation banner, so both
         // paths now apply immediately and show the identical lightweight auto-dismissing toast
@@ -8871,16 +8866,14 @@ class CockpitWindow : Window
     }
 
     // 強制開始: disable the disk gate live. Capture the current floor first so 床を戻す can restore
-    // it. Writes {"set_disk_floor_gb":0.0} via the SAME merge-with-existing WriteCommands path Pause
-    // uses, so a queued close/steer/set_maxtabs isn't clobbered. Consumed by fleet_runner.py ~L561.
+    // it. Writes {"set_disk_floor_gb":0.0} via the SAME one-file-per-command writer Pause uses, so a
+    // queued close/steer/set_maxtabs isn't clobbered. Consumed by fleet_runner.py ~L561.
     void ForceStart()
     {
         if (!RunIsLive()) return;     // nothing alive to consume the command
         var root = ReadStatus();
         _diskFloorPrev = Dbl(root ?? new Dictionary<string, object>(), "disk_floor_gb");
-        var cmd = ReadCommands();
-        cmd["set_disk_floor_gb"] = 0.0;
-        WriteCommands(cmd);
+        SendCommand(Cmd1("set_disk_floor_gb", 0.0));
         _diskFloorForced = true;
         UpdateCapBanner(root);
     }
@@ -8888,9 +8881,7 @@ class CockpitWindow : Window
     // 床を戻す: write the previously-captured floor back, re-arming the disk gate.
     void RestoreFloor()
     {
-        var cmd = ReadCommands();
-        cmd["set_disk_floor_gb"] = _diskFloorPrev;
-        WriteCommands(cmd);
+        SendCommand(Cmd1("set_disk_floor_gb", _diskFloorPrev));
         _diskFloorForced = false;
         UpdateCapBanner(ReadStatus());
     }
@@ -13679,7 +13670,7 @@ class CockpitWindow : Window
     }
 
     // Re-run the worker's goal. TWO honest paths, picked by whether a run is LIVE:
-    //  * LIVE  -> append to commands.json's add_goal list (MERGE writer); the running fleet
+    //  * LIVE  -> send an add_goal command of its own (one file per command); the running fleet
     //            consumes it on its next sweep and re-runs it WITH its acceptance gate (checks+cwd).
     //  * FINISHED/stale -> nothing alive would ever drain add_goal, so instead SPAWN a fresh fleet
     //            for this goal text (SpawnFleet). The relaunched run picks it up and re-runs it.
@@ -13688,13 +13679,9 @@ class CockpitWindow : Window
     {
         if (RunIsLive())
         {
-            var cmd = ReadCommands();
             var adds = new List<object>();
-            if (cmd.ContainsKey("add_goal") && cmd["add_goal"] is object[])
-                foreach (object o in (object[])cmd["add_goal"]) adds.Add(o);
             adds.Add(RetryEntry(w));
-            cmd["add_goal"] = adds;
-            WriteCommands(cmd);
+            SendCommand(Cmd1("add_goal", adds));
             return;
         }
         string goal = S(w, "goal");
@@ -13703,7 +13690,8 @@ class CockpitWindow : Window
     }
 
     // Feature C bulk: re-run EVERY currently-shown terminal non-DONE worker (respecting the active
-    // filter). LIVE -> one merged add_goal list; FINISHED/stale -> ONE relaunched fleet carrying
+    // filter). LIVE -> ONE add_goal command carrying every retried entry; FINISHED/stale -> ONE
+    // relaunched fleet carrying
     // all the retried goal texts (mirrors RetryGoal's live/finished split).
     // THE RETRY BUDGET IS SHARED WITH AutoRetryScan, DELIBERATELY. This button had no cap of
     // any kind, so _autoRetryMax bounded only the automatic path. One submitted goal reached
@@ -13718,10 +13706,7 @@ class CockpitWindow : Window
     {
         skippedAtCap = 0;
         bool live = RunIsLive();
-        var cmd = ReadCommands();
         var adds = new List<object>();
-        if (cmd.ContainsKey("add_goal") && cmd["add_goal"] is object[])
-            foreach (object o in (object[])cmd["add_goal"]) adds.Add(o);
         var goalTexts = new List<string>();
         int n = 0;
         foreach (Dictionary<string, object> w in shown)
@@ -13748,8 +13733,7 @@ class CockpitWindow : Window
         if (n == 0) return 0;
         if (live)
         {
-            cmd["add_goal"] = adds;
-            WriteCommands(cmd);
+            SendCommand(Cmd1("add_goal", adds));
         }
         else if (goalTexts.Count > 0)
         {
@@ -14062,71 +14046,59 @@ class CockpitWindow : Window
     }
 
     // ── cockpit -> fleet control channel ─────────────────────────────────────────
-    // Merge into the pending command file so concurrent commands don't clobber each
-    // other before the fleet (polling ~1s) consumes them.
-    Dictionary<string, object> ReadCommands()
+    // ONE COMMAND PER FILE, written through the shared FleetCommands.Write (ui/FleetCommands.cs).
+    // The old ReadCommands/WriteCommands pair read all of commands.json, added this caller's key
+    // and wrote the whole file back; CopilotChat.exe -- a SEPARATELY BUILT PROCESS -- did the same
+    // thing to the same file, so whichever wrote second deleted the other's queued command. See
+    // FleetCommands.cs for the full account. Each method below now sends ONLY its own key.
+    Dictionary<string, object> Cmd1(string key, object val)
     {
-        try
-        {
-            if (File.Exists(_commandsPath))
-            {
-                var ex = _js.DeserializeObject(File.ReadAllText(_commandsPath, Encoding.UTF8)) as Dictionary<string, object>;
-                if (ex != null) return ex;
-            }
-        }
-        catch (Exception) { }
-        return new Dictionary<string, object>();
+        var d = new Dictionary<string, object>();
+        d[key] = val;
+        return d;
     }
-    void WriteCommands(Dictionary<string, object> cmd)
+    bool SendCommand(Dictionary<string, object> patch)
     {
-        try { File.WriteAllText(_commandsPath, _js.Serialize(cmd), new UTF8Encoding(false)); }
-        catch (Exception) { }
+        return FleetCommands.Write(_fleetDir, patch);
     }
 
+    // THE DEDUPE WENT WITH THE MERGE, DELIBERATELY. This used to read the pending `close` list
+    // and skip a name already in it. With one command per file there is no pending list to
+    // consult -- and reintroducing one would reintroduce the read-modify-write race that cost a
+    // goal. It is acceptable here because the fleet applies closes idempotently: closing a
+    // worker that is already closed is a no-op, so a duplicate close changes nothing.
     void RequestClose(string name)
     {
-        var cmd = ReadCommands();
         var closes = new List<object>();
-        if (cmd.ContainsKey("close") && cmd["close"] is object[])
-            foreach (object o in (object[])cmd["close"]) closes.Add(o);
-        if (!closes.Contains(name)) closes.Add(name);
-        cmd["close"] = closes;
-        WriteCommands(cmd);
+        closes.Add(name);
+        SendCommand(Cmd1("close", closes));
     }
 
     void RequestSetMaxtabs(int n)
     {
-        var cmd = ReadCommands();
-        cmd["set_maxtabs"] = n;
-        WriteCommands(cmd);
+        SendCommand(Cmd1("set_maxtabs", n));
     }
 
-    // Live autoscale control: {"set_autoscale":{"on":0|1,"default":N,"max":M}}. Merged into
-    // commands.json via the SAME writer RequestSetMaxtabs uses, so concurrent commands
-    // (close/steer/set_maxtabs) aren't clobbered before the fleet (polling ~1s) consumes them.
+    // Live autoscale control: {"set_autoscale":{"on":0|1,"default":N,"max":M}}, sent as its own
+    // command file through the SAME writer RequestSetMaxtabs uses, so it cannot clobber a
+    // concurrent close/steer/add_goal from this window or from CopilotChat.exe.
     void RequestSetAutoscale(bool on, int def, int max)
     {
-        var cmd = ReadCommands();
         var sa = new Dictionary<string, object>();
         sa["on"] = on ? 1 : 0;
         sa["default"] = def;
         sa["max"] = max;
-        cmd["set_autoscale"] = sa;
-        WriteCommands(cmd);
+        SendCommand(Cmd1("set_autoscale", sa));
     }
 
     void RequestSteer(string name, string text)
     {
         if (string.IsNullOrEmpty(text)) return;
-        var cmd = ReadCommands();
-        var steers = new List<object>();
-        if (cmd.ContainsKey("steer") && cmd["steer"] is object[])
-            foreach (object o in (object[])cmd["steer"]) steers.Add(o);
         var item = new Dictionary<string, object>();
         item["worker"] = name; item["text"] = text;
+        var steers = new List<object>();
         steers.Add(item);
-        cmd["steer"] = steers;
-        WriteCommands(cmd);
+        SendCommand(Cmd1("steer", steers));
     }
 
     // Feature 1: the ONE steer-send code path, shared by SteerRow (expanded drawer) and
@@ -14635,7 +14607,7 @@ class CockpitWindow : Window
     }
 
     // Client-side archive of ONE worker into the persisted history + hide its card. Unlike the
-    // per-worker 解放 (which writes commands.json and needs a LIVE fleet to consume it), this works
+    // per-worker 解放 (which writes a command file and needs a LIVE fleet to consume it), this works
     // with the fleet stopped -- so a finished or stale card can be moved to history any time.
     void _archiveOne(Dictionary<string, object> w)
     {
@@ -14685,7 +14657,7 @@ class CockpitWindow : Window
     // Bulk-clear EVERY shown worker -- used by Stop-all when the run has gone STALE (no live fleet to
     // consume a stop command). Unlike ArchiveAllTerminal this clears non-terminal cards too, because a
     // stale run's "running" workers are frozen leftovers, not actually executing. Makes Stop-all do
-    // something visible even with the driver dead, instead of silently writing an unread commands.json.
+    // something visible even with the driver dead, instead of silently writing an unread command file.
     void ArchiveAllStale()
     {
         if (_toolbarShown == null) return;
