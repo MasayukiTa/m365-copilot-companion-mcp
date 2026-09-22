@@ -225,7 +225,7 @@ concluding "nothing matched" was wrong, and is recorded that way in the failure-
 
 | entry | verdict |
 |---|---|
-| `looks_like_transient_error` | **DUPLICATE.** `relay_fleet.TRANSIENT_ERROR_MARKERS` is live and a superset (予期しないエラー / システムエラー / unexpected error / something went wrong, plus reload-the-page and if-the-problem-persists). Deleting it is the right answer; it is left listed until someone confirms nothing outside this repository imports it |
+| `looks_like_transient_error` | **DELETED 2026-09-22, with its markers.** The verdict below was DUPLICATE -- `relay_fleet.TRANSIENT_ERROR_MARKERS` is live and a superset -- and the condition it was waiting on (that nothing outside imports it) was checked with `git ls-files`: the only mentions anywhere were prose explaining why it must never be called. `relay_fleet._decide` had already written that calling it "would be a THIRD copy of a judgement this file already makes". Two independent routes to the same answer, so the row was closed by deleting rather than by staying listed |
 | `looks_like_capability_failure` | overlaps `TOOL_UNREACHABLE_MARKERS` in intent, not in strings. Neither is a superset. **Could not determine** whether the difference is meaningful without a corpus of capability-failure replies, and there is no such corpus |
 | `looks_like_output_filter` | no live equivalent found. Its four markers (出力できませんでした / 応答を生成できませんでした / response was filtered / content filter blocked) would be a real fifth family, and adding a marker family to a live path needs the measurement the canned-non-answer family got before IT was added: "6 occurrences in 6,585 assistant replies on record, every one of them 89 to 103 characters long". That measurement has not been taken |
 | `diagnose_after_fresh_replay` | **wired** — see above |
@@ -233,6 +233,38 @@ concluding "nothing matched" was wrong, and is recorded that way in the failure-
 The rule those three are waiting on is the one already written into
 `CANNED_NONANSWER_MARKERS`' own comment: *a marker that fires on a real answer costs more than
 one that misses.* None of them may be wired on the strength of reading their strings.
+
+#### The measurement that "has not been taken" was taken, 2026-09-22
+
+Two rows above say the evidence for wiring does not exist. It does now, and it says do not
+wire -- the same answer `db020aa` reached from the enum side, arrived at independently from
+the corpus side.
+
+Counted across **14,054 assistant replies** recorded in this machine's session store
+(`turns` + `fleet_turns`), the same way `CANNED_NONANSWER_MARKERS` was measured before it was
+added (*6 occurrences in 6,585 replies, every one 89 to 103 characters long*):
+
+| family | hits | lengths |
+|---|---|---|
+| `OUTPUT_FILTER_MARKERS` (4 strings) | **0** | — |
+| `CAPABILITY_FAILURE_MARKERS` (6 strings) | **15**, all from ONE string (`この環境では実行できません`); the other five including all three English ones never fire | **518 – 15,247 characters** |
+
+The length column is the finding. The canned-non-answer family earned its place by being
+unmistakably templated -- every instance between 89 and 103 characters. Not one of these
+fifteen is under five hundred, which is what a real answer looks like when it happens to
+contain the sentence. So the one marker in this family that fires at all fires on real
+answers, which is exactly the cost the rule above names.
+
+`OUTPUT_FILTER_MARKERS` has the opposite problem: no evidence whatever. Four strings written
+for a phenomenon that has not appeared once in 14,054 replies. That is not proof it cannot
+happen -- it is proof there is nothing here to calibrate against, which is the same reason
+not to wire it into a live path.
+
+Recorded rather than acted on further: both predicates were already answered `db020aa`
+(*not wired, but measured and pinned*), and `NOT_PRODUCIBLE_CAUSES` in
+`bench/test_review_resilience.py` fails if either cause becomes producible. What changes here
+is only that the sentence "that measurement has not been taken" was still in this file after
+it had been.
 
 ### Triaged by hand, 2026-09-14: four more clusters
 

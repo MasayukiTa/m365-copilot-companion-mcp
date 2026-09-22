@@ -69,7 +69,7 @@ def test_the_late_delivery_record_carries_origin_from_the_earlier_one(state, mon
 
     monkeypatch.setattr(TR, "fleet_is_live", lambda *a, **k: True, raising=False)
     monkeypatch.setattr(TR, "fleet_handoff",
-                        lambda goal, j, sd=None: ("dispatched", {"delivered": "add_goal"}),
+                        lambda goal, j, sd=None, **kw: ("dispatched", {"delivered": "add_goal"}),
                         raising=False)
 
     out = TR._deliver_waiting_goals(now_ts=1_700_000_900.0, state_dir=str(state.parent))
@@ -89,7 +89,7 @@ def test_a_job_with_no_earlier_record_does_not_gain_a_false_origin(state, monkey
     (state / "for_fleet" / ("%s.txt" % jid)).write_text("do the thing", encoding="utf-8")
     monkeypatch.setattr(TR, "fleet_is_live", lambda *a, **k: True, raising=False)
     monkeypatch.setattr(TR, "fleet_handoff",
-                        lambda goal, j, sd=None: ("dispatched", {"delivered": "add_goal"}),
+                        lambda goal, j, sd=None, **kw: ("dispatched", {"delivered": "add_goal"}),
                         raising=False)
 
     TR._deliver_waiting_goals(now_ts=1_700_000_900.0, state_dir=str(state.parent))

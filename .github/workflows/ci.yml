@@ -720,12 +720,13 @@ jobs:
       # was added believing FLEET_FLOOR_GIB would fall back to 3.0; the runner read >5.6 and
       # four tests failed). So: run them, print the outcome, gate nothing.
       #
-      # WHAT TO DO WITH THE RESULT. If this step passes on a few runs, drop
-      # continue-on-error and it becomes a real gate. If it fails, the log says how the
-      # runner differs -- which is the measurement that was missing -- and either the test
-      # gains a skip for that condition or it stays here as a report.
-      - name: Windows-only tests (reporting, not gating)
-        continue-on-error: true
+      # AND THE RESULT CAME IN, SO IT IS A GATE NOW. Runs 62ba5b3 and cdeec15 both reported
+      # "10 passed" on this runner -- so a console allocated on a GitHub Windows runner does
+      # report itself visible without an interactive desktop, and csc.exe is present with the
+      # references FleetCommands.cs needs. That was the open question, and it is answered by
+      # the runner rather than by an assumption about it. continue-on-error is gone: the two
+      # files now fail the job, which is the whole point of having run them here.
+      - name: Windows-only tests
         run: |
           python -m pytest -rsx tools/test_a_windowless_launch_really_has_no_window.py ui/test_the_ui_and_the_fleet_agree_on_the_command_channel.py
 

@@ -4620,12 +4620,16 @@ class RelayWorker:
         be missed exactly as these were, and nothing would say so. `_decide` is the one
         funnel they all sit inside, so the transition is observed here instead.
 
-        IT DOES NOT RE-READ THE TEXT. `looks_like_transient_error(resp)` would be a THIRD copy
-        of a judgement this file already makes -- relay_fleet has five marker families
-        (transient/agent-dead, tool-unreachable, canned-nonanswer, admin-block, throttle) that
-        overlap with review_resilience.TRANSIENT_MARKERS and diverge from it in both
-        directions. The path that settled the worker already decided, and what it decided is
-        in `outcome`. That is better evidence than matching the same strings a third time.
+        IT DOES NOT RE-READ THE TEXT. Matching the strings again here would be a THIRD copy of
+        a judgement this file already makes -- relay_fleet has five marker families
+        (transient/agent-dead, tool-unreachable, canned-nonanswer, admin-block, throttle), and
+        TRANSIENT_ERROR_MARKERS among them was already a superset of the six strings
+        review_resilience kept for the same purpose. The path that settled the worker already
+        decided, and what it decided is in `outcome`. That is better evidence than matching the
+        same strings a third time.
+
+        (`review_resilience.looks_like_transient_error` and its markers were deleted on
+        2026-09-22 for that reason -- this paragraph is why, written before the deletion.)
         """
         before = self.status
         try:

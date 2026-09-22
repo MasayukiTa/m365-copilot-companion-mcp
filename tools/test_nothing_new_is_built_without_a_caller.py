@@ -58,7 +58,6 @@ NO_CALLER_NO_TEST = {
     "relay/autonomy_gate.py::constraints_text",                  # 5 lines
     "relay/review_resilience.py::looks_like_capability_failure", # 2 lines
     "relay/review_resilience.py::looks_like_output_filter",      # 2 lines
-    "relay/review_resilience.py::looks_like_transient_error",    # 2 lines
 }
 
 #: Called by nothing outside tests. Tests referencing a function say it was worth writing; they
@@ -287,15 +286,18 @@ REASONS: dict[str, tuple[str, str]] = {
     # survive their own triage.
     # NOT WIRED ON PURPOSE, decided 2026-09-19 while fixing the defect it looks like it should
     # have fixed. `diagnose_after_fresh_replay`'s TRANSIENT branch was unreachable because
-    # every caller passed `fresh_was_transient_error=False` as a literal, and this predicate
-    # was written to compute that argument. Calling it would have made a THIRD copy of a
-    # judgement relay_fleet already holds in five marker families (transient/agent-dead,
-    # tool-unreachable, canned-nonanswer, admin-block, throttle) which overlap
-    # review_resilience.TRANSIENT_MARKERS and diverge from it in both directions. The path
-    # that settles a worker has already decided, and its decision is in `outcome` -- better
-    # evidence than matching the same strings a third time. Written up where the fix is.
-    "relay/review_resilience.py::looks_like_transient_error":
-        ("deliberate", "relay/test_a_worker_that_dies_after_a_fresh_replay_says_why.py"),
+    # DELETED 2026-09-22, WHICH IS WHY IT IS NO LONGER LISTED HERE. It was carried as
+    # "deliberate": every caller passed `fresh_was_transient_error=False` as a literal, and
+    # this predicate was written to compute that argument. Calling it would have made a THIRD
+    # copy of a judgement relay_fleet already holds in five marker families
+    # (transient/agent-dead, tool-unreachable, canned-nonanswer, admin-block, throttle), one
+    # of which was already a superset of its six strings. docs/unreached_burndown.md had
+    # reached the same verdict independently and called it DUPLICATE.
+    #
+    # "Deliberate" was the right holding answer and not a resting place: an unwired detector
+    # sitting beside four wired ones reads as a family with a gap, and the row itself invites
+    # the next person to close it by wiring -- which would re-introduce the third copy this
+    # repository had already refused. A row answered by DELETING is the row leaving.
     "relay/autonomy_gate.py::judge_autonomy": ("deliberate", "docs/unreached_burndown.md"),
     "relay/autonomy_gate.py::constraints_text": ("deliberate", "docs/unreached_burndown.md"),
 }
