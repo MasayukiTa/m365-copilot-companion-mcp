@@ -237,16 +237,53 @@ class LocalLoopController:
         )
         _write_atomic(self.status_path, snapshot)
 
+    #: What this drain can actually act on. Everything else belongs to somebody else.
+    _HANDLED_COMMAND_KEYS = frozenset({"stop", "close"})
+
     def _drain_commands(self) -> bool:
+        """Consume a console command. DELETE ONLY WHAT WAS FULLY CONSUMED.
+
+        This used to read the file, unlink it in a `finally`, and then act on `stop`/`close`
+        -- so an `add_goal`, a `steer`, a `set_maxtabs` sitting in the same file was destroyed
+        with nothing written down, and a lost goal is indistinguishable from one never sent.
+        It normally reads its own state dir, but nothing enforces that: `--state-dir` is a
+        parameter, and pointed at `.fleet` this was a shredder racing the fleet's own reader.
+
+        A command carrying keys this cannot handle is not this controller's, so it is left
+        alone AND NOT ACTED ON -- taking the `stop` out of a file that clearly belongs to a
+        different channel would be answering someone else's instruction. Said out loud once,
+        because a refusal nobody can see is the failure this repository keeps paying for.
+
+        A file that will not parse is also left, for the same reason and a stronger one: what
+        was in it is exactly what nobody knows. The old code deleted it and then let the
+        exception out of the `finally`, so the evidence went first and the report second.
+        """
         if not self.commands_path or not self.commands_path.is_file():
             return False
         try:
             command = json.loads(self.commands_path.read_text(encoding="utf-8-sig"))
-        finally:
-            try:
-                self.commands_path.unlink()
-            except OSError:
-                pass
+        except Exception as exc:
+            if not getattr(self, "_command_refusal_said", False):
+                self._command_refusal_said = True
+                print("[local-loop] leaving %s alone: it will not parse (%s). Deleting it "
+                      "would destroy the only copy of whatever it holds."
+                      % (self.commands_path, exc), flush=True)
+            return False
+        if not isinstance(command, dict):
+            command = {}
+        foreign = set(command) - self._HANDLED_COMMAND_KEYS
+        if foreign:
+            if not getattr(self, "_command_refusal_said", False):
+                self._command_refusal_said = True
+                print("[local-loop] leaving %s alone: it carries %s, which this drain does "
+                      "not handle -- so this is not its channel, and consuming the rest of "
+                      "the file would destroy commands meant for whoever does."
+                      % (self.commands_path, ", ".join(sorted(foreign))), flush=True)
+            return False
+        try:
+            self.commands_path.unlink()
+        except OSError:
+            pass
         stop = bool(command.get("stop")) or self.job_id in command.get("close", [])
         if stop:
             self.store.cancel_job(self.job_id, "operator stop from console")

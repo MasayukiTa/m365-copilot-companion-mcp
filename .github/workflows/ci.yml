@@ -376,6 +376,7 @@ jobs:
             relay/test_fleet_resume.py \
             relay/test_local_job_store.py \
             relay/test_local_loop_controller.py \
+            relay/test_a_drain_deletes_only_what_it_consumed.py \
             relay/test_network_recovery.py \
             relay/test_provenance.py \
             relay/test_reply_settle.py \

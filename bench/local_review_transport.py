@@ -334,13 +334,38 @@ def _campaign_snapshot(store: LocalJobStore, entries: list[dict], started: float
     }
 
 
+#: What this consumer can act on. A file carrying anything else is not its channel.
+_HANDLED_COMMAND_KEYS = frozenset({"stop", "close"})
+
+
 def _consume_console_commands(path: Path, store: LocalJobStore, entries: list[dict]) -> set[str]:
+    """Apply a console stop/close. DELETE ONLY WHAT WAS FULLY CONSUMED.
+
+    This used to unlink the file unconditionally and then look for `stop`/`close`, so an
+    `add_goal` or `steer` in the same file was destroyed without a trace. The state dir is a
+    parameter, so nothing stops this being pointed at `.fleet`, where it would race the
+    fleet's own reader and win by deleting.
+
+    Unrecognised keys, or a file that will not parse, mean this is somebody else's channel:
+    leave it and act on nothing. Acting on the `stop` while refusing the rest would be
+    answering an instruction addressed elsewhere, and deleting an unparseable file destroys
+    the only copy of whatever it was.
+    """
     if not path.is_file():
         return set()
     try:
         value = json.loads(path.read_text(encoding="utf-8-sig"))
-    except Exception:
+    except Exception as exc:
+        print("[local-review] leaving %s alone: it will not parse (%s)" % (path, exc),
+              flush=True)
+        return set()
+    if not isinstance(value, dict):
         value = {}
+    foreign = set(value) - _HANDLED_COMMAND_KEYS
+    if foreign:
+        print("[local-review] leaving %s alone: it carries %s, which this consumer does not "
+              "handle" % (path, ", ".join(sorted(foreign))), flush=True)
+        return set()
     try:
         path.unlink()
     except OSError:
