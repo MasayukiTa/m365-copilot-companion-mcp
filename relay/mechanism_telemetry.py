@@ -63,7 +63,14 @@ MECHANISMS = ("fanout", "refuter", "panel", "veto", "retry", "bestofn", "skill",
               # build a reader when the first non-empty value appears. Nothing was going to
               # announce that, because those fields land in a snapshot no UI or script opens.
               # A row here is how the day gets noticed.
-              "refusal_recovery")
+              "refusal_recovery",
+              # The two-consecutive-turns stop for tool calls that never reach the gateway.
+              # Registered 2026-09-22 on the same footing as refusal_recovery: scanned across
+              # 78 durable worker records and 470 status rows and never seen to fire. It
+              # declares an INFRASTRUCTURE fault rather than a task failure, so the first time
+              # it is right about that should not land only in a status field the next sweep
+              # overwrites.
+              "unlanded_calls")
 
 
 def patch_hash(text):
