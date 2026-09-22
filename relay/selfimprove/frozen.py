@@ -569,7 +569,7 @@ def _undo_hint() -> str:
             " which is the point)")
 
 
-def _resolve_pending_for(changed_files, args) -> None:
+def _resolve_pending_for(changed_files, args, ledger_rows=None) -> None:
     """Close every approved proposal this re-signing carried out. Never raises.
 
     MATCHED ON THE FILES, NOT ON THE REASON TEXT. It used to key on the (files, reason) pair
@@ -587,6 +587,34 @@ def _resolve_pending_for(changed_files, args) -> None:
     re-signing just accepted those files. If two approved cards name the same files, both were
     approved and both are now satisfied, so closing both is right rather than a guess.
 
+    A DECISION MAY BE CARRIED OUT IN INSTALMENTS, and requiring one signing to cover every
+    file the card names meant those never closed at all. Measured on the live queue
+    2026-09-19: a card approved on 09-09 naming `bench/swe_grade_swebench.py` AND
+    `tools/security.py` was still reading "waiting on the agent" ten days later. Both files
+    match the baseline -- the drift it was raised about is gone -- but it was resolved by two
+    separate re-signings, and neither one alone contained both names. A subset test against
+    `changed_files` cannot close that card, which is the same defect this function exists to
+    end, surviving one level further in.
+
+    SO THE INSTALMENTS ARE ADDED UP, FROM THE LEDGER, RATHER THAN THE END STATE BEING READ
+    OFF THE BASELINE. `authority_ledger` already records the `changed` map of every REBLESS,
+    so the files accepted since a card was queued is a union over its rows -- including this
+    act, which `_record_rebless` appended just before this runs. A card is carried out when
+    that union covers every file it names.
+
+    THE FIRST ATTEMPT AT THIS FIX ASKED THE BASELINE INSTEAD, AND WAS VACUOUS. It tested the
+    card's files against the checksum map just written, reasoning that a card is satisfied
+    when none of its files drifts any more. But `snapshot_baseline` rewrites the map for
+    EVERY frozen file at its current content, so after any re-signing nothing drifts by
+    definition: the condition was true for every card naming frozen files, and one unrelated
+    re-signing would have closed all of them. The union above cannot go vacuous because it
+    counts only files an act actually accepted.
+
+    AND IT MUST STILL BE THIS ACT THAT CLAIMS THE CREDIT: `carried out` is recorded only when
+    a file of the card is in THIS signing. A card the union completed earlier is finished, but
+    saying "the re-signing succeeded" about it would put an act in the ledger that did not
+    happen, so it closes as `superseded` instead.
+
     STILL ONLY `APPROVED`. An open card has not been decided, and closing one would be this
     process answering on the operator's behalf.
     """
@@ -596,16 +624,51 @@ def _resolve_pending_for(changed_files, args) -> None:
         signed = set(str(f) for f in (changed_files or []))
         if not signed:
             return
+        # EVERY REBLESS AND THE FILES IT ACCEPTED, so a card can be paid off across several.
+        # A ledger that cannot be read leaves `rows` empty, and the rule below degrades to
+        # the plain subset test against this signing -- narrower, never wider.
+        rows = ledger_rows
+        if rows is None:
+            try:
+                from relay.selfimprove import authority_ledger as _led
+                rows = _led.read()
+            except Exception:
+                rows = []
+        accepted = []
+        for rec in rows or []:
+            if rec.get("event") != "rebless":
+                continue
+            accepted.append((float(rec.get("ts") or 0.0),
+                             set(str(f) for f in (rec.get("changed") or {}))))
         for row in pending.items():
             if row.get("status") != pending.APPROVED:
                 continue
             files = set(str(f) for f in (row.get("files") or []))
-            # SUBSET, not equality: a re-signing may accept more files than one card asked
-            # about, and a card asking about a subset of them has been carried out.
-            if files and files <= signed:
-                pending.resolve(row["id"],
-                                authorization="carried out: the re-signing succeeded",
-                                status=pending.DONE, kind="system")
+            if not files:
+                continue
+            # SINCE THE CARD WAS QUEUED, not since the ledger began. A re-signing that
+            # happened before the card existed did not carry it out; counting it would close
+            # cards on the strength of acts that predate the question they answer.
+            queued_at = float(row.get("ts") or 0.0)
+            settled = set(signed)
+            for ts, changed in accepted:
+                if ts >= queued_at:
+                    settled |= changed
+            if not files <= settled:
+                continue
+            # TWO TRUE SENTENCES, NOT ONE CONVENIENT ONE. A card this act carried out and a
+            # card that was already satisfied are both finished, and recording the second as
+            # "the re-signing succeeded" would put a claim in the ledger that did not happen.
+            # Leaving it open instead is the misreport this whole mechanism exists to end:
+            # measured 2026-09-19, one such card had read "waiting on the agent" since 09-09
+            # with every file it names matching the baseline.
+            if files & signed:
+                note = "carried out: the re-signing succeeded"
+            else:
+                note = ("superseded: earlier re-signings had already accepted every file "
+                        "this names, and this act was not one of them")
+            pending.resolve(row["id"], authorization=note,
+                            status=pending.DONE, kind="system")
     except Exception:
         pass
 
@@ -921,6 +984,10 @@ def _main(argv: list[str] | None = None) -> int:
         # says the work is done, and nobody was saying it. The card sat there after the change
         # had shipped -- the same mismatch as "I approved it and the screen did not move",
         # one transition further along.
+        # AFTER `_record_rebless`, and that order is load-bearing: the resolver adds up the
+        # files accepted since each card was queued from the authority ledger, and this act's
+        # own row has to be in it for a card this signing completes to close now rather than
+        # on the next one.
         _resolve_pending_for(_signed, args)
         # The next move, where the person reading this already is. Until now the undo existed
         # only as a button on a dashboard, so anybody working from the CLI could re-sign and

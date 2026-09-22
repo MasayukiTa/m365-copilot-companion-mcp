@@ -181,6 +181,16 @@ def test_the_success_path_actually_calls_it():
     import inspect
     src = inspect.getsource(F._main)
     after = src[src.index('print("snapshot written: %s" % args.baseline)'):]
-    assert "_resolve_pending_for(_signed, args)" in after[:900]
+    # The window is a proximity check -- the call belongs on the success path, not in some
+    # other branch further down. It was 900 and the call moved past it when the comment
+    # explaining the ordering below was written, so it is sized to the block it is watching
+    # rather than to what happened to fit.
+    assert "_resolve_pending_for(_signed, args)" in after[:2000]
+    # ORDER, NOT JUST PRESENCE. The resolver adds this act up from the authority ledger, so
+    # `_record_rebless` has to have appended its row before it runs -- otherwise a card that
+    # THIS signing completes cannot close until the next one.
+    assert src.index("_record_rebless(args, before, data)") \
+        < src.index("_resolve_pending_for(_signed, args)"), \
+        "the ledger row for this act is written after the resolver reads the ledger"
     assert "_resolve_pending_for(excluded, args)" not in after, \
         "back to closing only the delegation-excluded subset"
