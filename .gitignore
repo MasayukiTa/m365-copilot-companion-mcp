@@ -278,3 +278,22 @@ scripts/win/_selfimprove_nightly_hidden.vbs
 # code. Nothing in it is employee-id-shaped, so the pre-commit identity guard would NOT stop
 # it; this line is the thing that does.
 .config/
+
+# SCRATCH THAT WAS SITTING UNTRACKED AND UNIGNORED, 2026-09-22. `git status` listed all of
+# these as ordinary new files, which is one `git add -A` away from publication -- and the
+# pre-commit identity guard printed eleven employee-id-shaped hits inside
+# .codex-finalizer/*.validation.json while making this commit. The guard caught it, which is
+# the point of having it; it is also the LAST line of defence, and relying on a scanner to
+# recognise a shape is how the previous five of these got as far as they did.
+# outputs/ holds a person's name in a filename, which is a shape no guard is watching for.
+# None of it is source: deck candidates and their inspection dumps, a node scratch tree, run
+# logs, and one fleet verification snapshot.
+.codex-finalizer/
+.codex-redesign/
+outputs/
+.fleet_verify_*/
+.fleet_tests_out.txt
+.hermetic_list.txt
+.relay_regression_*.txt
+relay_full_run_result.txt
+scratch_out.txt
