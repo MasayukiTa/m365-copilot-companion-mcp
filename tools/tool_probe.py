@@ -644,6 +644,28 @@ def record_probe(ok: bool, kind: str, detail: str = "", ts: Optional[float] = No
             payload["inbound"] = bool(inbound)
         with _LOCK:
             _PROBE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            # A DENOMINATOR, BECAUSE THE FAILURES HAD NONE. probe_failures.jsonl records every
+            # failed probe and nothing anywhere counted the probes that ran, so its 500 rows
+            # were a numerator on its own: not a rate, not a trend, not even a total -- the
+            # journal is capped at 500 and reaped, so "500" is the cap rather than a count.
+            # send_failures.jsonl had the same gap, and supplying one is what turned a rule
+            # that fires on 28 of 72 into a rule that fires on 0.19% of everything.
+            #
+            # Three counters, not one. `probes` is what was attempted, `failures` is the
+            # subset, and `since_ts` says what window they cover -- without it a reader has a
+            # ratio and no idea whether it describes a day or a month. Carried forward from
+            # the previous file, because this write replaces it.
+            prev = {}
+            try:
+                with open(str(_PROBE_FILE), encoding="utf-8") as _f:
+                    prev = (json.load(_f) or {}).get("totals") or {}
+            except Exception:
+                prev = {}
+            payload["totals"] = {
+                "probes": int(prev.get("probes") or 0) + 1,
+                "failures": int(prev.get("failures") or 0) + (0 if ok else 1),
+                "since_ts": prev.get("since_ts") or now,
+            }
             tmp = str(_PROBE_FILE) + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False)
