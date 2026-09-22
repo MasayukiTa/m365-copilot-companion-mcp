@@ -36,6 +36,7 @@ GRADE_RESULTS = os.path.join(SWEDIR, "grade_results.jsonl")
 
 sys.path.insert(0, REPO)
 from relay.selfimprove import guards as G
+from tools import childproc as _childproc
 
 #: THE ORG MOVED, AND THE OLD NAME NOW FAILS OUTRIGHT. swebench's newer harness expects each
 #: instance to carry an `image` field, which the relocated datasets have and the princeton-nlp
@@ -112,7 +113,14 @@ def _run_solve_arm(spec_path, targets_file, preds_dir, tag, toggle, on, chunk, c
             "--preds-dir", preds_dir, "--tag", tag, "--chunk", str(chunk),
             "--max-concurrent", str(conc), "--max-turns", str(turns), "--effort", "auto",
             "--floor-gb", str(floor)]
-    r = subprocess.run(args, cwd=REPO, env=env)
+    # HEADLESS BECAUSE THIS DRIVER HAS NO CONSOLE. The nightly task runs
+    # `wscript.exe <launcher.vbs>` (scripts/win/register_selfimprove_nightly.ps1), chosen
+    # precisely so nothing appears on screen -- and a console program started by a parent with
+    # no console allocates its own, which Windows Terminal then shows. So the flag that was
+    # missing here put a black window on an unattended desktop every night, in the one
+    # configuration nobody is watching.
+    r = subprocess.run(args, cwd=REPO, env=env,
+                       creationflags=_childproc.headless_creationflags())
     done = G.done_after_last_start(env_log, "decoupled solve start", "solve done/paused")
     return r.returncode, done
 
@@ -138,7 +146,7 @@ def _grade_arm(preds_dir, targets_file, dataset, run_id, max_wait_min=200):
     args = [VENVPY, GRADER, "--preds-dir", preds_dir, "--targets-file", targets_file,
             "--dataset-name", dataset, "--max-workers", "12", "--run-id", run_id,
             "--max-wait-min", str(max_wait_min)]
-    subprocess.run(args, cwd=REPO)
+    subprocess.run(args, cwd=REPO, creationflags=_childproc.headless_creationflags())
     resolved = set()
     failed = set()
     infra = set()
