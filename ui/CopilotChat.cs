@@ -5293,7 +5293,7 @@ class ChatWindow : Window
             sb.Append("CONV\t").Append(c.ConvUrl == null ? "" : c.ConvUrl).Append('\n');
             sb.Append("TITLE\t").Append(B64(c.Title)).Append('\n');
             foreach (var m in c.Messages) sb.Append(m.Role).Append('\t').Append(B64(m.Text)).Append('\n');
-            File.WriteAllText(Path_(c.Id), sb.ToString(), Encoding.UTF8);
+            File.WriteAllText(Path_(c.Id), sb.ToString(), new UTF8Encoding(false));
         }
         catch { }
     }

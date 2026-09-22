@@ -3122,6 +3122,19 @@ class CockpitWindow : Window
     // An automatic repair that leaves no record cannot be audited: if it fires at three in the
     // morning and makes things worse, there is nothing to look at, and "did it even run?" is
     // unanswerable. I could not answer that question about its first real firing, which is how
+    // UTF-8 WITHOUT THE PREAMBLE, WHICH Encoding.UTF8 IS NOT. .NET's Encoding.UTF8 emits a
+    // BOM, and File.AppendAllText writes it when it creates the file -- so the FIRST line of
+    // every ledger this cockpit starts carries three bytes no line-oriented reader expects.
+    // Measured 2026-09-22: .fleet/autofix.jsonl and .fleet/ui_errors.jsonl both begin with
+    // one, and line 1 of autofix.jsonl is the single row in that file that json.loads
+    // refuses ("Unexpected UTF-8 BOM (decode using utf-8-sig)"). One unreadable row in five
+    // hundred is the kind of thing that gets called a torn write and is not.
+    //
+    // The rule this repository already holds is write no-BOM, read utf-8-sig; the write half
+    // was missing here. Shared so the next ledger written from this file cannot pick the
+    // wrong one -- the same reason ui/FleetCommands.cs exists.
+    static readonly Encoding NoBomUtf8 = new UTF8Encoding(false);
+
     // this line came to exist.
     void AutoFixRecord(int dot, string what)
     {
@@ -3137,7 +3150,7 @@ class CockpitWindow : Window
                         + ",\"what\":\"" + what.Replace("\"", "'") + "\""
                         + ",\"detail\":\"" + detail.Replace("\\", "/").Replace("\"", "'") + "\"}";
             string path = Path.Combine(Path.GetDirectoryName(ResolvePath(null)), "autofix.jsonl");
-            File.AppendAllText(path, line + Environment.NewLine, Encoding.UTF8);
+            File.AppendAllText(path, line + Environment.NewLine, NoBomUtf8);
         }
         catch (Exception) { }   // a trace that can break the repair is worse than no trace
     }
@@ -10148,7 +10161,7 @@ class CockpitWindow : Window
                         + ",\"type\":\"" + ex.GetType().Name + "\""
                         + ",\"detail\":\"" + (ex.Message ?? "").Replace("\\", "/").Replace("\"", "'") + "\"}";
             string path = Path.Combine(Path.GetDirectoryName(ResolvePath(null)), "ui_errors.jsonl");
-            File.AppendAllText(path, line + Environment.NewLine, Encoding.UTF8);
+            File.AppendAllText(path, line + Environment.NewLine, NoBomUtf8);
         }
         catch (Exception) { }   // a trace that can break the cockpit is worse than no trace
     }
