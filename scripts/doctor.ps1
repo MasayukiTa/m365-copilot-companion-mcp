@@ -413,6 +413,20 @@ function Get-Sha256HexDoctor([string]$s) {
     }
     return (-join ($bytes | ForEach-Object { $_.ToString("x2") }))
 }
+# A name setup_devtunnel.ps1 GENERATES: its fixed default plus an optional hex machine
+# suffix. Such a name carries nothing user- or folder-derived -- the suffix is a hash --
+# so the substring checks below must not fire on it. Duplicated from
+# setup_devtunnel.ps1's $DEFAULT_NAME / Test-GeneratedTunnelName (D29: without this
+# exemption, a user named e.g. "pan" or "com" had every run's generated name --
+# "m365-copilot-companion-<hex>" -- flagged as identifying, even though nothing about it
+# was). Keep this pair and Test-IdentifyingTunnelName in sync with setup_devtunnel.ps1's
+# copies (and with bootstrap.py's) by hand -- there is no fourth shared file for them; see
+# this change's report for why they are not in tunnel_name_util.ps1.
+$DOCTOR_DEFAULT_NAME = "m365-copilot-companion"
+function Test-GeneratedTunnelNameDoctor([string]$name) {
+    if ([string]::IsNullOrWhiteSpace($name)) { return $false }
+    return ($name.Trim().ToLowerInvariant() -match ('^' + [regex]::Escape($DOCTOR_DEFAULT_NAME) + '(-[0-9a-f]{6}|-[0-9a-f]{8}){0,2}$'))
+}
 function Test-IdentifyingTunnelName([string]$name) {
     if ([string]::IsNullOrWhiteSpace($name)) { return $false }
     $lower = $name.ToLowerInvariant()
@@ -421,6 +435,8 @@ function Test-IdentifyingTunnelName([string]$name) {
     foreach ($t in $tokens) {
         if ((Get-Sha256HexDoctor $t) -eq $TOKEN_SHA256) { return $true }
     }
+    # NOT FOR A GENERATED NAME (D29) -- see the comment above Test-GeneratedTunnelNameDoctor.
+    if (Test-GeneratedTunnelNameDoctor $name) { return $false }
     $repoLeaf = (Split-Path -Leaf $repo).ToLowerInvariant()
     $userName = ("$env:USERNAME").ToLowerInvariant()
     foreach ($t in $tokens) {
@@ -948,6 +964,118 @@ Check "auth_bearer" "Auth OK end-to-end (Bearer accepted on /mcp)" `
             -and (($noKey -eq 401) -or ($noKey -eq 403))
     } `
     "the /mcp endpoint did not behave like an authenticated one. 0 = the server is down (start_all.bat); 401/403 with the key = the 'Bearer <MCP_API_KEY>' in Copilot Studio does not match .env; 404 = the server is answering but /mcp is not there; anything else without the key NOT being refused means authentication is not being enforced."
+
+# 7. Last background start (.setup\logs\start_all_summary.txt). The daily launchers
+# (start_all.bat, the Desktop icon, the Startup .lnk/Task) run start_all.ps1 through
+# start_all_hidden.vbs / start_background_hidden.vbs -- window 0, exit code unread -- so a
+# failure there used to produce nothing anyone would see until the chat window quietly
+# stopped answering. start_all.ps1 now rewrites this file on EVERY run, clean or not (see
+# its own header comment above Write-StartupSummary), in exactly this shape:
+#   failures=N
+#   when=yyyy-MM-dd HH:mm:ss
+#   mode=<full|core (-CoreOnly)|background (-NoUi)>
+#   - <fix text for failure 1>          (N of these, only when N>0)
+#   fix: run doctor.bat for the specific fix for each line   (only when N>0)
+# doctor only READS this file -- it never runs start_all.ps1 or repairs anything itself.
+function Get-LastStartSummaryDoctor([string]$Path) {
+    # Returns $null when the file is absent, empty or unreadable; otherwise a hashtable:
+    #   Failures [int]                  the recorded count (0 if the line is missing/bad)
+    #   When     [Nullable[datetime]]   parsed "when=" value, or $null if missing/unparsable
+    #   Mode     [string]               the recorded "mode=" value, or ""
+    #   Lines    [string[]]             the "- " fix lines, in the order start_all wrote them
+    #   FileTime [Nullable[datetime]]   the file's own last-write time -- the staleness
+    #                                   fallback for when "when=" cannot be parsed
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $raw = $null
+    try { $raw = @(Get-Content -LiteralPath $Path -ErrorAction Stop) } catch { return $null }
+    if (-not $raw -or $raw.Count -eq 0) { return $null }
+    $failures = 0
+    $when = $null
+    $mode = ""
+    $lines = @()
+    foreach ($ln in $raw) {
+        if ($ln -match '^failures=(\d+)$') {
+            $failures = [int]$matches[1]
+        } elseif ($ln -match '^when=(.+)$') {
+            $parsed = [datetime]::MinValue
+            if ([datetime]::TryParse($matches[1], [ref]$parsed)) { $when = $parsed }
+        } elseif ($ln -match '^mode=(.*)$') {
+            $mode = $matches[1]
+        } elseif ($ln.StartsWith("- ")) {
+            $lines += $ln.Substring(2)
+        }
+    }
+    $fileTime = $null
+    try { $fileTime = (Get-Item -LiteralPath $Path -ErrorAction Stop).LastWriteTime } catch { }
+    return @{ Failures = $failures; When = $when; Mode = $mode; Lines = $lines; FileTime = $fileTime }
+}
+# PURE decision: does a recorded start no longer speak for the CURRENT boot? Older than 24h
+# on the wall clock, or older than the currently running server's own start time -- the
+# latter means the server has restarted since this record was written, so either a start_all
+# run happened and (for some other reason) did not rewrite the file, or the server was
+# started some other way; either way the record predates what is running now. Either input
+# may be $null (unknown); a $null SummaryTime is treated as not-stale -- nothing to compare
+# (Get-LastStartSummaryDoctor already falls back to the file's own write time, so this is
+# normally $null only when the file itself could not be stat'd).
+function Test-LastStartSummaryStale {
+    param($SummaryTime, $ServerStartTime, [datetime]$Now)
+    if ($null -eq $SummaryTime) { return $false }
+    if ($SummaryTime -lt $Now.AddHours(-24)) { return $true }
+    if (($null -ne $ServerStartTime) -and ($SummaryTime -lt $ServerStartTime)) { return $true }
+    return $false
+}
+
+$script:lastStartPath = Join-Path $repo ".setup\logs\start_all_summary.txt"
+$script:lastStart = Get-LastStartSummaryDoctor $script:lastStartPath
+if (-not $script:lastStart) {
+    Check "last_start" "Last background start recorded (.setup\logs\start_all_summary.txt)" `
+        { $false } `
+        "no background start has been recorded on this machine yet. It is written by start_all.ps1 (the daily launcher) on every run -- double-click the 'M365 Companion' Desktop icon, or run start_all.bat once, then re-run doctor.bat." `
+        -Info
+} else {
+    $lsWhen = $script:lastStart.When
+    $lsSummaryTime = if ($lsWhen) { $lsWhen } else { $script:lastStart.FileTime }
+    $lsWhenText = if ($lsWhen) {
+        $lsWhen.ToString("yyyy-MM-dd HH:mm:ss")
+    } elseif ($script:lastStart.FileTime) {
+        $script:lastStart.FileTime.ToString("yyyy-MM-dd HH:mm:ss") + " (file time -- the recorded 'when=' line could not be read)"
+    } else {
+        "unknown time"
+    }
+    $lsModeText = if ($script:lastStart.Mode) { $script:lastStart.Mode } else { "unknown mode" }
+
+    # THE RUNNING SERVER'S OWN START TIME, not this doctor process's. /health already reports
+    # server_pid for the tunnel_serving check above; reused here so a live server that has
+    # restarted since the recorded start is what "stale" is measured against.
+    $lsServerStart = $null
+    try {
+        $lsPid = (Invoke-RestMethod -Uri 'http://127.0.0.1:8000/health' -TimeoutSec 4 -UseBasicParsing).server_pid
+        if ($lsPid) { $lsServerStart = (Get-Process -Id ([int]$lsPid) -ErrorAction Stop).StartTime }
+    } catch { }
+    $lsStale = Test-LastStartSummaryStale $lsSummaryTime $lsServerStart (Get-Date)
+    $lsStaleSuffix = if ($lsStale) { " [may be stale: older than 24h, or than the running server]" } else { "" }
+
+    if ($script:lastStart.Failures -le 0) {
+        Check "last_start" ("Last background start OK (" + $lsWhenText + ", " + $lsModeText + ")" + $lsStaleSuffix) `
+            { $true } `
+            "no problems were recorded in the last background start."
+    } elseif ($script:lastStart.Lines.Count -gt 0) {
+        $lsN = 0
+        foreach ($lsLine in $script:lastStart.Lines) {
+            $lsN++
+            Check ("last_start_" + $lsN) `
+                ("Last background start (" + $lsWhenText + ", " + $lsModeText + ") problem " + $lsN + " of " + $script:lastStart.Failures + $lsStaleSuffix) `
+                { $false } `
+                $lsLine
+        }
+    } else {
+        # failures=N>0 but no "- " lines were readable (older/corrupt file format) -- still
+        # say a problem was recorded rather than going silent about it.
+        Check "last_start" ("Last background start (" + $lsWhenText + ", " + $lsModeText + ") recorded " + $script:lastStart.Failures + " problem(s), but none could be read from the file" + $lsStaleSuffix) `
+            { $false } `
+            "run doctor.bat for the specific fix for each line; if this keeps happening, .setup\logs\start_all_summary.txt may be corrupt -- check its contents by hand."
+    }
+}
 
 Write-Host ""
 Write-Host "---------------------------------------------"
