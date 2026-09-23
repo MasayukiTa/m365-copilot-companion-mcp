@@ -201,20 +201,42 @@ class CheckFailed(RuntimeError):
     """The check could not be performed. Never the same thing as finding nothing."""
 
 
+def _split_nul(text):
+    """Split a NUL-separated `-z` git listing into paths, dropping the empty tail `split`
+    leaves after the final terminator.
+
+    `-z` IS THE FIX, NOT A DETAIL. Without it, git's default `core.quotePath` wraps any
+    non-ASCII filename in double quotes and rewrites every non-ASCII byte as a C-style octal
+    escape -- `"\\346\\227\\245...".txt` -- which is a literal string of backslash-digit
+    characters, not the bytes of the name. Splitting that on newlines and decoding as UTF-8
+    (measured: `git -C repo ls-files` on a repo holding one file named with Japanese
+    characters) yields exactly that escaped, quoted string as the "path", which does not exist
+    on disk. `open()` on it then raised, and the guard reported the file as "unreadable, so
+    unchecked" -- a FOUND offence that blocked the commit for a file whose actual content was
+    never read. Per git-ls-files(1) and git-diff(1), `-z` disables the quoting entirely and
+    NUL-terminates each entry instead of newline-terminating it, so a name is returned as
+    itself and a literal newline inside a name cannot be mistaken for an entry separator.
+    """
+    return [p for p in text.split("\0") if p]
+
+
 def _git_lines(repo, args):
     """Lines from one git command, or [] when git has nothing to say. Never raises.
 
     Used for the two ADVISORY reaches below. The tracked list keeps its own hard failure --
     a guard that cannot enumerate what it guards must not report a pass.
+
+    `-z` is appended to every call -- see `_split_nul` -- so a non-ASCII filename comes back
+    as itself rather than as git's quoted, octal-escaped display form.
     """
     try:
         from tools.childproc import run as _run_child
-        out = _run_child(["git", "-C", repo] + list(args))
+        out = _run_child(["git", "-C", repo] + list(args) + ["-z"])
     except OSError:
         return []
     if out.returncode != 0:
         return []
-    return [p for p in out.stdout.splitlines() if p.strip()]
+    return _split_nul(out.stdout)
 
 
 def staged_files(repo="."):
@@ -259,12 +281,17 @@ def _run_git_or_fail(repo, args):
 
 def tracked_files(repo="."):
     """Every tracked path, or raise. A failed git call used to yield an empty list, and an
-    empty list reads as "nothing identifying in 0 tracked files" -- a pass."""
-    out = _run_git_or_fail(repo, ["ls-files"])
+    empty list reads as "nothing identifying in 0 tracked files" -- a pass.
+
+    `-z` -- see `_split_nul` -- so a non-ASCII filename decodes to itself instead of to git's
+    quoted, octal-escaped display form, which is not a path that exists and used to make this
+    check report the file "unreadable, so unchecked" for content it had never actually opened.
+    """
+    out = _run_git_or_fail(repo, ["ls-files", "-z"])
     if out.returncode != 0:
         raise CheckFailed("git ls-files failed in %s: %s"
                           % (repo, (out.stderr or "").strip()[:200]))
-    files = [p for p in out.stdout.splitlines() if p.strip()]
+    files = _split_nul(out.stdout)
     if not files:
         raise CheckFailed("git reported no tracked files in %s, which is not a repository "
                           "this check can vouch for" % repo)

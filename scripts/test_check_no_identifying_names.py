@@ -75,6 +75,42 @@ def test_a_file_type_outside_any_whitelist_is_still_read():
     assert {f[0] for f in C.offences(d)} == {"data.csv", "Makefile"}
 
 
+# ---- non-ASCII filenames: `git ls-files` quotes and octal-escapes them by default -----------
+
+def test_a_clean_non_ascii_named_file_is_read_and_passes():
+    """`core.quotePath` wraps a non-ASCII name in quotes and rewrites every non-ASCII byte as
+    a C-style octal escape (`"\\346\\227\\245...".txt`), and reading THAT string as a path
+    fails -- the file that plainly exists was reported "unreadable, so unchecked", a FOUND
+    offence, for content nobody ever looked at. tracked_files() must return the real name, and
+    offences() must actually open and clear a clean file under it rather than merely not error."""
+    name = "日本語ファイル.txt"
+    d = _repo({name: "nothing identifying here\n"})
+    assert C.tracked_files(d) == [name]
+    assert C.offences(d) == []
+
+
+def test_a_non_ascii_named_file_with_identifying_content_is_still_caught():
+    name = "日本語ファイル.txt"
+    d = _repo({name: "owner %s\n" % SYNTHETIC_ID})
+    got = C.offences(d)
+    assert [f[0] for f in got] == [name]
+    assert got[0][1] == "employee-id shape"
+
+
+def test_an_identifying_token_in_a_non_ascii_filename_itself_is_caught():
+    """The path-only check (a file named after the thing it should not carry) must also see
+    past the quoting -- a hyphen breaks the word boundary the id shape needs on both sides,
+    same as it would for an ASCII name. The filename is assembled from SYNTHETIC_ID for the
+    same reason SYNTHETIC_ID itself is assembled from fragments: writing the id out in full,
+    even in a comment naming what a variable holds, is itself the leak this check exists to
+    catch, and CI catching it in THIS file would be the check working, not a false alarm."""
+    name = "%s-日本語.txt" % SYNTHETIC_ID
+    d = _repo({name: "clean\n"})
+    got = C.offences(d)
+    assert [f[0] for f in got] == [name]
+    assert got[0][1] == "employee-id shape in a path"
+
+
 # ---- what it must never do -----------------------------------------------------------------
 
 def test_a_failed_git_call_is_not_a_clean_result():
