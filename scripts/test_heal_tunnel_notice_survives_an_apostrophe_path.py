@@ -23,10 +23,12 @@ WHY A GIT CLONE, AND WHY THE PATH ITSELF NEEDS THE APOSTROPHE. Extracting just t
 function (as scripts/test_a_silent_death_leaves_its_exit_code.py does for
 Get-ServerExitRecord) proves the syntax fix in isolation, but the defect is specifically about
 $root -- a real filesystem path -- containing `'`, so the regression test needs an actual
-directory whose path has one. This clones the CURRENT COMMIT of this repo (`git clone
---local`, per this task's hard rules -- never operates on the real checkout) into a scratch
-folder under %TEMP% whose name itself contains an apostrophe, then drives the real
-scripts/heal_tunnel.ps1 (as committed) against that path.
+directory whose path has one. This clones this repo (`git clone --local`, per this task's hard
+rules -- never operates on the real checkout) into a scratch folder under %TEMP% whose name
+itself contains an apostrophe, for a realistic layout (tools/notify_ops.py present, no .venv,
+exactly what a fresh clone looks like) -- then overwrites the clone's scripts/heal_tunnel.ps1
+with the WORKING-TREE copy before extracting Send-TunnelHealNotice from it, so the test (and
+its mutation check) exercise whatever is actually on disk rather than the last commit.
 
 WHAT THIS PROVES, AND WHAT IT DOES NOT. It proves the generated `python -c` child no longer
 raises SyntaxError when $root has an apostrophe (see test_notice_call_survives_apostrophe_root
@@ -95,6 +97,17 @@ def apostrophe_clone(tmp_path_factory):
 
     Cleaned up unconditionally: this fixture is module-scoped so every test in this file
     shares one clone (cloning is the slow part; nothing here mutates the clone).
+
+    scripts/heal_tunnel.ps1 IS THEN OVERWRITTEN FROM THE WORKING TREE, deliberately. A plain
+    `git clone` gives the last COMMITTED heal_tunnel.ps1, which is right for "does the shipped
+    fix work" but wrong for two things this suite needs: testing an edit before it is
+    committed, and this file's own mutation check (which edits the on-disk .ps1 and expects
+    the very next test run to see it -- a git-history clone would still show the last commit
+    and the check would pass for the wrong reason, which is exactly what happened the first
+    time this test was written: reverting the fix on disk and rerunning still showed 3 green).
+    Everything else in the clone (tools/notify_ops.py, the absence of .venv) still comes from
+    git, which is what makes the apostrophe directory a realistic install layout rather than a
+    single stray file.
     """
     base = tmp_path_factory.mktemp("heal_apostrophe_base")
     # tmp_path_factory dirs never contain "'" themselves -- the apostrophe has to be on the
@@ -110,10 +123,28 @@ def apostrophe_clone(tmp_path_factory):
         % (proc.stdout, proc.stderr)
     )
     assert "'" in dest, "test setup bug: clone path does not actually contain an apostrophe"
+    shutil.copyfile(
+        os.path.join(REPO, "scripts", "heal_tunnel.ps1"),
+        os.path.join(dest, "scripts", "heal_tunnel.ps1"),
+    )
     try:
         yield dest
     finally:
         shutil.rmtree(dest, ignore_errors=True)
+
+
+def _strip_ps_comment_lines(text: str) -> str:
+    """Drop every line that is, after leading whitespace, a '#' comment.
+
+    Same helper as scripts/test_a_silent_death_leaves_its_exit_code.py, duplicated rather than
+    imported (this repo has no shared PowerShell-source-probe module; each test that needs it
+    keeps its own copy, matching the existing pattern). Needed here specifically because this
+    file's own header comment explains the fixed function by quoting its PRE-FIX code
+    (`` r'$root' ``) -- without stripping comments first, the source check below would match
+    that explanation instead of real code, the exact class of false positive
+    conftest.py's code_only() was written to avoid for Python.
+    """
+    return "\n".join(line for line in text.splitlines() if not line.strip().startswith("#"))
 
 
 @pytest.fixture(scope="module")
@@ -128,14 +159,15 @@ def test_the_fix_is_present_in_the_cloned_source(notice_function_from_clone: str
     """Source-level guard: the raw-string splice must be gone, and the argument-passing form
     must be present. Written against the CLONE (i.e. the committed state this task leaves
     behind), not the working tree, so it also catches "fixed the file but forgot to commit"."""
-    assert "r'$root'" not in notice_function_from_clone, (
+    code_only = _strip_ps_comment_lines(notice_function_from_clone)
+    assert "r'$root'" not in code_only, (
         "Send-TunnelHealNotice still splices $root into a Python raw-string literal -- "
         "this is exactly the pattern an apostrophe in the path breaks"
     )
-    assert "sys.argv[1]" in notice_function_from_clone, (
+    assert "sys.argv[1]" in code_only, (
         "Send-TunnelHealNotice no longer passes $root as sys.argv[1]"
     )
-    assert "-c $code $root" in notice_function_from_clone, (
+    assert "-c $code $root" in code_only, (
         "Send-TunnelHealNotice no longer passes $root as a separate process argument to python"
     )
 
