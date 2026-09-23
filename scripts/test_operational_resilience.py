@@ -408,7 +408,11 @@ def test_the_tunnel_access_decision_is_asked_recorded_and_applied():
     assert 'if "!TUNNEL_ACCESS!"=="anonymous" (' in qs
     # and tenant access is applied, not printed
     assert "[string]$TenantId" in dt
-    assert "access create $target --tenant $TenantId" in dt
+    # D16 (2026-09-24, `devtunnel access create --help`): --tenant is a flag and takes no id, so
+    # the GUID must not follow it. Executed with a stub CLI that rejects the GUID form in
+    # scripts/test_setup_devtunnel_access_and_identity.py.
+    assert "Dt access create $target --tenant" in dt
+    assert "--tenant $TenantId" not in dt
     # `set /p` is not inside a parenthesized block: measured, it did not settle before the `if`
     assert "goto :after_tenant_id" in qs
 
@@ -770,7 +774,9 @@ def test_the_access_choice_beats_the_file_and_the_environment():
     dt = (ROOT / "scripts" / "setup_devtunnel.ps1").read_text(encoding="utf-8")
 
     assert "[switch]$ForceAnonymous" in dt
-    assert "$AllowAnonymous = $ForceAnonymous.IsPresent -or (Get-AllowAnonymous)" in dt
+    # D4 (2026-09-24): one access mode per run, -ForceAnonymous first, then -TenantId, then the
+    # standing opt-in -- executed in scripts/test_setup_devtunnel_access_and_identity.py.
+    assert "$AccessMode = Resolve-AccessMode $ForceAnonymous.IsPresent $TenantId $anonSetting" in dt
     assert "-ForceAnonymous" in qs and "ANON_FLAG" in qs
     # replaced, not appended: an older line further up would otherwise keep winning
     assert r"MCP_TUNNEL_ALLOW_ANONYMOUS\s*=" in qs

@@ -86,13 +86,11 @@ NO_CALLER_BUT_TESTED = {
     "relay/selfimprove/propose.py::mutation_generator",             # 33 lines
     "relay/selfimprove/guards.py::classify_outcome",                # 21 lines
     "bench/companionbench/shadow_rules.py::verdict",                # 20 lines
-    "tools/env_portability.py::parse_env",                          # 14 lines
     "relay/project_memory.py::entry_authority",                     # 11 lines
     "bench/companionbench/shadow_rules.py::old_verdict",            # 9 lines
     "bench/companionbench/shadow_rules.py::new_verdict",            # 6 lines
     "relay/selfimprove/calibration.py::competence",                 # 5 lines
     "relay/lean_capture.py::enabled",                               # 3 lines
-    "tools/env_portability.py::classify",                           # 3 lines
 
     "bench/skill_probe.py::compare",                               # 51 lines, revealed 2026-09-14
     "bench/companionbench/shadow_rules.py::compare",               # 41 lines, revealed 2026-09-14
@@ -109,7 +107,6 @@ NO_CALLER_BUT_TESTED = {
     "relay/selfimprove/autonomy.py::raise_to",                   # 48 lines
     "relay/selfimprove/apply.py::safe_commit",                   # 39 lines
     "bench/companionbench/baseline.py::repeat_suite",            # 36 lines
-    "tools/env_portability.py::merge_for_new_machine",           # 35 lines
     "bench/attempt_snapshots.py::transitions",                   # 32 lines
     "relay/selfimprove/solver_feedback.py::to_hypotheses",       # 31 lines
     "relay/selfimprove/autonomy.py::require",                    # 29 lines
@@ -193,8 +190,10 @@ REASONS: dict[str, tuple[str, str]] = {
     # row arrived (its only caller was itself unreached); it is not one of ALLOWED_REASONS'
     # closing kinds. Every row below now has an actual verdict, so the kind says what was
     # decided. `worktree_remove` and `worktree_add` left the inventory the same day, WIRED.
-    # `tools/env_portability.py::parse_env` / `::classify` are PENDING new-PC work and stay
-    # "revealed" on purpose -- nobody has triaged them yet.
+    # `tools/env_portability.py::parse_env` / `::classify` / `::merge_for_new_machine` left the
+    # inventory 2026-09-24, WIRED: scripts/setup_devtunnel.ps1 section 0 classifies a carried
+    # .env through `env_portability.py machine-bound` (machine_bound_keys_in), D7 of the new-PC
+    # review.
     "relay/selfimprove/diversify.py::diversify": ("deliberate", "docs/unreached_burndown.md"),
     "relay/solve_policy.py::plan_solve": ("deliberate", "docs/unreached_burndown.md"),
     "relay/selfimprove/calibration.py::recommend_effort":
@@ -205,7 +204,6 @@ REASONS: dict[str, tuple[str, str]] = {
         ("deliberate", "docs/unreached_burndown.md"),
     "bench/companionbench/shadow_rules.py::verdict":
         ("deliberate", "docs/unreached_burndown.md"),
-    "tools/env_portability.py::parse_env": ("revealed", "docs/unreached_burndown.md"),
     "relay/project_memory.py::entry_authority": ("deliberate", "docs/unreached_burndown.md"),
     "bench/companionbench/shadow_rules.py::old_verdict":
         ("deliberate", "docs/unreached_burndown.md"),
@@ -214,7 +212,6 @@ REASONS: dict[str, tuple[str, str]] = {
     "relay/selfimprove/calibration.py::competence":
         ("deliberate", "docs/unreached_burndown.md"),
     "relay/lean_capture.py::enabled": ("deliberate", "docs/unreached_burndown.md"),
-    "tools/env_portability.py::classify": ("revealed", "docs/unreached_burndown.md"),
 
     # `episode_record.py::compact` was always unreached and never printed at all: `compact` is
     # defined in two modules, and a colliding name used to be skipped by the scan rather than

@@ -316,6 +316,9 @@ jobs:
             scripts/test_bootstrap.py \
             scripts/test_bootstrap_p2c.py \
             scripts/test_repair_unlock_output.py \
+            scripts/test_setup_devtunnel_access_and_identity.py \
+            scripts/test_unlock_password_is_retrievable.py \
+            tools/test_env_portability_names_what_cannot_move.py \
             scripts/test_supervisor_refuses_an_unowned_tunnel.py \
             scripts/test_operational_resilience.py \
             scripts/test_bridge_startup_reporting.py \
@@ -835,7 +838,7 @@ jobs:
         env:
           REQUIRE_CSC: "1"
         run: |
-          python -m pytest -rsx tools/test_a_windowless_launch_really_has_no_window.py ui/test_the_ui_and_the_fleet_agree_on_the_command_channel.py ui/test_the_chat_window_sends_what_was_typed.py ui/test_both_windows_can_be_constructed.py ui/test_a_submitted_task_is_on_top_at_once.py scripts/test_a_silent_death_leaves_its_exit_code.py scripts/test_a_runner_that_dies_before_argparse_is_recorded.py scripts/test_start_all_install_path.py
+          python -m pytest -rsx tools/test_a_windowless_launch_really_has_no_window.py ui/test_the_ui_and_the_fleet_agree_on_the_command_channel.py ui/test_the_chat_window_sends_what_was_typed.py ui/test_both_windows_can_be_constructed.py ui/test_a_submitted_task_is_on_top_at_once.py scripts/test_a_silent_death_leaves_its_exit_code.py scripts/test_a_runner_that_dies_before_argparse_is_recorded.py scripts/test_start_all_install_path.py scripts/test_setup_devtunnel_access_and_identity.py scripts/test_unlock_password_is_retrievable.py
 
       # The keyboard table lives here rather than on the ubuntu job because
       # tools/desktop_input.py binds ctypes.windll.user32 at import, so the module cannot

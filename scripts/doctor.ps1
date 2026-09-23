@@ -468,18 +468,173 @@ Check-TriState "tunnel_owned" "Dev Tunnel name is owned by this account (MCP_TUN
     { Test-TunnelOwned $tname } `
     "Re-run doctor.bat after connectivity settles. If it remains FAIL, run start_all.bat or: powershell -File scripts\heal_tunnel.ps1"
 
-TunnelCheck "tunnel_serving" "Dev Tunnel host serving (public URL -> server)" `
+# 3c.1 The tunnel's ACCESS GRANT -- what a remote caller is allowed through with (D15 in the
+# 2026-09-24 new-PC review). Nothing checked it: quickstart could print SETUP COMPLETE over a
+# tunnel with NO grant (choice N), which no remote client can pass, or over an anonymous one
+# the operator believed closed. Read-only: `devtunnel access list` for the tunnel and for port
+# 8000. MEASURED on the working machine, an allow entry prints as "+Anonymous [connect]"; the
+# tenant entry's text has not been observed, so "+Tenant"/"+Tenants" is matched. This parse is
+# setup_devtunnel.ps1's Get-AccessGrantFromListing, and
+# scripts/test_setup_devtunnel_access_and_identity.py runs both on the same listings.
+function Test-AnonymousInListing([string]$text) { return [bool]($text -match '\+\s*Anonymous\b') }
+function Test-TenantInListing([string]$text) { return [bool]($text -match '\+\s*Tenants?\b') }
+function Get-AccessGrantFromListing([string]$text) {
+    if (Test-AnonymousInListing $text) { return "anonymous" }
+    if (Test-TenantInListing $text) { return "tenant" }
+    return "none"
+}
+# Like Invoke-DevTunnelBounded, but also returns the exit code: an error message ("tunnel not
+# found", "unauthorized") contains no "+Anonymous" and must not be read as "no grant".
+function Invoke-DevTunnelBoundedExit([string[]]$dtArgs, [int]$timeoutSec) {
+    try {
+        $job = Start-Job -ScriptBlock {
+            param($exe, $a)
+            $o = ""
+            try { $o = (& $exe @a 2>&1 | Out-String) } catch { $o = "" }
+            [PSCustomObject]@{ Out = $o; Exit = $LASTEXITCODE }
+        } -ArgumentList $DevTunnel, $dtArgs
+    } catch { return $null }
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    while ($job.State -eq 'Running' -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 150 }
+    if ($job.State -eq 'Running') {
+        try { Stop-Job $job -ErrorAction SilentlyContinue } catch { }
+        try { Remove-Job $job -Force -ErrorAction SilentlyContinue } catch { }
+        return $null
+    }
+    $r = Receive-Job $job | Select-Object -Last 1
+    try { Remove-Job $job -Force -ErrorAction SilentlyContinue } catch { }
+    return $r
+}
+function Get-TunnelAccessGrantDoctor([string]$name, [int]$port) {
+    if ([string]::IsNullOrWhiteSpace($name)) { return $null }
+    $a = Invoke-DevTunnelBoundedExit @('access', 'list', $name) 10
+    $b = Invoke-DevTunnelBoundedExit @('access', 'list', $name, '-p', [string]$port) 10
+    if ((-not $a) -or (-not $b) -or ($a.Exit -ne 0) -or ($b.Exit -ne 0)) { return $null }
+    return (Get-AccessGrantFromListing ($a.Out + "`n" + $b.Out))
+}
+$script:tunnelAccess = $null
+$accessId = "tunnel_access"
+$accessFixAnon = "Anonymous is what an API-key Copilot Studio connector needs. To close it instead, run quickstart.bat and choose N (no remote access) -- setup_devtunnel.ps1 now removes the anonymous grant."
+$accessFixTenant = "Tenant-only: a caller must present an Entra sign-in of your tenant to the tunnel. NOT VERIFIED that a Copilot Studio connector using an API key can do that -- if its connection test fails, run quickstart.bat and choose A."
+$accessFixNone = "No access grant: nothing remote can connect. Run quickstart.bat and choose A (anonymous, gated by the Bearer token) or T (tenant)."
+if ($script:tunnelChainBroken) {
+    Write-Host ("  [SKIP] Dev Tunnel access grant") -ForegroundColor DarkGray
+    Write-Host ("         blocked by the Dev Tunnel check above -- fix that first, then re-run doctor") -ForegroundColor DarkGray
+    Add-Result $accessId $false "Dev Tunnel access grant" $accessFixNone $false $false $true
+} else {
+    $script:tunnelAccess = Get-TunnelAccessGrantDoctor $tname 8000
+    switch ($script:tunnelAccess) {
+        "anonymous" {
+            $n = "Dev Tunnel access grant: anonymous (anyone with the URL reaches the server; the Bearer token is the only gate)"
+            Add-Result $accessId $true $n $accessFixAnon $false $false $false
+            Write-Host ("  [ OK ] " + $n) -ForegroundColor Green
+            $script:ok++
+        }
+        "tenant" {
+            # A REQUIRED property -- can Copilot Studio get through? -- that cannot be established
+            # here, so counted as unknown: quickstart must not call that a complete setup.
+            $n = "Dev Tunnel access grant: tenant only (Copilot Studio with an API key is not expected to pass -- unverified)"
+            Add-Result $accessId $false $n $accessFixTenant $false $false $false $true
+            Write-Host ("  [WARN] " + $n) -ForegroundColor Yellow
+            Write-Host ("         " + $accessFixTenant) -ForegroundColor DarkYellow
+            $script:warn++
+            $script:unknown++
+        }
+        "none" {
+            $n = "Dev Tunnel access grant: none (no remote client can connect)"
+            Add-Result $accessId $false $n $accessFixNone $false $false $false
+            Write-Host ("  [FAIL] " + $n) -ForegroundColor Red
+            Write-Host ("         fix: " + $accessFixNone) -ForegroundColor Yellow
+            $script:bad++
+        }
+        default {
+            $n = "Dev Tunnel access grant (could not be read: devtunnel access list failed or timed out)"
+            Add-Result $accessId $false $n ("retry doctor.bat; or run: devtunnel access list " + $tname) $false $false $false $true
+            Write-Host ("  [WARN] " + $n) -ForegroundColor Yellow
+            $script:warn++
+            $script:unknown++
+        }
+    }
+}
+
+# 3c.2 The public URL must reach THIS server, not merely answer (D15).
+# A 200 IS NOT THE SERVER. Invoke-WebRequest follows redirects, and a tunnel that does not admit
+# anonymous callers answers with the dev tunnels sign-in page or the relay's browser warning
+# page -- both HTML, both able to end in 200 -- so this check could pass while no remote client
+# could reach anything (UNVERIFIED which page a given relay serves; the check no longer depends
+# on it). What main.py's /health returns is JSON with status "ok" and the serving process's
+# server_pid (main.py health(); scripts/status.py compares the pid the same way). So: the
+# answer must come from the tunnel's own host, be that JSON, and -- when the local server
+# answers too -- carry THIS machine's pid; a different pid means another machine hosts the same
+# tunnel and the relay is splitting the calls between them (D7). The anti-phishing header is
+# the documented way for a non-browser client to skip the relay's warning page; Copilot Studio
+# (server-to-server) never sees that page.
+function Test-TunnelHealthAnswer([string]$tunnelUrl, $localPid, [int]$timeoutSec = 7) {
+    $res = [PSCustomObject]@{ Ok = $false; Why = "" }
+    if (-not $tunnelUrl) { $res.Why = "MCP_TUNNEL_URL is not set in .env"; return $res }
+    # MCP_TUNNEL_URL points at the /mcp path (e.g. https://host.devtunnels.ms/mcp);
+    # /health is a SIBLING route at the tunnel origin, not nested under /mcp -- so
+    # naively appending "/health" to $turl produced .../mcp/health, a 404 that made
+    # this check FAIL even when the tunnel was being served correctly. Use the
+    # origin (scheme+host) instead.
+    $u = [Uri]$tunnelUrl
+    $origin = $u.GetLeftPart([UriPartial]::Authority)
+    try {
+        $r = Invoke-WebRequest -Uri ($origin + '/health') -TimeoutSec $timeoutSec -UseBasicParsing `
+                               -Headers @{ 'X-Tunnel-Skip-AntiPhishing-Page' = 'true' }
+    } catch {
+        $code = $null
+        try { $code = [int]$_.Exception.Response.StatusCode } catch { }
+        if ($code) {
+            $res.Why = "the public URL answered HTTP $code instead of the server's /health -- the tunnel relay refused the call (a tunnel without an anonymous grant does this to every caller without an Entra sign-in)"
+        } else {
+            $res.Why = "no answer from the public URL: " + $_.Exception.Message
+        }
+        return $res
+    }
+    $finalUri = $null
+    try { $finalUri = $r.BaseResponse.ResponseUri } catch { }
+    if (-not $finalUri) { try { $finalUri = $r.BaseResponse.RequestMessage.RequestUri } catch { } }
+    if ($finalUri -and ($finalUri.Host -ne $u.Host)) {
+        $res.Why = "the public URL redirected to " + $finalUri.Host + " (a sign-in page), not the server -- the tunnel does not admit anonymous callers"
+        return $res
+    }
+    $j = $null
+    try { $j = ($r.Content | ConvertFrom-Json) } catch { $j = $null }
+    if ((-not $j) -or ($j.status -ne "ok")) {
+        $head = ("" + $r.Content)
+        if ($head.Length -gt 60) { $head = $head.Substring(0, 60) }
+        $head = ($head -replace '\s+', ' ')
+        $res.Why = "HTTP " + $r.StatusCode + " but not the server's /health JSON (it began: '" + $head + "') -- the dev tunnel relay answered (sign-in or warning page), not this server"
+        return $res
+    }
+    if ($localPid -and $j.server_pid -and ([string]$j.server_pid -ne [string]$localPid)) {
+        $res.Why = "the public URL reached server pid " + $j.server_pid + ", but this machine's server is pid " + $localPid + " -- another machine also hosts this tunnel and the relay splits the calls between them. Stop the stack on the other machine, or give this one its own tunnel: powershell -File scripts\setup_devtunnel.ps1"
+        return $res
+    }
+    $res.Ok = $true
+    return $res
+}
+$script:tunnelServingWhy = ""
+TunnelCheck "tunnel_serving" "Dev Tunnel host serving (public URL -> THIS server's /health)" `
     {
-        if (-not $turl) { return $false }
-        # MCP_TUNNEL_URL points at the /mcp path (e.g. https://host.devtunnels.ms/mcp);
-        # /health is a SIBLING route at the tunnel origin, not nested under /mcp -- so
-        # naively appending "/health" to $turl produced .../mcp/health, a 404 that made
-        # this check FAIL even when the tunnel was being served correctly. Use the
-        # origin (scheme+host) instead.
-        $origin = ([Uri]$turl).GetLeftPart([UriPartial]::Authority)
-        (Invoke-WebRequest -Uri ($origin + '/health') -TimeoutSec 7 -UseBasicParsing).StatusCode -eq 200
+        $localPid = $null
+        try { $localPid = (Invoke-RestMethod -Uri 'http://127.0.0.1:8000/health' -TimeoutSec 4 -UseBasicParsing).server_pid } catch { }
+        $probe = Test-TunnelHealthAnswer $turl $localPid
+        $script:tunnelServingWhy = $probe.Why
+        $probe.Ok
     } `
     "the tunnel exists but is not being served -- run start_all.bat (the supervisor hosts it). If this stays red while the checks above are green, MCP_TUNNEL_URL in .env may be stale -- compare it to the URL shown by 'devtunnel show <name>'."
+# SAY WHY. The fixed advice above is for "not hosted"; a relay page or a second host needs a
+# different action, and the probe knows which it saw.
+$lastResult = $script:results[-1]
+if ($lastResult.id -eq "tunnel_serving" -and -not $lastResult.ok -and -not $lastResult.skipped -and $script:tunnelServingWhy) {
+    Write-Host ("         why: " + $script:tunnelServingWhy) -ForegroundColor Yellow
+    if ($script:tunnelAccess -and $script:tunnelAccess -ne "anonymous") {
+        Write-Host ("         the tunnel's access grant is '" + $script:tunnelAccess + "' (see the access check above)") -ForegroundColor Yellow
+    }
+    $lastResult.fix = $script:tunnelServingWhy + " | " + $lastResult.fix
+}
 
 # 3d. Supervisor/env match -- catches a RUNNING supervisor that is hosting a different
 # (stale/borrowed) tunnel than .env currently names. This happens when .env was copied

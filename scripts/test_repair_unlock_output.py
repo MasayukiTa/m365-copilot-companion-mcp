@@ -99,5 +99,12 @@ def test_every_verdict_keeps_the_prefix_start_all_matches_on():
     src = io.open(R.__file__, encoding="utf-8").read()
     printed = [ln.strip() for ln in src.splitlines() if ln.strip().startswith("print(")]
     assert printed, "no output lines found; the contract cannot be checked"
+    # D1 (2026-09-24): `--current` answers password:/unset:/undecryptable:, and a repair run by a
+    # person (a TTY, or --show) adds a `password:` line AFTER its verdict. None of those may ever
+    # be what start_all selects, which is why they carry prefixes its match does not accept;
+    # that they never reach start_all's capture is executed in
+    # scripts/test_unlock_password_is_retrievable.py.
+    shapes = ('"noop:', '"repaired:', '"failed:', '"error:',
+              '"password:', '"unset:', '"undecryptable:')
     for ln in printed:
-        assert any(p in ln for p in ('"noop:', '"repaired:', '"failed:', '"error:')), ln
+        assert any(p in ln for p in shapes), ln
