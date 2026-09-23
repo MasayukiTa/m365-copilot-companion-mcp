@@ -23,19 +23,51 @@ if not "%QS_HERE:!=%"=="%QS_HERE%" goto :qs_bad_bang
 setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 
+REM OVERALL RESULT (SF-15, 2026-09-24). Several checks below (the health check especially) used
+REM to route a failure to the same :after_banner tail as success, which then fell off the end of
+REM the file with no `exit /b`, so cmd's own default (0) was reported regardless -- a caller
+REM (a scheduled re-run, another script, an operator reading %ERRORLEVEL%) saw "success" over a
+REM screen of FAIL lines. Every branch that finds a real problem sets this to non-zero before
+REM jumping to :after_banner; the tail exits with it.
+set "QS_EXIT=0"
+
 REM ONE QUICKSTART AT A TIME (D21). Two at once ran pip into one .venv, could each write a .env
 REM with DIFFERENT secrets (one window then shows values that are not the saved ones), and both
 REM created the tunnel so the loser made a second one. The lock records this window's cmd.exe and
 REM is released on every exit below; a window closed mid-run leaves a lock whose owner is gone,
-REM which the next run takes over. If the helper itself cannot run (exit other than 0/10), the
-REM run continues unlocked -- a missing guard must not become a refusal to install.
+REM which the next run takes over automatically (by checking whether the recorded PID is still
+REM alive), so a stale lock never needs anyone to delete a file by hand.
+REM FAILS CLOSED (INST-14, 2026-09-24): only errorlevel 0 -- POSITIVE, CONFIRMED ownership --
+REM proceeds. Anything else stops here instead of installing unlocked, because "the lock helper
+REM had a problem" and "another quickstart is running" look identical from this side, and
+REM guessing wrong risks two installs writing different secrets into the same .env at once.
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\quickstart_lock.ps1" acquire
 set "LOCK_RC=%ERRORLEVEL%"
+if "%LOCK_RC%"=="0" goto :lock_acquired
 if "%LOCK_RC%"=="10" (
+    REM Another quickstart is confirmed alive -- quickstart_lock.ps1 already printed its PID
+    REM and what to do.
     pause
     exit /b 10
 )
-if not "%LOCK_RC%"=="0" echo   ^(Could not check for another running quickstart; continuing without that check.^)
+if "%LOCK_RC%"=="9009" (
+    echo.
+    echo ACTION NEEDED: PowerShell could not be started ^(not found on PATH^), so quickstart
+    echo cannot confirm that no other quickstart is already installing into this folder.
+    echo Refusing to continue rather than risk two installs writing different secrets into
+    echo the same .env at once. Install/repair PowerShell on PATH, then run quickstart.bat again.
+    pause
+    exit /b 1
+)
+echo.
+echo ACTION NEEDED: could not confirm that no other quickstart is already running for this
+echo folder ^(the lock check exited with code %LOCK_RC% instead of confirming^). See the message
+echo above, if any. Refusing to continue rather than risk two installs writing different
+echo secrets into the same .env at once. Wait a few seconds and run quickstart.bat again -- a
+echo lock left by a closed window clears itself automatically.
+pause
+exit /b 1
+:lock_acquired
 
 echo.
 echo   SAFE TO RE-RUN: this script resumes where it left off.
@@ -516,6 +548,7 @@ if not "!DOCTOR_BAD!"=="0" (
     echo.
     echo   Fix what is shown above, then run quickstart.bat again.
     echo   It resumes from where it stopped - nothing is repeated unnecessarily.
+    set "QS_EXIT=!DOCTOR_BAD!"
     goto :after_banner
 )
 REM "COULD NOT DETERMINE" IS NOT "COMPLETE". doctor's exit code is the number of FAILURES, and
@@ -530,6 +563,7 @@ if not "!DOCTOR_UNKNOWN!"=="0" (
     echo   Nothing failed, but something required could not be determined -- look for
     echo   the [WARN] lines above; each printed what to retry. Re-run quickstart.bat
     echo   once that is resolved. It resumes; nothing is repeated unnecessarily.
+    set "QS_EXIT=1"
     goto :after_banner
 )
 echo ===========================================================================
@@ -547,8 +581,11 @@ REM must not make the next quickstart refuse to start.
 call :release_lock
 echo.
 pause
-endlocal
-goto :eof
+REM `exit /b` unwinds the setlocal scopes on its own (every other early exit in this file already
+REM relies on that, never calling `endlocal` first) -- an explicit `endlocal` here would instead
+REM discard QS_EXIT before it could be read, which is how this used to fall through to `goto
+REM :eof` and report 0 (success) after printing a screen of FAIL lines (SF-15, 2026-09-24).
+exit /b %QS_EXIT%
 
 REM ---- subroutines and early exits (never reached by falling through) -----------------------
 :release_lock

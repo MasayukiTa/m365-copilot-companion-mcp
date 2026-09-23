@@ -36,6 +36,21 @@ $DEFAULT_NAME = "m365-copilot-companion"
 # logic). No top-level side effects, so dot-sourcing it here is safe.
 . (Join-Path $PSScriptRoot "tunnel_name_util.ps1")
 
+# PURE (given a file on disk): decides whether a freshly-downloaded devtunnel.exe is trustworthy
+# (INST-10, 2026-09-24). The MZ-magic check the direct-download branch already does only rules
+# out a proxy's HTML block page; it says nothing about who built the binary. Requires BOTH a
+# Valid Authenticode chain AND a Microsoft signer -- measured on this machine's own installed
+# copies (WinGet's and the System32/MSI one) with this exact cmdlet: both report
+# Status=Valid, Subject="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond,
+# S=Washington, C=US" -- so this is what a real devtunnel.exe looks like today, not a guess.
+function Test-DevTunnelSignature {
+    param([Parameter(Mandatory)][string]$Path)
+    $sig = Get-AuthenticodeSignature -LiteralPath $Path
+    $subject = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { "" }
+    $ok = ($sig.Status -eq 'Valid') -and ($subject -match 'O=Microsoft Corporation')
+    return [pscustomobject]@{ Ok = $ok; Status = [string]$sig.Status; Subject = $subject }
+}
+
 # Anonymous tunnel access is an EXPLICIT opt-in (MCP_TUNNEL_ALLOW_ANONYMOUS), default OFF.
 # Granting --allow-anonymous / --anonymous makes this server (file/shell tools on the tunnel's
 # port) reachable by ANYONE on the internet, gated only by the app-layer MCP_API_KEY -- that must
@@ -627,6 +642,25 @@ if (-not $dtFound) {
             Write-Host "      %LOCALAPPDATA%\devtunnel\devtunnel.exe, then run quickstart.bat again."
             exit 1
         }
+
+        # Checked BEFORE the binary is ever executed (the --version probe below), not after: a
+        # rejected file must never be run, not even with a harmless-looking flag.
+        $dtSig = Test-DevTunnelSignature -Path $exe
+        if (-not $dtSig.Ok) {
+            # LEAVE NOTHING BEHIND, same as the "did not run" case below: a rejected file must not
+            # sit there to be mistaken for an installation on the next attempt.
+            Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue
+            Write-Host "      ERROR: the downloaded devtunnel.exe did not pass signature verification."
+            $dtSubj = if ($dtSig.Subject) { $dtSig.Subject } else { "(no signer)" }
+            Write-Host "      Authenticode status: $($dtSig.Status); signer: $dtSubj"
+            Write-Host "      A genuine devtunnel.exe is Authenticode-signed by Microsoft Corporation; this is"
+            Write-Host "      not, so it was removed rather than trusted. This is almost always a proxy or DNS"
+            Write-Host "      substituting something else for the real download, not a corrupt file."
+            Write-Host "      Ask IT (or use another PC) to download devtunnel for Windows x64, save it as"
+            Write-Host "      %LOCALAPPDATA%\devtunnel\devtunnel.exe, then run quickstart.bat again."
+            exit 1
+        }
+        Write-Host "      signature: Valid ($($dtSig.Subject))"
 
         # PROVE IT RUNS, THEN PERSIST. The order was the other way round: PATH was extended
         # permanently and only afterwards was the binary tried. When the check failed the bogus

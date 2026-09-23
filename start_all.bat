@@ -13,10 +13,39 @@ REM
 REM  ASCII / ENGLISH ONLY (cmd corrupts non-ASCII). First-time setup is still
 REM  quickstart.bat; this is the lightweight daily launcher.
 REM ===========================================================================
-setlocal EnableExtensions
+setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
+
+REM WINDOWS SCRIPT HOST CAN BE DISABLED (D18 / START-16, 2026-09-24). When it is, wscript.exe
+REM running the hidden .vbs below does NOTHING -- no window, no error, no non-zero exit code
+REM (see scripts\preflight_policy.ps1's wsh-disabled finding) -- so checking wscript's own exit
+REM code can never catch this case; the registry has to be asked directly, first. setup.bat's own
+REM preflight already runs this same check at INSTALL time and only WARNs, so a policy flipped
+REM off afterwards (or never checked because SETUP_IGNORE_POLICY was set) would otherwise make
+REM every later double-click of this file silently do nothing, forever.
+set "WSH_OK=1"
+for /f "usebackq delims=" %%W in (`powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\preflight_policy.ps1" -CheckWshOnly 2^>nul`) do (
+    if "%%W"=="WSH-ENABLED=0" set "WSH_OK=0"
+)
+if "!WSH_OK!"=="0" goto :wscript_fallback
+
 REM Launch the whole stack fully HIDDEN + DETACHED via the windowless VBS, then
 REM exit immediately. No console lingers (the old `pause` window was the "blank
 REM terminal" that, if closed mid-startup, left the stack half-up). start_all.ps1
 REM is idempotent, so this is safe to run any time.
 wscript.exe "%~dp0scripts\start_all_hidden.vbs"
+REM Belt-and-braces (START-16): wscript.exe itself refusing to run at all -- missing/blocked
+REM binary, NoDefaultCurrentDirectoryInExePath, some other policy the registry check above does
+REM not name -- is a second, different way this silently does nothing. That errorlevel used to
+REM be left unread.
+if errorlevel 1 goto :wscript_fallback
+goto :eof
+
+:wscript_fallback
+echo.
+echo   Windows Script Host is disabled, or wscript.exe could not run the hidden launcher, so the
+echo   usual windowless start could not fire. Starting the stack directly via PowerShell instead
+echo   (still hidden and detached; ask IT to enable Windows Script Host to restore the normal
+echo   wscript path, or see scripts\start_all.ps1 to run it yourself).
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath 'powershell' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','%~dp0scripts\start_all.ps1') -WindowStyle Hidden -WorkingDirectory '%~dp0'"
+goto :eof

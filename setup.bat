@@ -260,17 +260,81 @@ echo Attempting a no-admin install of 'uv' (Astral) into .setup\bin ...
 echo.
 if not exist ".setup\bin" mkdir ".setup\bin"
 if not defined UV_INSTALLER_URL set "UV_INSTALLER_URL=https://astral.sh/uv/install.ps1"
-REM Astral publish a standalone uv.exe; download it with PowerShell (no admin). The proxy line
-REM makes the installer's own downloads use the proxy found above, with this Windows sign-in
-REM for a proxy that asks for one.
+REM OFFICIAL HOST ONLY, UNLESS OPTED IN (INST-10, 2026-09-24). UV_INSTALLER_URL exists so a
+REM closed network can point at its own mirror of Astral's installer, but that URL's response
+REM runs with this user's privileges -- setting the variable to anywhere else was a way to run
+REM arbitrary code by setting one environment variable. A mirror is still supported: opt in
+REM explicitly with UV_INSTALLER_URL_ALLOW_UNTRUSTED=1 alongside it.
+echo !UV_INSTALLER_URL!| findstr /b /i /c:"https://astral.sh/" >nul
+if errorlevel 1 if not "!UV_INSTALLER_URL_ALLOW_UNTRUSTED!"=="1" (
+    echo   NOTE: UV_INSTALLER_URL is set to a host other than astral.sh: !UV_INSTALLER_URL!
+    echo   Ignoring it and using the official installer instead -- that URL's response would
+    echo   otherwise run with your user privileges. If this is a trusted mirror on a closed
+    echo   network, set UV_INSTALLER_URL_ALLOW_UNTRUSTED=1 in this window to use it anyway.
+    set "UV_INSTALLER_URL=https://astral.sh/uv/install.ps1"
+)
+REM Astral publish a standalone uv.exe; download the INSTALLER SCRIPT to a file first (not piped
+REM straight into Invoke-Expression -- a response that never lands on disk cannot be re-run if
+REM the connection drops mid-stream, and cannot be looked at either), run that file, then verify
+REM what it produced before anything below trusts it: an Authenticode signature check first (uv.exe
+REM has shipped one -- Azure Artifact Signing -- since release 0.12.12 / 2026-09-09; measured on
+REM this machine's own devtunnel.exe with the same cmdlet: Get-AuthenticodeSignature reports
+REM Status=Valid, Subject="CN=Microsoft Corporation, ..." for both the WinGet and System32 copies,
+REM which is the same trust model applied to uv.exe here). A build with NO signature at all (an
+REM older release, or a mirror that stripped it) falls back to an INDEPENDENT download of the
+REM matching release asset and a SHA-256 check against Astral's own published checksum registry
+REM (astral-sh/versions) -- comparing against the asset we fetch ourselves, not the one the
+REM installer already extracted, since the registry's checksum is for the .zip, not the .exe
+REM inside it. Either way this says on-screen which path it took. The proxy line makes the
+REM installer's own downloads use the proxy found above, with this Windows sign-in for a proxy
+REM that asks for one.
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$ErrorActionPreference='Stop';" ^
   "try {" ^
   "  if ($env:HTTPS_PROXY) { [System.Net.WebRequest]::DefaultWebProxy = New-Object System.Net.WebProxy($env:HTTPS_PROXY, $true) };" ^
   "  [System.Net.WebRequest]::DefaultWebProxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials;" ^
+  "  $installerFile = Join-Path '.setup\bin' 'uv-install.ps1';" ^
+  "  Invoke-WebRequest -UseBasicParsing -Uri $env:UV_INSTALLER_URL -OutFile $installerFile;" ^
   "  $env:UV_INSTALL_DIR = (Resolve-Path '.setup\bin').Path;" ^
   "  $env:UV_NO_MODIFY_PATH = '1';" ^
-  "  Invoke-RestMethod -UseBasicParsing $env:UV_INSTALLER_URL | Invoke-Expression;" ^
+  "  & $installerFile;" ^
+  "  $exe = Join-Path '.setup\bin' 'uv.exe';" ^
+  "  if (-not (Test-Path $exe)) { Write-Host 'uv.exe not found after the installer ran.'; exit 1 };" ^
+  "  $sig = Get-AuthenticodeSignature -LiteralPath $exe;" ^
+  "  if ($sig.Status -eq 'Valid') {" ^
+  "    Write-Host ('uv.exe Authenticode signature: Valid (' + $sig.SignerCertificate.Subject + ').');" ^
+  "  } elseif ($sig.Status -eq 'NotSigned') {" ^
+  "    Write-Host 'uv.exe carries no Authenticode signature (an older build); verifying it against Astrals published SHA-256 checksum registry instead.';" ^
+  "    $ok = $false;" ^
+  "    try {" ^
+  "      $ver = ((& $exe --version) -join ' ').Trim() -replace '^uv\s+', '' -replace '\s.*$', '';" ^
+  "      $plat = 'x86_64-pc-windows-msvc';" ^
+  "      $reg = Invoke-RestMethod -UseBasicParsing 'https://raw.githubusercontent.com/astral-sh/versions/main/v1/uv.ndjson';" ^
+  "      $match = $null;" ^
+  "      foreach ($line in ($reg -split [char]10)) { if (-not $line.Trim()) { continue }; try { $o = $line | ConvertFrom-Json } catch { continue }; if ($o.version -eq $ver) { $match = $o; break } };" ^
+  "      $art = $null;" ^
+  "      if ($match) { $art = $match.artifacts | Where-Object { $_.platform -eq $plat } | Select-Object -First 1 };" ^
+  "      if ($art -and $art.sha256 -and $art.url) {" ^
+  "        $zip = Join-Path '.setup\bin' 'uv-verify.zip';" ^
+  "        Invoke-WebRequest -UseBasicParsing -Uri $art.url -OutFile $zip;" ^
+  "        $actual = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash;" ^
+  "        if ($actual -ieq $art.sha256) {" ^
+  "          $exdir = Join-Path '.setup\bin' 'uv-verify-extract';" ^
+  "          if (Test-Path $exdir) { Remove-Item -LiteralPath $exdir -Recurse -Force };" ^
+  "          Expand-Archive -LiteralPath $zip -DestinationPath $exdir -Force;" ^
+  "          $found = Get-ChildItem -LiteralPath $exdir -Filter 'uv.exe' -Recurse | Select-Object -First 1;" ^
+  "          if ($found) { Copy-Item -LiteralPath $found.FullName -Destination $exe -Force; $ok = $true; Write-Host ('SHA-256 verified against Astrals published checksum for uv ' + $ver + '; using that independently-downloaded copy.') };" ^
+  "          Remove-Item -LiteralPath $exdir -Recurse -Force -ErrorAction SilentlyContinue;" ^
+  "        } else { Write-Host ('SHA-256 mismatch for uv ' + $ver + ': got ' + $actual + ', registry says ' + $art.sha256 + '.') };" ^
+  "        Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue;" ^
+  "      } else { Write-Host ('No published checksum found for uv ' + $ver + ' (' + $plat + ') in the registry.') };" ^
+  "    } catch { Write-Host ('Checksum verification failed: ' + $_.Exception.Message) };" ^
+  "    if (-not $ok) { Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue; Write-Host 'Refusing this uv.exe: it is neither Authenticode-signed nor checksum-verified.'; exit 1 };" ^
+  "  } else {" ^
+  "    Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue;" ^
+  "    Write-Host ('uv.exe Authenticode signature is ' + $sig.Status + ' -- refusing it.');" ^
+  "    exit 1;" ^
+  "  }" ^
   "} catch { Write-Host ('uv download failed: ' + $_.Exception.Message); exit 1 }"
 set "UVEXE="
 if exist ".setup\bin\uv.exe" (
