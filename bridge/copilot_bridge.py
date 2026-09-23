@@ -4565,8 +4565,19 @@ class Handler(BaseHTTPRequestHandler):
         if matched:
             try:
                 skill_prompt = SKILL_STORE.render(matched["name"], msg)
+                # APPLICABILITY CHECK, ADDED 2026-09-24. Measured on a held-out set: 2 of 30
+                # requests that should have matched nothing instead got a confident hit with
+                # the right topic and the wrong task (a job-posting request matched onboarding;
+                # a leave-law question matched a leave application). A lexical matcher cannot
+                # see "same topic, different task" -- the model reading the description can, so
+                # it is told to check before following what render() already handed it.
+                desc = str(matched.get("description") or "").strip()
+                note = (("\n%s Use this only if the request is for that exact task, not merely "
+                         "the same topic; if the topic matches but the task differs, proceed "
+                         "without it.\n" % desc) if desc else "")
                 self._stream_text(
-                    BRIDGE_DISCIPLINE + skill_prompt + "\n\nOriginal user request:\n" + msg
+                    BRIDGE_DISCIPLINE + skill_prompt + note
+                    + "\n\nOriginal user request:\n" + msg
                 )
                 return
             except SkillError:

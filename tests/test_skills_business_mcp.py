@@ -101,8 +101,10 @@ def test_a_confident_match_names_the_skill_to_load(lib):
     assert 0 < hit["score"]
     assert "時系列" in hit["description"]
     assert hit["confidence"] == "confident"
-    assert hit["instruction"] == ("CONFIDENT trusted match. Call skill_load(name='incident-report')"
-                                  " and follow that procedure as written.")
+    assert hit["instruction"] == (
+        "CONFIDENT trusted match. Call skill_load(name='incident-report') and follow that "
+        "procedure as written, but only if the request is for that exact task and not merely "
+        "the same topic.")
     assert "candidate" not in out
 
 

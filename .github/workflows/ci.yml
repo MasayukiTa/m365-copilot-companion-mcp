@@ -512,6 +512,7 @@ jobs:
             tests/test_faulthandler_rotation.py \
             tests/test_verify_stack_interrupted.py \
             tests/test_resume_interrupted.py \
+            tests/test_a_matched_skill_is_checked_before_it_is_followed.py \
             tests/test_skill_match_japanese.py \
             tests/test_skills_business_draft.py \
             tests/test_skills_business_lifecycle.py \
