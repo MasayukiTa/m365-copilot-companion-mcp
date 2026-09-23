@@ -89,6 +89,11 @@ EXEMPT = {
         "compiles ui/ChatSend.cs + ui/FleetCommands.cs with the test-only oracle and harness in "
         "ui/testdata/ into a throwaway console exe: it runs the chat's send path without WPF, "
         "which is the reason ChatSend.cs is its own file, not a build of the UI",
+    "ui/test_a_submitted_task_is_on_top_at_once.py":
+        "compiles ui/SubmittedTasks.cs + ui/FleetCommands.cs with the test-only driver in "
+        "ui/harness/ into a throwaway console exe: it runs the cockpit's submitted-group merge "
+        "and list order against real files without WPF, which is the reason SubmittedTasks.cs "
+        "is its own file, not a build of the UI",
 }
 
 #: ui/*.cs that are compiled by a TEST and by no Build line, on purpose -- each with the test
@@ -97,6 +102,7 @@ EXEMPT = {
 COMPILED_BY_A_TEST = {
     "ui/testdata/ChatDecisionsOriginal.cs": "ui/test_the_chat_window_sends_what_was_typed.py",
     "ui/testdata/ChatSendHarness.cs": "ui/test_the_chat_window_sends_what_was_typed.py",
+    "ui/harness/SubmittedTasksHarness.cs": "ui/test_a_submitted_task_is_on_top_at_once.py",
 }
 
 
