@@ -1,0 +1,19 @@
+# Line endings for files Windows interprets itself (D17, new-PC install review 2026-09-24).
+#
+# cmd.exe finds a `goto`/`call` label by re-reading the batch file, and with LF-only line
+# endings that lookup is known to misbehave -- labels are missed or the jump lands in the wrong
+# place, depending on where 512-byte boundaries fall. Every .bat here uses labels (quickstart.bat
+# and setup.bat depend on them). Until now there was no .gitattributes: the index holds .bat as
+# LF and a checkout got CRLF only from a machine-wide `core.autocrlf=true`. A clone with
+# autocrlf=false, and GitHub's "Download ZIP" (which the README recommends), therefore delivered
+# LF-only batch files. `eol=crlf` makes every checkout AND every `git archive` (the release ZIP,
+# GitHub's ZIP) write CRLF, whatever the machine's autocrlf says. The index keeps LF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# .ps1 and .vbs are deliberately NOT given an eol. Measured on this repository
+# (`git ls-files --eol`): every .ps1 and .vbs is LF in the index and working copies already mix
+# LF and CRLF (autocrlf-dependent), and both PowerShell 5.1 and wscript run either -- the daily
+# launcher start_all_hidden.vbs runs as LF on the owner's machine. Forcing a conversion would
+# rewrite 60 files for no behavioural gain, and PowerShell cares about ENCODING (a BOM or
+# ASCII-only), not line endings. So they keep what they have.

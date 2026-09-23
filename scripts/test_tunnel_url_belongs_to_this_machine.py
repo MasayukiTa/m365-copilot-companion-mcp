@@ -122,7 +122,9 @@ def test_the_source_still_gates_on_the_host(at):
     reverts to 'if existing_url:' does not pass silently."""
     import re
     src = io.open(B.__file__, encoding="utf-8").read()
-    assert "recorded_host == _this_host()" in src
+    # Since 2026-09-24 (D22) the comparison also accepts setup_devtunnel's legacy COMPUTERNAME
+    # stamp, through _host_is_mine -- which is itself run in test_bootstrap_install_path.py.
+    assert "recorded_host and _host_is_mine(recorded_host)" in src
     # Anchored, because "if existing_url:" is a substring of the legitimate "elif
     # existing_url:" that reports an inherited URL -- an unanchored check fails on the fix.
     bad = re.search(r"^\s*if existing_url:\s*$", src, re.M)

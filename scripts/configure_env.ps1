@@ -45,8 +45,47 @@ function Get-EnvVal([string[]]$lines, [string]$key) {
     if ($m) { return ($m -replace "^\s*$([regex]::Escape($key))\s*=\s*", "") }
     return ""
 }
-$lines = @()
-if (Test-Path $EnvPath) { $lines = @(Get-Content $EnvPath) }
+# READ AS UTF-8 (D29). Get-Content without -Encoding decodes with the ANSI code page (cp932
+# here), and the write below is UTF-8 -- so every save re-encoded the em-dash on .env line 2
+# (copied from .env.example) as mojibake, and it grew a little more garbled with each save. PS
+# 5.1's -Encoding UTF8 reads a file with or without a BOM.
+function Read-EnvLines([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return @() }
+    return @(Get-Content -LiteralPath $Path -Encoding UTF8)
+}
+
+# ATOMIC (D28). WriteAllText on .env truncates it first and writes second, so a closed window or
+# a power cut in between left a partial .env -- and the next setup run, finding no MCP_API_KEY,
+# minted a NEW one without a word, after which Copilot Studio got 401 while every local check
+# stayed green. Written to a temporary file beside .env and swapped in with File.Replace (one
+# rename on NTFS): afterwards the old file or the new one is there, never half of either. The
+# swap is retried briefly because a reader holding .env open refuses the rename for a moment.
+function Write-EnvFileAtomic([string]$Path, [string]$Text) {
+    $enc = New-Object System.Text.UTF8Encoding($false)
+    $tmp = $Path + ".tmp-" + $PID
+    [System.IO.File]::WriteAllText($tmp, $Text, $enc)
+    try {
+        $last = $null
+        for ($i = 0; $i -lt 10; $i++) {
+            try {
+                if (Test-Path -LiteralPath $Path) {
+                    [System.IO.File]::Replace($tmp, $Path, [NullString]::Value)
+                } else {
+                    [System.IO.File]::Move($tmp, $Path)
+                }
+                return
+            } catch [System.IO.IOException], [System.UnauthorizedAccessException] {
+                $last = $_
+                Start-Sleep -Milliseconds (100 * ($i + 1))
+            }
+        }
+        throw $last
+    } finally {
+        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+$lines = @(Read-EnvLines $EnvPath)
 
 $fields = @(
     @{ Key = "MCP_IMPL_AGENT_URL";       Label = "メイン エージェント (必須)";        Hint = "チャット＆フリートが操作する主エージェント。M365 Copilot で開いた時の URL バーの URL。" },
@@ -161,7 +200,9 @@ foreach ($f in $fields) {
     }
     $line = "$($f.Key)=$val"
     if ($lines | Where-Object { $_ -match "^\s*$([regex]::Escape($f.Key))\s*=" }) {
-        $lines = $lines | ForEach-Object { if ($_ -match "^\s*$([regex]::Escape($f.Key))\s*=") { $line } else { $_ } }
+        # @( ) KEEPS IT AN ARRAY. A one-line .env came back from the pipeline as a bare string,
+        # and the `+=` below then CONCATENATED onto it -- "KEY=aMCP_X=b" on a single line.
+        $lines = @($lines | ForEach-Object { if ($_ -match "^\s*$([regex]::Escape($f.Key))\s*=") { $line } else { $_ } })
     } else {
         $lines += $line
     }
@@ -170,8 +211,9 @@ foreach ($f in $fields) {
 # which corrupts the first line for plain parsers: bootstrap.py then read .env's first key
 # as "﻿MCP_API_KEY" and reported MCP_API_KEY missing, and python-dotenv left it unset
 # (main.py crashed with KeyError). UTF8Encoding($false) = no BOM. CRLF line endings.
+# Atomic, see Write-EnvFileAtomic.
 $text = ($lines -join "`r`n") + "`r`n"
-[System.IO.File]::WriteAllText($EnvPath, $text, (New-Object System.Text.UTF8Encoding($false)))
+Write-EnvFileAtomic $EnvPath $text
 Write-Host "Saved agent URLs to $EnvPath"
 # NO MODAL BOX. It had to be clicked before setup could continue, which is a second thing to
 # answer for an action that already succeeded; the console line above is the confirmation.

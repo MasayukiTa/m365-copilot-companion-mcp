@@ -8,27 +8,43 @@ from typing import Optional
 
 from .security import require_unlocked
 
+#: The explicit opt-in to every drive. The ONLY value that yields unrestricted access.
+ALLOW_EVERY_DRIVE = "*"
+
+
 def _parse_allowed_bases():
     """Scope for the file tools, from MCP_ALLOWED_BASE.
 
-    Policy is DEFAULT-OPEN, OPT-OUT:
-      * unset / empty / '*'  -> None  == unrestricted (all drives/paths allowed).
+    Policy is FAIL-CLOSED, OPT-IN (changed 2026-09-24, D6 of the new-PC install review):
+      * unset / empty        -> [home dir]  -- the same scope .env.example ships (`~`).
+      * '*'                  -> None == unrestricted (all drives). Deliberate opt-in only.
       * otherwise a list of allowed roots separated by the OS path separator
         (';' on Windows). Roots may be whole drives ('C:' / 'D:' -> the drive
         root) or specific folders ('~', 'D:/data'). A path is allowed if it sits
         under ANY listed root.
 
+    WHY ABSENT NO LONGER MEANS "EVERYTHING". An absent key is not a decision. It is what a
+    .env looks like when configure_env.ps1 created it before bootstrap ran (start_all's
+    first-time dialog does exactly that on a machine where start_all is clicked before
+    quickstart), and bootstrap's backfill then never added the template's `MCP_ALLOWED_BASE=~`
+    -- so an install the operator believed was scoped to their home directory handed every
+    drive to anyone holding the Bearer token. A missing line must not widen access; only
+    someone who writes `*` gets every drive. An existing install that relied on the old
+    default keeps it by adding `MCP_ALLOWED_BASE=*` to .env.
+
     Examples:
-      MCP_ALLOWED_BASE=            -> all drives (default)
-      MCP_ALLOWED_BASE=*           -> all drives
+      MCP_ALLOWED_BASE=            -> home dir only (default)
+      MCP_ALLOWED_BASE=*           -> all drives (explicit opt-in)
       MCP_ALLOWED_BASE=C:/;D:/     -> only the C: and D: drives
       MCP_ALLOWED_BASE=~;D:/data   -> home dir + one folder
 
     Returns a list of resolved roots, or None for unrestricted.
     """
     raw = os.environ.get("MCP_ALLOWED_BASE", "").strip()
-    if not raw or raw == "*":
+    if raw == ALLOW_EVERY_DRIVE:
         return None
+    if not raw:
+        return [Path("~").expanduser().resolve()]
     bases = []
     for part in raw.split(os.pathsep):
         part = part.strip().strip('"')
@@ -41,10 +57,12 @@ def _parse_allowed_bases():
             bases.append(Path(part).expanduser().resolve())
         except Exception:
             continue
-    return bases or None
+    # A value that names no usable root (";", a path that will not resolve) is a mistake, not
+    # a request for every drive -- the same fail-closed reading as an absent key.
+    return bases or [Path("~").expanduser().resolve()]
 
 
-ALLOWED_BASES = _parse_allowed_bases()  # None => unrestricted (all drives)
+ALLOWED_BASES = _parse_allowed_bases()  # None => unrestricted, only via MCP_ALLOWED_BASE=*
 # Canonical base for sibling modules' state (gate_ops, runlog_ops, trace_ops): the
 # first restricted root, else the home dir. State never lands on an external drive.
 ALLOWED_BASE = ALLOWED_BASES[0] if ALLOWED_BASES else Path("~").expanduser().resolve()
@@ -99,7 +117,7 @@ def _validate_path(path: str) -> Path:
     # other callers.
     _refuse_security_state(p, path)
     if not bases:
-        return p  # unrestricted (default-open policy)
+        return p  # unrestricted: only reachable through MCP_ALLOWED_BASE=* (explicit opt-in)
     for base in bases:
         try:
             p.relative_to(base)

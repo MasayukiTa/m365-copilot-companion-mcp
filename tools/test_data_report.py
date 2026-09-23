@@ -482,7 +482,16 @@ class _FakeConnection:
         self.closed = True
 
 
-def test_odbc_helper_single_execution_and_preview_and_xlsx(monkeypatch):
+@pytest.fixture
+def every_drive(monkeypatch):
+    """The odbc helper tests pass a made-up "C:/fake/out.xlsx" (the writer is mocked, so nothing
+    is written). They relied on an ABSENT MCP_ALLOWED_BASE meaning every drive; since
+    2026-09-24 (D6) absent means the home directory, and on Windows that path lies outside it.
+    Stated here as what it always was: these tests run with the explicit opt-in (`*`)."""
+    monkeypatch.setattr(file_ops, "ALLOWED_BASES", None)
+
+
+def test_odbc_helper_single_execution_and_preview_and_xlsx(monkeypatch, every_drive):
     monkeypatch.setattr(odbc_ops, "require_unlocked", lambda: None)
     columns = ["fake_col_a", "fake_col_b"]
     rows = [("a", 1), ("b", 2), ("c", 3)]
@@ -517,7 +526,7 @@ def test_odbc_helper_single_execution_and_preview_and_xlsx(monkeypatch):
     assert "--- 2 row(s)" in result["preview"]
 
 
-def test_odbc_helper_xlsx_is_not_truncated_at_old_200_cap(monkeypatch):
+def test_odbc_helper_xlsx_is_not_truncated_at_old_200_cap(monkeypatch, every_drive):
     """Regression test: the xlsx write must include the FULL result set (like
     odbc_to_excel), not be silently capped at the old max_rows=200 default
     that used to be shared with the text-preview cap.
@@ -561,7 +570,7 @@ def test_odbc_helper_rejects_non_read_only(monkeypatch):
     assert "only SELECT" in result["error"]
 
 
-def test_odbc_helper_error_path_never_raises(monkeypatch):
+def test_odbc_helper_error_path_never_raises(monkeypatch, every_drive):
     monkeypatch.setattr(odbc_ops, "require_unlocked", lambda: None)
 
     def _boom(connection, timeout=30):
