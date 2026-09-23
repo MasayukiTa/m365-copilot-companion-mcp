@@ -4,12 +4,37 @@
 #  repo". Re-runnable (overwrites). Called at the end of quickstart.bat, and you
 #  can run it by hand any time. ASCII / ENGLISH ONLY.
 # =============================================================================
+#
+#  -Remove deletes the Desktop launcher AND records shortcut=no, so start_all stops
+#  re-creating it. Deleting the icon by hand is not an answer start_all can read: the
+#  record still says yes, and a missing launcher with a "yes" on record is re-created.
+param([switch]$Remove)
 $ErrorActionPreference = "Stop"
 # This script lives in <repo>\scripts. $repo is the REPO ROOT (one level up); $scriptDir is
 # the scripts dir where the windowless .vbs launcher now lives.
 $scriptDir = $PSScriptRoot
 if (-not $scriptDir) { $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path }
 $repo = Split-Path -Parent $scriptDir
+. (Join-Path $scriptDir "win\convenience_marker.ps1")
+$lnk = Get-DesktopLauncherPath
+
+if ($Remove) {
+    # THE OTHER HALF OF D11 (new-PC analysis). start_all re-creates a missing launcher whenever
+    # .setup\convenience_provisioned says shortcut=yes, so the durable way to be rid of it is to
+    # change that answer, which is what this does.
+    if (Test-Path -LiteralPath $lnk) {
+        try { Remove-Item -LiteralPath $lnk -Force; Write-Host ("Removed Desktop launcher: " + $lnk) }
+        catch { Write-Host ("Could not remove " + $lnk + ": " + $_.Exception.Message) -ForegroundColor Yellow }
+    } else {
+        Write-Host ("Desktop launcher was not present: " + $lnk)
+    }
+    if (Set-ConvenienceDecision $repo "shortcut" "no") {
+        Write-Host "Recorded shortcut=no -- start_all will not re-create it. Undo: scripts\make_desktop_shortcut.ps1"
+    } else {
+        Write-Host "WARNING: could not record shortcut=no in .setup\convenience_provisioned; start_all may re-create the launcher." -ForegroundColor Yellow
+    }
+    return
+}
 
 # Point at the WINDOWLESS launcher (scripts\start_all_hidden.vbs, run via wscript) so a
 # double-click shows NO cmd/console window -- there is nothing for a user to accidentally
@@ -21,8 +46,6 @@ if (-not (Test-Path $target)) {
     return
 }
 
-$desktop = [Environment]::GetFolderPath("Desktop")
-$lnk = Join-Path $desktop "M365 Companion.lnk"
 try {
     $ws = New-Object -ComObject WScript.Shell
     $sc = $ws.CreateShortcut($lnk)
@@ -41,6 +64,11 @@ try {
     $sc.Save()
     Write-Host ("Desktop launcher created: " + $lnk) -ForegroundColor Green
     Write-Host "Daily startup is now: double-click 'M365 Companion' on your Desktop." -ForegroundColor Green
+    # Asking for the launcher by hand is an answer too; start_all keeps what is recorded.
+    if (-not (Set-ConvenienceDecision $repo "shortcut" "yes")) {
+        Write-Host "(could not record shortcut=yes in .setup\convenience_provisioned)" -ForegroundColor Yellow
+    }
+    Write-Host "Remove it for good with: scripts\make_desktop_shortcut.ps1 -Remove" -ForegroundColor Green
 } catch {
     Write-Host ("Could not create the Desktop shortcut: " + $_.Exception.Message) -ForegroundColor Yellow
     Write-Host "You can still start the stack with start_all.bat in the repo folder." -ForegroundColor Yellow

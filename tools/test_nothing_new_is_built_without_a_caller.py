@@ -119,7 +119,6 @@ NO_CALLER_BUT_TESTED = {
     "tools/tool_probe.py::classify_probe_reply",                 # 26 lines
     "relay/selfimprove/trace_to_eval.py::record_correction",     # 25 lines
     "tools/judge_backend.py::sampling_judge_async",              # 24 lines
-    "scripts/stale_server_check.py::decide_post_update_action",  # 20 lines
     "relay/selfimprove/harness_tree.py::justified",              # 17 lines
     "bench/companionbench/runner.py::solver_feedback_entries",   # 15 lines
     "relay/project_memory.py::list_themes",                      # 15 lines
@@ -133,7 +132,6 @@ NO_CALLER_BUT_TESTED = {
     "relay/selfimprove/guards.py::partition_outcomes",           # 11 lines
     "relay/fleet_toolset.py::unknown_tools",                     # 10 lines
     "relay/turn_outcome.py::is_capacity_signal",                 # 10 lines
-    "scripts/stale_server_check.py::fleet_is_running",           # 10 lines
     "relay/solve_policy.py::finalize",                           # 9 lines
     "relay/solve_policy.py::plan_and_explain",                   # 9 lines
     "relay/project_memory.py::authorities_in",                   # 8 lines

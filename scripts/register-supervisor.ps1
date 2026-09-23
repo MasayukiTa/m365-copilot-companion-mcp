@@ -10,14 +10,14 @@
 
 $repo = Split-Path $PSScriptRoot -Parent
 $vbs  = Join-Path $repo 'scripts\start_background_hidden.vbs'
+. (Join-Path $PSScriptRoot "win\convenience_marker.ps1")
 
 if (-not (Test-Path $vbs)) {
     Write-Host "ERROR: start_background_hidden.vbs not found at $vbs"
     exit 1
 }
 
-$startup = [Environment]::GetFolderPath('Startup')
-$lnk     = Join-Path $startup 'M365 Companion.lnk'
+$lnk = Get-StartupLauncherPath
 
 try {
     $ws = New-Object -ComObject WScript.Shell
@@ -37,6 +37,14 @@ catch {
 if (-not (Test-Path $lnk)) {
     Write-Host "ERROR: shortcut creation reported success but $lnk does not exist"
     exit 1
+}
+
+# RECORDED AS THE PERSON'S ANSWER. Running this by hand is asking for logon autostart, and
+# start_all keeps what .setup\convenience_provisioned says: without this line a hand-registered
+# autostart was never re-created if it went missing, and unregister-supervisor.ps1's "no"
+# (which it now records) would be the only answer the file could hold.
+if (-not (Set-ConvenienceDecision $repo "autostart" "yes")) {
+    Write-Host "WARNING: could not record autostart=yes in .setup\convenience_provisioned."
 }
 
 Write-Host "Installed autostart shortcut: $lnk"

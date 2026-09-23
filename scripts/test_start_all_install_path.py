@@ -1,0 +1,615 @@
+# -*- coding: utf-8 -*-
+r"""start_all.ps1's install-path fixes, run for real -- in a throwaway copy, never this machine.
+
+What each group proves (IDs from the new-PC state-machine analysis):
+
+  D3   quickstart.bat runs start_all twice while it is itself executing; a pull there rewrites the
+       batch file cmd is reading by byte offset. The update check is gated on -CoreOnly AND on a
+       cmd.exe parent. Proved by launching the gate from a real `cmd /c quickstart.bat`.
+  D12  the daily "server is older than its code" kill ignored live runs and subpackages. Proved
+       end to end: a dummy "main.py" process of the throwaway checkout, a newer file in a
+       subpackage, a live run marker -- it survives; without the marker it is stopped.
+  D30  both server-stopping paths ask stale_server_check.py --server-action (the post-update
+       form is exercised here too) and an unreadable answer never authorises a kill.
+  D11  provisioning re-creates only what the record says yes to AND is missing; the REAL
+       unregister-supervisor.ps1 and make_desktop_shortcut.ps1 -Remove record "no", after which
+       nothing comes back. Desktop/Startup folders are redirected into the temp dir.
+  D14  a named mutex serialises start_all copies (waits, hand-over on abandon, bounded); the
+       fleet resume is skipped when the supervisor just started or a coordinator is running.
+  D24  a signed-out devtunnel, a missing tunnel, and a tunnel with no host are COUNTED, with the
+       command to run -- against a stub devtunnel.cmd that logs its argv (read-only verbs only).
+  D27  UI exes are rebuilt when missing, empty or older than a source named by the real Build
+       lines, through a stub rebuild_ui.ps1 that keeps those lines.
+  D29  the provisioning hint prints `scripts\register-supervisor.ps1` on one line.
+  and  a failed hidden start writes .setup\logs\start_all_summary.txt and raises a notification
+       through tools/notify_ops (suppressed under pytest by notify_desktop itself).
+
+HOW. The functions are cut out of scripts/start_all.ps1 by balanced-brace extraction (as
+scripts/test_a_silent_death_leaves_its_exit_code.py does) and run in a separate powershell
+against a temp "checkout" assembled from the files they need. Nothing here starts the stack,
+touches the live supervisor/bridge/tunnel, the real Desktop or Startup folder, or Task Scheduler
+(Get-ScheduledTask / Unregister-ScheduledTask are shadowed by driver functions).
+
+Windows-only.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import uuid
+
+import pytest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+sys.path.insert(0, REPO)
+
+from tools import childproc  # noqa: E402
+
+START_ALL = os.path.join(HERE, "start_all.ps1")
+_POWERSHELL = shutil.which("powershell") or shutil.which("powershell.exe")
+
+pytestmark = pytest.mark.skipif(os.name != "nt" or not _POWERSHELL,
+                                reason="start_all.ps1 is Windows PowerShell only")
+
+#: What the temp checkout needs, copied from THIS working tree (a clone would miss the edits
+#: under test).
+_COPY = ["scripts/stale_server_check.py", "scripts/win/convenience_marker.ps1",
+         "scripts/unregister-supervisor.ps1", "scripts/make_desktop_shortcut.ps1",
+         "scripts/start_all_hidden.vbs", "tools/__init__.py", "tools/childproc.py",
+         "tools/deploy_freshness.py", "tools/notify_ops.py", "relay/fleet_reaper.py",
+         "bench/__init__.py", "bench/ui_build_check.py"]
+
+_FUNCS = ["Env-Value", "Get-UpdateCheckSkipReason", "Get-ParentProcessInfo",
+          "Get-ThisCheckoutServerProcesses", "Get-ServerStartEpoch", "ConvertTo-ServerActionResult",
+          "Get-ServerAction", "Invoke-ServerAction", "Enter-StartAllLock", "Exit-StartAllLock",
+          "Get-FleetResumeSkipReason", "Get-ThisCheckoutFleetCoordinatorPids",
+          "Resolve-DevTunnelExe", "Invoke-DevTunnelBounded", "Get-TunnelLoginState",
+          "Get-TunnelHostCount", "Test-TunnelServing", "ConvertFrom-UiStaleLines",
+          "Get-UiBuildState", "Invoke-UiStep", "Write-StartupSummary",
+          "Test-ShouldNotifyStartupFailures", "Send-StartupFailureNotice",
+          "Ensure-ConvenienceProvisioning"]
+
+
+def _extract_braced_block(text: str, start_marker: str) -> str:
+    """The balanced-brace block starting at `start_marker` (not string-aware; every brace inside
+    a string in the extracted functions is itself balanced -- "@{u}", '"{0}"')."""
+    idx = text.index(start_marker)
+    depth = 0
+    for i in range(text.index("{", idx), len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[idx:i + 1]
+    raise AssertionError("unbalanced braces at %r" % start_marker)
+
+
+@pytest.fixture(scope="module")
+def functions() -> str:
+    src = open(START_ALL, encoding="utf-8").read()
+    out = []
+    for name in _FUNCS:
+        m = re.search(r"(?m)^function %s\b" % re.escape(name), src)
+        assert m, "start_all.ps1 no longer defines %s" % name
+        out.append(_extract_braced_block(src, m.group(0)))
+    return "\n\n".join(out)
+
+
+def _q(s) -> str:
+    return "'" + str(s).replace("'", "''") + "'"
+
+
+@pytest.fixture()
+def checkout(tmp_path):
+    root = tmp_path / "co"
+    for rel in _COPY:
+        dst = root / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(os.path.join(REPO, rel), dst)
+    for d in ("tools", "relay", ".fleet", ".setup"):
+        (root / d).mkdir(exist_ok=True)
+    return root
+
+
+def _refused_url():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return "http://127.0.0.1:%d/status" % port
+
+
+def _driver(functions, root, body, script_dir=None, venv_py=None, bridge=None):
+    pre = "\n".join([
+        '$ErrorActionPreference = "Continue"',
+        "$root = %s" % _q(root),
+        "$scriptDir = %s" % _q(script_dir or os.path.join(root, "scripts")),
+        "$script:venvPy = %s" % _q(venv_py or sys.executable),
+        "$script:bridgeStatusUrl = %s" % _q(bridge or _refused_url()),
+        "$script:startupFailures = @()",
+        "$script:splash = $null",
+        "function Set-SplashStatus($s, [string]$t) { }",
+        "function Pump-Splash($s) { }",
+        "function Hide-Secrets([string]$text) { return $text }",
+        ". (Join-Path %s 'scripts\\win\\convenience_marker.ps1')" % _q(root),
+    ])
+    return pre + "\n\n" + functions + "\n\n" + body + "\n"
+
+
+def _ps(tmp_path, text, env=None, timeout=240):
+    p = tmp_path / ("drv_%s.ps1" % uuid.uuid4().hex[:8])
+    p.write_text(text, encoding="utf-8-sig")
+    r = childproc.run([_POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(p)],
+                      env=env, timeout=timeout)
+    return r
+
+
+def _result(r):
+    for line in reversed(r.stdout.splitlines()):
+        if line.startswith("RESULT:"):
+            return json.loads(line[len("RESULT:"):])
+    raise AssertionError("no RESULT line.\nstdout:\n%s\nstderr:\n%s" % (r.stdout[-3000:], r.stderr[-3000:]))
+
+
+# =============================================================== D3: the update-check gate
+
+def test_update_gate_truth_table(tmp_path, checkout, functions):
+    body = r"""
+$r = @{
+  noui     = (Get-UpdateCheckSkipReason -NoUi $true -CoreOnly $false -ParentName 'wscript.exe' -ParentCommandLine '');
+  core     = (Get-UpdateCheckSkipReason -NoUi $false -CoreOnly $true -ParentName 'wscript.exe' -ParentCommandLine '');
+  qs       = (Get-UpdateCheckSkipReason -NoUi $false -CoreOnly $false -ParentName 'cmd.exe' -ParentCommandLine 'C:\WINDOWS\system32\cmd.exe /c ""C:\x y\repo\quickstart.bat" "');
+  vbs      = (Get-UpdateCheckSkipReason -NoUi $false -CoreOnly $false -ParentName 'wscript.exe' -ParentCommandLine 'wscript.exe "C:\r\scripts\start_all_hidden.vbs"');
+  unknown  = (Get-UpdateCheckSkipReason -NoUi $false -CoreOnly $false -ParentName '' -ParentCommandLine '');
+}
+"RESULT:" + ($r | ConvertTo-Json -Compress)
+"""
+    r = _result(_ps(tmp_path, _driver(functions, checkout, body)))
+    assert r["noui"] == "-NoUi"
+    assert "-CoreOnly" in r["core"]
+    assert "quickstart.bat" in r["qs"] and "rewrite" in r["qs"]
+    assert r["vbs"] == "" and r["unknown"] == ""
+
+
+def test_update_gate_sees_a_real_batch_parent(tmp_path, checkout, functions):
+    """The mechanism, not the table: launched from `cmd /c quickstart.bat` the gate closes;
+    launched from Python (as wscript would be, a non-cmd parent) it stays open."""
+    body = r"""
+$p = Get-ParentProcessInfo
+"RESULT:" + (@{ parent = $p.Name; skip = (Get-UpdateCheckSkipReason -NoUi $false -CoreOnly $false -ParentName $p.Name -ParentCommandLine $p.CommandLine) } | ConvertTo-Json -Compress)
+"""
+    drv = tmp_path / "gate_driver.ps1"
+    drv.write_text(_driver(functions, checkout, body), encoding="utf-8-sig")
+    bat = tmp_path / "quickstart.bat"
+    bat.write_text('@echo off\r\n"%s" -NoProfile -ExecutionPolicy Bypass -File "%s"\r\n' % (_POWERSHELL, drv),
+                   encoding="ascii")
+    via_bat = _result(childproc.run(["cmd.exe", "/c", str(bat)], timeout=240))
+    assert via_bat["parent"].lower() == "cmd.exe"
+    assert "quickstart.bat" in via_bat["skip"]
+    direct = _result(childproc.run([_POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                                    "-File", str(drv)], timeout=240))
+    assert direct["skip"] == "", direct
+
+
+# =============================================================== D12 / D30: one server rule
+
+def _dummy_server(root):
+    """A process whose command line names this checkout's main.py -- what the scan looks for."""
+    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(180)",
+                             os.path.join(str(root), "main.py")])
+
+
+_DAILY = r"""
+$e = Get-ServerStartEpoch
+$a = Get-ServerAction -StartedEpoch $e
+$note = Invoke-ServerAction $a "[t]"
+"RESULT:" + (@{ epoch = $e; verdict = $a.Verdict; why = @($a.Why) } | ConvertTo-Json -Compress)
+"""
+
+
+def test_daily_check_keeps_a_live_run_and_sees_subpackages(tmp_path, checkout, functions):
+    (checkout / "main.py").write_text("# server\n", encoding="utf-8")
+    os.utime(checkout / "main.py", (1_000_000, 1_000_000))
+    proc = _dummy_server(checkout)
+    try:
+        time.sleep(2)
+        sub = checkout / "tools" / "auto" / "forged.py"       # a SUBPACKAGE file
+        sub.parent.mkdir(parents=True, exist_ok=True)
+        sub.write_text("# new\n", encoding="utf-8")
+        os.utime(sub, (time.time() + 30, time.time() + 30))
+        (checkout / ".fleet" / "fleet_run_active.json").write_text(
+            json.dumps({"pid": os.getpid()}), encoding="utf-8")
+
+        live = _result(_ps(tmp_path, _driver(functions, checkout, _DAILY)))
+        assert live["epoch"] > 0, "the dummy server of this checkout was not found"
+        assert live["verdict"] == "report-only", live
+        assert proc.poll() is None, "a live run's server was stopped"
+
+        (checkout / ".fleet" / "fleet_run_active.json").unlink()
+        idle = _result(_ps(tmp_path, _driver(functions, checkout, _DAILY)))
+        assert idle["verdict"] == "swap-needed", idle
+        assert any("tools/auto/forged.py" in w for w in idle["why"])
+        for _ in range(20):
+            if proc.poll() is not None:
+                break
+            time.sleep(0.5)
+        assert proc.poll() is not None, "the stale server of this checkout was not stopped"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
+def test_post_update_form_and_unreadable_answers(tmp_path, checkout, functions):
+    body = r"""
+$r = @{
+  server = (Get-ServerAction -ChangedPaths @('tools/x.py', 'docs/a.md')).Verdict;
+  docs   = (Get-ServerAction -ChangedPaths @('docs/a.md', 'ui/A.cs')).Verdict;
+  crash  = (ConvertTo-ServerActionResult @('Traceback', 'boom') 1).Verdict;
+  junk   = (ConvertTo-ServerActionResult @('yes') 0).Verdict;
+  empty  = (ConvertTo-ServerActionResult @() 0).Verdict;
+  good   = (ConvertTo-ServerActionResult @('why: a fleet run is live', 'report-only') 0);
+}
+$script:venvPy = 'C:\nonexistent\python.exe'
+$r.novenv = (Get-ServerAction -ChangedPaths @('tools/x.py')).Verdict
+$r.unknownNote = (Invoke-ServerAction @{ Verdict = 'unknown'; Why = @('x') } "[t]")
+"RESULT:" + ($r | ConvertTo-Json -Compress -Depth 4)
+"""
+    r = _result(_ps(tmp_path, _driver(functions, checkout, body)))
+    assert r["server"] == "swap-needed"
+    assert r["docs"] == "noop"
+    assert r["crash"] == r["junk"] == r["empty"] == r["novenv"] == "unknown"
+    assert r["good"]["Verdict"] == "report-only" and r["good"]["Why"] == ["a fleet run is live"]
+    assert not r["unknownNote"]
+
+
+# =============================================================== D11 + D29: provisioning
+
+_STUB_SCRIPT = r"""
+Add-Content -Path %(log)s -Value '%(name)s'
+New-Item -ItemType File -Force -Path %(lnk)s | Out-Null
+"""
+
+
+def test_provisioning_honours_the_recorded_answer(tmp_path, checkout, functions):
+    desk, start, stubs = tmp_path / "Desktop", tmp_path / "Startup", tmp_path / "stubs"
+    for d in (desk, start, stubs):
+        d.mkdir()
+    log = tmp_path / "calls.log"
+    (stubs / "make_desktop_shortcut.ps1").write_text(_STUB_SCRIPT % {
+        "log": _q(log), "name": "shortcut", "lnk": _q(desk / "M365 Companion.lnk")}, encoding="ascii")
+    (stubs / "register-supervisor.ps1").write_text(_STUB_SCRIPT % {
+        "log": _q(log), "name": "autostart", "lnk": _q(start / "M365 Companion.lnk")}, encoding="ascii")
+    env = dict(os.environ, M365_COMPANION_DESKTOP_DIR=str(desk), M365_COMPANION_STARTUP_DIR=str(start))
+    marker = checkout / ".setup" / "convenience_provisioned"
+
+    def calls():
+        return log.read_text(encoding="utf-8").split() if log.exists() else []
+
+    def provision():
+        return _ps(tmp_path, _driver(functions, checkout, "Ensure-ConvenienceProvisioning",
+                                     script_dir=str(stubs)), env=env)
+
+    # SAFETY FIRST: the redirection must hold before any real script is run.
+    probe = _ps(tmp_path, _driver(functions, checkout,
+                                  '"RESULT:" + (@{ d = (Get-DesktopLauncherPath); s = (Get-StartupLauncherPath) } | ConvertTo-Json -Compress)'),
+                env=env)
+    paths = _result(probe)
+    assert paths["d"].startswith(str(tmp_path)) and paths["s"].startswith(str(tmp_path)), paths
+
+    out = provision().stdout
+    assert calls() == [], "created something with no decision on record"
+    assert "scripts\\register-supervisor.ps1 to do either by hand" in out, "D29: the hint is broken over two lines"
+
+    marker.write_text("shortcut=yes\r\nautostart=yes\r\n", encoding="ascii")
+    provision()
+    assert sorted(calls()) == ["autostart", "shortcut"]
+    provision()
+    assert sorted(calls()) == ["autostart", "shortcut"], "re-ran with both already present"
+
+    # the REAL unregister-supervisor.ps1, with Task Scheduler shadowed
+    unreg = r"""
+function Get-ScheduledTask { [CmdletBinding()] param([Parameter(ValueFromRemainingArguments=$true)]$Rest) return $null }
+function Unregister-ScheduledTask { [CmdletBinding()] param([Parameter(ValueFromRemainingArguments=$true)]$Rest) throw 'STUB: must not be reached' }
+& %s
+"RESULT:" + (@{ ok = $true } | ConvertTo-Json -Compress)
+""" % _q(checkout / "scripts" / "unregister-supervisor.ps1")
+    _result(_ps(tmp_path, _driver(functions, checkout, unreg), env=env))
+    assert not (start / "M365 Companion.lnk").exists()
+    assert "autostart=no" in marker.read_text(encoding="ascii").split()
+    assert "shortcut=yes" in marker.read_text(encoding="ascii").split(), "the other answer was lost"
+    provision()
+    assert calls().count("autostart") == 1, "autostart came back after unregister-supervisor.ps1"
+    assert not (start / "M365 Companion.lnk").exists()
+
+    # a hand-deleted Desktop icon IS re-created while the record says yes ...
+    (desk / "M365 Companion.lnk").unlink()
+    provision()
+    assert calls().count("shortcut") == 2
+    # ... and make_desktop_shortcut.ps1 -Remove is the way to say no
+    rm = "& %s -Remove\n\"RESULT:{}\"" % _q(checkout / "scripts" / "make_desktop_shortcut.ps1")
+    _result(_ps(tmp_path, _driver(functions, checkout, rm), env=env))
+    assert not (desk / "M365 Companion.lnk").exists()
+    assert "shortcut=no" in marker.read_text(encoding="ascii").split()
+    provision()
+    assert calls().count("shortcut") == 2, "the Desktop launcher came back after -Remove"
+
+
+def test_a_legacy_marker_is_left_alone_and_survives_a_rewrite(tmp_path, checkout, functions):
+    marker = checkout / ".setup" / "convenience_provisioned"
+    marker.write_text("provisioned\r\n", encoding="ascii")
+    body = r"""
+$before = Read-ConvenienceDecision $root
+$ok = Set-ConvenienceDecision $root 'autostart' 'no'
+$plan = Get-ConvenienceProvisioningPlan -Decision (Read-ConvenienceDecision $root) -ShortcutPresent $false -AutostartPresent $false
+"RESULT:" + (@{ before = $before.Count; ok = $ok; s = $plan.Shortcut; a = $plan.Autostart } | ConvertTo-Json -Compress)
+"""
+    r = _result(_ps(tmp_path, _driver(functions, checkout, body)))
+    assert r == {"before": 0, "ok": True, "s": False, "a": False}
+    assert marker.read_text(encoding="ascii").split() == ["provisioned", "autostart=no"]
+
+
+# =============================================================== D14: one start_all at a time
+
+_HOLD = r"""
+$got = Enter-StartAllLock -Name %(name)s -TimeoutSec %(timeout)d
+$t0 = [DateTime]::UtcNow.Ticks
+if ($got) { Start-Sleep -Milliseconds %(hold)d }
+$t1 = [DateTime]::UtcNow.Ticks
+%(tail)s
+"RESULT:" + (@{ got = $got; t0 = $t0; t1 = $t1 } | ConvertTo-Json -Compress)
+"""
+
+
+def _hold(tmp_path, checkout, functions, name, hold_ms, timeout=60, tail="Exit-StartAllLock"):
+    p = tmp_path / ("hold_%s.ps1" % uuid.uuid4().hex[:8])
+    p.write_text(_driver(functions, checkout, _HOLD % {
+        "name": _q(name), "timeout": timeout, "hold": hold_ms, "tail": tail}), encoding="utf-8-sig")
+    return subprocess.Popen([_POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(p)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def _out(proc):
+    so, se = proc.communicate(timeout=240)
+    return _result(type("R", (), {"stdout": childproc.decode(so), "stderr": childproc.decode(se)}))
+
+
+def test_two_copies_run_one_after_the_other(tmp_path, checkout, functions):
+    name = "Global\\m365-test-start-all-%s" % uuid.uuid4().hex
+    a = _hold(tmp_path, checkout, functions, name, 4000)
+    time.sleep(1.5)
+    b = _hold(tmp_path, checkout, functions, name, 500)
+    ra, rb = _out(a), _out(b)
+    assert ra["got"] and rb["got"], "the second copy gave up instead of waiting"
+    assert rb["t0"] >= ra["t1"], "the two copies overlapped"
+
+
+def test_an_abandoned_lock_is_taken_over_and_a_held_one_times_out(tmp_path, checkout, functions):
+    name = "Global\\m365-test-start-all-%s" % uuid.uuid4().hex
+    dead = _hold(tmp_path, checkout, functions, name, 200, tail="[Environment]::Exit(0)")
+    dead.communicate(timeout=240)                     # exited holding it
+    after = _out(_hold(tmp_path, checkout, functions, name, 100, timeout=5))
+    assert after["got"], "an abandoned lock was not taken over"
+
+    holder = _hold(tmp_path, checkout, functions, name, 8000)
+    time.sleep(2)
+    waiter = _out(_hold(tmp_path, checkout, functions, name, 100, timeout=1))
+    assert waiter["got"] is False, "a held lock did not time out"
+    assert _out(holder)["got"]
+
+
+def test_fleet_resume_is_not_a_second_resumer(tmp_path, checkout, functions):
+    dummy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)",
+                              "-m", "relay.fleet_runner", str(checkout)])
+    try:
+        time.sleep(2)
+        body = r"""
+$pids = Get-ThisCheckoutFleetCoordinatorPids
+$r = @{
+  pids     = @($pids);
+  running  = (Get-FleetResumeSkipReason -SupervisorJustStarted $false -RunningCoordinatorPids $pids -AutoResumeSetting '');
+  fresh    = (Get-FleetResumeSkipReason -SupervisorJustStarted $true -RunningCoordinatorPids @() -AutoResumeSetting '');
+  optout   = (Get-FleetResumeSkipReason -SupervisorJustStarted $false -RunningCoordinatorPids @() -AutoResumeSetting 'off');
+  go       = (Get-FleetResumeSkipReason -SupervisorJustStarted $false -RunningCoordinatorPids @() -AutoResumeSetting '');
+}
+"RESULT:" + ($r | ConvertTo-Json -Compress)
+"""
+        r = _result(_ps(tmp_path, _driver(functions, checkout, body)))
+    finally:
+        dummy.kill()
+    assert dummy.pid in r["pids"]
+    assert "already running" in r["running"]
+    assert "supervisor" in r["fresh"]
+    assert "MCP_FLEET_AUTORESUME" in r["optout"]
+    assert r["go"] == ""
+
+
+# =============================================================== D24: the tunnel is counted
+
+_STUB_DT = "\r\n".join([
+    "@echo off",
+    'echo %*>> "%STUB_LOG%"',
+    'if "%1"=="user" goto user',
+    'if "%1"=="show" goto show',
+    "exit /b 0",
+    ":user",
+    'if "%STUB_LOGIN%"=="out" goto out',
+    "echo Logged in as test@x using Microsoft.",
+    "exit /b 0",
+    ":out",
+    "echo Not logged in.",
+    "exit /b 1",
+    ":show",
+    'if "%STUB_SHOW%"=="missing" goto missing',
+    "echo Tunnel ID             : t1.jpe1",
+    "echo Host connections      : %STUB_HOSTS%",
+    "exit /b 0",
+    ":missing",
+    "echo Tunnel not found.",
+    "exit /b 1",
+    ""])
+
+
+@pytest.mark.parametrize("login,show,hosts,envline,expect", [
+    ("out", "ok", "1", "MCP_TUNNEL_NAME=t1", "devtunnel user login"),
+    ("in", "missing", "0", "MCP_TUNNEL_NAME=t1", "setup_devtunnel.ps1"),
+    ("in", "ok", "0", "MCP_TUNNEL_NAME=t1", "is not hosted"),
+    ("in", "ok", "1", "MCP_TUNNEL_NAME=", "MCP_TUNNEL_NAME is empty"),
+    ("in", "ok", "2", "MCP_TUNNEL_NAME=t1", None),
+    ("nocli", "ok", "1", "MCP_TUNNEL_NAME=t1", "devtunnel CLI not found"),
+])
+def test_the_tunnel_is_part_of_started(tmp_path, checkout, functions, login, show, hosts, envline, expect):
+    bin_dir, lad = tmp_path / "bin", tmp_path / "localappdata"
+    bin_dir.mkdir()
+    lad.mkdir()
+    if login != "nocli":
+        (bin_dir / "devtunnel.cmd").write_text(_STUB_DT, encoding="ascii")
+    (checkout / ".env").write_text(envline + "\r\n", encoding="ascii")
+    stub_log = tmp_path / "devtunnel_argv.log"
+    sysroot = os.environ.get("SystemRoot", r"C:\Windows")
+    # The stub first. For "no CLI", NOTHING else: an IT-deployed devtunnel.exe can sit in
+    # System32 (it does on the machine this was written on), and the test must never reach a
+    # real CLI.
+    path = [str(bin_dir)]
+    if login != "nocli":
+        path += [os.path.join(sysroot, "System32"), sysroot]
+    env = dict(os.environ, STUB_LOG=str(stub_log), STUB_LOGIN=login, STUB_SHOW=show, STUB_HOSTS=hosts,
+               LOCALAPPDATA=str(lad), PATH=";".join(path))
+    body = r"""
+Test-TunnelServing -HostWaitSec 2 -PollSec 1
+"RESULT:" + (@{ failures = @($script:startupFailures) } | ConvertTo-Json -Compress)
+"""
+    r = _result(_ps(tmp_path, _driver(functions, checkout, body), env=env))
+    if expect is None:
+        assert r["failures"] == [], r
+    else:
+        assert len(r["failures"]) == 1 and expect in r["failures"][0], r
+    if stub_log.exists():
+        verbs = {l.split()[0] + (" " + l.split()[1] if l.split()[0] == "user" else "")
+                 for l in stub_log.read_text(encoding="ascii", errors="replace").splitlines() if l.strip()}
+        assert verbs <= {"user show", "show"}, "a devtunnel verb that changes something: %s" % verbs
+
+
+# =============================================================== D27: UI exes vs their sources
+
+def _ui_checkout(checkout):
+    from bench.ui_build_check import targets_from_rebuild_script
+    ui = checkout / "ui"
+    ui.mkdir()
+    real = open(os.path.join(REPO, "ui", "rebuild_ui.ps1"), encoding="utf-8").read()
+    build_lines = [l for l in real.splitlines() if re.match(r'\s*Build\s+"', l)]
+    assert build_lines
+    stub = "\r\n".join([
+        "param([switch]$NoLaunch)",
+        "Add-Content -Path (Join-Path $PSScriptRoot 'rebuild.log') -Value ('NoLaunch=' + $NoLaunch)",
+        "if ($env:STUB_REBUILD_FAIL) { Write-Host 'BUILD FAILED: CopilotChat'; Write-Host 'error CS0103: stub'; exit 1 }",
+        "function Build($name, $sources) { [IO.File]::WriteAllBytes((Join-Path $PSScriptRoot ($name + '.exe')), [byte[]](77, 90)) }",
+    ] + build_lines) + "\r\n"
+    (ui / "rebuild_ui.ps1").write_text(stub, encoding="ascii")
+    targets = targets_from_rebuild_script()
+    for _n, srcs in targets:
+        for s in srcs:
+            (ui / s).write_text("//\n", encoding="ascii")
+            os.utime(ui / s, (1_000_000, 1_000_000))
+    return ui, [n for n, _ in targets]
+
+
+_UI_BODY = r"""
+function Get-Process { [CmdletBinding()] param([Parameter(ValueFromRemainingArguments=$true)]$Rest) }
+function Start-Process { [CmdletBinding()] param([Parameter(Position=0)]$FilePath, [Parameter(ValueFromRemainingArguments=$true)]$Rest) Add-Content -Path (Join-Path $root 'launch.log') -Value $FilePath }
+Invoke-UiStep
+"RESULT:" + (@{ failures = @($script:startupFailures) } | ConvertTo-Json -Compress)
+"""
+
+
+def _ui_run(tmp_path, checkout, functions, env=None, venv_py=None):
+    for f in ("ui/rebuild.log", "launch.log"):
+        if (checkout / f).exists():
+            (checkout / f).unlink()
+    r = _result(_ps(tmp_path, _driver(functions, checkout, _UI_BODY, venv_py=venv_py), env=env))
+    rebuilt = (checkout / "ui" / "rebuild.log").exists()
+    launched = ((checkout / "launch.log").read_text(encoding="utf-8").split("\n")
+                if (checkout / "launch.log").exists() else [])
+    return r["failures"], rebuilt, [os.path.basename(l.strip()) for l in launched if l.strip()]
+
+
+def test_ui_is_rebuilt_when_missing_empty_or_older(tmp_path, checkout, functions):
+    ui, names = _ui_checkout(checkout)
+    fails, rebuilt, launched = _ui_run(tmp_path, checkout, functions)
+    assert rebuilt and fails == [] and sorted(launched) == sorted(n + ".exe" for n in names)
+    assert (ui / "rebuild.log").read_text(encoding="ascii").strip() == "NoLaunch=True"
+
+    later = time.time() + 60
+    for n in names:
+        os.utime(ui / (n + ".exe"), (later, later))
+    fails, rebuilt, _ = _ui_run(tmp_path, checkout, functions)
+    assert not rebuilt and fails == [], "rebuilt exes that were newer than every source"
+
+    (ui / (names[0] + ".exe")).write_bytes(b"")
+    fails, rebuilt, _ = _ui_run(tmp_path, checkout, functions)
+    assert rebuilt, "a zero-length exe was trusted"
+
+    for n in names:
+        os.utime(ui / (n + ".exe"), (later, later))
+    src = ui / "Theme.cs"
+    assert src.exists(), "Theme.cs is no longer in a Build line; pick another shared source"
+    os.utime(src, (later + 60, later + 60))
+    fails, rebuilt, _ = _ui_run(tmp_path, checkout, functions)
+    assert rebuilt, "an exe older than one of its sources was trusted"
+
+
+def test_a_failed_rebuild_is_counted(tmp_path, checkout, functions):
+    ui, names = _ui_checkout(checkout)
+    env = dict(os.environ, STUB_REBUILD_FAIL="1")
+    fails, rebuilt, launched = _ui_run(tmp_path, checkout, functions, env=env)
+    assert rebuilt
+    assert sorted(fails) == sorted("%s: rebuild failed" % n for n in names)
+    assert launched == [], "launched an exe that does not exist"
+
+
+def test_without_venv_it_still_catches_an_empty_exe(tmp_path, checkout, functions):
+    ui, names = _ui_checkout(checkout)
+    for n in names:
+        (ui / (n + ".exe")).write_bytes(b"MZ")
+    (ui / (names[0] + ".exe")).write_bytes(b"")
+    _f, rebuilt, _l = _ui_run(tmp_path, checkout, functions, venv_py=r"C:\nonexistent\python.exe")
+    assert rebuilt
+
+
+# =============================================================== the silent launcher
+
+def test_a_failed_hidden_start_is_written_down_and_announced(tmp_path, checkout, functions):
+    summary = checkout / ".setup" / "logs" / "start_all_summary.txt"
+    body = r"""
+$ok = Write-StartupSummary %s @('devtunnel is signed out: run devtunnel user login', 'bridge: x') 'background (-NoUi)'
+$r = @{
+  written = $ok;
+  sent    = (Send-StartupFailureNotice %s);
+  hidden  = (Test-ShouldNotifyStartupFailures 2 $true $true);
+  console = (Test-ShouldNotifyStartupFailures 2 $false $true);
+  novis   = (Test-ShouldNotifyStartupFailures 2 $false $false);
+  clean   = (Test-ShouldNotifyStartupFailures 0 $true $false);
+}
+"RESULT:" + ($r | ConvertTo-Json -Compress)
+""" % (_q(summary), _q(summary))
+    # PYTEST_CURRENT_TEST is inherited, so notify_desktop returns before any toast is raised --
+    # what is proved is that the code it runs imports, reads the file and exits 0.
+    r = _result(_ps(tmp_path, _driver(functions, checkout, body)))
+    assert r == {"written": True, "sent": True, "hidden": True, "console": False,
+                 "novis": True, "clean": False}
+    lines = summary.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "failures=2" and lines[2] == "mode=background (-NoUi)"
+    assert "- devtunnel is signed out: run devtunnel user login" in lines
+    assert lines[-1].startswith("fix: run doctor.bat")
+
+    # a clean start rewrites it, so yesterday's list does not linger
+    body2 = "$ok = Write-StartupSummary %s @() 'full'\n\"RESULT:{}\"" % _q(summary)
+    _result(_ps(tmp_path, _driver(functions, checkout, body2)))
+    assert summary.read_text(encoding="utf-8").splitlines()[0] == "failures=0"
