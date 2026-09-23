@@ -208,6 +208,10 @@ jobs:
             scripts/test_each_edge_profile_is_its_own_sign_in.py \
             scripts/test_nothing_new_is_invisible.py \
             scripts/test_a_leftover_tab_is_not_a_locked_door.py \
+            scripts/test_a_silent_death_leaves_its_exit_code.py \
+            scripts/test_a_runner_that_dies_before_argparse_is_recorded.py \
+            relay/test_a_doc_id_is_used_where_it_was_made.py \
+            relay/selfimprove/test_the_slice_refusal_fires_through_the_real_entry.py \
             ui/test_a_setting_that_is_off_is_said_out_loud.py \
             ui/test_fleet_cockpit_health.py \
             ui/test_fleet_cockpit_card_menu.py \
@@ -817,7 +821,7 @@ jobs:
       # files now fail the job, which is the whole point of having run them here.
       - name: Windows-only tests
         run: |
-          python -m pytest -rsx tools/test_a_windowless_launch_really_has_no_window.py ui/test_the_ui_and_the_fleet_agree_on_the_command_channel.py
+          python -m pytest -rsx tools/test_a_windowless_launch_really_has_no_window.py ui/test_the_ui_and_the_fleet_agree_on_the_command_channel.py scripts/test_a_silent_death_leaves_its_exit_code.py scripts/test_a_runner_that_dies_before_argparse_is_recorded.py
 
       # The keyboard table lives here rather than on the ubuntu job because
       # tools/desktop_input.py binds ctypes.windll.user32 at import, so the module cannot

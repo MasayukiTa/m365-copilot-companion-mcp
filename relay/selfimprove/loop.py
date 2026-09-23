@@ -195,11 +195,16 @@ def validate(toggle, spec_path, n, seed, dataset_key, alpha, min_n, min_pp,
     burned = G.BurnedRegistry(burned_path) if burned_path else G.BurnedRegistry()
     fresh = select_fresh_slice(spec_path, n, burned, seed)
     targets_file = os.path.join(SWEDIR, "_selfimprove_slice.txt")
-    with open(targets_file, "w", encoding="utf-8", newline="\n") as f:
-        f.write("\n".join(fresh) + "\n")
-    log("fresh slice: %d instances (burned excluded: %d) -> %s" % (len(fresh), len(burned), targets_file))
+    log("fresh slice: %d instances (burned excluded: %d)" % (len(fresh), len(burned)))
 
-    # WHAT THIS CONFIGURATION CAN AND CANNOT PRODUCE, said BEFORE anything is burned.
+    # WHAT THIS CONFIGURATION CAN AND CANNOT PRODUCE, said BEFORE anything is burned --
+    # AND BEFORE ANYTHING IS WRITTEN. The targets file used to be written first and the refusal
+    # checked second, so a refused invocation still overwrote `_selfimprove_slice.txt`, the one
+    # file a validation already in progress reads its instance list from. "Refused, nothing
+    # burned" was true; "refused before doing anything" was not, and the difference is another
+    # run's input. Found 2026-09-24 by the first test to drive this through the real entry point
+    # (relay/selfimprove/test_the_slice_refusal_fires_through_the_real_entry.py), which had to
+    # redirect SWEDIR precisely because a refusal wrote under .fleet/.
     #
     # `burned.add(fresh)` runs after grading whatever the verdict was, and that is correct --
     # the instances have been seen by the system under test, so they are contaminated even by a
@@ -219,6 +224,10 @@ def validate(toggle, spec_path, n, seed, dataset_key, alpha, min_n, min_pp,
         log("WARNING: n == min_n (%d), so a verdict needs ZERO attrition. The run of "
             "2026-09-11 lost 20 of 100 to one staging failure and burned the slice for an "
             "`underpowered` verdict. The default --n is 200 for this reason." % min_n)
+
+    with open(targets_file, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(fresh) + "\n")
+    log("fresh slice written -> %s" % targets_file)
 
     # HOW MUCH POOL IS LEFT, in runs rather than in instances. SWE-bench Verified is 500
     # instances and there is no more of it; "we ran out" should be a number the operator can

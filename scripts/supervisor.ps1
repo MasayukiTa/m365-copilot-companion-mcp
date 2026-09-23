@@ -248,6 +248,10 @@ function Invoke-StaleServerCycle {
     if ($script:StaleStreak -lt 2) { return }
     $script:StaleStreak = 0
     Write-Log "server is running stale code and nothing is in flight -- cycling it so the checkout's fixes are live"
+    # DECLARE THE REASON BEFORE STOPPING IT. This is the specific, human-legible reason
+    # Get-ServerExitRecord (see Start-Server) will show for this cycle's exit record instead of
+    # the generic default Start-Server falls back to when nothing upstream has said why.
+    $script:ServerPlannedEndReason = "stale code cycle"
     Start-Server
 }
 
@@ -281,7 +285,151 @@ function Test-DevtunnelLoggedIn {
     return $false
 }
 
+# TRACKS THE PROCESS THIS SUPERVISOR ITSELF LAUNCHED (see -PassThru on Start-Process inside
+# Start-Server, below) and, when this supervisor is about to end it on purpose, WHY. Both start
+# out $null: before this supervisor's own Start-Server has ever run, there is no process to
+# read and no plan to end one, and Get-ServerExitRecord says so explicitly instead of guessing.
+$script:ServerProc = $null
+$script:ServerPlannedEndReason = $null
+
+function Get-ServerExitRecord {
+    # WHY THIS FUNCTION EXISTS. A process that dies silently leaves no output BY DEFINITION --
+    # preserving stdout/stderr (the history-log dance in Start-Server, below) can explain a
+    # crash that printed a traceback, but it can never explain one that printed nothing, because
+    # there is nothing in either stream to preserve. Measured 2026-09-16: the server exited six
+    # times in two days and every preserved stderr block held only the uvicorn startup banner --
+    # no traceback, no "Shutting down", and Windows Error Reporting logged no fault for it
+    # either. What DOES survive a silent death is the process's own exit code and the moment it
+    # happened -- and until this function existed, Start-Server discarded both ON PURPOSE: it
+    # called Start-Process without -PassThru, so the .NET Process object (and with it .ExitCode
+    # / .HasExited / .ExitTime) was thrown away the instant the call returned. This is the read
+    # side of fixing that: given the process object this supervisor stored when it launched the
+    # server, report whether it has exited, its exit code in both decimal and the unsigned hex
+    # form crash codes are conventionally read in (0xC0000005 access violation, 0xC0000409 stack
+    # buffer overrun, ...), and whether the supervisor itself ended it on purpose or it ended on
+    # its own.
+    #
+    # PLANNED VS UNPLANNED MUST COME FROM THE CALLER, NOT BE GUESSED HERE. By the time anyone
+    # calls this, the process may already have been Stop-Process'd by Start-Server's own kill-
+    # by-port cleanup below -- so "has it exited" cannot by itself say whether WE ended it just
+    # now or it was already dead before we got there. Start-Server captures that distinction the
+    # only place it can be captured honestly: at its own top, before it does anything, by
+    # checking whether the previous process was still alive at that instant. -PlannedReason is
+    # that judgement, already made; this function only formats it.
+    #
+    # NOT JUST FOR THE SERVER. Invoke-FleetAutoResume / Invoke-ReviewAutoResume (below) launch
+    # relay.fleet_runner / bench.review_run the same way Start-Server launches main.py, and
+    # threw away the same process object -- see Invoke-AutoResumeRunnerCheck's header for why
+    # that one is worth reading back too. LifetimeSeconds exists for that caller: it needs
+    # sub-minute precision to tell "died before argparse" apart from a normal multi-hour run,
+    # which the human-facing Detail string's "Nh Nm" rounding cannot give it. Adding the field
+    # changes nothing about ExitCode/ExitCodeHex/Planned/Summary/Detail for the server's own
+    # callers -- it is read from the same $span this function was already computing.
+    param(
+        [System.Diagnostics.Process]$Process,
+        $LaunchTime,
+        [string]$PlannedReason
+    )
+    if (-not $Process) {
+        return [PSCustomObject]@{
+            ServerPid       = $null
+            LaunchTime      = $LaunchTime
+            HasExited       = $null
+            ExitCode        = $null
+            ExitCodeHex     = $null
+            ExitTime        = $null
+            LifetimeSeconds = $null
+            Planned         = $false
+            PlannedReason   = $null
+            Summary         = "no record: not launched by this supervisor"
+            Detail          = "no record: not launched by this supervisor"
+        }
+    }
+    $procPid = $Process.Id
+    try { $Process.Refresh() } catch { }
+    $hasExited = $true
+    try { $hasExited = $Process.HasExited } catch { $hasExited = $true }
+    if (-not $hasExited) {
+        return [PSCustomObject]@{
+            ServerPid       = $procPid
+            LaunchTime      = $LaunchTime
+            HasExited       = $false
+            ExitCode        = $null
+            ExitCodeHex     = $null
+            ExitTime        = $null
+            LifetimeSeconds = $null
+            Planned         = -not [string]::IsNullOrEmpty($PlannedReason)
+            PlannedReason   = $PlannedReason
+            Summary         = "still running, replaced"
+            Detail          = "pid=$procPid still running, replaced"
+        }
+    }
+    $exitCode = $null
+    $exitTime = $null
+    try { $exitCode = $Process.ExitCode } catch { }
+    try { $exitTime = $Process.ExitTime } catch { }
+    $hex = $null
+    if ($null -ne $exitCode) {
+        # NEVER [uint32]$exitCode DIRECTLY. That is a CHECKED conversion in PowerShell and
+        # throws OverflowException for any negative value -- i.e. for every crash code, which is
+        # exactly the case this function exists for. BitConverter reinterprets the same 4 bytes
+        # UNCHECKED instead, which is what "read a signed Int32 as its unsigned hex form" means.
+        $bytes = [BitConverter]::GetBytes([int32]$exitCode)
+        $hex = "0x{0:X8}" -f ([BitConverter]::ToUInt32($bytes, 0))
+    }
+    $ageStr = $null
+    $lifetimeSeconds = $null
+    if ($LaunchTime -and $exitTime) {
+        $span = $exitTime - $LaunchTime
+        if ($span.TotalSeconds -ge 0) {
+            $ageStr = "{0}h{1}m" -f [int]$span.TotalHours, $span.Minutes
+            $lifetimeSeconds = $span.TotalSeconds
+        }
+    }
+    $planned = -not [string]::IsNullOrEmpty($PlannedReason)
+    $summary = if ($planned) { "planned: $PlannedReason" } else { "unplanned" }
+    $codePart = "code=$hex ($exitCode)"
+    $agePart = if ($ageStr) { " after $ageStr" } else { "" }
+    [PSCustomObject]@{
+        ServerPid       = $procPid
+        LaunchTime      = $LaunchTime
+        HasExited       = $true
+        ExitCode        = $exitCode
+        ExitCodeHex     = $hex
+        ExitTime        = $exitTime
+        LifetimeSeconds = $lifetimeSeconds
+        Planned         = $planned
+        PlannedReason   = $PlannedReason
+        Summary         = $summary
+        Detail          = "pid=$procPid exited $codePart$agePart -- $summary"
+    }
+}
+
 function Start-Server {
+    # CAPTURE THE PREVIOUS LAUNCH'S STATE BEFORE TOUCHING ANYTHING BELOW. Everything past this
+    # point can end the previous process -- deliberately, via the kill-by-port/kill-stale-
+    # instances cleanup a few lines down, or incidentally if it had already died on its own --
+    # and Stop-Process -Force makes a previous process register as exited either way. Read
+    # "was it alive right now" AFTER that cleanup runs and the two are indistinguishable from
+    # state alone; only a snapshot taken NOW, before anything here acts, can tell "we ended it"
+    # apart from "it had already ended".
+    $prevProc = $script:ServerProc
+    $prevLaunchAt = $script:LastLaunchAt
+    $prevWasAlive = $false
+    if ($prevProc) {
+        try { $prevProc.Refresh() } catch { }
+        try { $prevWasAlive = -not $prevProc.HasExited } catch { $prevWasAlive = $false }
+    }
+    if ($prevWasAlive -and -not $script:ServerPlannedEndReason) {
+        # DEFAULT PLANNED REASON. Nobody upstream (e.g. Invoke-StaleServerCycle, which sets its
+        # own reason before calling us) declared why this relaunch is happening, but we are
+        # about to forcibly stop a server that was alive a moment ago -- that stop is still OUR
+        # doing, not a silent death, so it must still read as planned rather than falling
+        # through to "unplanned" for want of a label. A process that was already dead before we
+        # got here is left alone: $prevWasAlive is $false for it, and no reason is set.
+        $script:ServerPlannedEndReason = "relaunch: clearing running instance before starting a new one"
+    }
+
     # Kill the stale instance FIRST. A wedged main.py (dead event loop, CLOSE_WAIT
     # pile-up -- seen twice on 2026-06-12/13) keeps $Port LISTENING, so a new instance
     # can't bind and the supervisor restart-loops forever while the outage persists.
@@ -306,6 +454,19 @@ function Start-Server {
     $srvOut = Join-Path $logDir "server.log"
     $srvErr = Join-Path $logDir "server.err.log"
 
+    # THE PREVIOUS LAUNCH'S EXIT RECORD -- see Get-ServerExitRecord's own header for the full
+    # reasoning (in short: output can never explain a silent death, but the exit code can, and a
+    # planned cycle must not be allowed to read like a crash). $prevWasAlive was captured at the
+    # very top of this function, before the kill-by-port/kill-stale-instances cleanup above could
+    # have changed it, so a $null reason here truthfully means "it was already gone before we
+    # touched it" rather than "we forgot to say why".
+    $exitRecord = Get-ServerExitRecord -Process $prevProc -LaunchTime $prevLaunchAt `
+                  -PlannedReason $(if ($prevWasAlive) { $script:ServerPlannedEndReason } else { $null })
+    $script:ServerPlannedEndReason = $null   # consumed -- the next relaunch starts undeclared again
+    if ($exitRecord.Detail -ne "no record: not launched by this supervisor") {
+        Write-Log "previous server $($exitRecord.Detail)"
+    }
+
     # PRESERVE THE PREVIOUS LAUNCH BEFORE TRUNCATING IT. -RedirectStandardError truncates, and
     # this function runs about once a minute while the server is failing, so the one file that
     # explains the crash is erased by the next attempt -- roughly sixty times an hour. Anyone
@@ -326,7 +487,12 @@ function Start-Server {
         try {
             if ((Test-Path $live) -and ((Get-Item $live).Length -gt 0)) {
                 $stamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-                Add-Content -Path $hist -Value ("=== launch ending " + $stamp + " ===") -Encoding UTF8
+                # SAME FACTS AS THE LOG LINE ABOVE, IN THE FILE THAT SURVIVES THE LOG ROTATING.
+                # Without this, a preserved block that holds nothing but the uvicorn banner (the
+                # silent-death case this whole mechanism exists for) looks IDENTICAL to a block
+                # preserved because the supervisor deliberately cycled a healthy server -- the
+                # header used to say only when the launch ended, never why.
+                Add-Content -Path $hist -Value ("=== launch ending " + $stamp + " -- " + $exitRecord.Detail + " ===") -Encoding UTF8
                 Get-Content $live -ErrorAction Stop | Add-Content -Path $hist -Encoding UTF8
                 # Trim from the front: the oldest crash is the least useful and the newest
                 # must never be the one that gets dropped.
@@ -338,15 +504,23 @@ function Start-Server {
         } catch { }
     }
 
+    # -PASSTHRU ON BOTH CALLS. This is the write side of the fix Get-ServerExitRecord reads from
+    # (see its header above): without -PassThru, Start-Process discards the .NET Process object
+    # the instant the call returns, and with it .ExitCode / .ExitTime / .HasExited -- the only
+    # things that survive a silent death. Both branches launch the server that becomes THIS
+    # cycle's $script:ServerProc, so both must capture it or half of all launches (whichever one
+    # hit the redirection-failed fallback) would go back to being unrecorded.
+    $newProc = $null
     try {
-        Start-Process -FilePath $Py -ArgumentList "main.py" -WorkingDirectory $Root `
-                      -WindowStyle Hidden -RedirectStandardOutput $srvOut -RedirectStandardError $srvErr
+        $newProc = Start-Process -FilePath $Py -ArgumentList "main.py" -WorkingDirectory $Root `
+                      -WindowStyle Hidden -RedirectStandardOutput $srvOut -RedirectStandardError $srvErr -PassThru
     } catch {
         # Redirection can fail if a previous instance still holds the file. Starting the server
         # matters more than capturing it, so fall back rather than leave the stack down.
         Write-Log "server output could not be redirected ($($_.Exception.Message)); starting without it"
-        Start-Process -FilePath $Py -ArgumentList "main.py" -WorkingDirectory $Root -WindowStyle Hidden
+        $newProc = Start-Process -FilePath $Py -ArgumentList "main.py" -WorkingDirectory $Root -WindowStyle Hidden -PassThru
     }
+    $script:ServerProc = $newProc
     Pop-Location
     # RECORD THE SHA THIS SERVER STARTED ON, so doctor can later tell a running server
     # apart from a checkout that has since moved past it (a `git pull` lands new
@@ -416,6 +590,99 @@ $ReviewMarkerPath = Join-Path $Root ".fleet\review_run_active.json"
 $script:LastReviewResumeKey = ""
 $script:LastReviewResumeAttempt = [datetime]::MinValue
 
+# TRACKS AUTO-RESUME RUNNERS THIS SUPERVISOR ITSELF LAUNCHED (relay.fleet_runner /
+# bench.review_run below), so a LATER tick can read back their exit code instead of the
+# process vanishing the moment Start-Process returns -- the exact defect Get-ServerExitRecord
+# exists to fix for the MCP server, here applied one level up.
+#
+# WHY THIS MATTERS MORE HERE, NOT LESS. docs/agent_contract.md says a runner that "dies before
+# argparse (a bad path, the wrong interpreter, a failed import)" leaves NO record at all,
+# because from inside that process nothing has run yet that could write one -- there is no log
+# file, no marker, nothing. The supervisor is the one process that can ALWAYS see it, because
+# it is the parent: Start-Process's return value already carries the exit code, and until now
+# it was thrown away here exactly like it was for the server. A LIST, NOT A SINGLE SLOT: the
+# fleet marker is only checked once at startup, but review auto-resume runs every tick and can
+# relaunch more than once in a long session, so more than one runner can be pending a report
+# at the same time.
+$script:AutoResumeRunners = New-Object System.Collections.Generic.List[object]
+
+function Register-AutoResumeRunner {
+    # Call this right after a Start-Process -PassThru for an auto-resume relaunch, so
+    # Invoke-AutoResumeRunnerCheck (below) has something to read back on a later tick.
+    # $Proc may be $null (Start-Process failing before returning a process, or the call sat
+    # inside a try/catch that never reached it) -- silently does nothing then, since there is
+    # nothing to check back on; the existing Write-Log in the catch block already covers that
+    # failure on its own.
+    param(
+        [System.Diagnostics.Process]$Proc,
+        [datetime]$LaunchTime,
+        [string]$Kind,
+        [string]$CommandLine
+    )
+    if (-not $Proc) { return }
+    $script:AutoResumeRunners.Add([PSCustomObject]@{
+        Proc        = $Proc
+        LaunchTime  = $LaunchTime
+        Kind        = $Kind
+        CommandLine = $CommandLine
+    })
+}
+
+# HOW QUICKLY A DEATH COUNTS AS "DID NOT GET FAR ENOUGH TO DO ANYTHING" rather than a normal
+# end that happens to be short. Not an arbitrary guess: docs/agent_contract.md's own examples
+# (a bad path, the wrong interpreter, a failed import) fail at argparse or at the first
+# import, both well under a second; a coordinator that got INTO its run loop and died later is
+# a different failure with its own diagnostics already (fleet_reaper.py's stale-run reap,
+# review's own retry_after backoff) and does not need this flag on top.
+$script:AutoResumeQuickDeathSeconds = 30
+
+function Invoke-AutoResumeRunnerCheck {
+    # Called once per main-loop tick (see the while loop below). Reports each tracked runner
+    # EXACTLY ONCE, on the first tick after it has exited -- entries still running are simply
+    # left in the list for the next tick, never reported (Get-ServerExitRecord's own "still
+    # running, replaced" case is deliberately not logged here: a runner just relaunched is
+    # expected to still be running on the very next 15-second tick, and logging that every
+    # cycle would be noise, not signal).
+    if ($script:AutoResumeRunners.Count -eq 0) { return }
+    $stillPending = New-Object System.Collections.Generic.List[object]
+    foreach ($entry in $script:AutoResumeRunners) {
+        $rec = Get-ServerExitRecord -Process $entry.Proc -LaunchTime $entry.LaunchTime -PlannedReason $null
+        if (-not $rec.HasExited) {
+            $stillPending.Add($entry)
+            continue
+        }
+        $quick = ($null -ne $rec.LifetimeSeconds) -and
+                 ($rec.LifetimeSeconds -lt $script:AutoResumeQuickDeathSeconds) -and
+                 ($null -ne $rec.ExitCode) -and ($rec.ExitCode -ne 0)
+        if ($quick) {
+            $secs = [int][math]::Round($rec.LifetimeSeconds)
+            # PROMINENT AND ACTIONABLE. This is the exact scenario the whole function exists
+            # for: the runner died before it could log anything about itself, so the supervisor
+            # says so explicitly instead of leaving a bare exit code, and prints the COMMAND
+            # LINE so a human can run the identical thing by hand and see the real error on
+            # their own console (argparse and import errors print to stderr, which this
+            # process's own hidden, unredirected Start-Process never captured).
+            Write-Log ("$($entry.Kind) auto-resume runner died after ${secs}s, code=$($rec.ExitCodeHex) " +
+                       "($($rec.ExitCode)) -- it did not get far enough to log anything itself; " +
+                       "run the same command by hand to see why: $($entry.CommandLine)")
+        } else {
+            # A NORMAL END -- exit 0, or a nonzero code after running long enough that it is
+            # not the "dead before argparse" case. Logged briefly: one line of the same facts,
+            # without the "unplanned" language Get-ServerExitRecord's own Detail carries for
+            # the server (the supervisor never deliberately stops an auto-resume runner, so
+            # that distinction does not apply here and would only read as alarming noise on a
+            # routine finish).
+            $ageBit = if ($rec.LifetimeSeconds -ne $null) {
+                if ($rec.LifetimeSeconds -lt 120) { "$([int][math]::Round($rec.LifetimeSeconds))s" }
+                else { "{0}h{1}m" -f [int]([timespan]::FromSeconds($rec.LifetimeSeconds)).TotalHours, ([timespan]::FromSeconds($rec.LifetimeSeconds)).Minutes }
+            } else { "unknown duration" }
+            Write-Log ("$($entry.Kind) auto-resume runner (pid=$($rec.ServerPid)) exited code=$($rec.ExitCodeHex) " +
+                       "($($rec.ExitCode)) after $ageBit")
+        }
+    }
+    $script:AutoResumeRunners = $stillPending
+}
+
 function Test-FleetAutoResumeEnabled {
     $v = $env:MCP_FLEET_AUTORESUME
     if ([string]::IsNullOrWhiteSpace($v)) { return $true }   # unset -> default ON
@@ -475,8 +742,17 @@ function Invoke-FleetAutoResume {
         return $true
     }
     try {
-        Start-Process -FilePath $Py -ArgumentList (@("-m", "relay.fleet_runner") + $resumeArgs) `
-            -WorkingDirectory $Root -WindowStyle Hidden
+        # -PASSTHRU, SAME REASON AS Start-Server's. Without it the launch is fire-and-forget
+        # and a runner that dies before argparse (docs/agent_contract.md's own example: a bad
+        # path, the wrong interpreter, a failed import) leaves literally nothing behind --
+        # not even a marker, since that is written from inside main() and this death happens
+        # before main() runs. Registering it here is what lets Invoke-AutoResumeRunnerCheck
+        # (see its header, above the marker-path variables) read the exit code back later.
+        $fleetLaunchAt = Get-Date
+        $fleetProc = Start-Process -FilePath $Py -ArgumentList (@("-m", "relay.fleet_runner") + $resumeArgs) `
+            -WorkingDirectory $Root -WindowStyle Hidden -PassThru
+        Register-AutoResumeRunner -Proc $fleetProc -LaunchTime $fleetLaunchAt -Kind "fleet" `
+            -CommandLine ('"' + $Py + '" -m relay.fleet_runner ' + $shown)
         Write-Log "fleet coordinator relaunched with --resume"
         try {
             & $Py -c "import sys; sys.path.insert(0, r'$Root'); from tools.notify_ops import notify_desktop; notify_desktop('Fleet auto-resumed', 'An interrupted overnight fleet run was detected after startup and relaunched with --resume.')" 2>$null | Out-Null
@@ -553,8 +829,13 @@ function Invoke-ReviewAutoResume {
     $shown = $resumeArgs -join " "
     Write-Log "review pipeline INTERRUPTED (marker pid $procId is dead) -> auto-resuming: python -m bench.review_run $shown"
     try {
-        Start-Process -FilePath $Py -ArgumentList (@("-m", "bench.review_run") + $resumeArgs) `
-            -WorkingDirectory $Root -WindowStyle Hidden
+        # -PASSTHRU -- see Invoke-FleetAutoResume's identical comment above; the same silent-
+        # death-before-argparse risk applies to bench.review_run.
+        $reviewLaunchAt = Get-Date
+        $reviewProc = Start-Process -FilePath $Py -ArgumentList (@("-m", "bench.review_run") + $resumeArgs) `
+            -WorkingDirectory $Root -WindowStyle Hidden -PassThru
+        Register-AutoResumeRunner -Proc $reviewProc -LaunchTime $reviewLaunchAt -Kind "review" `
+            -CommandLine ('"' + $Py + '" -m bench.review_run ' + $shown)
         Write-Log "review pipeline relaunched from durable stamp $($marker.stamp)"
         return $true
     } catch {
@@ -718,6 +999,12 @@ while ($true) {
     }
 
     Invoke-ReviewAutoResume | Out-Null
+
+    # Report any tracked fleet/review auto-resume runner that has exited since the last tick.
+    # Every tick, not just after a relaunch, because the runner that needs reporting may still
+    # be alive on the tick that launched it and only exit (quickly, if it never got past
+    # argparse) on the very next one.
+    Invoke-AutoResumeRunnerCheck
 
     if (Test-ServerUp) {
         $serverMiss = 0
