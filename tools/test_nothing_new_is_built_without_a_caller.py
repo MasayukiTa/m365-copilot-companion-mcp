@@ -285,10 +285,15 @@ REASONS: dict[str, tuple[str, str]] = {
     # C-1 CLOSE-OUT, 2026-09-24. The commander's aggregation of all 84 rows scanned for this
     # burndown (scratchpad/c1_final_verdicts.md) reached a verdict for every remaining row that
     # was not already PENDING (new-PC work) or already decided above. WIRED/DELETED rows left
-    # the inventory the same day and are not here; PENDING rows (env_portability's three,
-    # stale_server_check's two) get no entry at all, by the legend's own instruction. Every
-    # entry below is either D (a standing decision not to wire something with a caller that
-    # would exist if wired) or FOLLOWS (its only caller is another row on this list, itself
+    # the inventory the same day and are not here; the five rows that were PENDING that day
+    # (env_portability's three -- merge_for_new_machine/parse_env/classify, wired via d4d2c33 --
+    # and stale_server_check's two -- decide_post_update_action/fleet_is_running, wired via
+    # 1f4588a) are ALSO now WIRED and get no entry either, for the same reason as any other
+    # WIRED row: see docs/unreached_burndown.md's updated table rows and its "Triage entries
+    # that did not survive verification" section for fleet_is_running's specific correction.
+    # No PENDING rows remain. Every entry below is either D (a standing decision not to wire
+    # something with a caller that would exist if wired) or FOLLOWS (its only caller is another
+    # row on this list, itself
     # deliberate) -- see docs/unreached_burndown.md's "C-1 closed out" section for the
     # one-line reason behind each name.
     "tools/golden.py::run_trajectory": ("dispatch", "docs/unreached_burndown.md"),

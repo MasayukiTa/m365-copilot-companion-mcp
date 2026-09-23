@@ -959,8 +959,9 @@ all_unclear(all-INCONCLUSIVE)     : False    <- True would mean it is discarded
 kept. The rounding the docstring describes is history. `all_inconclusive` is an unused helper
 whose purpose was served another way — a deletion candidate, not a live defect.
 
-**`scripts/stale_server_check.py::fleet_is_running` — it is NOT the rule the caller applies.**
-The survey reported that `_run_appears_live` duplicates it inline. It does not:
+**`scripts/stale_server_check.py::fleet_is_running` — WIRED 2026-09-24 (1f4588a), but not by
+substituting it for `_run_appears_live`.** The survey reported that `_run_appears_live`
+duplicates it inline. It does not:
 
 ```
 marker present, pid unreadable
@@ -968,10 +969,31 @@ marker present, pid unreadable
   fleet_is_running([(True, False)]) -> False
 ```
 
-`fleet_is_running` is a pure `any(present and pid_alive)`; `_run_appears_live` adds conservative
-branches for an unusable pid and for `status.running`. Substituting one for the other would
-drop the safe-side branch and permit a swap while a run might still be live. Wiring it would be
-a regression; the open question is whether the pure helper should exist at all.
+`fleet_is_running` is a pure `any(present and pid_alive)`; `_run_appears_live` used to add
+conservative branches for an unusable pid and for `status.running` INLINE, ahead of that `any`.
+Substituting one for the other outright, as the survey suggested, would have dropped the
+safe-side branch and permitted a swap while a run might still be live — that reading was
+correct, and is why the row was left PENDING rather than wired on the spot.
+
+1f4588a resolved it the other way: `_run_appears_live` now builds its states through a new
+`_run_states(fleet_dir)` helper, which encodes the conservative "unreadable/ambiguous counts as
+live" rule as explicit `(True, True)` pairs (see `_marker_state`'s docstring), and then calls
+`fleet_is_running` on those states instead of inlining the `any`. The safe-side branch was
+moved into the STATES, not removed, so `fleet_is_running` could be called for real without the
+regression above — the same example now reads:
+
+```
+marker present, pid unreadable
+  _marker_state(...)           -> (True, True)     <- conservative branch, now explicit
+  fleet_is_running([(True, True), review_state])  -> True   (same verdict as before)
+```
+
+`decide_post_update_action` was wired the same day through the same entry point:
+`stale_server_check.py --server-action` (a separate CLI flag from the one above) calls it too,
+and `start_all.ps1` now asks that ONE question from both call sites that used to hand-roll this
+logic (the post-update tail and the daily "server older than its code" check) instead of
+re-implementing it by hand — see the module's own header docstring. Both functions left the
+unreached inventory 2026-09-24; `tools/unreached.py` no longer reports them.
 
 **The pattern:** a survey that reads a docstring describing a past defect can report that defect
 as present. Both of these came from docstrings written in the past tense. Check the behaviour,
@@ -1188,9 +1210,9 @@ deliberate; the row above (the "sixteen" table) is corrected to point here inste
 | `coding_ops.py::worktree_remove` | **WIRED** | left the inventory 2026-09-24 |
 | `coding_ops.py::worktree_scope` | deliberate | a contextmanager; its two halves are the registered tools; in-process callers only |
 | `golden.py::run_trajectory` | dispatch | `tests/test_golden.py`, the CI regression harness that exists for it |
-| `env_portability.py::merge_for_new_machine` | PENDING | new-PC work, next phase |
-| `env_portability.py::parse_env` | PENDING | new-PC work, next phase |
-| `env_portability.py::classify` | PENDING | new-PC work, next phase |
+| `env_portability.py::merge_for_new_machine` | **WIRED** | reached through `machine_bound_keys_in`, called from `bootstrap.py` and `setup_devtunnel.ps1`'s classifier (d4d2c33) — left the inventory 2026-09-24 |
+| `env_portability.py::parse_env` | **WIRED** | called from `merge_for_new_machine` above AND directly imported by `scripts/repair_unlock.py` (d4d2c33) — left the inventory 2026-09-24 |
+| `env_portability.py::classify` | **WIRED** | called from `merge_for_new_machine` above (d4d2c33) — left the inventory 2026-09-24 |
 | `tool_probe.py::verify_probe_reply` | deliberate | settled in this document (see the "half-wired protocol" correction above) |
 | `tool_probe.py::classify_probe_reply` | deliberate | settled in this document, same section |
 | `tool_probe.py::next_probe_instruction` | deliberate | unbuilt second probe round; the design question is recorded in this document |
@@ -1207,8 +1229,8 @@ deliberate; the row above (the "sixteen" table) is corrected to point here inste
 | `provenance.py::resolved_value` | deliberate | same — no second-authority evidence source exists |
 | `bestofn_run.py::load_candidate_dir` | **WIRED** | `bench/swe_grade_batch.load_preds` — left the inventory 2026-09-24 |
 | `outcomes.py::tally` | deliberate | NOT the same metric as `bench/pro_record_result` — see "The `outcomes.py::tally` finding" above |
-| `scripts/stale_server_check.py::decide_post_update_action` | PENDING | new-PC work, next phase |
-| `scripts/stale_server_check.py::fleet_is_running` | PENDING | new-PC work, next phase |
+| `scripts/stale_server_check.py::decide_post_update_action` | **WIRED** | reached through `stale_server_check.py --server-action`, called by `start_all.ps1` from both the post-update tail and the daily "server older than its code" check (1f4588a) — left the inventory 2026-09-24 |
+| `scripts/stale_server_check.py::fleet_is_running` | **WIRED** | reached through `_run_appears_live` -> `_run_states` (1f4588a) — see "Triage entries that did not survive verification" above for how this avoided the regression that section originally flagged; left the inventory 2026-09-24 |
 | `bridge/session_store.py::compact` | **WIRED** | `python -m bridge.session_store compact` — left the inventory 2026-09-24 |
 | `bridge/session_store.py::search_turns` | deliberate | no consumer; would be a cockpit history search, which is a product decision |
 | `review_resilience.py::looks_like_capability_failure` | deliberate | measured `db020aa`: 15/0 hits over 14,054 replies; pinned by `NOT_PRODUCIBLE_CAUSES` |
@@ -1234,3 +1256,14 @@ test_nothing_new_is_built_without_a_caller.py`'s inventory the same day the code
 `tools/unreached.py` no longer reports them. Every `deliberate` and `dispatch` row has a
 `REASONS` entry in that file pointing at this section. PENDING rows keep whatever inventory
 entry they already had — new-PC work, not yet triaged.
+
+**Update 2026-09-24 (new-PC work): the five rows that were PENDING here are all WIRED now** —
+`env_portability.py`'s three (`merge_for_new_machine`, `parse_env`, `classify`, via d4d2c33) and
+`stale_server_check.py`'s two (`decide_post_update_action`, `fleet_is_running`, via 1f4588a) —
+see their table rows above, now marked **WIRED**, for how each is reached. No PENDING rows
+remain in this document. `tools/unreached.py`'s summary line as of this pass:
+
+```
+module-level public functions with no reference in non-test code: 77
+  of which 66 carry a recorded verdict -- 11 are still questions.
+```
