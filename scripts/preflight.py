@@ -100,6 +100,13 @@ def main(argv=None):
         # file is the commonest way for those two to differ.
         ("Audit hermetic test manifest",
          [PY, "scripts/check_ci_test_manifest.py", "--strict-untracked"]),
+        # AND THE SAME HAZARD FOR EVERY OTHER SWEEPING GUARD. --strict-untracked above is the
+        # MANIFEST's flag; the manifest is one guard out of a dozen that filter against
+        # `git ls-files`. On 2026-09-22 a new test file was green here and red on CI's decode
+        # ratchet, because an unstaged file is invisible to all of them at once and the manifest
+        # was the only one anybody had taught to say so.
+        ("Nothing new is invisible to the sweeping guards",
+         [PY, "scripts/check_nothing_new_is_invisible.py", "--strict"]),
         ("Integration evidence for new definitions", [PY, "scripts/check_integration_evidence.py"]),
         ("No identifying names in tracked files", [PY, "scripts/check_no_identifying_names.py", "."]),
         ("Run script-style tracer tests", [PY, "tools/test_trace.py"]),
@@ -122,6 +129,22 @@ def main(argv=None):
         gates.append(("windows-install-smoke: DPAPI bootstrap",
                       [PY, "-m", "pytest", "-q", "scripts/test_bootstrap.py",
                        "scripts/test_bootstrap_p2c.py"]))
+
+    # THE C# BUILD, WHICH WAS A SILENT GAP UNTIL IT COST A RED MAIN. CI has a `Windows build`
+    # job and a CodeQL C# build; neither appeared here, and neither appeared in the list of
+    # things deliberately not here -- so it was an oversight wearing the clothes of a decision.
+    # On 2026-09-22 ui/FleetCommands.cs was added to one build list and not the others,
+    # preflight was green, and CI failed with "CS0103: The name 'FleetCommands' does not exist".
+    #
+    # This box HAS csc.exe -- the same compiler the runner uses -- so the gate is real here and
+    # is named as absent where it is not, rather than silently dropped.
+    _CSC = r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+    if os.path.isfile(_CSC):
+        gates.append(("Compile both WPF binaries (CI: Windows build / CodeQL C#)",
+                      [PY, "bench/ui_build_check.py"]))
+    else:
+        skipped.append("Compile both WPF binaries -- csc.exe is not on this machine, so the "
+                       "C# build gates run only on the runner")
 
     failed = [name for name, cmd in gates if _run(name, cmd) != 0]
 
