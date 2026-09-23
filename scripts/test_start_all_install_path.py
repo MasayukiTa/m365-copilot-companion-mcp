@@ -80,7 +80,8 @@ _FUNCS = ["Env-Value", "Get-UpdateCheckSkipReason", "Get-ParentProcessInfo",
           "Get-TunnelHostCount", "Test-TunnelServing", "ConvertFrom-UiStaleLines",
           "Get-UiBuildState", "Invoke-UiStep", "Write-StartupSummary",
           "Test-ShouldNotifyStartupFailures", "Send-StartupFailureNotice",
-          "Ensure-ConvenienceProvisioning", "Get-LaunchLineage", "Get-StartAllMode",
+          "Ensure-ConvenienceProvisioning", "Test-ShortcutTargetsWscript", "Test-WshDisabled",
+          "Get-LaunchLineage", "Get-StartAllMode",
           "New-StartAllRunRecord", "Write-StartAllRunRecord"]
 
 
@@ -374,6 +375,71 @@ function Unregister-ScheduledTask { [CmdletBinding()] param([Parameter(ValueFrom
     assert "shortcut=no" in marker.read_text(encoding="ascii").split()
     provision()
     assert calls().count("shortcut") == 2, "the Desktop launcher came back after -Remove"
+
+
+def _real_wscript_shortcut(tmp_path, desktop):
+    """A Desktop .lnk made by the REAL make_desktop_shortcut.ps1 while WSH works (so it targets
+    wscript.exe), in a throwaway tree -- as scripts/test_shortcuts_without_wsh.py builds it."""
+    tree = tmp_path / "lnk_tree"
+    (tree / "scripts" / "win").mkdir(parents=True)
+    for name in ("make_desktop_shortcut.ps1", "preflight_policy.ps1"):
+        shutil.copyfile(os.path.join(HERE, name), tree / "scripts" / name)
+    shutil.copyfile(os.path.join(HERE, "win", "convenience_marker.ps1"),
+                    tree / "scripts" / "win" / "convenience_marker.ps1")
+    (tree / "scripts" / "start_all_hidden.vbs").write_text("' stub\n", encoding="ascii")
+    (tree / "scripts" / "start_all.ps1").write_text("# stub\n", encoding="ascii")
+    env = dict(os.environ, PREFLIGHT_TEST_WSH_ENABLED="1", M365_COMPANION_DESKTOP_DIR=str(desktop))
+    r = childproc.run([_POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                       str(tree / "scripts" / "make_desktop_shortcut.ps1")], cwd=str(tree), env=env,
+                      timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    lnk = desktop / "M365 Companion.lnk"
+    assert lnk.is_file()
+    return lnk
+
+
+def test_a_launcher_left_on_wscript_is_remade_once_wsh_is_disabled(tmp_path, checkout, functions):
+    """f27826d made the two launcher scripts pick powershell.exe when WSH is disabled, but
+    provisioning only re-ran them for a MISSING shortcut. A shortcut made while WSH worked,
+    still pointing at wscript.exe after WSH was disabled, starts nothing -- it must be re-made.
+    While WSH works, or once it no longer targets wscript.exe, it is left alone."""
+    desk, start, stubs = tmp_path / "Desktop", tmp_path / "Startup", tmp_path / "stubs"
+    for d in (desk, start, stubs):
+        d.mkdir()
+    _real_wscript_shortcut(tmp_path, desk)
+    # The Startup one as bytes: a wide-string target the way a .lnk stores it.
+    (start / "M365 Companion.lnk").write_bytes(
+        b"L\x00\x00\x00" + "C:\\Windows\\System32\\wscript.exe".encode("utf-16-le") + b"\x00" * 8)
+    log = tmp_path / "calls.log"
+    (stubs / "make_desktop_shortcut.ps1").write_text(_STUB_SCRIPT % {
+        "log": _q(log), "name": "shortcut", "lnk": _q(desk / "M365 Companion.lnk")}, encoding="ascii")
+    (stubs / "register-supervisor.ps1").write_text(_STUB_SCRIPT % {
+        "log": _q(log), "name": "autostart", "lnk": _q(start / "M365 Companion.lnk")}, encoding="ascii")
+    shutil.copyfile(os.path.join(HERE, "preflight_policy.ps1"), stubs / "preflight_policy.ps1")
+    (checkout / ".setup" / "convenience_provisioned").write_text("shortcut=yes\r\nautostart=yes\r\n",
+                                                                 encoding="ascii")
+
+    def calls():
+        return sorted(log.read_text(encoding="utf-8").split()) if log.exists() else []
+
+    def provision(wsh):
+        env = dict(os.environ, M365_COMPANION_DESKTOP_DIR=str(desk),
+                   M365_COMPANION_STARTUP_DIR=str(start), PREFLIGHT_TEST_WSH_ENABLED=wsh)
+        return _ps(tmp_path, _driver(functions, checkout, "Ensure-ConvenienceProvisioning",
+                                     script_dir=str(stubs)), env=env).stdout
+
+    probe = _driver(functions, checkout, '"RESULT:" + (@{ d = (Test-ShortcutTargetsWscript %s); '
+                    's = (Test-ShortcutTargetsWscript %s) } | ConvertTo-Json -Compress)'
+                    % (_q(desk / "M365 Companion.lnk"), _q(start / "M365 Companion.lnk")))
+    assert _result(_ps(tmp_path, probe)) == {"d": True, "s": True}, "the real .lnk's target was not read"
+
+    provision("1")
+    assert calls() == [], "re-made a wscript launcher while WSH works"
+    out = provision("0")
+    assert calls() == ["autostart", "shortcut"], calls()
+    assert "Windows Script Host is disabled" in out, out
+    provision("0")
+    assert calls() == ["autostart", "shortcut"], "re-made a launcher that no longer targets wscript.exe"
 
 
 def test_a_legacy_marker_is_left_alone_and_survives_a_rewrite(tmp_path, checkout, functions):

@@ -1087,6 +1087,37 @@ function Invoke-FirstTimeSetupGate {
 # one (unregister-supervisor.ps1, make_desktop_shortcut.ps1 -Remove, and their opposites)
 # record the new answer, so the file always says what the person last asked for.
 # ---------------------------------------------------------------------------
+# A LAUNCHER THAT EXISTS CAN STILL BE DEAD. make_desktop_shortcut.ps1 / register-supervisor.ps1
+# (f27826d) point a shortcut at powershell.exe instead of wscript.exe when Windows Script Host is
+# disabled -- but only when they RUN, and provisioning below ran them only for a MISSING
+# shortcut. One made while WSH worked stayed on wscript.exe after a policy disabled WSH, and
+# wscript then does nothing at all: no window, no error, no start. So a shortcut that targets
+# wscript.exe is re-made when preflight_policy.ps1 -CheckWshOnly (the check both scripts and
+# start_all.bat use) says WSH is disabled. The .lnk is read as bytes, the way
+# scripts/test_shortcuts_without_wsh.py reads it -- WScript.Shell is the thing that may be gone.
+function Test-ShortcutTargetsWscript([string]$LnkPath) {
+    if (-not $LnkPath -or -not (Test-Path -LiteralPath $LnkPath)) { return $false }
+    try {
+        $b = [System.IO.File]::ReadAllBytes($LnkPath)
+        # UTF-16LE at both byte parities (StringData fields land on either) plus a latin-1 pass
+        # for LinkInfo's narrow LocalBasePath, where the target path is.
+        $u0 = [System.Text.Encoding]::Unicode.GetString($b)
+        $u1 = $(if ($b.Length -gt 1) { [System.Text.Encoding]::Unicode.GetString($b, 1, $b.Length - 1) } else { "" })
+        $a = [System.Text.Encoding]::GetEncoding(28591).GetString($b)
+        return (($u0 + "`n" + $u1 + "`n" + $a).ToLowerInvariant().Contains("wscript.exe"))
+    } catch { return $false }
+}
+function Test-WshDisabled {
+    # $true only when preflight_policy.ps1 -CheckWshOnly answers WSH-ENABLED=0. A check that
+    # cannot run is "not known to be disabled": nothing is re-made on a guess.
+    $preflight = Join-Path $scriptDir "preflight_policy.ps1"
+    if (-not (Test-Path -LiteralPath $preflight)) { return $false }
+    try {
+        $lines = @(& powershell -NoProfile -ExecutionPolicy Bypass -File $preflight -CheckWshOnly 2>$null |
+                   ForEach-Object { ([string]$_).Trim() })
+        return ($lines -contains "WSH-ENABLED=0")
+    } catch { return $false }
+}
 function Ensure-ConvenienceProvisioning {
     try {
         $markerPath = Get-ConvenienceMarkerPath $root
@@ -1109,14 +1140,28 @@ function Ensure-ConvenienceProvisioning {
                     -ShortcutPresent (Test-Path (Get-DesktopLauncherPath)) `
                     -AutostartPresent (Test-Path (Get-StartupLauncherPath))
 
-        # a) Desktop shortcut -- only when the record says yes AND it is not there.
+        # A present launcher that targets wscript.exe while WSH is disabled is dead: re-made like
+        # a missing one (see Test-ShortcutTargetsWscript). WSH is asked only when a shortcut
+        # actually targets wscript.exe, so an ordinary start pays nothing for this.
+        $deadShortcut = $wantShortcut -and -not $plan.Shortcut -and (Test-ShortcutTargetsWscript (Get-DesktopLauncherPath))
+        $deadAutostart = $wantAutostart -and -not $plan.Autostart -and (Test-ShortcutTargetsWscript (Get-StartupLauncherPath))
+        if (($deadShortcut -or $deadAutostart) -and -not (Test-WshDisabled)) {
+            $deadShortcut = $false
+            $deadAutostart = $false
+        }
+
+        # a) Desktop shortcut -- only when the record says yes AND it is not there (or is dead).
         $shortcutScript = Join-Path $scriptDir "make_desktop_shortcut.ps1"
-        if ($wantShortcut -and (Test-Path $shortcutScript) -and $plan.Shortcut) {
+        if ($wantShortcut -and (Test-Path $shortcutScript) -and ($plan.Shortcut -or $deadShortcut)) {
             try {
                 Start-Process powershell -WindowStyle Hidden -Wait -ArgumentList @(
                     "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ('"{0}"' -f $shortcutScript)
                 ) -WorkingDirectory $root
-                Write-Host "[provision] Desktop launcher was missing and your recorded answer is shortcut=yes -- re-created."
+                if ($deadShortcut) {
+                    Write-Host "[provision] Desktop launcher pointed at wscript.exe, and Windows Script Host is disabled on this PC -- re-created to start through PowerShell."
+                } else {
+                    Write-Host "[provision] Desktop launcher was missing and your recorded answer is shortcut=yes -- re-created."
+                }
                 Write-Host "[provision] To remove it for good: scripts\make_desktop_shortcut.ps1 -Remove"
             } catch {
                 Write-Host "[provision] desktop shortcut skipped: $_"
@@ -1126,12 +1171,16 @@ function Ensure-ConvenienceProvisioning {
         # b) Logon autostart -- only when the record says yes AND the Startup shortcut (the
         #    primary mechanism; the scheduled task is an optional extra) is not there.
         $autostartScript = Join-Path $scriptDir "register-supervisor.ps1"
-        if ($wantAutostart -and (Test-Path $autostartScript) -and $plan.Autostart) {
+        if ($wantAutostart -and (Test-Path $autostartScript) -and ($plan.Autostart -or $deadAutostart)) {
             try {
                 Start-Process powershell -WindowStyle Hidden -Wait -ArgumentList @(
                     "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ('"{0}"' -f $autostartScript)
                 ) -WorkingDirectory $root
-                Write-Host "[provision] logon autostart was missing and your recorded answer is autostart=yes -- registered."
+                if ($deadAutostart) {
+                    Write-Host "[provision] logon autostart pointed at wscript.exe, and Windows Script Host is disabled on this PC -- re-registered to start through PowerShell."
+                } else {
+                    Write-Host "[provision] logon autostart was missing and your recorded answer is autostart=yes -- registered."
+                }
                 Write-Host "[provision] To turn it off for good: scripts\unregister-supervisor.ps1"
             } catch {
                 Write-Host "[provision] autostart registration skipped: $_"
