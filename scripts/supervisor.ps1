@@ -285,6 +285,70 @@ function Test-DevtunnelLoggedIn {
     return $false
 }
 
+# ASK DEVTUNNEL WHO IS LOGGED IN WHEN THE ANSWER CAN HAVE CHANGED, NOT EVERY TICK.
+# `devtunnel user show` measured 3.7 s per call on 2026-09-24, and it ran on every pass of the
+# loop below -- the single largest part of a ~20 s tick whose nominal interval is 15 s, and so
+# of how long a submitted job sat in pending before the queue pass saw it. A login does not
+# change on its own between two ticks; it changes when someone logs out or a token expires,
+# and both of those show up first as the tunnel host failing.
+#
+# ONLY A CLEAR "Logged in" IS CACHED. "Not logged in" and "cannot tell" (offline, CLI missing,
+# odd output) are answered live every tick exactly as before: not-logged-in is the state in
+# which a person is running `devtunnel login` by hand and the supervisor must notice the fix
+# on the next tick, not ten minutes later; and a network failure is not a logout, so it must
+# not be remembered as one either. Test-DevtunnelLoggedIn itself is unchanged.
+#
+# THE CACHE IS DROPPED AT ONCE (Clear-DevtunnelLoginCache) when the tunnel-hosting check
+# fails, when a host this supervisor launched has exited, and when a re-host does not
+# establish -- the three observations that can mean the login went away. And a re-host is
+# never decided on a cached answer: the branch that would call Start-TunnelHost re-asks live
+# first, so the "never touch devtunnel while logged out" rule holds exactly as before.
+#
+# LOGGED BRIEFLY: one line when a live re-check says "logged in" (at most once per expiry
+# unless something invalidated it), one line the first time the cached answer is relied on
+# after that. Not a line per tick.
+$script:DevtunnelLoginCacheSeconds = 600
+$script:DevtunnelLoginCachedUntil = [datetime]::MinValue
+$script:DevtunnelLoginCacheUseLogged = $false
+$script:DevtunnelLoginAnswerWasCached = $false
+$script:DevtunnelLoginRecheckReason = "first check"
+
+function Clear-DevtunnelLoginCache {
+    param([string]$Reason)
+    $script:DevtunnelLoginCachedUntil = [datetime]::MinValue
+    $script:DevtunnelLoginRecheckReason = $Reason
+}
+
+function Test-DevtunnelLoggedInCached {
+    $now = Get-Date
+    if ($now -lt $script:DevtunnelLoginCachedUntil) {
+        $script:DevtunnelLoginAnswerWasCached = $true
+        if (-not $script:DevtunnelLoginCacheUseLogged) {
+            $until = $script:DevtunnelLoginCachedUntil.ToString("HH:mm:ss")
+            Write-Log ("devtunnel login: using the cached 'logged in' answer until $until " +
+                       "(re-asked sooner if the tunnel host fails)")
+            $script:DevtunnelLoginCacheUseLogged = $true
+        }
+        return $true
+    }
+    $script:DevtunnelLoginAnswerWasCached = $false
+    $why = $script:DevtunnelLoginRecheckReason
+    $script:DevtunnelLoginRecheckReason = $null
+    $answer = [bool](Test-DevtunnelLoggedIn)
+    if ($answer) {
+        $script:DevtunnelLoginCachedUntil = $now.AddSeconds($script:DevtunnelLoginCacheSeconds)
+        $script:DevtunnelLoginCacheUseLogged = $false
+        if (-not $why) { $why = "cache expired" }
+        Write-Log "devtunnel login re-checked ($why): logged in"
+    } else {
+        $script:DevtunnelLoginCachedUntil = [datetime]::MinValue
+        # A live "no" after an invalidation is worth one line; the steady not-logged-in state
+        # is already announced by the main loop's own transition log, so repeats stay silent.
+        if ($why) { Write-Log "devtunnel login re-checked ($why): not logged in or cannot tell" }
+    }
+    return $answer
+}
+
 # TRACKS THE PROCESS THIS SUPERVISOR ITSELF LAUNCHED (see -PassThru on Start-Process inside
 # Start-Server, below) and, when this supervisor is about to end it on purpose, WHY. Both start
 # out $null: before this supervisor's own Start-Server has ever run, there is no process to
@@ -553,20 +617,26 @@ function Start-TunnelHost {
         Where-Object { $_.CommandLine -match '\bhost\b' -and $_.CommandLine -match [regex]::Escape($TunnelName) } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Seconds 2
-    Start-Process -FilePath $DevTunnel -ArgumentList "host $TunnelName" -WindowStyle Hidden
+    # -PASSTHRU SO THE MAIN LOOP CAN SEE THIS HOST EXIT. A host that exits is one of the three
+    # events that drop the cached devtunnel login answer (see Test-DevtunnelLoggedInCached).
+    $script:TunnelHostProc = $null
+    $script:TunnelHostProc = Start-Process -FilePath $DevTunnel -ArgumentList "host $TunnelName" -WindowStyle Hidden -PassThru
     Write-Log "devtunnel host starting for $TunnelName (bin=$DevTunnel) ..."
     # A freshly-started host can take 15-30s to register with the relay. Block until it
     # actually shows >=1 connection (up to ~50s) so the monitor loop never kills a host
     # that is still in the middle of connecting (which would cause a restart churn loop).
+    # RETURNS WHETHER IT ESTABLISHED: a re-host that does not is the third invalidation event.
     for ($i = 0; $i -lt 25; $i++) {
         Start-Sleep -Seconds 2
         if (Test-TunnelHosting) {
             Write-Log "devtunnel host established (after ~$([int](($i + 1) * 2))s)"
-            return
+            return $true
         }
     }
     Write-Log "devtunnel host did not establish within ~50s (will retry next cycle)"
+    return $false
 }
+$script:TunnelHostProc = $null
 
 # ── Fleet coordinator auto-resume ───────────────────────────────────────────────
 # A fleet run (python -m relay.fleet_runner) killed by an unplanned reboot leaves
@@ -844,6 +914,154 @@ function Invoke-ReviewAutoResume {
     }
 }
 
+# -- Queue delivery: the reaper + router pass, and the wait between ticks -----------------------
+# The two steps the tick has always run back to back, now callable from two places: the full
+# tick (unchanged position and order) and the express pass inside Wait-ForNextTick below.
+function Invoke-FleetReap {
+    # Clear phantom fleet runs whose coordinator process died without a supervisor restart
+    # (Invoke-FleetAutoResume above only runs once at supervisor startup, so a mid-session
+    # coordinator kill/crash would otherwise leave .fleet/status.json stuck showing
+    # running=true forever). Best-effort, idempotent, never relaunches anything -- see
+    # relay/fleet_reaper.py.
+    try {
+        $reapOut = & $Py -c "import sys; sys.path.insert(0, r'$Root'); from relay.fleet_reaper import reap_stale_run; import json; r = reap_stale_run(); print(json.dumps(r) if r else '')" 2>$null
+        if ($reapOut) { Write-Log "reaped stale fleet run: $reapOut" }
+    } catch { }
+}
+
+function Invoke-QueueDrain {
+    # Drain the typed-job queue. An agent reaching the MCP server can hand this machine a goal
+    # (tools/fleet_intake.fleet_submit), and until something calls the router that goal just
+    # sits in .fleet/tasks/pending -- which is where the first real submission sat.
+    #
+    # ONE PASS FROM THIS LOOP, NOT A DAEMON. The router's own --poll-s mode would be a second
+    # long-lived process to start, supervise and reap; this loop already runs, already survives
+    # for days. Fewer moving parts is the whole reason. Latency is handled by the express pass
+    # in Wait-ForNextTick, which calls THIS function -- still one deliverer, one process.
+    #
+    # Unattended is safe by construction rather than by promise: a LOCAL job still meets the
+    # approval gate (default mode confirms every first-seen class into awaiting/), a CLAUDE job
+    # is only written out, and a FLEET goal joins a run that is ALREADY in flight -- nothing
+    # here starts one, so no browser opens and no Copilot budget is spent by a queue drain.
+    # NO 2>$null ON A NATIVE COMMAND. Windows PowerShell wraps a native process's stderr lines
+    # in ErrorRecords, so redirecting them turns a harmless import-time DeprecationWarning
+    # into a terminating error. -W ignore keeps the warning down; stderr is left alone.
+    #
+    # THE PATH IS BUILT IN TWO SEGMENTS, and that is not style. Written as one string it was
+    # "relay\task_router.py", and the \t in it became a TAB before it ever reached this file
+    # -- so the supervisor spent every 15-second pass launching python against
+    # "relay<TAB>ask_router.py", getting exit code 2 and an empty stdout, and saying nothing.
+    # The queue never moved and nothing anywhere reported a failure. Two segments cannot carry
+    # an escape, so the bug cannot come back the same way.
+    #
+    # $LASTEXITCODE IS CHECKED. The router failing is not a PowerShell exception, so the catch
+    # below never saw it; a drain that fails quietly is exactly how this went unnoticed.
+    param([string]$Tag = "")
+    $label = "task_router"
+    if ($Tag) { $label = "task_router ($Tag)" }
+    try {
+        $rtPath = Join-Path (Join-Path $Root "relay") "task_router.py"
+        $routed = (& $Py -W ignore $rtPath --once) -join ""
+        if ($LASTEXITCODE -ne 0) {
+            Write-Log "${label}: exit $LASTEXITCODE from $rtPath (queue not drained)"
+        } elseif ($routed -and $routed.Trim() -and $routed.Trim() -ne "[]") {
+            Write-Log "${label}: $($routed.Trim())"
+        }
+    } catch {
+        Write-Log "$label pass failed: $($_.Exception.Message)"
+    }
+}
+
+$PendingDir = Join-Path (Join-Path (Join-Path $Root ".fleet") "tasks") "pending"
+
+function Get-PendingJobNames {
+    # File NAMES only, read in-process: no python, no child process, nothing parsed. fleet_submit
+    # writes <id>.json.tmp and os.replace()s it into place, so a name ending in .json is a
+    # finished file; the extra EndsWith keeps a .json.tmp (or an 8.3 alias) from counting.
+    param([string]$Dir)
+    $names = New-Object System.Collections.Generic.List[string]
+    try {
+        foreach ($f in [System.IO.Directory]::GetFiles($Dir, "*.json")) {
+            $n = [System.IO.Path]::GetFileName($f)
+            if ($n.EndsWith(".json", [StringComparison]::OrdinalIgnoreCase)) { $names.Add($n) }
+        }
+    } catch { }
+    return ,$names
+}
+
+# WHICH PENDING FILES A ROUTER PASS HAS ALREADY BEEN SHOWN. A job can stay in pending after a
+# pass on purpose -- still owned by a live writer, held back by a backoff, waiting on something
+# the router decided to wait for. Triggering on "pending is not empty" would then run an
+# express pass every few seconds for as long as that job waits, i.e. the router every 3 s
+# forever instead of every 15. Triggering on "a NAME appeared that no pass has seen" fires once
+# per arrival and never again for the same file. Names are added from a snapshot taken BEFORE
+# each pass (full or express), so a file landing mid-pass is still new afterwards; names that
+# have left pending are pruned on every probe, so the set cannot grow without bound, and a job
+# that leaves and is later put back counts as a new arrival, which it is.
+$script:ExpressSeen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+$script:LastExpressPassAt = [datetime]::MinValue
+
+function Wait-ForNextTick {
+    # REPLACES `Start-Sleep -Seconds $IntervalSeconds`. Measured 2026-09-24: a job written by
+    # fleet_submit waited ~26 s before the router saw it -- the rest of a ~20 s tick plus the
+    # sleep. This waits the same interval, but looks at pending once a second and, when a job
+    # file appears that no pass has been shown, runs an EXPRESS PASS at once: the reaper and
+    # then the router, the same two steps in the same order as the full tick
+    # ($ExpressPass is { Invoke-FleetReap; Invoke-QueueDrain }). The reaper is never skipped,
+    # including while a server restart is in progress -- queue delivery does not depend on the
+    # server, and a delivery pass that skipped the reaper could hand a goal to a run that is
+    # already dead.
+    #
+    # WHY A 1-SECOND PROBE AND NOT A NAMED EVENT that fleet_submit signals. An event is a
+    # second channel into the supervisor: it needs an ACL that lets the server's user signal
+    # it and nobody else, a name in the Global/Local namespace that another process can create
+    # first (squatting) and so either block or spoof the wake-up, and a lost-wakeup story for
+    # a signal raised while the supervisor is busy in the tick or not running at all -- which
+    # ends in polling the directory anyway. The probe is a directory listing in this process:
+    # no child process, no new resident memory, nothing another process can hold or forge,
+    # and at worst one second of latency.
+    #
+    # THE SUPERVISOR STAYS THE ONLY DELIVERER. The express pass runs here, synchronously, in the
+    # one supervisor that holds the Global mutex; it is not a second process and cannot overlap
+    # the tick's own pass.
+    #
+    # RATE-LIMITED ($MinExpressSpacingSeconds, 3 s). A burst of submissions gets one pass for
+    # everything that arrived inside the window, not one router process per file. A new name
+    # that arrives inside the window is not marked seen, so it triggers the first probe after
+    # the window closes.
+    #
+    # AN ABSOLUTE DEADLINE, fixed when the wait starts. Express passes never extend it: a
+    # steady stream of submissions must not postpone the health, stale-code and tunnel checks
+    # of the full tick indefinitely. A pass already running at the deadline finishes; nothing
+    # new starts after it.
+    param(
+        [double]$Seconds,
+        [string]$Dir,
+        [scriptblock]$ExpressPass,
+        [double]$ProbeSeconds = 1,
+        [double]$MinExpressSpacingSeconds = 3
+    )
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ($true) {
+        $leftMs = ($deadline - (Get-Date)).TotalMilliseconds
+        if ($leftMs -le 0) { return }
+        Start-Sleep -Milliseconds ([int][math]::Ceiling([math]::Min($ProbeSeconds * 1000, $leftMs)))
+        if ((Get-Date) -ge $deadline) { return }
+        $names = Get-PendingJobNames -Dir $Dir
+        $present = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($n in $names) { [void]$present.Add($n) }
+        $script:ExpressSeen.IntersectWith($present)
+        $fresh = 0
+        foreach ($n in $names) { if (-not $script:ExpressSeen.Contains($n)) { $fresh++ } }
+        if ($fresh -eq 0) { continue }
+        if (((Get-Date) - $script:LastExpressPassAt).TotalSeconds -lt $MinExpressSpacingSeconds) { continue }
+        $script:LastExpressPassAt = Get-Date
+        foreach ($n in $names) { [void]$script:ExpressSeen.Add($n) }
+        Write-Log "express queue pass: $fresh new job file(s) in pending"
+        try { & $ExpressPass } catch { Write-Log "express queue pass failed: $($_.Exception.Message)" }
+    }
+}
+
 Write-Log "supervisor up (tunnel=$TunnelName port=$Port interval=${IntervalSeconds}s debounce=$FailuresBeforeAction)"
 
 # Checked once, here, before the forever health-check loop starts.
@@ -950,53 +1168,13 @@ while ($true) {
         $tunnelMiss = 0
     }
 
-    # Clear phantom fleet runs whose coordinator process died without a supervisor restart
-    # (Invoke-FleetAutoResume above only runs once at supervisor startup, so a mid-session
-    # coordinator kill/crash would otherwise leave .fleet/status.json stuck showing
-    # running=true forever). Best-effort, idempotent, never relaunches anything -- see
-    # relay/fleet_reaper.py.
-    try {
-        $reapOut = & $Py -c "import sys; sys.path.insert(0, r'$Root'); from relay.fleet_reaper import reap_stale_run; import json; r = reap_stale_run(); print(json.dumps(r) if r else '')" 2>$null
-        if ($reapOut) { Write-Log "reaped stale fleet run: $reapOut" }
-    } catch { }
-
-    # Drain the typed-job queue. An agent reaching the MCP server can hand this machine a goal
-    # (tools/fleet_intake.fleet_submit), and until something calls the router that goal just
-    # sits in .fleet/tasks/pending -- which is where the first real submission sat.
-    #
-    # ONE PASS FROM THIS LOOP, NOT A DAEMON. The router's own --poll-s mode would be a second
-    # long-lived process to start, supervise and reap; this loop already runs, already survives
-    # for days, and 15 seconds of latency is nothing against a goal that will take minutes.
-    # Fewer moving parts is the whole reason.
-    #
-    # Unattended is safe by construction rather than by promise: a LOCAL job still meets the
-    # approval gate (default mode confirms every first-seen class into awaiting/), a CLAUDE job
-    # is only written out, and a FLEET goal joins a run that is ALREADY in flight -- nothing
-    # here starts one, so no browser opens and no Copilot budget is spent by a queue drain.
-    # NO 2>$null ON A NATIVE COMMAND. Windows PowerShell wraps a native process's stderr lines
-    # in ErrorRecords, so redirecting them turns a harmless import-time DeprecationWarning
-    # into a terminating error. -W ignore keeps the warning down; stderr is left alone.
-    #
-    # THE PATH IS BUILT IN TWO SEGMENTS, and that is not style. Written as one string it was
-    # "relay\task_router.py", and the \t in it became a TAB before it ever reached this file
-    # -- so the supervisor spent every 15-second pass launching python against
-    # "relay<TAB>ask_router.py", getting exit code 2 and an empty stdout, and saying nothing.
-    # The queue never moved and nothing anywhere reported a failure. Two segments cannot carry
-    # an escape, so the bug cannot come back the same way.
-    #
-    # $LASTEXITCODE IS CHECKED. The router failing is not a PowerShell exception, so the catch
-    # below never saw it; a drain that fails quietly is exactly how this went unnoticed.
-    try {
-        $rtPath = Join-Path (Join-Path $Root "relay") "task_router.py"
-        $routed = (& $Py -W ignore $rtPath --once) -join ""
-        if ($LASTEXITCODE -ne 0) {
-            Write-Log "task_router: exit $LASTEXITCODE from $rtPath (queue not drained)"
-        } elseif ($routed -and $routed.Trim() -and $routed.Trim() -ne "[]") {
-            Write-Log "task_router: $($routed.Trim())"
-        }
-    } catch {
-        Write-Log "task_router pass failed: $($_.Exception.Message)"
-    }
+    # The reaper, then the queue drain -- see Invoke-FleetReap / Invoke-QueueDrain for why each
+    # exists. The pending names are snapshotted BEFORE the pass and marked seen after it, so
+    # Wait-ForNextTick below does not run an express pass for a job this pass was already shown.
+    $shownToPass = Get-PendingJobNames -Dir $PendingDir
+    Invoke-FleetReap
+    Invoke-QueueDrain
+    foreach ($n in $shownToPass) { [void]$script:ExpressSeen.Add($n) }
 
     Invoke-ReviewAutoResume | Out-Null
 
@@ -1047,7 +1225,19 @@ while ($true) {
         }
     }
 
-    if (-not (Test-DevtunnelLoggedIn)) {
+    # A HOST THIS SUPERVISOR LAUNCHED HAS EXITED -> the cached login answer is no longer
+    # trusted (see Test-DevtunnelLoggedInCached). A host started by someone else is not
+    # tracked; its failure still reaches the cache through the hosting check below.
+    if ($script:TunnelHostProc) {
+        $hostGone = $true
+        try { $script:TunnelHostProc.Refresh(); $hostGone = $script:TunnelHostProc.HasExited } catch { $hostGone = $true }
+        if ($hostGone) {
+            Clear-DevtunnelLoginCache "the devtunnel host this supervisor launched has exited"
+            $script:TunnelHostProc = $null
+        }
+    }
+
+    if (-not (Test-DevtunnelLoggedInCached)) {
         # First-run / token-cleared: pause tunnel management and DO NOT touch devtunnel,
         # so the user can run `devtunnel login` (interactive) without it being reaped.
         if ($loggedIn -ne $false) {
@@ -1061,15 +1251,28 @@ while ($true) {
         if (Test-TunnelHosting) {
             $tunnelMiss = 0
         } else {
+            Clear-DevtunnelLoginCache "tunnel host connections = 0"
             $tunnelMiss++
             Write-Log "tunnel host connections = 0 ($tunnelMiss/$FailuresBeforeAction)"
             if ($tunnelMiss -ge $FailuresBeforeAction) {
-                Start-TunnelHost
+                # NEVER RE-HOST ON A CACHED ANSWER. The cache was just dropped, so this asks
+                # the CLI live; only a clear "logged in" lets Start-TunnelHost touch devtunnel.
+                if ($script:DevtunnelLoginAnswerWasCached -and -not (Test-DevtunnelLoggedInCached)) {
+                    Write-Log "devtunnel NOT logged in on the live re-check before re-hosting -> tunnel management PAUSED, not re-hosting."
+                    $loggedIn = $false
+                } else {
+                    if (-not (Start-TunnelHost)) {
+                        Clear-DevtunnelLoginCache "the re-host did not establish"
+                    }
+                    Start-Sleep -Seconds 8
+                }
                 $tunnelMiss = 0
-                Start-Sleep -Seconds 8
             }
         }
     }
 
-    Start-Sleep -Seconds $IntervalSeconds
+    Wait-ForNextTick -Seconds $IntervalSeconds -Dir $PendingDir -ExpressPass {
+        Invoke-FleetReap
+        Invoke-QueueDrain -Tag "express"
+    }
 }
