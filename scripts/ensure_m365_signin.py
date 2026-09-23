@@ -62,6 +62,25 @@ def tabs(port: int):
         return None
 
 
+def _is_residue(url: str) -> bool:
+    """Is this auth-host tab a leftover rather than a page waiting for a person?
+
+    THE ANSWER LIVES IN relay/edge_auth, NOT HERE. That module owns what an auth URL means,
+    and relay/relay_fleet.py's residue reaper was written against the same two shapes. A copy
+    here would be the second place to keep one fact -- the defect this repository spent
+    2026-09-22 removing from four build scripts.
+
+    IF IT CANNOT BE IMPORTED, NOTHING IS RESIDUE. That is the previous behaviour, which
+    over-reports a sign-in rather than skipping one, and it fails toward the answer a human
+    can check.
+    """
+    try:
+        from relay import edge_auth
+    except Exception:
+        return False
+    return edge_auth.looks_like_auth_bounce_residue(url)
+
+
 def _bare(url: str) -> str:
     """scheme://host/path -- the identifying part, without the query string.
 
@@ -95,7 +114,7 @@ def state(port: int):
         # to look at a process that is fine.
         return None, "no Edge is answering on :%d" % port
     urls = [x.get("url") or "" for x in t]
-    walls = [u for u in urls if LOGIN_RE.search(u)]
+    walls = [u for u in urls if LOGIN_RE.search(u) and not _is_residue(u)]
     if walls:
         # NAME THE TAB. "a sign-in page is open" is not enough to act on, and on 2026-09-23 it
         # was the whole of what the operator's screen said while the same FAIL kept coming back
@@ -116,6 +135,14 @@ def state(port: int):
         if all(MID_AUTH_RE.search(u) for u in m365):
             return None, "an M365 tab is open but still mid-authentication, so nothing to confirm yet"
         return True, "an M365 page is open, past any sign-in wall and not mid-authentication"
+    # AUTH-HOST TABS THAT ARE ONLY RESIDUE. Reached when nothing above decided: no wall, no
+    # M365 tab. Residue is not evidence of a wall and it is not evidence of a sign-in either,
+    # so this is the third answer, said out loud -- otherwise the reason would be the tab-less
+    # one and a reader would go looking for a browser with no tabs while two are open.
+    residue = sorted({_bare(u) for u in urls if LOGIN_RE.search(u)})
+    if residue:
+        return None, ("only auth-bounce leftovers are open, which say nothing either way: %s"
+                      % ", ".join(residue))
     return None, "no M365 page open, so nothing to judge from (the fleet opens no tabs)"
 
 
@@ -274,11 +301,20 @@ def _wait_for_signin(a, edge_recover, deadline_s):
             print("\n  [ OK ] signed in. Continuing.")
             return 0
         left = int(deadline - time.time())
-        msg = "  waiting for sign-in... (%s, %dm%02ds left)" % (why, left // 60, left % 60)
-        if msg != last:
-            sys.stdout.write("\r" + msg + " " * 8)
-            sys.stdout.flush()
-            last = msg
+        # THE REASON GOES ON ITS OWN LINE, ONCE; THE COUNTDOWN REDRAWS IN PLACE.
+        #
+        # `\r` returns to the start of the last PHYSICAL line, so a status line longer than the
+        # console is not redrawn -- it wraps, and every tick leaves the previous copy behind.
+        # With the reason now naming the tabs it found, the line went past 80 columns and the
+        # operator's screen filled with identical half-truncated repeats of
+        # "waiting for sign-in... (a sign-in page is open: https://login.live.com/Me.srf, ...".
+        # Nothing was wrong with the content; it could not be read.
+        if why != last:
+            sys.stdout.write("\r" + " " * 78 + "\r")
+            print("  %s" % why)
+            last = why
+        sys.stdout.write("\r  waiting for sign-in... (%dm%02ds left)   " % (left // 60, left % 60))
+        sys.stdout.flush()
         time.sleep(2.0)
 
     print("\n  sign-in did not complete within %d minutes." % int(a.timeout / 60))
