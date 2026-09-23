@@ -150,16 +150,55 @@ def _record_skill_use_inner(kind, query, matched):
         pass
 
 
+#: What skill_match says with each tier. Kept as constants so the tests pin the exact words a
+#: model reads (tests/test_skills_business_mcp.py).
+CONFIDENT_INSTRUCTION = (
+    "CONFIDENT trusted match. Call skill_load(name='%s') and follow that procedure as written.")
+CANDIDATE_INSTRUCTION = (
+    "This is only a POSSIBLE match (confidence: candidate), not a confident one. Read the "
+    "description. Call skill_load(name='%s') only if the user's request is for exactly this "
+    "procedure; otherwise proceed without it, and do not present it as the user's procedure.")
+
+
 def skill_match(text: str) -> str:
-    """Find a confidently matching trusted Skill using metadata only; does not load it."""
+    """Find a trusted Skill for a request using metadata only; does not load it.
+
+    TWO TIERS (see relay.skills._TRUSTED_POLICY). A CONFIDENT match comes from
+    SkillStore.match() -- the same door every automatic caller uses -- and says
+    "confidence": "confident": load it and follow it. When there is none, a CANDIDATE may come
+    from SkillStore.candidate_match(), and this tool is the ONLY caller of that method: the
+    result says "confidence": "candidate" and tells the model, in words, that it is a possible
+    match to be used only if the request is for exactly that procedure.
+
+    THE ORDER, when there is no confident match:
+      1. The unapproved near match (match_unapproved), if there is one, is ALWAYS raised for
+         approval -- whether or not a trusted candidate exists. A plausible trusted candidate
+         says nothing about whether the user's own procedure is sitting unapproved (typically
+         an approved Skill whose text was edited), and not asking is how six Skills once sat
+         unreadable for weeks. Asking grants nothing and is de-duplicated by digest.
+      2. The ANSWER puts a trusted candidate first, because it is the only one that can be
+         loaded now, and names the unapproved near match beside it. With no candidate the
+         answer is the unapproved-near-match message, then the list of Skills waiting for
+         approval, then a plain "no match".
+    """
     try:
         store = _store()
         result = store.match(text)
         if result:
             _record_skill_use("match", text,
                               (result or {}).get("name") if isinstance(result, dict) else "")
-            return json.dumps(result, ensure_ascii=False, indent=2)
+            payload = {"confidence": result.get("confidence", "confident"),
+                       "instruction": CONFIDENT_INSTRUCTION % result["name"]}
+            payload.update(result)
+            return json.dumps(payload, ensure_ascii=False, indent=2)
         _record_skill_use("match", text, "")
+        try:
+            candidate = store.candidate_match(text)
+        except Exception:
+            candidate = None
+        if candidate:
+            # A separate kind, so the funnel of CONFIDENT matches ("match") keeps its meaning.
+            _record_skill_use_inner("candidate", text, candidate.get("name"))
         # 一致なしとだけ返していたとき、呼び出し側は「そんな手順は無い」と読み、
         # 自分でやり方を考え始めた。実際には手順はあって、束を1文字直したせいで
         # 再承認待ちになっていただけだった。照合は信頼済みしか見ないので、
@@ -180,8 +219,9 @@ def skill_match(text: str) -> str:
             near = store.match_unapproved(text)
         except Exception:
             near = None
+        asked = ""
+        state = ""
         if near:
-            asked = ""
             try:
                 review = store.request_approval(near["name"])
                 asked = ("承認待ちとして登録しました（承認センターに表示されます）。"
@@ -197,6 +237,19 @@ def skill_match(text: str) -> str:
             state = ("has changed since it was approved and is waiting for human "
                      "re-approval" if near["trust"] == "changed"
                      else "has never been approved by a human")
+        if candidate:
+            payload = {"confidence": "candidate",
+                       "instruction": CANDIDATE_INSTRUCTION % candidate["name"]}
+            payload.update(candidate)
+            if near:
+                payload["unapproved_near_match"] = {
+                    "name": near["name"], "trust": near["trust"],
+                    "note": ("/%s may also fit this request but it %s, so it cannot be "
+                             "loaded. %sAsk the user to approve it if it is the procedure "
+                             "they mean." % (near["name"], state, asked)),
+                }
+            return json.dumps(payload, ensure_ascii=False, indent=2)
+        if near:
             return ("(no confident Skill match among TRUSTED Skills. "
                     "/%s looks like the right procedure but it %s, so it cannot be matched "
                     "or loaded. %sAsk the user to approve it, or proceed without it -- do not "

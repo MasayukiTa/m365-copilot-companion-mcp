@@ -10,7 +10,9 @@ ambiguous ones where two Skills or none are all acceptable.
 THIS IS A DEVELOPMENT SET, AND SAYS SO. The first measurement (recall 0.436) was taken on the
 unmodified matcher. The 2026-09-24 rewrite of relay/skills.py matching (character n-grams, IDF,
 coverage, a margin rule -- see the block above _match_units) was then developed against these
-requests, with every miss studied: its parameters were chosen on this set. So the numbers
+requests, with every miss studied: its parameters were chosen on this set, and so was the split
+into a CONFIDENT tier (match()) and a CANDIDATE tier (candidate_match(); see
+relay.skills._TRUSTED_POLICY) that followed it. So the numbers
 below say how well the method fits the requests it was built with, NOT how well it
 generalises. That is measured on a separate held-out set kept outside this repository, which
 the rewrite never saw; a large gap between the two would mean the method was fitted to these
@@ -337,18 +339,39 @@ def test_the_labelled_set_is_large_and_balanced():
 # false positives get NO headroom beyond what was measured: they are the expensive failure.
 # ---------------------------------------------------------------------------------------------
 
-#: trusted-store match(), after the rewrite. Measured: recall 0.782 (61/78), precision 0.984,
-#: FP 1/25 ('請求書を発行したい' -> invoice-check, see relay.skills._TRUSTED_POLICY), 0 wrong
-#: Skills, one ambiguous request outside its acceptable set ('クレームの件数を月次で集計' ->
-#: monthly-sales-excel). By kind: ja-paraphrase 16/18, ja-casual 17/18, ja-polite 14/15,
-#: ja-typo 3/9, en 11/18.
-FLOOR_RECALL = 0.73                   # measured 61/78 = 0.782
-FLOOR_JAPANESE_RECALL = 0.78          # measured 50/60 = 0.833
-FLOOR_ENGLISH_RECALL = 0.50           # measured 11/18 = 0.611
-FLOOR_PRECISION = 0.95                # measured 0.984
-CEIL_FP_RATE = 0.04                   # measured 1 of 25; at most 1 of 25
+#: THE 6f69e4b REWRITE, one tier (its match() policy is now _CANDIDATE_POLICY): recall 0.782
+#: (61/78), precision 0.984, FP 1/25 ('請求書を発行したい' -> invoice-check), 0 wrong Skills,
+#: one ambiguous request outside its acceptable set; by kind ja-paraphrase 16/18, ja-casual
+#: 17/18, ja-polite 14/15, ja-typo 3/9, en 11/18.
+#:
+#: TWO TIERS (relay.skills._TRUSTED_POLICY). match() is what every automatic caller acts on,
+#: so it must not name a Skill for a match-nothing request at all; candidate_match() is shown
+#: to a model only, marked as a possible match.
+#:
+#: CONFIDENT -- trusted-store match(). Measured: recall 0.679 (53/78), precision 1.000, FP 0/25,
+#: 0 wrong Skills, one ambiguous request outside its acceptable set ('クレームの件数を月次で集計'
+#: -> monthly-sales-excel: 月次 + 集計 are two distinctive words of that Skill). By kind:
+#: ja-paraphrase 15/18, ja-casual 15/18, ja-polite 13/15, ja-typo 1/9, en 9/18.
+FLOOR_RECALL = 0.63                   # measured 53/78 = 0.679
+FLOOR_JAPANESE_RECALL = 0.68          # measured 44/60 = 0.733
+FLOOR_ENGLISH_RECALL = 0.38           # measured 9/18 = 0.500
+FLOOR_PRECISION = 1.0                 # measured 1.000 -- no headroom: see the margin note
+CEIL_FP_RATE = 0.0                    # measured 0 of 25
 CEIL_WRONG_SINGLE = 0                 # measured 0: never the wrong Skill for a clear request
 CEIL_WRONG = 1                        # wrong + ambiguous-outside-set; measured 0 + 1
+
+#: CANDIDATE -- trusted-store candidate_match(), which answers only where match() does not.
+#: Its precision is counted over the requests where it RETURNS a candidate. Measured: a
+#: candidate on 9 of the 103 single-answer and match-nothing requests, 8 of them right
+#: (precision 0.889), 0 wrong Skills, 1 false positive -- the development near miss
+#: '請求書を発行したい' -> invoice-check, which the confident tier refuses -- and no ambiguous
+#: request outside its set. By kind: en 2, ja-casual 2, ja-paraphrase 1, ja-polite 1, ja-typo 2.
+#: Either tier (what skill_match can offer a model): recall 0.782 (61/78), exactly the 6f69e4b
+#: one-tier recall -- the split moved 8 requests from "follow this" to "possibly this" and lost
+#: none.
+FLOOR_CANDIDATE_PRECISION = 0.85      # measured 8/9 = 0.889
+CEIL_CANDIDATE_FP = 1                 # measured 1 of 25
+FLOOR_EITHER_TIER_RECALL = 0.73       # measured 61/78 = 0.782
 
 #: untrusted-store match_unapproved() -- the "ask a human to approve this" path.
 #: Measured after the rewrite: top-1 0.833 (65/78), precision 0.985, FP 1/25, 0 wrong Skills.
@@ -357,6 +380,7 @@ CEIL_UNAPPROVED_FP_RATE = 0.04        # measured 1 of 25 (was 7 of 25 before the
 
 
 def test_matching_quality_on_office_requests(trusted_store):
+    """match() -- the CONFIDENT tier every automatic caller acts on."""
     m = _measure(trusted_store.match)
     _report("SkillStore.match (all 18 trusted)", m)
     assert m["recall"] >= FLOOR_RECALL
@@ -368,6 +392,49 @@ def test_matching_quality_on_office_requests(trusted_store):
     assert m["fp_rate"] <= CEIL_FP_RATE
     assert len(m["wrong"]) <= CEIL_WRONG_SINGLE
     assert len(m["wrong"]) + len(m["amb_bad"]) <= CEIL_WRONG
+
+
+def test_candidate_tier_quality_on_office_requests(trusted_store):
+    """candidate_match() -- shown to a model as a POSSIBLE match, never acted on automatically.
+
+    Measured twice: on its own (precision over the requests where it returns something), and
+    together with match() (what a model calling skill_match can reach at all)."""
+    cand = _measure(trusted_store.candidate_match)
+    _report("SkillStore.candidate_match (all 18 trusted; only where match() declines)", cand)
+    returned = len(cand["correct"]) + len(cand["wrong"]) + len(cand["fp"])
+    assert returned > 0, "the candidate tier returned nothing at all"
+    assert cand["precision"] >= FLOOR_CANDIDATE_PRECISION
+    assert len(cand["fp"]) <= CEIL_CANDIDATE_FP
+    assert len(cand["wrong"]) <= CEIL_WRONG_SINGLE
+    either = _measure(lambda q: trusted_store.match(q) or trusted_store.candidate_match(q))
+    _report("match() or candidate_match() -- what skill_match can offer", either)
+    assert either["recall"] >= FLOOR_EITHER_TIER_RECALL
+    assert len(either["wrong"]) <= CEIL_WRONG_SINGLE
+
+
+def test_the_tiers_never_answer_the_same_request(trusted_store):
+    """THE TIER BOUNDARY. match() says only "confident", candidate_match() only "candidate", and
+    never both for one request -- so a caller holding a candidate cannot mistake it for the
+    other."""
+    for query, _expected, _kind in LABELLED:
+        confident = trusted_store.match(query)
+        candidate = trusted_store.candidate_match(query)
+        assert confident is None or candidate is None, query
+        if confident:
+            assert confident["confidence"] == "confident", query
+        if candidate:
+            assert candidate["confidence"] == "candidate", query
+            assert candidate["trust"] == "trusted" and candidate["description"], query
+            assert 0 < candidate["coverage"] <= 1 and candidate["evidence"] > 0, query
+
+
+def test_the_development_near_miss_is_only_a_candidate(trusted_store):
+    """請求書を発行したい (issue an invoice) shares 請求書 with invoice-check (check one): the
+    right topic and a different action. The confident tier must refuse it; the candidate tier
+    may show it (measured: it does), with the description that says what the Skill does."""
+    assert trusted_store.match("請求書を発行したい") is None
+    candidate = trusted_store.candidate_match("請求書を発行したい")
+    assert candidate is None or candidate["name"] == "invoice-check"
 
 
 def test_approval_suggestion_quality_on_office_requests(untrusted_store):

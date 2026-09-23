@@ -211,7 +211,9 @@ mcp = FastMCP(
         # 一覧取得の直後に上げる。
         "RULE 2 -- DO THIS SECOND: call skill_match with the user's request, before "
         "doing any domain work. If it returns a confident trusted match, call "
-        "skill_load and FOLLOW that procedure as written. Do not re-derive it, do not "
+        "skill_load and FOLLOW that procedure as written. A result marked 'candidate' is "
+        "only a possible match: load it only if the request is for exactly that procedure. "
+        "Do not re-derive a confident one, do not "
         "write your own query, and do not substitute a similar-sounding question: a "
         "matched Skill encodes decisions that were verified against the real data, and "
         "improvising past it has produced confident wrong answers. Skill trust never "
