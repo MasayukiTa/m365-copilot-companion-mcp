@@ -4,9 +4,120 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 POWERSHELL_TIMEOUT = 20
+
+
+def _user_profile() -> str:
+    """%USERPROFILE%, the same folder Environment.SpecialFolder.UserProfile resolves to on
+    the .NET side. A thin wrapper only so tests have one place to monkeypatch it."""
+    return os.path.expanduser("~")
+
+
+def resolve_gate_directory(file_base: str = "", file_gate_dir: str = "") -> str:
+    """Mirror ui/FleetCockpit.cs `CockpitWindow.ResolveGateDirectory`, in the SAME order,
+    so this launcher can ask the cockpit's own question before spawning it: "will the
+    process I am about to start be able to find this gate file at all?"
+
+    THIS MUST STAY IN LOCKSTEP WITH THE C# METHOD OF THE SAME NAME. It exists because the
+    two were drifting: gate writers (relay/skills.py, tools/gate_ops.py, tools/contract_gate.py,
+    tools/task_router.py) each pick their own gate directory -- often a temp dir with
+    MCP_SKILLS_GATE_DIR or SkillStore(gate_dir=...), neither of which the cockpit's
+    ApprovalPromptWindow has ever heard of -- while the WINDOW that is supposed to display the
+    gate resolves its own directory independently in FleetCockpit.cs. When the two disagreed,
+    the window still opened, immediately refused the gate as "not in the gate directory", and
+    closed -- a window whose only purpose was to report that it had failed. Diagnosed from a
+    real MessageBox naming `...\\tierbench_1e_zcl1p\\gates` as the gate's folder and
+    `C:\\Users\\<user>\\.companion_gates` as the one the prompt would accept.
+
+    `file_base` / `file_gate_dir` exist only so this signature matches the C# one exactly
+    (a settings-file fallback for MCP_ALLOWED_BASE / MCP_GATE_DIR); the ApprovalPromptWindow
+    constructor -- the ONLY caller that matters for --approval-gate -- calls
+    `ResolveGateDirectory("", "")`, i.e. it never reads that fallback, only the process
+    environment the child inherits from this launcher. Callers here should do the same.
+    """
+    # MCP_GATE_DIR FIRST -- same order as the C# side, and for the same reason: it is what a
+    # test suite (or a benchmark script) sets to steer its gates away from the operator's queue.
+    over = os.environ.get("MCP_GATE_DIR") or ""
+    if not over.strip():
+        over = file_gate_dir or ""
+    over = over.strip().strip('"')
+    if over:
+        return os.path.abspath(over)
+
+    raw = os.environ.get("MCP_ALLOWED_BASE") or ""
+    if not raw.strip():
+        raw = file_base or ""
+    raw = raw.strip()
+    if not raw or raw == "*":
+        base_path = _user_profile()
+    else:
+        # Path.PathSeparator is ';' on Windows -- MCP_ALLOWED_BASE may list several roots,
+        # and only the first one is the gate root, exactly as the C# side takes roots[0].
+        roots = raw.split(os.pathsep)
+        base_path = roots[0].strip().strip('"') if roots else ""
+        if base_path == "~":
+            base_path = _user_profile()
+        elif base_path.startswith("~\\") or base_path.startswith("~/"):
+            base_path = os.path.join(_user_profile(), base_path[2:])
+        if len(base_path) == 2 and base_path[1] == ":":
+            base_path += os.sep
+        if not base_path:
+            base_path = _user_profile()
+    # Path.GetFullPath does NOT expand an 8.3 short name, and neither does os.path.abspath --
+    # both just normalise separators and "..". That asymmetry is exactly why the membership
+    # check below asks the filesystem instead of comparing this string to another one.
+    return os.path.join(os.path.abspath(base_path), ".companion_gates")
+
+
+def gate_is_reachable(gate_path: str | Path) -> Tuple[bool, str, str, str]:
+    """Would ui/FleetCockpit.cs's ApprovalPromptWindow actually accept this gate file?
+
+    Mirrors the check in the ApprovalPromptWindow constructor (ui/FleetCockpit.cs, around the
+    `_gateDir = Path.GetDirectoryName(full)` / `Directory.GetFiles(allowed, ...)` lines): the
+    filename must look like a gate (`gate_*.json`), and the file must actually be found inside
+    `resolve_gate_directory()`'s answer.
+
+    Returns (ok, gate_dir, allowed_dir, reason). `reason` is "" when ok is True, else one of a
+    few short machine-stable strings a caller can match on or simply display.
+
+    FILESYSTEM IDENTITY, NOT STRING SPELLING. A gate directory under %TEMP% can be handed back
+    in its 8.3 short form by one caller while `resolve_gate_directory()` is spelled long (or the
+    reverse) -- comparing the two directory strings failed exactly there in the C# window before
+    it was rewritten to enumerate the target directory instead of trusting a string compare (see
+    the comment at FleetCockpit.cs ApprovalPromptWindow, "ASK THE FILESYSTEM, DO NOT COMPARE
+    SPELLINGS"). `os.path.samefile` and directory listing both ask Windows the same question the
+    fix there asks: is this the same directory, whatever either side happened to call it.
+    """
+    full = os.path.abspath(str(gate_path))
+    gate_dir = os.path.dirname(full)
+    name = os.path.basename(full)
+    allowed = resolve_gate_directory()
+
+    if not name.lower().startswith("gate_") or os.path.splitext(name)[1].lower() != ".json":
+        return False, gate_dir, allowed, "invalid gate filename"
+
+    if not os.path.isdir(allowed):
+        return False, gate_dir, allowed, "prompt directory does not exist"
+
+    try:
+        if os.path.isdir(gate_dir) and os.path.samefile(gate_dir, allowed):
+            if os.path.isfile(full):
+                return True, gate_dir, allowed, ""
+            return False, gate_dir, allowed, "gate file does not exist"
+    except OSError:
+        pass
+
+    # Fall back to exactly what the C# side does: list the ALLOWED directory for the exact
+    # file name, rather than trust any directory-path comparison at all.
+    try:
+        entries = os.listdir(allowed)
+    except OSError:
+        return False, gate_dir, allowed, "prompt directory is not listable"
+    if any(entry.lower() == name.lower() for entry in entries):
+        return True, gate_dir, allowed, ""
+    return False, gate_dir, allowed, "outside the prompt's directory"
 
 
 def notify_approval_gate(title: str, body: str, gate_path: str | Path) -> str:
@@ -33,6 +144,20 @@ def notify_approval_gate(title: str, body: str, gate_path: str | Path) -> str:
         gate = Path(gate_path).expanduser().resolve()
         if gate.suffix.lower() != ".json" or not gate.name.lower().startswith("gate_"):
             return toast_result + "; approval prompt rejected invalid gate path"
+        # ASK THE SAME QUESTION THE COCKPIT WILL ASK, BEFORE SPAWNING IT. FleetCockpit.exe's
+        # ApprovalPromptWindow refuses any gate it does not find inside
+        # CockpitWindow.ResolveGateDirectory("", "")'s answer and then closes itself, having
+        # painted nothing but a MessageBox that says so -- a window whose only purpose was to
+        # report its own failure. A gate written by a caller with a non-default gate directory
+        # (a benchmark script's SkillStore(gate_dir=...) or MCP_SKILLS_GATE_DIR, without also
+        # setting MCP_GATE_DIR or MCP_SUPPRESS_GUI) hits this every time. gate_is_reachable
+        # mirrors that same resolution in Python so THIS process -- which shares the same
+        # environment the child inherits -- can tell in advance and simply not open the window.
+        reachable, gate_dir, allowed_dir, reason = gate_is_reachable(gate)
+        if not reachable:
+            return (toast_result +
+                    f"; approval prompt not opened: gate {gate_dir} is outside "
+                    f"the prompt's directory {allowed_dir} ({reason})")
         cockpit = Path(__file__).resolve().parents[1] / "ui" / "FleetCockpit.exe"
         if not cockpit.is_file():
             return toast_result + "; approval prompt unavailable (FleetCockpit.exe not built)"
