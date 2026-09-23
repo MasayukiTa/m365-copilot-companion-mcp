@@ -135,11 +135,24 @@ def test_the_autonomy_gate_is_visible_in_this_repository():
 
 def test_the_names_the_fix_revealed_are_on_the_list():
     """They had never been printed once. If a caller appears for either, the ratchet's other
-    half fails and they come off — which is the only way they should leave."""
+    half fails and they come off — which is the only way they should leave.
+
+    `compact` (bridge/session_store.py + relay/selfimprove/episode_record.py) was the pair this
+    fix originally surfaced, but 9b63a94 wired bridge/session_store.py::compact behind a CLI, so
+    it left BASELINE entirely -- an example that fixed itself is no longer an example of
+    anything. `compare` (bench/skill_probe.py + bench/companionbench/shadow_rules.py) is still
+    defined twice and still unreached in production today (checked with tools/unreached.py), so
+    it now carries the property this test exists to pin: a colliding name stays on the list
+    instead of quietly dropping out. Also note REASONS no longer uses the "revealed" kind for
+    either name -- the 2026-09-24 C-1 close-out reclassified every entry that used to sit as
+    "revealed" (which only said HOW a row arrived) into an actual verdict, "deliberate" for both
+    `compare` rows. What matters here is that a reason is on record at all, not which of
+    ALLOWED_REASONS it is.
+    """
     import importlib
 
     m = importlib.import_module("tools.test_nothing_new_is_built_without_a_caller")
-    for k in ("bridge/session_store.py::compact",
-              "relay/selfimprove/episode_record.py::compact"):
+    for k in ("bench/skill_probe.py::compare",
+              "bench/companionbench/shadow_rules.py::compare"):
         assert k in m.BASELINE, k
-        assert m.REASONS.get(k, ("", ""))[0] == "revealed", k
+        assert m.REASONS.get(k, ("", ""))[0] in m.ALLOWED_REASONS, k
