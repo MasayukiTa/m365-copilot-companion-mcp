@@ -26,6 +26,9 @@ import pytest
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+# The harness lives under tests/ so tools/unreached.py counts it as test support (a helper
+# under scripts/ read as ten unreached PRODUCTION functions and grew the burndown inventory).
+sys.path.insert(0, str(HERE.parent / "tests"))
 
 import _install_path_harness as H  # noqa: E402
 
