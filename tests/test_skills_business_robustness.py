@@ -491,7 +491,7 @@ def test_the_cached_store_answers_exactly_like_the_uncached_one(env, monkeypatch
     import relay.skills as skills_mod
     queries = [q for q, _e, _k in LABELLED]
     proj, _ = _mixed_library(env)
-    skills_mod.clear_bundle_cache()
+    skills_mod._clear_bundle_cache()
     cached, plain = _both(env)
 
     def same(label, asked):
@@ -563,7 +563,7 @@ def test_a_same_tick_rewrite_of_a_fresh_bundle_is_never_served_stale(env):
     must not have vouched for the first: a bundle whose files are younger than the racy margin
     is re-read on every call. Simulated by restoring the exact mtime after the second write."""
     import relay.skills as skills_mod
-    skills_mod.clear_bundle_cache()
+    skills_mod._clear_bundle_cache()
     store = _store(env)
     d = _write_skill(store.project_root, "stationery-order", GOOD.encode("utf-8"))
     md = d / "SKILL.md"
@@ -584,7 +584,7 @@ def test_an_edit_that_hides_from_the_listing_is_caught_before_anything_is_handed
     the first to run after the edit, so each one's own check is what is tested -- and once
     that check has run, the listing answers like the uncached store again."""
     import relay.skills as skills_mod
-    skills_mod.clear_bundle_cache()
+    skills_mod._clear_bundle_cache()
     proj = env / "proj"
     shutil.copytree(FIXTURES / "invoice-check", proj / "skills" / "invoice-check")
     store = _store(env)
