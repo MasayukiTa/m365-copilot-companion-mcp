@@ -103,7 +103,6 @@ BASELINE = {
     "bench/swe_solve_decoupled.py::stage::subprocess.run": 1,
     "bench/swe_split.py::load_lite::subprocess.run": 1,
     "bench/swe_status.py::run::subprocess.run": 1,
-    "bench/ui_build_check.py::<module>::subprocess.run": 1,
     "bench/ui_deploy.py::<module>::subprocess.run": 3,
     "bridge/copilot_bridge.py::_review_stream::subprocess.Popen": 1,
     "bridge/copilot_bridge.py::_run_fix_subprocess::subprocess.Popen": 1,
