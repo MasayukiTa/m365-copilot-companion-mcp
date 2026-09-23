@@ -80,14 +80,36 @@ jobs:
           }
           if ($bad) { $bad; exit 1 }
           Write-Host "all batch files are CRLF"
+          # EXPLICIT, NOT INHERITED: `git ls-files` above set $LASTEXITCODE, and nothing after
+          # it (Write-Host does not) touches that variable again. GitHub's powershell/pwsh shell
+          # wrapper exits the STEP with whatever $LASTEXITCODE holds when the script ends, so a
+          # stray nonzero code from an earlier native command -- even one whose result this
+          # script already judged fine -- would fail the step for a reason the log never shows.
+          # Same class of bug as the robocopy step below; fixed here too rather than left as a
+          # second instance waiting to be found by hand.
+          exit 0
 
       - name: Place the checkout at the install path under test
         shell: powershell
         run: |
           $target = Join-Path $env:RUNNER_TEMP $env:TARGET_DIR
           robocopy $env:GITHUB_WORKSPACE $target /E /XD .git /NFL /NDL /NJH /NJS | Out-Null
-          if ($LASTEXITCODE -ge 8) { exit 1 }
-          Write-Host "installing into: $target"
+          $rc = $LASTEXITCODE
+          # robocopy's exit code is a BITMASK, not the usual "0 = success": 1 = files copied,
+          # 2 = extra files present at the destination, and any combination of bits 0-2 (0-7) is
+          # still success -- only 8+ (bit 3, "some files/dirs could not be copied") is a real
+          # failure. The `if` below already judged that correctly, but a plain "files were
+          # copied" run (exit 1) still failed this step every time: GitHub's powershell shell
+          # wrapper propagates whatever $LASTEXITCODE holds when the script ends as the STEP's
+          # own exit code, and nothing after robocopy (Write-Host does not touch it) ever
+          # overwrote that leftover 1 with the 0 this script had actually decided on. Measured
+          # 2026-09-24: both matrix legs failed here, immediately after robocopy, on every run.
+          if ($rc -ge 8) {
+            Write-Host "robocopy failed copying the checkout to $target (exit code $rc)"
+            exit 1
+          }
+          Write-Host "installing into: $target (robocopy exit code $rc, not a failure)"
+          exit 0
 
       - name: Stub devtunnel first on PATH
         shell: powershell
@@ -152,6 +174,10 @@ jobs:
           $argv = Get-Content (Join-Path $env:RUNNER_TEMP 'devtunnel_argv.log') -ErrorAction SilentlyContinue
           $argv
           if ($argv -match '--anonymous|--allow-anonymous') { 'anonymous access was granted without being chosen'; exit 1 }
+          # Explicit, not inherited from whichever native call above ran last (see the robocopy
+          # step's comment for why that matters) -- every check above already exits 1 on its own
+          # failure, so reaching here means success.
+          exit 0
 
       - name: Second run resumes and still verifies
         shell: cmd
@@ -177,6 +203,12 @@ jobs:
           Add-Content -Path (Join-Path $root 'requirements.txt') -Value '# changed by CI'
           & $py (Join-Path $root 'scripts\bootstrap.py') --check-deps
           if ($LASTEXITCODE -ne 3) { "a changed requirements.txt was not noticed (exit $LASTEXITCODE)"; exit 1 }
+          # The expected, SUCCESSFUL outcome of the check just above is exit code 3 (stale
+          # deps detected) -- a nonzero code that would otherwise leak through as this step's
+          # own exit code once the script ends, since nothing after it touches $LASTEXITCODE.
+          # Same class of bug as the robocopy step: a native exit code the script already
+          # judged correct, propagated anyway because it was never explicitly overwritten.
+          exit 0
 
       - name: Upload the setup transcript
         if: always()

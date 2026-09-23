@@ -59,12 +59,18 @@ pytestmark = pytest.mark.skipif(os.name != "nt" or not _POWERSHELL,
                                 reason="start_all.ps1 is Windows PowerShell only")
 
 #: What the temp checkout needs, copied from THIS working tree (a clone would miss the edits
-#: under test).
+#: under test). EVERY ENTRY HERE MUST BE TRACKED (`git ls-files`), because CI's checkout is
+#: built from the git index, not from this machine's working tree: a file that exists here but
+#: was never `git add`ed -- `bench/__init__.py` was exactly that, an empty package marker
+#: created locally and never committed -- is silently absent on a fresh CI checkout, and
+#: `shutil.copy2` then raises FileNotFoundError before a single test body runs. `bench/__init__.py`
+#: is created directly by the `checkout` fixture below instead of copied, since all it has to be
+#: is present and empty -- the temp tree's own need, not a copy of anything.
 _COPY = ["scripts/stale_server_check.py", "scripts/win/convenience_marker.ps1",
          "scripts/unregister-supervisor.ps1", "scripts/make_desktop_shortcut.ps1",
          "scripts/start_all_hidden.vbs", "tools/__init__.py", "tools/childproc.py",
          "tools/deploy_freshness.py", "tools/notify_ops.py", "relay/fleet_reaper.py",
-         "bench/__init__.py", "bench/ui_build_check.py"]
+         "bench/ui_build_check.py"]
 
 _FUNCS = ["Env-Value", "Get-UpdateCheckSkipReason", "Get-ParentProcessInfo",
           "Get-ThisCheckoutServerProcesses", "Get-ServerStartEpoch", "ConvertTo-ServerActionResult",
@@ -116,6 +122,11 @@ def checkout(tmp_path):
         shutil.copy2(os.path.join(REPO, rel), dst)
     for d in ("tools", "relay", ".fleet", ".setup"):
         (root / d).mkdir(exist_ok=True)
+    # bench/__init__.py is not copied (see _COPY's comment): it only has to exist and be
+    # empty for `bench` to import as a package, which is a fact about the temp tree, not
+    # something to fetch from a source file that CI's checkout may not carry.
+    (root / "bench").mkdir(exist_ok=True)
+    (root / "bench" / "__init__.py").touch()
     return root
 
 

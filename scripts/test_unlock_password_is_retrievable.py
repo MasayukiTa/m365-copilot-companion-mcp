@@ -63,7 +63,7 @@ def test_current_prints_the_password_this_account_can_open(tmp_path):
 
 
 def test_current_says_undecryptable_rather_than_absent(tmp_path):
-    p = _env(tmp_path, "MCP_UNLOCK_PASSWORD_PROTECTED=dpapi:AAAAbm90LWEtYmxvYg==\n")
+    p = _env(tmp_path, "MCP_UNLOCK_PASSWORD_PROTECTED=dpapi:AAAAbm90LWEtYmxvYg==\n")  # gitleaks:allow -- base64 of "not-a-blob", a deliberately-undecryptable fixture, not a secret
     out = _run("--current", p)
     assert len(out) == 1 and out[0].startswith("undecryptable:"), out
 
@@ -127,4 +127,4 @@ def test_copilot_studio_values_prints_the_unlock_password(tmp_path):
                           str(root / "scripts" / "copilot_studio_values.ps1")],
                          env=env, timeout=120)
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "Unlock password  :  visible-pw-5678" in proc.stdout, proc.stdout
+    assert "Unlock password  :  visible-pw-5678" in proc.stdout, proc.stdout  # gitleaks:allow -- fixture password minted by this test, not a real credential
