@@ -667,15 +667,24 @@ def _real_dotenv_and_fleet_state_must_not_change():
     if fleet_changed:
         # WARNING ONLY -- see this fixture's own docstring for the measured reason (a live
         # supervisor/bridge on this machine legitimately writes some of these files every
-        # ~60s, independent of any test). Printed rather than logged: pytest captures stdout
-        # per test but this runs at session teardown, after every test's own capture has
-        # already been reported, so a plain print here reaches the terminal.
-        print(
-            "\n[conftest] LIVE-STATE CANARY WARNING: %d real .fleet/ file(s) changed during "
-            "this session (not failing -- see _real_dotenv_and_fleet_state_must_not_change's "
-            "docstring: a live supervisor/bridge on this machine can legitimately write these "
-            "independent of any test). If this surprises you, check what wrote to:\n" % len(fleet_changed) +
-            "\n".join("  %s (was %r, now %r)" % (p, before[p], _fingerprint(p)) for p in fleet_changed)
+        # ~60s, independent of any test). warnings.warn(), NOT print(): a plain print() during
+        # SESSION-scoped teardown is captured by pytest like any other test output, and pytest
+        # only ever SHOWS captured output for a test that failed -- on an otherwise-green run
+        # (which this is, by design: the whole point is not to fail it) the print was measured
+        # to vanish completely, reaching nobody. warnings.warn() goes through pytest's own
+        # warnings plugin instead, which this repo's own runs already show working: every run
+        # in this suite prints a "warnings summary" section (see the opentelemetry/authlib
+        # deprecation warnings at the bottom of any run of this file) REGARDLESS of whether
+        # anything failed, which is exactly the "surfaced but not fatal" behaviour this needs.
+        import warnings as _warnings
+
+        _warnings.warn(
+            "LIVE-STATE CANARY WARNING (conftest._real_dotenv_and_fleet_state_must_not_change): "
+            "%d real .fleet/ file(s) changed during this session (NOT failing -- see this "
+            "fixture's own docstring: a live supervisor/bridge on this machine can legitimately "
+            "write these independent of any test). Changed file(s): " % len(fleet_changed) +
+            "; ".join("%s (was %r, now %r)" % (p, before[p], _fingerprint(p)) for p in fleet_changed),
+            stacklevel=1,
         )
 
 
