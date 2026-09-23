@@ -89,7 +89,16 @@ jobs:
 
       # Run only the hermetic test paths. Explicit file list is the safest guard
       # against accidentally picking up non-hermetic tests when new files are added.
+      #
+      # TMPDIR UNDER $HOME (2026-09-24, D6). An absent MCP_ALLOWED_BASE now scopes the file
+      # tools to the home directory instead of every drive. On Windows the temp directory is
+      # inside the profile, so tests writing under tmp_path were always "at home"; on this
+      # runner /tmp is not under /home/runner, and 17 tests that list or write a tmp_path would
+      # read as "outside the allowed base". runner.temp is /home/runner/work/_temp -- the same
+      # relationship as on Windows -- so the product's default is tested, not bypassed.
       - name: Run hermetic unit tests
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: |
           pytest -q \
             tests/test_security_xff.py \
@@ -139,6 +148,7 @@ jobs:
             scripts/test_check_integration_evidence.py \
             scripts/test_stale_server_check.py \
             scripts/test_one_rule_stops_the_server.py \
+            scripts/test_a_bridge_restart_respects_a_live_turn.py \
             scripts/test_start_all_install_path.py \
             scripts/test_the_identity_guard_speaks_before_the_push.py \
             scripts/test_run_script_style_tests.py \
@@ -215,6 +225,7 @@ jobs:
             scripts/test_a_leftover_tab_is_not_a_locked_door.py \
             scripts/test_a_silent_death_leaves_its_exit_code.py \
             scripts/test_a_runner_that_dies_before_argparse_is_recorded.py \
+            scripts/test_a_submitted_job_is_picked_up_at_once.py \
             relay/test_a_doc_id_is_used_where_it_was_made.py \
             bench/test_swe_grade_batch.py \
             relay/selfimprove/test_the_slice_refusal_fires_through_the_real_entry.py \
@@ -315,6 +326,12 @@ jobs:
             scripts/test_foreign_tunnel_url_is_set_aside.py \
             scripts/test_bootstrap.py \
             scripts/test_bootstrap_p2c.py \
+            scripts/test_bootstrap_install_path.py \
+            scripts/test_env_file_atomic.py \
+            scripts/test_install_path_python_version.py \
+            scripts/test_install_path_powershell.py \
+            scripts/test_install_path_batch.py \
+            tools/test_file_scope_fails_closed.py \
             scripts/test_repair_unlock_output.py \
             scripts/test_setup_devtunnel_access_and_identity.py \
             scripts/test_unlock_password_is_retrievable.py \
@@ -838,7 +855,7 @@ jobs:
         env:
           REQUIRE_CSC: "1"
         run: |
-          python -m pytest -rsx tools/test_a_windowless_launch_really_has_no_window.py ui/test_the_ui_and_the_fleet_agree_on_the_command_channel.py ui/test_the_chat_window_sends_what_was_typed.py ui/test_both_windows_can_be_constructed.py ui/test_a_submitted_task_is_on_top_at_once.py scripts/test_a_silent_death_leaves_its_exit_code.py scripts/test_a_runner_that_dies_before_argparse_is_recorded.py scripts/test_start_all_install_path.py scripts/test_setup_devtunnel_access_and_identity.py scripts/test_unlock_password_is_retrievable.py
+          python -m pytest -rsx tools/test_a_windowless_launch_really_has_no_window.py ui/test_the_ui_and_the_fleet_agree_on_the_command_channel.py ui/test_the_chat_window_sends_what_was_typed.py ui/test_both_windows_can_be_constructed.py ui/test_a_submitted_task_is_on_top_at_once.py scripts/test_a_silent_death_leaves_its_exit_code.py scripts/test_a_runner_that_dies_before_argparse_is_recorded.py scripts/test_a_submitted_job_is_picked_up_at_once.py scripts/test_setup_devtunnel_access_and_identity.py scripts/test_unlock_password_is_retrievable.py scripts/test_start_all_install_path.py scripts/test_a_bridge_restart_respects_a_live_turn.py scripts/test_install_path_powershell.py scripts/test_install_path_batch.py
 
       # The keyboard table lives here rather than on the ubuntu job because
       # tools/desktop_input.py binds ctypes.windll.user32 at import, so the module cannot
@@ -854,7 +871,7 @@ jobs:
       # real, so this is where they must run -- a skip on the other job is only honest
       # while this line stands.
       - name: Run DPAPI-dependent bootstrap tests
-        run: python -m pytest -q scripts/test_bootstrap.py scripts/test_bootstrap_p2c.py scripts/test_bootstrap_transcript.py
+        run: python -m pytest -q scripts/test_bootstrap.py scripts/test_bootstrap_p2c.py scripts/test_bootstrap_transcript.py scripts/test_bootstrap_install_path.py
 
       - name: Run force-push updater integration tests
         shell: powershell

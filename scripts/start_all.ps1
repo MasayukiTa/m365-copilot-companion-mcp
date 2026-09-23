@@ -58,39 +58,6 @@ function Port-Up([int]$p) {
 function Http-Up([string]$url) {
     try { Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 $url | Out-Null; return $true } catch { return $false }
 }
-function Proc-Is-Outdated([string]$repo, [string]$match, [string[]]$dirs, [string[]]$files) {
-    # True when a process matching $match is running that started BEFORE the newest source
-    # it loads. Only the modules that process imports at startup are considered, so editing
-    # docs or an unrelated tool never forces a restart. Any failure answers $false: an
-    # unreadable timestamp must never be the reason a healthy process gets torn down.
-    try {
-        $procs = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-                   Where-Object { $_.CommandLine -and ($_.CommandLine -match $match) })
-        if ($procs.Count -eq 0) { return $false }   # nothing running -> normal start path
-        $started = ($procs | Measure-Object -Property CreationDate -Minimum).Minimum
-        if (-not $started) { return $false }
-        $newest = $null
-        foreach ($sub in $dirs) {
-            $d = Join-Path $repo $sub
-            if (-not (Test-Path $d)) { continue }
-            $m = (Get-ChildItem $d -Filter *.py -File -ErrorAction SilentlyContinue |
-                  Where-Object { $_.Name -notlike 'test_*' } |
-                  Measure-Object -Property LastWriteTime -Maximum).Maximum
-            if ($m -and (-not $newest -or $m -gt $newest)) { $newest = $m }
-        }
-        foreach ($f in $files) {
-            $p = Join-Path $repo $f
-            if (-not (Test-Path $p)) { continue }
-            $m = (Get-Item $p -ErrorAction SilentlyContinue).LastWriteTime
-            if ($m -and (-not $newest -or $m -gt $newest)) { $newest = $m }
-        }
-        if (-not $newest) { return $false }
-        return ($newest -gt $started)
-    } catch { return $false }
-}
-function Bridge-Is-Outdated([string]$repo) {
-    return (Proc-Is-Outdated $repo 'copilot_bridge\.py' @('bridge', 'tools', 'relay') @())
-}
 # ---------------------------------------------------------------------------
 # THE RUNNING SERVER: ONE RULE FOR "MAY IT BE STOPPED?", ASKED FROM BOTH PLACES THAT STOP IT.
 #
@@ -186,6 +153,63 @@ function Invoke-ServerAction($Action, [string]$Tag) {
             return ""
         }
         default { return "" }
+    }
+}
+# ---------------------------------------------------------------------------
+# THE RUNNING BRIDGE: the same one-question shape as the server above, asked from the one
+# place that can stop it (the daily "bridge is older than its code" check further down).
+#
+# Bridge-Is-Outdated (removed) called Get-ChildItem WITHOUT -Recurse over the top level of
+# bridge/, tools/ and relay/ only -- a change inside a subpackage (relay/selfimprove/,
+# tools/auto/) was invisible to it, exactly the D12/D30 top-level-only bug the server's own
+# daily check had -- and it asked nothing about whether a chat turn was in progress, so a
+# manual `git pull` plus a double-click of start_all could kill the bridge mid-turn.
+# Get-BridgeAction asks stale_server_check.py --bridge-action, which scans the SAME
+# directories RECURSIVELY (stale_server_check.BRIDGE_WATCHED: bridge/, relay/, tools/ -- what
+# copilot_bridge.py actually imports from) and refuses the swap while the bridge's own
+# /status reports a turn live (turn_running or busy) -- the identical GET-only, no-proxy
+# probe --server-action already uses for its "bridge turn" input. NEVER call /stream, /goal,
+# /new, /switch, /history or /upload from here: only /status, which holds no page lock.
+# ---------------------------------------------------------------------------
+function Get-ThisCheckoutBridgeProcesses {
+    # SCOPED TO THIS CHECKOUT, exactly like Get-ThisCheckoutServerProcesses above: another
+    # clone's bridge, or an unrelated project's, is not ours to judge or to stop.
+    try {
+        return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+                 Where-Object { $_.CommandLine -and ($_.CommandLine -match 'copilot_bridge\.py') -and ($_.CommandLine -like "*$root*") })
+    } catch { return @() }
+}
+function Get-BridgeStartEpoch {
+    # Unix seconds at which the oldest of this checkout's bridge processes started, or 0 when
+    # none is running or its start cannot be read (0 = nothing to judge, never "stale") --
+    # the same rule Get-ServerStartEpoch uses.
+    try {
+        $started = (Get-ThisCheckoutBridgeProcesses | Measure-Object -Property CreationDate -Minimum).Minimum
+        if (-not $started) { return 0 }
+        return ([DateTimeOffset]$started).ToUnixTimeMilliseconds() / 1000.0
+    } catch { return 0 }
+}
+function Get-BridgeAction {
+    # Same shape as Get-ServerAction on purpose: ConvertTo-ServerActionResult parses the
+    # output unchanged, and the caller reads the same three verdict words (noop /
+    # report-only / swap-needed).
+    $pyExe = $script:venvPy
+    $chk = Join-Path $scriptDir "stale_server_check.py"
+    if (-not (Test-Path $pyExe) -or -not (Test-Path $chk)) {
+        return @{ Verdict = "unknown"; Why = @("no .venv python to ask stale_server_check.py") }
+    }
+    $epoch = Get-BridgeStartEpoch
+    if ($epoch -le 0) {
+        return @{ Verdict = "noop"; Why = @("no bridge process of this checkout is running") }
+    }
+    $cliArgs = @($chk, "--bridge-action",
+                 "--started-epoch", $epoch.ToString("R", [Globalization.CultureInfo]::InvariantCulture),
+                 "--bridge-status", $script:bridgeStatusUrl)
+    try {
+        $out = @(& $pyExe @cliArgs 2>$null)
+        return (ConvertTo-ServerActionResult $out $LASTEXITCODE)
+    } catch {
+        return @{ Verdict = "unknown"; Why = @($_.Exception.Message) }
     }
 }
 function Stop-Bridge-Processes() {
@@ -1563,11 +1587,25 @@ function Invoke-Startup {
     # shipped that day was inert and the bug they fixed looked unfixed. Restarting only when
     # the source is actually newer keeps the idempotent behaviour for the ordinary case and
     # makes "pull, then click this" enough on its own.
+    #
+    # BUT NOT MID-TURN. Get-BridgeAction (see its block above) withholds the restart while
+    # the bridge's own /status reports a turn live, exactly like the server-swap rule
+    # withholds a kill during a live fleet/review run -- a manual `git pull` plus a
+    # double-click must not be able to drop what the operator is doing right now.
     Set-SplashStatus $script:splash "Starting the chat bridge..."
-    if (Bridge-Is-Outdated $root) {
-        Write-Host "[3/4] bridge: code is newer than the running process -- restarting"
-        Stop-Bridge-Processes
-        Start-Sleep -Seconds 2
+    $bridgeAction = Get-BridgeAction
+    switch ($bridgeAction.Verdict) {
+        "swap-needed" {
+            $why = ""
+            if ($bridgeAction.Why -and @($bridgeAction.Why).Count -gt 0) { $why = " (" + (@($bridgeAction.Why) -join "; ") + ")" }
+            Write-Host "[3/4] bridge: code is newer than the running process and no turn is live$why -- restarting"
+            Stop-Bridge-Processes
+            Start-Sleep -Seconds 2
+        }
+        "report-only" {
+            Write-Host "[3/4] bridge is running old code and will be refreshed on the next start when idle"
+        }
+        default { }
     }
     # A KEEPALIVE PROCESS IS NOT A SERVING BRIDGE. This branch asked only whether the wrapper
     # existed, so a wedged python holding :8765 behind a live keepalive reported "already
