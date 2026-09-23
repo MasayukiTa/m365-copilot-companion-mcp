@@ -152,8 +152,16 @@ def _record_skill_use_inner(kind, query, matched):
 
 #: What skill_match says with each tier. Kept as constants so the tests pin the exact words a
 #: model reads (tests/test_skills_business_mcp.py).
+#: APPLICABILITY CHECK, ADDED 2026-09-24. Measured on a held-out set: 2 of 30 requests that
+#: should have matched nothing instead got a confident hit with the right topic and the wrong
+#: task ("求人票の文章を考えてほしい" matched new-hire-onboarding; a question about how many
+#: paid-leave days carry over matched a leave-application procedure). A lexical matcher cannot
+#: tell "same topic, different task" from the words alone -- the model receiving the Skill's
+#: description can, so the instruction now asks it to check before following what is otherwise
+#: still the same order: when it does apply, follow it as written, do not re-derive it.
 CONFIDENT_INSTRUCTION = (
-    "CONFIDENT trusted match. Call skill_load(name='%s') and follow that procedure as written.")
+    "CONFIDENT trusted match. Call skill_load(name='%s') and follow that procedure as written, "
+    "but only if the request is for that exact task and not merely the same topic.")
 CANDIDATE_INSTRUCTION = (
     "This is only a POSSIBLE match (confidence: candidate), not a confident one. Read the "
     "description. Call skill_load(name='%s') only if the user's request is for exactly this "

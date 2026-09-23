@@ -7175,6 +7175,14 @@ def _with_matched_skill(goal_text, want_body=True):
             return ("%s【承認済み手順あり】この作業には承認済みの手順 `%s` が一致しました"
                     "（score %s）。%s\n必要なら call_tool(name='skill_load', "
                     "arguments={'name': '%s'}) で全文を読み、その手順どおりに進めてください。"
+                    # APPLICABILITY CHECK, ADDED 2026-09-24. Measured on a held-out set: 2 of
+                    # 30 requests that should have matched nothing instead got a confident hit
+                    # with the right topic and the wrong task (job-posting text vs. onboarding
+                    # a new hire; a legal question about carry-over vs. applying for leave). A
+                    # lexical matcher cannot see "same topic, different task" -- the model that
+                    # reads the description can, so it is told to check before following it.
+                    "ただし、話題が同じでも依頼の作業内容がこの手順と異なる場合は使わず、"
+                    "そのまま進めてください。"
                     # THE FOOTER WAS ALWAYS EMPTY. This read
                     # `_SKILL_FOOTER if "_SKILL_FOOTER" in globals() else ""`, and nothing
                     # anywhere defines _SKILL_FOOTER -- so the guard's true branch was
@@ -7187,6 +7195,15 @@ def _with_matched_skill(goal_text, want_body=True):
         body = store.render(hit["name"], "")
         if not body:
             return goal_text
+        # APPLICABILITY CHECK, ADDED 2026-09-24, same measurement as the pointer form above:
+        # a confident lexical match can still be the wrong TASK on the right topic. The body
+        # is the procedure's own text, not a place that names itself, so the one-line
+        # description and the check are prepended here rather than folded into _skill_v1 --
+        # keeping impl(text, body) unchanged for the "off" arm and for direct callers.
+        desc = str(hit.get("description") or "").strip()
+        if desc:
+            body = ("%s\nただし、話題が同じでも依頼の作業内容がこの手順と異なる場合は使わず、"
+                    "そのまま進めること。\n\n%s" % (desc, body))
         # THERE WAS A GUARD HERE AGAINST CONTROL WORDS IN A PROCEDURE'S BODY, AND IT WAS
         # PROTECTING AGAINST A HAZARD THAT DOES NOT EXIST.
         #
