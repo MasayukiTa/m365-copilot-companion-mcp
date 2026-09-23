@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -72,14 +73,25 @@ def test_it_still_says_what_it_did_rather_than_failing_silently(monkeypatch, no_
 
 def test_with_the_switch_off_the_prompt_is_reachable_again(monkeypatch, no_toast, tmp_path):
     """The suppression must be a switch, not a removal -- production has no conftest, so this
-    path is the one that actually runs for the operator."""
+    path is the one that actually runs for the operator.
+
+    THE GATE MUST BE ONE THE COCKPIT WOULD ACTUALLY FIND. notify_approval_gate now asks the
+    same question ui/FleetCockpit.cs's ApprovalPromptWindow asks -- is this gate inside
+    resolve_gate_directory()'s answer -- before spawning it, so an arbitrary tmp_path (which is
+    never that directory) would now be correctly refused rather than launched. The gate here is
+    written into resolve_gate_directory() itself, i.e. MCP_GATE_DIR, which conftest already
+    points at this run's own sandbox -- the same directory the real cockpit process would
+    resolve given the same inherited environment."""
     monkeypatch.setenv("MCP_SUPPRESS_GUI", "0")
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     launched = []
     monkeypatch.setattr(notify_ops.subprocess, "Popen",
                         lambda *a, **k: launched.append(a) or None)
     monkeypatch.setattr(notify_ops.Path, "is_file", lambda self: True)
-    gate = tmp_path / "gate_abc.json"
+    allowed = Path(notify_ops.resolve_gate_directory())
+    allowed.mkdir(parents=True, exist_ok=True)
+    gate = allowed / "gate_abc.json"
     gate.write_text("{}", encoding="utf-8")
-    notify_ops.notify_approval_gate("t", "b", str(gate))
-    assert launched, "the prompt can no longer open at all, which breaks the operator's path"
+    result = notify_ops.notify_approval_gate("t", "b", str(gate))
+    assert launched, (
+        "the prompt can no longer open at all, which breaks the operator's path: %s" % result)
