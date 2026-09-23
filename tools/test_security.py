@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -285,7 +286,17 @@ def test_grant_ip_and_revoke_ip_are_not_registered_as_mcp_tools():
     main_src = (Path(__file__).resolve().parent.parent / "main.py").read_text(encoding="utf-8")
     assert "grant_ip" not in main_src
     assert "revoke_ip" not in main_src
-    assert "from tools.security import list_unlocked, unlock" in main_src
+    # A POSITIVE CONTROL, NOT A COPY OF THE LINE. The two assertions above would pass vacuously
+    # if main.py stopped importing tools.security at all, so this confirms list_unlocked/unlock
+    # really are imported from there -- as names on ONE `from tools.security import ...` line,
+    # not that the line spells only those two. 609ad32 (SEC-04) added `derive_identity` to the
+    # same import for the per-start-token peer check, which a literal string match broke without
+    # the guarantee itself having changed.
+    m = re.search(r"from tools\.security import ([^\n]+)", main_src)
+    assert m, "main.py no longer imports from tools.security at all"
+    imported = {n.strip() for n in m.group(1).split(",")}
+    assert {"list_unlocked", "unlock"} <= imported, (
+        "main.py's tools.security import dropped list_unlocked and/or unlock: %r" % imported)
 
 
 # ── CLI surface (what the cockpit shells out to) ────────────────────────────────
