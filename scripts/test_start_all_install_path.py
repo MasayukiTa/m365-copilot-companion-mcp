@@ -80,7 +80,8 @@ _FUNCS = ["Env-Value", "Get-UpdateCheckSkipReason", "Get-ParentProcessInfo",
           "Get-TunnelHostCount", "Test-TunnelServing", "ConvertFrom-UiStaleLines",
           "Get-UiBuildState", "Invoke-UiStep", "Write-StartupSummary",
           "Test-ShouldNotifyStartupFailures", "Send-StartupFailureNotice",
-          "Ensure-ConvenienceProvisioning"]
+          "Ensure-ConvenienceProvisioning", "Get-LaunchLineage", "Get-StartAllMode",
+          "New-StartAllRunRecord", "Write-StartAllRunRecord"]
 
 
 def _extract_braced_block(text: str, start_marker: str) -> str:
@@ -279,6 +280,28 @@ $r.unknownNote = (Invoke-ServerAction @{ Verdict = 'unknown'; Why = @('x') } "[t
     assert r["crash"] == r["junk"] == r["empty"] == r["novenv"] == "unknown"
     assert r["good"]["Verdict"] == "report-only" and r["good"]["Why"] == ["a fleet run is live"]
     assert not r["unknownNote"]
+
+
+def test_post_update_form_does_not_depend_on_the_hosts_pipe_encoding(tmp_path, checkout, functions):
+    """CI (windows-install-smoke, 2026-09-23) got "noop" where this machine got "swap-needed"
+    for the same tools/x.py. The path list reached Python through PowerShell's native pipe,
+    which encodes with the HOST's $OutputEncoding; a UTF-8 one is written with a BOM, the first
+    path became "﻿tools/x.py", and a changed server read as unchanged. Reproduced here by
+    giving the host exactly that encoding: the answer must not move. A non-ASCII path from
+    `git diff` must survive the trip as well."""
+    body = r"""
+$OutputEncoding = [System.Text.Encoding]::UTF8
+$a = Get-ServerAction -ChangedPaths @('tools/x.py', 'docs/a.md')
+$b = Get-ServerAction -ChangedPaths @('docs/a.md', ('tools/' + [char]0x65E5 + [char]0x672C + '.py'))
+$c = Get-ServerAction -ChangedPaths @('docs/a.md')
+"RESULT:" + (@{ first = $a.Verdict; why = @($a.Why); nonascii = $b.Verdict; nonasciiWhy = @($b.Why); docs = $c.Verdict } | ConvertTo-Json -Compress)
+"""
+    r = _result(_ps(tmp_path, _driver(functions, checkout, body)))
+    assert r["first"] == "swap-needed", r
+    assert r["why"] == ["the update changed tools/x.py"], r
+    assert r["nonascii"] == "swap-needed", r
+    assert r["nonasciiWhy"] == ["the update changed tools/日本.py"], r
+    assert r["docs"] == "noop", r
 
 
 # =============================================================== D11 + D29: provisioning
@@ -534,9 +557,9 @@ def _ui_checkout(checkout):
 
 _UI_BODY = r"""
 function Get-Process { [CmdletBinding()] param([Parameter(ValueFromRemainingArguments=$true)]$Rest) }
-function Start-Process { [CmdletBinding()] param([Parameter(Position=0)]$FilePath, [Parameter(ValueFromRemainingArguments=$true)]$Rest) Add-Content -Path (Join-Path $root 'launch.log') -Value $FilePath }
+function Start-Process { [CmdletBinding()] param([Parameter(Position=0)]$FilePath, [Parameter(ValueFromRemainingArguments=$true)]$Rest) Add-Content -Path (Join-Path $root 'launch.log') -Value ([string]$FilePath + '|' + [string]$env:M365_LAUNCHED_BY_START_ALL) }
 Invoke-UiStep
-"RESULT:" + (@{ failures = @($script:startupFailures) } | ConvertTo-Json -Compress)
+"RESULT:" + (@{ failures = @($script:startupFailures); flagAfter = [string]$env:M365_LAUNCHED_BY_START_ALL } | ConvertTo-Json -Compress)
 """
 
 
@@ -548,7 +571,12 @@ def _ui_run(tmp_path, checkout, functions, env=None, venv_py=None):
     rebuilt = (checkout / "ui" / "rebuild.log").exists()
     launched = ((checkout / "launch.log").read_text(encoding="utf-8").split("\n")
                 if (checkout / "launch.log").exists() else [])
-    return r["failures"], rebuilt, [os.path.basename(l.strip()) for l in launched if l.strip()]
+    launched = [l.strip() for l in launched if l.strip()]
+    # A window start_all opens is told so (M365_LAUNCHED_BY_START_ALL=1 in ITS environment), and
+    # start_all's own environment does not keep the flag for anything it launches afterwards.
+    assert all(l.rsplit("|", 1)[1] == "1" for l in launched), launched
+    assert r["flagAfter"] == "", "M365_LAUNCHED_BY_START_ALL leaked past the UI launch"
+    return r["failures"], rebuilt, [os.path.basename(l.rsplit("|", 1)[0]) for l in launched]
 
 
 def test_ui_is_rebuilt_when_missing_empty_or_older(tmp_path, checkout, functions):
@@ -624,3 +652,58 @@ $r = @{
     body2 = "$ok = Write-StartupSummary %s @() 'full'\n\"RESULT:{}\"" % _q(summary)
     _result(_ps(tmp_path, _driver(functions, checkout, body2)))
     assert summary.read_text(encoding="utf-8").splitlines()[0] == "failures=0"
+
+
+# =============================================================== who started this run
+
+def test_every_run_records_who_started_it_and_the_file_stays_bounded(tmp_path, checkout, functions):
+    """2026-09-24: repeated full start_alls could not be attributed -- their launcher (wscript)
+    had exited and nothing had written it down. Each run appends one line to
+    .setup\\logs\\start_all_runs.jsonl: its lineage (read at the top of the script), switches,
+    lock wait and outcome; the file keeps the last 500 lines."""
+    runs = checkout / ".setup" / "logs" / "start_all_runs.jsonl"
+    runs.parent.mkdir(parents=True, exist_ok=True)
+    runs.write_text("".join('{"old":%d}\n' % i for i in range(600)), encoding="utf-8")
+    body = r"""
+$NoUi = $true
+$NoSplash = $true
+$script:runStartedAt = Get-Date
+$script:launch = Get-LaunchLineage
+$script:lockState = "got after waiting"
+$script:lockWaitSec = 12.5
+$script:startupFailures = @('a', 'b')
+$ok = Write-StartAllRunRecord %s (New-StartAllRunRecord "failures")
+"RESULT:" + (@{ ok = $ok } | ConvertTo-Json -Compress)
+""" % _q(runs)
+    assert _result(_ps(tmp_path, _driver(functions, checkout, body)))["ok"] is True
+    lines = runs.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 500, len(lines)
+    assert lines[0] == '{"old":101}', "the oldest lines were not the ones dropped"
+    rec = json.loads(lines[-1])
+    assert rec["parent_pid"] == os.getpid() and rec["parent_name"].lower().startswith("python"), rec
+    assert "pytest" in rec["parent_cmd"], rec
+    assert rec["grandparent_pid"] > 0 and rec["grandparent_name"], rec
+    assert rec["mode"] == "background (-NoUi)" and rec["switches"] == ["-NoUi", "-NoSplash"], rec
+    assert rec["lock"] == "got after waiting" and rec["lock_wait_s"] == 12.5, rec
+    assert rec["failures"] == 2 and rec["outcome"] == "failures", rec
+    assert rec["pid"] > 0 and rec["ts"] and rec["end"] and rec["reexec"] is False, rec
+
+
+def test_the_run_record_is_wired_where_the_launcher_is_still_alive(tmp_path):
+    """The lineage must be read BEFORE the splash and Invoke-Startup (the launcher exits within
+    a second); the record is written at the end before the lock is released, and on the
+    self-update re-exec path, which never reaches the end."""
+    src = open(START_ALL, encoding="utf-8").read()
+    capture = src.index("$script:launch = Get-LaunchLineage")
+    assert capture < src.index("function Invoke-Startup") < src.index("$ranViaSplash = $false")
+    tail = src[src.index("$summaryWritten = Write-StartupSummary"):]
+    assert tail.index("Write-StartAllRunRecord") < tail.index("Exit-StartAllLock")
+    reexec = _extract_braced_block(src, "function Invoke-PostUpdateTail")
+    assert reexec.index("New-StartAllRunRecord \"re-exec after update\"") < reexec.index("[System.Environment]::Exit(0)")
+    lock = _extract_braced_block(src, "function Invoke-Startup")
+    t0 = lock.index("$lockT0 = Get-Date")
+    enter = lock.index("Enter-StartAllLock", t0)
+    measured = re.search(r"\$script:lockWaitSec\s*=\s*\[math\]::Round\(\(\(Get-Date\) - \$lockT0\)", lock)
+    state = re.search(r"\$script:lockState\s*=", lock)
+    assert measured and state, "the lock wait / lock outcome is not recorded"
+    assert t0 < enter < measured.start() < lock.index("if (-not $gotLock)")

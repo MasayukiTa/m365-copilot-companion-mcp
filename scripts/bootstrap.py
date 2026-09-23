@@ -21,6 +21,8 @@
 #   python scripts/bootstrap.py --status   print each step done/pending (no changes)
 #   python scripts/bootstrap.py --reset    clear saved state (no system changes)
 #   python scripts/bootstrap.py --only X   run a single step by name
+#   python scripts/bootstrap.py --check-deps  exit 0 if .venv satisfies requirements.txt, else 3
+#   python scripts/bootstrap.py --sync-deps   bring .venv up to date (start_all.ps1's daily path)
 # =============================================================================
 from __future__ import annotations
 
@@ -495,6 +497,418 @@ def deps_are_stale(state: dict, req: Path = None) -> bool:
     return state.get(DEPS_HASH_KEY) != requirements_hash(req)
 
 
+# --------------------------------------------------------------------------- #
+# Dependency drift on the DAILY start path (start_all.ps1 -> --check-deps / --sync-deps)
+# --------------------------------------------------------------------------- #
+# WHY THIS EXISTS. --check-deps used to answer "is the stamp for this requirements.txt?" and
+# nothing else, so a state.json written before the stamp existed (every PC installed before
+# 2026-09) answered "stale" on every start forever, and start_all could only tell the operator
+# to run setup.bat. The question start_all actually needs answered is "does this .venv satisfy
+# requirements.txt?", and when it does not, start_all brings it up to date itself (owner's rule:
+# the only remedy start_all may give for its own environment is running start_all.bat again).
+#
+# THE STAMP IS STILL THE FAST PATH. A matching stamp is a hash of one small file; the probe
+# below reads installed metadata (~0.1-1 s) and only runs when the stamp is missing or differs.
+
+#: pip's output for an install started from the daily path. start_all runs hidden, so without a
+#: file its output would go nowhere; the failure line in the startup summary names this file.
+DEPS_LOG_DIR = STATE_DIR / "logs"
+
+#: Cross-process lock around "satisfied? -> pip install -> stamp". Two start_all copies are
+#: already serialised by start_all's own Global mutex, but setup/quickstart run bootstrap
+#: outside it, and two pip processes writing one .venv is the corruption quickstart_lock.ps1
+#: was written for. An OS byte-range lock (msvcrt / fcntl), not a marker file: the kernel drops
+#: it when the holder dies, so a killed install can never wedge the next one.
+INSTALL_LOCK_NAME = "install_deps.lock"
+INSTALL_LOCK_TIMEOUT_SEC = 1800
+
+_HELD_INSTALL_LOCKS: dict = {}
+
+
+class InstallLockTimeout(StepError):
+    """Another install into this venv held the lock for the whole timeout."""
+
+
+def _try_lock(fh) -> bool:
+    fh.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def _unlock(fh) -> None:
+    fh.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+class install_lock:
+    """`with install_lock(dir):` -- hold <dir>/install_deps.lock, waiting up to `timeout`.
+
+    RE-ENTRANT PER PROCESS: --sync-deps holds it across check + install + stamp and calls
+    step_install_deps, which takes it too; a second handle in the same process would otherwise
+    wait on itself (a Windows byte-range lock belongs to the handle, not the process)."""
+
+    def __init__(self, lock_dir, timeout: float = None, poll: float = 0.25):
+        self.path = Path(lock_dir) / INSTALL_LOCK_NAME
+        self.key = os.path.normcase(os.path.abspath(str(self.path)))
+        self.timeout = INSTALL_LOCK_TIMEOUT_SEC if timeout is None else timeout
+        self.poll = poll
+        self.fh = None
+
+    def __enter__(self):
+        held = _HELD_INSTALL_LOCKS.get(self.key)
+        if held:
+            held[1] += 1
+            return self
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(self.path, "a+b")
+        deadline = time.monotonic() + self.timeout
+        announced = False
+        while not _try_lock(fh):
+            if not announced:
+                log("    another dependency install into this .venv is running; waiting for it "
+                    "(lock: %s)" % self.path)
+                announced = True
+            if time.monotonic() >= deadline:
+                fh.close()
+                raise InstallLockTimeout(
+                    "another dependency install into this .venv was still running after %d "
+                    "minutes (lock: %s)" % (self.timeout // 60, self.path))
+            time.sleep(self.poll)
+        self.fh = fh
+        _HELD_INSTALL_LOCKS[self.key] = [fh, 1]
+        return self
+
+    def __exit__(self, *exc):
+        held = _HELD_INSTALL_LOCKS.get(self.key)
+        if not held:
+            return False
+        held[1] -= 1
+        if held[1] == 0:
+            del _HELD_INSTALL_LOCKS[self.key]
+            _unlock(held[0])
+            held[0].close()
+        return False
+
+
+def _load_packaging():
+    """(Requirement, InvalidRequirement) from `packaging`, else pip's vendored copy, else None."""
+    try:
+        from packaging.requirements import InvalidRequirement, Requirement
+        return Requirement, InvalidRequirement
+    except ImportError:
+        pass
+    try:
+        from pip._vendor.packaging.requirements import InvalidRequirement, Requirement
+        return Requirement, InvalidRequirement
+    except ImportError:
+        return None
+
+
+def _requirement_lines(text: str):
+    """The requirement lines of a requirements file: comments (whole-line, and inline after
+    whitespace, as pip reads them) and blank lines dropped."""
+    for raw in text.splitlines():
+        line = re.split(r"\s+#", raw.strip(), maxsplit=1)[0].strip()
+        if line and not line.startswith("#"):
+            yield line
+
+
+def _marker_applies(marker, extras) -> bool:
+    if marker is None:
+        return True
+    for extra in extras:
+        try:
+            if marker.evaluate({"extra": extra}):
+                return True
+        except Exception:
+            return True             # cannot tell -> treat it as needed (the install decides)
+    return False
+
+
+def _canonical_name(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name or "").lower()
+
+
+def _installed_index(md) -> dict:
+    """{canonical name: Distribution} from ONE pass over sys.path. md.distribution(name) scans
+    every path entry per call -- measured 1.3-2.1 s for this requirements.txt on the 2026-09
+    venv; one pass is the difference between a probe and a pause on every start. The first
+    entry for a name wins, which is the one `import` would find."""
+    index = {}
+    for dist in md.distributions():
+        try:
+            meta = dist.metadata            # parsed once here; re-reading it per use doubled the cost
+            key = _canonical_name(meta["Name"])
+        except Exception:
+            continue
+        if key and key not in index:
+            index[key] = (meta["Name"], meta["Version"], meta.get_all("Requires-Dist") or [])
+    return index
+
+
+_EXTRA_IN_MARKER = re.compile(r"""extra\s*==\s*['"]([^'"]+)['"]""")
+
+
+def _only_for_other_extras(dep: str, extras) -> bool:
+    """A Requires-Dist that applies only to extras nobody asked for -- most of them (test, dev,
+    docs) -- skipped before it is parsed: `packaging` parses with pyparsing at ~5 ms a line, and
+    those lines were most of the probe's time. Anything less plain than `...; extra == "x"`
+    (an `or` in the marker) is left to the full parse."""
+    _, sep, marker = dep.partition(";")
+    if not sep or " or " in marker:
+        return False
+    named = {_canonical_name(e) for e in _EXTRA_IN_MARKER.findall(marker)}
+    return bool(named) and not (named & {_canonical_name(e) for e in extras if e})
+
+
+def unsatisfied_requirements(req: Path = None) -> list:
+    """What THIS interpreter's installed distributions lack for requirements.txt -- one
+    readable line per problem, [] when every line (and everything those need, recursively,
+    with markers and extras evaluated) is satisfied.
+
+    Offline and read-only: importlib.metadata over the installed .dist-info, no pip, no
+    network. Anything it cannot judge -- an option line (-r, --index-url), a direct URL, no
+    `packaging` at all -- is reported as a problem, because "cannot tell" must lead to the
+    install (which pip then decides), never to a stamp that says it is fine."""
+    req = REQUIREMENTS if req is None else Path(req)
+    try:
+        text = req.read_text(encoding="utf-8-sig")
+    except OSError as e:
+        return ["requirements.txt could not be read (%s)" % e]
+    loaded = _load_packaging()
+    if loaded is None:
+        return ["requirements.txt cannot be checked here: no 'packaging' module in %s"
+                % sys.executable]
+    Requirement, InvalidRequirement = loaded
+    import importlib.metadata as md
+
+    problems = []
+    todo = []
+    for line in _requirement_lines(text):
+        if line.startswith("-"):
+            problems.append("an option line cannot be checked without pip: %s" % line)
+            continue
+        try:
+            r = Requirement(line)
+        except InvalidRequirement:
+            problems.append("unreadable requirement line: %s" % line)
+            continue
+        if _marker_applies(r.marker, [""]):
+            todo.append((r, None))
+
+    seen = set()
+    parsed = {}
+    index = _installed_index(md)
+    while todo:
+        r, parent = todo.pop()
+        needed_by = "" if parent is None else " (needed by %s)" % parent
+        if getattr(r, "url", None):
+            problems.append("%s is a direct URL requirement, which only pip can check%s"
+                            % (r.name, needed_by))
+            continue
+        found = index.get(_canonical_name(r.name))
+        if found is None:
+            problems.append("%s is not installed%s" % (r.name, needed_by))
+            continue
+        name, version, requires = found
+        name = name or r.name
+        try:
+            ok = (not r.specifier) or r.specifier.contains(version, prereleases=True)
+        except Exception:
+            ok = False
+        if not ok:
+            problems.append("%s %s is installed, %s%s is required%s"
+                            % (name, version, r.name, r.specifier, needed_by))
+            continue
+        key = (_canonical_name(name), frozenset(r.extras))
+        if key in seen:
+            continue
+        seen.add(key)
+        extras = [""] + sorted(r.extras)
+        for dep in requires:
+            if _only_for_other_extras(dep, extras):
+                continue
+            d = parsed.get(dep)
+            if d is None:
+                try:
+                    d = parsed[dep] = Requirement(dep)
+                except InvalidRequirement:
+                    continue        # someone else's malformed metadata is not ours to judge
+            if _marker_applies(d.marker, extras):
+                todo.append((d, name))
+    # One line per problem, in a stable order, without repeats.
+    return sorted(set(problems))
+
+
+def distributions_missing_files(paths=None) -> list:
+    """[("name==version", "a missing file")] for every distribution in THIS interpreter whose
+    RECORD names a file that is not on disk. Bytecode caches are skipped (deleting them is
+    legitimate); everything else a RECORD lists -- .py, .pyd, data -- is expected to exist."""
+    import importlib.metadata as md
+    out = []
+    seen = set()
+    listing = {}
+
+    def present(path: str) -> bool:
+        # One directory listing per directory rather than one stat per file: a venv RECORD set
+        # is tens of thousands of files, and a per-file exists() took ~19 s on the owner's PC.
+        parent, name = os.path.split(os.path.normpath(path))
+        names = listing.get(parent)
+        if names is None:
+            try:
+                names = {n.lower() if os.name == "nt" else n for n in os.listdir(parent)}
+            except OSError:
+                names = set()
+            listing[parent] = names
+        return (name.lower() if os.name == "nt" else name) in names
+
+    for dist in (md.distributions() if paths is None else md.distributions(path=list(paths))):
+        try:
+            name, version = dist.metadata["Name"], dist.version
+            files = dist.files or []
+        except Exception:
+            continue
+        key = _canonical_name(name)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        for f in files:
+            s = str(f).replace("\\", "/")
+            if s.endswith(".pyc") or "__pycache__/" in s:
+                continue
+            try:
+                if not present(str(f.locate())):
+                    out.append(("%s==%s" % (name, version), s))
+                    break
+            except Exception:
+                continue
+    return out
+
+
+def _broken_distributions(py: str) -> list:
+    """distributions_missing_files() as seen by the interpreter `py` (the venv pip just wrote
+    into). A check that cannot run reports nothing: the import sentinel after it still runs."""
+    from tools.childproc import run as _run_child
+    try:
+        r = _run_child([py, str(Path(__file__).resolve()), "--list-broken-dists"], timeout=300)
+    except Exception:
+        return []
+    if r.returncode != 0:
+        return []
+    rows = []
+    for line in (r.stdout or "").splitlines():
+        if line.startswith("- ") and "\t" in line:
+            spec, _, missing = line[2:].partition("\t")
+            rows.append((spec.strip(), missing.strip()))
+    return rows
+
+
+def _running_in_project_venv() -> bool:
+    try:
+        return (sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+                and os.path.samefile(sys.prefix, str(ROOT / ".venv")))
+    except OSError:
+        return False
+
+
+def venv_unsatisfied(req: Path = None) -> list:
+    """unsatisfied_requirements() as seen by the PROJECT venv, whichever interpreter is
+    running this. In-process when that is the venv (start_all runs --check-deps with it);
+    otherwise asked of the venv's own python, since another interpreter's site-packages says
+    nothing about the venv's."""
+    if _running_in_project_venv() or not VENV_PYTHON.exists():
+        return unsatisfied_requirements(req)
+    from tools.childproc import run as _run_child
+    args = [str(VENV_PYTHON), str(Path(__file__).resolve()), "--list-unsatisfied"]
+    if req is not None:
+        args += ["--requirements", str(req)]
+    r = _run_child(args, timeout=120)
+    if r.returncode != 0:
+        detail = (r.stderr or r.stdout or "").strip().splitlines()
+        return ["the .venv python could not check requirements.txt (%s)"
+                % (detail[-1] if detail else "exit %s" % r.returncode)]
+    return [l[2:] for l in r.stdout.splitlines() if l.startswith("- ")]
+
+
+def check_deps(state_file: Path = None, req: Path = None) -> tuple:
+    """(rc, problems) for --check-deps. rc 0: the venv satisfies requirements.txt (the stamp
+    matches, or it did not and the probe found everything installed -- the stamp is then
+    RECORDED, atomically, so the next start takes the fast path); rc 3: an install is needed.
+
+    Writes state.json only in that one case, and only the stamp."""
+    state_file = STATE_FILE if state_file is None else state_file
+    state = load_state(state_file)
+    if not is_done(state, "install_deps"):
+        return 3, ["install_deps has not completed on this machine"]
+    if not deps_are_stale(state, req):
+        return 0, []
+    problems = venv_unsatisfied(req)
+    if problems:
+        return 3, problems
+    state[DEPS_HASH_KEY] = requirements_hash(req)
+    save_state(state, state_file)
+    return 0, []
+
+
+def sync_deps(state_file: Path = None, req: Path = None, log_dir: Path = None) -> int:
+    """--sync-deps: bring the venv up to date with requirements.txt, for start_all.
+
+    Under install_lock the whole way: the state is re-read after the lock is taken, because the
+    copy that held it may just have done the install. Satisfied -> stamp (no pip). Otherwise the
+    install_deps step itself runs (pip's output to a file under .setup/logs, no pip self-upgrade)
+    and is marked done with its stamp. Prints exactly one verdict line last:
+        deps: ok | deps: recorded | deps: installed (...) | deps: failed: <what and what to do>
+    """
+    state_file = STATE_FILE if state_file is None else state_file
+    log_dir = DEPS_LOG_DIR if log_dir is None else Path(log_dir)
+    try:
+        with install_lock(Path(state_file).parent):
+            state = load_state(state_file)
+            done = is_done(state, "install_deps")
+            if done and not deps_are_stale(state, req):
+                _print_safe("deps: ok")
+                return 0
+            problems = venv_unsatisfied(req)
+            if done and not problems:
+                state[DEPS_HASH_KEY] = requirements_hash(req)
+                save_state(state, state_file)
+                _print_safe("deps: recorded (the .venv already satisfies requirements.txt)")
+                return 0
+            pip_log = log_dir / ("deps_install_%s.log" % time.strftime("%Y%m%d_%H%M%S"))
+            log("    .venv does not satisfy requirements.txt: %s" % "; ".join(problems[:5] or
+                ["install_deps has not completed on this machine"]))
+            log("    installing -- pip output: %s" % pip_log)
+            try:
+                step_install_deps(state=state, state_file=state_file, pip_log=pip_log,
+                                  rerun=RERUN_START_ALL, upgrade_pip=False)
+            except StepError as e:
+                log("    FAILED: %s" % e)
+                _print_safe("deps: failed: %s" % e)
+                return 1
+            mark_done(state, "install_deps", state_file)
+            _print_safe("deps: installed (pip output: %s)" % pip_log)
+            return 0
+    except InstallLockTimeout as e:
+        _print_safe("deps: failed: %s -- re-run %s once it has finished" % (e, RERUN_START_ALL))
+        return 1
+
+
 def configured_proxy() -> str | None:
     """The proxy this run was given (setup.bat derives it from the system, D10), if any."""
     for k in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY"):
@@ -504,24 +918,79 @@ def configured_proxy() -> str | None:
     return None
 
 
-def _pip_failure_message() -> str:
+def _redact_userinfo(text: str) -> str:
+    """scheme://user:password@host -> scheme://***@host. A proxy that needs a password is set
+    as HTTPS_PROXY=http://USER:PASSWORD@host:port (setup.bat's own advice), and the failure
+    text below lands in the startup summary file and a desktop notification."""
+    return re.sub(r"(://)[^/@\s]+@", r"\1***@", text or "")
+
+
+#: Where each caller tells the reader to go after a pip failure. setup/quickstart are run by a
+#: person in a window; start_all runs hidden and fixes its own environment, so its reader is
+#: told to run start_all.bat again -- never to go and run setup.bat.
+RERUN_SETUP = "quickstart.bat (or setup.bat)"
+RERUN_START_ALL = "start_all.bat"
+
+
+def _pip_failure_message(rerun: str = RERUN_SETUP, detail: str = "") -> str:
     """What to say when pip fails. On a proxied network the likely cause is the proxy, and
-    certificate advice sends the reader to the wrong fix (D10)."""
+    certificate advice sends the reader to the wrong fix (D10). `detail` is pip's own last
+    error line when its output was captured to a file (the start_all path runs hidden)."""
+    head = "pip install -r requirements.txt failed"
+    if detail:
+        head += ": " + detail
     proxy = configured_proxy()
     if proxy:
-        return ("pip install -r requirements.txt failed. This PC reaches the internet through "
-                "a proxy (%s), and setup passed it to pip. If the error above mentions "
-                "'ProxyError', '407', 'Tunnel connection failed' or a timeout, the proxy "
-                "refused the connection: ask IT whether pypi.org and files.pythonhosted.org "
-                "are allowed through it for your account, or set HTTPS_PROXY to the proxy "
-                "they tell you to use, then re-run quickstart.bat (or setup.bat)." % proxy)
-    return ("pip install -r requirements.txt failed (network or a wheel build). If this "
-            "network needs a proxy that Windows does not know about, set HTTPS_PROXY="
-            "http://<proxy-host>:<port> in this window first. Re-running quickstart.bat "
-            "(or setup.bat) retries this step.")
+        return _redact_userinfo(
+            "%s. This PC reaches the internet through a proxy (%s), and it was passed to pip. "
+            "If the error mentions 'ProxyError', '407', 'Tunnel connection failed' or a "
+            "timeout, the proxy refused the connection: ask IT whether pypi.org and "
+            "files.pythonhosted.org are allowed through it for your account, or set "
+            "HTTPS_PROXY to the proxy they tell you to use, then re-run %s."
+            % (head, proxy, rerun))
+    where = ("in this window first" if rerun == RERUN_SETUP
+             else "as a Windows user environment variable")
+    return _redact_userinfo(
+        "%s (network or a wheel build). If this network needs a proxy that Windows does not "
+        "know about, set HTTPS_PROXY=http://<proxy-host>:<port> %s. Re-running %s retries "
+        "this step." % (head, where, rerun))
 
 
-def step_install_deps(state: dict | None = None, state_file: Path = STATE_FILE) -> None:
+def _last_pip_error(pip_log: Path) -> str:
+    """The line of pip's output that says what went wrong: its last 'ERROR:' line, else the
+    last line naming an error, else the last line at all. Bounded, and never raises."""
+    try:
+        lines = [l.strip() for l in Path(pip_log).read_text(encoding="utf-8", errors="replace")
+                 .splitlines() if l.strip()]
+    except OSError:
+        return ""
+    # pip prints "ERROR: pip's dependency resolver does not currently take into account ..." on
+    # SUCCESSFUL installs too (measured in this repo's 2026-09-24 install log); it names no failure.
+    lines = [l for l in lines if "dependency resolver does not currently take into account" not in l]
+    pick = ([l for l in lines if l.startswith("ERROR:")]
+            or [l for l in lines if "error" in l.lower()]
+            or lines)
+    return _redact_userinfo(pick[-1][:300]) if pick else ""
+
+
+def step_install_deps(state: dict | None = None, state_file: Path = None, *,
+                      pip_log: Path | None = None, rerun: str = RERUN_SETUP,
+                      upgrade_pip: bool = True) -> None:
+    """pip install -r requirements.txt into the venv, then prove the core imports work.
+
+    `pip_log`: pip's output goes to this file instead of the console (the hidden start_all
+    path, where a console is nobody's to read). `rerun`: what the failure text tells the
+    reader to run again. `upgrade_pip`: the best-effort pip self-upgrade needs the network even
+    when every requirement is already met, which the daily path must not wait on.
+
+    Serialised against every other install into this venv by install_lock (re-entrant, so the
+    --sync-deps caller that already holds it is not blocked by itself)."""
+    state_file = STATE_FILE if state_file is None else state_file
+    with install_lock(Path(state_file).parent):
+        _install_deps_locked(state, pip_log=pip_log, rerun=rerun, upgrade_pip=upgrade_pip)
+
+
+def _install_deps_locked(state, *, pip_log, rerun, upgrade_pip) -> None:
     step_header("Installing Python dependencies (requirements.txt)")
     py = str(venv_python())
     req = REQUIREMENTS
@@ -539,33 +1008,85 @@ def step_install_deps(state: dict | None = None, state_file: Path = STATE_FILE) 
         "--trusted-host", "pypi.python.org",
     ]
 
-    # Best-effort pip upgrade; never fatal.
-    subprocess.call([py, "-m", "pip", "install", *trusted, "--upgrade", "pip", "--quiet"])
-
-    rc = subprocess.call([py, "-m", "pip", "install", *trusted, "-r", str(req)])
+    out = None
+    if pip_log is not None:
+        Path(pip_log).parent.mkdir(parents=True, exist_ok=True)
+        out = open(pip_log, "a", encoding="utf-8")
+    try:
+        redirect = {} if out is None else {"stdout": out, "stderr": subprocess.STDOUT}
+        if upgrade_pip:
+            # Best-effort pip upgrade; never fatal.
+            subprocess.call([py, "-m", "pip", "install", *trusted, "--upgrade", "pip", "--quiet"],
+                            **redirect)
+        if out is not None:
+            out.flush()
+        # A FILE THAT MOVED BETWEEN DISTRIBUTIONS IS DELETED BY THE UPGRADE THAT MOVED IT.
+        # Measured on this repository's own venv, 2026-09-24: fastmcp 2.14.7 -> 3.4.7 moved the
+        # fastmcp/ package into the new fastmcp-slim distribution. pip installed fastmcp-slim
+        # first, THEN uninstalled fastmcp 2.14.7 -- whose RECORD still listed
+        # fastmcp/server/server.py, dependencies.py, ... -- and deleted the files it had just
+        # written. pip exited 0, `import fastmcp` still worked (the old sentinel import passed),
+        # and the server and the bridge died on `cannot import name 'FastMCP'` /
+        # `fastmcp.server.dependencies`. A fresh venv (CI) never sees it; an upgrade of an
+        # existing one does, on setup.bat and start_all alike. So every distribution's RECORD is
+        # checked against the disk before and after, and whatever pip left missing files is
+        # reinstalled in place at the version now installed (--force-reinstall --no-deps).
+        # BEFORE AND AFTER, NOT AFTER ALONE: a venv carries old, harmless gaps of its own (a
+        # RECORD naming a MANIFEST.in the wheel never shipped); repairing those on every
+        # install would fetch packages this install never touched, and one that stays "broken"
+        # after its reinstall would fail every install forever.
+        before = {spec for spec, _ in _broken_distributions(py)}
+        rc = subprocess.call([py, "-m", "pip", "install", *trusted, "-r", str(req)], **redirect)
+        broken = []
+        if rc == 0:
+            broken = [b for b in _broken_distributions(py) if b[0] not in before]
+            if broken:
+                log("    pip left installed packages missing their own files; reinstalling "
+                    "them in place: %s" % ", ".join(b[0] for b in broken))
+                if out is not None:
+                    out.flush()
+                rc2 = subprocess.call([py, "-m", "pip", "install", *trusted, "--force-reinstall",
+                                       "--no-deps", *[b[0] for b in broken]], **redirect)
+                if rc2 == 0:
+                    still = {spec for spec, _ in _broken_distributions(py)}
+                    broken = [b for b in broken if b[0] in still]
+    finally:
+        if out is not None:
+            out.close()
     if rc != 0:
-        raise StepError(_pip_failure_message())
-
-    # pip returning 0 is NECESSARY but not SUFFICIENT: a partial download, a
-    # broken wheel, or an install against the wrong interpreter can leave core
-    # deps unimportable while pip still exits 0. Verify by actually importing a
-    # CORE sentinel packages in the venv (including the v0.3 headless LOCAL_LOOP
-    # execution path). sqlite3 is from the standard library, but checking it here also
-    # catches unusually stripped Python distributions. If any import fails to
-    # import, the environment is not usable; raise a novice-readable StepError.
-    sentinels = ["fastmcp", "httpx", "dotenv", "playwright", "psutil", "sqlite3"]
-    from tools.childproc import run as _run_child
-    check = _run_child([py, "-c", "import " + ", ".join(sentinels)])
-    if check.returncode != 0:
-        detail = (check.stderr or check.stdout or "").strip().splitlines()
-        last = detail[-1] if detail else "(no error text)"
+        if pip_log is not None:
+            detail = _last_pip_error(pip_log) or "(pip printed nothing)"
+            raise StepError(_pip_failure_message(
+                rerun, "%s -- full pip output: %s" % (detail, pip_log)))
+        raise StepError(_pip_failure_message(rerun))
+    if broken:
+        where = (" -- full pip output: %s" % pip_log) if pip_log is not None else ""
         raise StepError(
-            "Dependencies did not import after install: could not 'import %s' in "
-            ".venv. This usually means the download was incomplete or a package "
-            "failed to build. Check your internet connection, then re-run "
-            "quickstart.bat (or setup.bat) to retry. Technical detail: %s"
-            % (", ".join(sentinels), last)
-        )
+            "pip reported success, but these installed packages are missing their own files "
+            "and reinstalling them did not restore them: %s%s. Re-running %s retries this step."
+            % ("; ".join("%s (missing e.g. %s)" % (b[0], b[1]) for b in broken[:5]), where, rerun))
+
+    # pip returning 0 is NECESSARY but not SUFFICIENT -- the fastmcp-slim case above passed
+    # `import fastmcp`. So the proof is the one the verify step uses: main.py imported in a child
+    # on the venv's python, and its registered tools counted. .env may not exist yet on a first
+    # install (gen_env runs after this step), and main.py reads MCP_API_KEY at import, so the
+    # child gets .env's values and a placeholder key when there is none -- never written anywhere.
+    count, detail = _import_main_in_venv(for_install=True)
+    if count is _IMPORT_TIMED_OUT:
+        # Not evidence of a broken install (D26: a first import under antivirus can be slow);
+        # the verify step and the server's own start still import it.
+        log("    WARN: importing main.py took longer than %d s; not treated as a failure"
+            % VERIFY_IMPORT_TIMEOUT_S)
+    elif count is None:
+        where = (" (pip output: %s)" % pip_log) if pip_log is not None else ""
+        raise StepError(
+            "Dependencies installed, but the server code (main.py) does not import with them, "
+            "so the environment is not usable%s. This usually means a download was incomplete "
+            "or a package failed to build. Check your internet connection, then re-run %s to "
+            "retry. Technical detail: %s" % (where, rerun, detail or "(no error text)"))
+    else:
+        log("    OK: main.py imports with the installed packages; registered tool count = %d"
+            % count)
 
     # IMPORTANT: 'playwright' is pulled in (for the optional relay/bridge), but
     # we deliberately DO NOT run 'playwright install'. The relay attaches to an
@@ -573,7 +1094,7 @@ def step_install_deps(state: dict | None = None, state_file: Path = STATE_FILE) 
     # existing Edge/Chrome -- it never drives a Playwright-managed browser. A
     # 'playwright install' would download ~400MB of browser binaries for nothing
     # and can require extra permissions. So: no browser download here, on purpose.
-    log("    OK: dependencies installed and import-verified (server + headless LOCAL_LOOP)")
+    log("    OK: dependencies installed and verified")
     # RECORDED BESIDE THE FLAG, AND ONLY ON SUCCESS: the hash names the requirements.txt this
     # install satisfied, so run_all can tell when a pull has changed it (D5). The driver's
     # mark_done saves it together with the flag.
@@ -1513,6 +2034,24 @@ def _count_tools_via_subprocess():
     venv where the deps were actually installed.
 
     Returns the count, None on a failed import, or _IMPORT_TIMED_OUT."""
+    count, detail = _import_main_in_venv()
+    if count is None and detail:
+        # Explain the wall of traceback to a novice BEFORE dumping it, so they
+        # know the stack trace below is the reason main.py would not load (not
+        # some unrelated crash of the bootstrap itself).
+        sys.stderr.write(
+            "The server code (main.py) failed to load; the technical error follows:\n"
+        )
+        sys.stderr.write(detail if detail.endswith("\n") else detail + "\n")
+    return count
+
+
+def _import_main_in_venv(for_install: bool = False):
+    """(count | None | _IMPORT_TIMED_OUT, error text) -- THE check the verify step and the
+    install step share: import main.py in a child on the venv's python, count its tools.
+
+    for_install: the child's environment also gets .env's values and, when there is still no
+    MCP_API_KEY (a first install runs before gen_env), a placeholder -- in the CHILD only."""
     py = str(venv_python())
     # %r, NOT r'%s' (D23): a raw string literal cannot hold a path with an apostrophe in it
     # (<repo> under a folder named with a quote), so verify failed on every run there and cleared
@@ -1526,27 +2065,44 @@ def _count_tools_via_subprocess():
         "print(n)" % str(ROOT)
     )
     env = dict(os.environ)
+    if for_install:
+        env.update(_dotenv_values(ROOT / ".env"))
+        if not (env.get("MCP_API_KEY") or "").strip():
+            env["MCP_API_KEY"] = "install-verify-placeholder"
     try:
         from tools.childproc import run as _run_child
         res = _run_child([py, "-c", code], cwd=str(ROOT), env=env,
                          timeout=VERIFY_IMPORT_TIMEOUT_S)
     except subprocess.TimeoutExpired:
-        return _IMPORT_TIMED_OUT
-    except (OSError, subprocess.SubprocessError):
-        return None
+        return _IMPORT_TIMED_OUT, ""
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, str(e)
     if res.returncode != 0:
-        # Explain the wall of traceback to a novice BEFORE dumping it, so they
-        # know the stack trace below is the reason main.py would not load (not
-        # some unrelated crash of the bootstrap itself).
-        sys.stderr.write(
-            "The server code (main.py) failed to load; the technical error follows:\n"
-        )
-        sys.stderr.write(res.stderr)
-        return None
+        err = (res.stderr or res.stdout or "").strip()
+        if for_install:
+            lines = err.splitlines()
+            err = lines[-1] if lines else ""
+        return None, err
     try:
-        return int(res.stdout.strip().splitlines()[-1])
+        return int(res.stdout.strip().splitlines()[-1]), ""
     except (ValueError, IndexError):
-        return None
+        return None, "main.py imported but printed no tool count: %r" % (res.stdout or "")[-200:]
+
+
+def _dotenv_values(env_path: Path) -> dict:
+    """.env as a dict, parsed exactly as _load_dotenv_into_env does, without touching os.environ."""
+    out = {}
+    try:
+        text = env_path.read_text(encoding="utf-8-sig")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#") or "=" not in s:
+            continue
+        k, v = s.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -1727,20 +2283,39 @@ def main(argv=None) -> int:
     g.add_argument("--reset", action="store_true", help="clear saved progress, change nothing on the system")
     g.add_argument("--only", metavar="STEP", help="run a single step by name")
     g.add_argument("--check-deps", action="store_true",
-                   help="exit 3 if requirements.txt changed since the last dependency "
-                        "install (so setup.bat must run), else 0; changes nothing")
+                   help="exit 0 if .venv satisfies requirements.txt (recording that in "
+                        ".setup/state.json when only the record was missing), else 3")
+    g.add_argument("--sync-deps", action="store_true",
+                   help="bring .venv up to date with requirements.txt (start_all's daily "
+                        "path): lock, re-check, install if needed, record")
+    g.add_argument("--list-unsatisfied", action="store_true", help=argparse.SUPPRESS)
+    g.add_argument("--list-broken-dists", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--requirements", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
-    if args.check_deps:
-        # FOR THE DAILY START PATH (D5). start_all.ps1 never runs bootstrap, so a pull that adds
-        # a dependency is only installed by the next setup/quickstart. This lets a launcher ask
-        # the question in a few milliseconds without importing anything heavy.
-        state = load_state()
-        if deps_are_stale(state) or not is_done(state, "install_deps"):
-            log("requirements.txt differs from the last dependency install -- run setup.bat.")
-            return 3
-        log("Dependencies match requirements.txt.")
+    if args.list_broken_dists:
+        # Internal: step_install_deps asks the venv's python this after every pip install.
+        for spec, missing in distributions_missing_files():
+            _print_safe("- %s\t%s" % (spec, missing))
         return 0
+    if args.list_unsatisfied:
+        # Internal: venv_unsatisfied() asks the venv's own python this when bootstrap itself
+        # runs on another interpreter.
+        for p in unsatisfied_requirements(Path(args.requirements) if args.requirements else None):
+            _print_safe("- " + p)
+        return 0
+    if args.check_deps:
+        # FOR THE DAILY START PATH (D5). start_all.ps1 asks this on every start; the matching
+        # stamp answers in milliseconds, and only a missing/different stamp reads the installed
+        # metadata. Exit 3 is "an install is needed" -- start_all then runs --sync-deps itself.
+        rc, problems = check_deps()
+        if rc == 0:
+            log("Dependencies satisfy requirements.txt.")
+            return 0
+        log("The .venv does not satisfy requirements.txt: %s" % "; ".join(problems[:8]))
+        return 3
+    if args.sync_deps:
+        return sync_deps()
     if args.status:
         return print_status()
     if args.reset:

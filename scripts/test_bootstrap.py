@@ -446,6 +446,8 @@ class EnsureVenvInvalidatesDepsTests(unittest.TestCase):
         self.state_file = self.root / "state.json"
         self._orig_root = bootstrap.ROOT
         self._orig_vpy = bootstrap.VENV_PYTHON
+        self._orig_sf = bootstrap.STATE_FILE
+        bootstrap.STATE_FILE = self.root / ".setup" / "state.json"   # the install lock lives beside it
         bootstrap.ROOT = self.root
         # Point VENV_PYTHON at a file we can create/remove inside the temp root.
         self.vpy = self.root / ".venv" / "Scripts" / "python.exe"
@@ -454,6 +456,7 @@ class EnsureVenvInvalidatesDepsTests(unittest.TestCase):
     def tearDown(self):
         bootstrap.ROOT = self._orig_root
         bootstrap.VENV_PYTHON = self._orig_vpy
+        bootstrap.STATE_FILE = self._orig_sf
         self.tmp.cleanup()
 
     def test_broken_venv_recreated_and_install_deps_flag_cleared(self):
@@ -505,6 +508,8 @@ class InstallDepsSentinelTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self._orig_root = bootstrap.ROOT
         self._orig_vpy = bootstrap.VENV_PYTHON
+        self._orig_sf = bootstrap.STATE_FILE
+        bootstrap.STATE_FILE = self.root / ".setup" / "state.json"   # the install lock lives beside it
         bootstrap.ROOT = self.root
         self.vpy = self.root / ".venv" / "Scripts" / "python.exe"
         bootstrap.VENV_PYTHON = self.vpy
@@ -515,6 +520,7 @@ class InstallDepsSentinelTests(unittest.TestCase):
     def tearDown(self):
         bootstrap.ROOT = self._orig_root
         bootstrap.VENV_PYTHON = self._orig_vpy
+        bootstrap.STATE_FILE = self._orig_sf
         self.tmp.cleanup()
 
     def test_sentinel_import_failure_raises_step_error(self):
@@ -533,10 +539,10 @@ class InstallDepsSentinelTests(unittest.TestCase):
         self.assertIn("quickstart.bat", msg)
 
     def test_sentinel_import_success_completes(self):
-        # pip succeeds AND the import probe succeeds -> no raise.
+        # pip succeeds AND the verify import of main.py prints a tool count -> no raise.
         with mock.patch.object(bootstrap.subprocess, "call", return_value=0), \
              mock.patch.object(bootstrap.subprocess, "run",
-                               return_value=_completed(returncode=0)):
+                               return_value=_completed(returncode=0, stdout="42")):
             bootstrap.step_install_deps()  # must not raise
 
 
