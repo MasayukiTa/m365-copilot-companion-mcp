@@ -15,6 +15,21 @@
 // extraction changed behaviour (fix ChatSend.cs) or the change is deliberate -- in which case
 // the test declares the divergence by name and says why, and this file stays as it is.
 //
+// DECLARED DIFFERENCES (this file intentionally keeps the OLD behaviour; ui/ChatSend.cs has the
+// fix; ui/test_the_chat_window_sends_what_was_typed.py's `_EXPECTED_DIVERGENCE` and
+// `_DECLARED_BEHAVIOUR_CHANGES` name exactly which cases exercise each one):
+//   1. TERMINAL STATUSES (2026-09-24). LiveWorkerFor / ReadActiveFleetWorkerCount below still
+//      lack "maxturns" and "content_refused" -- both are in relay/relay_fleet.py's own TERMINAL
+//      set. So this oracle still steers a worker that has already used its whole turn budget
+//      or had its prompt declined, and still counts it toward the chip's active total.
+//   2. CAPACITY REROUTE WRITE RESULT (2026-09-24). DoSend's capacity branch above ignores
+//      AppendCommand's return value, exactly as the shipped f26c4de code did -- a write that
+//      failed still clears the composer and says "queued".
+//   3. CAPACITY REROUTE VS. A FLEET CONVERSATION (2026-09-24). DoSend's capacity branch fires
+//      before it asks whether the target conversation is a fleet one, exactly as shipped -- a
+//      follow-up typed into a fleet conversation while the fleet is full still becomes an
+//      unlinked bare goal instead of reaching SendToFleetConversation.
+//
 // ADAPTERS, all of them, and why each is the smallest one available:
 //   * `public` on DoSend, SendText, LiveWorkerFor, FleetState and ReadActiveFleetWorkerCount,
 //     so the harness can call them. Trailing // comments on copied lines were dropped.

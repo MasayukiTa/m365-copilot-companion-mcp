@@ -20,8 +20,12 @@ effects behind `IChatSendEffects`. This file compiles it with the real csc and R
   both, against the same recording world, and the two must agree on everything: the ordered
   effect trace, the state left behind, and three status decisions. The expected answers come
   from RUNNING the code that shipped, not from what anyone thinks it did.
-  One divergence is declared, by rule, below: the header chip no longer counts a "stuck"
-  worker as active (see `_EXPECTED_DIVERGENCE`).
+  Several divergences are declared, by rule or by case id: the header chip no longer counts a
+  "stuck", "maxturns" or "content_refused" worker as active (see `_EXPECTED_DIVERGENCE`), and a
+  handful of specific cases changed which command is sent -- a now-terminal worker is not
+  steered, a failed capacity-reroute write is reported instead of silently "queued", and a
+  fleet conversation at capacity uses its own path instead of the bare-goal reroute (see
+  `_DECLARED_BEHAVIOUR_CHANGES`).
 * **Orchestration.** Properties of the extracted flow per case: which door or command, how
   many dispatches, the exact payload, what the person sees when it is refused or fails.
 * **Cross-language.** status.json is produced by the fleet's own writer
@@ -89,7 +93,7 @@ T4 = r"C:\repo\.fleet\transcripts\1726000000_w3.jsonl"
 T5 = r"C:\repo\.fleet\transcripts\1726000000_w4.jsonl"
 
 _ALL_STATUSES = ["done", "resolved", "failed", "error", "cancelled", "stopped", "stuck",
-                 "pending", "maxturns", "running", "verifying", "Stuck", "Done"]
+                 "pending", "maxturns", "content_refused", "running", "verifying", "Stuck", "Done"]
 
 
 def _slug(status):
@@ -189,11 +193,23 @@ def _write_status(root, key):
     return p
 
 
-def _stuck_count(key):
-    """How many workers in fixture `key` the chip used to count and no longer does."""
+#: Statuses IsTerminalWorkerStatus excludes from "active" now and did not before 2026-09-24.
+#: "stuck" was ALREADY terminal to the steer lookup in the shipped code (ChatDecisionsOriginal
+#: .cs's LiveWorkerFor lists it); only the chip's separate copy (ReadActiveFleetWorkerCount)
+#: missed it, so "stuck" only ever moves active_count. "maxturns" and "content_refused" were
+#: missing from BOTH copies in the shipped code, so they move active_count too -- but a fleet
+#: conversation whose transcript is pinned to a worker in one of these two statuses also changes
+#: which COMMAND gets sent (steer vs. follow-up), which active_count cannot express. Those
+#: specific cases are excluded from the blanket equality below and asserted by their own test
+#: instead (see _DECLARED_BEHAVIOUR_CHANGES and test_a_now_terminal_worker_is_not_steered).
+_NEWLY_EXCLUDED_FROM_ACTIVE = ("stuck", "maxturns", "content_refused")
+
+
+def _excluded_now_count(key):
+    """How many workers in fixture `key` the chip used to count as active and no longer does."""
     if key not in REAL:
         return 0
-    return sum(1 for w in REAL[key][0] if w.status.lower() == "stuck")
+    return sum(1 for w in REAL[key][0] if w.status.lower() in _NEWLY_EXCLUDED_FROM_ACTIVE)
 
 
 # ── the cases ─────────────────────────────────────────────────────────────────────────────
@@ -261,7 +277,7 @@ CASES = [
     _case("bang_alone_with_room", "!", _chat(), status="room"),
     _case("cap_slash_not_rerouted", "/goal a new job", _chat(), status="cap"),
     _case("cap_research_slash", "/research compare x", _chat(), status="cap"),
-    _case("cap_append_fails_unchecked", "plain words", _chat(), status="cap", append_ok=False),
+    _case("cap_append_fails_is_reported", "plain words", _chat(), status="cap", append_ok=False),
     _case("cap_bom", "plain words", _chat(), status="bom_cap"),
     _case("cap_strings", "plain words", _chat(), status="strings"),
     _case("cap_idle_key", "plain words", _chat(), status="idle_key"),
@@ -270,7 +286,8 @@ CASES = [
     _case("cap_maxc_zero", "plain words", _chat(), status="maxc_zero"),
     _case("cap_fraction", "plain words", _chat(), status="fraction"),
     _case("cap_locked", "plain words", _chat(), status="cap", status_locked=True),
-    _case("cap_fleet_row_queued_without_id", "a follow-up", _fleet(), status="cap"),
+    _case("cap_fleet_steer_not_rerouted", "a follow-up", _fleet(), status="cap"),
+    _case("cap_fleet_follow_up_not_rerouted", "a follow-up", _fleet(transcript=T2), status="cap"),
     # ── research router ──
     _case("research_en", "please investigate the outage", _chat()),
     _case("research_ja", "これを調査して", _chat()),
@@ -414,31 +431,69 @@ def test_every_case_ran_and_is_matched_by_id(results):
 
 # ── differential: the extracted code does what the shipped code did ───────────────────────
 
-#: THE ONE DELIBERATE DIFFERENCE, stated as a rule rather than a list of cases. The chip's
-#: terminal list (ReadActiveFleetWorkerCount) had no "stuck" while the steer lookup's did, and
-#: its comment claimed they matched. Both now use ChatSend.IsTerminalWorkerStatus; relay's own
-#: TERMINAL set (relay/relay_fleet.py) contains "stuck". So the extracted active count is the
-#: original minus the stuck workers (any case -- the chip lowercases), and NOTHING ELSE differs.
+#: A DELIBERATE DIFFERENCE, stated as a rule rather than a list of cases. The chip's terminal
+#: list (ReadActiveFleetWorkerCount) had no "stuck" while the steer lookup's did, and its
+#: comment claimed they matched. Both now use ChatSend.IsTerminalWorkerStatus, which as of
+#: 2026-09-24 also gained "maxturns" and "content_refused" (relay/relay_fleet.py's own TERMINAL
+#: set has all three). So the extracted active count is the original minus every worker in one
+#: of those three statuses (any case -- the chip lowercases), and NOTHING ELSE differs -- except
+#: the cases in _DECLARED_BEHAVIOUR_CHANGES below, which change more than a count and are
+#: excluded from the blanket comparison entirely.
 def _EXPECTED_DIVERGENCE(case):
     if case.get("status_locked"):
         return 0            # neither side can read a locked file; both count 0
-    return _stuck_count(case["status_path"].replace("\\", "/").split("/")[-2])
+    return _excluded_now_count(case["status_path"].replace("\\", "/").split("/")[-2])
+
+
+#: Cases excluded from the blanket equality below because a 2026-09-24 fix changed WHICH
+#: COMMAND is sent, not just a count, so the oracle (frozen, pre-fix behaviour) and the
+#: extracted code cannot be made to agree by adjusting a field. Each is asserted by its own
+#: test instead; the value says which test and why.
+_DECLARED_BEHAVIOUR_CHANGES = {
+    "status_maxturns":
+        "the conversation's transcript now matches a terminal (maxturns) worker; the oracle "
+        "still steers it, the extracted code falls through to the follow-up instead -- see "
+        "test_a_now_terminal_worker_is_not_steered",
+    "status_content_refused":
+        "same fix as status_maxturns, for content_refused -- see "
+        "test_a_now_terminal_worker_is_not_steered",
+    "cap_append_fails_is_reported":
+        "DoSend now checks the capacity reroute's AppendCommand result and keeps the typed "
+        "text on failure; the oracle never checked it -- see "
+        "test_a_failed_capacity_enqueue_is_reported_and_keeps_the_text",
+    "cap_fleet_steer_not_rerouted":
+        "a fleet conversation at capacity now goes through SendToFleetConversation (here: a "
+        "steer) instead of the bare-goal reroute -- see "
+        "test_at_capacity_a_fleet_conversation_uses_its_own_path",
+    "cap_fleet_follow_up_not_rerouted":
+        "same fix as cap_fleet_steer_not_rerouted, for the no-live-worker (follow-up) branch "
+        "-- see test_at_capacity_a_fleet_conversation_uses_its_own_path",
+}
 
 
 def test_the_extracted_send_path_does_exactly_what_the_original_did(results):
     diffs = []
     for cid, r in sorted(results["got"].items()):
+        if cid in _DECLARED_BEHAVIOUR_CHANGES:
+            continue     # asserted by its own test instead; see the dict for which and why
         o, x = r["original"], r["extracted"]
-        stuck = _EXPECTED_DIVERGENCE(results["cases"][cid])
+        excluded = _EXPECTED_DIVERGENCE(results["cases"][cid])
         o = json.loads(json.dumps(o))
-        if stuck:
-            o["decisions"]["active_count"] -= stuck
+        if excluded:
+            o["decisions"]["active_count"] -= excluded
         if o != x:
             for part in ("trace", "state", "error", "decisions"):
                 if o.get(part) != x.get(part):
                     diffs.append("%s: %s\n  original : %r\n  extracted: %r"
                                  % (cid, part, o.get(part), x.get(part)))
     assert not diffs, "the extraction changed behaviour:\n" + "\n".join(diffs)
+
+
+def test_every_declared_behaviour_change_is_a_real_case(results):
+    """A name in _DECLARED_BEHAVIOUR_CHANGES that matches no case would silently exempt nothing
+    from the blanket comparison above -- catch a typo'd or removed id."""
+    missing = set(_DECLARED_BEHAVIOUR_CHANGES) - set(results["cases"])
+    assert not missing, missing
 
 
 def test_the_declared_divergence_really_occurs(results):
@@ -588,20 +643,42 @@ def test_the_capacity_reading_follows_the_status_file(results):
     assert queued == {"cap_bom", "cap_strings", "cap_fraction"}, queued
 
 
-def test_a_failed_enqueue_at_capacity_is_not_checked(results):
-    """RECORDED AS IT IS, NOT AS IT SHOULD BE: the queue path ignores AppendCommand's result,
-    so a command that was never written still says "queued". The differential pins that this
-    extraction did not change it; fixing it is a behaviour change of its own."""
-    out = _x(results, "cap_append_fails_unchecked")
-    assert _said(out) == ["T:fleet_queued"]
+def test_a_failed_capacity_enqueue_is_reported_and_keeps_the_text(results):
+    """FIXED 2026-09-24: the queue path used to ignore AppendCommand's result, so a command
+    that was never written still said "queued" and the composer was already cleared -- the
+    text was gone and never reached the fleet either. Now the write is checked: on failure the
+    window says fleet_send_failed (the key the fleet-conversation path already uses for this)
+    and puts the typed text back."""
+    out = _x(results, "cap_append_fails_is_reported")
+    # AppendCommand IS attempted (and recorded) -- it is its FAILURE that must now be reported,
+    # rather than the old behaviour of trying, ignoring the result, and saying "queued" anyway.
+    assert _payloads(out) == [("add_goal", {"text": "plain words", "priority": False})], out["trace"]
+    assert _said(out) == ["T:fleet_send_failed"], out["trace"]
+    assert out["state"]["input"] == "plain words", "the text was lost on a failed enqueue"
 
 
-def test_at_capacity_a_fleet_row_is_queued_as_a_bare_goal(results):
-    """THE OVERLAP: capacity is decided before the fleet door, so a follow-up typed into a
-    fleet conversation while the fleet is full becomes a NEW bare goal -- no resume_conv, no
-    follow_up_to. Recorded as the shipped behaviour."""
-    out = _x(results, "cap_fleet_row_queued_without_id")
-    assert _payloads(out) == [("add_goal", {"text": "a follow-up", "priority": False})]
+def test_at_capacity_a_fleet_conversation_uses_its_own_path(results):
+    """FIXED 2026-09-24: capacity used to be decided before the fleet door, so a follow-up
+    typed into a fleet conversation while the fleet was full became a NEW, unlinked bare goal
+    -- no resume_conv, no follow_up_to -- and a steer-worthy message never reached the worker it
+    was meant to steer. Now a fleet conversation skips the capacity reroute entirely and goes
+    through SendToFleetConversation, exactly as it would if the fleet were not at capacity."""
+    # a live worker (w0) matches this conversation's transcript -> steered, not queued
+    steer = _x(results, "cap_fleet_steer_not_rerouted")
+    assert _payloads(steer) == [("steer", {"worker": "w0", "text": "a follow-up"})], steer["trace"]
+    assert _said(steer) == ["T:fleet_steer_sent"]
+    assert not _gets(steer), "a fleet conversation went through a page door"
+
+    # no worker matches this conversation's transcript -> a follow-up goal, not a bare one
+    follow = _x(results, "cap_fleet_follow_up_not_rerouted")
+    want_text = ("【ユーザーからの追加指示】a follow-up\n直前までの作業内容を踏まえ、この追加指示に対して"
+                 "だけ答えてください。最初からやり直す必要はありません。完了なら DONE、無理なら FAIL と"
+                 "理由を書いてください。")
+    assert _payloads(follow) == [("add_goal", {
+        "text": want_text, "resume_conv": SESS,
+        "follow_up_to": "summarise the release notes", "priority": True})], follow["trace"]
+    assert _said(follow) == ["T:fleet_follow_sent"]
+    assert not _gets(follow), "a fleet conversation went through a page door"
 
 
 def test_research_intent_asks_first(results):
@@ -727,14 +804,32 @@ def test_the_fleet_path_records_the_line_before_it_decides(results):
 
 def test_every_status_is_classified_for_the_steer(results):
     live = {s for s in _ALL_STATUSES if _payloads(_x(results, "status_" + _slug(s)), "steer")}
-    # case-SENSITIVE: "Stuck"/"Done" are live to the steer lookup; "maxturns" was never listed
-    assert live == {"maxturns", "running", "verifying", "Stuck", "Done"}, sorted(live)
+    # case-SENSITIVE: "Stuck"/"Done" are live to the steer lookup; "maxturns" and
+    # "content_refused" are terminal (as of 2026-09-24) and so is neither
+    assert live == {"running", "verifying", "Stuck", "Done"}, sorted(live)
+
+
+def test_a_now_terminal_worker_is_not_steered(results):
+    """FIXED 2026-09-24: IsTerminalWorkerStatus gained "maxturns" and "content_refused" (relay's
+    own terminal set already had both). A worker in either status is finished and will never
+    read a steer, so the message must become a follow-up goal instead of being lost."""
+    for cid, status in (("status_maxturns", "maxturns"),
+                        ("status_content_refused", "content_refused")):
+        out = _x(results, cid)
+        assert not _payloads(out, "steer"), (status, out["trace"])
+        payloads = _payloads(out, "add_goal")
+        assert len(payloads) == 1, (status, out["trace"])
+        item = payloads[0][1]
+        assert item["text"].startswith("【ユーザーからの追加指示】anything\n"), (status, item)
+        assert item["resume_conv"] == SESS and item["follow_up_to"] == "summarise the release notes"
+        assert _said(out) == ["T:fleet_follow_sent"], (status, out["trace"])
 
 
 def test_the_chip_count_no_longer_counts_a_stuck_worker(results):
     d = _x(results, "status_running")["decisions"]
-    # 13 workers; not active: done resolved failed error cancelled stopped stuck pending Stuck Done
-    assert d["active_count"] == 3, d            # maxturns, running, verifying
+    # 14 workers; not active: done resolved failed error cancelled stopped stuck pending
+    # maxturns content_refused Stuck Done -- 12 excluded, 2 left
+    assert d["active_count"] == 2, d            # running, verifying
 
 
 # ── cross-language: the command the window wrote is the goal the fleet reads ──────────────
