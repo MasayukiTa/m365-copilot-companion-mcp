@@ -1,3 +1,4 @@
+import hmac
 import os
 import time
 from pathlib import Path
@@ -164,7 +165,7 @@ from tools.pptx_ops import (
 )
 from tools.registry import list_my_tools, register
 from tools.search_ops import find_files, glob
-from tools.security import list_unlocked, unlock
+from tools.security import derive_identity, list_unlocked, unlock
 from tools.task_ops import todo_clear, todo_list, todo_write
 from tools.web_ops import github_file, render_page, web_fetch
 
@@ -432,22 +433,67 @@ def _server_identity():
     }
 
 
+def _health_bearer_ok(request: Request) -> bool:
+    """True iff the caller presented this server's own MCP_API_KEY as a bearer token.
+
+    /health is registered via @mcp.custom_route, which sits OUTSIDE the FastMCP
+    StaticTokenVerifier auth that guards the /mcp mount (that verifier never runs for this
+    route at all -- this is not a duplicate of a check FastMCP already does, it is the
+    only one). Tolerates a raw, unprefixed key the same way _BearerPrefix does for /mcp,
+    since an operator who pastes the key without "Bearer " should not get a confusing
+    partial /health response as the result.
+    """
+    value = (request.headers.get("authorization") or "").strip()
+    if not value:
+        return False
+    if value.lower().startswith("bearer "):
+        value = value[len("bearer "):].strip()
+    return hmac.compare_digest(value, API_KEY)
+
+
 @mcp.custom_route("/health", methods=["GET"])
-async def health(_request: Request) -> JSONResponse:
+async def health(request: Request) -> JSONResponse:
     """Liveness probe that NEVER touches a blocking tool.
 
     This async handler runs directly on the event loop and returns immediately, so the
     supervisor can distinguish "the loop is briefly busy running a heavy tool in a worker
     thread" (this still answers fast, because tool bodies are now offloaded) from "the
-    loop is actually dead". It does no auth and does no blocking I/O on purpose (the
-    auth-failure summary below is an in-memory read of tools.auth_stats' module
-    singleton, not a file read).
+    loop is actually dead". It does no blocking I/O on purpose (the auth-failure summary
+    below is an in-memory read of tools.auth_stats' module singleton, not a file read).
+
+    SEC-20: this route has NO FastMCP auth (see _health_bearer_ok's docstring) and is
+    reachable through the dev tunnel by anyone who can reach the public URL -- it used to
+    hand every such caller server identity, code-staleness, auth-failure counts and
+    tool/fleet probe state with zero authentication. Now: a caller that is neither a
+    genuine local peer (tools.security.derive_identity -- the SAME helper the unlock gate
+    and the auth-failure ASGI observer already use, so "local" means exactly what it means
+    everywhere else in this server) NOR presenting a valid bearer token gets back only
+    {"status": "ok", "server_pid": ...}.
+
+    server_pid stays in that minimal reply on purpose, not by oversight: three existing,
+    unauthenticated callers already hit this exact code path (a round trip out through the
+    dev tunnel and back to this same machine) and compare server_pid against a separate
+    loopback call to catch a tunnel forwarding to the wrong host (D7) --
+    scripts/doctor.ps1's Test-TunnelHealthAnswer, scripts/status.py's section_tunnel, and
+    ui/FleetCockpit.cs's tunnel dot (PollHealthOnce). None of the three send a bearer
+    token today. Dropping server_pid from the unauthenticated reply would silently disable
+    that mismatch check for all three rather than fail loudly, which is worse than the
+    small amount of information server_pid discloses (an OS process id, already exposed
+    today). Everything else this route can say -- code staleness, auth-failure counts,
+    tool/fleet probe state -- stays behind loopback-or-bearer.
 
     Also surfaces auth_fail_10m / auth_fail_last_ts (see tools/auth_stats.py) so a
     burst of 401s -- e.g. Copilot Studio's stored key desyncing from MCP_API_KEY --
     is visible to the supervisor/cockpit without grepping logs. get_summary() never
     raises, so this can't turn a healthy-loop probe into a 500."""
     payload = {"status": "ok"}
+    client = getattr(request, "client", None)
+    peer = client.host if client else ""
+    xff = request.headers.get("x-forwarded-for", "")
+    is_local, _identity_ip = derive_identity(peer, xff)
+    if not is_local and not _health_bearer_ok(request):
+        payload["server_pid"] = _BOOT_PID
+        return JSONResponse(payload)
     # WHO IS ANSWERING, AND IS IT RUNNING THE CODE ON DISK.
     #
     # A server that is already running keeps executing what it imported at startup. A pull
