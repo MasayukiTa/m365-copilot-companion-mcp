@@ -94,7 +94,8 @@ $Log = Join-Path $env:TEMP "m365-companion-supervisor.log"
 # Alias under WindowsApps -- which is not an interpreter; run with arguments it returns an error
 # code. The loop would then fail identically twice a pass, every fifteen seconds, forever, while
 # reporting itself as running. Saying it once and stopping is better than doing nothing loudly.
-$Py = Join-Path $Root ".venv\Scripts\python.exe"
+$VenvPy = Join-Path $Root ".venv\Scripts\python.exe"
+$Py = $VenvPy
 if (-not (Test-Path $Py)) {
     $fallback = Get-Command python -ErrorAction SilentlyContinue | Select-Object -First 1
     $why = ""
@@ -147,6 +148,206 @@ function Write-Log($msg) {
     "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $msg" | Out-File -FilePath $Log -Append -Encoding utf8
 }
 
+# -- WHICH PYTHON: re-decided before every launch, not once at startup (new-PC analysis D2) ----
+# $Py above is resolved ONCE, when this process starts. A supervisor started before the .venv
+# existed -- start_all run before quickstart, or a logon autostart that fires while setup.bat is
+# still creating it -- got the PATH python and kept it for its whole life: after setup completed,
+# every launch of main.py still ran on an interpreter without the server's packages and died on
+# import, and nothing replaced this supervisor (start_all restarts it only on tunnel-name drift).
+# Re-running quickstart, which is what doctor advised, changed nothing.
+#
+# SO BEFORE EACH LAUNCH (the server, the auto-resume runners, and once per tick for the reaper
+# and the queue drain) ASK AGAIN. The common case is one Test-Path: the .venv interpreter is
+# already the one in use. Only when a .venv interpreter has appeared that we are not using is it
+# RUN once (Test-PythonRuns) -- a .venv caught half-created by setup.bat has a python.exe that
+# cannot start, and switching to it would trade a working interpreter for a broken one. If it
+# does not run we keep the current one, say why once, and try again after
+# $script:PyRecheckSeconds. Only ever TOWARDS the .venv: when the .venv disappears (setup.bat
+# rebuilding it) the current interpreter is kept, because the .venv coming back is the only
+# change that fixes anything.
+$script:PyRecheckSeconds = 60
+$script:PyRejectedAt = $null
+$script:PyRejectedWhy = $null
+
+function Test-PythonRuns {
+    # Does this file start as a Python interpreter? @{ Ok; Why }. Bounded: a hung start is a
+    # failure after $TimeoutMs, not a hung supervisor.
+    param([string]$Exe, [int]$TimeoutMs = 20000)
+    $p = $null
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $Exe
+        $psi.Arguments = '-c "import sys; print(sys.version_info[0])"'
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $p = [System.Diagnostics.Process]::Start($psi)
+        $outTask = $p.StandardOutput.ReadToEndAsync()
+        $errTask = $p.StandardError.ReadToEndAsync()
+        if (-not $p.WaitForExit($TimeoutMs)) {
+            try { $p.Kill() } catch { }
+            return @{ Ok = $false; Why = "it did not finish a one-line start within $([int]($TimeoutMs / 1000))s" }
+        }
+        $out = [string]$outTask.Result
+        $err = [string]$errTask.Result
+        if ($p.ExitCode -eq 0 -and $out.Trim() -eq "3") { return @{ Ok = $true; Why = "" } }
+        $first = ($err -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 1)
+        return @{ Ok = $false; Why = ("exit code " + $p.ExitCode + $(if ($first) { ": " + $first.Trim() } else { "" })) }
+    } catch {
+        return @{ Ok = $false; Why = ("it could not be started: " + $_.Exception.Message) }
+    } finally {
+        if ($p) { try { $p.Dispose() } catch { } }
+    }
+}
+
+function Update-PythonInterpreter {
+    # Switches $script:Py to the .venv interpreter when one exists, is not the one in use, and
+    # runs. Logs every switch and (once per distinct reason) every refusal. $Before names the
+    # launch this is about to serve, for the log line.
+    param([string]$Before)
+    if ($script:Py -eq $script:VenvPy) { return }
+    if (-not (Test-Path -LiteralPath $script:VenvPy)) { return }
+    if ($script:PyRejectedAt -and ((Get-Date) - $script:PyRejectedAt).TotalSeconds -lt $script:PyRecheckSeconds) { return }
+    $check = Test-PythonRuns -Exe $script:VenvPy
+    if (-not $check.Ok) {
+        $script:PyRejectedAt = Get-Date
+        if ($script:PyRejectedWhy -ne $check.Why) {
+            Write-Log ("interpreter: " + $script:VenvPy + " exists but does not run (" + $check.Why +
+                       ") -- keeping " + $script:Py + ". If setup.bat is still running this clears itself; " +
+                       "otherwise re-run setup.bat. Re-checked every " + $script:PyRecheckSeconds + "s.")
+            $script:PyRejectedWhy = $check.Why
+        }
+        return
+    }
+    Write-Log ("interpreter: switching " + $script:Py + " -> " + $script:VenvPy + " before " + $Before +
+               " (this supervisor started before the .venv existed; the .venv now exists and runs)")
+    $script:Py = $script:VenvPy
+    $script:PyRejectedAt = $null
+    $script:PyRejectedWhy = $null
+}
+
+# -- WHO IS ON THE PORT: this checkout's main.py, or something else (new-PC analysis D13) ------
+# Port 8000 was assumed to be ours. Start-Server stopped EVERY process listening on it, and
+# Test-ServerUp counted ANY HTTP answer on it -- a 404, a directory listing -- as "server up".
+# So another local service on :8000 was either killed every minute or mistaken for the server,
+# in which case main.py was never started while doctor said the server was down.
+#
+# NOW A PORT IS A CLAIM, NOT AN IDENTITY, the same rule start_all's D12 fix applies
+# (Get-ThisCheckoutServerProcesses): only a process whose command line is this checkout's
+# main.py is ours to stop. ONE EXTRA STEP IS MEASURED, NOT ASSUMED: the process that owns the
+# port is NOT the one whose command line names the checkout. Measured on this machine
+# 2026-09-24: :8000 is owned by "...\Python310\python.exe main.py", whose PARENT is
+# "<checkout>\.venv\Scripts\python.exe main.py" -- the .venv python.exe is a launcher that
+# starts the base interpreter as a child. So a main.py owner counts as ours when its own OR its
+# parent's command line names this checkout, or when it (or its parent) is the process this
+# supervisor launched ($script:ServerProc; that also covers a launch on a PATH python, whose
+# command line names no checkout at all).
+function Get-PortListenerPids {
+    # @{ Queried; Pids }. Queried=$false only when the port could not be inspected.
+    # AN EMPTY ANSWER ARRIVES AS AN EXCEPTION. Get-NetTCPConnection -ErrorAction Stop THROWS
+    # (CimJobException, category ObjectNotFound) when nothing matches -- measured 2026-09-24 --
+    # so a plain try/catch read "nothing is listening" as "could not look". That made the
+    # startup launch below ("nothing is listening on :$Port at startup") dead code: this
+    # machine's supervisor log has never once printed it.
+    try {
+        $pids = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop |
+                  Select-Object -ExpandProperty OwningProcess -Unique)
+        return @{ Queried = $true; Pids = $pids }
+    } catch {
+        if ($_.CategoryInfo.Category -eq 'ObjectNotFound') { return @{ Queried = $true; Pids = @() } }
+        return @{ Queried = $false; Pids = @() }
+    }
+}
+
+function Test-IsMainPyCommandLine {
+    # main.py as an argument or the end of a path -- not test_main.py, not main.pyc.
+    param([string]$CommandLine)
+    return ($CommandLine -match '(?i)(^|[\s"\\/])main\.py(["\s]|$)')
+}
+
+function Test-IsThisCheckoutServerCommandLine {
+    # PURE. This checkout's main.py: main.py AND the checkout's folder followed by a separator,
+    # so C:\x\repo does not claim C:\x\repo2's server.
+    param([string]$CommandLine, [string]$RootDir)
+    if (-not $CommandLine -or -not $RootDir) { return $false }
+    if (-not (Test-IsMainPyCommandLine $CommandLine)) { return $false }
+    $pat = "*" + [System.Management.Automation.WildcardPattern]::Escape($RootDir.TrimEnd('\')) + "\*"
+    return ($CommandLine -like $pat)
+}
+
+function Get-ProcessVerdict {
+    # Is this pid this checkout's server? @{ Ours = $true | $false | $null; Desc }. $null means
+    # it cannot be told (the process is gone, or its command line is not readable -- another
+    # user's or an elevated process), and a caller must never stop a process on $null.
+    param([int]$ProcId)
+    $tracked = 0
+    if ($script:ServerProc) {
+        try {
+            $script:ServerProc.Refresh()
+            if (-not $script:ServerProc.HasExited) { $tracked = $script:ServerProc.Id }
+        } catch { }
+    }
+    if ($tracked -and $ProcId -eq $tracked) {
+        return @{ Ours = $true; Desc = "pid $ProcId (the server this supervisor launched)" }
+    }
+    $p = $null
+    try { $p = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcId" -ErrorAction Stop } catch {
+        return @{ Ours = $null; Desc = "pid $ProcId (its details could not be read: $($_.Exception.Message))" }
+    }
+    if (-not $p) { return @{ Ours = $null; Desc = "pid $ProcId (no longer running)" } }
+    $cl = [string]$p.CommandLine
+    if (-not $cl) {
+        return @{ Ours = $null; Desc = "pid $ProcId ($($p.Name); its command line cannot be read -- another user's or an elevated process)" }
+    }
+    $desc = "pid $ProcId ($($p.Name)): $($cl.Trim())"
+    if (Test-IsThisCheckoutServerCommandLine $cl $Root) { return @{ Ours = $true; Desc = $desc } }
+    if (Test-IsMainPyCommandLine $cl) {
+        if ($tracked -and $p.ParentProcessId -eq $tracked) { return @{ Ours = $true; Desc = $desc } }
+        try {
+            $pp = Get-CimInstance Win32_Process -Filter "ProcessId=$($p.ParentProcessId)" -ErrorAction Stop
+            if ($pp -and (Test-IsThisCheckoutServerCommandLine ([string]$pp.CommandLine) $Root)) {
+                return @{ Ours = $true; Desc = $desc }
+            }
+        } catch { }
+    }
+    return @{ Ours = $false; Desc = $desc }
+}
+
+function Get-HealthServerPid {
+    # PURE. The server_pid main.py's /health reports, or $null when the body is not main.py's
+    # answer. main.py's /health returns JSON {"status": "ok", "server_pid": <int>, ...} (see
+    # health() and _server_identity() in main.py); a 200 without both is someone else's page.
+    param([string]$Body)
+    if (-not $Body) { return $null }
+    try { $j = $Body | ConvertFrom-Json -ErrorAction Stop } catch { return $null }
+    if (-not $j -or $j.status -ne "ok") { return $null }
+    $sp = 0
+    try { $sp = [int]$j.server_pid } catch { return $null }
+    if ($sp -le 0) { return $null }
+    return $sp
+}
+
+# A port held by something else is logged in full when the holder changes, and again every
+# ten minutes while it stays -- not on every refused launch.
+$script:ForeignHolderKey = ""
+$script:ForeignHolderLoggedAt = [datetime]::MinValue
+
+function Write-ForeignPortHolderLog {
+    param([object[]]$Holders)
+    $key = (@($Holders | ForEach-Object { $_.Desc }) -join " | ")
+    if ($key -eq $script:ForeignHolderKey -and
+        ((Get-Date) - $script:ForeignHolderLoggedAt).TotalMinutes -lt 10) { return }
+    $script:ForeignHolderKey = $key
+    $script:ForeignHolderLoggedAt = Get-Date
+    Write-Log (":$Port is held by " + $key + " -- that is not this checkout's MCP server (" +
+               (Join-Path $Root "main.py") + "), so the supervisor will NOT stop it, and it cannot " +
+               "start the server while the port is taken. To fix: close that program, or move it to " +
+               "another port (this server's port $Port is fixed in main.py). The server is started " +
+               "automatically once :$Port is free.")
+}
+$script:VerifiedServerPid = 0
+
 function Test-ServerUp {
     # A TCP-only connect check cannot detect the failure mode where the port stays
     # LISTENING but the asyncio event loop is dead (every request times out, CLOSE_WAIT
@@ -168,22 +369,41 @@ function Test-ServerUp {
     # opposite fixes, so the loop could not be diagnosed from what was recorded -- only from
     # standing next to the machine. $script:LastServerCheck now carries the distinction so the
     # next occurrence names itself.
+    #
+    # AND AN ANSWER IS NOT PROOF OF WHO ANSWERED (D13). Any HTTP status used to count as alive,
+    # so a different program on :$Port -- a dev server's 404, a directory listing -- was taken
+    # for the server, and main.py was never started. Now a 200 counts only when the body is
+    # main.py's /health answer (Get-HealthServerPid) AND the pid it reports is this checkout's
+    # server (Get-ProcessVerdict; verified once per pid, not every tick). An HTTP ERROR still
+    # counts as alive when the port's owner is this checkout's main.py -- a loop that answers
+    # at all is not wedged, which is why "any answer" was accepted in the first place -- and
+    # as "foreign" otherwise. A "foreign" result is what the main loop and Start-Server act on.
     $script:LastServerCheck = "unknown"
+    $body = $null
     try {
         $req = [System.Net.WebRequest]::Create("http://127.0.0.1:$Port/health")
         $req.Method = "GET"
         $req.Timeout = 5000
         $req.ReadWriteTimeout = 5000
         $resp = $req.GetResponse()
+        try { $body = (New-Object System.IO.StreamReader($resp.GetResponseStream())).ReadToEnd() } catch { $body = $null }
         $resp.Close()
-        $script:LastServerCheck = "ok"
-        return $true
     } catch [System.Net.WebException] {
         $r = $_.Exception.Response
         if ($r) {
+            $code = 0
+            try { $code = [int]$r.StatusCode } catch { }
             $r.Close()
-            $script:LastServerCheck = "answered"
-            return $true                        # any HTTP status = app responded = alive
+            $listeners = Get-PortListenerPids
+            $verdicts = @($listeners.Pids | ForEach-Object { Get-ProcessVerdict $_ })
+            if (@($verdicts | Where-Object { $_.Ours -eq $true }).Count -gt 0) {
+                $script:LastServerCheck = "answered HTTP $code (this checkout's server owns :$Port)"
+                return $true
+            }
+            $who = (@($verdicts | ForEach-Object { $_.Desc }) -join " | ")
+            if (-not $who) { $who = "a process that could not be identified" }
+            $script:LastServerCheck = "foreign: HTTP $code on /health from $who"
+            return $false
         }
         $script:LastServerCheck = [string]$_.Exception.Status   # Timeout / ConnectFailure / ...
         return $false
@@ -191,6 +411,25 @@ function Test-ServerUp {
         $script:LastServerCheck = "threw: " + $_.Exception.GetType().Name
         return $false
     }
+    $serverPid = Get-HealthServerPid $body
+    if ($null -eq $serverPid) {
+        $snippet = ""
+        if ($body) { $snippet = ($body -replace '\s+', ' ').Trim(); if ($snippet.Length -gt 80) { $snippet = $snippet.Substring(0, 80) + "..." } }
+        $script:LastServerCheck = "foreign: HTTP 200 on /health, but not main.py's answer ($snippet)"
+        return $false
+    }
+    if ($serverPid -ne $script:VerifiedServerPid) {
+        $v = Get-ProcessVerdict $serverPid
+        if ($v.Ours -eq $false) {
+            $script:LastServerCheck = "foreign: a main.py /health answer from $($v.Desc), which is not this checkout's server"
+            return $false
+        }
+        # $null (cannot tell) is accepted: the answer has main.py's shape, and refusing it would
+        # restart-loop a healthy server on a machine where process details are unreadable.
+        if ($v.Ours -eq $true) { $script:VerifiedServerPid = $serverPid }
+    }
+    $script:LastServerCheck = "ok"
+    return $true
 }
 
 
@@ -477,6 +716,24 @@ function Start-Server {
     # "was it alive right now" AFTER that cleanup runs and the two are indistinguishable from
     # state alone; only a snapshot taken NOW, before anything here acts, can tell "we ended it"
     # apart from "it had already ended".
+    #
+    # (Two read-only steps run first; neither stops anything. The interpreter is re-decided
+    # (D2, Update-PythonInterpreter), and the port's holders are identified (D13): when every
+    # holder is something other than this checkout's server, nothing is stopped and nothing is
+    # launched -- a new main.py could not bind anyway -- and the log says who holds it and
+    # what to do. See the block above Get-PortListenerPids.)
+    Update-PythonInterpreter "the server launch"
+    $listeners = Get-PortListenerPids
+    $oursOnPort = @()
+    $foreignOnPort = @()
+    foreach ($holderPid in $listeners.Pids) {
+        $v = Get-ProcessVerdict $holderPid
+        if ($v.Ours -eq $true) { $oursOnPort += $holderPid } else { $foreignOnPort += $v }
+    }
+    if ($foreignOnPort.Count -gt 0 -and $oursOnPort.Count -eq 0) {
+        Write-ForeignPortHolderLog $foreignOnPort
+        return
+    }
     $prevProc = $script:ServerProc
     $prevLaunchAt = $script:LastLaunchAt
     $prevWasAlive = $false
@@ -497,15 +754,16 @@ function Start-Server {
     # Kill the stale instance FIRST. A wedged main.py (dead event loop, CLOSE_WAIT
     # pile-up -- seen twice on 2026-06-12/13) keeps $Port LISTENING, so a new instance
     # can't bind and the supervisor restart-loops forever while the outage persists.
-    # Scope: the process(es) owning $Port + any main.py launched from this repo's venv.
-    try {
-        Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop |
-            Select-Object -ExpandProperty OwningProcess -Unique |
-            ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
-    } catch {}
+    # Scope: the port's holders that are THIS CHECKOUT'S main.py (D13 -- it used to be every
+    # holder), any main.py launched from this checkout, and the server this supervisor launched
+    # (which on a PATH python names no checkout in its command line). A foreign holder that
+    # shares the port with ours (IPv4/IPv6 on one port) is left alone.
+    foreach ($holderPid in $oursOnPort) { Stop-Process -Id $holderPid -Force -ErrorAction SilentlyContinue }
+    foreach ($f in $foreignOnPort) { Write-Log "leaving $($f.Desc) alone on :$Port -- it is not this checkout's server" }
     Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-        $_.CommandLine -match 'main\.py' -and $_.CommandLine -like "*$Root*"
+        Test-IsThisCheckoutServerCommandLine ([string]$_.CommandLine) $Root
     } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    if ($prevWasAlive) { try { Stop-Process -Id $prevProc.Id -Force -ErrorAction SilentlyContinue } catch { } }
     Start-Sleep -Seconds 2
     $script:LastLaunchAt = Get-Date
     Push-Location $Root
@@ -655,6 +913,7 @@ $script:TunnelHostProc = $null
 # this point, so it can never double-relaunch.
 #
 # Opt-out: set MCP_FLEET_AUTORESUME=0 (or false/no/off) in the environment. Default ON.
+$FleetDir = Join-Path $Root ".fleet"
 $FleetMarkerPath = Join-Path $Root ".fleet\fleet_run_active.json"
 $ReviewMarkerPath = Join-Path $Root ".fleet\review_run_active.json"
 $script:LastReviewResumeKey = ""
@@ -790,6 +1049,24 @@ function Test-FleetShouldAutoResume {
     return -not (Test-PidAlive -ProcId $procId)
 }
 
+# A COORDINATOR OF THIS CHECKOUT THAT IS ALREADY RUNNING. A MIRROR, NOT A SHARED COPY, of
+# start_all.ps1's function of the same name (added in 1f4588a): sharing it means moving it into
+# a dot-sourced helper and changing start_all.ps1 to load it, and start_all.ps1 is not this
+# change's file. The body is kept textually identical ($Root and $root are one variable to
+# PowerShell), and scripts/test_supervisor_fleet_resume_guard.py fails if the two ever differ.
+function Get-ThisCheckoutFleetCoordinatorPids {
+    try {
+        return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+                 Where-Object { $_.CommandLine -and ($_.CommandLine -match 'relay[\\/.]fleet_runner') -and
+                                ($_.CommandLine -like "*$root*") } |
+                 ForEach-Object { $_.ProcessId })
+    } catch { return @() }
+}
+
+# THE RUN THIS SUPERVISOR JUST RESUMED, until it has written its own marker. See
+# Get-FleetReapHoldReason.
+$script:ResumedFleet = $null
+
 function Invoke-FleetAutoResume {
     # Returns $true iff it (would have) relaunched the coordinator; $false otherwise.
     # -DryRun logs the would-be relaunch command without starting a process.
@@ -802,6 +1079,19 @@ function Invoke-FleetAutoResume {
     if (-not (Test-FleetShouldAutoResume $marker)) {
         return $false
     }
+    # A DEAD PID IN THE MARKER DOES NOT MEAN NOTHING IS RUNNING. A coordinator resumed a moment
+    # ago -- by start_all's resume_interrupted_fleet.py, or by hand -- writes its fresh marker
+    # only after its imports and ledger load, so for that window the marker still names the
+    # dead pid. Resuming again then puts two coordinators on one .fleet directory, each
+    # overwriting the other's status. start_all skips its resume in the same case (1f4588a,
+    # Get-FleetResumeSkipReason); this is the supervisor's side of that rule.
+    $runningCoordinators = @(Get-ThisCheckoutFleetCoordinatorPids | Where-Object { $_ })
+    if ($runningCoordinators.Count -gt 0) {
+        Write-Log ("fleet run marker names dead pid $($marker.pid), but a fleet coordinator of this checkout " +
+                   "is already running (pid " + ($runningCoordinators -join ", ") + ") -- not resuming a second one")
+        return $false
+    }
+    Update-PythonInterpreter "the fleet auto-resume"
     $resumeArgs = @()
     if ($marker.resume_argv) { $resumeArgs = @($marker.resume_argv) }
     $resumeArgs = @($resumeArgs) + "--resume"
@@ -823,6 +1113,7 @@ function Invoke-FleetAutoResume {
             -WorkingDirectory $Root -WindowStyle Hidden -PassThru
         Register-AutoResumeRunner -Proc $fleetProc -LaunchTime $fleetLaunchAt -Kind "fleet" `
             -CommandLine ('"' + $Py + '" -m relay.fleet_runner ' + $shown)
+        if ($fleetProc) { $script:ResumedFleet = @{ Proc = $fleetProc; OldPid = [int]$marker.pid } }
         Write-Log "fleet coordinator relaunched with --resume"
         try {
             & $Py -c "import sys; sys.path.insert(0, r'$Root'); from tools.notify_ops import notify_desktop; notify_desktop('Fleet auto-resumed', 'An interrupted overnight fleet run was detected after startup and relaunched with --resume.')" 2>$null | Out-Null
@@ -891,6 +1182,7 @@ function Invoke-ReviewAutoResume {
         Write-Log "review auto-resume skipped: marker has no resume_argv"
         return $false
     }
+    Update-PythonInterpreter "the review auto-resume"
     $key = "$($marker.started)|$($marker.stamp)|$($marker.restart_count)"
     $since = ((Get-Date) - $script:LastReviewResumeAttempt).TotalSeconds
     if ($key -eq $script:LastReviewResumeKey -and $since -lt 300) { return $false }
@@ -917,14 +1209,75 @@ function Invoke-ReviewAutoResume {
 # -- Queue delivery: the reaper + router pass, and the wait between ticks -----------------------
 # The two steps the tick has always run back to back, now callable from two places: the full
 # tick (unchanged position and order) and the express pass inside Wait-ForNextTick below.
+# THE REAP MUST NOT DELETE THE MARKER OF A RUN THAT IS BEING RESUMED. The reaper removes a
+# marker whose pid is dead -- and a marker whose pid is dead is exactly what a resume reads and
+# leaves in place until the resumed coordinator writes its own, after its imports and ledger
+# load: tens of seconds, i.e. several reap passes (every tick, and every express pass in
+# Wait-ForNextTick). Reaping inside that window finalises status/history of a run that is being
+# continued, and if the resumed coordinator then dies before writing its marker, the record
+# that the run was interrupted is gone and no later boot can resume it.
+#
+# A GUARD, NOT AN ORDERING. The resume must come BEFORE any reap (the reap deletes the file the
+# resume reads), and the window is after the resume and longer than a tick, so no order of the
+# first loop closes it. The reap is withheld while the marker names a dead pid AND a resumer of
+# it is alive: the coordinator this supervisor launched ($script:ResumedFleet), or any
+# relay.fleet_runner of this checkout started with --resume (start_all's
+# resume_interrupted_fleet.py, or a person). It lifts itself as soon as the marker names a live
+# pid (the resumed run wrote its own; the reaper leaves that alone anyway), or the resumer has
+# exited (then the marker is again an interrupted run's, and Invoke-AutoResumeRunnerCheck
+# reports how the runner ended).
+$script:FleetReapHeldFor = ""
+
+function Get-FleetReapHoldReason {
+    # "" when the reap may run, else who it is being withheld for.
+    $marker = Get-FleetActiveMarker
+    if ($null -eq $marker) { $script:ResumedFleet = $null; return "" }
+    $markerPid = 0
+    try { $markerPid = [int]$marker.pid } catch { $markerPid = 0 }
+    if ($markerPid -gt 0 -and (Test-PidAlive -ProcId $markerPid)) { $script:ResumedFleet = $null; return "" }
+    $holders = @()
+    if ($script:ResumedFleet) {
+        $gone = $true
+        try { $script:ResumedFleet.Proc.Refresh(); $gone = $script:ResumedFleet.Proc.HasExited } catch { $gone = $true }
+        if ($gone) { $script:ResumedFleet = $null }
+        else { $holders += ("pid " + $script:ResumedFleet.Proc.Id + " (resumed by this supervisor)") }
+    }
+    # One process-table scan (the shared detection), then a per-pid read of the few it found.
+    # Reached only while a dead-pid marker exists, never on an ordinary tick.
+    foreach ($coordPid in @(Get-ThisCheckoutFleetCoordinatorPids | Where-Object { $_ })) {
+        if ($script:ResumedFleet -and $coordPid -eq $script:ResumedFleet.Proc.Id) { continue }
+        $cl = ""
+        try { $cl = [string](Get-CimInstance Win32_Process -Filter "ProcessId=$coordPid" -ErrorAction Stop).CommandLine } catch { }
+        if ($cl -match '(^|\s)--resume(\s|$)') {
+            $holders += ("pid " + $coordPid + " (a --resume coordinator of this checkout)")
+        }
+    }
+    if ($holders.Count -eq 0) { return "" }
+    return ("marker pid $markerPid is dead but its run is being resumed by " + ($holders -join ", "))
+}
+
 function Invoke-FleetReap {
     # Clear phantom fleet runs whose coordinator process died without a supervisor restart
     # (Invoke-FleetAutoResume above only runs once at supervisor startup, so a mid-session
     # coordinator kill/crash would otherwise leave .fleet/status.json stuck showing
     # running=true forever). Best-effort, idempotent, never relaunches anything -- see
     # relay/fleet_reaper.py.
+    #
+    # THE FLEET DIRECTORY IS PASSED, NOT LEFT TO THE WORKING DIRECTORY. reap_stale_run()
+    # defaults to the RELATIVE ".fleet", and python inherits this process's working directory
+    # -- and the logon launcher (start_background_hidden.vbs) sets CurrentDirectory to
+    # scripts\, where there is no .fleet, before starting start_all, which starts this script
+    # without -WorkingDirectory. Consistent with that, this machine's supervisor log
+    # (2026-09-24, 1698 lines) shows exactly one reap, on 2026-09-09.
+    $hold = Get-FleetReapHoldReason
+    if ($hold) {
+        if ($hold -ne $script:FleetReapHeldFor) { Write-Log "stale-run reap withheld: $hold" }
+        $script:FleetReapHeldFor = $hold
+        return
+    }
+    $script:FleetReapHeldFor = ""
     try {
-        $reapOut = & $Py -c "import sys; sys.path.insert(0, r'$Root'); from relay.fleet_reaper import reap_stale_run; import json; r = reap_stale_run(); print(json.dumps(r) if r else '')" 2>$null
+        $reapOut = & $Py -c "import sys; sys.path.insert(0, r'$Root'); from relay.fleet_reaper import reap_stale_run; import json; r = reap_stale_run(r'$FleetDir'); print(json.dumps(r) if r else '')" 2>$null
         if ($reapOut) { Write-Log "reaped stale fleet run: $reapOut" }
     } catch { }
 }
@@ -1087,12 +1440,16 @@ $serverMiss = 0
 # could not be inspected' indistinguishable from 'nothing owns it' -- and the branch below
 # calls Start-Server, whose first act is to kill whatever owns the port. An inspection that
 # fails must not license that; the debounce is the correct behaviour when we cannot tell.
+#
+# AND AN EMPTY ANSWER IS NOT A FAILED QUERY EITHER: Get-NetTCPConnection throws ObjectNotFound
+# when nothing listens, which the plain catch here used to read as "could not inspect", so this
+# launch never happened (see Get-PortListenerPids). The helper tells the two apart.
 $portQueried = $false
-try {
-    $portOwner = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop
+$portOwner = $null
+$startupListeners = Get-PortListenerPids
+if ($startupListeners.Queried) {
     $portQueried = $true
-} catch {
-    $portOwner = $null
+    if (@($startupListeners.Pids).Count -gt 0) { $portOwner = $startupListeners.Pids }
 }
 if ($portQueried -and -not $portOwner) {
     Write-Log "nothing is listening on :$Port at startup -> launching the server now, without the debounce"
@@ -1110,6 +1467,10 @@ while ($true) {
     # nothing ever re-runs start_all.bat (which also detects and restarts this drift, but
     # only at the moment it is invoked). Bare-name compare (ignores the ".cluster" suffix)
     # so a URL-only .env rewrite of the SAME tunnel never causes a needless churn.
+    #
+    # First, the interpreter every python launch of this tick uses (D2): one Test-Path unless a
+    # .venv has appeared that this supervisor is not using yet. See Update-PythonInterpreter.
+    Update-PythonInterpreter "this tick's reaper and queue drain"
     $freshTn = Get-EnvTunnelName
     if ($freshTn -and ((Get-BareTunnelName $freshTn) -ne (Get-BareTunnelName $TunnelName))) {
         # A NEW NAME IS A CLAIM, AND IT USED TO BE BELIEVED WITHOUT CHECKING.
@@ -1203,9 +1564,14 @@ while ($true) {
         $reason = $script:LastServerCheck
         $booting = $false
         if (-not (Test-PortListening)) {
+            # Same identity rule as Start-Server's (Test-IsThisCheckoutServerCommandLine), plus
+            # the process this supervisor launched, whose command line on a PATH python names
+            # no checkout.
             $alive = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-                       Where-Object { $_.CommandLine -match 'main\.py' -and
-                                      $_.CommandLine -like "*$Root*" })
+                       Where-Object { Test-IsThisCheckoutServerCommandLine ([string]$_.CommandLine) $Root })
+            if ($alive.Count -eq 0 -and $script:ServerProc) {
+                try { $script:ServerProc.Refresh(); if (-not $script:ServerProc.HasExited) { $alive = @($script:ServerProc) } } catch { }
+            }
             if ($alive.Count -gt 0 -and $script:LastLaunchAt -and
                 ((Get-Date) - $script:LastLaunchAt).TotalSeconds -lt $StartupGraceSeconds) {
                 $booting = $true
