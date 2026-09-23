@@ -260,6 +260,7 @@ class ChatWindow : Window, IChatSendEffects
         if (k == "fleet_send_failed") return ja ? "フリートへの受け渡しに失敗しました。送信は行われていません。" : "Could not hand this to the fleet -- nothing was sent.";
         if (k == "send_offline") return ja ? "ブリッジに接続できません。送信していません。" : "Can't reach the bridge. Nothing was sent.";
         if (k == "retry_start_stack") return ja ? "スタックを起動して再試行" : "Start the stack and retry";
+        if (k == "bridge_auth_problem") return ja ? "ブリッジが要求を受け付けませんでした（認証またはバージョンの不一致）。" : "The bridge refused the request (authentication or version mismatch).";
         if (k == "reload_transcript") return ja ? "再読み込み" : "Reload";
         // ── sidebar section / action labels ──────────────────────────────────────
         if (k == "sec_pinned")   return ja ? "ピン留め"   : "Pinned";
@@ -1655,7 +1656,7 @@ class ChatWindow : Window, IChatSendEffects
             // is what made clicking a past chat "load forever, then error").
             try
             {
-                string hist = HttpGet("/history?url=" + Uri.EscapeDataString(url), 25000);
+                string hist = BridgeCall("/history?url=" + Uri.EscapeDataString(url), 25000);
                 var root = _cjs.DeserializeObject(hist) as Dictionary<string, object>;
                 if (root != null && root.ContainsKey("messages") && root["messages"] is object[])
                     foreach (object o in (object[])root["messages"])
@@ -3621,7 +3622,7 @@ class ChatWindow : Window, IChatSendEffects
         var newConv = new Conversation();
         new Thread((ThreadStart)delegate
         {
-            try { HttpGet("/new"); _pageConv = newConv; } catch { }
+            try { BridgeCall("/new"); _pageConv = newConv; } catch { }
         }) { IsBackground = true }.Start();
         _conv = newConv;
         _conv.Ts = (DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
@@ -3699,7 +3700,7 @@ class ChatWindow : Window, IChatSendEffects
         if (!string.IsNullOrEmpty(c.ConvUrl))
             new Thread((ThreadStart)delegate
             {
-                try { HttpGet("/switch?url=" + Uri.EscapeDataString(c.ConvUrl)); _pageConv = c; } catch { }
+                try { BridgeCall("/switch?url=" + Uri.EscapeDataString(c.ConvUrl)); _pageConv = c; } catch { }
             }) { IsBackground = true }.Start();
     }
 
@@ -3737,7 +3738,7 @@ class ChatWindow : Window, IChatSendEffects
             {
                 try
                 {
-                    HttpGet("/forget?url=" + Uri.EscapeDataString(url)
+                    BridgeCall("/forget?url=" + Uri.EscapeDataString(url)
                             + "&sid=" + Uri.EscapeDataString(cid));
                 }
                 catch { }
@@ -3979,7 +3980,7 @@ class ChatWindow : Window, IChatSendEffects
             new Thread((ThreadStart)delegate
             {
                 string j = null; string err = null;
-                try { j = HttpGet("/agent_conversations", 120000); }
+                try { j = BridgeCall("/agent_conversations", 120000); }
                 catch (Exception ex) { err = ex.GetType().Name; }
                 var orphans = new List<Conversation>();
                 int n = 0;
@@ -4064,7 +4065,7 @@ class ChatWindow : Window, IChatSendEffects
                         {
                             // a Copilot-side delete (goto + menu ops + GUID-disappearance verify) can take
                             // ~40s; give it 120s so the HTTP call doesn't time out mid-delete.
-                            var j = HttpGet("/delete?url=" + Uri.EscapeDataString(c.ConvUrl) + "&title=" + Uri.EscapeDataString(c.Title ?? ""), 120000);
+                            var j = BridgeCall("/delete?url=" + Uri.EscapeDataString(c.ConvUrl) + "&title=" + Uri.EscapeDataString(c.Title ?? ""), 120000);
                             ok = j != null && j.Contains("\"ok\": true");
                             if (!ok) reason = ExtractField(j, "reason") ?? ExtractField(j, "error");
                         }
@@ -4241,7 +4242,7 @@ class ChatWindow : Window, IChatSendEffects
         if (mode == 1) { Toast(T("t_local")); return; }
         if (mode == 2)
         {
-            if (!string.IsNullOrEmpty(url)) new Thread((ThreadStart)delegate { try { HttpGet("/switch?url=" + Uri.EscapeDataString(url)); } catch { } }) { IsBackground = true }.Start();
+            if (!string.IsNullOrEmpty(url)) new Thread((ThreadStart)delegate { try { BridgeCall("/switch?url=" + Uri.EscapeDataString(url)); } catch { } }) { IsBackground = true }.Start();
             Toast(T("t_open"));
             return;
         }
@@ -4250,14 +4251,14 @@ class ChatWindow : Window, IChatSendEffects
         new Thread((ThreadStart)delegate
         {
             bool ok = false;
-            try { var j = HttpGet("/delete?url=" + Uri.EscapeDataString(url) + "&title=" + Uri.EscapeDataString(title)); ok = j != null && j.Contains("\"ok\": true"); } catch { }
+            try { var j = BridgeCall("/delete?url=" + Uri.EscapeDataString(url) + "&title=" + Uri.EscapeDataString(title)); ok = j != null && j.Contains("\"ok\": true"); } catch { }
             Dispatcher.BeginInvoke(new Action(delegate
             {
                 if (ok) Toast(T("t_auto_ok"));
                 else
                 {
                     Toast(T("t_auto_fail"));
-                    new Thread((ThreadStart)delegate { try { HttpGet("/switch?url=" + Uri.EscapeDataString(url)); } catch { } }) { IsBackground = true }.Start();
+                    new Thread((ThreadStart)delegate { try { BridgeCall("/switch?url=" + Uri.EscapeDataString(url)); } catch { } }) { IsBackground = true }.Start();
                 }
             }));
         }) { IsBackground = true }.Start();
@@ -4663,7 +4664,9 @@ class ChatWindow : Window, IChatSendEffects
     void IChatSendEffects.AddUser(string text) { AddUser(text); }
     void IChatSendEffects.AddAssistant(string text) { AddAssistant(text); }
     void IChatSendEffects.NewChat() { NewChat(); }
-    string IChatSendEffects.HttpGet(string path, int timeoutMs) { return HttpGet(path, timeoutMs); }
+    // The interface keeps its historical name (the send-path oracle records "HttpGet|..."); it is
+    // an authenticated POST now, like every other bridge call from this window.
+    string IChatSendEffects.HttpGet(string path, int timeoutMs) { return BridgeCall(path, timeoutMs); }
     void IChatSendEffects.SetBridgeReachable(bool ok) { _bridgeReachable = ok; }
     void IChatSendEffects.SetDot(string state) { SetDot(state); }
     void IChatSendEffects.RefreshIdleDot() { RefreshIdleDot(); }
@@ -4830,7 +4833,7 @@ class ChatWindow : Window, IChatSendEffects
         new Thread((ThreadStart)delegate
         {
             string r = null;
-            try { r = HttpGet("/upload?path=" + Uri.EscapeDataString(path)); } catch { }
+            try { r = BridgeCall("/upload?path=" + Uri.EscapeDataString(path)); } catch { }
             bool ok = r != null && r.Contains("\"ok\": true");
             Dispatcher.BeginInvoke(new Action(delegate
             {
@@ -4867,17 +4870,22 @@ class ChatWindow : Window, IChatSendEffects
         string errMsg = null;
         try
         {
-            var url = _bridge + "/stream?msg=" + Uri.EscapeDataString(msg);
-            var req = (HttpWebRequest)WebRequest.Create(url);
             // /review and /security-review run a full-repo fleet pass that can exceed the
             // default 10-minute cap -- give those two commands a 60-minute window instead.
             string msgTrim = (msg ?? "").TrimStart();
             bool isLongReview = msgTrim.StartsWith("/review", StringComparison.OrdinalIgnoreCase)
                 || msgTrim.StartsWith("/security-review", StringComparison.OrdinalIgnoreCase);
             int reqTimeoutMs = isLongReview ? 3600000 : 600000;
-            req.Timeout = reqTimeoutMs; req.ReadWriteTimeout = reqTimeoutMs;
-            _activeReq = req;
-            using (var resp = (HttpWebResponse)req.GetResponse())
+            // An authenticated POST (ui/BridgeClient.cs). Every request it makes is kept in
+            // _activeReq as it is made, so Stop can Abort() whichever one is in flight.
+            HttpWebResponse opened;
+            try
+            {
+                opened = BridgeClient.Open(_bridge, "/stream?msg=" + Uri.EscapeDataString(msg), reqTimeoutMs,
+                                           delegate(HttpWebRequest r) { _activeReq = r; });
+            }
+            catch (BridgeClientException bex) { NoteBridgeProblem(bex); throw; }
+            using (var resp = opened)
             using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
             {
                 string line; bool done = false;
@@ -4971,7 +4979,7 @@ class ChatWindow : Window, IChatSendEffects
         }));
         try
         {
-            var j = HttpGet("/conv");
+            var j = BridgeCall("/conv");
             var u = ExtractField(j, "url");
             if (!string.IsNullOrEmpty(u))
             {
@@ -5127,17 +5135,35 @@ class ChatWindow : Window, IChatSendEffects
         catch { }
     }
 
-    string HttpGet(string path) { return HttpGet(path, 60000); }
+    string BridgeCall(string path) { return BridgeCall(path, 60000); }
 
-    string HttpGet(string path, int timeoutMs)
+    // Every bridge endpoint except the reachability probe goes through here: an authenticated
+    // POST (ui/BridgeClient.cs). A refusal the person has to act on -- no token file, a bridge
+    // older than this window -- is ALSO put in the banner, because most call sites catch and
+    // swallow exceptions, and a door that fails in silence is how "nothing happened" looks.
+    string BridgeCall(string path, int timeoutMs)
     {
         if (WindowSelfTest.Active) throw new InvalidOperationException("--selftest touches no network: " + path);
-        var req = (HttpWebRequest)WebRequest.Create(_bridge + path);
-        req.Timeout = timeoutMs;
-        req.ReadWriteTimeout = timeoutMs;
-        using (var resp = (HttpWebResponse)req.GetResponse())
-        using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
-            return sr.ReadToEnd();
+        try { return BridgeClient.Call(_bridge, path, timeoutMs); }
+        catch (BridgeClientException ex) { NoteBridgeProblem(ex); throw; }
+    }
+
+    DateTime _bridgeProblemShown = DateTime.MinValue;
+
+    void NoteBridgeProblem(Exception ex)
+    {
+        var msg = ex.Message;
+        try
+        {
+            Dispatcher.BeginInvoke(new Action(delegate
+            {
+                // At most once every 30 s: a sidebar refresh can make several calls in a row.
+                if ((DateTime.UtcNow - _bridgeProblemShown).TotalSeconds < 30) return;
+                _bridgeProblemShown = DateTime.UtcNow;
+                ShowRecoveryBanner(T("bridge_auth_problem") + "\n" + msg, T("close"), delegate { HideBanner(); });
+            }));
+        }
+        catch { }
     }
 
     // Map a raw bridge delete reason to a short, stable bucket key for the summary.

@@ -224,7 +224,7 @@ eventsへ退避する方式です。DB容量は完了時のWAL checkpointで抑�
 .\scripts\start_bridge.ps1 -Keepalive    # 常時稼働（クラッシュ時も自動再起動）
 ```
 
-`start_bridge.ps1` は bridge 専用 Edge（`:9223`）を立て、`bridge/copilot_bridge.py` を起動します。`http://127.0.0.1:8765` でネイティブチャット UI が開きます。fleet の Edge（`:9222`）とは完全に別プロファイルなので、fleet 走行中でも同時に使えます。
+`start_bridge.ps1` は bridge 専用 Edge（`:9223`）を立て、`bridge/copilot_bridge.py` を起動します。チャットは CopilotChat ウィンドウ（`ui\CopilotChat.exe`）か `python bridge\session_cli.py` から使います。bridge への要求はすべて起動ごとのトークン（`X-Bridge-Token`、`%LOCALAPPDATA%\m365-copilot-companion\bridge\token-<port>`、本人のみ読める ACL）付きの POST が必要で、ブラウザからの要求は拒否されます（`bridge/bridge_auth.py`）。fleet の Edge（`:9222`）とは完全に別プロファイルなので、fleet 走行中でも同時に使えます。
 
 ---
 

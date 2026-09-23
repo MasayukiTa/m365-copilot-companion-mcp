@@ -72,7 +72,7 @@ FastMCP のエントリポイント。`tools/*.py` の関数を `TOOLS` タプ�
 
 ### bridge（チャット UI・`bridge/copilot_bridge.py`）
 
-Premium / Direct Line を使わず、stdlib の `http.server` だけで自己完結の HTML チャットを配信し、Copilot の応答を差分スクレイピングでトークン単位ストリーミングします。ブラウザで `http://127.0.0.1:8765` にアクセスして使います。bridge は専用プロファイル `copilot-bridge-edge`（CDP `:9223`）で立つので、fleet の Edge（`:9222`）と取り合わず同時に使えます。
+Premium / Direct Line を使わず、stdlib の `http.server` だけで Copilot の応答を差分スクレイピングでトークン単位ストリーミングします。クライアントは CopilotChat ウィンドウと `bridge/session_cli.py`。状態を変える要求とページを読む要求はすべて POST + 起動ごとのトークン（`X-Bridge-Token`、本人のみ読めるファイル）必須で、Origin / Referer / cross-site の Sec-Fetch-Site / loopback 以外の Host を持つ要求は拒否します（`bridge/bridge_auth.py`）。ブラウザ用のチャットページは廃止しました。bridge は専用プロファイル `copilot-bridge-edge`（CDP `:9223`）で立つので、fleet の Edge（`:9222`）と取り合わず同時に使えます。
 
 ネイティブ WPF チャット `ui/CopilotChat.cs` も裏は同じ経路です。
 

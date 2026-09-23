@@ -372,20 +372,18 @@ _BRIDGE_JUDGE_FENCE = (
 
 
 def _bridge_get(path: str, query: dict, timeout: float) -> dict:
-    """One GET to the bridge, decoded as JSON. Raises JudgeTransportError on any failure.
+    """One authenticated request to the bridge, decoded as JSON. Raises JudgeTransportError on any failure.
 
     The bridge's control endpoints (/new, /status) answer JSON; /stream answers SSE and is read
     separately by _bridge_stream. Kept narrow on purpose: a judge that could reach arbitrary
     bridge paths would be a judge that can act.
     """
     import json as _json
-    import urllib.parse
-    import urllib.request
-    url = bridge_base_url() + path
-    if query:
-        url += "?" + urllib.parse.urlencode(query)
+    from bridge import bridge_auth
+    # AN AUTHENTICATED POST (bridge/bridge_auth.py): the bridge refuses GET on /new and wants
+    # its per-start token. /status is asked the same way, so the answer is the full one.
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        with bridge_auth.request(bridge_base_url(), path, query, timeout=timeout) as resp:
             body = resp.read().decode("utf-8", "replace")
     except Exception as exc:
         raise JudgeTransportError("bridge %s unreachable (%s: %s)"
@@ -440,7 +438,7 @@ def parse_bridge_stream(body: str) -> str:
 
 
 def _bridge_stream(msg: str, timeout: float) -> str:
-    """POST-less GET to /stream, reassembling the SSE stream into the final answer text.
+    """Authenticated POST to /stream, reassembling the SSE stream into the final answer text.
 
     The bridge emits Server-Sent Events: `data: {json}` lines, each carrying a `delta` (append)
     or a `replace` (supersede everything so far), ended by a `done` event. `replace` is the
@@ -448,11 +446,10 @@ def _bridge_stream(msg: str, timeout: float) -> str:
     stream that never produced text is a transport failure, not an empty verdict -- parse_verdict
     would read empty text as REQUIRE_HUMAN, but reporting it here names the real problem.
     """
-    import urllib.parse
-    import urllib.request
-    url = bridge_base_url() + "/stream?" + urllib.parse.urlencode({"msg": msg})
+    from bridge import bridge_auth
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        with bridge_auth.request(bridge_base_url(), "/stream", {"msg": msg},
+                                 timeout=timeout) as resp:
             body = resp.read().decode("utf-8", "replace")
     except Exception as exc:
         raise JudgeTransportError("bridge /stream failed (%s: %s)"

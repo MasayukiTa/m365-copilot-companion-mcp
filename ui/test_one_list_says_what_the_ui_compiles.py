@@ -85,6 +85,14 @@ EXEMPT = {
     "tests/_install_path_harness.py":
         "compiles a throwaway uv.exe STUB from a one-file C# snippet it writes itself, so the "
         "install-path tests can run setup.bat without downloading uv; not a UI binary",
+    "scripts/test_preflight_wsh_and_start_all_fallback.py":
+        "compiles a throwaway wscript.exe STUB from a C# snippet it writes itself (it logs its "
+        "arguments and exits with a chosen code), so start_all.bat's fallback when Windows Script "
+        "Host is disabled can be exercised; not a UI binary",
+    "scripts/test_setup_devtunnel_signature.py":
+        "compiles a throwaway, deliberately UNSIGNED devtunnel.exe stub from a one-line C# "
+        "snippet it writes itself, so setup_devtunnel.ps1's Authenticode check can be shown to "
+        "refuse it; not a UI binary",
     "ui/test_the_ui_and_the_fleet_agree_on_the_command_channel.py":
         "compiles ui/FleetCommands.cs ALONE into a throwaway console exe, on purpose: it is "
         "the cross-language contract test for that one file's writer, not a build of the UI",
