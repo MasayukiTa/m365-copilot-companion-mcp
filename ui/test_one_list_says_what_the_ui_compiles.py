@@ -92,16 +92,16 @@ EXEMPT = {
         "compiles ui/ChatSend.cs + ui/FleetCommands.cs with the test-only oracle and harness in "
         "ui/testdata/ into a throwaway console exe: it runs the chat's send path without WPF, "
         "which is the reason ChatSend.cs is its own file, not a build of the UI",
+    "ui/test_the_bridge_client_sends_the_token.py":
+        "compiles ui/BridgeClient.cs with the test-only driver ui/testdata/BridgeClientHarness.cs "
+        "into a throwaway console exe and runs it against a real bridge Handler on a free port: "
+        "it proves the chat's bridge calls carry the token, which is the reason BridgeClient.cs "
+        "is its own WPF-free file, not a build of the UI",
     "ui/test_a_submitted_task_is_on_top_at_once.py":
         "compiles ui/SubmittedTasks.cs + ui/FleetCommands.cs with the test-only driver in "
         "ui/harness/ into a throwaway console exe: it runs the cockpit's submitted-group merge "
         "and list order against real files without WPF, which is the reason SubmittedTasks.cs "
         "is its own file, not a build of the UI",
-    "ui/test_the_frozen_dot_hides_when_self_improvement_is_unused.py":
-        "compiles the SHIPPED ui/SelfImproveDashboard.cs + ui/Theme.cs (with WPF references, "
-        "since SelfImproveDashboardWindow extends Window) plus the test-only driver in "
-        "ui/harness/ into a throwaway console exe: it drives FrozenGate.Decide, the pure "
-        "health-strip-dot policy, directly -- not a build of either shipped UI binary",
 }
 
 #: ui/*.cs that are compiled by a TEST and by no Build line, on purpose -- each with the test
@@ -110,8 +110,8 @@ EXEMPT = {
 COMPILED_BY_A_TEST = {
     "ui/testdata/ChatDecisionsOriginal.cs": "ui/test_the_chat_window_sends_what_was_typed.py",
     "ui/testdata/ChatSendHarness.cs": "ui/test_the_chat_window_sends_what_was_typed.py",
+    "ui/testdata/BridgeClientHarness.cs": "ui/test_the_bridge_client_sends_the_token.py",
     "ui/harness/SubmittedTasksHarness.cs": "ui/test_a_submitted_task_is_on_top_at_once.py",
-    "ui/harness/FrozenGateHarness.cs": "ui/test_the_frozen_dot_hides_when_self_improvement_is_unused.py",
 }
 
 

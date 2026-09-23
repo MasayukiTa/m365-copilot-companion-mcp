@@ -9,6 +9,18 @@ term that means the checksum-guarded set of judge files to the engineer who name
 nothing to anyone else. The tool has to be usable by anyone in the company, not just the
 person who wrote the self-improvement loop.
 
+## Update, 2026-09-24
+
+The health-strip dot this was originally about (hs_frozen, commit 12b06fd) was itself removed
+from ui/FleetCockpit.cs on owner feedback in the same conversation: "自己改善の安全確認" did
+not fit the strip even in plain language, and "そもそも置く必要ある？" -- the strip was the
+wrong place for it at all, since the self-improvement loop already refuses to run on drift and
+the dashboard already shows the same fact with its own re-sign button. So FleetCockpit.cs no
+longer carries ANY string about this concept, plain or jargon; this file's checks now apply in
+practice only to ui/SelfImproveDashboard.cs, which keeps its own plain-language label
+(auth_intact = "自己改善の安全確認" / "Self-improvement check") on the authority section. Both
+files stay in SOURCES below so a jargon string that creeps back into either one is still caught.
+
 ## What this checks
 
 Every operator-visible string in ui/FleetCockpit.cs and ui/SelfImproveDashboard.cs -- labels,
@@ -71,10 +83,11 @@ def test_no_operator_visible_string_says_frozen_set(path):
 
 def test_the_replacement_wording_is_actually_present():
     """A guard against the trivial way to pass the test above: deleting the label instead of
-    replacing it. The plain-language label has to exist somewhere an operator reads it."""
-    fleet = (UI / "FleetCockpit.cs").read_text(encoding="utf-8", errors="replace")
+    replacing it. The plain-language label has to exist somewhere an operator reads it.
+
+    Only ui/SelfImproveDashboard.cs is checked here: ui/FleetCockpit.cs no longer has a health
+    dot for this concept at all (removed after 12b06fd; see the module docstring), so it is not
+    expected to carry either the jargon or its replacement any more."""
     dash = (UI / "SelfImproveDashboard.cs").read_text(encoding="utf-8", errors="replace")
-    assert "自己改善の安全確認" in fleet, "hs_frozen's Japanese label went missing, not just its jargon"
-    assert "Self-improvement check" in fleet, "hs_frozen's English label went missing, not just its jargon"
     assert "自己改善の安全確認" in dash, "auth_intact's Japanese label went missing, not just its jargon"
     assert "Self-improvement check" in dash, "auth_intact's English label went missing, not just its jargon"
