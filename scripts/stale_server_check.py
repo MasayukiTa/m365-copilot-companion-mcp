@@ -74,7 +74,12 @@ if _REPO_ROOT not in sys.path:
 #: the server process, so touching them must not trigger a server swap (that would
 #: break the "re-running is a no-op" contract for the common docs-only update).
 SERVER_CODE_PREFIXES: tuple[str, ...] = ("relay/", "tools/")
-SERVER_CODE_FILES: frozenset[str] = frozenset({"main.py"})
+#: requirements.txt names the PACKAGES the running server imported, so a change to it is a change
+#: the running server cannot see either. start_all.ps1 (Invoke-DependencySync) asks this rule with
+#: exactly that path after it has brought .venv up to date, so a server still holding the old
+#: packages is swapped by the same "never while a run or a bridge turn is live" decision as for a
+#: code change -- rather than by a second, separate restart path.
+SERVER_CODE_FILES: frozenset[str] = frozenset({"main.py", "requirements.txt"})
 
 #: Directories the BRIDGE itself imports from. copilot_bridge.py's own import lines name
 #: ``bridge.session_store``, ``bridge.review_command``, ``relay.copilot_autopilot_relay``,

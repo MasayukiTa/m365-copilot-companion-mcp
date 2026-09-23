@@ -60,6 +60,39 @@ function Http-Up([string]$url) {
     try { Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 $url | Out-Null; return $true } catch { return $false }
 }
 # ---------------------------------------------------------------------------
+# WHO STARTED THIS RUN (.setup\logs\start_all_runs.jsonl, one line per invocation).
+#
+# On 2026-09-24 full start_alls kept appearing (the splash) and could not be attributed: the
+# launchers (wscript running a .vbs) had already exited, and nothing recorded who had started
+# which run. So the lineage is read HERE, as the first thing the script does -- before the
+# launcher is gone -- and written with the lock wait and the outcome at the end
+# (New-StartAllRunRecord / Write-StartAllRunRecord). A parent that has already exited still
+# leaves its pid (ParentProcessId outlives it); a live pid whose process started AFTER this one
+# is a reused pid, not the parent, and is not reported as one.
+# ---------------------------------------------------------------------------
+function Get-LaunchLineage {
+    $l = [ordered]@{ parent_pid = 0; parent_name = ""; parent_cmd = ""; grandparent_pid = 0; grandparent_name = "" }
+    try {
+        $me = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $PID) -ErrorAction Stop
+        $l.parent_pid = [int]$me.ParentProcessId
+        $p = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $me.ParentProcessId) -ErrorAction SilentlyContinue
+        if ($p -and $p.CreationDate -le $me.CreationDate) {
+            $l.parent_name = [string]$p.Name
+            $l.parent_cmd = [string]$p.CommandLine
+            $l.grandparent_pid = [int]$p.ParentProcessId
+            $g = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $p.ParentProcessId) -ErrorAction SilentlyContinue
+            $l.grandparent_name = $(if ($g -and $g.CreationDate -le $p.CreationDate) { [string]$g.Name } else { "(exited)" })
+        } else {
+            $l.parent_name = "(exited)"
+        }
+    } catch { }
+    return $l
+}
+$script:runStartedAt = Get-Date
+$script:launch = Get-LaunchLineage
+$script:lockState = "not reached"
+$script:lockWaitSec = 0.0
+# ---------------------------------------------------------------------------
 # THE RUNNING SERVER: ONE RULE FOR "MAY IT BE STOPPED?", ASKED FROM BOTH PLACES THAT STOP IT.
 #
 # There were two. Invoke-PostUpdateTail (after this script's own pull) asked
@@ -119,7 +152,31 @@ function Get-ServerAction {
             $cliArgs += @("--started-epoch", $StartedEpoch.ToString("R", [Globalization.CultureInfo]::InvariantCulture))
             $out = @(& $pyExe @cliArgs 2>$null)
         } else {
-            $out = @($ChangedPaths | & $pyExe @cliArgs 2>$null)
+            # THE PATH LIST GOES IN AS BYTES THIS FUNCTION WROTE, NOT THROUGH POWERSHELL'S PIPE.
+            # `$ChangedPaths | & $pyExe ...` had PowerShell encode stdin with whatever
+            # $OutputEncoding the host has: a UTF-8 one is written with a BOM, so the first path
+            # reads "﻿tools/x.py", is not server code, and a changed server comes back
+            # "noop" -- the verdict CI got in test_post_update_form_and_unreadable_answers
+            # (reproduced here by setting $OutputEncoding = [Text.Encoding]::UTF8; an empty
+            # pipe gives the same "noop"). A file of UTF-8 WITHOUT a BOM, handed over as the
+            # child's stdin, and Python told to read it as UTF-8 (-X utf8), removes the host
+            # setting from the question -- and a non-ASCII path from `git diff` survives too.
+            $tmpIn = [System.IO.Path]::GetTempFileName()
+            $tmpOut = [System.IO.Path]::GetTempFileName()
+            $tmpErr = [System.IO.Path]::GetTempFileName()
+            try {
+                $text = ((@($ChangedPaths) | ForEach-Object { [string]$_ }) -join "`n") + "`n"
+                [System.IO.File]::WriteAllText($tmpIn, $text, (New-Object System.Text.UTF8Encoding($false)))
+                $argLine = @(@("-X", "utf8") + $cliArgs | ForEach-Object { '"' + ([string]$_).Replace('"', '\"') + '"' })
+                $p = Start-Process -FilePath $pyExe -ArgumentList $argLine -NoNewWindow -PassThru `
+                                   -RedirectStandardInput $tmpIn -RedirectStandardOutput $tmpOut -RedirectStandardError $tmpErr
+                $null = $p.Handle           # keeps ExitCode readable after exit (PS 5.1)
+                $p.WaitForExit()
+                $out = @(Get-Content -LiteralPath $tmpOut -Encoding UTF8 -ErrorAction SilentlyContinue)
+                return (ConvertTo-ServerActionResult $out ([int]$p.ExitCode))
+            } finally {
+                Remove-Item -LiteralPath $tmpIn, $tmpOut, $tmpErr -Force -ErrorAction SilentlyContinue
+            }
         }
         return (ConvertTo-ServerActionResult $out $LASTEXITCODE)
     } catch {
@@ -271,7 +328,7 @@ function Show-OwnedDialog([string]$body, [string]$title, [string]$buttons, [stri
 # .Show() + DoEvents -- the SAME path as the update dialog (which is known to display), so it
 # reliably appears (an earlier runspace version created the window but it never became
 # visible). Best-effort: any failure leaves $splash = $null and every helper no-ops, so
-# startup is NEVER blocked. No X (can't be closed onto a half-started stack), and a minimum
+# startup is NEVER blocked. It can be closed and minimised (see Start-Splash), and has a minimum
 # on-screen time so a fast (already-running) startup does not just flash by unseen.
 # ---------------------------------------------------------------------------
 function Start-Splash {
@@ -301,7 +358,13 @@ function Start-Splash {
         # window, not to remove its close button.
         $f.ControlBox = $true
         $f.MaximizeBox = $false
-        $f.MinimizeBox = $false
+        # MINIMIZABLE, because it is TopMost. A startup that waits (another start_all holding the
+        # lock, a slow tunnel, a dependency update) kept this window above every other window for
+        # the whole wait, and the only way out was the close button, which reads as "cancel the
+        # startup". Minimising keeps the startup running and puts the window on the taskbar
+        # (ShowInTaskbar), where the person can bring it back to see the status.
+        $f.MinimizeBox = $true
+        $f.ShowInTaskbar = $true
         $title = New-Object System.Windows.Forms.Label
         $title.Text = "M365 Companion"
         $title.Font = New-Object System.Drawing.Font("Segoe UI", 13, [System.Drawing.FontStyle]::Bold)
@@ -513,6 +576,8 @@ function Invoke-PostUpdateTail {
                 if ($NoUi) { $reArgs += "-NoUi" }
                 if ($NoSplash) { $reArgs += "-NoSplash" }
                 if ($CoreOnly) { $reArgs += "-CoreOnly" }
+                # This run ends here without reaching the end of the script: record it now.
+                $null = Write-StartAllRunRecord (Join-Path $script:diagDir "start_all_runs.jsonl") (New-StartAllRunRecord "re-exec after update")
                 $env:MCP_STARTALL_REEXEC = "1"
                 # HAND THE LOCK OVER FIRST. The fresh copy waits on the single-instance lock;
                 # held until Environment.Exit below it would come back abandoned, which works,
@@ -537,42 +602,251 @@ function Invoke-PostUpdateTail {
     }
 }
 
-function Test-DependenciesAreStale([string]$VenvPy, [string]$BootstrapPy) {
-    # D5 of the new-PC install review: `git pull` (or a manual pull/merge) can add a line to
-    # requirements.txt, but nothing on the daily start path used to notice. bootstrap.py's own
-    # install_deps step stamps the sha256 of requirements.txt into .setup\state.json on success
-    # (DEPS_HASH_KEY); `bootstrap.py --check-deps` (added alongside that stamp) re-hashes the
-    # live file, compares it against the stamp, and exits 3 on a mismatch (or when install_deps
-    # was never marked done at all) and 0 when they match -- a single hash read plus one sha256
-    # over a small text file, so cheap enough to run on every daily start rather than only at
-    # setup time.
-    #
-    # NOT WIRED TO INSTALL ANYTHING. start_all.ps1 runs on the daily/logon path, often hidden
-    # (start_all.bat -> start_all_hidden.vbs -> window 0, exit code unread -- see this file's
-    # own header and start_all.bat's) and sometimes twice at once (Startup .lnk + Task, 15 s
-    # apart). `pip install -r requirements.txt` downloads packages, can take minutes, needs the
-    # same trusted-host/proxy handling setup.bat already has (D10), and two unserialised copies
-    # racing pip into one .venv is exactly the corruption 5.3 in the install-path review warns
-    # about. An unattended install failing silently inside a hidden window is a worse outcome
-    # than telling the operator once and pointing them at setup.bat, which they run
-    # interactively and only one at a time (quickstart_lock.ps1 / setup's own guard).
-    #
-    # Returns $false -- "not stale, or could not tell" -- when either path is missing (no venv
-    # yet, or a checkout without scripts\bootstrap.py): there is nothing this function can
-    # safely report in that state, and the OTHER startup checks (supervisor's own "no usable
-    # Python" refusal, the first-time setup gate) already cover "nothing is installed yet".
-    if ((-not $VenvPy) -or (-not (Test-Path -LiteralPath $VenvPy)) -or
-        (-not $BootstrapPy) -or (-not (Test-Path -LiteralPath $BootstrapPy))) {
+# ---------------------------------------------------------------------------
+# DEPENDENCY DRIFT (D5): START_ALL BRINGS THE VENV UP TO DATE ITSELF.
+#
+# `git pull` (or a manual pull/merge) can change requirements.txt, and nothing on the daily path
+# used to install the difference: this function's predecessor only REPORTED it, telling the
+# operator to run setup.bat -- and because it asked "is the stamp for this requirements.txt?"
+# rather than "does the venv satisfy it?", every PC installed before the stamp existed got that
+# line on every start, forever. The owner's rule since: the only remedy start_all may give for
+# its own environment is running start_all.bat again, and preferably not even that.
+#
+# The old reasons for not installing here are each solved, not waived:
+#   * hidden window, nobody reads the console -- pip's output goes to .setup\logs\deps_install_*.log
+#     and a failure is COUNTED into the startup summary with pip's own last error line and that
+#     path (bootstrap.py sync_deps / _last_pip_error);
+#   * two starts at once (Startup .lnk + Task, 15 s apart) racing pip into one .venv -- the two
+#     copies are already serialised by Enter-StartAllLock, and bootstrap.py takes an OS
+#     byte-range lock (.setup\install_deps.lock) around check + install + stamp, which also
+#     covers setup/quickstart running their own install_deps at the same time; a waiting
+#     start_all keeps waiting while that lock is held (Test-DepsInstallInProgress);
+#   * proxy / TLS interception -- Set-PipNetworkEnvironment gives pip the same environment
+#     setup.bat does (ca_bundle.ps1 roots, detect_proxy.ps1 proxy), and restores it afterwards;
+#   * processes running from the venv while pip rewrites it -- the install runs only when none of
+#     this checkout's supervisor / server / bridge / fleet coordinator is running, or when the
+#     SAME rule every server swap here uses (Get-ServerAction / stale_server_check.py
+#     --server-action, requirements.txt as the changed path) says nothing is live; they are then
+#     stopped first and started again by the rest of this start_all. Otherwise the install is
+#     put off to the next start_all, and the summary says so in plain words;
+#   * an upgrade that pip reports as successful but leaves a package missing its own files (the
+#     fastmcp 2 -> 3 / fastmcp-slim case, 2026-09-24) -- bootstrap's install step checks every
+#     RECORD against the disk, reinstalls what it broke, and proves the result by importing
+#     main.py, for setup.bat and start_all alike.
+# Runs BEFORE the supervisor is started, so a normal logon start installs first and the server
+# then starts on the new packages with nothing to restart.
+# ---------------------------------------------------------------------------
+function Get-ThisCheckoutSupervisorProcesses {
+    # All Win32_Process entries whose command line launches THIS checkout's supervisor.ps1.
+    # SCOPED -- this list is what gets STOPPED. A bare name match finds anything that mentions
+    # the file: measured, four matches here and three of them were shell commands that merely
+    # contained the string. Stopping those would kill another checkout's supervisor, or
+    # somebody's shell.
+    try {
+        $supPath = Join-Path $scriptDir "supervisor.ps1"
+        return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+                  Where-Object {
+                      $_.CommandLine -and
+                      ($_.Name -match '^(powershell|pwsh)') -and
+                      ($_.CommandLine -like ("*" + $supPath + "*")) -and
+                      ($_.CommandLine -notlike "*register-supervisor*")
+                  })
+    } catch { return @() }
+}
+function ConvertFrom-DepsSyncOutput([object[]]$Lines) {
+    # PURE. bootstrap.py --sync-deps prints one verdict line last: "deps: ok", "deps: recorded
+    # ...", "deps: installed ...", "deps: failed: <what>". Anything else -- a crash, no output --
+    # is "unknown", which the caller counts as a failure (it did not bring the venv up to date).
+    $v = @($Lines | ForEach-Object { [string]$_ } | Where-Object { $_ -like "deps: *" } | Select-Object -Last 1)
+    if ($v.Count -eq 0) {
+        $tail = @($Lines | ForEach-Object { [string]$_ } | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 1)
+        return @{ Verdict = "unknown"; Detail = ($(if ($tail.Count) { $tail[0].Trim() } else { "no output" })) }
+    }
+    $body = $v[0].Substring(6).Trim()
+    foreach ($word in @("failed", "installed", "recorded", "ok")) {
+        if ($body -eq $word -or $body.StartsWith($word + " ") -or $body.StartsWith($word + ":")) {
+            return @{ Verdict = $word; Detail = $body.Substring($word.Length).TrimStart(":").Trim() }
+        }
+    }
+    return @{ Verdict = "unknown"; Detail = $body }
+}
+function Get-DepsProblemSummary([object[]]$CheckLines) {
+    # PURE. The first few "what is missing" items from --check-deps's own line, for a summary line.
+    $l = @($CheckLines | ForEach-Object { [string]$_ } | Where-Object { $_ -like "The .venv does not satisfy requirements.txt:*" } | Select-Object -Last 1)
+    if ($l.Count -eq 0) { return "requirements.txt is not satisfied by .venv" }
+    $items = @($l[0].Substring($l[0].IndexOf(":") + 1).Split(";") | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $s = ($items | Select-Object -First 3) -join "; "
+    if ($items.Count -gt 3) { $s += "; and $($items.Count - 3) more" }
+    return $s
+}
+function Test-DepsInstallInProgress {
+    # Is some process holding bootstrap.py's install lock right now? Probed with the same Win32
+    # byte-range lock msvcrt.locking takes (FileStream.Lock -> LockFile), released at once.
+    param([string]$LockPath = (Join-Path $root ".setup\install_deps.lock"))
+    if (-not (Test-Path -LiteralPath $LockPath)) { return $false }
+    $fs = $null
+    try {
+        $fs = [System.IO.File]::Open($LockPath, [System.IO.FileMode]::Open,
+                                     [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)
+        try { $fs.Lock(0, 1) } catch { return $true }
+        try { $fs.Unlock(0, 1) } catch { }
         return $false
+    } catch {
+        return $false
+    } finally {
+        if ($fs) { $fs.Dispose() }
+    }
+}
+function Set-PipNetworkEnvironment {
+    # The environment setup.bat gives pip, for THIS process only (so for the bootstrap.py child
+    # started next): the machine's trusted roots exported by ca_bundle.ps1 (TLS interception),
+    # and the proxy detect_proxy.ps1 derives from Windows' own settings. Like setup.bat, a value
+    # that is already set wins. Returns what was there before, for Restore-ProcessEnvironment --
+    # the supervisor, server and bridge started later must not inherit a proxy meant for pip.
+    $names = @("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY")
+    $saved = @{}
+    foreach ($n in $names) { $saved[$n] = [Environment]::GetEnvironmentVariable($n, "Process") }
+    try {
+        $caScript = Join-Path $scriptDir "ca_bundle.ps1"
+        if (Test-Path -LiteralPath $caScript) {
+            $bundle = @(& $caScript -OutFile (Join-Path $root ".setup\ca-bundle.pem") -ExtraPem (Join-Path $root ".setup\ca-extra.pem") 2>$null |
+                        ForEach-Object { [string]$_ } | Where-Object { $_ -and $_.Trim() }) | Select-Object -Last 1
+            if ($bundle -and (Test-Path -LiteralPath $bundle)) {
+                foreach ($n in @("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")) {
+                    if (-not [Environment]::GetEnvironmentVariable($n, "Process")) {
+                        [Environment]::SetEnvironmentVariable($n, [string]$bundle, "Process")
+                    }
+                }
+            }
+        }
+    } catch {
+        Write-Host "[deps] could not export this machine's root certificates ($($_.Exception.Message)); pip uses its own"
     }
     try {
-        & $VenvPy $BootstrapPy --check-deps *> $null
-        return ($LASTEXITCODE -eq 3)
+        if (-not $env:HTTPS_PROXY) {
+            $proxyScript = Join-Path $scriptDir "detect_proxy.ps1"
+            $proxy = $null
+            if (Test-Path -LiteralPath $proxyScript) {
+                $proxy = @(& $proxyScript 2>$null | ForEach-Object { [string]$_ } | Where-Object { $_ -and $_.Trim() }) | Select-Object -Last 1
+            }
+            if ($proxy) {
+                $env:HTTPS_PROXY = $proxy
+                if (-not $env:HTTP_PROXY) { $env:HTTP_PROXY = $proxy }
+                if (-not $env:NO_PROXY) { $env:NO_PROXY = "localhost,127.0.0.1,::1" }
+                Write-Host "[deps] using this PC's proxy for the download: $proxy"
+            }
+        }
     } catch {
-        # A python that cannot even be launched is not this function's question to answer --
-        # some other check (supervisor python resolution, doctor.ps1) already covers that.
-        return $false
+        Write-Host "[deps] proxy detection skipped ($($_.Exception.Message))"
     }
+    return $saved
+}
+function Restore-ProcessEnvironment([hashtable]$Saved) {
+    if (-not $Saved) { return }
+    foreach ($n in @($Saved.Keys)) { [Environment]::SetEnvironmentVariable($n, $Saved[$n], "Process") }
+}
+function Invoke-DependencySync([string]$VenvPy, [string]$BootstrapPy) {
+    # Returns the outcome word (ok / recorded / installed / deferred / failed / unknown / skipped)
+    # and COUNTS every outcome that leaves the venv behind requirements.txt into
+    # $script:startupFailures -- with what failed and "re-run start_all.bat", never setup.bat.
+    #
+    # No venv or no bootstrap.py: nothing to bring up to date; the first-time setup gate and the
+    # supervisor's own "no usable Python" refusal cover "nothing is installed yet".
+    if ((-not $VenvPy) -or (-not (Test-Path -LiteralPath $VenvPy)) -or
+        (-not $BootstrapPy) -or (-not (Test-Path -LiteralPath $BootstrapPy))) {
+        return "skipped"
+    }
+    # 1. The cheap question. A matching stamp answers from one hash; a missing or different stamp
+    #    reads the installed metadata and, when everything is satisfied, RECORDS the stamp -- so a
+    #    PC set up before the stamp existed is clean from this start on, with no install.
+    try {
+        $checkOut = @(& $VenvPy $BootstrapPy --check-deps 2>&1 | ForEach-Object { [string]$_ })
+        $rc = $LASTEXITCODE
+    } catch {
+        Write-Host "[deps] dependency check could not run ($($_.Exception.Message)) -- left as-is"
+        return "unknown"
+    }
+    if ($rc -eq 0) { return "ok" }
+    if ($rc -ne 3) {
+        # The venv's python itself failed; the supervisor's own Python check reports that.
+        Write-Host ("[deps] dependency check exited $rc -- left as-is: " + (($checkOut | Select-Object -Last 2) -join " / "))
+        return "unknown"
+    }
+    $need = Get-DepsProblemSummary $checkOut
+    Write-Host "[deps] .venv does not satisfy requirements.txt: $need"
+
+    # 2. NOTHING THAT RUNS FROM .venv MAY BE RUNNING WHILE PIP REWRITES IT. Measured 2026-09-24:
+    #    an install under a running server and bridge left both unable to import fastmcp until the
+    #    venv was repaired by hand. So: a fleet coordinator of this checkout -> not now. Anything
+    #    else of ours up (the supervisor, which restarts the server on its own; the server; the
+    #    bridge and its keepalive) -> ask the ONE server rule (stale_server_check.py
+    #    --server-action, requirements.txt as the changed path; it reads the fleet/review run
+    #    markers and the bridge's turn state). Only "swap-needed" -- nothing live -- lets this
+    #    stop them; anything else, including "cannot tell", puts the install off. What is stopped
+    #    here is started again by the rest of this start_all, on the new packages.
+    $coords = @(Get-ThisCheckoutFleetCoordinatorPids | Where-Object { $_ })
+    $sups = @(Get-ThisCheckoutSupervisorProcesses)
+    $servers = @(Get-ThisCheckoutServerProcesses)
+    $bridges = @(Get-ThisCheckoutBridgeProcesses)
+    $why = ""
+    $live = $false
+    if ($coords.Count -gt 0) {
+        $live = $true
+        $why = "a fleet run is in progress"
+    } elseif ($CoreOnly -and $bridges.Count -gt 0) {
+        # -CoreOnly starts the supervisor only, so a bridge stopped here would stay down.
+        $live = $true
+        $why = "the chat bridge is running and this core-only start would not start it again"
+    } elseif (($sups.Count + $servers.Count + $bridges.Count) -gt 0) {
+        $pre = Get-ServerAction -ChangedPaths @("requirements.txt")
+        if ($pre.Verdict -ne "swap-needed") {
+            $live = $true
+            $w = @($pre.Why | Where-Object { $_ -and ($_ -notlike "the update changed *") })
+            $why = $(if ($w.Count) { $w -join "; " } else { "it could not be confirmed that nothing is running" })
+        } else {
+            Write-Host "[deps] nothing is in use -- stopping this checkout's supervisor, MCP server and bridge for the install; they are started again below"
+            foreach ($p in $sups) { try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop } catch { } }
+            $null = Invoke-ServerAction $pre "[deps]"
+            if ($bridges.Count -gt 0) { Stop-Bridge-Processes }
+            Start-Sleep -Seconds 1
+        }
+    }
+    if ($live) {
+        Write-Host "[deps] not updating now: $why"
+        $script:startupFailures += "Python dependencies need updating ($need), but $why -- they will be updated automatically the next time start_all.bat runs while nothing is running"
+        return "deferred"
+    }
+
+    # 3. Install, through bootstrap.py's own install_deps step (lock, re-check, pip, repair,
+    #    verify by importing main.py, stamp).
+    Set-SplashStatus $script:splash "Updating Python dependencies..."
+    Write-Host "[deps] bringing .venv up to date with requirements.txt"
+    $saved = Set-PipNetworkEnvironment
+    try {
+        $syncOut = @(& $VenvPy $BootstrapPy --sync-deps 2>&1 | ForEach-Object { [string]$_ })
+    } catch {
+        $syncOut = @("deps: failed: bootstrap.py --sync-deps could not run ($($_.Exception.Message)) -- re-run start_all.bat")
+    } finally {
+        Restore-ProcessEnvironment $saved
+    }
+    $res = ConvertFrom-DepsSyncOutput $syncOut
+    switch ($res.Verdict) {
+        "installed" {
+            Write-Host "[deps] installed $($res.Detail)"
+        }
+        { $_ -eq "recorded" -or $_ -eq "ok" } {
+            Write-Host "[deps] .venv satisfies requirements.txt ($($res.Verdict))"
+        }
+        "failed" {
+            Write-Host "[deps] FAILED: $($res.Detail)" -ForegroundColor Yellow
+            $script:startupFailures += "Python dependencies could not be brought up to date ($need): $($res.Detail)"
+        }
+        default {
+            Write-Host "[deps] no verdict from bootstrap.py --sync-deps: $($res.Detail)" -ForegroundColor Yellow
+            $script:startupFailures += "Python dependencies could not be brought up to date ($need): bootstrap.py --sync-deps ended without a verdict (last output: $($res.Detail)); its record is .setup\bootstrap.log -- re-run start_all.bat"
+        }
+    }
+    return $res.Verdict
 }
 
 function Check-ForUpdates {
@@ -959,9 +1233,15 @@ function Enter-StartAllLock {
     # Returns $true once this process holds the lock (or when a lock cannot be created at all:
     # Constrained Language Mode refuses New-Object on a Mutex, and a missing lock must never be
     # the reason nothing starts). $false only after waiting $TimeoutSec for another copy.
+    # -KeepWaitingWhile: past $TimeoutSec, keep waiting (up to $MaxExtraSec more) while this
+    # returns true. Used for "the holder is installing Python dependencies" (Invoke-
+    # DependencySync), which on a slow proxied network can outlast ten minutes -- and giving up
+    # then would count a failure telling the operator to close a start_all that is working.
     param([string]$Name = "Global\m365-copilot-companion-start-all",
           [int]$TimeoutSec = 600,
-          [scriptblock]$OnWait = $null)
+          [scriptblock]$OnWait = $null,
+          [scriptblock]$KeepWaitingWhile = $null,
+          [int]$MaxExtraSec = 3600)
     try {
         $m = New-Object System.Threading.Mutex($false, $Name)
     } catch {
@@ -969,6 +1249,8 @@ function Enter-StartAllLock {
         return $true
     }
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $hardDeadline = $deadline.AddSeconds($MaxExtraSec)
+    $extended = $false
     $announced = $false
     while ($true) {
         $got = $false
@@ -992,6 +1274,18 @@ function Enter-StartAllLock {
         }
         if ($OnWait) { & $OnWait }
         if ((Get-Date) -ge $deadline) {
+            $keep = $false
+            if ($KeepWaitingWhile -and ((Get-Date) -lt $hardDeadline)) {
+                try { $keep = [bool](& $KeepWaitingWhile) } catch { $keep = $false }
+            }
+            if ($keep) {
+                if (-not $extended) {
+                    Write-Host "[lock] the other start_all is still installing Python dependencies -- waiting for it (up to $MaxExtraSec s more)"
+                    $extended = $true
+                }
+                $deadline = (Get-Date).AddSeconds(15)
+                continue
+            }
             try { $m.Dispose() } catch { }
             return $false
         }
@@ -1227,7 +1521,16 @@ function Invoke-UiStep {
             Write-Host "[4/4] ${app}: already running"
         } elseif ((Test-Path $exe) -and ((Get-Item $exe).Length -gt 0)) {
             Write-Host "[4/4] ${app}: launching"
-            Start-Process $exe
+            # THE WINDOW MAY ASK "WHO OPENED ME?": M365_LAUNCHED_BY_START_ALL=1 in ITS environment
+            # only. Start-Process copies this process's environment, so it is set for the call
+            # and put back at once -- nothing else start_all launches inherits it.
+            $prevLaunched = [Environment]::GetEnvironmentVariable("M365_LAUNCHED_BY_START_ALL", "Process")
+            [Environment]::SetEnvironmentVariable("M365_LAUNCHED_BY_START_ALL", "1", "Process")
+            try {
+                Start-Process $exe
+            } finally {
+                [Environment]::SetEnvironmentVariable("M365_LAUNCHED_BY_START_ALL", $prevLaunched, "Process")
+            }
         } else {
             Write-Host "[4/4] ${app}: no usable ui\$app.exe -- the chat/cockpit window cannot open" -ForegroundColor Yellow
             if (-not $counted[$app]) {
@@ -1258,6 +1561,56 @@ function Write-StartupSummary([string]$Path, [string[]]$Failures, [string]$Mode)
         if (@($Failures).Count -gt 0) { $lines += "fix: run doctor.bat for the specific fix for each line" }
         $dir = Split-Path -Parent $Path
         if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        $tmp = $Path + ".tmp"
+        [System.IO.File]::WriteAllLines($tmp, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $tmp -Destination $Path -Force
+        return $true
+    } catch { return $false }
+}
+function Get-StartAllMode {
+    if ($CoreOnly) { return "core (-CoreOnly)" }
+    if ($NoUi) { return "background (-NoUi)" }
+    return "full"
+}
+function New-StartAllRunRecord([string]$Outcome) {
+    # One line of start_all_runs.jsonl -- see Get-LaunchLineage's header.
+    $sw = @()
+    if ($NoUi) { $sw += "-NoUi" }
+    if ($NoSplash) { $sw += "-NoSplash" }
+    if ($CoreOnly) { $sw += "-CoreOnly" }
+    $l = $script:launch
+    if (-not $l) { $l = @{} }
+    return [ordered]@{
+        ts               = $script:runStartedAt.ToString("yyyy-MM-ddTHH:mm:ss.fffzzz")
+        end              = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffzzz")
+        pid              = $PID
+        mode             = (Get-StartAllMode)
+        switches         = $sw
+        reexec           = ($env:MCP_STARTALL_REEXEC -eq "1")
+        parent_pid       = $l.parent_pid
+        parent_name      = $l.parent_name
+        parent_cmd       = (Hide-Secrets ([string]$l.parent_cmd))
+        grandparent_pid  = $l.grandparent_pid
+        grandparent_name = $l.grandparent_name
+        lock             = $script:lockState
+        lock_wait_s      = $script:lockWaitSec
+        failures         = @($script:startupFailures).Count
+        outcome          = $Outcome
+    }
+}
+function Write-StartAllRunRecord([string]$Path, $Record, [int]$Keep = 500) {
+    # Append one JSON line, keeping only the last $Keep. Written while the start_all lock is still
+    # held, so two copies do not interleave their rewrites. Never throws.
+    try {
+        $line = ($Record | ConvertTo-Json -Compress -Depth 3)
+        $dir = Split-Path -Parent $Path
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        $lines = @()
+        if (Test-Path -LiteralPath $Path) {
+            $lines = @([System.IO.File]::ReadAllLines($Path) | Where-Object { $_ -and $_.Trim() })
+        }
+        $lines += $line
+        if ($lines.Count -gt $Keep) { $lines = $lines[($lines.Count - $Keep)..($lines.Count - 1)] }
         $tmp = $Path + ".tmp"
         [System.IO.File]::WriteAllLines($tmp, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
         Move-Item -LiteralPath $tmp -Destination $Path -Force
@@ -1304,9 +1657,12 @@ function Send-StartupFailureNotice([string]$SummaryPath) {
 function Invoke-Startup {
     # FIRST, BEFORE ANYTHING IS WRITTEN OR STARTED: one copy of this script at a time (see
     # Enter-StartAllLock). The splash keeps painting while a second copy waits.
+    $lockT0 = Get-Date
     $gotLock = Enter-StartAllLock -OnWait {
         Set-SplashStatus $script:splash "Another startup is already running -- waiting for it to finish..."
-    }
+    } -KeepWaitingWhile { Test-DepsInstallInProgress }
+    $script:lockWaitSec = [math]::Round(((Get-Date) - $lockT0).TotalSeconds, 1)
+    $script:lockState = $(if (-not $gotLock) { "timed out" } elseif ($script:lockWaitSec -ge 1) { "got after waiting" } else { "got" })
     if (-not $gotLock) {
         $script:lockTimedOut = $true
         $script:startupFailures += "another start_all.ps1 held the startup lock for 10 minutes; this one did not start anything alongside it -- close it (Task Manager) and start again"
@@ -1390,19 +1746,6 @@ function Invoke-Startup {
         Write-Host "[setup] unlock-password check skipped ($($_.Exception.Message))"
     }
 
-    # Dependency drift (D5): requirements.txt changed since the last successful setup/quickstart
-    # run and nothing here installs the difference -- see Test-DependenciesAreStale's own header
-    # for why this only reports rather than running pip. Counted, not just printed, same as the
-    # unlock-password repair above: the exit code is the number of startup problems.
-    try {
-        if (Test-DependenciesAreStale $script:venvPy $script:bootstrapPy) {
-            Write-Host "[setup] requirements.txt has changed since dependencies were last installed"
-            $script:startupFailures += "requirements.txt has changed since the last setup -- a dependency may be missing or out of date: run setup.bat"
-        }
-    } catch {
-        Write-Host "[setup] dependency-drift check skipped ($($_.Exception.Message))"
-    }
-
     # Pre-flight update check (best-effort, non-blocking). Runs once before any service starts.
     # Skipped when nobody should be asked, or when a pull could rewrite a batch file that is
     # running this script -- see Get-UpdateCheckSkipReason for the exact gate and why.
@@ -1414,6 +1757,18 @@ function Invoke-Startup {
     } else {
         Set-SplashStatus $script:splash "Checking for updates..."
         Check-ForUpdates
+    }
+
+    # Dependency drift (D5): the venv is brought up to date with requirements.txt HERE -- after
+    # the update check, so a requirements.txt that pull just changed is installed on this start,
+    # and before the supervisor (and so the server) is started below. See the block above
+    # ConvertFrom-DepsSyncOutput. Whatever it cannot fix is counted into
+    # $script:startupFailures with what failed and "re-run start_all.bat"; never setup.bat.
+    try {
+        $null = Invoke-DependencySync $script:venvPy $script:bootstrapPy
+    } catch {
+        Write-Host "[deps] dependency update skipped ($($_.Exception.Message))"
+        $script:startupFailures += "Python dependencies could not be checked: $($_.Exception.Message) -- re-run start_all.bat"
     }
 
     # Dev Tunnel self-heal (best-effort, non-blocking, runs even under -NoUi):
@@ -1484,22 +1839,9 @@ function Invoke-Startup {
         }
     }
     function Get-RunningSupervisorProcesses {
-        # All Win32_Process entries whose command line launches supervisor.ps1. Normally
-        # zero or one; returned as an array so a drift-restart can stop every match.
-        try {
-            # SCOPED -- this list is what a drift restart STOPS. A bare name match finds
-            # anything that mentions the file: measured, four matches here and three of them
-            # were shell commands that merely contained the string. Stopping those would kill
-            # another checkout's supervisor, or somebody's shell.
-            $supPath = Join-Path $scriptDir "supervisor.ps1"
-            return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-                      Where-Object {
-                          $_.CommandLine -and
-                          ($_.Name -match '^(powershell|pwsh)') -and
-                          ($_.CommandLine -like ("*" + $supPath + "*")) -and
-                          ($_.CommandLine -notlike "*register-supervisor*")
-                      })
-        } catch { return @() }
+        # Normally zero or one; an array so a drift-restart can stop every match. One scoped
+        # definition, shared with Invoke-DependencySync (see Get-ThisCheckoutSupervisorProcesses).
+        return @(Get-ThisCheckoutSupervisorProcesses)
     }
     # main.py が自分のソースより古ければ落とす。supervisor が居れば数十秒で拾い直し、
     # 居なければ下の起動経路が立ち上げる。トンネルには触らない。
@@ -1963,10 +2305,12 @@ if ($script:startupFailures.Count -gt 0) {
 }
 
 # AND WHERE SOMEBODY WILL SEE IT when this ran hidden -- see Write-StartupSummary's header.
-$startMode = "full"
-if ($CoreOnly) { $startMode = "core (-CoreOnly)" } elseif ($NoUi) { $startMode = "background (-NoUi)" }
+$startMode = Get-StartAllMode
 $summaryPath = Join-Path $script:diagDir "start_all_summary.txt"
 $summaryWritten = Write-StartupSummary $summaryPath @($script:startupFailures) $startMode
+# WHO STARTED IT AND HOW IT ENDED (see Get-LaunchLineage), while the lock is still held.
+$runOutcome = $(if ($script:lockTimedOut) { "lock timed out" } elseif ($script:startupFailures.Count -gt 0) { "failures" } else { "ok" })
+$null = Write-StartAllRunRecord (Join-Path $script:diagDir "start_all_runs.jsonl") (New-StartAllRunRecord $runOutcome)
 if ($summaryWritten -and (Test-ShouldNotifyStartupFailures $script:startupFailures.Count ([bool]$NoUi) (Test-ConsoleVisible))) {
     Send-StartupFailureNotice $summaryPath | Out-Null
 }

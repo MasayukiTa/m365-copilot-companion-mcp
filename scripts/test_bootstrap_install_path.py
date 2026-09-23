@@ -19,6 +19,7 @@ Windows CI job runs this file.
 from __future__ import annotations
 
 import io
+import json
 import os
 import subprocess
 import sys
@@ -157,11 +158,11 @@ def test_a_successful_install_records_the_hash(tmp_path, monkeypatch):
     req.write_text("x\n", encoding="utf-8")
     monkeypatch.setattr(B, "REQUIREMENTS", req)
     monkeypatch.setattr(B, "TRANSCRIPT", tmp_path / "log")
-    ok = subprocess.CompletedProcess([], 0, "", "")
+    ok = subprocess.CompletedProcess([], 0, "42", "")      # the verify import's tool count
     state = {"done": {}}
     with mock.patch.object(B.subprocess, "call", return_value=0), \
             mock.patch("tools.childproc.run", return_value=ok):
-        B.step_install_deps(state=state)
+        B.step_install_deps(state=state, state_file=tmp_path / "state.json")
     assert state[B.DEPS_HASH_KEY] == B.requirements_hash(req)
 
 
@@ -169,10 +170,11 @@ def test_a_failed_install_records_nothing(tmp_path, monkeypatch):
     req = tmp_path / "requirements.txt"
     req.write_text("x\n", encoding="utf-8")
     monkeypatch.setattr(B, "REQUIREMENTS", req)
+    monkeypatch.setattr(B, "_broken_distributions", lambda py: [])
     state = {"done": {}}
     with mock.patch.object(B.subprocess, "call", return_value=1):
         with pytest.raises(B.StepError):
-            B.step_install_deps(state=state)
+            B.step_install_deps(state=state, state_file=tmp_path / "state.json")
     assert B.DEPS_HASH_KEY not in state
 
 
@@ -188,6 +190,356 @@ def test_check_deps_cli(tmp_path, monkeypatch):
     assert B.main(["--check-deps"]) == 0
     req.write_text("x\ny\n", encoding="utf-8")
     assert B.main(["--check-deps"]) == 3
+
+
+# ---- D5b: the daily path brings the venv up to date itself ---------------------------------
+# --check-deps used to compare the stamp only, so a state.json written before the stamp existed
+# said "run setup.bat" on every start forever. It now asks whether the venv SATISFIES
+# requirements.txt, records the stamp when it does, and --sync-deps installs when it does not.
+
+#: Requirement lines this very interpreter satisfies (pytest is running it; pytest needs
+#: packaging), so the REAL probe runs against real installed metadata, offline.
+_SATISFIED_HERE = "pytest\npackaging\n"
+
+
+def _no_pip(*a, **k):
+    raise AssertionError("pip was run for a venv that already satisfies requirements.txt: %r" % (a,))
+
+
+@pytest.fixture
+def deps_repo(tmp_path, monkeypatch):
+    req = tmp_path / "requirements.txt"
+    monkeypatch.setattr(B, "REQUIREMENTS", req)
+    monkeypatch.setattr(B, "TRANSCRIPT", tmp_path / "bootstrap.log")
+    monkeypatch.setattr(B, "STATE_FILE", tmp_path / ".setup" / "state.json")
+    monkeypatch.setattr(B, "DEPS_LOG_DIR", tmp_path / ".setup" / "logs")
+    # The real probe, in-process: the interpreter running pytest IS the environment under test.
+    monkeypatch.setattr(B, "_running_in_project_venv", lambda: True)
+    # The RECORD integrity check has tests of its own below; here nothing is broken.
+    monkeypatch.setattr(B, "_broken_distributions", lambda py: [])
+    return tmp_path
+
+
+def test_the_probe_reads_real_metadata(deps_repo):
+    req = deps_repo / "requirements.txt"
+    req.write_text(_SATISFIED_HERE + "# a comment\n\n", encoding="utf-8")
+    assert B.unsatisfied_requirements(req) == []
+    req.write_text("pytest>=999\nno-such-package-xyz\n", encoding="utf-8")
+    got = B.unsatisfied_requirements(req)
+    assert any(p.startswith("no-such-package-xyz is not installed") for p in got), got
+    assert any("pytest>=999 is required" in p for p in got), got
+    # Anything it cannot judge leads to the install, never to a stamp.
+    req.write_text("--index-url https://example.invalid/simple\npytest\n", encoding="utf-8")
+    assert B.unsatisfied_requirements(req)
+
+
+def test_no_stamp_but_satisfied_is_recorded_without_an_install(deps_repo, capsys):
+    """(a) The owner's machine: install_deps done in July, no stamp, venv fine -> rc 0, the stamp
+    is written, pip never runs, and the next check takes the fast path."""
+    (deps_repo / "requirements.txt").write_text(_SATISFIED_HERE, encoding="utf-8")
+    sf = B.STATE_FILE
+    B.save_state({"done": {"install_deps": True, "ensure_venv": True}}, sf)
+    with mock.patch.object(B.subprocess, "call", _no_pip):
+        assert B.main(["--check-deps"]) == 0
+    st = B.load_state(sf)
+    assert st[B.DEPS_HASH_KEY] == B.requirements_hash()
+    assert st["done"] == {"install_deps": True, "ensure_venv": True}, "anything but the stamp changed"
+    assert "setup.bat" not in capsys.readouterr().out
+    # The stamp now matches, so the probe is not even asked.
+    with mock.patch.object(B, "venv_unsatisfied", side_effect=AssertionError("probed again")):
+        assert B.main(["--check-deps"]) == 0
+    # --sync-deps on the same no-stamp state: recorded, no pip.
+    B.save_state({"done": {"install_deps": True}}, sf)
+    with mock.patch.object(B.subprocess, "call", _no_pip):
+        assert B.sync_deps() == 0
+    assert capsys.readouterr().out.strip().splitlines()[-1].startswith("deps: recorded")
+    assert B.load_state(sf)[B.DEPS_HASH_KEY] == B.requirements_hash()
+
+
+def test_check_deps_names_what_is_missing_and_never_setup_bat(deps_repo, capsys):
+    (deps_repo / "requirements.txt").write_text("no-such-package-xyz>=1\n", encoding="utf-8")
+    B.save_state({"done": {"install_deps": True}}, B.STATE_FILE)
+    assert B.main(["--check-deps"]) == 3
+    out = capsys.readouterr().out
+    assert "no-such-package-xyz is not installed" in out
+    assert "setup.bat" not in out
+    assert B.DEPS_HASH_KEY not in B.load_state(B.STATE_FILE), "stamped a venv that does not satisfy"
+
+
+def _ok_import(*a, **k):
+    return subprocess.CompletedProcess([], 0, "42", "")     # main.py imported; 42 tools
+
+
+def test_unsatisfied_runs_the_install_step_and_records_it(deps_repo, capsys):
+    """(b) A genuinely missing package: bootstrap's own install_deps step runs (pip -r, output
+    to .setup/logs, no pip self-upgrade on the daily path), then the stamp and the flag."""
+    (deps_repo / "requirements.txt").write_text("no-such-package-xyz>=1\n", encoding="utf-8")
+    B.save_state({"done": {"install_deps": True}}, B.STATE_FILE)
+    calls = []
+
+    def fake_pip(cmd, **kw):
+        calls.append((list(cmd), kw))
+        kw["stdout"].write("Successfully installed no-such-package-xyz-1.0\n")
+        return 0
+
+    with mock.patch.object(B.subprocess, "call", fake_pip), \
+            mock.patch("tools.childproc.run", _ok_import):
+        assert B.sync_deps() == 0
+    assert len(calls) == 1, "the daily path ran more than the one install: %r" % calls
+    cmd, kw = calls[0]
+    assert cmd[-2:] == ["-r", str(deps_repo / "requirements.txt")] and "--upgrade" not in cmd
+    log_file = Path(kw["stdout"].name)
+    assert log_file.parent == deps_repo / ".setup" / "logs"
+    assert "Successfully installed" in log_file.read_text(encoding="utf-8")
+    st = B.load_state(B.STATE_FILE)
+    assert st[B.DEPS_HASH_KEY] == B.requirements_hash() and B.is_done(st, "install_deps")
+    last = capsys.readouterr().out.strip().splitlines()[-1]
+    assert last.startswith("deps: installed") and str(log_file) in last
+
+
+def test_a_failed_install_says_what_failed_and_to_rerun_start_all(deps_repo, capsys):
+    """(c) bootstrap's half: pip's own last ERROR line, the log path, start_all.bat -- and no
+    setup.bat anywhere. Nothing is recorded."""
+    (deps_repo / "requirements.txt").write_text("no-such-package-xyz>=1\n", encoding="utf-8")
+    B.save_state({"done": {"install_deps": True}}, B.STATE_FILE)
+
+    def failing_pip(cmd, **kw):
+        kw["stdout"].write("Collecting no-such-package-xyz>=1\n"
+                           "ERROR: Could not find a version that satisfies the requirement "
+                           "no-such-package-xyz>=1 (from versions: none)\n"
+                           "ERROR: No matching distribution found for no-such-package-xyz>=1\n")
+        return 1
+
+    with mock.patch.object(B.subprocess, "call", failing_pip):
+        assert B.sync_deps() == 1
+    last = capsys.readouterr().out.strip().splitlines()[-1]
+    assert last.startswith("deps: failed: ")
+    assert "No matching distribution found for no-such-package-xyz>=1" in last
+    assert str(deps_repo / ".setup" / "logs") in last and "deps_install_" in last
+    assert "start_all.bat" in last and "setup.bat" not in last
+    assert B.DEPS_HASH_KEY not in B.load_state(B.STATE_FILE)
+
+
+# ---- the fastmcp-slim breakage (2026-09-24) ------------------------------------------------
+# fastmcp 2.14.7 -> 3.4.7 moved the fastmcp/ package into a new distribution, fastmcp-slim. pip
+# installed fastmcp-slim, then uninstalled fastmcp 2.14.7 by ITS RECORD -- deleting
+# fastmcp/server/server.py & co. that fastmcp-slim had just written. pip exited 0 and
+# `import fastmcp` still worked; the server did not.
+
+def _fake_dist(site: Path, name: str, version: str, files: dict, record_extra=()):
+    """A minimal installed distribution: <name>-<version>.dist-info with METADATA and RECORD,
+    plus the files in `files` (relpath -> text) actually written. `record_extra` are RECORD
+    entries whose files are NOT written -- what the uninstall of the old owner deleted."""
+    di = site / ("%s-%s.dist-info" % (name.replace("-", "_"), version))
+    di.mkdir(parents=True)
+    (di / "METADATA").write_text("Metadata-Version: 2.1\nName: %s\nVersion: %s\n" % (name, version),
+                                 encoding="utf-8")
+    for rel, text in files.items():
+        p = site / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+    rows = list(files) + list(record_extra) + [di.name + "/METADATA", di.name + "/RECORD"]
+    (di / "RECORD").write_text("".join("%s,,\n" % r for r in rows), encoding="utf-8")
+
+
+def test_the_record_check_finds_exactly_the_distribution_that_lost_files(tmp_path):
+    site = tmp_path / "site-packages"
+    _fake_dist(site, "fastmcp-slim", "3.4.7",
+               {"fastmcp/__init__.py": "", "fastmcp/utilities/x.py": ""},
+               record_extra=["fastmcp/server/server.py", "fastmcp/server/dependencies.py"])
+    _fake_dist(site, "intact-pkg", "1.0", {"intact_pkg/__init__.py": ""},
+               record_extra=["intact_pkg/__pycache__/__init__.cpython-310.pyc"])  # caches may go
+    got = B.distributions_missing_files([str(site)])
+    assert [spec for spec, _ in got] == ["fastmcp-slim==3.4.7"], got
+    assert got[0][1].startswith("fastmcp/server/"), got
+
+
+def _install_with(monkeypatch, tmp_path, broken_seq, import_result=(42, "")):
+    """Run the REAL install step with pip, the RECORD check and the main.py import stubbed.
+    broken_seq: what _broken_distributions returns on each call (before, after, after repair)."""
+    req = tmp_path / "requirements.txt"
+    req.write_text("fastmcp>=3.4.7\n", encoding="utf-8")
+    monkeypatch.setattr(B, "REQUIREMENTS", req)
+    monkeypatch.setattr(B, "TRANSCRIPT", tmp_path / "bootstrap.log")
+    seq = list(broken_seq)
+    monkeypatch.setattr(B, "_broken_distributions", lambda py: seq.pop(0) if seq else [])
+    imports = []
+    monkeypatch.setattr(B, "_import_main_in_venv",
+                        lambda for_install=False: (imports.append(for_install), import_result)[1])
+    calls = []
+
+    def fake_pip(cmd, **kw):
+        calls.append(list(cmd))
+        return 0
+
+    state = {"done": {}}
+    with mock.patch.object(B.subprocess, "call", fake_pip):
+        try:
+            B.step_install_deps(state=state, state_file=tmp_path / ".setup" / "state.json",
+                                upgrade_pip=False)
+            err = None
+        except B.StepError as e:
+            err = e
+    return calls, imports, state, err
+
+
+_OLD_GAP = ("antlr4-python3-runtime==4.7.2", "MANIFEST.in")          # harmless, pre-existing
+_SLIM = ("fastmcp-slim==3.4.7", "fastmcp/server/server.py")
+
+
+def test_a_package_the_upgrade_broke_is_reinstalled_and_then_verified(monkeypatch, tmp_path):
+    calls, imports, state, err = _install_with(
+        monkeypatch, tmp_path, [[_OLD_GAP], [_OLD_GAP, _SLIM], [_OLD_GAP]])
+    assert err is None, err
+    assert len(calls) == 2, calls
+    assert calls[0][-2:] == ["-r", str(tmp_path / "requirements.txt")]
+    repair = calls[1]
+    assert "--force-reinstall" in repair and "--no-deps" in repair
+    assert repair[-1] == "fastmcp-slim==3.4.7", "not exactly the broken distribution, at its version"
+    assert "antlr4-python3-runtime==4.7.2" not in repair, "reinstalled an old gap this install never touched"
+    assert imports == [True], "the result was not verified by importing main.py"
+    assert state[B.DEPS_HASH_KEY]
+
+
+def test_a_package_the_repair_cannot_fix_fails_by_name(monkeypatch, tmp_path):
+    calls, imports, state, err = _install_with(
+        monkeypatch, tmp_path, [[], [_SLIM], [_SLIM]])
+    assert isinstance(err, B.StepError)
+    assert "fastmcp-slim==3.4.7" in str(err) and "fastmcp/server/server.py" in str(err)
+    assert B.DEPS_HASH_KEY not in state
+
+
+def test_the_install_is_verified_by_importing_main_not_fastmcp(monkeypatch, tmp_path):
+    """The exact production symptom: the packages import, main.py does not."""
+    calls, imports, state, err = _install_with(
+        monkeypatch, tmp_path, [[], [], []],
+        import_result=(None, "ImportError: cannot import name 'FastMCP' from 'fastmcp' (unknown location)"))
+    assert isinstance(err, B.StepError)
+    assert "cannot import name 'FastMCP'" in str(err) and "main.py" in str(err)
+    assert B.DEPS_HASH_KEY not in state
+
+
+def test_the_install_verify_import_has_a_key_even_before_gen_env(monkeypatch, tmp_path):
+    """install_deps runs before gen_env on a first install, and main.py reads MCP_API_KEY at
+    import: the child gets a placeholder, and nothing outside the child changes."""
+    monkeypatch.setattr(B, "ROOT", tmp_path)                   # no .env here
+    monkeypatch.delenv("MCP_API_KEY", raising=False)
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen.update(kw.get("env") or {})
+        return subprocess.CompletedProcess(cmd, 0, "7\n", "")
+
+    with mock.patch("tools.childproc.run", fake_run):
+        assert B._import_main_in_venv(for_install=True) == (7, "")
+    assert seen.get("MCP_API_KEY") == "install-verify-placeholder"
+    assert "MCP_API_KEY" not in os.environ
+
+
+def test_a_proxy_password_never_reaches_the_failure_text(monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://alice:s3cret@proxy.example:8080")
+    msg = B._pip_failure_message(B.RERUN_START_ALL, "ERROR: ProxyError http://alice:s3cret@proxy.example:8080")
+    assert "s3cret" not in msg and "proxy.example:8080" in msg and "start_all.bat" in msg
+
+
+#: A process that runs the REAL bootstrap.main with pip and the probe stubbed: "installing"
+#: takes PIP_SLEEP seconds and makes the probe report satisfied afterwards, exactly what a real
+#: install does to the next reader. Every pip run is logged with its start and end time.
+_SYNC_DRIVER = r'''
+import json, os, subprocess, sys, time
+from pathlib import Path
+root = Path(os.environ["DEPS_ROOT"])
+sys.path.insert(0, os.environ["DEPS_REPO"])
+sys.path.insert(0, os.path.join(os.environ["DEPS_REPO"], "scripts"))
+import bootstrap as B
+B.STATE_DIR = root / ".setup"
+B.STATE_FILE = root / ".setup" / "state.json"
+B.DEPS_LOG_DIR = root / ".setup" / "logs"
+B.TRANSCRIPT = root / ".setup" / "bootstrap.log"
+B.REQUIREMENTS = root / "requirements.txt"
+flag = root / "installed.flag"
+B.venv_unsatisfied = lambda req=None: [] if flag.exists() else ["no-such-package-xyz is not installed"]
+def fake_pip(cmd, **kw):
+    t0 = time.time()
+    time.sleep(float(os.environ.get("PIP_SLEEP", "0")))
+    flag.touch()
+    with open(root / "pip_runs.jsonl", "a") as fh:
+        fh.write(json.dumps([os.getpid(), t0, time.time()]) + "\n")
+    return 0
+B.subprocess.call = fake_pip
+B._broken_distributions = lambda py: []
+import tools.childproc
+tools.childproc.run = lambda *a, **k: subprocess.CompletedProcess(a, 0, "42", "")
+print("started %f" % time.time(), flush=True)
+sys.exit(B.main(sys.argv[1:]))
+'''
+
+
+def _spawn_sync(tmp_path, env):
+    drv = tmp_path / "sync_driver.py"
+    drv.write_text(_SYNC_DRIVER, encoding="utf-8")
+    return subprocess.Popen([sys.executable, str(drv), "--sync-deps"], env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def test_two_syncs_at_once_install_once_one_after_the_other(tmp_path):
+    """(d) The Startup .lnk and the scheduled Task start 15 s apart; setup can run beside
+    either. Two --sync-deps at once: one installs, the other WAITS on the lock, then re-reads
+    the state that install wrote and does nothing. Never two pips in one .venv."""
+    (tmp_path / "requirements.txt").write_text("no-such-package-xyz>=1\n", encoding="utf-8")
+    B.save_state({"done": {"install_deps": True}}, tmp_path / ".setup" / "state.json")
+    env = dict(os.environ, DEPS_ROOT=str(tmp_path), DEPS_REPO=str(REPO), PIP_SLEEP="3")
+    a = _spawn_sync(tmp_path, env)
+    b = _spawn_sync(tmp_path, env)
+    outs = [childproc.decode(p.communicate(timeout=120)[0]) for p in (a, b)]
+    assert a.returncode == 0 and b.returncode == 0, outs
+    runs = [json.loads(l) for l in (tmp_path / "pip_runs.jsonl").read_text().splitlines()]
+    assert len(runs) == 1, "both copies ran pip into the same venv: %r\n%s" % (runs, outs)
+    verdicts = sorted(o.strip().splitlines()[-1].split()[1] for o in outs)
+    assert verdicts == ["installed", "ok"], outs
+    # The one that did not install really waited: it started before the install ended and
+    # finished after it (a copy that skipped the lock would have read the unfinished state).
+    loser = outs[0] if outs[0].strip().splitlines()[-1] == "deps: ok" else outs[1]
+    started = float(loser.split("started ", 1)[1].split()[0])
+    assert started < runs[0][2], "the second copy only started after the install: no overlap tested"
+    st = B.load_state(tmp_path / ".setup" / "state.json")
+    assert st[B.DEPS_HASH_KEY] == B.requirements_hash(tmp_path / "requirements.txt")
+
+
+_HOLD_LOCK = r'''
+import sys, time
+sys.path.insert(0, sys.argv[1]); sys.path.insert(0, sys.argv[1] + "/scripts")
+import bootstrap as B
+with B.install_lock(sys.argv[2]):
+    print("held", flush=True)
+    time.sleep(float(sys.argv[3]))
+'''
+
+
+def test_a_lock_held_too_long_is_a_start_all_failure_not_a_hang(tmp_path, monkeypatch, capsys):
+    (tmp_path / "requirements.txt").write_text("no-such-package-xyz>=1\n", encoding="utf-8")
+    monkeypatch.setattr(B, "REQUIREMENTS", tmp_path / "requirements.txt")
+    monkeypatch.setattr(B, "TRANSCRIPT", tmp_path / "bootstrap.log")
+    monkeypatch.setattr(B, "INSTALL_LOCK_TIMEOUT_SEC", 1)
+    sf = tmp_path / ".setup" / "state.json"
+    B.save_state({"done": {"install_deps": True}}, sf)
+    holder_py = tmp_path / "hold.py"
+    holder_py.write_text(_HOLD_LOCK, encoding="utf-8")
+    holder = subprocess.Popen([sys.executable, str(holder_py), str(REPO), str(sf.parent), "20"],
+                              stdout=subprocess.PIPE)
+    try:
+        assert holder.stdout.readline().strip() == b"held"
+        with mock.patch.object(B.subprocess, "call", _no_pip):
+            assert B.sync_deps(state_file=sf) == 1
+    finally:
+        holder.kill()
+        holder.wait()
+    last = capsys.readouterr().out.strip().splitlines()[-1]
+    assert last.startswith("deps: failed: another dependency install")
+    assert "start_all.bat" in last and "setup.bat" not in last
+    # The kernel dropped the killed holder's lock: the next caller is not wedged.
+    with B.install_lock(sf.parent, timeout=5):
+        pass
 
 
 # ---- D8 / D20 ------------------------------------------------------------------------------
