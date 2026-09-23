@@ -125,9 +125,15 @@ def test_job_class_key():
     check("shell class keys on first two tokens only",
           tr._job_class_key("shell", {"cmd": "git status --short"}) ==
           tr._job_class_key("shell", {"cmd": "git status --long --extra"}))
-    check("python class keys on first two tokens",
-          tr._job_class_key("python", {"code": "import os"}) ==
+    # SEC-07: this used to assert these two were the SAME class -- i.e. that approving
+    # `import os` also approved every later program beginning `import os`. Python code is
+    # keyed by its exact normalised text now; see relay/test_task_router_exact_approval.py.
+    check("python code is keyed by its exact text, not its first two tokens",
+          tr._job_class_key("python", {"code": "import os"}) !=
           tr._job_class_key("python", {"code": "import os\nprint(1)"}))
+    check("identical python code keeps one key (CRLF / outer whitespace ignored)",
+          tr._job_class_key("python", {"code": "import os\nprint(1)"}) ==
+          tr._job_class_key("python", {"code": "  import os\r\nprint(1)\n"}))
     check("python class distinguishes different first tokens",
           tr._job_class_key("python", {"code": "import os"}) !=
           tr._job_class_key("python", {"code": "os.remove('x')"}))
