@@ -533,6 +533,28 @@ def scan(files=None, iterate=True):
     return rows
 
 
+#: Verdict kinds that CLOSE a row. `revealed` is deliberately absent: it says the row appeared
+#: because its only caller is itself unreached, which explains the arrival and decides nothing.
+_SETTLED = frozenset({"dispatch", "entrypoint", "deliberate"})
+
+
+def _recorded_verdicts():
+    """{"path::name": (kind, where)} from the ratchet that already holds them.
+
+    READ, NOT RESTATED. tools/test_nothing_new_is_built_without_a_caller.py::REASONS is where a
+    decision about one of these rows is written down, and it is checked there against
+    ALLOWED_REASONS. A second copy here would be the fifth instance this week of a fact kept in
+    two places; if the import fails, the column reads "-- open --" for everything, which
+    over-reports work rather than hiding it.
+    """
+    try:
+        sys.path.insert(0, REPO)
+        from tools import test_nothing_new_is_built_without_a_caller as _r
+        return dict(_r.REASONS)
+    except Exception:
+        return {}
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--limit", type=int, default=0, help="print only the N largest (0 = all)")
@@ -541,11 +563,26 @@ def main(argv=None):
     if rows is None:
         print("git could not list the tracked files; nothing measured")
         return 1
+    verdicts = _recorded_verdicts()
+    open_rows = [r for r in rows if verdicts.get(r[0], ("",))[0] not in _SETTLED]
     print("module-level public functions with no reference in non-test code: %d" % len(rows))
+    # THE NUMBER ON ITS OWN INVITES THE WRONG READING. Three of these rows have been looked at
+    # and closed -- reached only by dispatch, an entry point, or a deliberate decision not to
+    # wire something -- and reporting them beside the open ones makes the burndown look like it
+    # has not moved. It also hides the opposite mistake: `judge_autonomy` was investigated and
+    # settled in 456f803, and a reader of this list would have investigated it again.
+    #
+    # `revealed` is NOT settled and is not counted here. It records how a row ARRIVED (its only
+    # caller is itself unreached), which is provenance, not a verdict.
+    print("  of which %d carry a recorded verdict -- %d are still questions."
+          % (len(rows) - len(open_rows), len(open_rows)))
     print()
-    print("%-6s %-42s %-46s %s" % ("lines", "name", "file:line", "refs in tests"))
+    print("%-6s %-42s %-46s %-14s %s"
+          % ("lines", "name", "file:line", "refs in tests", "verdict"))
     for key, name, rel, lineno, span, tref in (rows[:a.limit] if a.limit else rows):
-        print("%-6d %-42s %-46s %d" % (span, name, "%s:%d" % (rel, lineno), tref))
+        kind = verdicts.get(key, ("", ""))[0]
+        print("%-6d %-42s %-46s %-14d %s"
+              % (span, name, "%s:%d" % (rel, lineno), tref, kind or "-- open --"))
     # SAY WHAT COULD NOT BE DECIDED. These are names defined in several modules where at least
     # one call could not be attributed to any of them -- a bare call the AST cannot resolve, or
     # a star import. They are neither reached nor reported, and until 2026-09-14 that state was

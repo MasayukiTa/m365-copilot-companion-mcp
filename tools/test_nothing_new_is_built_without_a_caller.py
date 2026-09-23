@@ -514,3 +514,22 @@ def test_a_helper_under_tests_is_not_reported_as_dead_production_code():
     assert U.is_test("tests/sub/helper.py")
     assert not U.is_test("tools/golden.py")
     assert not U.is_test("relay/tests_support.py")
+
+
+def test_the_burndown_report_closes_exactly_the_kinds_that_are_verdicts():
+    """`tools/unreached.py` prints a verdict column by reading REASONS from here.
+
+    **新しい種類を足したとき、それが「閉じる」のか「出自を説明するだけ」なのかは
+    足した人にしか分からない。**黙って `-- open --` 側に落ちれば、裁定済みの行が
+    もう一度調査される（`judge_autonomy` が 456f803 で決着したのに一覧に並んでいたのが
+    まさにそれ）。逆に黙って閉じれば、未回答の行が消える — こちらは取り返しがつかない。
+    """
+    from tools import unreached as U_
+    assert U_._SETTLED <= set(ALLOWED_REASONS), (
+        "unreached.py closes rows on a reason kind this file does not define: %r"
+        % sorted(U_._SETTLED - set(ALLOWED_REASONS)))
+    undecided = set(ALLOWED_REASONS) - U_._SETTLED
+    assert undecided == {"revealed"}, (
+        "a reason kind was added and nobody said whether it CLOSES a burndown row or only "
+        "records how it arrived; unreached.py is currently treating %r as still open"
+        % sorted(undecided))
