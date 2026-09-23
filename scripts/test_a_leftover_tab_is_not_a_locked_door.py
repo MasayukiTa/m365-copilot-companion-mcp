@@ -123,34 +123,21 @@ def test_which_urls_are_leftovers(url, expected):
 def test_the_two_shapes_are_defined_once():
     """**4つのビルド一覧で同じ日に払った授業料。**残骸の定義は `relay/edge_auth` にあり、
     チェッカーはそれを読む。ここにもう一組書けば、次に増えたとき片方だけが更新される。"""
-    import ast
-    import io
-    path = os.path.join(REPO, "scripts", "ensure_m365_signin.py")
-    src = io.open(path, encoding="utf-8").read()
-    assert "edge_auth.looks_like_auth_bounce_residue" in src
+    # THE REPOSITORY ALREADY HAS THE RIGHT TOOL FOR THIS, and I wrote the first version without
+    # it: a raw-text search that failed on a COMMENT quoting the operator's screen -- the third
+    # source assertion today to catch its own spelling instead of the property it names.
+    # tests/_srcprobe.py exists for exactly that, and its own docstring opens with four earlier
+    # instances: "A test that scans raw text cannot tell code from the account of the code."
+    sys.path.insert(0, os.path.join(REPO, "tests"))
+    from _srcprobe import executable_source_of_file
 
-    # PARSED, NOT MATCHED. The first version searched the raw text and failed on a COMMENT that
-    # quotes the operator's screen -- the third source assertion today to catch its own spelling
-    # rather than the property it names. A comment is not in the AST at all, and a docstring is
-    # the one string constant that is prose by construction, so both drop out here and what is
-    # left is a literal the program would actually use.
-    tree = ast.parse(src)
-    docstrings = set()
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            body = getattr(node, "body", None) or []
-            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
-                    and isinstance(body[0].value.value, str):
-                docstrings.add(id(body[0].value))
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str) \
-                and id(node) not in docstrings:
-            low = node.value.lower()
-            for marker in edge_auth.AUTH_BOUNCE_RESIDUE_MARKERS:
-                assert marker not in low, (
-                    "%r is spelled out in the checker's code as well as in relay/edge_auth "
-                    "(line %d) -- two places to update when a third shape turns up"
-                    % (marker, node.lineno))
+    path = os.path.join(REPO, "scripts", "ensure_m365_signin.py")
+    code = executable_source_of_file(path)
+    assert "edge_auth.looks_like_auth_bounce_residue" in code
+    for marker in edge_auth.AUTH_BOUNCE_RESIDUE_MARKERS:
+        assert marker not in code.lower(), (
+            "%r is spelled out in the checker's code as well as in relay/edge_auth -- two "
+            "places to update when a third shape turns up" % marker)
 
 
 def test_the_countdown_line_stays_inside_a_console(monkeypatch):
