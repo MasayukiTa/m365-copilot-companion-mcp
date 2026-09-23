@@ -10,8 +10,10 @@ why a broken one is broken.
 """
 from __future__ import annotations
 
+import ast
 import json
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -98,6 +100,171 @@ def test_a_confident_match_names_the_skill_to_load(lib):
     assert hit["name"] == "incident-report" and hit["trust"] == "trusted"
     assert 0 < hit["score"]
     assert "時系列" in hit["description"]
+    assert hit["confidence"] == "confident"
+    assert hit["instruction"] == ("CONFIDENT trusted match. Call skill_load(name='incident-report')"
+                                  " and follow that procedure as written.")
+    assert "candidate" not in out
+
+
+#: Issue an invoice, where invoice-check CHECKS one: the right topic, a different action.
+NEAR_MISS = "請求書を発行したい"
+
+
+def test_a_candidate_is_offered_as_a_possible_match_only(lib):
+    for name in ("invoice-check", "incident-report", "inventory-stocktake"):
+        lib["add"](name)
+    out = skill_ops.skill_match(NEAR_MISS)
+    hit = json.loads(out)
+    assert hit["confidence"] == "candidate" and hit["name"] == "invoice-check"
+    assert hit["trust"] == "trusted"
+    assert "発注書・納品書との突合" in hit["description"], "the model is given what it does"
+    assert 0 < hit["coverage"] < 1 and hit["evidence"] > 0 and hit["score"] == hit["coverage"]
+    text = hit["instruction"]
+    # The words a model reads, in the order it needs them.
+    assert text.startswith("This is only a POSSIBLE match (confidence: candidate), not a "
+                           "confident one.")
+    assert "Read the description." in text
+    assert ("Call skill_load(name='invoice-check') only if the user's request is for exactly "
+            "this procedure") in text
+    assert "otherwise proceed without it" in text
+    assert "do not present it as the user's procedure" in text
+    assert "unapproved_near_match" not in hit
+    # A candidate is not a confident match in the consultation funnel either.
+    kinds = [json.loads(x) for x in lib["log"].read_text(encoding="utf-8").splitlines()]
+    assert [(r["kind"], r["matched"]) for r in kinds] == [("match", ""),
+                                                          ("candidate", "invoice-check")]
+    assert not _pending(lib), "nothing unapproved, so nothing is asked"
+
+
+def test_a_candidate_and_an_unapproved_near_match_are_both_reported(lib):
+    """THE ORDER (tools.skill_ops.skill_match): the unapproved near match is raised for
+    approval whether or not a trusted candidate exists, and the answer leads with the trusted
+    candidate -- the only one loadable now -- naming the unapproved one beside it."""
+    for name in ("invoice-check", "incident-report", "inventory-stocktake"):
+        lib["add"](name)
+    lib["raw"]("invoice-issue", '---\nname: invoice-issue\ndescription: "請求書の発行手順。'
+               '発行日と発行番号の採番"\n---\n\n# 発行\n\n1. 発行する\n')
+    hit = json.loads(skill_ops.skill_match(NEAR_MISS))
+    assert hit["confidence"] == "candidate" and hit["name"] == "invoice-check"
+    near = hit["unapproved_near_match"]
+    assert near["name"] == "invoice-issue" and near["trust"] == "untrusted"
+    assert "has never been approved by a human" in near["note"]
+    assert "承認待ちとして登録しました" in near["note"]
+    assert "cannot be loaded" in near["note"]
+    pending = _pending(lib)
+    assert len(pending) == 1 and "invoice-issue" in pending[0]["context"]
+
+
+def _pending(lib):
+    """Approval questions still waiting for a person (lib["add"] answers its own)."""
+    rows = [json.loads(g.read_text(encoding="utf-8")) for g in lib["gates"].glob("*.json")]
+    return [r for r in rows if not r["answered"]]
+
+
+def test_no_candidate_leaves_the_unapproved_message_unchanged(lib):
+    """With no trusted candidate, an unapproved near match is still answered the old way."""
+    lib["add"]("incident-report")
+    lib["raw"]("invoice-issue", '---\nname: invoice-issue\ndescription: "請求書の発行手順。'
+               '発行日と発行番号の採番"\n---\n\n# 発行\n\n1. 発行する\n')
+    out = skill_ops.skill_match(NEAR_MISS)
+    assert out.startswith("(no confident Skill match among TRUSTED Skills. "
+                          "/invoice-issue looks like the right procedure")
+
+
+# ------------------------------------------------ no automatic caller acts on a candidate
+#
+# SkillStore.match() is the CONFIDENT tier and candidate_match() the CANDIDATE tier (see
+# relay.skills._TRUSTED_POLICY). A candidate is only safe because a model is TOLD it is one;
+# an automatic caller that injected or rendered it would follow a possibly-wrong procedure with
+# nobody told. These enumerate every production call site of both, statically, so a new one
+# fails here until someone has decided which tier it may use.
+
+REPO = Path(__file__).resolve().parent.parent
+
+#: Every production call of <store>.match(), and what the caller does with the answer.
+MATCH_CALLERS = {
+    ("tools/skill_ops.py", "skill_match"): "the MCP tool: a model reads the result",
+    ("relay/relay_fleet.py", "_with_matched_skill"): "AUTOMATIC: injects it into a worker prompt",
+    ("bridge/copilot_bridge.py", "_stream"): "AUTOMATIC: renders it into the bridge chat",
+    ("scripts/win/skill_match_bench.py", "score"): "measurement script",
+}
+#: The ONLY permitted caller of candidate_match(): the tool whose text says it is a candidate.
+CANDIDATE_CALLERS = {("tools/skill_ops.py", "skill_match")}
+
+
+def _production_python_files():
+    # Tracked files only: a scan of the working tree would disagree with CI about untracked
+    # local files.
+    out = subprocess.run(["git", "ls-files", "--", "*.py"], cwd=REPO, capture_output=True,
+                         text=True, encoding="utf-8", check=True).stdout
+    for rel in out.splitlines():
+        parts = rel.split("/")
+        name = parts[-1]
+        if (name.startswith("test_") or name == "conftest.py" or "tests" in parts
+                or rel == "relay/skills.py"):
+            continue
+        yield rel
+
+
+def _method_calls(method, receiver_hint=""):
+    """{(file, enclosing function)} of every production call `<x>.<method>(...)` whose
+    receiver's source contains receiver_hint (case-insensitive)."""
+    found = set()
+    for rel in _production_python_files():
+        path = REPO / rel
+        if not path.is_file():
+            continue
+        src = path.read_text(encoding="utf-8", errors="replace")
+        if "." + method + "(" not in src:
+            continue
+        tree = ast.parse(src)
+
+        def visit(node, func):
+            for child in ast.iter_child_nodes(node):
+                inner = func
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    inner = child.name
+                if (isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)
+                        and child.func.attr == method
+                        and receiver_hint in ast.unparse(child.func.value).lower()):
+                    found.add((rel, func))
+                visit(child, inner)
+
+        visit(tree, "<module>")
+    return found
+
+
+def test_only_the_skill_match_tool_calls_candidate_match():
+    callers = _method_calls("candidate_match")
+    assert callers == CANDIDATE_CALLERS, (
+        "candidate_match() returns a POSSIBLE match. Only tools/skill_ops.skill_match may call "
+        "it, because only there is the model told so; an automatic path must use match(). "
+        "Unexpected: %s" % sorted(callers - CANDIDATE_CALLERS))
+
+
+def test_every_caller_of_match_is_known():
+    """A new caller of SkillStore.match() must be listed above with what it does, so its
+    author has looked at the tiers. Automatic callers receive only the confident tier."""
+    callers = _method_calls("match", receiver_hint="store")
+    assert callers == set(MATCH_CALLERS), (
+        "new: %s  gone: %s" % (sorted(callers - set(MATCH_CALLERS)),
+                               sorted(set(MATCH_CALLERS) - callers)))
+    automatic = {k for k, v in MATCH_CALLERS.items() if v.startswith("AUTOMATIC")}
+    assert not automatic & _method_calls("candidate_match")
+
+
+def test_no_production_code_consumes_the_skill_match_tool_output():
+    """The tool's text is for a model. Code that called skill_match() and acted on the result
+    would be an automatic path around the candidate rule, so none may exist."""
+    for rel in _production_python_files():
+        src = (REPO / rel).read_text(encoding="utf-8", errors="replace")
+        if "skill_match(" not in src or rel == "tools/skill_ops.py":
+            continue
+        for node in ast.walk(ast.parse(src)):
+            if isinstance(node, ast.Call):
+                f = node.func
+                name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
+                assert name != "skill_match", "%s calls skill_match() itself" % rel
 
 
 def test_an_agent_can_go_from_request_to_procedure(lib):

@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """The Skill matcher's METHOD, tested piece by piece (relay/skills.py, the block above
-_match_units): normalisation, n-gram features, the evidence unit, IDF, coverage, the three
-guards of MatchPolicy, and the optional `keywords:` field.
+_match_units): normalisation, n-gram features, the evidence unit, IDF, coverage, the guards
+of MatchPolicy, the boundary between the CONFIDENT tier (match()) and the CANDIDATE tier
+(candidate_match()), and the optional `keywords:` field.
 
 tests/test_skills_business_matching.py measures how well the whole thing does on office
 requests; this file pins what each part is FOR, with synthetic libraries small enough that
@@ -153,13 +154,43 @@ def test_the_margin_refuses_a_request_between_two_skills():
     assert _decide([best, _Scored("b", 1.9, 0.6, 1.9)], POLICY) is best      # 0.63 < 2/3
 
 
-def test_the_trusted_policy_is_stricter_than_the_suggestion_policy():
-    t, s = S._TRUSTED_POLICY, S._SUGGEST_POLICY
-    assert t.min_evidence >= s.min_evidence and t.min_distinct >= s.min_distinct
-    assert t.min_coverage >= s.min_coverage
-    assert t.max_runner_up_ratio <= s.max_runner_up_ratio
-    # The trusted door keeps the old rule's intent: no single word selects a Skill.
-    assert t.min_evidence > 2.0 and t.min_distinct >= 2.0
+def test_the_policies_get_looser_from_confident_to_candidate_to_suggestion():
+    ladder = [S._TRUSTED_POLICY, S._CANDIDATE_POLICY, S._SUGGEST_POLICY]
+    for strict, loose in zip(ladder, ladder[1:]):
+        assert strict.min_evidence >= loose.min_evidence
+        assert strict.min_coverage >= loose.min_coverage
+        assert strict.max_runner_up_ratio <= loose.max_runner_up_ratio
+        # The whole-request exception may lower the distinctiveness bar, never below the
+        # looser policy's own.
+        assert min(strict.min_distinct, strict.whole_request_min_distinct) >= loose.min_distinct
+    t, c = S._TRUSTED_POLICY, S._CANDIDATE_POLICY
+    # The confident door keeps the old rule's intent: no single word selects a Skill...
+    assert t.min_evidence > 2.0 and t.whole_request_min_distinct >= 2.0
+    # ...and, unless the Skill accounts for nearly the whole request, it needs TWO words'
+    # worth of distinctive evidence (MIN_DISTINCTIVE_WORDS = 2, in the new unit).
+    assert t.min_distinct >= 4.0 and 0.5 < t.whole_request_coverage <= 1.0
+    # The tiers must differ, or the candidate tier is the confident one under another name.
+    assert t != c and c.min_distinct < t.min_distinct
+
+
+# ------------------------------------------------------------------ the tier boundary
+
+def test_one_distinctive_word_is_confident_only_when_it_is_the_whole_request():
+    """_TRUSTED_POLICY: one word's worth of distinctive evidence (3.0) passes at coverage 0.9
+    and is refused at 0.89 -- where the request carries content the Skill does not account for
+    (the right topic with a different action: 請求書を発行したい)."""
+    t = S._TRUSTED_POLICY
+    whole = _Scored("a", evidence=3.0, coverage=0.9, distinct=3.0)
+    partial = _Scored("a", evidence=3.0, coverage=0.89, distinct=3.0)
+    assert _decide([whole], t) is whole
+    assert _decide([partial], t) is None
+    assert _decide([partial], S._CANDIDATE_POLICY) is partial, "...which is a CANDIDATE"
+    # Two words' worth needs no exception.
+    two = _Scored("a", evidence=4.0, coverage=0.6, distinct=4.0)
+    assert _decide([two], t) is two
+    assert _decide([_Scored("a", 4.0, 0.6, 3.9)], t) is None
+    # And the exception never waives the one-word floor.
+    assert _decide([_Scored("a", 2.6, 1.0, 1.9)], t) is None
 
 
 # ------------------------------------------------------------------- through the store
@@ -198,6 +229,34 @@ def test_a_single_compound_word_matches(tmp_path, monkeypatch):
 def test_a_single_short_word_does_not(tmp_path, monkeypatch):
     store = _store(tmp_path, monkeypatch, JA)
     assert store.match("経費の予算を立てたい") is None
+    assert store.candidate_match("経費の予算を立てたい") is None
+
+
+def test_the_right_topic_with_another_action_is_only_a_candidate(tmp_path, monkeypatch):
+    """領収書 is distinctive to expense-claim. Asked about on its own it is the whole request,
+    and confident; asked about with an action the Skill does not describe (再発行, reissue) it
+    is only a candidate -- the Skill may or may not be what the user wants."""
+    store = _store(tmp_path, monkeypatch, JA)
+    whole = store.match("領収書について")
+    assert whole and whole["name"] == "expense-claim" and whole["confidence"] == "confident"
+    assert store.candidate_match("領収書について") is None, "the tiers never overlap"
+    request = "領収書を再発行したい"
+    assert store.match(request) is None
+    cand = store.candidate_match(request)
+    assert cand and cand["name"] == "expense-claim" and cand["confidence"] == "candidate"
+    assert cand["description"].startswith("経費精算の手順")
+    assert 0.5 <= cand["coverage"] < S._TRUSTED_POLICY.whole_request_coverage
+
+
+def test_an_unapproved_skill_is_never_a_candidate(tmp_path, monkeypatch):
+    store = _store(tmp_path, monkeypatch, JA, trust=False)
+    assert store.candidate_match("領収書を再発行したい") is None
+    assert store.candidate_match("経費精算のやり方を教えて") is None
+
+
+def test_an_explicit_name_is_confident_never_a_candidate(tmp_path, monkeypatch):
+    store = _store(tmp_path, monkeypatch, JA)
+    assert store.candidate_match("/room-booking で頼む") is None
 
 
 def test_two_skills_equally_named_by_a_request_match_neither(tmp_path, monkeypatch):
@@ -222,7 +281,12 @@ def test_keywords_let_an_english_request_reach_a_japanese_skill(tmp_path, monkey
     front["expense-claim"] += "keywords: [reimbursement, receipt, けいひせいさん]\n"
     with_kw = _store(tmp_path / "with", monkeypatch, front)
     assert with_kw.match(request)["name"] == "expense-claim"
-    assert with_kw.match("けいひせいさん の しかた")["name"] == "expense-claim"
+    assert with_kw.match("けいひせいさん")["name"] == "expense-claim"
+    # With a kana word the library does not know (しかた), the kana keyword (3.5: half a
+    # kanji per kana) is one word's worth of distinctive evidence in a request it does not
+    # wholly account for -- a candidate, not a confident match.
+    assert with_kw.match("けいひせいさん の しかた") is None
+    assert with_kw.candidate_match("けいひせいさん の しかた")["name"] == "expense-claim"
 
 
 def test_keywords_are_matching_text_for_unapproved_skills_too(tmp_path, monkeypatch):

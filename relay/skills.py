@@ -1228,8 +1228,10 @@ class SkillStore:
 
     #: HISTORICAL, like MIN_DISTINCTIVE_WORDS below: match() no longer counts words (see the
     #: block above _match_units, and _TRUSTED_POLICY's min_evidence / min_distinct, which
-    #: carry the same intent in the new unit). Both are kept, with their measurements, because
-    #: they record the fail-opens any replacement must answer for.
+    #: carry the same intent in the new unit -- min_distinct 4.0 is MIN_DISTINCTIVE_WORDS = 2
+    #: restored, after the one-word version let the incident below through again). Both are
+    #: kept, with their measurements, because they record the fail-opens any replacement must
+    #: answer for.
     #:
     #: Distinct real WORDS -- not bigrams -- a candidate's overlap with the query must
     #: contain, counting only content (kanji/katakana/ASCII) words. See _merge_word_groups:
@@ -1325,13 +1327,59 @@ class SkillStore:
         multiple pieces of evidence. See those constants' docstrings for what they catch and,
         as important, what they do not.
         """
-        candidates = {s.name: s for s in self.discover()
-                      if s.trust == "trusted"
-                      and s.metadata.get("disable-model-invocation") is not True}
+        candidates = self._model_invocable_trusted()
         best = self._pick(text, candidates, set(candidates), _TRUSTED_POLICY)
         if best is None:
             return None
-        return {"score": best[1], **candidates[best[0]].public_metadata()}
+        # "confidence" names the tier (see _TRUSTED_POLICY): this door only ever says
+        # "confident". candidate_match() is the other tier and says "candidate".
+        return {"score": best[1], "confidence": "confident",
+                **candidates[best[0]].public_metadata()}
+
+    def _model_invocable_trusted(self) -> dict[str, Skill]:
+        return {s.name: s for s in self.discover()
+                if s.trust == "trusted"
+                and s.metadata.get("disable-model-invocation") is not True}
+
+    def candidate_match(self, text: str) -> dict[str, Any] | None:
+        """The CANDIDATE tier: the trusted Skill that _CANDIDATE_POLICY (the looser policy
+        match() used before the tiers were split) accepts for `text`, when match() -- the
+        CONFIDENT tier -- accepts none. None whenever match() would answer, so the two tiers
+        never name a Skill for the same request.
+
+        ONLY tools.skill_ops.skill_match may call this. What it returns is a POSSIBLE match:
+        the tool hands it to a model with its description and says to load it only if the
+        request is for exactly that procedure. Nothing may inject it, render it, or act on it
+        automatically -- that is what match() is for, and why the two are different methods
+        rather than one method with a flag an automatic caller could forget to check
+        (tests/test_skills_business_mcp.py fails if any other caller appears).
+
+        The winner's bytes are re-hashed before its description is reported, as in match().
+        """
+        for _attempt in range(3):
+            result = self._candidate_once(text)
+            if result is None or not self.use_cache:
+                return result
+            if self._verified_digest(Path(result["path"]), result["scope"], result["digest"]):
+                return result
+        return None
+
+    def _candidate_once(self, text: str) -> dict[str, Any] | None:
+        library = self._model_invocable_trusted()
+        if not library:
+            return None
+        if len(_named_in(text, set(library))) == 1:
+            return None                     # an explicit name is a CONFIDENT match
+        scored = _score_library(text, [(n, _skill_features(s)) for n, s in library.items()],
+                                set(library))
+        if _decide(scored, _TRUSTED_POLICY) is not None:
+            return None                     # the confident tier answers this request
+        best = _decide(scored, _CANDIDATE_POLICY)
+        if best is None:
+            return None
+        return {"score": round(best.coverage, 3), "confidence": "candidate",
+                "coverage": round(best.coverage, 3), "evidence": round(best.evidence, 3),
+                **library[best.name].public_metadata()}
 
     @staticmethod
     def _pick(text: str, library: dict[str, Skill], eligible: set[str],
@@ -1781,11 +1829,17 @@ def _skill_features(skill: "Skill") -> frozenset[str]:
 
 @dataclass(frozen=True)
 class MatchPolicy:
-    """The three guards a best candidate must clear. See _TRUSTED_POLICY for why each exists."""
+    """The guards a best candidate must clear. See _TRUSTED_POLICY for why each exists.
+
+    min_distinct is the distinctive evidence required in general. A request the Skill accounts
+    for almost entirely (coverage >= whole_request_coverage) needs only
+    whole_request_min_distinct instead; the default (infinite) switches that exception off."""
     min_evidence: float
     min_coverage: float
     max_runner_up_ratio: float
     min_distinct: float = 0.0
+    whole_request_coverage: float = math.inf
+    whole_request_min_distinct: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -1861,11 +1915,14 @@ def _score_library(text: str, library: list[tuple[str, frozenset[str]]],
 
 
 def _decide(scored: list[_Scored], policy: MatchPolicy) -> _Scored | None:
-    """The best candidate if it clears all three guards of `policy`, else None."""
+    """The best candidate if it clears every guard of `policy`, else None."""
     if not scored:
         return None
     best = scored[0]
-    if (best.evidence < policy.min_evidence or best.distinct < policy.min_distinct
+    need = policy.min_distinct
+    if best.coverage >= policy.whole_request_coverage:
+        need = min(need, policy.whole_request_min_distinct)
+    if (best.evidence < policy.min_evidence or best.distinct < need
             or best.coverage < policy.min_coverage):
         return None
     runner_up = scored[1].evidence if len(scored) > 1 else 0.0
@@ -1874,18 +1931,38 @@ def _decide(scored: list[_Scored], policy: MatchPolicy) -> _Scored | None:
     return best
 
 
-#: What match() -- the door to a TRUSTED procedure the agent will follow -- demands.
+#: TWO TIERS. A trusted Skill reaches a caller at one of two strengths, and they are different
+#: doors on purpose:
+#:
+#:   CONFIDENT -- _TRUSTED_POLICY, SkillStore.match(). What every AUTOMATIC caller receives:
+#:     relay_fleet._with_matched_skill and the bridge inject the procedure into a worker's
+#:     prompt, and the server's RULE 2 tells a model to load and FOLLOW a confident match. A
+#:     wrong answer here means following the wrong procedure, so it must be refused rather than
+#:     guessed.
+#:   CANDIDATE -- _CANDIDATE_POLICY, SkillStore.candidate_match(). A POSSIBLE match, returned
+#:     only by the MCP tool skill_match, with its description and the explicit instruction to
+#:     load it only if the request is for exactly that procedure. No automatic path may act on
+#:     it (tests/test_skills_business_mcp.py enumerates the callers).
+#:
+#: What the CONFIDENT tier demands:
 #:
 #: min_evidence 2.5 -- MINIMUM SCORE. One distinctive two-kanji word (経費, 請求, 会議), one
 #:   loanword (ロット, メール) and one English word are each worth exactly 2.0, so none can
 #:   select a Skill alone: the old rule's safety intent ("a single weak overlap must not
-#:   select a Skill") stated in the new unit. A distinctive 3-kanji word (稟議書 = 3.0) or
-#:   two words (expense + receipt, 月次 + 集計 = 4.0) clear it.
-#: min_distinct 2.0 -- at least one whole word's worth of the evidence must be DISTINCTIVE
-#:   (features no other Skill has). A match built entirely of vocabulary other Skills share
-#:   says nothing about which of them is meant -- the reason MIN_DISTINCTIVE_WORDS existed;
-#:   this keeps it at one word rather than two, because two is what refused every request
-#:   naming a single compound.
+#:   select a Skill") stated in the new unit.
+#: min_distinct 4.0 -- TWO WORDS' WORTH OF DISTINCTIVE EVIDENCE (features no other Skill has):
+#:   MIN_DISTINCTIVE_WORDS = 2, restored in the new unit, where a two-kanji word or a loanword
+#:   is 2.0. So 経費精算 (4.0), 月次 + 集計 (4.0) or two English words clear it; one distinctive
+#:   word plus shared vocabulary does not.
+#:   ...UNLESS THE SKILL ACCOUNTS FOR THE WHOLE REQUEST: at coverage >= 0.9
+#:   (whole_request_coverage) one distinctive word (2.0) is enough. The near misses this tier
+#:   exists to refuse all have the same shape -- the right topic and a DIFFERENT ACTION:
+#:   「請求書を発行したい」 (issue, where invoice-check checks), 「別材料のロットを調査して
+#:   ほしい」 (a different material's lots). The topic word is distinctive to the Skill; the
+#:   action or object is content the Skill does not account for, so coverage stays well below
+#:   0.9 (0.66 and 0.70). A request that is nothing but the Skill's own topic --
+#:   「稟議書の書き方を教えて」, 「さっきの会議の議事録をまとめてください」 (coverage 1.0) --
+#:   has nothing left over for the Skill to be wrong about, and keeps its match.
 #: min_coverage 0.5 -- the Skill must account for at least half of what the request's content
 #:   could be worth. This refuses one strong word inside a request about something else
 #:   (ロット in 「ロットの価格推移をグラフにして」).
@@ -1894,27 +1971,43 @@ def _decide(scored: list[_Scored], policy: MatchPolicy) -> _Scored | None:
 #:   served by none than by a coin toss (「顧客から品質クレームが来て報告書を出せ」 lands
 #:   between the complaint and 8D Skills and is refused).
 #:
-#: HOW THEY WERE CHOSEN. On the 110-request development set of
-#: tests/test_skills_business_matching.py, the must/must-not cases of
-#: tests/test_skill_match_japanese.py and those of scripts/win/skill_match_bench.py, over a
-#: grid of the guards and the three weights. The grid's recall optimum sat at its permissive
-#: corner (lower evidence and coverage, a 0.8 ratio) and bought a wrong Skill and must-not
-#: matches; these are instead round, explainable values inside the region with no wrong Skill,
-#: and their neighbours (evidence 2.5-3.0, coverage 0.5-0.55, ratio 0.6-0.7) score within 4
-#: requests of them -- no single request decides them. Below min_evidence 2.5 the false
-#: positives jump (7/25 at 2.0 for match_unapproved): a lone word is exactly what this bound
-#: exists to stop.
+#: HOW THEY WERE CHOSEN. min_evidence, min_coverage and the margin were chosen for commit
+#: 6f69e4b on the 110-request development set of tests/test_skills_business_matching.py, the
+#: must/must-not cases of tests/test_skill_match_japanese.py and those of
+#: scripts/win/skill_match_bench.py (see _CANDIDATE_POLICY, which keeps those values). That
+#: policy left one development false positive (請求書を発行したい) and let the live wrong match
+#: MIN_DISTINCTIVE_WORDS was written for (別材料のロットを調査してほしい, bench) through again,
+#: and an independent held-out set showed 4 of 30 match-nothing requests matched -- every one
+#: a right-topic / wrong-action near miss. So the confident tier adds the two-word
+#: distinctiveness requirement back, and the whole-request exception is what keeps it from
+#: refusing every request that names a single 3-kanji compound. MEASURED (dev set):
 #:
-#: WHAT THEY STILL LET THROUGH, MEASURED. 「請求書を発行したい」 (a development near-miss) matches
-#: invoice-check on 請求書: the same shape as 「稟議書の書き方を教えて」, which must match. And
-#: skill_match_bench.py's 「別材料のロットを調査してほしい」 -- the live wrong match
-#: MIN_DISTINCTIVE_WORDS was written for -- matches copper-foil-survey again: one distinctive
-#: word (ロット) plus one shared (調査) plus one unknown (別材料). That is the shape of most
-#: correct development matches too (「海外の取引先に英語でメールを返したい」: 英語 distinctive,
-#: the rest shared); the old rule refused the whole shape and with it most of the recall this
-#: replacement exists to recover. Nothing short of meaning separates them.
+#:   min_distinct 2.0 (6f69e4b)          recall 61/78  FP 1/25  wrong 0
+#:   min_distinct 4.0, no exception      recall 46/78  FP 0/25  wrong 0
+#:   min_distinct 4.0, exception at 0.9  recall 53/78  FP 0/25  wrong 0   <- this
+#:     (exception at 0.85 also 53; at 0.8 54; at 0.95 or 1.0 52 -- no one request decides it)
+#:   min_coverage 0.75 instead           recall 48/78  FP 0/25, but English 2/18
+#:
+#: and on skill_match_bench.py (all six live Skills trusted) exactly the old recorded baseline
+#: comes back: the incident query is refused again; the two KNOWN wrong matches remain.
+#:
+#: WHAT IT STILL LETS THROUGH. A near miss that shares TWO distinctive words with a Skill
+#: (skill_match_bench.py's 「予定表に新しい会議を登録して」 -- creation, where mail-lookup only
+#: reads) is indistinguishable here from a correct match. Nothing short of meaning separates
+#: them. And what this tier refuses is not lost: skill_match offers it as a candidate.
 _TRUSTED_POLICY = MatchPolicy(min_evidence=2.5, min_coverage=0.5, max_runner_up_ratio=2 / 3,
-                              min_distinct=2.0)
+                              min_distinct=4.0, whole_request_coverage=0.9,
+                              whole_request_min_distinct=2.0)
+
+#: What candidate_match() -- the CANDIDATE tier, shown only to a model through the skill_match
+#: tool, never acted on automatically -- demands: exactly the policy match() used in commit
+#: 6f69e4b (one distinctive word's worth of evidence, coverage 0.5, a 1.5x margin). Its
+#: measured cost is known: on the development set it adds the confident misses it gets right
+#: and the one near miss above; see tests/test_skills_business_matching.py for the numbers.
+#: That is acceptable here, and only here, because the caller is told in plain words that it
+#: is a possible match and to use it only if the request is for exactly that procedure.
+_CANDIDATE_POLICY = MatchPolicy(min_evidence=2.5, min_coverage=0.5, max_runner_up_ratio=2 / 3,
+                                min_distinct=2.0)
 
 #: What match_unapproved() -- which only decides which Skill a PERSON is asked to approve --
 #: demands. The same minimum evidence (a lone word is noise here too: at 2.0 this path
