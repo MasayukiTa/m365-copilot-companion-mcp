@@ -28,6 +28,20 @@ This module is the PURE decision core for both halves of the fix:
   double-click dropped a live run, and a change in a subpackage was never seen (new-PC
   analysis D12/D30).
 
+* ``start_all.ps1`` asks the SAME SHAPE of question through ``--bridge-action`` (see
+  ``_cli_bridge_action``) for the chat bridge (``bridge/copilot_bridge.py``). Wiring the
+  server's daily check through ``--server-action`` left the bridge's own daily check
+  (``Bridge-Is-Outdated`` in start_all.ps1) exactly as it always was: ``Get-ChildItem``
+  without ``-Recurse`` over the top level of ``bridge/``, ``tools/`` and ``relay/`` only, and
+  no question at all about whether a chat turn was in progress -- a manual ``git pull`` plus
+  a double-click could kill the bridge mid-turn. ``--bridge-action`` scans the SAME watched
+  directories RECURSIVELY (:func:`_bridge_newer_than`, reusing
+  ``tools.deploy_freshness.newer_than``) and asks the SAME bridge ``/status`` probe
+  (:func:`_bridge_state`) the server's own "is a bridge turn live" input already uses, then
+  reuses :func:`decide_post_update_action` unchanged -- a stale-but-idle bridge is
+  ``swap-needed``, a stale-and-busy bridge is ``report-only``, and an unchanged bridge is
+  ``noop`` whatever ``/status`` says.
+
 The decision functions are pure (no I/O, no side effects) so they can be exercised
 directly from pytest on any OS. The I/O -- the run markers, the bridge's /status, file
 times -- lives in the underscore readers and the CLI at the bottom, which prints one
@@ -61,6 +75,16 @@ if _REPO_ROOT not in sys.path:
 #: break the "re-running is a no-op" contract for the common docs-only update).
 SERVER_CODE_PREFIXES: tuple[str, ...] = ("relay/", "tools/")
 SERVER_CODE_FILES: frozenset[str] = frozenset({"main.py"})
+
+#: Directories the BRIDGE itself imports from. copilot_bridge.py's own import lines name
+#: ``bridge.session_store``, ``bridge.review_command``, ``relay.copilot_autopilot_relay``,
+#: ``relay.relay_fleet``, ``relay.skills`` and ``tools.tool_probe`` -- so, like
+#: deploy_freshness.WATCHED for the server, the conservative and verifiable unit is the WHOLE
+#: directory each of those lives under, not the literal name list (a new import inside
+#: relay/ or tools/ must not have to be added here by hand to stay covered). ``bridge/`` is
+#: additionally watched because that is the bridge's own package -- the one directory the
+#: server's WATCHED never needed, since main.py does not import it.
+BRIDGE_WATCHED: tuple[str, ...] = ("bridge", "relay", "tools")
 
 
 def _normalize(path: str) -> str:
@@ -312,6 +336,24 @@ def _bridge_state(url):
     return (True, body.get("turn_running") is True or body.get("busy") is True)
 
 
+def _bridge_newer_than(when, repo):
+    """[(relpath, mtime)] under BRIDGE_WATCHED modified after ``when``, newest first.
+
+    Reuses ``tools.deploy_freshness.newer_than`` -- the SAME recursive ``os.walk`` the
+    server's ``--server-action`` already trusts -- so a change inside a subpackage
+    (``relay/selfimprove/``, ``tools/auto/``) is seen here too, not just at the top level.
+    That top-level-only scan was exactly the bug in start_all.ps1's old ``Bridge-Is-Outdated``
+    (a plain ``Get-ChildItem`` with no ``-Recurse``).
+
+    ``main.py`` IS EXCLUDED. ``newer_than`` always appends it, since it is the server's own
+    entrypoint, but ``copilot_bridge.py`` never imports ``main`` -- counting it would restart
+    the bridge over a server-only change the bridge cannot even see.
+    """
+    from tools.deploy_freshness import newer_than
+    return [(rel, m) for rel, m in newer_than(when, repo, watched=BRIDGE_WATCHED)
+            if rel.replace("\\", "/") != "main.py"]
+
+
 def stale_ui_targets(ui_dir: str, targets, extra_inputs=("app.manifest",)):
     """[(name, reason)] for each UI target whose exe has to be (re)built before it is run.
 
@@ -422,6 +464,47 @@ def _cli_server_action(rest) -> int:
     return 0
 
 
+def _cli_bridge_action(rest) -> int:
+    """start_all's bridge question: should the running bridge be stopped and restarted?
+
+        --bridge-action --started-epoch E [--bridge-status URL] [--repo R]
+
+    The bridge half of the ``--server-action`` fix (see the module docstring). Only the
+    daily/started-epoch form exists -- the bridge is never restarted from a ``git diff``
+    change list the way the post-update tail restarts the server, because start_all only
+    ever restarts the bridge from its own daily "is the running process older than its code"
+    check.
+
+    Prints ``why:`` evidence lines, then ONE verdict word: ``noop``, ``report-only`` or
+    ``swap-needed`` -- the SAME vocabulary ``--server-action`` prints, read by the SAME
+    ``ConvertTo-ServerActionResult`` on the PowerShell side. Anything that goes wrong raises,
+    exits non-zero and prints no verdict, which the caller must read as "leave the bridge
+    alone".
+    """
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="stale_server_check.py --bridge-action")
+    ap.add_argument("--bridge-status", default=None)
+    ap.add_argument("--started-epoch", type=float, required=True)
+    ap.add_argument("--repo", default=_REPO_ROOT)
+    a = ap.parse_args(rest)
+    newer = _bridge_newer_than(a.started_epoch, a.repo)
+    changed = bool(newer)
+    for rel, _m in newer[:5]:
+        print("why: newer than the running bridge: %s" % rel.replace("\\", "/"))
+    # As in --server-action: the bridge's own /status is asked only when the code actually
+    # changed. An unchanged bridge is a no-op whatever a turn is doing, and it must never be
+    # probed just to find that out.
+    busy = False
+    if changed:
+        _present, busy = _bridge_state(a.bridge_status)
+        if busy:
+            print("why: a bridge turn is live (or cannot be proven finished)")
+    verdict = decide_post_update_action(changed, busy)
+    print(verdict)
+    return 0
+
+
 def _cli_ui_stale() -> int:
     """One line per UI target, ``<name> ok`` or ``<name> rebuild <reason>``, from the Build
     lines bench/ui_build_check.py parses out of ui/rebuild_ui.ps1. That parser raises
@@ -445,6 +528,7 @@ def main(argv=None) -> int:
 
     start_all.ps1:
         stale_server_check.py --server-action ...   see _cli_server_action
+        stale_server_check.py --bridge-action ...    see _cli_bridge_action
         stale_server_check.py --ui-stale            see _cli_ui_stale
 
     Older sub-commands, kept for anything that still calls them (start_all no longer does):
@@ -461,6 +545,8 @@ def main(argv=None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if args and args[0] == "--server-action":
         return _cli_server_action(args[1:])
+    if args and args[0] == "--bridge-action":
+        return _cli_bridge_action(args[1:])
     if args and args[0] == "--ui-stale":
         return _cli_ui_stale()
     if args and args[0] == "--pyside":
