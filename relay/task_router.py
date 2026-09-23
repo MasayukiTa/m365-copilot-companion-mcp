@@ -65,6 +65,7 @@ import hashlib
 import itertools
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -126,6 +127,9 @@ LOCAL_TIMEOUT_S = int(os.environ.get("TASK_LOCAL_TIMEOUT_S", "120"))
 #              job held in awaiting/); once a human approves that class, later same-class jobs
 #              auto-run -- UNLESS the specific payload is itself flagged destructive (see
 #              job_gate() below: an approved class never bypasses a fresh destructive check).
+#              A "class" is only as wide as a payload's text cannot carry code: python code and
+#              interpreter / shell-operator commands are keyed by their exact normalised text,
+#              so approving one approves that text only (see _job_class_key).
 #   auto    -- purely STATIC risk check (never executes the payload to test it): clean -> run,
 #              a STOP-pattern -> deny, an ASK-pattern -> fall back to a confirm gate.
 #   bypass  -- current (pre-gate) behavior: run anything. The H3 path floor (see _exec_file /
@@ -353,20 +357,125 @@ LOCAL_EXECUTORS = {
 
 # ── Job-approval gate: class key, allowlist store, static risk, decision ──────────────────────
 
+#: Programs that run code or a command taken from their OWN ARGUMENTS. For these, the first two
+#: tokens name no action at all: `python -c`, `powershell -Command`, `cmd /c`, `bash -c`,
+#: `node -e`, `wsl <anything>` each describe "whatever text follows", so a class built from them
+#: is a class of every program. Missing an entry here fails toward the weaker class key, so this
+#: is the list to extend when a new launcher turns up.
+_CODE_RUNNERS = frozenset((
+    "python", "python3", "py", "pyw", "pythonw", "pypy", "pypy3", "ipython",
+    "powershell", "powershell_ise", "pwsh", "cmd", "command", "conhost",
+    "bash", "sh", "zsh", "dash", "ksh", "fish", "wsl", "busybox",
+    "node", "nodejs", "deno", "bun", "npx", "perl", "ruby", "php", "lua", "tclsh", "osascript",
+    "cscript", "wscript", "mshta", "rundll32", "regsvr32", "msiexec", "installutil", "msbuild",
+    "start", "call", "env", "xargs", "find", "forfiles", "wmic", "schtasks", "at", "runas",
+    "sudo", "nohup", "iex", "invoke-expression", "awk", "gawk", "sed", "uv", "uvx", "pipx",
+))
+
+#: Argument tokens that hand the NEXT text to something that executes it, whatever the program:
+#: `git -c core.pager=..`, `find -exec`, `git rebase -x`, `git fetch --upload-pack=..`,
+#: `git submodule foreach`, `docker run`, `npm exec`. Compared case-insensitively, before any `=`.
+_CODE_CARRYING_ARGS = frozenset((
+    "-c", "/c", "/k", "/r", "-e", "-x", "--eval", "-command", "--command", "-encodedcommand",
+    "-enc", "-ec", "-exec", "--exec", "-execdir", "-ok", "--upload-pack", "--receive-pack",
+    "--config", "exec", "run", "foreach", "eval", "call", "start", "invoke-expression", "iex",
+))
+
+#: A token a class may be built from: letters, digits and path/option punctuation only. No
+#: quote (a quoted program path hides where the program name ends), no shell operator
+#: (& | ; < > ^), no expansion (% ! $ `), no grouping or glob. Anything else and the text can
+#: say more than its first two tokens do.
+_PLAIN_TOKEN = re.compile(r"^[\w.:\\/@+,=~-]+$")
+
+
+def _normalised_payload_text(text):
+    """The text an exact approval is keyed on: line endings unified, outer whitespace dropped.
+    Nothing inside is collapsed -- in Python indentation and string contents are code, so two
+    texts that differ inside are two different payloads."""
+    return str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def _payload_text(job_type, payload):
+    """What the operator is shown, and what an exact approval covers, for one job."""
+    payload = payload or {}
+    if job_type == "shell":
+        return str(payload.get("cmd") or payload.get("command") or "")
+    if job_type == "python":
+        return str(payload.get("code") or "")
+    return json.dumps({k: v for k, v in payload.items() if k != "id"},
+                      ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _exact_key(job_type, payload):
+    """Approval key for exactly this payload and nothing else.
+
+    `@sha256:` rather than `::` so no class key can ever spell one: a class key is always
+    `<type>::<tokens>`, and a command whose first token happened to read `exact::<hex>` must not
+    be able to stand in for the payload that hex was computed from."""
+    text = _normalised_payload_text(_payload_text(job_type, payload))
+    return "%s@sha256:%s" % (job_type, hashlib.sha256(text.encode("utf-8")).hexdigest())
+
+
+def _program_name(token):
+    """`C:\\Python\\python.exe` -> `python`. Lower-cased, directory and executable suffix dropped."""
+    name = token.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    for ext in (".exe", ".com", ".bat", ".cmd", ".ps1"):
+        if name.endswith(ext):
+            name = name[:-len(ext)]
+            break
+    return name
+
+
+def _shell_class_prefix(cmd):
+    """The first-two-token class this command may share an approval with -- or None when its
+    own text can carry code, so that only an approval of this exact text may cover it.
+
+    None when: the command spans lines; any token is not plain (see _PLAIN_TOKEN); the program
+    runs code from its arguments (_CODE_RUNNERS, including `python3.12`-style names); the
+    second token is an option rather than a subcommand, so the pair names no action
+    (`git -c`, `node -e`); or any token is a code-carrying argument (_CODE_CARRYING_ARGS)."""
+    text = _normalised_payload_text(cmd)
+    if not text or "\n" in text:
+        return None
+    tokens = text.split()
+    if not all(_PLAIN_TOKEN.match(t) for t in tokens):
+        return None
+    prog = _program_name(tokens[0])
+    if prog in _CODE_RUNNERS or re.match(r"^(python|pypy)[\d.]*w?$", prog):
+        return None
+    if len(tokens) > 1 and tokens[1][:1] in ("-", "/"):
+        return None
+    if any(t.split("=", 1)[0].lower() in _CODE_CARRYING_ARGS for t in tokens[1:]):
+        return None
+    return " ".join(tokens[:2])
+
+
 def _job_class_key(job_type, payload):
     """Pure fn: map (job_type, payload) -> a stable class-key string for the approval
     allowlist. Deliberately granular: "git status" and "git push --force" are DISTINCT
     classes -- collapsing to just the program name (e.g. "git") would let one approval of
-    a benign invocation silently cover a destructive one later. shell/python key on the
-    first two whitespace-normalized tokens of the command/code; file keys on
-    (op, resolved parent dir). Hermetically testable: no I/O besides path resolution."""
+    a benign invocation silently cover a destructive one later. file keys on
+    (op, resolved parent dir). Hermetically testable: no I/O besides path resolution.
+
+    THE SAME REASONING, CARRIED ONE STEP FURTHER. shell and python used to key on the first two
+    whitespace tokens of the command/code, which for an interpreter is no class at all:
+    `python -c "print(1)"` and `python -c "<anything>"` share `shell::python -c`, and a python
+    job's own code keyed on its first two tokens (`import os`), so one approval covered every
+    program that began the same way -- with only the regex static check between an obfuscated
+    payload and execution, and no further human decision (SEC-07).
+
+    So a key now only groups payloads whose differences cannot be code:
+      python -- always the exact normalised code (_exact_key). The payload IS code.
+      shell  -- the first-two-token class only when _shell_class_prefix() finds the command
+                cannot carry code past that prefix; otherwise the exact normalised command."""
     payload = payload or {}
     if job_type == "shell":
-        cmd = (payload.get("cmd") or payload.get("command") or "").split()
-        return "shell::%s" % " ".join(cmd[:2])
+        prefix = _shell_class_prefix(payload.get("cmd") or payload.get("command") or "")
+        if prefix is None:
+            return _exact_key(job_type, payload)
+        return "shell::%s" % prefix
     if job_type == "python":
-        code = (payload.get("code") or "").split()
-        return "python::%s" % " ".join(code[:2])
+        return _exact_key(job_type, payload)
     if job_type == "file":
         op = payload.get("op") or ""
         path = payload.get("path") or ""
@@ -485,6 +594,44 @@ def _gate_token_for_class(key):
     tools/contract_gate.py's _stable_token(op_class, detail) pattern."""
     h = hashlib.sha256(("task_router_job_class::%s" % key).encode("utf-8")).hexdigest()[:16]
     return "gate_%s" % h
+
+
+def _gate_key(job_type, payload, level):
+    """The key a CONFIRM gate is posted under -- which is exactly what answering it approves.
+
+    A clean payload asks about its class key (for code-carrying forms that already IS the exact
+    payload). A payload the static check flagged asks about THAT payload only.
+
+    WHY THE SECOND HALF. Gate files are durable and the token was derived from the class key
+    alone, so once any `git log ...` gate had been answered "approved", a later same-class
+    payload that job_gate() held back as risky ("class approved but this payload is risky")
+    was moved to awaiting/, found the old answered gate under the same token, and ran on the
+    next recheck -- the confirm existed, nobody was asked. The same replay reached `auto`
+    mode's ASK-pattern confirms. A flagged payload's gate is now its own."""
+    if level == "clean":
+        return _job_class_key(job_type, payload)
+    return _exact_key(job_type, payload)
+
+
+def _job_gate_question(job_type, payload, gate_key):
+    """The approval text: says what answering it covers, and shows the payload IN FULL.
+
+    It used to show the first 160 characters -- the tail of an obfuscated payload is exactly
+    what would sit past that cut -- and to call every approval a class approval even when the
+    class was every program an interpreter could run."""
+    text = _normalised_payload_text(_payload_text(job_type, payload))
+    if "@sha256:" in gate_key:
+        return ("ジョブ承認（この内容のみ）: %s\n"
+                "承認されるのは以下の内容そのものだけです。1文字でも違えば再度確認します。\n"
+                "Approve exactly this %s job? Only this exact text is approved; any change "
+                "asks again.\n"
+                "----\n%s\n----\n%s" % (job_type, job_type, text, gate_key))
+    return ("ジョブ承認（クラス）: %s\n"
+            "承認すると、クラス %r に属する以後のジョブは静的検査が clean な限り確認なしで"
+            "実行されます。\n"
+            "Approve job class %r ? Later jobs in this class run without asking while the "
+            "static check finds them clean.\n"
+            "----\n%s\n----" % (job_type, gate_key, gate_key, text))
 
 
 def _write_job_gate(token, question, context):
@@ -1922,13 +2069,11 @@ def run_job(job, now_ts=None):
                 elif decision == "DENY":
                     rec["status"], rec["error"] = "denied", reason
                 else:  # CONFIRM -- hold the job, raise a desktop gate, do NOT block the loop
-                    key = _job_class_key(job_type, payload)
+                    # The gate is keyed on what answering it approves (see _gate_key), and the
+                    # question shows that payload in full.
+                    key = _gate_key(job_type, payload, _static_risk(job_type, payload)[0])
                     token = _gate_token_for_class(key)
-                    detail = (payload.get("cmd") or payload.get("command") or
-                              payload.get("code") or payload.get("path") or "")
-                    question = ("ジョブ承認: %s %s ? "
-                                "(このクラスを許可すると次回以降自動実行) / "
-                                "Approve job class %r ?" % (job_type, str(detail)[:160], key))
+                    question = _job_gate_question(job_type, payload, key)
                     _write_job_gate(token, question, "task_router job class: %s" % key)
                     rec["status"] = "awaiting_approval"
                     rec["result"] = {"gate_token": token, "class_key": key}
@@ -2185,17 +2330,44 @@ def _recheck_awaiting(now_ts=None):
         jid = job.get("id", name[:-5] if name.endswith(".json") else name)
         job_type = job.get("type")
         payload = dict(job.get("payload") or {}, id=jid)
-        key = _job_class_key(job_type, payload)
-        token = _gate_token_for_class(key)
-        gate = _read_job_gate(token)
-        if gate is None or not gate.get("answered"):
-            continue  # still waiting -- no sleep, just move on to the next tick
-        answer = str(gate.get("answer") or "").lower().strip()
         rec = {"id": jid, "type": job_type, "destination": "local",
                "ts_done": now_ts, "status": None, "result": None, "error": None}
+        # EVERYTHING BELOW IS DERIVED FROM THE PAYLOAD, NEVER READ FROM THE FILE. awaiting/ is
+        # as writable as pending/, so a job can arrive here without job_gate() ever having
+        # seen it. The policy is therefore asked again: a payload the current mode refuses
+        # outright is refused here too, rather than being run on some other job's answer.
+        decision, why = job_gate(job_type, payload, _current_approval_mode(TASK_JOB_APPROVAL_MODE))
+        if decision == "DENY":
+            rec["status"], rec["error"] = "denied", why
+            try:
+                with open(_p("done", name), "w", encoding="utf-8") as f:
+                    json.dump(rec, f, ensure_ascii=False, indent=2)
+                os.remove(path)
+            except OSError:
+                pass
+            out.append(rec)
+            continue
+        class_key = _job_class_key(job_type, payload)
+        key = _gate_key(job_type, payload, _static_risk(job_type, payload)[0])
+        token = _gate_token_for_class(key)
+        gate = _read_job_gate(token)
+        if gate is None:
+            # A waiting job that no gate asks about can never be answered: it arrived here
+            # directly, or its key changed since it was parked. Ask about it now -- once, since
+            # _write_job_gate never overwrites an existing gate.
+            _write_job_gate(token, _job_gate_question(job_type, payload, key),
+                            "task_router job class: %s" % key)
+            continue
+        if not gate.get("answered"):
+            continue  # still waiting -- no sleep, just move on to the next tick
+        answer = str(gate.get("answer") or "").lower().strip()
         try:
             if answer == "approved":
-                _approve_class(key, example=json.dumps(payload, ensure_ascii=False)[:200])
+                # Record only what the gate asked about. A gate for a payload the static check
+                # flagged approved that payload, once -- not its class, and recording the exact
+                # key would change nothing (job_gate never ALLOWs a flagged payload).
+                if key == class_key:
+                    _approve_class(key, example=json.dumps(payload, ensure_ascii=False)[:200])
                 fn = LOCAL_EXECUTORS.get(job_type)
                 if not fn:
                     rec["status"], rec["error"] = "error", "no local executor for type %r" % job_type
