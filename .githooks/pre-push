@@ -1,0 +1,55 @@
+#!/bin/sh
+# Run the sweeping ratchets against the tree that is about to be pushed.
+#
+# WHY PUSH AND NOT COMMIT. Half a dozen guards here filter against `git ls-files`, so what they
+# see changes between "I ran the suite" and "I pushed": a file that was untracked becomes
+# visible, and a call that was fixed leaves a stale inventory entry behind. Both shapes reached
+# main on 2026-09-22 and 2026-09-23, one after the other:
+#
+#   * a new test used subprocess.run(..., text=True); untracked at test time, so the decode
+#     inventory could not see it, and CI met it first.
+#   * bench/ui_build_check.py was moved onto childproc.run and its launch-site entry was not
+#     removed, so the ratchet's other half -- "a site that is clean is removed from the list" --
+#     fired on the runner.
+#
+# Neither is a flaky test or a CI quirk. Both are the index changing under a guard, at the one
+# moment nothing was looking.
+#
+# WHY THIS SUBSET, MEASURED. Every sweeping ratchet together is 7m37s, which is not a price
+# anybody pays per push -- a hook that slow gets --no-verify'd into uselessness, and then it
+# protects nothing. These four are 40s and are exactly the two failure shapes above plus the
+# two guards of the same construction. The expensive one (the unreached fixed point) stays in
+# the full suite and in preflight, where it belongs.
+#
+# THIS IS NOT A SUBSTITUTE FOR preflight. preflight runs everything CI runs; this runs only the
+# part that can go wrong between running the suite and pushing.
+set -e
+
+if [ -x ".venv/Scripts/python.exe" ]; then
+    PY=".venv/Scripts/python.exe"
+elif [ -x ".venv/bin/python" ]; then
+    PY=".venv/bin/python"
+else
+    PY="python"
+fi
+
+# A guard that cannot run is not a guard that passed -- the rule this repository's pre-commit
+# hook already states, and the reason --strict is passed rather than the lenient default.
+"$PY" scripts/check_nothing_new_is_invisible.py --strict || {
+    echo ""
+    echo "pre-push: refused. The guards below would sweep a tree that does not contain those"
+    echo "files, and CI would be the first thing to look at them."
+    exit 1
+}
+
+"$PY" -m pytest -q --no-header -p no:warnings \
+    ui/test_one_list_says_what_the_ui_compiles.py \
+    tools/test_child_output_is_not_decoded_by_luck.py \
+    tools/test_a_backslash_in_a_literal_means_what_it_says.py \
+    tools/test_no_new_launch_inherits_its_console_by_accident.py || {
+    echo ""
+    echo "pre-push: refused. These ratchets read the git index, so they see the push and not"
+    echo "the working tree you last ran the suite against. Caught here it is an edit; caught"
+    echo "after the push it is a red main and a second commit."
+    exit 1
+}

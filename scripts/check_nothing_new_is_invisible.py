@@ -35,10 +35,10 @@ from __future__ import annotations
 
 import argparse
 import os
-import subprocess
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
 
 #: The directories the sweeping guards walk. Kept in step with tools/ and relay/'s own ROOTS
 #: tuples; a root that is swept by a guard and missing here is a blind spot in this check.
@@ -50,11 +50,20 @@ SUFFIXES = (".py", ".cs", ".ps1", ".bat", ".cmd")
 
 
 def _git(*args):
-    r = subprocess.run(["git"] + list(args), cwd=REPO, capture_output=True, timeout=120)
+    """Through tools.childproc, like every other guard here.
+
+    Two ratchets have something to say about a bare `subprocess.run`: it decodes the child with
+    the local code page (cp932 here, so one bad byte takes the whole of stdout), and it is a
+    new launch site with no decision recorded about the console it inherits. Both fired on this
+    file the moment it was staged -- which is, in the smallest possible way, the thing this
+    file exists to say.
+    """
+    from tools.childproc import run as _run_child
+    r = _run_child(["git"] + list(args), cwd=REPO, timeout=120)
     if r.returncode != 0:
         raise SystemExit("check_nothing_new_is_invisible: git %s failed: %s"
-                         % (" ".join(args), r.stderr.decode("utf-8", "replace").strip()))
-    return [p for p in r.stdout.decode("utf-8", "replace").split("\n") if p.strip()]
+                         % (" ".join(args), (r.stderr or "").strip()))
+    return [p for p in (r.stdout or "").split("\n") if p.strip()]
 
 
 def invisible():

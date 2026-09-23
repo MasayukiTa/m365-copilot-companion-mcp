@@ -38,11 +38,16 @@ def install(repo=REPO):
     # execute it, and a pre-commit hook is a file that runs on every commit, so a writable or
     # broadly reachable copy of it is a foothold rather than a convenience. Flagged as
     # py/overly-permissive-file (alert #34) and it was my own line from the same day.
-    hook = os.path.join(repo, HOOKS_DIR, "pre-commit")
-    try:
-        os.chmod(hook, 0o700)
-    except OSError:
-        pass
+    #
+    # EVERY HOOK IN THE DIRECTORY, not "pre-commit". A second hook was added on 2026-09-23
+    # (pre-push) and chmodding one file by name would have left it unexecutable on POSIX --
+    # where it would then be skipped SILENTLY, which is the failure mode a hook can least
+    # afford. Reading the directory means the next hook is installed by existing.
+    for name in sorted(os.listdir(os.path.join(repo, HOOKS_DIR))):
+        try:
+            os.chmod(os.path.join(repo, HOOKS_DIR, name), 0o700)
+        except OSError:
+            pass
     return current_hooks_path(repo)
 
 
@@ -54,6 +59,8 @@ def main():
         return 1
     print("core.hooksPath = %s%s" % (now, "" if was == now else "  (was %r)" % was))
     print("pre-commit now refuses a commit whose STAGED files carry identifying content.")
+    print("pre-push now runs the ratchets that read the git index, which is the tree being")
+    print("pushed rather than the one the suite was last run against (about 40s).")
     return 0
 
 
