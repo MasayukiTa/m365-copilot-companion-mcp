@@ -64,15 +64,81 @@ def test_the_marker_file_is_enough(tmp_path):
     assert out.stdout.strip() == "True", out.stderr
 
 
+_FAKE_PING_OK = (
+    "import subprocess\n"
+    "class _P:\n"
+    "    stdout = '{\"ok\": true, \"pong\": true}'\n"
+    "    stderr = ''\n"
+    "    returncode = 0\n"
+    "subprocess.run = lambda *a, **k: _P()\n"
+)
+
+_FAKE_PING_DOWN = (
+    "import subprocess\n"
+    "class _P:\n"
+    "    stdout = ''\n"
+    "    stderr = 'ssh: connect to host swe-broker port 22: Connection refused'\n"
+    "    returncode = 255\n"
+    "subprocess.run = lambda *a, **k: _P()\n"
+)
+
+
 def test_relay_is_importable_from_the_bench_directory():
     """THE ONE THAT WOULD HAVE CAUGHT IT. `from bench.remote import broker_client` raises here unless
-    the helper puts the repository on the path first."""
-    out = _run("import routing_switch; print(routing_switch.broker() is not None)", cwd=BENCH,
+    the helper puts the repository on the path first. The broker's `subprocess.run` is faked so
+    this exercises the import/path wiring, not a real network call."""
+    out = _run(_FAKE_PING_OK +
+               "import routing_switch; print(routing_switch.broker() is not None)", cwd=BENCH,
                env={"SWE_BROKER": "on"})
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "True", (
         "the switch was asked for and the helper answered no; that answer sent staging to "
         "clone locally and capture to read an empty directory")
+
+
+def test_broker_pings_before_handing_back_the_client():
+    """THE GAP THE BURNDOWN NAMED: `broker()` used to establish only that the module imports,
+    never that the broker answers. A routed run against a down host must fail here, once, with
+    a reason -- not proceed and fail one `create` at a time across every instance."""
+    out = _run(_FAKE_PING_OK +
+               "import routing_switch; print(routing_switch.broker() is not None)", cwd=BENCH,
+               env={"SWE_BROKER": "on"})
+    assert out.stdout.strip() == "True", (out.stdout, out.stderr)
+
+    out = _run(
+        _FAKE_PING_DOWN +
+        "import routing_switch as R\n"
+        "try:\n"
+        "    R.broker()\n"
+        "    print('FELL BACK')\n"
+        "except RuntimeError as e:\n"
+        "    print('RAISED')\n",
+        cwd=BENCH, env={"SWE_BROKER": "on"})
+    assert out.stdout.strip() == "RAISED", (
+        "the broker never answered a ping and routing was asked for; this must raise, never "
+        "fall back to running the instance on this machine", out.stdout, out.stderr)
+
+
+def test_the_ping_is_cached_for_the_process_not_repeated_per_call():
+    """`broker()` is called once per instance in a run of forty; re-pinging every call would
+    turn that into forty extra SSH round trips for a fact that does not change mid-run."""
+    out = _run(
+        "import subprocess\n"
+        "calls = []\n"
+        "class _P:\n"
+        "    stdout = '{\"ok\": true, \"pong\": true}'\n"
+        "    stderr = ''\n"
+        "    returncode = 0\n"
+        "def _fake_run(*a, **k):\n"
+        "    calls.append(1)\n"
+        "    return _P()\n"
+        "subprocess.run = _fake_run\n"
+        "import routing_switch as R\n"
+        "R.broker(); R.broker(); R.broker()\n"
+        "print(len(calls))\n",
+        cwd=BENCH, env={"SWE_BROKER": "on"})
+    assert out.stdout.strip() == "1", (
+        "broker() pinged more than once per process", out.stdout, out.stderr)
 
 
 def test_being_unable_to_answer_is_an_error_not_a_no(tmp_path):
