@@ -17,9 +17,12 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\quickstart_lock.ps1 acquire
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\quickstart_lock.ps1 release
 #
-# EXIT: 0 acquired / released; 10 another quickstart holds it (message printed).
-# Anything else means this helper itself could not run -- quickstart.bat then continues
-# WITHOUT a lock rather than refusing to install over a missing helper.
+# EXIT: 0 acquired / released; 10 another LIVE quickstart holds it (message printed, names the
+# PID); 11 could not CONFIRM ownership after 3 attempts (message printed) -- treated the same as
+# "in use": quickstart.bat fails closed on either code rather than installing unlocked, because
+# an unconfirmed lock is exactly the ambiguous state two quickstarts racing into one .venv looks
+# like from here. Anything else (a crash in this script, or cmd's own 9009 when PowerShell itself
+# is not on PATH) also makes quickstart.bat fail closed with a generic message -- see quickstart.bat.
 #
 # ASCII / ENGLISH ONLY.
 param(
@@ -105,5 +108,18 @@ for ($attempt = 0; $attempt -lt 3; $attempt++) {
     Remove-Item -LiteralPath $LockPath -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 150
 }
-Write-Host "  Could not take the quickstart lock ($LockPath); continuing without it."
-exit 0
+# FAIL CLOSED. 3 attempts each either lost the create race to a lock that stayed unreadable/
+# contested or hit some other repeated interference (never resolving to "ours", "stale", or "a
+# live PID") -- an ambiguous state, not a confirmed absence of another quickstart. Proceeding
+# unlocked here is exactly the bug this lock exists to close: two installs could still write
+# different secrets into the same .env. This is NOT "helper cannot run" (that is any other
+# non-zero, e.g. cmd's own 9009) -- the helper ran fine three times and still could not confirm
+# ownership, so it is reported the same as "in use", with automatic stale-lock detection (by the
+# owning PID's liveness, not by asking anyone to delete a file) already having been tried above.
+Write-Host ""
+Write-Host "  COULD NOT CONFIRM the quickstart lock ($LockPath) after 3 attempts -- something kept"
+Write-Host "  changing it underneath this check. Treated as IN USE, so nothing was installed."
+Write-Host "  A lock left behind by a closed quickstart window is detected and cleared"
+Write-Host "  automatically (by checking whether its owning process is still alive), so this"
+Write-Host "  usually clears itself. Wait a few seconds and run quickstart.bat again."
+exit 11

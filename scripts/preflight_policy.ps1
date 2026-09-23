@@ -142,6 +142,10 @@ function Get-MotwCount {
 
 function Test-WshEnabled {
     # Enabled=0 (string or DWORD) under either hive disables wscript for this user.
+    # PREFLIGHT_TEST_WSH_ENABLED (tests only): forces the answer so a test can exercise both
+    # branches without touching this machine's real Windows Script Host registry keys.
+    if ($env:PREFLIGHT_TEST_WSH_ENABLED -eq '0') { return $false }
+    if ($env:PREFLIGHT_TEST_WSH_ENABLED -eq '1') { return $true }
     foreach ($k in @('HKLM:\SOFTWARE\Microsoft\Windows Script Host\Settings',
                      'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows Script Host\Settings',
                      'HKCU:\SOFTWARE\Microsoft\Windows Script Host\Settings')) {
@@ -152,6 +156,14 @@ function Test-WshEnabled {
 }
 
 # ---- entry points --------------------------------------------------------------------------
+if ($args -contains '-CheckWshOnly') {
+    # START-16, 2026-09-24: start_all.bat (the DAILY launcher, run long after setup.bat's own
+    # preflight already warned-and-continued past a disabled WSH) calls this on every run to
+    # decide whether wscript.exe's hidden launcher can be trusted at all -- reusing this same
+    # Test-WshEnabled check rather than a second copy of the registry paths.
+    Write-Output ('WSH-ENABLED=' + [int](Test-WshEnabled))
+    exit 0
+}
 if ($args -contains '-ProbeOnly') {
     # Reached only through a real -File launch: proves the launch works and says in which mode.
     Write-Output ('PROBE-LANGUAGE=' + $ExecutionContext.SessionState.LanguageMode)
