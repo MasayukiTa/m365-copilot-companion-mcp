@@ -100,13 +100,17 @@ static class ChatSend
     /// with LiveWorkerFor. EXACT, CASE-SENSITIVE MATCH: the chip lowercases before asking, the
     /// steer lookup never did, and each caller keeps what it did.
     ///
-    /// NOT HERE, AND KNOWN: relay's terminal set also has "maxturns" (and idle_edge.py
-    /// "content_refused"). Neither list here ever had them; adding them would change what both
-    /// readers do, which this extraction does not.
+    /// "maxturns" and "content_refused" ADDED 2026-09-24: relay/relay_fleet.py's own TERMINAL
+    /// tuple is ("done", "stuck", "maxturns", "error", "cancelled", "content_refused") -- both
+    /// were missing here, so a worker that spent its whole turn budget (MAXTURNS) or whose
+    /// prompt Copilot declined (CONTENT_REFUSED, idle_edge.py) still looked "live" to this
+    /// window. LiveWorkerFor would then steer it: the worker is finished and will never read
+    /// the steer, so the message was silently lost instead of becoming a follow-up goal.
     public static bool IsTerminalWorkerStatus(string status)
     {
         return status == "done" || status == "resolved" || status == "failed" || status == "error"
-            || status == "cancelled" || status == "stopped" || status == "stuck" || status == "pending";
+            || status == "cancelled" || status == "stopped" || status == "stuck" || status == "pending"
+            || status == "maxturns" || status == "content_refused";
     }
 
     public static string SS(Dictionary<string, object> d, string k)
@@ -448,17 +452,43 @@ static class ChatSend
 
         // #3: at capacity -> the fleet queue. Read even for a slash command; only the decision
         // exempts it.
+        //
+        // NEITHER BRANCH APPLIES TO A FLEET CONVERSATION. The reroute exists to stop a native
+        // send from opening another heavy tab; a fleet conversation is never on the page and a
+        // send into it never opens one, so the capacity check has nothing to protect here. Worse,
+        // taking it anyway meant DecideCapacity's bare add_goal pre-empted SendToFleetConversation
+        // -- a follow-up typed into a live fleet conversation came out as a NEW, unlinked goal
+        // (no resume_conv, no follow_up_to), and a steer-worthy message never reached the worker
+        // it was meant to steer. FIXED 2026-09-24: fall straight through to the door logic below,
+        // which already knows how to route a fleet conversation (DOOR_FLEET ->
+        // SendToFleetConversation), exactly as if the fleet were not at capacity at all.
+        Conversation capTarget = fx.CurrentConversation();
+        bool capTargetIsFleet = capTarget != null && capTarget.Source == "fleet";
         Capacity cap = DecideCapacity(text, FleetState(fx));
-        if (cap.Drop) return;
-        if (cap.Reroute)
+        if (!capTargetIsFleet)
         {
-            fx.ClearInput(); fx.HideRouter();
-            var item = new Dictionary<string, object>();
-            item["text"] = cap.Body; item["priority"] = cap.Force;
-            fx.AppendCommand("add_goal", item);   // result unchecked, as it always was
-            fx.AddUser(text);
-            fx.AddAssistant(cap.Force ? fx.T("fleet_forced") : fx.T("fleet_queued"));
-            return;
+            if (cap.Drop) return;
+            if (cap.Reroute)
+            {
+                fx.ClearInput(); fx.HideRouter();
+                var item = new Dictionary<string, object>();
+                item["text"] = cap.Body; item["priority"] = cap.Force;
+                // CHECKED 2026-09-24 (was ignored): a write failure used to still say "queued" --
+                // the text was gone from the composer (ClearInput above) and never reached the
+                // fleet either. Now a failed write is reported and the text is put back, the way
+                // every other write failure on this path already behaves (SendToFleetConversation's
+                // steer/add_goal, the door-open failures below).
+                bool ok = fx.AppendCommand("add_goal", item);
+                fx.AddUser(text);
+                if (!ok)
+                {
+                    fx.AddAssistant(fx.T("fleet_send_failed"));
+                    fx.RestoreInput(text);
+                    return;
+                }
+                fx.AddAssistant(cap.Force ? fx.T("fleet_forced") : fx.T("fleet_queued"));
+                return;
+            }
         }
 
         // #2: research-intent auto-router -- propose the researcher (confirm, not auto, to
