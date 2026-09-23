@@ -84,6 +84,24 @@ def private_mb(profile="copilot-companion-edge", timeout=60):
     return round(total / 1048576.0, 1)
 
 
+def private_mb_by_profile(profiles, timeout=60):
+    """{profile: MB or None} for several profiles from ONE sample of the machine.
+
+    private_mb() asks PowerShell for every Edge process on the machine and keeps one profile's;
+    calling it once per profile paid that 4-5 s query once per profile, for the same answer
+    taken at different moments. One sample also means one moment, which is what the _PS
+    comment above asks of a per-profile figure.
+    """
+    rows = _rows(timeout)
+    if not rows:
+        return {p: None for p in profiles}
+    out = {}
+    for prof in profiles:
+        total = sum(float(r.get("priv") or 0) for r in rows if prof in (r.get("cmd") or ""))
+        out[prof] = round(total / 1048576.0, 1)
+    return out
+
+
 def per_process(profile="copilot-companion-edge", timeout=60):
     """{process kind: MB} for one profile, so a total can be read rather than guessed at.
 

@@ -320,6 +320,15 @@ def _initialize(conn):
         );
         CREATE INDEX IF NOT EXISTS fleet_turns_key_idx ON fleet_turns(key, id);
         CREATE INDEX IF NOT EXISTS fleet_turns_ts_idx ON fleet_turns(ts DESC);
+        -- THE ROWS _collapse_goals STILL HAS TO FOLD, AND ONLY THOSE. Its query is
+        -- `WHERE goal <> ''`, which no index answered, so once the fold was finished every
+        -- connection -- one per transcript line the fleet records -- scanned the whole table
+        -- to find nothing: 0.22 s warm on a 197 MB store, and 6.5 s for the first write of a
+        -- cold fleet start (measured 2026-09-24, the gap between a worker's `pending` and its
+        -- transcript appearing). Partial, so it holds the unfolded rows and nothing else:
+        -- empty once the fold is done, and new rows are written with goal = '' and never
+        -- enter it.
+        CREATE INDEX IF NOT EXISTS fleet_turns_unfolded_idx ON fleet_turns(id) WHERE goal <> '';
         """
     )
     _migrate(conn)

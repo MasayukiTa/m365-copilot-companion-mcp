@@ -125,13 +125,18 @@ def unowned(copilot_targets):
     return ownership.reconcile(observed, _pid_alive)["orphaned"]
 
 
-def edge_state():
+def edge_state(memory=True):
     """Per managed profile: {"mb": resident private MB, "headed": owns a window}.
 
     THE MEMORY FIGURE IS PRIVATE WORKING SET, not the sum of WorkingSetSize this used to
     report. That counter includes SHARED pages and a Chromium browser is fifteen processes
     sharing one binary, so every figure this line printed on 2026-08-27 was 2.4 to 2.9 times
     too large -- 295 MB where the machine, and Task Manager, said 122.
+
+    `memory=False` leaves "mb" at 0 and does not ask. The figure costs a PowerShell CIM query
+    of 4-5 s, and the launch gate -- which runs this before EVERY fleet run -- reads only
+    "headed": measured 2026-09-24, 9.3 of the gate's 12.9 s went on two memory figures that
+    _launch_blockers then discarded, between a goal's submission and its first turn.
     """
     raw = _ps("Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | "
               "Select-Object CommandLine | ConvertTo-Json -Compress -Depth 3")
@@ -149,11 +154,13 @@ def edge_state():
                 rec = out.setdefault(prof, {"mb": 0, "headed": False})
                 if "--type=" not in cmd and "--headless" not in cmd:
                     rec["headed"] = True
+    if not memory or not out:
+        return out
     try:
         sys.path.insert(0, os.path.join(REPO, "scripts", "win"))
-        from edge_memory import private_mb
-        for prof in list(out):
-            out[prof]["mb"] = private_mb(prof) or 0
+        from edge_memory import private_mb_by_profile
+        for prof, mb in private_mb_by_profile(list(out)).items():
+            out[prof]["mb"] = mb or 0
     except Exception:
         pass
     return out
@@ -204,19 +211,22 @@ def run_state():
         return {}
 
 
-def verdicts_now():
+def verdicts_now(memory=True):
     """The invariants and whether each holds, as data. Returns (verdicts, extras).
 
     Split out of main() so a LAUNCH can ask the same question the screen answers. The whole
     lesson of the leaked page was that a breach nobody is obliged to read is worthless: the
     detector wrote it at 22:40 and runs were launched on top of it for nine and a half hours.
     A gate that calls this cannot not-read it.
+
+    `memory=False` skips the per-browser memory figure, which only extras["memory"] carries
+    and no verdict reads; see edge_state.
     """
     today = time.strftime("%Y-%m-%d")
     verdicts = []
 
     # 1. No browser owns a window.
-    edge = edge_state()
+    edge = edge_state(memory=memory)
     headed = [p for p, r in edge.items() if r["headed"]]
     verdicts.append(("no browser window", not headed,
                      "headed: %s" % (", ".join(headed) if headed else "none")))

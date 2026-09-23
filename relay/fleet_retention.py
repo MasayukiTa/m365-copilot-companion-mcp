@@ -187,32 +187,95 @@ STORE_KEEP_DAYS = float(os.environ.get("MCP_FLEET_STORE_DAYS", "30"))
 #: store added later is untouched until someone decides otherwise, which is the safe default.
 STORE_DIRS = ("transcripts", "swe")
 
+#: Subtrees of a named store that are WORKSPACES, not per-run output, and are never entered.
+#:
+#: swe/work holds the benchmark clones, their worktrees and pip target directories
+#: (`_np123/numpy`, `<repo>-main/.git/objects/pack/...`) that runs reuse. Two things are wrong
+#: with walking it under a per-file age rule, measured 2026-09-24:
+#:
+#:   * It is 101,170 files in 46,069 directories, and this rule stat()ed every one of them on
+#:     every fleet start. That walk was the whole of the ~60 s between "fleet_runner started"
+#:     and the run's `started` stamp (277 s on a cold copy; 24 s warm), with nothing deleted.
+#:   * Were anything in it older than the window, the rule would delete it FILE BY FILE -- a
+#:     pack file a clone has not rewritten in thirty days is still the repository, and the
+#:     clone would be left corrupt rather than removed.
+#:
+#: Named, relative to the .fleet root, for the same fail-safe reason STORE_DIRS is.
+STORE_SKIP = (os.path.join("swe", "work"),)
+
+#: FILE_ATTRIBUTE_REPARSE_POINT. A junction is not a symlink to Python 3.10's is_symlink(), so
+#: os.walk descended through one -- and an age rule following a junction deletes files that
+#: are not in the store at all.
+_REPARSE_POINT = 0x400
+
+
+def _store_files(root, skip):
+    """Every regular file under `root` as a DirEntry, without following links or junctions.
+
+    NO stat() PER FILE. On Windows a DirEntry carries the size and times the directory listing
+    already returned, so the age test below costs nothing extra; os.walk + getmtime cost one
+    stat per file plus one lstat per directory, which is where the startup minute went.
+
+    A directory that holds `.git` is a checkout and is one unit: it is never entered, because
+    the only thing a per-file rule can do inside one is corrupt it.
+    """
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                entries = list(it)
+        except OSError:
+            continue
+        if any(e.name == ".git" for e in entries):
+            continue
+        for e in entries:
+            try:
+                if e.is_symlink():
+                    continue
+                st = e.stat(follow_symlinks=False)
+                if getattr(st, "st_file_attributes", 0) & _REPARSE_POINT:
+                    continue
+                if e.is_dir(follow_symlinks=False):
+                    if os.path.normcase(os.path.abspath(e.path)) not in skip:
+                        stack.append(e.path)
+                elif e.is_file(follow_symlinks=False):
+                    yield e, st
+            except OSError:
+                continue
+
 
 def stores(fleet_dir, now=None, dry_run=False, keep_days=None, names=None):
     """Age out per-run files inside the named stores.
 
     `sessions` is deliberately absent from STORE_DIRS: that directory holds the conversation
     database, which has its own retention with its own settings, and two policies on one store
-    is how they come to disagree about what is still live.
+    is how they come to disagree about what is still live. STORE_SKIP and any checkout are not
+    entered either -- see there.
     """
     now = time.time() if now is None else now
     keep_days = _setting("fleet_store_days", STORE_KEEP_DAYS) if keep_days is None else keep_days
+    skip = {os.path.normcase(os.path.abspath(os.path.join(fleet_dir, s))) for s in STORE_SKIP}
     freed, removed = 0, []
     for name in (names or STORE_DIRS):
         root = os.path.join(fleet_dir, name)
         if not os.path.isdir(root):
             continue
-        for parent, _dirs, files in os.walk(root):
-            for f in files:
-                p = os.path.join(parent, f)
-                # Never a database, wherever it turns up. The extension check is cheap and it
-                # is the last line between an age rule and someone's history.
-                if os.path.splitext(f)[1].lower() in (".sqlite3", ".db", ".sqlite"):
-                    continue
-                if _age_days(p, now) <= keep_days:
-                    continue
-                freed += _rm(p, dry_run)
-                removed.append(os.path.relpath(p, fleet_dir))
+        for entry, st in _store_files(root, skip):
+            # Never a database, wherever it turns up. The extension check is cheap and it
+            # is the last line between an age rule and someone's history.
+            if os.path.splitext(entry.name)[1].lower() in (".sqlite3", ".db", ".sqlite"):
+                continue
+            if (now - st.st_mtime) / 86400.0 <= keep_days:
+                continue
+            # CONFIRMED BEFORE IT IS DELETED. The listing's time is the directory's copy, which
+            # NTFS may update late for a file another process holds open; a real stat on the
+            # handful of candidates costs nothing and makes the deletion rest on the file.
+            p = entry.path
+            if _age_days(p, now) <= keep_days:
+                continue
+            freed += _rm(p, dry_run)
+            removed.append(os.path.relpath(p, fleet_dir))
     return freed, removed
 
 
@@ -329,24 +392,72 @@ def cap_jsonl(fleet_dir, dry_run=False, max_mb=None):
         before = _size(p)
         if before <= limit:
             continue
+        keep = int(limit * JSONL_TRIM_FRACTION)
         if dry_run:
-            freed += before - limit
+            freed += before - keep
             trimmed.append(n)
             continue
-        try:
-            with io.open(p, "rb") as fh:
-                fh.seek(before - limit)
-                # Land on a line boundary: half a JSON object at the head of the file is a
-                # parse error for every reader, which is worse than the bytes it saved.
-                fh.readline()
-                tail = fh.read()
-            with io.open(p, "wb") as fh:
-                fh.write(tail)
+        if _keep_tail(p, before, keep):
             freed += before - _size(p)
             trimmed.append(n)
-        except OSError:
-            continue
     return freed, trimmed
+
+
+#: A capped ledger is cut to this fraction of the ceiling, not to the ceiling itself.
+#:
+#: Cut to exactly the ceiling, a ledger that is written every day sits a few hundred KB over it
+#: at every start, and was rewritten whole at every start: measured 2026-09-24, tool_events.jsonl
+#: at 64.0 MB, "freed 0.1 MB" -- 64 MB read and 64 MB written to free 0.1. With headroom the
+#: rewrite happens once per tenth of the ceiling written, and the tail kept is still 57 MB.
+JSONL_TRIM_FRACTION = float(os.environ.get("MCP_FLEET_JSONL_TRIM_FRACTION", "0.9"))
+
+#: Bytes held in memory at once while a tail is moved.
+_COPY_CHUNK = 1024 * 1024
+
+
+def _keep_tail(path, size, keep):
+    """Rewrite `path` as its last `keep` bytes, starting on a line boundary. True if it did.
+
+    STREAMED, NOT READ WHOLE. The first version read the tail into one bytes object -- the full
+    64 MB ceiling, resident in the fleet process at every start, for the length of a disk write.
+    This moves it a megabyte at a time into a sibling file and swaps it in, so the peak is one
+    chunk. If the swap is refused (another process holds the ledger open without delete
+    sharing), the tail is streamed back over the original instead, which is what the in-memory
+    version did too, just without holding it.
+    """
+    tmp = path + ".captmp"
+    try:
+        with io.open(path, "rb") as src:
+            src.seek(size - keep)
+            # Land on a line boundary: half a JSON object at the head of the file is a
+            # parse error for every reader, which is worse than the bytes it saved.
+            src.readline()
+            with io.open(tmp, "wb") as dst:
+                while True:
+                    chunk = src.read(_COPY_CHUNK)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+        try:
+            os.replace(tmp, path)
+            return True
+        except OSError:
+            pass
+        with io.open(tmp, "rb") as src, io.open(path, "wb") as dst:
+            while True:
+                chunk = src.read(_COPY_CHUNK)
+                if not chunk:
+                    break
+                dst.write(chunk)
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
 
 
 #: Registry entries younger than this are kept even when nothing links them: a fleet run
