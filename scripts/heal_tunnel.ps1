@@ -313,8 +313,14 @@ function Send-TunnelHealNotice([string]$title, [string]$body) {
     try {
         $py = Join-Path $root ".venv\Scripts\python.exe"
         if (-not (Test-Path $py)) { $py = "python" }
-        $code = "import sys; sys.path.insert(0, r'$root'); from tools.notify_ops import notify_desktop; notify_desktop('$title', '$body')"
-        & $py -c $code 2>$null | Out-Null
+        # $root IS PASSED AS sys.argv[1], NOT SPLICED INTO THE CODE STRING (fix, 2026-09-24).
+        # An install path containing an apostrophe (e.g. D:\repos\o'brien-clone) broke
+        # the generated Python raw-string literal `r'$root'` with a SyntaxError -- and because
+        # this whole call sits inside the outer try/catch, the toast just silently never fired
+        # for every operator whose path has one. sys.argv is passed as a separate process
+        # argument, so no character in $root can break out of the -c code string.
+        $code = "import sys; sys.path.insert(0, sys.argv[1]); from tools.notify_ops import notify_desktop; notify_desktop('$title', '$body')"
+        & $py -c $code $root 2>$null | Out-Null
     } catch { }
 }
 
