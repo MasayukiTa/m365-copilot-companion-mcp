@@ -64,6 +64,14 @@ def build(name, srcs, out_dir, timeout=300):
 
 
 def main():
+    # BEFORE ANY PROGRESS OUTPUT. csc.exe missing (no .NET Framework 4.x, or a machine where it
+    # lives somewhere other than this hardcoded path) used to reach childproc.run -> subprocess.run
+    # unchecked, and FileNotFoundError propagated as a bare traceback -- AFTER the "target ..."
+    # lines below had already printed, which reads as progress toward a build that never started.
+    if not os.path.isfile(CSC):
+        raise SystemExit(
+            "csc.exe not found at %s: .NET Framework 4.x is required "
+            "(Windows Features > .NET Framework 4.8 Advanced Services)" % CSC)
     os.makedirs(OUT, exist_ok=True)
     targets = _targets_from_rebuild_script()
     for _name, _srcs in targets:

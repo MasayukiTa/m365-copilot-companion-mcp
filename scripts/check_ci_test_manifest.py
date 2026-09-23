@@ -69,19 +69,28 @@ EXCLUDED = {
 }
 
 
-def _git(*args) -> set[str] | None:
+class GitUnavailable(RuntimeError):
+    """git could not be run, or ran and failed. The audit cannot vouch for anything without
+    it -- see the module docstring: a filter that silently stops filtering is the same silent
+    pass this whole check exists to prevent."""
+
+
+def _git(*args) -> set[str]:
     from tools.childproc import run as _run_child
     try:
         out = _run_child(["git", *args], cwd=ROOT, timeout=30)
-    except Exception:
-        return None
+    except Exception as exc:
+        raise GitUnavailable(str(exc)) from exc
     if out.returncode != 0:
-        return None
+        why = (out.stderr or out.stdout or "").strip()[:300] or (
+            "git exited %d" % out.returncode)
+        raise GitUnavailable(why)
     return {line.strip() for line in out.stdout.splitlines() if line.strip()}
 
 
-def _tracked() -> set[str] | None:
-    """CI のチェックアウトに存在することになるファイル。取れなければ None（判定を諦める）。
+def _tracked() -> set[str]:
+    """CI のチェックアウトに存在することになるファイル。取れなければ GitUnavailable（判定を
+    諦めるのではなく、audit 自体を失敗させる -- 詳細は GitUnavailable のドキュメント参照）。
 
     追跡していないテストは CI のチェックアウトに存在しないので、一覧に載せようが
     ないし、載せれば CI が「そんなファイルは無い」で落ちる。手元にだけ置いてある
@@ -105,7 +114,7 @@ def discover_tests() -> set[str]:
         for glob in _TEST_GLOBS:
             for path in base.rglob(glob):
                 rel = path.relative_to(ROOT).as_posix()
-                if tracked is not None and rel not in tracked:
+                if rel not in tracked:
                     continue
                 found.add(rel)
     return found
@@ -223,7 +232,11 @@ def main(argv=None) -> int:
                     help="fail when an untracked test file exists (pre-push use)")
     args = ap.parse_args(argv)
 
-    discovered = discover_tests()
+    try:
+        discovered = discover_tests()
+    except GitUnavailable as exc:
+        print("could not run git: %s; the audit did not run" % exc)
+        return 2
     listed = listed_tests()
     excluded = set(EXCLUDED)
     # Covered by the script-style runner rather than by pytest. Read from that module, not
@@ -286,7 +299,13 @@ def main(argv=None) -> int:
     # so demanding they be listed would make CI fail on a file it cannot run. But saying
     # nothing about them lets a test be written, never committed, and never noticed. Named,
     # not enforced; the enforcement happens the moment they are added.
-    others = _git("ls-files", "--others", "--exclude-standard") or set()
+    try:
+        others = _git("ls-files", "--others", "--exclude-standard")
+    except GitUnavailable:
+        # Advisory-only section (see the comment above): git already proved usable in
+        # discover_tests() above, so a failure here is not "git is unavailable" -- it is not
+        # worth failing the whole audit over a NOTE-level, best-effort listing.
+        others = set()
     pending = sorted(p for p in others
                      if re.fullmatch(r"(?:%s)/(?:[^/]+/)*%s"
                                      % ("|".join(TEST_ROOTS), _TEST_FILE_RE), p))

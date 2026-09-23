@@ -59,7 +59,15 @@ def _git(*args):
     file exists to say.
     """
     from tools.childproc import run as _run_child
-    r = _run_child(["git"] + list(args), cwd=REPO, timeout=120)
+    try:
+        r = _run_child(["git"] + list(args), cwd=REPO, timeout=120)
+    except OSError as exc:
+        # git missing from PATH entirely is a plain OSError from CreateProcess, with nothing
+        # between it and the caller unless caught here -- the same shape as the sibling guard
+        # (check_no_identifying_names.py), and it used to reach the console as a bare
+        # traceback instead of the readable "git ... failed" message the line below already
+        # gives for a git that runs and fails.
+        raise SystemExit("check_nothing_new_is_invisible: could not run git: %s" % exc) from exc
     if r.returncode != 0:
         raise SystemExit("check_nothing_new_is_invisible: git %s failed: %s"
                          % (" ".join(args), (r.stderr or "").strip()))
