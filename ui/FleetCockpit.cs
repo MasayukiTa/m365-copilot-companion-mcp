@@ -1148,8 +1148,6 @@ class CockpitWindow : Window
     readonly AutoResetEvent _healthWake = new AutoResetEvent(false); // immediate post-action refresh
     volatile bool _bridgeReconnectRunning = false;   // guard: manual "Reconnect chat" button, never two at once
     string _agentMarkerId = "";    // T_.../P_... id extracted from the configured agent URL (.env)
-    volatile bool _startAllLaunched = false;   // reentry guard for RunStartAll (per-cooldown, not per-app-run only)
-    double _startAllLastUnix = 0.0;            // NowUnix() at last RunStartAll launch; 120s cooldown
     bool _startupHealCheckDone = false;        // set after the first PollHealthOnce's auto-heal decision runs once
 
     public CockpitWindow(string path)
@@ -1504,6 +1502,15 @@ class CockpitWindow : Window
         if (k == "hs_fix_done") return ja ? "完了" : "done";
         if (k == "hs_fix_err") return ja ? "修復でエラー" : "fix error";
         if (k == "hs_fix_manual_needed") return ja ? "手動での対応が必要です" : "Manual step needed";
+        // 2026-09-24 startup-loop fix: see StartupGate / AutoFixBudget in
+        // ui/SelfImproveDashboard.cs for the mechanism these three strings surface.
+        if (k == "autofix_start_all_running") return ja ? "起動処理が進行中です" : "Startup is already in progress";
+        if (k == "autofix_exhausted") return ja
+            ? "自動修復を繰り返しましたが直りませんでした。しばらく待つか、「直す」ボタンで再試行してください。"
+            : "Automatic repair kept failing and has stopped retrying for now. Wait a bit, or use the Fix button to try again.";
+        if (k == "hs_fix_repair_unreadable") return ja
+            ? "自動修復の結果を読み取れませんでした。doctor.bat を実行して原因を確認してください。"
+            : "Could not read the automatic repair result. Run doctor.bat to see what is wrong.";
         if (k == "infra_wait") return ja ? "インフラ待ち" : "Infra wait";
         if (k == "infra_retry") return ja ? "再投入" : "Re-queue";
         if (k == "badge_default_copilot") return ja ? "既定Copilot" : "default Copilot";
@@ -2545,7 +2552,10 @@ class CockpitWindow : Window
             // Startup auto-heal: once per app run, right after the FIRST sweep completes, check
             // whether the stack needs bringing up and do it ourselves -- this is what makes
             // launching FleetCockpit.exe directly (not via the desktop icon) self-healing too.
-            // Guarded by _startupHealCheckDone (runs once) and RunStartAll's own 120s cooldown.
+            // Guarded by _startupHealCheckDone (runs once), StartupGate (below -- start_all
+            // already running, or this process was launched BY start_all), RunStartAll's own
+            // persisted cooldown, and FleetRunIsLive(). See StartupGate's doc comment in
+            // ui/SelfImproveDashboard.cs for the loop this whole gate exists to stop.
             if (!_startupHealCheckDone)
             {
                 _startupHealCheckDone = true;
@@ -2554,17 +2564,20 @@ class CockpitWindow : Window
                 System.Diagnostics.Debug.WriteLine("[FleetCockpit] HealthLoop: startup auto-heal check server=" + srv0 + " tunnel=" + tun0);
                 if (srv0 == HealthState.Red || tun0 == HealthState.Red)
                 {
-                    try
+                    var gate = StartupGate.GateAutomaticLaunch(IsStartAllRunning(), LaunchedByStartAll(), true);
+                    if (!gate.Allow)
                     {
-                        if (!Dispatcher.HasShutdownStarted)
-                            Dispatcher.BeginInvoke(new Action(delegate { if (_fixNote != null) _fixNote.Text = T("hs_fix_stack"); }));
+                        if (!string.IsNullOrEmpty(gate.ReasonKey)) NoteFromAnyThread(T(gate.ReasonKey));
                     }
-                    catch (Exception) { }
-// THE SAME GUARD AS EVERY OTHER AUTOMATIC ACTION. This ran RunStartAll on the
+                    // THE SAME GUARD AS EVERY OTHER AUTOMATIC ACTION. This ran RunStartAll on the
                     // first sweep regardless of whether a fleet run was in flight, so a cockpit
                     // opened during a run could restart the stack underneath it.
-                    if (FleetRunIsLive()) { /* leave it to the person */ }
-                    else RunStartAll();
+                    else if (FleetRunIsLive()) { /* leave it to the person */ }
+                    else
+                    {
+                        NoteFromAnyThread(T("hs_fix_stack"));
+                        RunStartAll();
+                    }
                 }
             }
 
@@ -3006,11 +3019,21 @@ class CockpitWindow : Window
     // bounded number of times, and hands over to the human only when it has genuinely failed.
     const int AUTOFIX_CONSECUTIVE_POLLS = 2;   // ~30s of a steady fault, not one flap
     const int AUTOFIX_MAX_ATTEMPTS      = 3;   // then it is the human's turn
+    // 2026-09-24: the window AUTOFIX_MAX_ATTEMPTS applies over. This used to be an unbounded
+    // process lifetime -- which was fine as long as the process lived, and meant nothing at all
+    // once the loop this file's startup-gate comment describes made "the process" mean a few
+    // seconds. 30 minutes bounds a genuinely stuck repair without permanently locking one out.
+    const double AUTOFIX_BUDGET_WINDOW_S = 1800.0;
     const int AUTOFIX_GREEN_POLLS_TO_RESET = 3; // one green poll is a flap, not a recovery
     int _autoFixBadPolls = 0;
     int _autoFixGreenPolls = 0;
     string _autoFixFault = "";
     int _autoFixAttempts = 0;
+    // Which repair keys this PROCESS has already told the operator gave up, so a persisted
+    // exhaustion (bug (b): a fresh process used to get a fresh budget and a fresh silence)
+    // still surfaces the "not a loop" message once here, without repeating it every ~15s poll
+    // for as long as the fault and the exhaustion both persist.
+    readonly HashSet<string> _autoFixExhaustedNoted = new HashSet<string>();
 
     // Which dot a repair would target, and whether that repair touches the FLEET's Edge.
     //
@@ -3128,6 +3151,124 @@ class CockpitWindow : Window
         catch (Exception) { }   // a trace that can break the repair is worse than no trace
     }
 
+    // ── cross-process gates for automatic startup/repair (2026-09-24 startup-loop fix) ──────
+    //
+    // Whether start_all.ps1 is CURRENTLY mid-bring-up on this machine, checked the same way its
+    // own Enter-StartAllLock does: the "Global\m365-copilot-companion-start-all" named mutex.
+    // WaitOne(0) is a non-blocking probe -- acquire-and-immediately-release if free, so this
+    // never itself waits the up-to-600s a real start_all launch would. An abandoned mutex (the
+    // holder died) is taken as "not running", same interpretation start_all.ps1's own comment
+    // gives it ("still handed over ownership... rather than treated as a failure"). A missing
+    // lock (no OS support) must never be mistaken for "running forever", so any exception here
+    // also reads as "not running" -- the same fail-open start_all.ps1 itself uses.
+    static bool IsStartAllRunning()
+    {
+        try
+        {
+            using (var m = new Mutex(false, @"Global\m365-copilot-companion-start-all"))
+            {
+                try
+                {
+                    if (m.WaitOne(0)) { m.ReleaseMutex(); return false; }
+                    return true;
+                }
+                catch (AbandonedMutexException)
+                {
+                    try { m.ReleaseMutex(); } catch (Exception) { }
+                    return false;
+                }
+            }
+        }
+        catch (Exception) { return false; }
+    }
+
+    // scripts/start_all.ps1 sets M365_LAUNCHED_BY_START_ALL=1 in the environment of ONLY the UI
+    // process it launches (see its "THE WINDOW MAY ASK 'WHO OPENED ME?'" comment) -- this reads
+    // that flag. No start_all.ps1 change needed; the flag already existed and was unread here.
+    static bool LaunchedByStartAll()
+    {
+        try { return Environment.GetEnvironmentVariable("M365_LAUNCHED_BY_START_ALL") == "1"; }
+        catch (Exception) { return false; }
+    }
+
+    const string AUTOFIX_BUDGET_FILENAME = "autofix_budget.json";
+
+    static string AutoFixBudgetPath()
+    {
+        return Path.Combine(Path.GetDirectoryName(ResolvePath(null)), AUTOFIX_BUDGET_FILENAME);
+    }
+
+    // Best-effort read of {"<key>": [ts, ts, ...], ...}. Any I/O/parse failure (missing file,
+    // torn write, a hand-edited file) reads as "no history for any key" -- the safe direction,
+    // since it costs one extra attempt rather than silencing repair for ever.
+    Dictionary<string, object> LoadAutoFixBudgetRaw()
+    {
+        try
+        {
+            string path = AutoFixBudgetPath();
+            if (!File.Exists(path)) return new Dictionary<string, object>();
+            var d = _js.DeserializeObject(File.ReadAllText(path, Encoding.UTF8)) as Dictionary<string, object>;
+            return d ?? new Dictionary<string, object>();
+        }
+        catch (Exception) { return new Dictionary<string, object>(); }
+    }
+
+    static List<double> AttemptTimestampsFor(Dictionary<string, object> data, string key)
+    {
+        var list = new List<double>();
+        object v;
+        if (data != null && data.TryGetValue(key, out v) && v is object[])
+            foreach (object o in (object[])v)
+                try { list.Add(Convert.ToDouble(o, CultureInfo.InvariantCulture)); }
+                catch (Exception) { }
+        return list;
+    }
+
+    // tmp+delete+move, the same atomic-write shape PublishHealthStrip already uses for its own
+    // file in this same directory.
+    void SaveAutoFixBudgetRaw(Dictionary<string, object> data)
+    {
+        try
+        {
+            string path = AutoFixBudgetPath();
+            string tmp = path + ".tmp";
+            File.WriteAllText(tmp, _js.Serialize(data), NoBomUtf8);
+            if (File.Exists(path)) File.Delete(path);
+            File.Move(tmp, path);
+        }
+        catch (Exception) { }
+    }
+
+    // Read-decide-write in one call: the ONE place FleetCockpit.cs touches the budget file, so
+    // every automatic launch (RunStartAll's own cooldown, and each MaybeAutoFix repair key)
+    // shares one persistence path rather than growing a second. Cross-process races (two
+    // cockpits reading, deciding, and writing back within the same instant) are not locked
+    // against here -- the same risk PublishHealthStrip already accepts for this directory --
+    // but the failure mode of a lost race is "one extra attempt slips through the cap", not the
+    // unbounded-relaunch loop this exists to fix.
+    bool TryConsumeAutoFixBudget(string key, int maxAttempts, double windowS, out bool exhausted)
+    {
+        var data = LoadAutoFixBudgetRaw();
+        var attempts = AttemptTimestampsFor(data, key);
+        AutoFixBudget.Decision d = AutoFixBudget.Decide(attempts, NowUnix(), maxAttempts, windowS);
+        data[key] = d.Kept.ToArray();
+        SaveAutoFixBudgetRaw(data);
+        exhausted = d.Exhausted;
+        return d.Allow;
+    }
+
+    // Marshal a note onto the UI thread from wherever (poll thread or UI thread alike),
+    // mirroring the Dispatcher pattern the startup auto-heal block already used inline.
+    void NoteFromAnyThread(string text)
+    {
+        try
+        {
+            if (!Dispatcher.HasShutdownStarted)
+                Dispatcher.BeginInvoke(new Action(delegate { if (_fixNote != null) _fixNote.Text = text; }));
+        }
+        catch (Exception) { }
+    }
+
     // ONE COCKPIT REPAIRS. Nothing stops a second one being opened, and each process has its
     // own _fixRunning and its own attempt budget -- so two of them would restart the same
     // browser twice, each believing it was the only one. The mutex is held for the process's
@@ -3166,6 +3307,7 @@ class CockpitWindow : Window
                 _autoFixBadPolls = 0;
                 _autoFixAttempts = 0;
                 _autoFixFault = "";
+                _autoFixExhaustedNoted.Clear();
             }
             return;
         }
@@ -3199,8 +3341,24 @@ class CockpitWindow : Window
 
         _autoFixBadPolls++;
         if (_autoFixBadPolls < AUTOFIX_CONSECUTIVE_POLLS) return;
-        if (_autoFixAttempts >= AUTOFIX_MAX_ATTEMPTS) return;   // the button is the way on
         if (_fixRunning) return;
+
+        // PERSISTED, not per-process (2026-09-24 startup-loop fix): AUTOFIX_MAX_ATTEMPTS used
+        // to bound only _autoFixAttempts, a field of THIS process. A cockpit relaunched by the
+        // very loop this budget exists to stop got a brand-new field, and so a brand-new three
+        // tries, every time -- the budget bound nothing across the relaunches that mattered
+        // most. TryConsumeAutoFixBudget reads/writes .fleet/autofix_budget.json instead.
+        bool exhausted;
+        if (!TryConsumeAutoFixBudget(fault, AUTOFIX_MAX_ATTEMPTS, AUTOFIX_BUDGET_WINDOW_S, out exhausted))
+        {
+            if (exhausted && !_autoFixExhaustedNoted.Contains(fault))
+            {
+                _autoFixExhaustedNoted.Add(fault);
+                AutoFixRecord(dot, "exhausted: automatic repair stopped retrying " + fault);
+                NoteFromAnyThread(T("autofix_exhausted"));
+            }
+            return;   // the button is the way on
+        }
 
         _autoFixAttempts++;
         _autoFixBadPolls = 0;
@@ -4053,14 +4211,26 @@ class CockpitWindow : Window
             {
                 try
                 {
+                    // repair.ps1's Tier A for server/tunnel IS another start_all.ps1 invocation
+                    // (`-NoUi -NoSplash`) -- running it while one is already mid-bring-up does
+                    // not fix anything, it queues a second startup behind the first one's lock.
+                    // Same check RunStartAll() makes itself, made here too because this branch
+                    // can reach repair.ps1 without ever calling RunStartAll directly.
+                    if (IsStartAllRunning()) { note(T("autofix_start_all_running")); return; }
                     string repairPs1 = Path.Combine(repo, "scripts", "repair.ps1");
                     RepairResult rr = File.Exists(repairPs1) ? ParseRepairResult(RunRepairDispatcher(repairPs1)) : null;
                     if (rr == null)
                     {
-                        // repair.ps1 missing, failed to run, or its output could not be parsed --
-                        // never regress: fall back to the previous blind stack bring-up.
-                        RunStartAll();
-                        note(T("hs_fix_stack"));
+                        // repair.ps1 missing, failed to run, or its output could not be parsed.
+                        // THIS USED TO fall back to a blind RunStartAll() "to never regress" --
+                        // measured (2026-09-24, .fleet/autofix.jsonl + process trees, 07:35-
+                        // 07:53) to be the third way this exact branch could add another queued
+                        // startup on top of an already-running one, with nothing to show for it
+                        // when repair.ps1's own diagnosis was simply unreadable. Record it and
+                        // tell the operator instead of guessing at a fix.
+                        AutoFixRecord(0, "repair.ps1 output unparsable or unavailable; not "
+                                       + "falling back to a blind start_all");
+                        note(T("hs_fix_repair_unreadable"));
                     }
                     else if (rr.HumanSteps.Count > 0)
                     {
@@ -4361,20 +4531,28 @@ class CockpitWindow : Window
         catch (Exception) { return null; }
     }
 
+    const double START_ALL_COOLDOWN_S = 120.0;
+
     // Fire the full stack bring-up EXACTLY the way the desktop icon does: wscript.exe running
     // start_all_hidden.vbs, which in turn drives scripts\start_all.ps1 (Invoke-Startup starts
     // supervisor.ps1 [MCP server + devtunnel], companion Edge, bridge, UIs). start_all.ps1 is
     // idempotent -- it skips components already running -- so calling this when the stack is
     // already healthy is a safe no-op. Fire-and-forget: we do not wait for it to finish (up to
-    // ~2 min), we just launch it and let it self-log. Guarded by a 120s cooldown so repeated
-    // Fix clicks or health-poll ticks cannot stack multiple launches.
+    // ~2 min), we just launch it and let it self-log.
+    //
+    // TWO GUARDS, BOTH CROSS-PROCESS (2026-09-24 startup-loop fix; see StartupGate's doc
+    // comment in ui/SelfImproveDashboard.cs): if start_all.ps1 is ALREADY running, launching a
+    // second one only queues behind its lock and relaunches this cockpit again -- do nothing
+    // and say so, rather than repeat the mechanism that caused the loop. Otherwise, the 120s
+    // cooldown that used to live in this process's own fields (_startAllLaunched/
+    // _startAllLastUnix, so a freshly relaunched cockpit always saw it as never-yet-fired) is
+    // now the persisted "start_all" budget key, so a new process inherits the real cooldown.
     void RunStartAll()
     {
         if (WindowSelfTest.Active) return;   // a selftest never starts the stack
-        double nowU = NowUnix();
-        if (_startAllLaunched && (nowU - _startAllLastUnix) < 120.0) return;
-        _startAllLaunched = true;
-        _startAllLastUnix = nowU;
+        if (IsStartAllRunning()) { NoteFromAnyThread(T("autofix_start_all_running")); return; }
+        bool exhausted;
+        if (!TryConsumeAutoFixBudget("start_all", 1, START_ALL_COOLDOWN_S, out exhausted)) return;
         try
         {
             string vbs = Path.Combine(RepoRoot(), "scripts", "start_all_hidden.vbs");

@@ -102,6 +102,12 @@ EXEMPT = {
         "ui/harness/ into a throwaway console exe: it runs the cockpit's submitted-group merge "
         "and list order against real files without WPF, which is the reason SubmittedTasks.cs "
         "is its own file, not a build of the UI",
+    "ui/test_the_startup_loop_has_a_backstop.py":
+        "compiles the SHIPPED ui/SelfImproveDashboard.cs + ui/Theme.cs (with WPF references, "
+        "since SelfImproveDashboardWindow extends Window) plus the test-only driver in "
+        "ui/harness/ into a throwaway console exe: it drives StartupGate.GateAutomaticLaunch "
+        "and AutoFixBudget.Decide, the pure startup/auto-repair policy, directly -- not a "
+        "build of either shipped UI binary",
 }
 
 #: ui/*.cs that are compiled by a TEST and by no Build line, on purpose -- each with the test
@@ -112,6 +118,7 @@ COMPILED_BY_A_TEST = {
     "ui/testdata/ChatSendHarness.cs": "ui/test_the_chat_window_sends_what_was_typed.py",
     "ui/testdata/BridgeClientHarness.cs": "ui/test_the_bridge_client_sends_the_token.py",
     "ui/harness/SubmittedTasksHarness.cs": "ui/test_a_submitted_task_is_on_top_at_once.py",
+    "ui/harness/StartupGateHarness.cs": "ui/test_the_startup_loop_has_a_backstop.py",
 }
 
 
