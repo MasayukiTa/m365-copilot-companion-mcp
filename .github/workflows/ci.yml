@@ -207,6 +207,7 @@ jobs:
             ui/test_one_list_says_what_the_ui_compiles.py \
             scripts/test_each_edge_profile_is_its_own_sign_in.py \
             scripts/test_nothing_new_is_invisible.py \
+            scripts/test_a_leftover_tab_is_not_a_locked_door.py \
             ui/test_a_setting_that_is_off_is_said_out_loud.py \
             ui/test_fleet_cockpit_health.py \
             ui/test_fleet_cockpit_card_menu.py \

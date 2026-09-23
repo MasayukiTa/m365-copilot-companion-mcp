@@ -43,6 +43,36 @@ _REDIRECT_MARKERS = (
 )
 
 
+#: URL shapes on an auth host that are LEFTOVER, not a page asking anybody for anything.
+#:
+#: relay/relay_fleet.py's residue reaper was written against exactly these two -- "four such
+#: tabs were sitting in the fleet Edge when this was written" -- and its comment states the
+#: rule this module exists to enforce: THE URL IS NOT THE TEST, THE PAGE STATE IS. The reaper
+#: therefore asks classify_page before closing one.
+#:
+#: A CALLER THAT CANNOT ASK THE PAGE STILL NEEDS THIS. scripts/ensure_m365_signin.py reads the
+#: CDP /json tab list, which carries a URL and a title and no DOM, so it cannot probe page
+#: state at all. It was matching login.live.com and declaring a sign-in wall, so ONE piece of
+#: residue pinned its verdict at "sign in" forever -- on 2026-09-23 the operator's new machine
+#: sat in "waiting for sign-in..." against login.live.com/Me.srf and
+#: login.microsoftonline.com/savedusers, and quickstart could not finish.
+#:
+#: WHAT THIS LICENSES AND WHAT IT DOES NOT. Residue is not evidence of a wall. It is not
+#: evidence of being signed in either -- a caller that sees only residue has learned nothing
+#: and must say so. Removing something from the "needs a human" side is safe in a way that
+#: adding something to the "already fine" side is not.
+AUTH_BOUNCE_RESIDUE_MARKERS = (
+    "/me.srf",          # the personal-MSA profile endpoint Edge fetches on its own
+    "/savedusers",      # the "remembered accounts" bounce left behind after a sign-in
+)
+
+
+def looks_like_auth_bounce_residue(url: str) -> bool:
+    """True if *url* is a leftover auth-host tab rather than a page awaiting a human."""
+    u = (url or "").lower()
+    return any(m in u for m in AUTH_BOUNCE_RESIDUE_MARKERS)
+
+
 def _looks_like_signin(url: str) -> bool:
     """True if *url* looks like an active sign-in / account-pick page (case-insensitive)."""
     u = (url or "").lower()
