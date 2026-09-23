@@ -413,20 +413,15 @@ function Get-Sha256HexDoctor([string]$s) {
     }
     return (-join ($bytes | ForEach-Object { $_.ToString("x2") }))
 }
-# A name setup_devtunnel.ps1 GENERATES: its fixed default plus an optional hex machine
-# suffix. Such a name carries nothing user- or folder-derived -- the suffix is a hash --
-# so the substring checks below must not fire on it. Duplicated from
-# setup_devtunnel.ps1's $DEFAULT_NAME / Test-GeneratedTunnelName (D29: without this
-# exemption, a user named e.g. "pan" or "com" had every run's generated name --
-# "m365-copilot-companion-<hex>" -- flagged as identifying, even though nothing about it
-# was). Keep this pair and Test-IdentifyingTunnelName in sync with setup_devtunnel.ps1's
-# copies (and with bootstrap.py's) by hand -- there is no fourth shared file for them; see
-# this change's report for why they are not in tunnel_name_util.ps1.
-$DOCTOR_DEFAULT_NAME = "m365-copilot-companion"
-function Test-GeneratedTunnelNameDoctor([string]$name) {
-    if ([string]::IsNullOrWhiteSpace($name)) { return $false }
-    return ($name.Trim().ToLowerInvariant() -match ('^' + [regex]::Escape($DOCTOR_DEFAULT_NAME) + '(-[0-9a-f]{6}|-[0-9a-f]{8}){0,2}$'))
-}
+# Test-GeneratedTunnelName (a name setup_devtunnel.ps1 GENERATES: its fixed default plus an
+# optional hex machine suffix) now lives in tunnel_name_util.ps1, dot-sourced near the top of
+# this file -- it used to be duplicated here (byte-for-byte except its name) as
+# Test-GeneratedTunnelNameDoctor, hand-kept in sync with setup_devtunnel.ps1's copy and with
+# bootstrap.py's _is_generated_tunnel_name (D29: without this exemption, a user named e.g.
+# "pan" or "com" had every run's generated name -- "m365-copilot-companion-<hex>" -- flagged
+# as identifying, even though nothing about it was). Test-IdentifyingTunnelName below still
+# stays duplicated between this file and setup_devtunnel.ps1 by hand (and with bootstrap.py's
+# _is_identifying_tunnel_name) -- only the generated-name exemption moved.
 function Test-IdentifyingTunnelName([string]$name) {
     if ([string]::IsNullOrWhiteSpace($name)) { return $false }
     $lower = $name.ToLowerInvariant()
@@ -435,8 +430,8 @@ function Test-IdentifyingTunnelName([string]$name) {
     foreach ($t in $tokens) {
         if ((Get-Sha256HexDoctor $t) -eq $TOKEN_SHA256) { return $true }
     }
-    # NOT FOR A GENERATED NAME (D29) -- see the comment above Test-GeneratedTunnelNameDoctor.
-    if (Test-GeneratedTunnelNameDoctor $name) { return $false }
+    # NOT FOR A GENERATED NAME (D29) -- see tunnel_name_util.ps1's Test-GeneratedTunnelName.
+    if (Test-GeneratedTunnelName $name) { return $false }
     $repoLeaf = (Split-Path -Leaf $repo).ToLowerInvariant()
     $userName = ("$env:USERNAME").ToLowerInvariant()
     foreach ($t in $tokens) {

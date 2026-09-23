@@ -31,6 +31,11 @@ $ErrorActionPreference = "Continue"
 $root = Split-Path -Parent $PSScriptRoot
 $DEFAULT_NAME = "m365-copilot-companion"
 
+# Shared PURE helper Test-GeneratedTunnelName (see its header comment in tunnel_name_util.ps1
+# for why only this one function moved there and not the rest of this file's tunnel-name
+# logic). No top-level side effects, so dot-sourcing it here is safe.
+. (Join-Path $PSScriptRoot "tunnel_name_util.ps1")
+
 # Anonymous tunnel access is an EXPLICIT opt-in (MCP_TUNNEL_ALLOW_ANONYMOUS), default OFF.
 # Granting --allow-anonymous / --anonymous makes this server (file/shell tools on the tunnel's
 # port) reachable by ANYONE on the internet, gated only by the app-layer MCP_API_KEY -- that must
@@ -157,14 +162,12 @@ function Get-LegacyMachineSuffix {
     $hex = -join ($bytes | ForEach-Object { $_.ToString("x2") })
     return $hex.Substring(0, 6)
 }
-# A name this repository GENERATES: the default, optionally followed by a hex machine suffix
-# (8 = current scheme, 6 = legacy). Such a name carries nothing user-derived -- the suffix is a
-# hash -- which matters twice below: it cannot be identifying (D29), and its suffix says which
-# machine made it even when .env has no host stamp (D7).
-function Test-GeneratedTunnelName([string]$name) {
-    if ([string]::IsNullOrWhiteSpace($name)) { return $false }
-    return ($name.Trim().ToLowerInvariant() -match ('^' + [regex]::Escape($DEFAULT_NAME) + '(-[0-9a-f]{6}|-[0-9a-f]{8}){0,2}$'))
-}
+# Test-GeneratedTunnelName (a name THIS repository generates, default + optional hex machine
+# suffix) now lives in tunnel_name_util.ps1, dot-sourced above -- it used to be defined here,
+# byte-for-byte duplicated (except its name) as Test-GeneratedTunnelNameDoctor in doctor.ps1,
+# and hand-kept in sync with both that copy and bootstrap.py's _is_generated_tunnel_name.
+# Callers below pass only $name, relying on the shared function's $DefaultName default
+# ("m365-copilot-companion"), which has always equaled this file's own $DEFAULT_NAME.
 
 # Privacy guard: some tunnel names leak an identifying (organization/user) token to the
 # GLOBAL devtunnels.ms namespace, which is visible to Microsoft and to the tunnel owner.

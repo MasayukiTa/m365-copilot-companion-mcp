@@ -180,6 +180,13 @@ class Rig:
         (self.root / "scripts").mkdir(parents=True)
         (self.root / "tools").mkdir()
         shutil.copy(SETUP_PS1, self.root / "scripts" / "setup_devtunnel.ps1")
+        # setup_devtunnel.ps1 dot-sources tunnel_name_util.ps1 (Test-GeneratedTunnelName moved
+        # there 2026-09-24, out of this file) from $PSScriptRoot -- it must sit next to the
+        # copy above or the dot-source resolves nothing and every call to
+        # Test-GeneratedTunnelName inside Test-IdentifyingTunnelName is a command-not-found
+        # error, which is terminating regardless of $ErrorActionPreference.
+        shutil.copy(os.path.join(REPO, "scripts", "tunnel_name_util.ps1"),
+                    self.root / "scripts" / "tunnel_name_util.ps1")
         shutil.copy(os.path.join(REPO, "tools", "env_portability.py"),
                     self.root / "tools" / "env_portability.py")
         self.env_path = self.root / ".env"
