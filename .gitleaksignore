@@ -1,0 +1,19 @@
+# Gitleaks ignore list (fingerprint per line): <commit>:<file>:<rule>:<line>.
+#
+# History-only false positives. The current tree already marks the equivalent lines with
+# inline `# gitleaks:allow` comments (commit 5fe12bc), which silences the TREE scan
+# (`gitleaks detect --no-git`) -- but git history is immutable, so the full-history scan
+# (`gitleaks detect --log-opts="--all"`) still sees the pre-comment blob at the commit that
+# first introduced these lines and will always flag it there. That is exactly what
+# .gitleaksignore is for: an exact, per-finding fingerprint, not a rule change.
+#
+# Both are fixture literals from scripts/test_unlock_password_is_retrievable.py, verified by
+# reading `git show d4d2c33e:scripts/test_unlock_password_is_retrievable.py`:
+#   line 66:  a password this same test mints ("known-pw-1234") and asserts it can read back
+#   line 130: a password this same test mints ("visible-pw-5678") and asserts it appears in
+#             copilot_studio_values.ps1's output
+# Neither is a real credential; both are 8-hex-digit-shaped strings the generic-api-key rule
+# cannot distinguish from a key. Confirmed clean with gitleaks v8.30.1:
+#   gitleaks detect --redact -v --log-opts="--all"  ->  0 leaks found, 2431 commits scanned.
+d4d2c33ef1f6ac580d4bb6fd9968573a20ec2ea9:scripts/test_unlock_password_is_retrievable.py:generic-api-key:66
+d4d2c33ef1f6ac580d4bb6fd9968573a20ec2ea9:scripts/test_unlock_password_is_retrievable.py:generic-api-key:130
