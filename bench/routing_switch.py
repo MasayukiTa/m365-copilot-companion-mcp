@@ -37,13 +37,26 @@ def routing_requested():
         return False
 
 
-def broker(context=""):
-    """relay.broker_client if routing is carrying this run, else None.
+#: Whether the broker answered a ping, cached for the life of the process. `broker()` is
+#: called once per instance -- pro_capture.py and pro_stage_goals.py both call it in a loop
+#: over the run's instances -- and re-pinging on every call would turn a forty-instance run
+#: into forty extra SSH round trips for a fact that does not change mid-run. None means "not
+#: checked yet this process"; True/False is the cached answer.
+_broker_live = None
+_broker_ping_error = None
 
-    Raises RuntimeError when routing was asked for and the module cannot be reached: falling
-    back to the local machine there is the behaviour being replaced, and doing it silently is
-    how a routed run comes to look like an ordinary one that went badly.
+
+def broker(context=""):
+    """relay.broker_client if routing is carrying this run AND the broker answers, else None.
+
+    Raises RuntimeError when routing was asked for and the module cannot be reached, or is
+    reachable but never answers a ping: falling back to the local machine there is the
+    behaviour being replaced, and doing it silently is how a routed run comes to look like an
+    ordinary one that went badly -- a run with routing switched on against a down host used to
+    proceed and fail one `create` at a time across forty instances instead of failing once,
+    here, with a reason.
     """
+    global _broker_live, _broker_ping_error
     import sys
     if REPO not in sys.path:
         sys.path.insert(0, REPO)
@@ -58,4 +71,21 @@ def broker(context=""):
                 "refusing to fall back to this machine, which is the behaviour routing "
                 "replaces" % (exc, (" [%s]" % context) if context else ""))
         return None
-    return bc if bc.enabled() else None
+    if not bc.enabled():
+        return None
+    if _broker_live is None:
+        try:
+            bc.ping()
+            _broker_live = True
+        except Exception as exc:
+            _broker_live = False
+            _broker_ping_error = exc
+    if _broker_live:
+        return bc
+    if asked:
+        raise RuntimeError(
+            "routing was asked for and bench.remote.broker_client imported, but the broker "
+            "did not answer a ping (%s)%s; refusing to fall back to this machine, which is "
+            "the behaviour routing replaces" % (
+                _broker_ping_error, (" [%s]" % context) if context else ""))
+    return None
