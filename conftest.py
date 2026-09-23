@@ -548,6 +548,17 @@ _FLEET_TARGET_MODULE_EXCEPTIONS = frozenset({
 })
 
 
+def _real_dotenv_target():
+    """The REAL repo .env's path -- conftest.py sits at the repo root, so this is always
+    right beside it. A tiny function rather than a module constant so it re-resolves
+    __file__ the same way _real_dotenv_and_fleet_state_targets does, instead of being a
+    second, independently-computed answer to "where is .env" that could drift from it.
+    """
+    from pathlib import Path as _P
+
+    return _P(__file__).resolve().parent / ".env"
+
+
 def _real_dotenv_and_fleet_state_targets():
     """The REAL repo .env, plus every real top-level .fleet/<file> that LIVE_RECORD_REDIRECTS
     (above) names, EXCEPT the documented exceptions in _FLEET_TARGET_MODULE_EXCEPTIONS whose
@@ -585,8 +596,9 @@ def _real_dotenv_and_fleet_state_targets():
 
 @pytest.fixture(autouse=True, scope="session")
 def _real_dotenv_and_fleet_state_must_not_change():
-    """SESSION-SCOPED CANARY: the whole test session must leave the owner's REAL .env, and the
-    real top-level .fleet/ state files LIVE_RECORD_REDIRECTS names, byte-for-byte untouched.
+    """SESSION-SCOPED CANARY: the whole test session must leave the owner's REAL .env
+    byte-for-byte untouched (HARD FAIL), and WARNS (does not fail) if a real top-level .fleet/
+    state file LIVE_RECORD_REDIRECTS names changes during the session.
 
     TWICE IN ONE DAY (2026-09-24) a test run reached real operator state anyway, through two
     DIFFERENT mechanisms neither of the existing safeguards covered: a test wrote
@@ -600,32 +612,70 @@ def _real_dotenv_and_fleet_state_must_not_change():
 
     LIVE_RECORD_REDIRECTS and the per-test fixture above already redirect every KNOWN write
     target, one entry at a time. This is the BACKSTOP, not a replacement for that table: it does
-    not know which file a test SHOULD have redirected, only that the one file this entire
-    repository ultimately depends on (.env) -- and the .fleet/ files already named on that table
-    -- must read the same at the end of the session as they did at the start. That is exactly
-    what catches a redirect that silently failed to take (an import-order surprise, the
-    `except Exception: continue` above swallowing a real problem) and a code path like
-    test_bootstrap's own ROOT swap, which reaches the real path directly and was never a
-    LIVE_RECORD_REDIRECTS case to begin with.
+    not know which file a test SHOULD have redirected, only that .env -- and the .fleet/ files
+    already named on that table -- must read the same at the end of the session as they did at
+    the start. That is exactly what catches a redirect that silently failed to take (an
+    import-order surprise, the `except Exception: continue` above swallowing a real problem) and
+    a code path like test_bootstrap's own ROOT swap, which reaches the real path directly and
+    was never a LIVE_RECORD_REDIRECTS case to begin with.
+
+    WHY .env IS A HARD FAIL AND .fleet/ IS ONLY A WARNING -- measured, not assumed. The first
+    version of this fixture failed the session on ANY change to either. On this machine (the
+    owner's live install, per this repo's own standing warning against starting/stopping the
+    supervisor/bridge here), a real run of this exact suite failed on
+    .fleet/page_counts.jsonl -- measured growing from 1,307,925 to 1,308,085 bytes DURING an
+    unrelated ~115s test session, with no test in that session writing to it. The cause is
+    bridge/copilot_bridge.py's own CDP watchdog, which appends to that file every ~60s AS PART
+    OF NORMAL PRODUCTION OPERATION whenever the bridge is running -- which it legitimately was,
+    the whole time, on this machine. A byte-level change to a .fleet/ file is therefore NOT
+    reliable evidence of a TEST writing to it on a machine with a live install; a byte-level
+    change to .env is -- nothing in this repository's normal running operation rewrites .env
+    (see .env's own row in the state inventory: it is written only by setup/quickstart/
+    setup_devtunnel/configure_env/heal_tunnel, none of which run as a side effect of `pytest`).
+    Hard-failing .fleet/ changes here would make this canary itself the thing that turns a
+    healthy owner's-machine test run red for a reason having nothing to do with test hygiene --
+    which is precisely the "the operator saw the dot move while nothing was wrong" failure mode
+    _no_writes_to_the_live_records's own docstring describes, just relocated to this fixture. A
+    THROWAWAY CLONE (no live supervisor/bridge running against it) does not have this problem,
+    and is where the .fleet/ half of this canary is actually proven to catch a real test write
+    (see test_real_dotenv_canary.py's throwaway-clone tests at the repo root).
 
     SESSION-scoped, not per-test: fingerprinting several dozen files is cheap but not free, and
     the property this proves -- "the session as a whole left these alone" -- does not need
-    re-proving after every one of several thousand tests. NEVER reads a byte of .env for any
-    purpose other than feeding it to sha256: the fingerprint is (exists, size, digest), and the
-    failure message below prints only paths and sizes, never contents.
+    re-proving after every one of several thousand tests. NEVER reads a byte of .env (or any
+    .fleet/ file) for any purpose other than feeding it to sha256: the fingerprint is (exists,
+    size, digest), and every message below prints only paths, sizes and digests, never contents.
     """
+    dotenv_path = _real_dotenv_target()
     targets = _real_dotenv_and_fleet_state_targets()
     before = {p: _fingerprint(p) for p in targets}
     yield
     changed = [p for p in targets if _fingerprint(p) != before[p]]
-    if changed:
+    dotenv_changed = [p for p in changed if p == dotenv_path]
+    fleet_changed = [p for p in changed if p != dotenv_path]
+
+    if dotenv_changed:
         pytest.fail(
             "LIVE-STATE CANARY (conftest._real_dotenv_and_fleet_state_must_not_change): this "
-            "test session modified real operator state that tests must never touch -- every "
-            "write to one of these files should have gone through LIVE_RECORD_REDIRECTS (see "
-            "conftest.py) or an equivalent per-test redirect instead. Changed file(s):\n" +
-            "\n".join("  %s (was %r, now %r)" % (p, before[p], _fingerprint(p)) for p in changed),
+            "test session modified the real repo .env, which nothing in a normal `pytest` run "
+            "should ever touch -- every write should have gone through LIVE_RECORD_REDIRECTS "
+            "(see conftest.py), dotenv neutralisation, or an equivalent per-test redirect "
+            "instead. Changed file(s):\n" +
+            "\n".join("  %s (was %r, now %r)" % (p, before[p], _fingerprint(p)) for p in dotenv_changed),
             pytrace=False,
+        )
+    if fleet_changed:
+        # WARNING ONLY -- see this fixture's own docstring for the measured reason (a live
+        # supervisor/bridge on this machine legitimately writes some of these files every
+        # ~60s, independent of any test). Printed rather than logged: pytest captures stdout
+        # per test but this runs at session teardown, after every test's own capture has
+        # already been reported, so a plain print here reaches the terminal.
+        print(
+            "\n[conftest] LIVE-STATE CANARY WARNING: %d real .fleet/ file(s) changed during "
+            "this session (not failing -- see _real_dotenv_and_fleet_state_must_not_change's "
+            "docstring: a live supervisor/bridge on this machine can legitimately write these "
+            "independent of any test). If this surprises you, check what wrote to:\n" % len(fleet_changed) +
+            "\n".join("  %s (was %r, now %r)" % (p, before[p], _fingerprint(p)) for p in fleet_changed)
         )
 
 
