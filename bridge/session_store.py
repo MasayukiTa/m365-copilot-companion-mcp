@@ -113,16 +113,40 @@ def _db_path():
     return os.path.join(_base_dir(), "sessions.sqlite3")
 
 
+class StoreUnavailable(RuntimeError):
+    """The session store's database file could not be opened at all -- an unwritable or
+    missing store directory, a locked file, or anything else sqlite3 refuses.
+
+    Raised by `_connect()` instead of letting `sqlite3.Error` (or the FileNotFoundError a
+    missing directory produces) reach a caller as a bare traceback naming sqlite3 internals.
+    Carries the path so the one line `main()` prints says WHERE, not just that something
+    failed.
+    """
+
+    def __init__(self, path, cause):
+        super().__init__("cannot open session store at %s: %s" % (path, cause))
+        self.path = path
+        self.cause = cause
+
+
 def _connect():
-    conn = sqlite3.connect(_db_path(), timeout=10.0, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    # BEFORE ANY OTHER PRAGMA THAT WRITES. auto_vacuum is fixed at the first write to a new
-    # database and can only be changed afterwards by a full VACUUM. Setting journal_mode
-    # first was enough to lock it at NONE, so pruning freed rows and returned no disk.
-    conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
-    # WAL so a reader (the cockpit, a CLI) never blocks the bridge mid-turn.
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
+    path = _db_path()
+    try:
+        conn = sqlite3.connect(path, timeout=10.0, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        # BEFORE ANY OTHER PRAGMA THAT WRITES. auto_vacuum is fixed at the first write to a new
+        # database and can only be changed afterwards by a full VACUUM. Setting journal_mode
+        # first was enough to lock it at NONE, so pruning freed rows and returned no disk.
+        conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+        # WAL so a reader (the cockpit, a CLI) never blocks the bridge mid-turn.
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+    except (sqlite3.Error, OSError) as exc:
+        # sqlite3.connect() itself is lazy about opening the file on some platforms -- the
+        # actual OS-level failure (e.g. an unwritable directory) can surface here on the first
+        # PRAGMA instead of on connect(). Either way, the caller gets one readable exception
+        # naming the path, never a bare OperationalError/FileNotFoundError traceback.
+        raise StoreUnavailable(path, exc) from exc
     return conn
 
 
@@ -1026,8 +1050,15 @@ def main(argv=None):
 
     a = ap.parse_args(argv)
     if a.cmd == "compact":
-        before = store_stats()
-        after = compact()
+        try:
+            before = store_stats()
+            after = compact()
+        except StoreUnavailable as exc:
+            # ONE READABLE LINE, NOT A BARE TRACEBACK. See StoreUnavailable's docstring: this
+            # is the operator-reachable surface for `_connect()` refusing to open the store,
+            # e.g. an unwritable MCP_SESSION_STORE_DIR.
+            print(str(exc))
+            return 1
         print(json.dumps({"db_path": _db_path(), "before": before, "after": after},
                           ensure_ascii=False))
         return 0
