@@ -82,6 +82,9 @@ EXEMPT = {
     "scripts/win/move_companion_to_desktop.ps1":
         "compiles thirdparty/VirtualDesktop11.cs, a single vendored file that is not part of "
         "either UI binary",
+    "tests/_install_path_harness.py":
+        "compiles a throwaway uv.exe STUB from a one-file C# snippet it writes itself, so the "
+        "install-path tests can run setup.bat without downloading uv; not a UI binary",
     "ui/test_the_ui_and_the_fleet_agree_on_the_command_channel.py":
         "compiles ui/FleetCommands.cs ALONE into a throwaway console exe, on purpose: it is "
         "the cross-language contract test for that one file's writer, not a build of the UI",
