@@ -206,3 +206,51 @@ def safe_commit(paths: Iterable[str], message: str, *, repo: str = frozen.REPO,
     subprocess.run(["git", "-C", repo, "add", *paths], check=False)
     rc = subprocess.run(["git", "-C", repo, "commit", "-m", message], check=False).returncode
     return {"ok": True, "committed": True, "paths": paths, "rc": rc}
+
+
+# --------------------------------------------------------------------------------------------------
+# Operator CLI -- the only way to run revert() without a Python REPL
+# --------------------------------------------------------------------------------------------------
+#
+# active_genome()/apply_genome() are already reachable in production: apply_genome() is called
+# from the activation path in controller.py::_conclude, and active_genome() is read on every
+# quality_cards.py card lookup. Nothing could call revert() -- there was no CLI here at all,
+# unlike runtime_config.py's analogous `python -m relay.selfimprove.runtime_config revert` for
+# the (different) active_manifest.json store. A bad genome landing in active_genome.json had no
+# operator-usable undo.
+
+
+def main(argv=None):
+    """Show or roll back the applied-genome store. Returns a process exit code."""
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        prog="python -m relay.selfimprove.apply",
+        description="Inspect or roll back the applied-genome store (relay/selfimprove/"
+                    "active_genome.json).")
+    sub = ap.add_subparsers(dest="cmd")
+    sub.add_parser("show", help="print the currently-applied genome")
+    sub.add_parser("revert", help="restore the store from its one-deep backup (<store>.prev)")
+
+    a = ap.parse_args(argv)
+    cmd = a.cmd or "show"
+
+    if cmd == "show":
+        genome = active_genome(DEFAULT_STORE)
+        exists = os.path.isfile(DEFAULT_STORE)
+        print("applied genome : %s"
+              % (json.dumps(genome, ensure_ascii=False, sort_keys=True)))
+        print("store path     : %s%s"
+              % (DEFAULT_STORE, "" if exists else "   (base -- no store file)"))
+        return 0
+
+    if not revert(DEFAULT_STORE):
+        print("nothing to revert to -- no genome has ever been applied")
+        return 2
+    print("reverted; applied genome is now %s"
+          % json.dumps(active_genome(DEFAULT_STORE), ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

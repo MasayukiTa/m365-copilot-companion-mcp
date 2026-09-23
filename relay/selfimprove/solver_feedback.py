@@ -26,7 +26,6 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections import Counter
 
 
 def enabled() -> bool:
@@ -148,35 +147,6 @@ def collect(episode_id: str, reply: str) -> dict:
     return {"episode_id": episode_id, **parse(reply)}
 
 
-def tally(entries) -> dict:
-    """What several episodes said, counted by how many EPISODES raised each item.
-
-    Counted per episode rather than per mention: one solver repeating itself is one
-    observation, and totalling raw mentions would let a single verbose reply outvote five
-    quiet ones. The count is the whole reason to aggregate -- an item raised once is an
-    anecdote, and an item raised on half the suite is a property of the harness.
-    """
-    per_field = {}
-    for field in LIST_FIELDS:
-        counter = Counter()
-        where = {}
-        for entry in entries or []:
-            for item in set(entry.get(field) or []):
-                counter[item] += 1
-                where.setdefault(item, []).append(entry.get("episode_id"))
-        per_field[field] = [
-            {"item": item, "episodes": count, "where": sorted(x for x in where[item] if x)}
-            for item, count in counter.most_common()
-        ]
-    return {
-        "episodes": len(entries or []),
-        "parse_errors": sum(1 for e in (entries or []) if e.get("parse_error")),
-        "fields": per_field,
-        "suggestions": [e["suggested_harness_change"] for e in (entries or [])
-                        if (e.get("suggested_harness_change") or "").strip()],
-    }
-
-
 def to_hypotheses(tallied, *, min_episodes=2) -> list:
     """Turn recurring friction into proposals -- never into decisions.
 
@@ -265,19 +235,3 @@ def where(entry) -> str:
     return named.pop() if len(named) == 1 else UNATTRIBUTED
 
 
-def where_distribution(entries) -> dict:
-    """How the episodes distribute over components, `unattributed` included.
-
-    Reported rather than hidden: if most episodes are unattributed then the WHERE axis is not
-    carrying information yet, and a reader needs to see that before treating the few attributed
-    cells as a map of the harness.
-    """
-    counts = Counter(where(e) for e in (entries or []))
-    total = sum(counts.values())
-    return {
-        "counts": dict(counts),
-        "attributed": total - counts.get(UNATTRIBUTED, 0),
-        "total": total,
-        "attribution_rate": round((total - counts.get(UNATTRIBUTED, 0)) / total, 4)
-        if total else None,
-    }

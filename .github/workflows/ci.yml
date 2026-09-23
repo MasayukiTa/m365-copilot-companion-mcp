@@ -214,6 +214,7 @@ jobs:
             scripts/test_a_silent_death_leaves_its_exit_code.py \
             scripts/test_a_runner_that_dies_before_argparse_is_recorded.py \
             relay/test_a_doc_id_is_used_where_it_was_made.py \
+            bench/test_swe_grade_batch.py \
             relay/selfimprove/test_the_slice_refusal_fires_through_the_real_entry.py \
             ui/test_a_setting_that_is_off_is_said_out_loud.py \
             ui/test_fleet_cockpit_health.py \

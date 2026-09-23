@@ -91,6 +91,55 @@ def test_safe_commit_refuses_frozen_path(monkeypatch):
     print("ok test_safe_commit_refuses_frozen_path")
 
 
+def test_cli_revert_rolls_back_the_real_store(tmp_path, monkeypatch, capsys):
+    """`revert()` had no CLI at all -- the only undo for a bad applied genome required a Python
+    REPL. `main()` is what an operator actually runs; this executes it, not `revert()` directly."""
+    store = str(tmp_path / "active_genome.json")
+    monkeypatch.setattr(A, "DEFAULT_STORE", store)
+    g1 = {"knobs": {}, "cards": {"c1": "old text"}, "parent_id": None, "note": "g1"}
+    g2 = {"knobs": {}, "cards": {"c1": "new text"}, "parent_id": None, "note": "g2"}
+    A.apply_genome(g1, store)
+    A.apply_genome(g2, store)
+    capsys.readouterr()
+    rc = A.main(["revert"])
+    assert rc == 0
+    assert A.active_genome(store) == g1
+    out = capsys.readouterr().out
+    assert "reverted" in out
+
+
+def test_cli_revert_with_nothing_to_revert_is_reported_not_silently_ignored(tmp_path,
+                                                                            monkeypatch, capsys):
+    store = str(tmp_path / "active_genome.json")
+    monkeypatch.setattr(A, "DEFAULT_STORE", store)
+    rc = A.main(["revert"])
+    assert rc == 2
+    assert "nothing to revert" in capsys.readouterr().out
+
+
+def test_cli_show_prints_the_store_path_and_current_genome(tmp_path, monkeypatch, capsys):
+    store = str(tmp_path / "active_genome.json")
+    monkeypatch.setattr(A, "DEFAULT_STORE", store)
+    g = {"knobs": {}, "cards": {"c1": "x"}, "parent_id": None, "note": "g"}
+    A.apply_genome(g, store)
+    rc = A.main(["show"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert store in out
+    assert "c1" in out
+
+
+def test_the_cli_runs_as_a_module_not_only_as_an_import():
+    """import 経由でしか確かめないと、エントリポイントの欠陥は見えない
+    (compare.py の __main__ 直前に withdraw/withdrawn_ids を足して NameError を出した事故と
+    同じクラス)。"""
+    import sys
+    from tools.childproc import run as _run_child
+    out = _run_child([sys.executable, "-m", "relay.selfimprove.apply", "--help"], timeout=120)
+    assert out.returncode == 0, out.stderr[-400:]
+    assert "revert" in out.stdout and "show" in out.stdout
+
+
 def test_safe_commit_dry_run_does_not_touch_git(monkeypatch):
     monkeypatch.setattr(frozen, "frozen_intact", lambda repo=None, baseline=None: (True, []))
     # blow up if git is ever invoked -- dry_run must not call subprocess

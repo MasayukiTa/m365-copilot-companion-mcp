@@ -76,22 +76,6 @@ class SpendCeiling:
         return False
 
 
-def run_until(stop_when: Callable[[], bool], iterate_fn: Callable[[], dict],
-              max_steps: int = 1000) -> list:
-    """Minimal driver: call iterate_fn() until stop_when() is True (or max_steps for safety).
-
-    stop_when is checked BEFORE each step (so a ceiling already at its limit runs zero iterations).
-    Returns the list of per-step results. The real cron wiring (CronCreate) lives a layer up; this is
-    just the in-process helper so the spend ceiling can gate a sequence of iterations.
-    """
-    results: list = []
-    steps = 0
-    while not stop_when() and steps < max_steps:
-        results.append(iterate_fn())
-        steps += 1
-    return results
-
-
 # --------------------------------------------------------------------------------------------------
 # The L2 iteration
 # --------------------------------------------------------------------------------------------------

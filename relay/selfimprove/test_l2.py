@@ -241,23 +241,6 @@ def test_spend_ceiling():
     print("ok test_spend_ceiling")
 
 
-def test_run_until_respects_ceiling():
-    sc = L2.SpendCeiling(start_ts=0.0)
-    calls = {"n": 0}
-
-    def step():
-        calls["n"] += 1
-        sc.tick()
-        return {"step": calls["n"]}
-
-    res = L2.run_until(lambda: sc.exceeded(max_iters=3, max_hours=None, now_ts=0.0), step)
-    assert len(res) == 3 and calls["n"] == 3, res
-    # already at the ceiling -> zero steps
-    res2 = L2.run_until(lambda: sc.exceeded(max_iters=3, max_hours=None, now_ts=0.0), step)
-    assert res2 == []
-    print("ok test_run_until_respects_ceiling")
-
-
 if __name__ == "__main__":
     test_frozen_changed_aborts()
     test_happy_path_queued()
@@ -268,5 +251,4 @@ if __name__ == "__main__":
     test_gate_reject_no_sentinel()
     test_frozen_post_change_aborts()
     test_spend_ceiling()
-    test_run_until_respects_ceiling()
     print("ALL L2 TESTS PASSED")

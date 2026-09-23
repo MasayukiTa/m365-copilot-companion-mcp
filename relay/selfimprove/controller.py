@@ -24,6 +24,7 @@ judge, and the whole structure exists to keep those apart.
 from __future__ import annotations
 
 from relay import provenance as PROV
+from relay.selfimprove import apply as APPLY
 from relay.selfimprove import decision as D
 from relay.selfimprove import experiment as EX
 from relay.selfimprove import frozen as F
@@ -113,7 +114,7 @@ class EvolutionController:
         if not ok_pre:
             return self._conclude(experiment_id, D.decide(frozen_ok=False),
                                   {"frozen_changed": changed_pre}, candidate, cand_id,
-                                  changed)
+                                  changed, genome)
 
         try:
             # THE BASE THE CONTROLLER RECORDED AS THE PARENT, handed to the evaluator so the
@@ -133,13 +134,13 @@ class EvolutionController:
                 experiment_id,
                 D.decide(infra={"aborted": True,
                                 "reason": "evaluator raised %s: %s" % (type(exc).__name__, exc)}),
-                {"exception": type(exc).__name__}, candidate, cand_id, changed)
+                {"exception": type(exc).__name__}, candidate, cand_id, changed, genome)
 
         ok_post, changed_post = self._frozen()
         if not ok_post:
             return self._conclude(experiment_id, D.decide(frozen_ok=False),
                                   {"frozen_changed_during_run": changed_post},
-                                  candidate, cand_id, changed)
+                                  candidate, cand_id, changed, genome)
 
         # SECTIONS 19-21. Written before the decision, because a record whose contents
         # depend on the verdict is a record of the verdict rather than of the run. Failure to
@@ -160,7 +161,7 @@ class EvolutionController:
             # then write the manifest anyway.
             will_activate=self.activate,
         )
-        return self._conclude(experiment_id, verdict, result, candidate, cand_id, changed)
+        return self._conclude(experiment_id, verdict, result, candidate, cand_id, changed, genome)
 
     # -- internals ---------------------------------------------------------------------
 
@@ -313,7 +314,7 @@ class EvolutionController:
         except Exception as exc:
             return "%s: %s" % (type(exc).__name__, exc)
 
-    def _conclude(self, experiment_id, verdict, result, candidate, cand_id, changed):
+    def _conclude(self, experiment_id, verdict, result, candidate, cand_id, changed, genome):
         # ARCHIVE FIRST, THEN CONCLUDE, THEN ACTIVATE. The ledger conclusion was written
         # before the archive attempt, and a failed archive then downgraded the RETURNED
         # verdict from KEEP to NEEDS_HUMAN_REVIEW -- leaving the durable record saying
@@ -340,6 +341,13 @@ class EvolutionController:
         activated = False
         if verdict["may_activate"] and self.activate:
             RC.write_active(candidate)
+            # The manifest carries components/parameters; it has no field for the genome's
+            # `cards` overrides. Without this, an activated genome's cards were silently
+            # discarded even though quality_cards.py already reads them back through
+            # apply.active_genome() (relay/selfimprove/apply.py module docstring, "DONE
+            # 2026-08-20"). Recording the genome alongside the manifest is what makes that
+            # reader see anything but the base genome.
+            APPLY.apply_genome(genome or {}, store_path=APPLY.DEFAULT_STORE)
             activated = True
         return {
             "experiment_id": experiment_id,

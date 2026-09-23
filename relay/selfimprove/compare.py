@@ -524,7 +524,7 @@ def _active_harness_id() -> str:
     """The harness in force on this machine right now, or "" if it cannot be read."""
     try:
         from relay.selfimprove import runtime_config as RC
-        return M.harness_id(RC.active_manifest(refresh=True))
+        return RC.active_harness_id(refresh=True)
     except Exception:
         return ""
 
@@ -695,6 +695,15 @@ def _cli(argv=None):
     hs.add_argument("a")
     hs.add_argument("b")
 
+    wd = sub.add_parser("withdraw", help="withdraw an earlier verdict (append-only, nothing "
+                                         "is rewritten)")
+    wd.add_argument("id", help="the request id of the verdict being withdrawn")
+    wd.add_argument("reason")
+
+    mz = sub.add_parser("materialize", help="write a named branch's manifest to a temp file "
+                                            "for a child process (MCP_HARNESS_MANIFEST)")
+    mz.add_argument("label")
+
     args = p.parse_args(argv)
     arc = _archive()
 
@@ -757,6 +766,18 @@ def _cli(argv=None):
             print("  %s  %-13s %s"
                   % (time.strftime("%Y-%m-%d %H:%M", time.localtime(row.get("at", 0))),
                      row.get("verdict") or "REFUSED", (row.get("why") or "")[:90]))
+        return 0
+
+    if args.cmd == "withdraw":
+        row = withdraw(args.id, args.reason)
+        print("withdrawn %s: %s" % (row["withdraws"], row["why"]))
+        return 0
+
+    if args.cmd == "materialize":
+        path, info = BR.materialize_to_file(args.label, archive=arc)
+        print(path)
+        print("  branch %s -> %s (harness %s)"
+              % (info["label"], info["genome_id"], info["harness_id"]))
         return 0
     return 1                                                    # pragma: no cover
 

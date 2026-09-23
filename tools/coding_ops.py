@@ -193,10 +193,10 @@ def _dedicated_deny_msg(reason: str) -> str:
     return (
         "[refused: this checkout is not a confirmed dedicated repository root.\n"
         "Why: %s\n"
-        "Instead: create an isolated worktree for your branch and run the operation there:\n"
-        "  git worktree add -b <branch> ../wt/<branch> <base>\n"
-        "then operate from that worktree's root. To start a NEW branch in place without "
-        "discarding anything, use create=True (git checkout -b).]" % reason
+        "Instead: call the worktree_add tool to create an isolated linked worktree for your\n"
+        "branch, then operate from that worktree's root (worktree_remove tears it down when\n"
+        "done). To start a NEW branch in place without discarding anything, use create=True\n"
+        "(git checkout -b).]" % reason
     )
 
 
@@ -621,10 +621,11 @@ def git_checkout(branch: str, repo_path: str = ".", create: bool = False) -> str
                     "Why: this checkout shares the repository's main working tree with other\n"
                     "workers and the owner. A branch switch here sweeps their uncommitted changes\n"
                     "onto the target branch.\n"
-                    "Instead: create an isolated worktree for your branch, e.g.\n"
-                    "  git worktree add -b <branch> ../wt/<branch> <base>\n"
-                    "and work there. To start a NEW branch in place, use create=True (git\n"
-                    "checkout -b), which is permitted because it discards nothing.]"
+                    "Instead: call the worktree_add tool to create an isolated linked worktree\n"
+                    "for your branch (same arguments as `git worktree add -b <branch> <path>\n"
+                    "<base>`, gated the same way this tool is), work there, then call\n"
+                    "worktree_remove when done. To start a NEW branch in place, use create=True\n"
+                    "(git checkout -b), which is permitted because it discards nothing.]"
                 )
             # (A2) Affirmatively confirm this checkout is a dedicated repo root before a
             # discarding switch. _is_shared_worktree above only blocks a PROVEN shared tree;
@@ -885,10 +886,23 @@ def worktree_scope(worktree_path: str, branch: str, base: str = "HEAD",
                    repo_path: str = "."):
     """Create an isolated linked worktree, yield its path, and ALWAYS tear it down.
 
-    FOR IN-PROCESS CALLERS. This is the shape the two bench teardown sites should share: the
-    worktree is removed in a `finally`, so an exception mid-work cannot leave a husk behind,
-    and the removal goes through `worktree_remove`, which refuses to touch the shared tree
-    and never lets an rmtree fallback hit it.
+    FOR IN-PROCESS CALLERS ONLY, and that is structural, not an oversight: it is a
+    `@contextlib.contextmanager` generator, so calling it returns a context-manager object
+    rather than doing anything -- creation happens on `__enter__` and teardown on `__exit__`,
+    both of which have to run in the SAME call frame as the work in between. An MCP tool call
+    is one request/response with no frame an agent's later tool calls share, so this cannot be
+    registered as a tool itself (`register()` would hand FastMCP a bare context-manager object,
+    the worktree would never actually be created, and nothing would ever tear it down).
+
+    `worktree_add` and `worktree_remove` -- the two calls this makes, in the `finally` -- ARE
+    registered as MCP tools for exactly that reason: they are the externally-usable halves of
+    this same lifecycle, one call to open, one to close, which is the shape a multi-turn agent
+    can actually drive. `git_checkout`'s shared-worktree refusal names them.
+
+    This remains the shape the two bench teardown sites should share: the worktree is removed
+    in a `finally`, so an exception mid-work cannot leave a husk behind, and the removal goes
+    through `worktree_remove`, which refuses to touch the shared tree and never lets an rmtree
+    fallback hit it.
 
     Yields the worktree path on success, or None when creation failed (teardown then has
     nothing to do and is a safe no-op).

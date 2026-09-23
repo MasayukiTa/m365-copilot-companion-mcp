@@ -8,10 +8,12 @@ import io
 import json
 import os
 import sqlite3
+import sys
 
 import pytest
 
 from bridge import session_store as ss
+from tools.childproc import run as _child_run
 
 
 @pytest.fixture
@@ -211,6 +213,93 @@ def test_compact_runs_and_leaves_the_data_intact(box):
     ss.append_turn(sess["sid"], "user", "still here")
     ss.compact()
     assert [t["text"] for t in ss.all_turns(sess["sid"])] == ["still here"]
+
+
+def test_compact_cli_runs_against_a_tmp_store_and_really_shrinks_it(tmp_path):
+    """`python -m bridge.session_store compact` -- the operator entry point `compact()`
+    never had. `_collapse_goals`'s own comment (session_store.py, near line 174) names the
+    gap directly: "compact() has no caller in the repository at all", and the module has no
+    `__main__` at all -- so even the one case its docstring says it exists for had no
+    operator-reachable path.
+
+    This runs the REAL CLI as a subprocess (not `ss.main([...])` in-process, and not
+    `ss.compact()` directly -- both would only prove the function works, not that the new
+    entry point reaches it), pointed at an isolated store via MCP_SESSION_STORE_DIR --
+    NEVER the operator's live store under `bridge.session_store.SESS_DIR` -- and checks the
+    store the CLI reports acting on is genuinely the tmp one, and that the file it rewrote
+    actually shrank (not merely that the command exited 0).
+    """
+    env = dict(os.environ)
+    env[ss.STORE_DIR_ENV] = str(tmp_path)
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(ss.__file__)))
+    db_path = os.path.join(str(tmp_path), "sessions.sqlite3")
+
+    # Build the store through the same env-var boundary the CLI subprocess will read --
+    # an attribute monkeypatch does not cross a process (see
+    # test_the_store_location_can_be_moved_by_environment, above).
+    setup_code = (
+        "import sys; sys.path.insert(0, '.')\n"
+        "from bridge import session_store as ss\n"
+        "for i in range(20):\n"
+        "    s = ss.new_session(title='cli-test-%d' % i)\n"
+        "    ss.append_turn(s['sid'], 'user', 'x' * 4000)\n"
+        "print('ok')\n"
+    )
+    setup = _child_run([sys.executable, "-c", setup_code], cwd=repo, env=env, timeout=60)
+    assert setup.returncode == 0, setup.stdout + setup.stderr
+    assert os.path.isfile(db_path), "setup did not create the tmp store"
+
+    # Delete everything without running incremental_vacuum, so the freed pages stay IN the
+    # file (auto_vacuum=INCREMENTAL does not reclaim on its own -- see
+    # test_pruning_actually_returns_the_disk, above) -- giving compact()'s VACUUM real space
+    # to hand back, rather than a no-op on an already-small file.
+    delete_code = (
+        "import sys; sys.path.insert(0, '.')\n"
+        "from bridge import session_store as ss\n"
+        "conn = ss._db()\n"
+        "conn.execute('DELETE FROM turns')\n"
+        "conn.execute('DELETE FROM sessions')\n"
+        "conn.close()\n"
+    )
+    deleted = _child_run([sys.executable, "-c", delete_code], cwd=repo, env=env, timeout=60)
+    assert deleted.returncode == 0, deleted.stdout + deleted.stderr
+
+    before_size = os.path.getsize(db_path)
+    assert before_size > 50_000, "test setup produced too little data to measure a shrink"
+
+    out = _child_run([sys.executable, "-m", "bridge.session_store", "compact"],
+                      cwd=repo, env=env, timeout=60)
+    assert out.returncode == 0, out.stdout + out.stderr
+    payload = json.loads(out.stdout.strip())
+
+    # The store really moved: the CLI's own report names the tmp path, not the live one.
+    assert os.path.normcase(os.path.abspath(payload["db_path"])) == \
+        os.path.normcase(os.path.abspath(db_path)), (
+            "compact CLI acted on %r, not the isolated tmp store %r"
+            % (payload["db_path"], db_path))
+    assert payload["db_path"] != os.path.join(ss.SESS_DIR, "sessions.sqlite3")
+    assert payload["before"]["sessions"] == 0 and payload["before"]["turns"] == 0
+
+    after_size = os.path.getsize(db_path)
+    assert after_size < before_size * 0.5, (
+        "compact did not shrink the tmp store after freed rows were deleted: %d -> %d"
+        % (before_size, after_size))
+
+
+def test_compact_cli_without_a_subcommand_does_not_mutate(tmp_path):
+    """No subcommand named -- print usage and exit nonzero rather than guessing `compact`.
+
+    Unlike `contract_gate`'s CLI (whose bare default is `show`, read-only), `compact` VACUUMs
+    the file on disk; defaulting to it silently would run a mutation nobody asked for.
+    """
+    env = dict(os.environ)
+    env[ss.STORE_DIR_ENV] = str(tmp_path)
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(ss.__file__)))
+    out = _child_run([sys.executable, "-m", "bridge.session_store"],
+                      cwd=repo, env=env, timeout=60)
+    assert out.returncode == 2
+    assert not os.path.isfile(os.path.join(str(tmp_path), "sessions.sqlite3")), (
+        "no subcommand still touched the store")
 
 
 def test_pruning_actually_returns_the_disk(box):
