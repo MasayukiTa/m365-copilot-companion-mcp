@@ -111,6 +111,14 @@ class CockpitProgram
             }
             return;
         }
+        // --selftest: construct the window the ordinary way, pump once, exit (WindowSelfTest.cs).
+        // Its status.json lives in an empty scratch directory, not the real .fleet, and the
+        // health poll -- which reaches the network and can start the stack -- does not start.
+        if (args.Length >= 1 && args[0].Equals("--selftest", StringComparison.OrdinalIgnoreCase))
+        {
+            string scratch = Path.Combine(WindowSelfTest.ScratchDir("cockpit-fleet"), "status.json");
+            Environment.Exit(WindowSelfTest.Run(delegate { return new CockpitWindow(scratch); }));
+        }
         string path = args.Length > 0 ? args[0] : null;
         new Application().Run(new CockpitWindow(path));
     }
@@ -2528,6 +2536,7 @@ class CockpitWindow : Window
     // running, so we don't restart it — we just refresh the UI from the still-updating cache.
     void StartHealthPoll()
     {
+        if (WindowSelfTest.Active) return;   // probes the network and may start the stack
         _agentMarkerId = ExtractAgentMarker();
         if (_healthThread != null && _healthThread.IsAlive) { ApplyHealthToUi(); return; }
         _healthStop = false;
@@ -4397,6 +4406,7 @@ class CockpitWindow : Window
     // Fix clicks or health-poll ticks cannot stack multiple launches.
     void RunStartAll()
     {
+        if (WindowSelfTest.Active) return;   // a selftest never starts the stack
         double nowU = NowUnix();
         if (_startAllLaunched && (nowU - _startAllLastUnix) < 120.0) return;
         _startAllLaunched = true;

@@ -204,6 +204,8 @@ jobs:
             ui/test_a_fleet_conversation_can_be_answered.py \
             ui/test_a_ledger_the_ui_writes_has_no_byte_order_mark.py \
             ui/test_the_ui_and_the_fleet_agree_on_the_command_channel.py \
+            ui/test_the_chat_window_sends_what_was_typed.py \
+            ui/test_both_windows_can_be_constructed.py \
             ui/test_one_list_says_what_the_ui_compiles.py \
             scripts/test_each_edge_profile_is_its_own_sign_in.py \
             scripts/test_nothing_new_is_invisible.py \
@@ -819,9 +821,17 @@ jobs:
       # references FleetCommands.cs needs. That was the open question, and it is answered by
       # the runner rather than by an assumption about it. continue-on-error is gone: the two
       # files now fail the job, which is the whole point of having run them here.
+      #
+      # REQUIRE_CSC: the csc-backed tests skip where csc.exe is missing, which is right on a
+      # developer box without the .NET Framework and WRONG here -- on this runner a missing csc
+      # would turn the send-path and window-construction tests into a green skip. With it set,
+      # they fail instead. (ui/test_the_chat_window_sends_what_was_typed.py and
+      # ui/test_both_windows_can_be_constructed.py read it; the command-channel test predates it.)
       - name: Windows-only tests
+        env:
+          REQUIRE_CSC: "1"
         run: |
-          python -m pytest -rsx tools/test_a_windowless_launch_really_has_no_window.py ui/test_the_ui_and_the_fleet_agree_on_the_command_channel.py scripts/test_a_silent_death_leaves_its_exit_code.py scripts/test_a_runner_that_dies_before_argparse_is_recorded.py
+          python -m pytest -rsx tools/test_a_windowless_launch_really_has_no_window.py ui/test_the_ui_and_the_fleet_agree_on_the_command_channel.py ui/test_the_chat_window_sends_what_was_typed.py ui/test_both_windows_can_be_constructed.py scripts/test_a_silent_death_leaves_its_exit_code.py scripts/test_a_runner_that_dies_before_argparse_is_recorded.py
 
       # The keyboard table lives here rather than on the ubuntu job because
       # tools/desktop_input.py binds ctypes.windll.user32 at import, so the module cannot

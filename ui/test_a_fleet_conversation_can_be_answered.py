@@ -51,17 +51,24 @@ import pytest
 
 UI = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(UI, "CopilotChat.cs")
+#: The send path moved here on 2026-09-24 and is now EXECUTED by
+#: ui/test_the_chat_window_sends_what_was_typed.py, which checks every branch below by running
+#: it and comparing with the pre-extraction code. What remains in this file are shape checks
+#: on the source, kept because they name the reasons.
+SEND = os.path.join(UI, "ChatSend.cs")
 
 
 def _code() -> str:
-    """The source with // comments removed.
+    """Both sources, with // comments removed.
 
     A source assertion that matches this file's own explanatory comments passes whether or not
     the code does anything -- and every comment here names the very identifiers being asserted
     on, so without this the whole module would be vacuous.
     """
-    with open(SRC, encoding="utf-8") as fh:
-        text = fh.read()
+    text = ""
+    for p in (SRC, SEND):
+        with open(p, encoding="utf-8-sig") as fh:
+            text += fh.read() + "\n"
     return "\n".join(re.sub(r"//.*$", "", ln) for ln in text.splitlines())
 
 
@@ -76,20 +83,20 @@ def test_a_fleet_conversation_is_routed_before_the_page_doors():
     """It has to be decided BEFORE the pinning block, not inside it: the three doors there are
     about putting the bridge page on a conversation, which is not where this one is."""
     code = _code()
-    body = _block(code, "void SendText(")
+    body = _block(code, "string DecideDoor(")
     fleet = body.index('target.Source == "fleet"')
-    doors = body.index("ReferenceEquals(target, _pageConv)")
+    doors = body.index("ReferenceEquals(target, pageConv)")
     assert fleet < doors, (
         "a fleet conversation still reaches the page-pinning doors, where it has no key to any "
         "of them and falls through to send_unknown_conv")
-    assert "SendToFleetConversation(target, text)" in body
+    assert "SendToFleetConversation(fx, target, text)" in _block(code, "void SendText(IChatSendEffects")
 
 
 def test_the_refusal_still_exists_for_what_it_was_actually_for():
     """send_unknown_conv keeps its job. A `chat` conversation with no url, no sid and messages
     genuinely has nowhere to go, and silently sending it somewhere would be worse."""
     code = _code()
-    assert 'AddAssistant(T("send_unknown_conv"))' in code
+    assert 'fx.AddAssistant(fx.T("send_unknown_conv"))' in code
 
 
 # ── addressing: the part that can go quietly wrong ─────────────────────────────────────────
@@ -99,8 +106,8 @@ def test_a_live_worker_is_matched_on_its_transcript_not_its_name():
     a w0 -- so steering an old conversation by name would interrupt a stranger doing unrelated
     work, and the steer would look delivered."""
     code = _code()
-    body = _block(code, "string LiveWorkerFor(")
-    assert 'SS(w, "transcript"), c.Transcript' in body, (
+    body = _block(code, "string LiveWorkerFor(string statusText")
+    assert 'SS(w, "transcript"), transcript' in body, (
         "the live worker is not identified by transcript path, so a name collision across runs "
         "can deliver this message to a different worker")
     assert 'd["running"]' in body, "a stale status.json would name workers that are long gone"
@@ -109,7 +116,9 @@ def test_a_live_worker_is_matched_on_its_transcript_not_its_name():
 def test_a_terminal_or_pending_worker_is_not_treated_as_live():
     """A steer for a terminal worker is dropped by deliver_steers, and a pending one has no
     turn to take it -- either way the message must go to the follow-up instead."""
-    body = _block(_code(), "string LiveWorkerFor(")
+    code = _code()
+    assert "IsTerminalWorkerStatus(SS(w, \"status\"))" in _block(code, "string LiveWorkerFor(string statusText")
+    body = _block(code, "bool IsTerminalWorkerStatus(", 600)
     for st in ("done", "resolved", "failed", "error", "cancelled", "stopped", "stuck", "pending"):
         assert '"%s"' % st in body, "status %r is not excluded from the live branch" % st
 
@@ -119,7 +128,7 @@ def test_the_follow_up_names_the_conversation_by_goal_text():
     goal text. The Title is truncated for display, so using it would look right and resolve to
     nothing -- and a follow-up that silently starts a fresh conversation answers plausibly."""
     code = _code()
-    body = _block(code, "void SendToFleetConversation(")
+    body = _block(code, "FleetSend DecideFleetSend(")
     assert 'g["follow_up_to"] = goal' in body
     assert "c.Goal" in body and "c.Title" not in body, (
         "the follow-up is addressed by the display title rather than the goal text")
@@ -128,8 +137,8 @@ def test_the_follow_up_names_the_conversation_by_goal_text():
 def test_a_conversation_with_no_recorded_goal_says_so_instead_of_guessing():
     """Every transcript written before the identity fix has no goal-resolvable conversation.
     Those must be refused out loud, not turned into a fresh chat wearing a follow-up's words."""
-    body = _block(_code(), "void SendToFleetConversation(")
-    assert 'T("fleet_no_goal")' in body
+    body = _block(_code(), "FleetSend DecideFleetSend(")
+    assert 'r.RefusalKey = "fleet_no_goal"' in body
     assert "goal.Length == 0" in body
 
 
@@ -179,10 +188,11 @@ def test_the_ref_is_not_called_a_url():
     """A sess: reference is not navigable. /switch would try to open it as a page, which is how
     a resume silently becomes a fresh chat."""
     code = _code()
-    body = _block(code, "void SendText(")
-    fleet = body.index('target.Source == "fleet"')
-    switch = body.index("/switch?url=")
-    assert fleet < switch
+    body = _block(code, "string DecideDoor(")
+    fleet = body.index("return DOOR_FLEET;")
+    guid = body.index("return DOOR_RESUME_GUID;")
+    switch = body.index("return DOOR_SWITCH;")
+    assert fleet < guid < switch, "a sess: reference can reach /switch"
 
 
 def test_the_new_strings_exist_in_both_languages():
