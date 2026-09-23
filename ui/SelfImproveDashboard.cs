@@ -164,7 +164,7 @@ class SelfImproveDashboardWindow : Window
               + "何も許可しないし、止めもしない。actor は自己申告で検証されていない。"
             : "Acts that changed what this system may become. The ledger is append-only and "
               + "chained; it authorises nothing and prevents nothing, and actor is self-reported.";
-        if (k == "auth_intact")   return ja ? "凍結セット照合" : "Frozen set";
+        if (k == "auth_intact")   return ja ? "自己改善の安全確認" : "Self-improvement check";
         if (k == "auth_ok")       return ja ? "一致" : "matches";
         if (k == "auth_broken")   return ja ? "不一致" : "differs";
         if (k == "auth_anchor")   return ja ? "アンカー" : "Anchor";
@@ -181,28 +181,28 @@ class SelfImproveDashboardWindow : Window
         if (k == "auth_revoke")   return ja ? "直前の再署名を取り消す" : "Revoke the last re-signing";
         if (k == "auth_revoke_q") return ja
             ? "直前の再署名を取り消します。\n\n戻すのは【承認】であって【コード】ではありません。"
-              + "ファイルは変わったままなので、直後に凍結セットは不一致になり、走行は止まります。"
+              + "ファイルは変わったままなので、直後に自己改善の安全確認は不一致になり、走行は止まります。"
               + "それが狙いです。\n\n戻り先: "
             : "Withdraw the last re-signing.\n\nThis undoes the APPROVAL, not the code. The files "
-              + "stay as they are, so the frozen set will differ immediately afterwards and runs "
-              + "will stop. That is the intent.\n\nRestoring: ";
+              + "stay as they are, so the self-improvement check will show a mismatch immediately "
+              + "afterwards and runs will stop. That is the intent.\n\nRestoring: ";
         if (k == "auth_revoke_t") return ja ? "最終確認" : "Final confirmation";
         if (k == "auth_revoke_ok") return ja
-            ? "取り消しました。凍結セットが不一致になっているのは正常です。"
-            : "Revoked. The frozen set differing now is the expected state.";
+            ? "取り消しました。自己改善の安全確認が不一致になっているのは正常です。"
+            : "Revoked. The self-improvement check showing a mismatch now is the expected state.";
         if (k == "auth_revoke_no") return ja ? "取り消せませんでした" : "Could not revoke";
         if (k == "auth_nothing")  return ja ? "取り消せる再署名がありません" : "No re-signing to withdraw";
         // THE ACT, not a command to go and run elsewhere. See BuildAuthority.
         if (k == "auth_resign")   return ja ? "ここで再署名する" : "Re-sign here";
-        if (k == "auth_resign_t") return ja ? "凍結セットを今の内容で承認する"
-                                            : "Approve the frozen set as it now stands";
+        if (k == "auth_resign_t") return ja ? "自己改善の安全確認を今の内容で承認する"
+                                            : "Approve the self-improvement check as it now stands";
         if (k == "auth_resign_why") return ja
-            ? "凍結セットが不一致の間、自己改善ループは走れません。今の内容でよければ"
+            ? "自己改善の安全確認が不一致の間、自己改善ループは走れません。今の内容でよければ"
               + "ここで再署名できます。あなたが書いた文がそのまま台帳に残ります。"
               + "取り消しは下の「記録と取り消し」から。"
-            : "While the frozen set differs the self-improvement loop cannot run. If the "
-              + "files are right as they stand, re-sign here; what you write is kept in the "
-              + "ledger word for word. The undo is under Records and undo, below.";
+            : "While the self-improvement check shows a mismatch, the self-improvement loop "
+              + "cannot run. If the files are right as they stand, re-sign here; what you write "
+              + "is kept in the ledger word for word. The undo is under Records and undo, below.";
         if (k == "auth_r1")       return ja
             ? "この変更は意図したもの。今の内容で承認する。"
             : "This change was intended. Approve the set as it stands.";
@@ -293,8 +293,8 @@ class SelfImproveDashboardWindow : Window
         if (k == "pending_copied") return ja ? "コピーしました" : "Copied";
         // The two outcomes of an approval that DOES something, rather than only records it.
         if (k == "pd_resign_done")   return ja
-            ? "再署名しました。凍結セットは新しい内容で承認され、自己改善ループは再び走れます。"
-            : "Re-signed. The frozen set is approved as it now stands and the loop can run again.";
+            ? "再署名しました。自己改善の安全確認は新しい内容で承認され、自己改善ループは再び走れます。"
+            : "Re-signed. The self-improvement check is approved as it now stands and the loop can run again.";
         if (k == "pd_resign_failed") return ja
             ? "承認は記録しましたが、再署名は実行されませんでした。理由は下記のとおりです。"
             : "The approval was recorded, but the re-signing did not run. The reason follows.";
@@ -992,6 +992,65 @@ class SelfImproveDashboardWindow : Window
         }
         catch (Exception) { differing.Add("UNREADABLE"); }
         return differing.Count == 0;
+    }
+
+    // Whether self-improvement has ever been engaged with on THIS machine, independent of
+    // whether the checksums above currently match. Used by the cockpit's health strip to
+    // decide whether the "self-improvement check" dot belongs on screen at all.
+    //
+    // WHY THE ANCHOR AND NOT THE BASELINE. frozen_baseline.json (read above) is tracked in
+    // git, so it exists on every checkout, including a machine where nobody has ever run the
+    // self-improvement loop -- that is what made the dot always-on and always red there,
+    // reporting a fact nobody on that machine could act on. The anchor at AnchorPath()
+    // (~/.selfimprove_frozen_anchor) is different: it lives outside the repo, in the
+    // operator's own profile, and is written only by frozen.py's snapshot/re-sign path --
+    // by hand from the dashboard, or by the loop's own re-sign cycle once it has actually
+    // run. frozen.py's own anchor_state() already treats its absence as unavoidable and
+    // expected on a fresh clone; this reuses that same fact rather than inventing a second
+    // one.
+    internal static bool SelfImproveInUse()
+    {
+        try { return File.Exists(AnchorPath()); }
+        catch (Exception) { return false; }
+    }
+
+    // Pure decision for the health strip's 7th dot -- no file I/O, no WPF. Given the facts
+    // that FleetCockpit's poll loop already computed (SelfImproveInUse(), FrozenMatches()'s
+    // ok/drift), this is the ENTIRE policy: hidden and Gray when self-improvement has never
+    // been engaged with here; Green only on a positive match; NO_BASELINE (evidence expected
+    // and absent) is Red, never Gray, whenever the feature IS in use; anything else that
+    // differs is Yellow. Extracted so a test can drive the policy directly with synthetic
+    // inputs -- inUse/ok/drift -- instead of staging real baseline/anchor files on disk, and
+    // so FleetCockpit.cs's dot-coloring and the dashboard never implement this twice.
+    internal static class FrozenGate
+    {
+        internal const string Hidden = "hidden";
+        internal const string Gray = "gray";
+        internal const string Green = "green";
+        internal const string Yellow = "yellow";
+        internal const string Red = "red";
+
+        internal struct Result
+        {
+            public bool Visible;
+            public string Color;
+            public string DetailKey;   // localization key (T(...) in FleetCockpit.cs)
+        }
+
+        internal static Result Decide(bool inUse, bool ok, List<string> drift)
+        {
+            if (!inUse)
+                return new Result { Visible = false, Color = Gray, DetailKey = "hs_frozen_not_in_use" };
+            if (ok)
+                return new Result { Visible = true, Color = Green, DetailKey = "hs_frozen_ok" };
+            if (drift != null && drift.Count == 1 && drift[0] == "NO_BASELINE")
+                // NOT GRAY, even though inUse is what usually pairs with Gray's absence-branch
+                // above: a machine that IS in use and has no baseline is evidence that was
+                // expected and is missing, which this project's rule (see FleetCockpit.cs,
+                // "grey means there is no evidence and none is expected") reserves for Red.
+                return new Result { Visible = true, Color = Red, DetailKey = "hs_frozen_none" };
+            return new Result { Visible = true, Color = Yellow, DetailKey = "hs_frozen_drift" };
+        }
     }
 
     UIElement BuildAuthority()

@@ -1148,6 +1148,13 @@ class CockpitWindow : Window
     volatile bool _startAllLaunched = false;   // reentry guard for RunStartAll (per-cooldown, not per-app-run only)
     double _startAllLastUnix = 0.0;            // NowUnix() at last RunStartAll launch; 120s cooldown
     bool _startupHealCheckDone = false;        // set after the first PollHealthOnce's auto-heal decision runs once
+    // Whether the 7th health dot ("self-improvement check") belongs on screen at all. False
+    // on any machine that has never engaged with self-improvement (SelfImproveDashboardWindow.
+    // SelfImproveInUse() -- the per-user anchor file, not the git-tracked baseline). Read by
+    // both BuildHealthStrip (first paint, before any poll has run) and ApplyHealthToUi (kept
+    // current every ~15s sweep, in case the anchor appears or disappears mid-session). A bool
+    // read/write is atomic in .NET, so `volatile` is enough without pulling in _healthLock.
+    volatile bool _frozenApplicable = false;
 
     public CockpitWindow(string path)
     {
@@ -1596,18 +1603,28 @@ class CockpitWindow : Window
         // ── 6th health dot "Tool": bridge self-probe (.fleet/tool_probe.json), see the class-field
         // comment near HEALTH_DOT_COUNT for what this axis covers and why it's separate from Agent.
         if (k == "hs_tool") return ja ? "ツール" : "Tool";
-        if (k == "hs_frozen") return ja ? "凍結セット" : "Frozen set";
+        // Plain-language label/tooltips: this used to say "凍結セット" ("frozen set"), a term
+        // that means nothing outside this codebase. The tool has to be usable by anyone in the
+        // company, not just the engineer who named the internal mechanism.
+        if (k == "hs_frozen") return ja ? "自己改善の安全確認" : "Self-improvement check";
         if (k == "hs_frozen_ok") return ja
-            ? "判定器は承認済みの内容と一致しています。自己改善ループは走れます。"
-            : "The judge matches what was approved. The self-improvement loop can run.";
+            ? "自己改善が使う判定ファイルは、承認した内容から変わっていません。自己改善ループは動作できます。"
+            : "The files self-improvement uses to judge its own work still match what was approved. The self-improvement loop can run.";
         if (k == "hs_frozen_drift") return ja
-            ? "凍結セットが承認済みの内容と違います。自己改善ループは走りません。クリックで自己改善ダッシュボードを開き、そこで再署名できます: "
-            : "The frozen set differs from what was approved, so the self-improvement loop will not run. Click to open the dashboard and re-sign there: ";
+            ? "自己改善が使う判定ファイルが、承認した内容から変わっています。自己改善ループは止まっています。クリックで自己改善ダッシュボードを開き、そこで承認し直せます: "
+            : "The files self-improvement uses to judge its own work have changed since they were approved, so the self-improvement loop is stopped. Click to open the self-improvement dashboard and approve the new content there: ";
         if (k == "hs_frozen_none") return ja
-            ? "基準ファイルがありません。照合できていないので、一致しているとは言えません。"
-            : "No baseline on disk. Nothing has been compared, so nothing can be called intact.";
+            ? "自己改善が使う判定ファイルの承認記録がまだありません。比較できていないので、安全とは言えません。"
+            : "There is no approval record yet for the files self-improvement uses to judge its own work, so nothing has been verified safe.";
         if (k == "hs_frozen_hint") return ja ? "クリックで自己改善ダッシュボードを開く"
                                              : "Click to open the self-improvement dashboard";
+        // Shown (well, not shown -- the dot is hidden) when self-improvement has never been
+        // engaged with on this machine. Kept as a Detail string anyway: it still lands in the
+        // .fleet/health_strip.json export the command line reads, so that reader isn't left
+        // looking at an empty detail for a dot the GUI dropped.
+        if (k == "hs_frozen_not_in_use") return ja
+            ? "この端末では自己改善が使われていないため、対象外です。"
+            : "Not applicable: self-improvement has not been used on this machine.";
         if (k == "hs_tool_detail_ok") return ja ? "ツール呼び出し確認 OK" : "tool call confirmed OK";
         if (k == "hs_tool_detail_consent") return ja ? "consent待ち（再接続で解消可）" : "consent pending (reconnect can clear this)";
         if (k == "hs_tool_detail_down") return ja ? "応答なし(再接続が必要)" : "no response (reconnect needed)";
@@ -2330,6 +2347,13 @@ class CockpitWindow : Window
         return Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
     }
 
+    // Never let a probe of the operator's profile take the health strip down with it.
+    static bool SafeSelfImproveInUse()
+    {
+        try { return SelfImproveDashboardWindow.SelfImproveInUse(); }
+        catch (Exception) { return false; }
+    }
+
     // Build the health strip: 5 dots with labels + an INLINE Fix pill + an inline note, all on ONE
     // horizontal row. Redesign: left-aligned & vertically centered (it sits at the left edge of the
     // header where the title used to be). The Fix pill appears immediately to the RIGHT of the 5th
@@ -2348,6 +2372,12 @@ class CockpitWindow : Window
         _healthStrip.HorizontalAlignment = HorizontalAlignment.Left;   // flush to the header's left edge
         _healthStrip.VerticalAlignment = VerticalAlignment.Center;
         _healthStrip.Margin = new Thickness(0, 0, 12, 0);
+
+        // Computed synchronously (a single File.Exists, no network) so the very first paint
+        // already reflects reality -- if this waited for the first poll sweep, the dot would
+        // flash into existence on every machine before disappearing on the ones where
+        // self-improvement is not in use. ApplyHealthToUi refreshes it every sweep after this.
+        _frozenApplicable = SafeSelfImproveInUse();
 
         // Single horizontal row: [dot label] x6, then the inline Fix pill, then the inline note.
         var row = new StackPanel { Orientation = Orientation.Horizontal,
@@ -2390,6 +2420,12 @@ class CockpitWindow : Window
                 {
                     try { new SelfImproveDashboardWindow().Show(); } catch (Exception) { }
                 };
+                // HIDE THE COLUMN, NOT A GRAY DOT. On a machine that has never engaged with
+                // self-improvement this dot named a problem nobody there could act on -- a
+                // standing red light with no door behind it. Collapsed (not just an empty
+                // color) removes it from the row entirely, so nothing left behind reads as
+                // "unknown" or "broken" for a feature that was simply never turned on here.
+                if (!_frozenApplicable) wrap.Visibility = Visibility.Collapsed;
             }
             row.Children.Add(wrap);
         }
@@ -2504,6 +2540,17 @@ class CockpitWindow : Window
                 snap[i] = new DotState { State = _health[i].State, Detail = _health[i].Detail, Checked = _health[i].Checked };
         for (int i = 0; i < HEALTH_DOT_COUNT; i++)
         {
+            // HIDE THE COLUMN, NOT A GRAY DOT (mirrors the guard in BuildHealthStrip). Kept
+            // in sync every sweep because SafeSelfImproveInUse() is re-read in PollHealthOnce,
+            // so the anchor appearing mid-session (dashboard "re-sign here") reveals the dot
+            // without waiting for a chrome rebuild, and it disappearing again hides it just
+            // as promptly.
+            if (_healthKeys[i] == "hs_frozen")
+            {
+                if (_healthDotWrap[i] != null)
+                    _healthDotWrap[i].Visibility = _frozenApplicable ? Visibility.Visible : Visibility.Collapsed;
+                if (!_frozenApplicable) continue;   // no dot/spin/tooltip work for a hidden column
+            }
             bool checking = snap[i].State == HealthState.Checking || (_fixRunning && (_fixTargetMask & (1 << i)) != 0);
             if (_healthDot[i] != null)
             {
@@ -2843,23 +2890,35 @@ class CockpitWindow : Window
         //    and a colour that is on in the normal working state teaches its reader to clear
         //    it. This one is amber only while an approval is genuinely owed: the loop re-signs
         //    as part of its own cycle, so a matching set IS the resting state.
-        try
+        // Re-checked every sweep (not just at BuildHealthStrip): the anchor can appear mid-
+        // session -- the dashboard's own "re-sign here" button writes it -- and a dot that
+        // only ever learns "not in use" at startup would stay hidden on the machine that just
+        // turned the feature on until the window was rebuilt.
+        _frozenApplicable = SafeSelfImproveInUse();
+        int nFrozen = 0; List<string> drift = new List<string>(); bool ok = false;
+        if (_frozenApplicable)
         {
-            int nFrozen; List<string> drift; bool anchorOk;
-            bool ok = SelfImproveDashboardWindow.FrozenMatches(out nFrozen, out drift,
-                                                               out anchorOk);
-            if (ok)
-                SetDot(6, HealthState.Green, T("hs_frozen_ok") + " (" + nFrozen + ")", now);
-            else if (drift.Count == 1 && drift[0] == "NO_BASELINE")
-                // NOT GREY. Grey means "no evidence expected", and a missing baseline is
-                // evidence that is expected and absent -- the failure mode where a check
-                // reports intact because it compared nothing.
-                SetDot(6, HealthState.Red, T("hs_frozen_none"), now);
-            else
-                SetDot(6, HealthState.Yellow,
-                       T("hs_frozen_drift") + string.Join(", ", drift.ToArray()), now);
+            try
+            {
+                bool anchorOk;
+                ok = SelfImproveDashboardWindow.FrozenMatches(out nFrozen, out drift, out anchorOk);
+            }
+            catch (Exception) { ok = false; drift = new List<string> { "UNREADABLE" }; }
         }
-        catch (Exception) { SetDot(6, HealthState.Gray, T("hs_frozen_none"), now); }
+        // THE DECISION ITSELF LIVES IN SelfImproveDashboardWindow.FrozenGate.Decide -- a pure
+        // function of (inUse, ok, drift), so a test can drive the policy directly (hidden when
+        // unused; never green without a positive match; NO_BASELINE reads Red, not Gray,
+        // whenever the feature IS in use) without staging real files on disk, and so this file
+        // and the dashboard can never implement the policy two different, disagreeing ways.
+        var fg = SelfImproveDashboardWindow.FrozenGate.Decide(_frozenApplicable, ok, drift);
+        HealthState fst = fg.Color == SelfImproveDashboardWindow.FrozenGate.Green ? HealthState.Green
+                         : fg.Color == SelfImproveDashboardWindow.FrozenGate.Yellow ? HealthState.Yellow
+                         : fg.Color == SelfImproveDashboardWindow.FrozenGate.Red ? HealthState.Red
+                         : HealthState.Gray;
+        string fdetail = fg.DetailKey == "hs_frozen_ok" ? T("hs_frozen_ok") + " (" + nFrozen + ")"
+                        : fg.DetailKey == "hs_frozen_drift" ? T("hs_frozen_drift") + string.Join(", ", drift.ToArray())
+                        : T(fg.DetailKey);
+        SetDot(6, fst, fdetail, now);
 
         MaybeAutoFix();
         PublishHealthStrip();
