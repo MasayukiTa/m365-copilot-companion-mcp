@@ -78,8 +78,8 @@ def active_manifest(refresh: bool = False) -> dict:
         return _cache
 
 
-def active_harness_id() -> str:
-    return M.harness_id(active_manifest())
+def active_harness_id(refresh: bool = False) -> str:
+    return M.harness_id(active_manifest(refresh=refresh))
 
 
 def parameter(name: str, default=None):

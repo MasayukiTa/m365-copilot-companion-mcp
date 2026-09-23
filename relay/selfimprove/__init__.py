@@ -41,7 +41,6 @@ from .propose import (
 from .l2 import (
     run_iteration,
     SpendCeiling,
-    run_until,
 )
 from .policy import (
     DatasetRotation,
@@ -49,9 +48,9 @@ from .policy import (
     evaluate_tripwires,
     run_campaign,
 )
-# NOTE: diversify / diversity_report are intentionally NOT re-exported here. Exporting a `diversify`
-# function would SHADOW the `relay.selfimprove.diversify` submodule (a name collision that already
-# caused a real bug). Import them by full path: `from relay.selfimprove.diversify import diversify`.
+# NOTE: diversify is intentionally NOT re-exported here. Exporting a `diversify` function would
+# SHADOW the `relay.selfimprove.diversify` submodule (a name collision that already caused a real
+# bug). Import it by full path: `from relay.selfimprove.diversify import diversify`.
 from .l2_cron import run_once, cron_command, IterationLock
 from .status import status_text
 from .targeting import (
@@ -104,7 +103,6 @@ __all__ = [
     "mutation_generator",
     "run_iteration",
     "SpendCeiling",
-    "run_until",
     "DatasetRotation",
     "plateaued",
     "evaluate_tripwires",

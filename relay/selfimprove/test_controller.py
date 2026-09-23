@@ -11,6 +11,7 @@ import tempfile
 import pytest
 
 from relay import provenance as PROV
+from relay.selfimprove import apply as APPLY
 from relay.selfimprove import decision as D
 from relay.selfimprove import frozen as F
 from relay.selfimprove import manifest as M
@@ -90,6 +91,27 @@ def test_activation_writes_the_manifest_rather_than_the_intent_to(tmp_path, monk
     monkeypatch.setenv(RC.OVERRIDE_ENV, path)
     RC.active_manifest(refresh=True)
     assert RC.memory_max_items() == 9
+
+
+def test_activation_also_applies_the_genomes_card_overrides(tmp_path, monkeypatch):
+    """マニフェストが持てるのは components/parameters だけ。genome の cards 上書きは
+    quality_cards.py が apply.active_genome() 経由で既に読みに行っている
+    (relay/selfimprove/apply.py の docstring, "DONE 2026-08-20") のに、有効化の書き手が
+    無ければそこには常に base genome しか無い。マニフェストと同じ回の有効化で書かれる
+    ことを確認する。"""
+    manifest_path = str(tmp_path / "active.json")
+    genome_store = str(tmp_path / "active_genome.json")
+    monkeypatch.setattr(RC, "ACTIVE_PATH", manifest_path)
+    monkeypatch.setattr(APPLY, "DEFAULT_STORE", genome_store)
+    ctl = _controller(activate=True)
+    genome = {"parameters": {"memory_max_items": 9},
+              "cards": {"c1": "prefer smaller diffs"}, "parent_id": None, "note": "g1"}
+    out = _run(ctl, _all_gates_pass(), genome=genome)
+    assert out["activated"] is True
+    assert os.path.isfile(genome_store), "有効化したのに genome ストアへ書いていない"
+    assert APPLY.active_genome(genome_store) == genome
+    # quality_cards.py reads exactly this shape back through apply.active_genome().
+    assert APPLY.active_genome(genome_store).get("cards") == {"c1": "prefer smaller diffs"}
 
 
 # ---- the ways a caller could skip a gate --------------------------------------------------

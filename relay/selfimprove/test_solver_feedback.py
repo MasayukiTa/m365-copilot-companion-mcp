@@ -73,41 +73,31 @@ def _entry(eid, **fields):
     return F.collect(eid, json.dumps(fields))
 
 
-def test_an_item_is_counted_once_per_episode_not_once_per_mention():
-    """同じソルバが繰り返しても観測は1件。生の言及数で数えると、
-    饒舌な1回が静かな5回に勝ってしまう。"""
-    entries = [_entry("e1", tool_friction=["slow reads", "slow reads", "slow reads"]),
-               _entry("e2", tool_friction=["slow reads"])]
-    got = F.tally(entries)
-    rows = got["fields"]["tool_friction"]
-    assert rows[0]["item"] == "slow reads"
-    assert rows[0]["episodes"] == 2, "言及数ではなくエピソード数で数える"
-    assert rows[0]["where"] == ["e1", "e2"]
+def _tallied(**fields):
+    """The `tally()`-shaped {"fields": {...}} dict `to_hypotheses` consumes, built directly.
 
-
-def test_every_item_carries_the_episode_it_came_from():
-    """エピソードに紐づかない項目は、実際に何が起きたかと突き合わせられない。
-    検証できないフィードバックを事実として扱うのが、この節が警告している失敗。"""
-    got = F.tally([_entry("ep_alpha", missing_information=["no schema"])])
-    assert got["fields"]["missing_information"][0]["where"] == ["ep_alpha"]
-
-
-def test_unreadable_replies_are_counted_not_hidden():
-    got = F.tally([_entry("e1", tool_friction=["x"]), F.collect("e2", "not json at all")])
-    assert got["episodes"] == 2 and got["parse_errors"] == 1
+    `tally()` itself was DELETED (relay/selfimprove/solver_feedback.py) -- its only
+    production-shaped input producer, bench/companionbench/runner.py::solver_feedback_entries,
+    is itself unreached, and nothing downstream ever called tally()/where_distribution()
+    outside this test module. `to_hypotheses` is not itself being deleted here, so its tests
+    build the input shape it actually consumes rather than losing coverage.
+    """
+    return {"fields": fields}
 
 
 # ---- and it must not become a decision ----------------------------------------------------
 
 def test_a_single_complaint_does_not_become_a_hypothesis():
     """1件は逸話。逸話を所見に見せかけないことが、このモジュールの仕事の半分。"""
-    got = F.to_hypotheses(F.tally([_entry("e1", tool_friction=["annoying"])]))
+    tallied = _tallied(tool_friction=[{"item": "annoying", "episodes": 1, "where": ["e1"]}])
+    got = F.to_hypotheses(tallied)
     assert got == []
 
 
 def test_a_recurring_complaint_becomes_something_to_TEST():
-    entries = [_entry("e%d" % i, tool_friction=["read_file pages awkwardly"]) for i in range(3)]
-    got = F.to_hypotheses(F.tally(entries))
+    tallied = _tallied(tool_friction=[{"item": "read_file pages awkwardly", "episodes": 3,
+                                       "where": ["e0", "e1", "e2"]}])
+    got = F.to_hypotheses(tallied)
     assert len(got) == 1
     h = got[0]
     assert h["raised_by"] == 3
@@ -119,16 +109,16 @@ def test_a_recurring_complaint_becomes_something_to_TEST():
 def test_a_hypothesis_does_not_come_with_a_genome():
     """どのつまみが不満に応えるかは、このモジュールには分からない。
     ここで当て推量で1つ選ぶのは、報告の中に決定を紛れ込ませること。"""
-    entries = [_entry("e%d" % i, missing_tool_capability=["no way to diff two sheets"])
-               for i in range(2)]
-    assert F.to_hypotheses(F.tally(entries))[0]["genome"] is None
+    tallied = _tallied(missing_tool_capability=[{"item": "no way to diff two sheets",
+                                                  "episodes": 2, "where": ["e0", "e1"]}])
+    assert F.to_hypotheses(tallied)[0]["genome"] is None
 
 
 def test_nothing_here_returns_a_verdict_a_gate_could_read():
     """ソルバの言い分が受理判定に触れた瞬間、もっともらしい自己弁護が承認になる。"""
-    entries = [_entry("e%d" % i, tool_friction=["x"]) for i in range(5)]
-    tallied = F.tally(entries)
-    blob = json.dumps({"tally": tallied, "hypotheses": F.to_hypotheses(tallied)})
+    tallied = _tallied(tool_friction=[{"item": "x", "episodes": 5,
+                                       "where": ["e0", "e1", "e2", "e3", "e4"]}])
+    blob = json.dumps({"hypotheses": F.to_hypotheses(tallied)})
     for word in ("keep", "reject", "verdict", "accept", "p_value", "significant"):
         assert word not in blob.lower(), "受理判定に読める語 %r が出力に含まれている" % word
 
@@ -172,19 +162,6 @@ def test_a_useful_memory_is_also_an_attribution():
     """軸は『どこが悪かったか』ではなく『どこが効いたか』。
     エピソードを支えている memory は、誤らせている memory と同じくらいその軸の事実。"""
     assert F.where(_entry("e1", memory_useful=["the prior schema note"])) == "memory"
-
-
-def test_the_distribution_shows_how_much_is_unattributed():
-    """帰属できた数件を『ハーネスの地図』として読む前に、
-    大半が unattributed なら軸がまだ情報を運んでいないことを読者は知る必要がある。"""
-    entries = [_entry("e1", memory_harmful=["x"]),
-               _entry("e2"),
-               _entry("e3", memory_harmful=["x"], tool_friction=["y"])]
-    got = F.where_distribution(entries)
-    assert got["counts"]["memory"] == 1
-    assert got["counts"][F.UNATTRIBUTED] == 2
-    assert got["attributed"] == 1 and got["total"] == 3
-    assert got["attribution_rate"] == round(1 / 3, 4)
 
 
 def test_free_text_is_never_guessed_into_a_component():

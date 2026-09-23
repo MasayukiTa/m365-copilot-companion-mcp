@@ -147,6 +147,47 @@ def _burned_ledger(burned_path) -> dict:
     return {"total": len(recs), "by_reason": by_reason, "recent": recent}
 
 
+def _authority_ledger_section(path=None) -> dict:
+    """{'total', 'recent'(last<=20)} from the authority ledger, with a translated summary
+    beside each raw `reason`. Read-only.
+
+    THE MISSING SECTION record_summary.py was built for. The rebless/revoke/genome_apply/
+    genome_revert/branch_create/branch_delete stream (relay/selfimprove/authority_ledger.py)
+    had no browsable history here at all -- not even untranslated -- so a raw `reason` an
+    agent typed in whatever language it happened to be working in never reached this screen,
+    and record_summary.summary_for() had nothing to be called for (its own module's whole
+    purpose statement: "toggling the interface to English left those lines in Japanese,
+    because they are not interface text -- they are the record").
+
+    The record itself is never touched, per record_summary.py's own rule ("THE RECORD IS
+    NEVER REWRITTEN"): this keeps the raw `reason` and adds the cached ja/en summary beside
+    it. A record with no cache entry yet shows "" for both languages and the raw reason is
+    what a reader falls back to -- the same degrade-to-raw behaviour record_summary.py
+    documents for every other consumer.
+    """
+    from relay.selfimprove import authority_ledger as AL
+    from relay.selfimprove import record_summary as RS
+    try:
+        rows = AL.read(path)
+    except Exception:
+        return {"total": 0, "recent": []}
+    # The genesis row is bookkeeping (the chain's anchor), not an act anyone performed --
+    # counting or showing it would put a record with no actor and no reason on a screen that
+    # exists to answer "who changed what, and why".
+    acts = [r for r in rows if r.get("event") != AL.GENESIS]
+    cache = RS.load()
+    recent = []
+    for r in acts[-20:]:
+        recent.append({
+            "seq": r.get("seq"),
+            "event": r.get("event"),
+            "actor_claimed": r.get("actor_claimed"),
+            "reason": r.get("reason"),
+            "summary": {lang: RS.summary_for(r, lang, cache) for lang in RS.LANGS},
+        })
+    return {"total": len(acts), "recent": recent}
+
+
 def _archive_sections(archive_path):
     """Load the Archive (read-only) and return (pass1_trend, archive_section).
 
@@ -349,7 +390,7 @@ def _pending_section() -> list:
 
 
 def dashboard_state(*, archive_path=None, burned_path=None, grade_results_path=None,
-                    reports_glob=None) -> dict:
+                    reports_glob=None, authority_ledger_path=None) -> dict:
     """Aggregate the self-improvement ledgers into one JSON-safe ``dashboard_state`` dict.
 
     READ-ONLY: opens each ledger for reading only -- it never writes to or locks any of them (a live
@@ -357,13 +398,15 @@ def dashboard_state(*, archive_path=None, burned_path=None, grade_results_path=N
     empty file produces an empty/zero section instead of raising.
 
     Args (all optional; None -> the repo-root default for that ledger):
-      archive_path        relay/selfimprove/archive/entries.jsonl
-      burned_path         relay/selfimprove/burned.jsonl
-      grade_results_path  .fleet/swe/grade_results.jsonl
-      reports_glob        .fleet/swe/selfimprove_report_*.json
+      archive_path           relay/selfimprove/archive/entries.jsonl
+      burned_path             relay/selfimprove/burned.jsonl
+      grade_results_path      .fleet/swe/grade_results.jsonl
+      reports_glob             .fleet/swe/selfimprove_report_*.json
+      authority_ledger_path    ~/.selfimprove_ledger.jsonl (or $MCP_SELFIMPROVE_LEDGER);
+                               resolved by authority_ledger.py itself when left None
 
     Top-level sections: summary, pending_decisions, ab_history, pass1_trend,
-    burned_ledger, archive.
+    burned_ledger, archive, authority_ledger.
     """
     archive_path = _DEFAULT_ARCHIVE if archive_path is None else archive_path
     burned_path = _DEFAULT_BURNED if burned_path is None else burned_path
@@ -373,6 +416,7 @@ def dashboard_state(*, archive_path=None, burned_path=None, grade_results_path=N
     ab_history = _ab_history(reports_glob)
     burned_ledger = _burned_ledger(burned_path)
     pass1_trend, archive_section = _archive_sections(archive_path)
+    authority_ledger_section = _authority_ledger_section(authority_ledger_path)
 
     # grade_results is read so missing-ness is exercised and the section is available to consumers;
     # the headline numbers come from the structured trend/history, but we surface its size cheaply.
@@ -471,6 +515,7 @@ def dashboard_state(*, archive_path=None, burned_path=None, grade_results_path=N
         "pass1_trend": pass1_trend,
         "burned_ledger": burned_ledger,
         "archive": archive_section,
+        "authority_ledger": authority_ledger_section,
     }
 
 

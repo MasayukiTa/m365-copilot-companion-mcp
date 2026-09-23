@@ -508,7 +508,12 @@ worse than no filter, because the result reads as thorough** — the same shape 
 `fleet_toolset` scan that answered `['main.py']` off a comment, one section above, on the same
 day.
 
-### Triaged, not wired: `bench/remote/broker_client.py::ping`
+### `bench/remote/broker_client.py::ping` — WIRED 2026-09-24
+
+**Stale as of the C-1 close-out below: this row left the inventory.** The heading and the
+analysis under it are kept as the record of why it sat unwired for as long as it did;
+`routing_switch.broker()` now calls it (verdict table: "C-1 closed out", 2026-09-24). See that
+section for the one-line reason.
 
 The liveness verb exists on **both** ends of the protocol — `broker.sh` answers it with
 `{"ok":true,"pong":true,...}` and `broker_parse.VERBS` lists it — and no client asks it.
@@ -599,11 +604,11 @@ sixteen: no.
 | `bench/skill_probe.py::compare` | 51 | `compare` in several |
 | `bench/companionbench/shadow_rules.py::compare` | 41 | the same `compare` |
 | `relay/selfimprove/planner_evaluator.py::preflight` | 39 | `preflight` also names a script |
-| `relay/outcomes.py::tally` | 35 | `tally` in three modules — `pro_ledger_report`'s is the live one |
-| `relay/selfimprove/solver_feedback.py::tally` | 27 | the same `tally`; its consumer was never built |
+| `relay/outcomes.py::tally` | 35 | `tally` in three modules — `pro_ledger_report`'s is the live one. **Stale**: the C-1 close-out found the actual comparison is against `bench/pro_record_result`, not `pro_ledger_report`, and the two are not the same metric — see below |
+| `relay/selfimprove/solver_feedback.py::tally` | 27 | the same `tally`; its consumer was never built. **DELETED 2026-09-24** — left the inventory, see the C-1 close-out |
 | `relay/selfimprove/authority_ledger.py::verify` | 25 | `verify` is a common name |
 | `relay/selfimprove/decision.py::summarise` | 21 | `summarise` in eight modules |
-| `relay/selfimprove/apply.py::apply_genome` | 20 | shares with the manifest's validator |
+| `relay/selfimprove/apply.py::apply_genome` | 20 | shares with the manifest's validator. **WIRED 2026-09-24** (`controller._conclude`) — left the inventory, see the C-1 close-out |
 | `relay/quota_meter.py::prune` | 13 | `prune` in four modules |
 | `relay/turn_outcome.py::summarise` | 13 | `relay_fleet` calls only `classify` from this module |
 | `relay/acceptance_contract.py::intact` | 11 | `intact` in the companionbench episodes |
@@ -1080,3 +1085,152 @@ API" were two different facts about it**. The scan counts `ast.Name`/`ast.Attrib
 its own header that a name reached through "a table of handler strings" is invisible to it.
 `__all__` is such a table: the declaration that this was part of the package's surface never
 made anything call it, and nothing ever did.
+
+---
+
+## 2026-09-24: C-1 closed out
+
+The commander aggregated all 84 rows the scan reported before this pass (`scratchpad/
+c1_final_verdicts.md`) into a single verdict per row: WIRED or DELETED (leaves the inventory),
+D (deliberate — kept, unwired, on purpose, recorded here), FOLLOWS X (its only caller is X,
+itself on this list, recorded as deliberate), DISPATCH (reached by a path the scanner cannot
+see), or PENDING (new-PC work, left for the next phase with its current inventory entry
+unchanged). Sixteen rows were WIRED or DELETED and left `tools/
+test_nothing_new_is_built_without_a_caller.py`'s inventory the same day; every other row not
+marked PENDING below got a `REASONS` entry in that file pointing back at this section. `[F]`
+rows (frozen files, owner authorization previously pending) are now decided — none needed the
+owner after all — and are recorded as deliberate with their code unchanged.
+
+### The shared finding: the self-improvement loop has no driver
+
+Fourteen of the thirty-three `relay/selfimprove/` rows below (and two more outside that
+directory whose only reason to exist is feeding it) share one reason, stated once here rather
+than fourteen times: **`scripts/run_nightly_real.py` has never run.** No CI job, scheduler,
+`.bat` or cron invokes any entry point of the loop. Wiring any one of these functions means
+building the driver first; deleting one means retiring a designed, tested subsystem. Both are
+product decisions this burndown is not the place to make, so each stays listed as deliberate —
+kept, unwired, on purpose — with this paragraph as the reason every "D(loop)" row below points
+to.
+
+### The `outcomes.py::tally` finding: not the same metric as the grader
+
+`relay/outcomes.py::tally` looks like a duplicate of `bench/pro_record_result` and was carried
+in this file's own table (above) as if `pro_ledger_report`'s implementation were simply "the
+live one" and this one redundant. It is not a duplicate: `tally` scores the **fleet's claimed
+outcome** — what the worker itself reported — and `pro_record_result` scores **the grader's
+verdict** on the same attempt. A `MAXTURNS` instance the grader went on to resolve is a pass
+under `pro_record_result` and a fail under `tally`. Wiring `tally` in place of the grader's
+number, or deleting it as redundant, would each throw away a real distinction (what the fleet
+believed happened vs. what actually happened) rather than a duplicate computation. Kept
+deliberate; the row above (the "sixteen" table) is corrected to point here instead of at
+`pro_ledger_report`.
+
+### relay/selfimprove — the loop with no driver (33 rows)
+
+| function | verdict | reason |
+|---|---|---|
+| `propose.py::propose_candidates` | deliberate | loop has no driver |
+| `routing.py::held_out_advantage` | deliberate | loop has no driver ([F], now decided: no owner sign-off needed) |
+| `diversify.py::diversify` | deliberate (FOLLOWS) | only caller is `solve_policy.py::plan_solve`, itself deliberate |
+| `autonomy.py::raise_to` | deliberate | test-enforced never-call — `test_autonomy.py::test_raise_to_has_no_production_caller` fails the build if a caller appears |
+| `apply.py::safe_commit` | deliberate | loop has no driver |
+| `planner_evaluator.py::preflight` | deliberate | live preflight is `route_evaluator.preflight`; this belongs to the unused second instrument |
+| `calibration.py::recommend_effort` | deliberate (FOLLOWS) | only caller is `solve_policy.py::plan_solve`, itself deliberate |
+| `propose.py::mutation_generator` | deliberate (FOLLOWS) | only caller is `diversify.py::diversify`, itself deliberate |
+| `solver_feedback.py::to_hypotheses` | deliberate | loop has no driver; feeder `bench/companionbench/runner.py::solver_feedback_entries` is frozen and unwired |
+| `autonomy.py::require` | deliberate | ladder gate, no caller |
+| `episode_record.py::compact` | deliberate | loop has no driver |
+| `solver_feedback.py::tally` | **DELETED** | left the inventory 2026-09-24 |
+| `trace_to_eval.py::record_correction` | deliberate | loop has no driver |
+| `decision.py::summarise` | deliberate | the wiring point would be `scheduler.nightly()`, which is the self-improvement loop itself (no driver) ([F], now decided) |
+| `guards.py::classify_outcome` | deliberate (FOLLOWS) | only caller is `guards.py::partition_outcomes`, itself deliberate ([F], now decided) |
+| `apply.py::apply_genome` | **WIRED** | `controller._conclude` — left the inventory 2026-09-24 |
+| `compare.py::withdraw` | **WIRED** | `compare` module's `_cli` — left the inventory 2026-09-24 |
+| `diversify.py::diversity_report` | **DELETED** | left the inventory 2026-09-24 |
+| `harness_tree.py::justified` | deliberate | leaf of the per-task-class routing subsystem (`routing.route`/`classify`/`resolve`), part of the loop with no driver ([F], now decided) |
+| `solver_feedback.py::where_distribution` | **DELETED** | left the inventory 2026-09-24 |
+| `autonomy.py::lower_to` | deliberate | no mutable autonomy-level store exists or is planned; the scheduler passes `level="B"` as a literal |
+| `branches.py::materialize_to_file` | **WIRED** | `compare` module's `_cli` — left the inventory 2026-09-24 |
+| `harness_tree.py::branches` | deliberate | leaf of the per-task-class routing subsystem, part of the loop with no driver ([F], now decided) |
+| `l2.py::run_until` | **DELETED** | left the inventory 2026-09-24 |
+| `apply.py::revert` | **WIRED** | `apply`'s `main` CLI — left the inventory 2026-09-24 |
+| `record_summary.py::summary_for` | **WIRED** | `dashboard._authority_ledger_section` — left the inventory 2026-09-24 |
+| `guards.py::partition_outcomes` | deliberate | loop has no driver ([F], now decided) |
+| `harness_feedback.py::report` | deliberate | loop has no driver |
+| `coreset.py::summarise` | deliberate | loop has no driver |
+| `calibration.py::competence` | deliberate (FOLLOWS) | only caller is `calibration.py::recommend_effort`, itself deliberate |
+| `compare.py::transport_versions_differ` | deliberate | already settled in this document (see "A recurring shape" above) |
+| `guards.py::is_domain_general` | deliberate | a three-line redundant wrapper around `overfit_lint`, which every caller uses directly; delete it at the next re-sign of `guards.py`, not worth a frozen re-sign on its own ([F], now decided) |
+| `runtime_config.py::active_harness_id` | **WIRED** | `compare._active_harness_id` — left the inventory 2026-09-24 |
+
+### bench (11 rows)
+
+| function | verdict | reason |
+|---|---|---|
+| `remote/broker_client.py::ping` | **WIRED** | `routing_switch.broker` — left the inventory 2026-09-24 |
+| `companionbench/runner.py::solver_feedback_entries` | deliberate | frozen grader harness; its consumer (`solver_feedback.to_hypotheses`) feeds the loop, which has no driver ([F], now decided) |
+| `companionbench/baseline.py::why_they_flip` | deliberate | operator's manual analysis tool; output quoted in `results/README.md:83` |
+| `companionbench/baseline.py::repeat_suite` | deliberate | manual tool; `results/reliability_rested.txt` records a run |
+| `companionbench/shadow_rules.py::compare` | deliberate | one-off diagnostic; `results/README.md:159-166` |
+| `companionbench/shadow_rules.py::verdict` | deliberate (FOLLOWS) | only caller is `shadow_rules.py::compare`, itself deliberate |
+| `companionbench/shadow_rules.py::old_verdict` | deliberate (FOLLOWS) | only caller is `shadow_rules.py::compare`, itself deliberate |
+| `companionbench/shadow_rules.py::new_verdict` | deliberate (FOLLOWS) | only caller is `shadow_rules.py::compare`, itself deliberate |
+| `skill_use_log.py::compare_runs` | deliberate | settled `docs/unreached_burndown.md:1033` |
+| `skill_probe.py::compare` | deliberate | ran once; its own docstring quotes the 0.30/0.40/0.60 scores it produced |
+| `attempt_snapshots.py::transitions` | deliberate | inputs exist and it runs, but the only graded pair is a best-of-N sample experiment, not the retry policy it measures; nothing performs the join |
+
+### tools (14 rows)
+
+| function | verdict | reason |
+|---|---|---|
+| `coding_ops.py::survey_worktrees` | **WIRED** | registered as a `main.py` tool — left the inventory 2026-09-24 |
+| `coding_ops.py::worktree_add` | **WIRED** | left the inventory 2026-09-24 |
+| `coding_ops.py::worktree_remove` | **WIRED** | left the inventory 2026-09-24 |
+| `coding_ops.py::worktree_scope` | deliberate | a contextmanager; its two halves are the registered tools; in-process callers only |
+| `golden.py::run_trajectory` | dispatch | `tests/test_golden.py`, the CI regression harness that exists for it |
+| `env_portability.py::merge_for_new_machine` | PENDING | new-PC work, next phase |
+| `env_portability.py::parse_env` | PENDING | new-PC work, next phase |
+| `env_portability.py::classify` | PENDING | new-PC work, next phase |
+| `tool_probe.py::verify_probe_reply` | deliberate | settled in this document (see the "half-wired protocol" correction above) |
+| `tool_probe.py::classify_probe_reply` | deliberate | settled in this document, same section |
+| `tool_probe.py::next_probe_instruction` | deliberate | unbuilt second probe round; the design question is recorded in this document |
+| `judge_backend.py::sampling_judge_async` | deliberate | no registered MCP tool is async |
+| `judge_backend.py::ask_human_async` | deliberate | same; `KNOWN_EMPTY` in `tools/test_a_declared_field_is_a_written_field.py` |
+| `security.py::clear_presented_token` | deliberate | test-isolation twin of `set_presented_token`/`reset_presented_token` ([F], now decided) |
+
+### relay (other) / bridge / scripts (26 rows)
+
+| function | verdict | reason |
+|---|---|---|
+| `provenance.py::adjudicate` | deliberate | no second-authority evidence source exists to adjudicate between (see the hand-triage above) |
+| `provenance.py::outranks` | deliberate | same — no second-authority evidence source exists |
+| `provenance.py::resolved_value` | deliberate | same — no second-authority evidence source exists |
+| `bestofn_run.py::load_candidate_dir` | **WIRED** | `bench/swe_grade_batch.load_preds` — left the inventory 2026-09-24 |
+| `outcomes.py::tally` | deliberate | NOT the same metric as `bench/pro_record_result` — see "The `outcomes.py::tally` finding" above |
+| `scripts/stale_server_check.py::decide_post_update_action` | PENDING | new-PC work, next phase |
+| `scripts/stale_server_check.py::fleet_is_running` | PENDING | new-PC work, next phase |
+| `bridge/session_store.py::compact` | **WIRED** | `python -m bridge.session_store compact` — left the inventory 2026-09-24 |
+| `bridge/session_store.py::search_turns` | deliberate | no consumer; would be a cockpit history search, which is a product decision |
+| `review_resilience.py::looks_like_capability_failure` | deliberate | measured `db020aa`: 15/0 hits over 14,054 replies; pinned by `NOT_PRODUCIBLE_CAUSES` |
+| `review_resilience.py::looks_like_output_filter` | deliberate | same measurement, same pin |
+| `project_memory.py::list_themes` | deliberate | "for the cockpit and for tests" — the cockpit has no project-memory panel (see "Kept for X" above) |
+| `project_memory.py::authorities_in` | deliberate | loop has no driver |
+| `project_memory.py::entry_authority` | deliberate (FOLLOWS) | only caller is `project_memory.py::authorities_in`, itself deliberate |
+| `solve_policy.py::plan_and_explain` | deliberate | written for a cockpit or a log, and neither exists |
+| `solve_policy.py::plan_solve` | deliberate (FOLLOWS) | only caller is `solve_policy.py::plan_and_explain`, itself deliberate |
+| `solve_policy.py::finalize` | deliberate | bench callers import `decide` from `relay.bestofn_run` directly; the module is orphaned |
+| `lean_capture.py::capture_fn` | deliberate | page capture must run inside the frozen `socket_route.capture_via_tab` |
+| `lean_capture.py::enabled` | deliberate (FOLLOWS) | only caller is `lean_capture.py::capture_fn`, itself deliberate |
+| `relay_fleet.py::connector_proven` | deliberate | a coarse bool view of `connector_proof_source`, kept for its tests |
+| `fleet_toolset.py::unknown_tools` | deliberate | its designed consumer is the CI guard `test_every_catalogue_tool_has_been_decided_about` |
+| `turn_outcome.py::classify_turns` | deliberate | `turn_class` is recorded as MEASUREMENT, NOT CONTROL — `relay_fleet.py:4788-4791` |
+| `turn_outcome.py::summarise` | deliberate | same — MEASUREMENT, not CONTROL |
+| `turn_outcome.py::is_capacity_signal` | deliberate | `quota_meter.sustainable_workers` is only printed by its own CLI; no admission controller consults it |
+| `execution_profiles.py::validate_runtime` | deliberate | no caller ever builds a capabilities dict; an unbuilt feature |
+| `chathub.py::collect_text` | deliberate | kept; the earlier "no caller" reading was a grep artifact (see "The deletion that was nearly made on a filtered grep" above) |
+
+All rows above marked **WIRED** or **DELETED** left `tools/
+test_nothing_new_is_built_without_a_caller.py`'s inventory the same day the code change landed;
+`tools/unreached.py` no longer reports them. Every `deliberate` and `dispatch` row has a
+`REASONS` entry in that file pointing at this section. PENDING rows keep whatever inventory
+entry they already had — new-PC work, not yet triaged.

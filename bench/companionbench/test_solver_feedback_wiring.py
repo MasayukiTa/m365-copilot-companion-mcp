@@ -170,53 +170,6 @@ def test_solver_feedback_entries_extracts_only_present_rows():
     assert R.solver_feedback_entries(rows) == [rows[0]["solver_feedback"]]
 
 
-def test_accumulated_entries_feed_tally_and_to_hypotheses(monkeypatch):
-    """収集した entries が、そのまま tally/to_hypotheses に渡せることを確認する --
-    プールを終えたあとで仮説を作る、という配線の目的そのもの。"""
-    monkeypatch.setenv("MCP_SOLVER_FEEDBACK", "1")
-    rows = []
-    for i in range(3):
-        calls = []
-        reply = json.dumps({"tool_friction": ["slow reads"]})
-        rows.append(R.run_episode(_Ep("e%d" % i), _agent(calls, feedback_reply=reply),
-                                  root=_tmp()))
-    entries = R.solver_feedback_entries(rows)
-    assert len(entries) == 3
-    tallied = SF.tally(entries)
-    hyps = SF.to_hypotheses(tallied)
-    assert len(hyps) == 1
-    assert hyps[0]["raised_by"] == 3
-    assert sorted(hyps[0]["evidence_episodes"]) == ["e0", "e1", "e2"]
-
-
-def test_a_single_complaint_across_a_pool_is_still_only_an_anecdote(monkeypatch):
-    """min_episodes=2 の既定は、この配線を通しても効いたままでなければならない。"""
-    monkeypatch.setenv("MCP_SOLVER_FEEDBACK", "1")
-    reply = json.dumps({"tool_friction": ["one-off complaint"]})
-    row = R.run_episode(_Ep("solo"), _agent([], feedback_reply=reply), root=_tmp())
-    entries = R.solver_feedback_entries([row])
-    assert SF.to_hypotheses(SF.tally(entries)) == []
-
-
-def test_nothing_the_feedback_produces_reaches_a_gate(monkeypatch):
-    """tally/to_hypotheses の出力に、判定として読める語が混じっていないこと --
-    そしてこれは success/gate 系のキーとは別の場所にしか現れないことも確認する。"""
-    monkeypatch.setenv("MCP_SOLVER_FEEDBACK", "1")
-    rows = []
-    for i in range(3):
-        reply = json.dumps({"tool_friction": ["slow reads"]})
-        rows.append(R.run_episode(_Ep("g%d" % i), _agent([], feedback_reply=reply),
-                                  root=_tmp()))
-        assert rows[-1]["success"] is True, "採点はフィードバック収集と無関係でなければならない"
-
-    entries = R.solver_feedback_entries(rows)
-    tallied = SF.tally(entries)
-    hyps = SF.to_hypotheses(tallied)
-    blob = json.dumps({"tally": tallied, "hypotheses": hyps})
-    for word in ("keep", "reject", "verdict", "accept", "p_value", "significant"):
-        assert word not in blob.lower(), "判定に読める語 %r が出力に含まれている" % word
-
-
 def test_the_flag_is_recorded_in_the_experiment_fingerprint():
     """未記録のトグルは未記録の交絡変数 -- フラグは fingerprint の対象に入っていなければ
     ならない。"""

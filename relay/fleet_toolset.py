@@ -136,6 +136,12 @@ DELIBERATELY_EXCLUDED = {
     # gate does -- unlisted was already refused -- it changes whether anybody looked.
     "restore_point":     "establishes a way back before editing; the capture step reads `git diff HEAD`, so a worker able to roll the tree back can erase the artefact the run exists to produce -- same reason as git_checkout",
     "roll_back":         "returns the tree to a restore_point, which is exactly the diff the run is being graded on",
+    # REGISTERED 2026-09-24 (C-1 burndown: git_checkout's refusal told agents to shell out to a
+    # raw `git worktree add` while these safety-checked versions sat unregistered). Right for an
+    # interactive agent; wrong for a fleet worker, for the same reason as git_checkout.
+    "worktree_add":      "the capture step reads ONE working tree; a worker that opens another does its work where the capture never looks -- same reason as git_checkout",
+    "worktree_remove":   "removes a working tree, which may be the operator's; a worker's own tree is the run's, not the worker's, to dispose of",
+    "survey_worktrees":  "reads what other trees the operator has checked out, which is not part of fixing the instance -- same reason as fleet_queue",
     "fleet_submit":      "queues work for this machine's fleet: a worker that can enqueue runs is not bounded by the run it is in -- same family as stop_request and schedule_create",
     "fleet_queue":       "reads what else the operator has running, which is not part of fixing the instance",
     "loop_until_verified": "drives an edit/verify loop of its own inside one turn; a worker that can start an unbounded agent loop is not bounded by a list of tools -- same reason as forge_tool",

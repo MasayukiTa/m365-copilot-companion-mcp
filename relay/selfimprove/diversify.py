@@ -96,22 +96,3 @@ def diversify(base_genome, n, *, archive=None, rejected_ids=None) -> list[dict]:
         seen_ids.add(gid)
 
     return out
-
-
-def diversity_report(genomes) -> dict:
-    """Quick check a caller (or test) can assert on.
-
-    Returns {"n", "distinct_ids", "all_domain_general", "ids"} where:
-      - n                  = number of genomes;
-      - distinct_ids       = number of unique genome_ids (== n iff no duplicates);
-      - all_domain_general = True iff every genome passes overfit_lint;
-      - ids                = the genome_id of each genome, in order.
-    """
-    glist = list(genomes or [])
-    ids = [genome_id(g) for g in glist]
-    return {
-        "n": len(glist),
-        "distinct_ids": len(set(ids)),
-        "all_domain_general": all(_is_domain_general(g) for g in glist),
-        "ids": ids,
-    }

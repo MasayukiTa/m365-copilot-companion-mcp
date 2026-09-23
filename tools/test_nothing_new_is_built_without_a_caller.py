@@ -76,17 +76,14 @@ NO_CALLER_BUT_TESTED = {
     "tools/golden.py::run_trajectory",                              # 64 lines, 4 test refs
     "bench/skill_use_log.py::compare_runs",                         # 24 lines, 4 test refs
     "relay/lean_capture.py::capture_fn",                            # 10 lines, 7 test refs
-    "bridge/session_store.py::compact",                             # 6 test refs
     "relay/selfimprove/episode_record.py::compact",                 # 6 test refs
     # DEAD SUBGRAPHS, revealed 2026-09-14 by iterating the scan to a fixed point. Each was held
     # off the list by a caller that is itself unreached, so a reference count said "someone
     # names this" while nothing could get there. Not new code.
     "relay/selfimprove/diversify.py::diversify",                    # 62 lines
     "relay/solve_policy.py::plan_solve",                            # 56 lines
-    "tools/coding_ops.py::worktree_remove",                         # 44 lines
     "relay/selfimprove/calibration.py::recommend_effort",           # 33 lines
     "relay/selfimprove/propose.py::mutation_generator",             # 33 lines
-    "tools/coding_ops.py::worktree_add",                            # 29 lines
     "relay/selfimprove/guards.py::classify_outcome",                # 21 lines
     "bench/companionbench/shadow_rules.py::verdict",                # 20 lines
     "tools/env_portability.py::parse_env",                          # 14 lines
@@ -101,23 +98,15 @@ NO_CALLER_BUT_TESTED = {
     "bench/companionbench/shadow_rules.py::compare",               # 41 lines, revealed 2026-09-14
     "relay/selfimprove/planner_evaluator.py::preflight",           # 39 lines, revealed 2026-09-14
     "relay/outcomes.py::tally",                                    # 35 lines, revealed 2026-09-14
-    "relay/selfimprove/solver_feedback.py::tally",                 # 27 lines, revealed 2026-09-14
-    # WIRED 2026-09-22, so it leaves the inventory. relay/selfimprove/frozen._record_rebless
-    # now walks the chain before extending it: a hash-linked ledger whose verifier nobody
-    # called was accepting appends onto a history that might already be broken, and
-    # printing a tail that asserts a continuity it no longer had.
     "relay/selfimprove/decision.py::summarise",                    # 21 lines, revealed 2026-09-14
-    "relay/selfimprove/apply.py::apply_genome",                    # 20 lines, revealed 2026-09-14
     "relay/turn_outcome.py::summarise",                            # 13 lines, revealed 2026-09-14
     "relay/selfimprove/harness_feedback.py::report",               # 11 lines, revealed 2026-09-14
     "relay/selfimprove/coreset.py::summarise",                     # 8 lines, revealed 2026-09-14
-    "tools/coding_ops.py::survey_worktrees",                     # 96 lines
     "relay/provenance.py::adjudicate",                           # 82 lines
     "relay/selfimprove/propose.py::propose_candidates",          # 68 lines
     "relay/selfimprove/routing.py::held_out_advantage",          # 65 lines
     "bench/companionbench/baseline.py::why_they_flip",           # 54 lines
     "relay/selfimprove/autonomy.py::raise_to",                   # 48 lines
-    "relay/bestofn_run.py::load_candidate_dir",                  # 39 lines
     "relay/selfimprove/apply.py::safe_commit",                   # 39 lines
     "bench/companionbench/baseline.py::repeat_suite",            # 36 lines
     "tools/env_portability.py::merge_for_new_machine",           # 35 lines
@@ -130,23 +119,16 @@ NO_CALLER_BUT_TESTED = {
     "tools/tool_probe.py::classify_probe_reply",                 # 26 lines
     "relay/selfimprove/trace_to_eval.py::record_correction",     # 25 lines
     "tools/judge_backend.py::sampling_judge_async",              # 24 lines
-    "relay/selfimprove/compare.py::withdraw",                    # 20 lines
     "scripts/stale_server_check.py::decide_post_update_action",  # 20 lines
-    "relay/selfimprove/diversify.py::diversity_report",          # 17 lines
     "relay/selfimprove/harness_tree.py::justified",              # 17 lines
-    "relay/selfimprove/solver_feedback.py::where_distribution",  # 16 lines
     "bench/companionbench/runner.py::solver_feedback_entries",   # 15 lines
     "relay/project_memory.py::list_themes",                      # 15 lines
     "tools/tool_probe.py::next_probe_instruction",               # 15 lines
     "relay/selfimprove/autonomy.py::lower_to",                   # 14 lines
-    "relay/selfimprove/branches.py::materialize_to_file",        # 14 lines
     "relay/selfimprove/harness_tree.py::branches",               # 14 lines
-    "relay/selfimprove/l2.py::run_until",                        # 14 lines
-    "relay/selfimprove/apply.py::revert",                        # 13 lines
     "relay/turn_outcome.py::classify_turns",                     # 13 lines
     "relay/provenance.py::outranks",                             # 12 lines
     "relay/provenance.py::resolved_value",                       # 12 lines
-    "relay/selfimprove/record_summary.py::summary_for",          # 12 lines
     "relay/execution_profiles.py::validate_runtime",             # 11 lines
     "relay/selfimprove/guards.py::partition_outcomes",           # 11 lines
     "relay/fleet_toolset.py::unknown_tools",                     # 10 lines
@@ -159,8 +141,6 @@ NO_CALLER_BUT_TESTED = {
     "relay/relay_fleet.py::connector_proven",                    # 3 lines
     "relay/selfimprove/compare.py::transport_versions_differ",   # 3 lines
     "relay/selfimprove/guards.py::is_domain_general",            # 3 lines
-    "bench/remote/broker_client.py::ping",                       # 2 lines
-    "relay/selfimprove/runtime_config.py::active_harness_id",    # 2 lines
     "tools/security.py::clear_presented_token",                  # 2 lines
 }
 
@@ -209,64 +189,69 @@ REASONS: dict[str, tuple[str, str]] = {
     # a caller that is itself unreached: something named it, and nothing could get there. Three
     # had already been found by hand while chasing other things, which is what prompted the
     # loop. Not new code -- dead subgraphs behind leaves that were already on the list.
-    "relay/selfimprove/diversify.py::diversify": ("revealed", "docs/unreached_burndown.md"),
-    "relay/solve_policy.py::plan_solve": ("revealed", "docs/unreached_burndown.md"),
-    "tools/coding_ops.py::worktree_remove": ("revealed", "docs/unreached_burndown.md"),
+    #
+    # RECLASSIFIED 2026-09-24, C-1 CLOSE-OUT (scratchpad/c1_final_verdicts.md, aggregated into
+    # docs/unreached_burndown.md's "C-1 closed out" section). "revealed" only ever said HOW a
+    # row arrived (its only caller was itself unreached); it is not one of ALLOWED_REASONS'
+    # closing kinds. Every row below now has an actual verdict, so the kind says what was
+    # decided. `worktree_remove` and `worktree_add` left the inventory the same day, WIRED.
+    # `tools/env_portability.py::parse_env` / `::classify` are PENDING new-PC work and stay
+    # "revealed" on purpose -- nobody has triaged them yet.
+    "relay/selfimprove/diversify.py::diversify": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/solve_policy.py::plan_solve": ("deliberate", "docs/unreached_burndown.md"),
     "relay/selfimprove/calibration.py::recommend_effort":
-        ("revealed", "docs/unreached_burndown.md"),
+        ("deliberate", "docs/unreached_burndown.md"),
     "relay/selfimprove/propose.py::mutation_generator":
-        ("revealed", "docs/unreached_burndown.md"),
-    "tools/coding_ops.py::worktree_add": ("revealed", "docs/unreached_burndown.md"),
+        ("deliberate", "docs/unreached_burndown.md"),
     "relay/selfimprove/guards.py::classify_outcome":
-        ("revealed", "docs/unreached_burndown.md"),
+        ("deliberate", "docs/unreached_burndown.md"),
     "bench/companionbench/shadow_rules.py::verdict":
-        ("revealed", "docs/unreached_burndown.md"),
+        ("deliberate", "docs/unreached_burndown.md"),
     "tools/env_portability.py::parse_env": ("revealed", "docs/unreached_burndown.md"),
-    "relay/project_memory.py::entry_authority": ("revealed", "docs/unreached_burndown.md"),
+    "relay/project_memory.py::entry_authority": ("deliberate", "docs/unreached_burndown.md"),
     "bench/companionbench/shadow_rules.py::old_verdict":
-        ("revealed", "docs/unreached_burndown.md"),
+        ("deliberate", "docs/unreached_burndown.md"),
     "bench/companionbench/shadow_rules.py::new_verdict":
-        ("revealed", "docs/unreached_burndown.md"),
+        ("deliberate", "docs/unreached_burndown.md"),
     "relay/selfimprove/calibration.py::competence":
-        ("revealed", "docs/unreached_burndown.md"),
-    "relay/lean_capture.py::enabled": ("revealed", "docs/unreached_burndown.md"),
+        ("deliberate", "docs/unreached_burndown.md"),
+    "relay/lean_capture.py::enabled": ("deliberate", "docs/unreached_burndown.md"),
     "tools/env_portability.py::classify": ("revealed", "docs/unreached_burndown.md"),
 
-    # Both were always unreached and neither was ever printed: `compact` is defined in
-    # two modules, and a colliding name used to be skipped by the scan rather than
+    # `episode_record.py::compact` was always unreached and never printed at all: `compact` is
+    # defined in two modules, and a colliding name used to be skipped by the scan rather than
     # reported. Found 2026-09-13 when a new `require` silently retired
-    # relay/selfimprove/autonomy.py::require the same way.
-    "bridge/session_store.py::compact": ("revealed", "docs/unreached_burndown.md"),
-    "relay/selfimprove/episode_record.py::compact": ("revealed",
+    # relay/selfimprove/autonomy.py::require the same way. `bridge/session_store.py::compact`
+    # shared that discovery and left the inventory 2026-09-24, WIRED.
+    "relay/selfimprove/episode_record.py::compact": ("deliberate",
                                                     "docs/unreached_burndown.md"),
 
     # THE SAME BLIND SPOT, MEASURED AND CLOSED 2026-09-14. `unreached.py` skipped a name
     # defined in more than one module whenever ANY definition was referenced -- the half of
     # the 2026-09-13 fix that was left. 421 definitions sat behind that skip. Attributing a
     # reference to the module the AST names reports these eighteen; each was checked against
-    # the owning module's own importers before being listed.
+    # the owning module's own importers before being listed. RECLASSIFIED 2026-09-24 for the
+    # same reason as the block above -- "revealed" said how they arrived, not what to do about
+    # them, and they now have verdicts. `solver_feedback.py::tally` and `apply.py::apply_genome`
+    # left the inventory the same day (DELETED and WIRED respectively).
     "bench/skill_probe.py::compare":
-        ("revealed", "docs/unreached_burndown.md"),
+        ("deliberate", "docs/unreached_burndown.md"),
     "bench/companionbench/shadow_rules.py::compare":
-        ("revealed", "docs/unreached_burndown.md"),
+        ("deliberate", "docs/unreached_burndown.md"),
     "relay/selfimprove/planner_evaluator.py::preflight":
-        ("revealed", "docs/unreached_burndown.md"),
+        ("deliberate", "docs/unreached_burndown.md"),
     "relay/outcomes.py::tally":
-        ("revealed", "docs/unreached_burndown.md"),
-    "relay/selfimprove/solver_feedback.py::tally":
-        ("revealed", "docs/unreached_burndown.md"),
+        ("deliberate", "docs/unreached_burndown.md"),
     "relay/selfimprove/decision.py::summarise":
-        ("revealed", "docs/unreached_burndown.md"),
-    "relay/selfimprove/apply.py::apply_genome":
-        ("revealed", "docs/unreached_burndown.md"),
+        ("deliberate", "docs/unreached_burndown.md"),
     "relay/turn_outcome.py::summarise":
-        ("revealed", "docs/unreached_burndown.md"),
+        ("deliberate", "docs/unreached_burndown.md"),
     "relay/selfimprove/harness_feedback.py::report":
-        ("revealed", "docs/unreached_burndown.md"),
+        ("deliberate", "docs/unreached_burndown.md"),
     "relay/lean_capture.py::capture_fn":
-        ("revealed", "docs/unreached_burndown.md"),
+        ("deliberate", "docs/unreached_burndown.md"),
     "relay/selfimprove/coreset.py::summarise":
-        ("revealed", "docs/unreached_burndown.md"),
+        ("deliberate", "docs/unreached_burndown.md"),
 
     # KEPT UNWIRED, AND THE DECISION HAS A LOCATION NOW. This table's own comment names
     # judge_autonomy as the cautionary case -- "'we decided' with no location is how
@@ -301,6 +286,78 @@ REASONS: dict[str, tuple[str, str]] = {
     # repository had already refused. A row answered by DELETING is the row leaving.
     "relay/autonomy_gate.py::judge_autonomy": ("deliberate", "docs/unreached_burndown.md"),
     "relay/autonomy_gate.py::constraints_text": ("deliberate", "docs/unreached_burndown.md"),
+
+    # C-1 CLOSE-OUT, 2026-09-24. The commander's aggregation of all 84 rows scanned for this
+    # burndown (scratchpad/c1_final_verdicts.md) reached a verdict for every remaining row that
+    # was not already PENDING (new-PC work) or already decided above. WIRED/DELETED rows left
+    # the inventory the same day and are not here; PENDING rows (env_portability's three,
+    # stale_server_check's two) get no entry at all, by the legend's own instruction. Every
+    # entry below is either D (a standing decision not to wire something with a caller that
+    # would exist if wired) or FOLLOWS (its only caller is another row on this list, itself
+    # deliberate) -- see docs/unreached_burndown.md's "C-1 closed out" section for the
+    # one-line reason behind each name.
+    "tools/golden.py::run_trajectory": ("dispatch", "docs/unreached_burndown.md"),
+
+    # relay/selfimprove -- the loop with no driver (scripts/run_nightly_real.py has never run).
+    "relay/provenance.py::adjudicate": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/provenance.py::outranks": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/provenance.py::resolved_value": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/selfimprove/propose.py::propose_candidates": ("deliberate",
+                                                        "docs/unreached_burndown.md"),
+    "relay/selfimprove/routing.py::held_out_advantage": ("deliberate",
+                                                        "docs/unreached_burndown.md"),
+    "relay/selfimprove/autonomy.py::raise_to": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/selfimprove/apply.py::safe_commit": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/selfimprove/solver_feedback.py::to_hypotheses": ("deliberate",
+                                                            "docs/unreached_burndown.md"),
+    "relay/selfimprove/autonomy.py::require": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/selfimprove/trace_to_eval.py::record_correction": ("deliberate",
+                                                              "docs/unreached_burndown.md"),
+    "relay/selfimprove/harness_tree.py::justified": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/selfimprove/autonomy.py::lower_to": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/selfimprove/harness_tree.py::branches": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/selfimprove/guards.py::partition_outcomes": ("deliberate",
+                                                        "docs/unreached_burndown.md"),
+    "relay/selfimprove/compare.py::transport_versions_differ": ("deliberate",
+                                                                "docs/unreached_burndown.md"),
+    "relay/selfimprove/guards.py::is_domain_general": ("deliberate", "docs/unreached_burndown.md"),
+
+    # bench -- one-off / manual analysis tools whose output is recorded in results/*, not a
+    # production consumer.
+    "bench/companionbench/baseline.py::why_they_flip": ("deliberate",
+                                                        "docs/unreached_burndown.md"),
+    "bench/companionbench/baseline.py::repeat_suite": ("deliberate",
+                                                        "docs/unreached_burndown.md"),
+    "bench/companionbench/runner.py::solver_feedback_entries": ("deliberate",
+                                                                "docs/unreached_burndown.md"),
+    "bench/skill_use_log.py::compare_runs": ("deliberate", "docs/unreached_burndown.md"),
+    "bench/attempt_snapshots.py::transitions": ("deliberate", "docs/unreached_burndown.md"),
+
+    # tools -- settled docs, test-isolation twins, and a contextmanager reached only in-process.
+    "tools/coding_ops.py::worktree_scope": ("deliberate", "docs/unreached_burndown.md"),
+    "tools/tool_probe.py::verify_probe_reply": ("deliberate", "docs/unreached_burndown.md"),
+    "tools/tool_probe.py::classify_probe_reply": ("deliberate", "docs/unreached_burndown.md"),
+    "tools/tool_probe.py::next_probe_instruction": ("deliberate", "docs/unreached_burndown.md"),
+    "tools/judge_backend.py::sampling_judge_async": ("deliberate", "docs/unreached_burndown.md"),
+    "tools/judge_backend.py::ask_human_async": ("deliberate", "docs/unreached_burndown.md"),
+    "tools/security.py::clear_presented_token": ("deliberate", "docs/unreached_burndown.md"),
+
+    # relay (other) / bridge / scripts.
+    "bridge/session_store.py::search_turns": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/project_memory.py::list_themes": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/project_memory.py::authorities_in": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/solve_policy.py::plan_and_explain": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/solve_policy.py::finalize": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/relay_fleet.py::connector_proven": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/fleet_toolset.py::unknown_tools": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/turn_outcome.py::classify_turns": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/turn_outcome.py::is_capacity_signal": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/execution_profiles.py::validate_runtime": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/chathub.py::collect_text": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/review_resilience.py::looks_like_capability_failure": ("deliberate",
+                                                                  "docs/unreached_burndown.md"),
+    "relay/review_resilience.py::looks_like_output_filter": ("deliberate",
+                                                              "docs/unreached_burndown.md"),
 }
 
 #: The inventory as it stood when the reason requirement went in. See the file's own header.

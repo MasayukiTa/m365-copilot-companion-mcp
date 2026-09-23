@@ -84,7 +84,7 @@ def test_aggregates_correctly():
 
         # top-level shape (now includes the general-user `usage` lens)
         assert set(st.keys()) == {"summary", "pending_decisions", "usage", "reliability", "ab_history", "pass1_trend",
-                                  "burned_ledger", "archive", "branches"}
+                                  "burned_ledger", "archive", "branches", "authority_ledger"}
 
         # summary
         s = st["summary"]
@@ -229,7 +229,7 @@ def test_write_json_writes_valid_feed():
         with open(out, encoding="utf-8") as f:
             obj = json.load(f)                                       # must be valid JSON
         assert set(obj.keys()) == {"summary", "pending_decisions", "usage", "reliability", "ab_history", "pass1_trend",
-                                   "burned_ledger", "archive", "branches"}
+                                   "burned_ledger", "archive", "branches", "authority_ledger"}
         # pretty-printed (indent=2) -> multi-line with leading spaces, not a single dense line
         raw = open(out, encoding="utf-8").read()
         assert "\n  " in raw
@@ -358,6 +358,49 @@ def test_a_measured_reliability_reports_k_so_the_number_can_be_read():
     text = render_text(state)
     assert "pass^3" in text and "0.240" in text
     assert "0.360" in text          # the flakiness is shown, not only the floor
+
+
+def test_the_authority_ledger_section_surfaces_records_with_their_cached_summary(tmp_path,
+                                                                                  monkeypatch):
+    """record_summary.py の存在理由: authority_ledger.py の rebless/revoke/genome_apply/... は
+    誰も読まないなら summary_for() を呼ぶ場所も無い。ここは実際に台帳へ1行足し、それが
+    dashboard_state()['authority_ledger'] に生の reason と一緒にキャッシュ済みの訳を連れて
+    出てくることを、production の消費経路 (relay_fleet.py の _refresh_selfimprove_dashboard
+    -> dashboard.write_json -> dashboard_state) と同じ関数で確かめる。"""
+    from relay.selfimprove import authority_ledger as AL
+    from relay.selfimprove import record_summary as RS
+
+    ledger_path = str(tmp_path / "authority.jsonl")
+    monkeypatch.setattr(AL, "_notify", lambda record: None)
+    record = AL.append(AL.REBLESS, reason="a long reason an agent typed, worth summarising",
+                       actor_claimed="test", path=ledger_path)
+
+    monkeypatch.setattr(RS, "CACHE_PATH", str(tmp_path / "summaries.json"))
+    RS.save({RS.key_of(record): {"ja": "日本語の要約", "en": "an english summary"}})
+
+    st = D.dashboard_state(authority_ledger_path=ledger_path)
+    al = st["authority_ledger"]
+    assert al["total"] == 1, "genesis 行を実際の行として数えている"
+    row = al["recent"][0]
+    assert row["event"] == AL.REBLESS
+    assert row["reason"] == "a long reason an agent typed, worth summarising"
+    assert row["summary"] == {"ja": "日本語の要約", "en": "an english summary"}
+
+
+def test_the_authority_ledger_section_falls_back_to_the_raw_reason_with_no_cache_entry(tmp_path,
+                                                                                        monkeypatch):
+    from relay.selfimprove import authority_ledger as AL
+    from relay.selfimprove import record_summary as RS
+
+    ledger_path = str(tmp_path / "authority.jsonl")
+    monkeypatch.setattr(AL, "_notify", lambda record: None)
+    AL.append(AL.REBLESS, reason="short", actor_claimed="test", path=ledger_path)
+    monkeypatch.setattr(RS, "CACHE_PATH", str(tmp_path / "summaries.json"))
+
+    st = D.dashboard_state(authority_ledger_path=ledger_path)
+    row = st["authority_ledger"]["recent"][0]
+    assert row["reason"] == "short"
+    assert row["summary"] == {"ja": "", "en": ""}
 
 
 def test_a_row_from_another_run_does_not_supersede_the_one_before_it():

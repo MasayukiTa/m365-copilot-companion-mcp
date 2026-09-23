@@ -26,6 +26,9 @@ from tools.coding_ops import (
     multi_edit,
     python_check,
     replace_in_file,
+    survey_worktrees,
+    worktree_add,
+    worktree_remove,
 )
 from tools.auto_ops import (edit_and_verify, loop_trajectory, loop_until_verified,
                             restore_point, roll_back)
@@ -507,6 +510,12 @@ TOOLS = (
     git_status, git_diff, git_log, git_branch, git_blame,
     # git (write)
     git_add, git_commit, git_checkout,
+    # git worktrees -- the isolated-checkout alternative git_checkout's own refusal points
+    # callers at when a branch switch in the shared working tree is not allowed. survey is
+    # read-only; add/remove are the two externally-usable halves of coding_ops.worktree_scope
+    # (an in-process-only context manager -- see its docstring for why it cannot itself be a
+    # tool), gated the same way (require_unlocked + the destructive-op contract gate).
+    survey_worktrees, worktree_add, worktree_remove,
     # web
     web_fetch, render_page, github_file,
     web_search, web_search_news,

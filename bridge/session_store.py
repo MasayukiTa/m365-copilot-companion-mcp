@@ -1002,3 +1002,40 @@ def latest_session():
     finally:
         conn.close()
     return _row_to_session(row) if row else None
+
+
+def main(argv=None):
+    """Operator entry point. The only subcommand today is `compact`.
+
+    `compact()` itself has been callable since the store was built, but nothing in the
+    repository ever called it -- no `__main__`, no `.ps1`, no MCP tool (see `_collapse_goals`'s
+    own comment, above, on why that gap matters: it is the one case that predates incremental
+    `auto_vacuum` and that `prune()` does not reach). This gives it the operator-reachable
+    surface its own docstring assumed existed. Honours MCP_SESSION_STORE_DIR like every other
+    entry point in this module -- it does NOT default to the operator's live store unless that
+    env var is unset, same as `_base_dir()` always has.
+    """
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        prog="python -m bridge.session_store",
+        description="Operate on the session store (%s honours MCP_SESSION_STORE_DIR)."
+                     % STORE_DIR_ENV)
+    sub = ap.add_subparsers(dest="cmd")
+    sub.add_parser("compact", help="VACUUM the store so deleted space returns to the OS")
+
+    a = ap.parse_args(argv)
+    if a.cmd == "compact":
+        before = store_stats()
+        after = compact()
+        print(json.dumps({"db_path": _db_path(), "before": before, "after": after},
+                          ensure_ascii=False))
+        return 0
+    # No subcommand named -- print usage rather than guessing. `compact` mutates the file on
+    # disk (a VACUUM rewrite); unlike contract_gate's read-only default it must be asked for.
+    ap.print_usage()
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

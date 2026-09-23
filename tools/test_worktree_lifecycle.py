@@ -319,3 +319,121 @@ def test_survey_never_returns_safe_for_locked(shared_repo, tmp_path):
         assert row["safe_to_remove"] is False
     finally:
         _git(shared_repo, "worktree", "unlock", str(wt))
+
+
+# ---- registered as MCP tools, reached through main.py's dispatch, not called directly ------
+#
+# Before this row was wired, none of the three names below existed in main.py's TOOLS tuple
+# at all: git_checkout's own shared-worktree refusal told an agent to shell out to raw
+# `git worktree add`, while the safety-checked functions that do the identical operation with
+# gates sat unregistered ~250 lines below it in this same file. The defect was the REGISTRY
+# entry, not the function body (tools/test_worktree_lifecycle.py above already exercises the
+# real git behaviour directly) -- so this proves the REGISTRY reaches them, in a clean
+# subprocess interpreter. Importing `main` in-process would read a registry this pytest
+# session may already have altered (see relay/test_fleet_toolset.py's own comment on exactly
+# that hazard), so this spawns a fresh one instead, exactly as that file does.
+
+def _import_main_and_probe(repo, tool_names):
+    """Import main.py fresh in a subprocess and report which of tool_names main._ALL_TOOLS
+    holds, plus what main.call_tool(name=<name>) returns for each -- WITHOUT ever unlocking
+    (no HTTP request context in this in-process call, so every gated tool refuses with its
+    own real "[locked: no HTTP request context]" message, which is itself proof the call
+    reached the real, gated function rather than a stub or an "unknown tool" catalogue miss).
+    """
+    import json as _json
+    import os as _os
+    import sys as _sys
+
+    from tools.childproc import run as _child_run
+
+    env = {k: v for k, v in _os.environ.items() if not k.startswith("MCP_")}
+    env["MCP_API_KEY"] = "test-only"
+    args_by_tool = {
+        "survey_worktrees": {"repo_path": "."},
+        "worktree_add": {"worktree_path": "zzz_probe_wt", "branch": "zzz_probe_branch"},
+        "worktree_remove": {"worktree_path": "zzz_probe_wt"},
+        "worktree_scope": {"worktree_path": "zzz_probe_wt", "branch": "zzz_probe_branch"},
+    }
+    payload = {"names": list(tool_names),
+              "args": {n: args_by_tool.get(n, {}) for n in tool_names}}
+    code = (
+        "import sys; sys.path.insert(0, '.')\n"
+        "import json\n"
+        "payload = json.loads(sys.argv[1])\n"
+        "import main\n"
+        "present = {n: (n in main._ALL_TOOLS) for n in payload['names']}\n"
+        "results = {}\n"
+        "for n in payload['names']:\n"
+        "    if n in main._ALL_TOOLS:\n"
+        "        try:\n"
+        "            results[n] = main._ALL_TOOLS[n](**payload['args'][n])\n"
+        "        except Exception as e:\n"
+        "            results[n] = '[exception] %s: %s' % (type(e).__name__, e)\n"
+        "print('<<<' + json.dumps({'present': present, 'results': results}) + '>>>')\n"
+    )
+    # 180s, matching relay/test_fleet_toolset.py's own probe of the same import -- `main.py`
+    # itself is a heavy module to import fresh (its own comment: "IN A SUBPROCESS, AND THAT
+    # IS THE POINT" -- a clean interpreter is slow for the same reason it is correct).
+    out = _child_run([_sys.executable, "-c", code, _json.dumps(payload)],
+                     cwd=str(repo), env=env, timeout=180)
+    body = out.stdout or ""
+    assert "<<<" in body and ">>>" in body, (
+        "could not probe main._ALL_TOOLS (rc=%s):\n%s\n%s"
+        % (out.returncode, body[-2000:], (out.stderr or "")[-2000:]))
+    return _json.loads(body.split("<<<", 1)[1].split(">>>", 1)[0])
+
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+
+def test_worktree_tools_are_registered_in_main():
+    probe = _import_main_and_probe(REPO_ROOT, ["worktree_add", "worktree_remove",
+                                               "survey_worktrees"])
+    assert probe["present"] == {
+        "worktree_add": True, "worktree_remove": True, "survey_worktrees": True,
+    }
+
+
+def test_worktree_scope_itself_is_not_registered_as_a_tool():
+    # It cannot be: it is a @contextlib.contextmanager generator (see its docstring) and
+    # registering it directly would hand FastMCP a bare context-manager object instead of
+    # running anything. worktree_add / worktree_remove are its externally-usable halves.
+    probe = _import_main_and_probe(REPO_ROOT, ["worktree_scope"])
+    assert probe["present"] == {"worktree_scope": False}
+
+
+def test_call_tool_reaches_the_real_gated_worktree_functions():
+    """The dispatch reaches the REAL survey_worktrees/worktree_add/worktree_remove -- proven
+    by getting back THEIR OWN require_unlocked() refusal (a string starting with "[locked",
+    the exact prefix tools/security.py calls load-bearing), not a generic "unknown tool"
+    catalogue miss. Before this row was wired, this same probe returned "no tool or category
+    named 'worktree_add'" for all three."""
+    probe = _import_main_and_probe(REPO_ROOT, ["worktree_add", "worktree_remove",
+                                               "survey_worktrees"])
+    for name in ("worktree_add", "worktree_remove"):
+        result = probe["results"][name]
+        assert isinstance(result, str) and result.startswith("[locked"), (
+            "%s did not reach the real gated function: %r" % (name, result))
+    # survey_worktrees returns a LIST (its own docstring: "callers always get a list"), whose
+    # one element on refusal is {"error": "<the same [locked ...> message"}.
+    survey_result = probe["results"]["survey_worktrees"]
+    assert isinstance(survey_result, list) and len(survey_result) == 1
+    assert survey_result[0]["error"].startswith("[locked"), (
+        "survey_worktrees did not reach the real gated function: %r" % survey_result)
+
+
+def test_git_checkout_refusal_names_the_registered_worktree_tool(monkeypatch, tmp_path):
+    """The refusal an agent actually reads must point at a tool that exists, not at a raw
+    git command it has no safe way to run. Regression for the exact defect the investigation
+    named: git_checkout's shared-worktree refusal told an agent to shell out to raw
+    `git worktree add` while worktree_add/worktree_scope sat unregistered in this file."""
+    monkeypatch.setattr(C, "require_unlocked", lambda: None)
+    monkeypatch.setattr(C, "_validate_path", lambda p: pathlib.Path(p))
+    monkeypatch.setattr(C, "_is_shared_worktree", lambda cwd: True)
+    repo = tmp_path / "shared"
+    repo.mkdir()
+    out = C.git_checkout("some-branch", repo_path=str(repo))
+    assert "worktree_add" in out
+    assert "worktree_remove" in out
+    assert "Instead: call the worktree_add tool" in out, (
+        "refusal no longer directs the agent to call the registered, gated tool: %r" % out)

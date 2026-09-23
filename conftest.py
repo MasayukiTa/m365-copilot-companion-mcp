@@ -193,6 +193,64 @@ LIVE_RECORD_REDIRECTS = {
     "tools.tool_probe": {"_PROBE_FILE": "tool_probe.json",
                          "PROBE_FAILURE_JOURNAL": "tool_probe_failures.jsonl",
                          "_INBOUND_PATH": "probe_inbound.json"},
+
+    # ── THE FOURTH CLASS, 2026-09-24 ─────────────────────────────────────────────────────────
+    #
+    # A live-state file beside its own module, naming no marker directory at all --
+    # `relay/selfimprove/apply.py::DEFAULT_STORE` is `os.path.dirname(__file__) / "active_
+    # genome.json"`, and every check above (literal scan, then the derived-constant fixpoint)
+    # walks straight past it because nothing in that expression mentions .fleet or either other
+    # marker. `relay/selfimprove/test_controller.py` wrote the real active_genome.json AND its
+    # .prev this same day, through exactly this constant, before a file-scoped fixture caught it
+    # by hand. relay/test_live_record_isolation.py's walker was widened the same day to also
+    # find a constant that resolves (by its own conservative static evaluator) to a gitignored
+    # path, or to a state-shaped filename sitting beside its module -- see STATE_FILE_EXTENSIONS
+    # there for the exact rule. Everything below this line is what that widened walk found.
+    "relay.selfimprove.apply": {"DEFAULT_STORE": "active_genome.json"},
+    # A class-default constructor argument (`class Sentinel: def __init__(self, path=DEFAULT)`)
+    # rather than a function default reached on every call -- no production caller currently
+    # constructs one without an explicit path (relay/selfimprove/l2.py always resolves and
+    # checks its own sentinel_path first). Redirected anyway: it costs nothing but a temp path,
+    # and "no caller reaches the default today" is exactly the kind of claim this table exists
+    # to stop anyone having to keep re-verifying by hand.
+    "relay.selfimprove.sentinel": {"DEFAULT": "sentinel.json"},
+    # THE ONE OF THE ELEVEN THAT IS LIVE ON THE HAPPY PATH, NOT JUST REACHABLE. scheduler.nightly
+    # forwards its own trace_ledger_path default (None) straight through to
+    # trace_to_eval.nightly_step, and relay/selfimprove/test_policy_wiring.py's
+    # test_the_scheduled_run_reports_tripwires_rather_than_acting_on_them and
+    # test_five_passes_are_not_a_plateau both call S.nightly(...) with no trace_ledger_path --
+    # so whether this ever wrote the real promoted_traces.jsonl depended entirely on whether
+    # ~/.companion_runs (itself redirected, see tools.trace_ops/tools.runlog_ops above) happened
+    # to hold a promotable correction on the day the test ran.
+    "relay.selfimprove.trace_to_eval": {"DEFAULT_LEDGER": "promoted_traces.jsonl"},
+    # THE ONE MEASURED ACTUALLY WRITING, NOT JUST REACHABLE.
+    # tools/test_memory_ops_local.py::test_an_in_process_caller_can_actually_save calls
+    # memory_ops.memory_save_local(...) with no monkeypatch on STATE_FILE at all -- it accepts a
+    # tmp_path fixture and never uses it. Every write memory_save_local makes goes through
+    # _save(), which writes STATE_FILE unconditionally: this test wrote the operator's real
+    # .memory_state.json at the repo root on every run until this redirect existed.
+    "tools.memory_ops": {"STATE_FILE": "memory_state.json"},
+    # Its own test file (tools/test_procedural_memory.py) already monkeypatches STATE_FILE per
+    # test via a fixture -- this is belt and braces, the same argument as the read-only
+    # tools.* ledgers above: it costs nothing and it removes the class for whichever test in
+    # this file gets written next without remembering the local fixture.
+    "tools.procedural_memory": {"STATE_FILE": "procedural_memory.json"},
+    # THE SECURITY STATE, so belt and braces matters more here than anywhere else on this list.
+    # tools/test_security.py already monkeypatches STATE_FILE via its own isolated_state
+    # fixture -- this does not replace that, it is the same guarantee the toast stub gives
+    # tools.notify_ops: a test in this file that forgets the local fixture still cannot reach
+    # the operator's real unlock state.
+    "tools.security": {"STATE_FILE": "unlock_state.json"},
+    # Its own test file (tools/test_data_aliases.py) already monkeypatches STATE_FILE per test
+    # via a fixture, same shape as tools.procedural_memory above -- belt and braces.
+    "tools.data_aliases": {"STATE_FILE": "procedural_memory_aliases.json"},
+    # NO TEST FILE PROTECTS THIS ONE AT ALL. There is no tools/test_task_ops.py; the module is
+    # only reached through main.py's tool registration today. A future test that imports
+    # tools.task_ops and calls todo_write with no fixture of its own would write the operator's
+    # real .todo_state.json with nothing standing in the way -- which is exactly the shape the
+    # other ten entries above were found in, just one step earlier: before the write rather than
+    # after it.
+    "tools.task_ops": {"STATE_FILE": "todo_state.json"},
 }
 
 #: Constants that build a .fleet path but are NOT redirected, each with the reason. Being on
@@ -369,6 +427,28 @@ DELIBERATELY_NOT_REDIRECTED = {
         "an exclusion set naming .fleet as a directory to skip, not a path into it",
     ("relay.repo_map", "_SKIP"):
         "an exclusion set naming .fleet as a directory to skip, not a path into it",
+
+    # ── THE FOURTH CLASS, 2026-09-24 -- see the matching header in LIVE_RECORD_REDIRECTS above
+    # for what widened the walk to find these three along with the eight redirected there.
+    ("relay.local_job_store", "DEFAULT_DB_PATH"):
+        "resolved through the MCP_LOCAL_JOB_DB environment variable, which conftest already "
+        "points at a per-run temp file; the .jobs/jobs.sqlite3 path is only its fallback",
+    # A lock file whose whole purpose is to be taken and released, same shape as
+    # relay.selfimprove.l2_cron.DEFAULT_LOCK above. Every call site that can reach it --
+    # relay/selfimprove/test_scheduler.py's whole file, and the S.nightly(...) calls in
+    # relay/selfimprove/test_policy_wiring.py and test_trace_wiring.py -- passes its own
+    # lock_path; checked by reading every call, not assumed from the shape.
+    ("relay.selfimprove.scheduler", "DEFAULT_LOCK"):
+        "a lock file whose whole purpose is to be taken and released; every test that reaches "
+        "scheduler.nightly/scheduled_run passes its own lock_path",
+    # READ-ONLY, AND GUARDED TWICE OVER. tools/notify_ops.py checks `COCKPIT.is_file()` and
+    # `COCKPIT.name` but never writes through it -- it is the path to a built .exe this module
+    # launches via subprocess.Popen. Both call sites that would actually spawn it
+    # (notify_approval_gate, open_authority_dashboard) already refuse under
+    # PYTEST_CURRENT_TEST/MCP_SUPPRESS_GUI before COCKPIT is touched.
+    ("tools.notify_ops", "COCKPIT"):
+        "a read-only path to the built FleetCockpit.exe this module launches; nothing writes "
+        "through it, and both callers that would spawn it already refuse under pytest",
 }
 
 

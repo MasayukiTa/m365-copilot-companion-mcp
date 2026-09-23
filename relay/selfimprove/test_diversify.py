@@ -81,22 +81,10 @@ def test_archive_excludes_already_tried_variant():
     print("ok test_archive_excludes_already_tried_variant")
 
 
-def test_diversity_report_clean_run():
-    out = D.diversify(_BASE, 4)
-    rep = D.diversity_report(out)
-    assert rep["n"] == 4
-    assert rep["distinct_ids"] == 4                        # distinct_ids == n for a clean run
-    assert rep["all_domain_general"] is True
-    assert rep["ids"] == [genome_id(g) for g in out]
-    assert rep["ids"][0] == _BASE_ID
-    print("ok test_diversity_report_clean_run")
-
-
 if __name__ == "__main__":
     test_diversify_four_distinct_domain_general()
     test_n_le_one_is_single_shot()
     test_base_none_uses_empty_base()
     test_rejected_ids_excludes_variant()
     test_archive_excludes_already_tried_variant()
-    test_diversity_report_clean_run()
     print("ALL DIVERSIFY TESTS PASSED")

@@ -72,6 +72,32 @@ def _module_path(file_path):
 #: pytest temp directory and none naming anything real.
 RECORD_DIR_MARKERS = (".fleet", ".companion_runs", ".companion_gates")
 
+#: THE FOURTH CLASS, found 2026-09-24. A live-state file that sits BESIDE ITS MODULE in the
+#: tracked tree and is gitignored -- `relay/selfimprove/apply.py`'s
+#:
+#:     DEFAULT_STORE = os.path.join(os.path.dirname(__file__), "active_genome.json")
+#:
+#: names no marker directory at all, so every check above (both the literal scan and the
+#: derived-constant fixpoint) walks straight past it. `relay/selfimprove/test_controller.py`
+#: wrote the real active_genome.json and its .prev twice through exactly this constant on
+#: 2026-09-24, fixed at the time with a fixture scoped to that one test file -- which protects
+#: this module and leaves every other one with the same shape exactly as invisible as this one
+#: was five minutes before it was found.
+#:
+#: A constant built this way is in scope when EITHER: (a) it resolves, by the conservative
+#: static evaluator below, to a path under this repo that `git check-ignore` reports as
+#: ignored -- ignored regardless of where in the tree it sits, the same test that decides
+#: whether a real write would be caught by `git status` after the fact; OR (b) its filename
+#: looks like a state file (one of STATE_FILE_EXTENSIONS) AND it is joined onto
+#: `os.path.dirname(__file__)` or the module's own directory -- beside the module, the shape
+#: the defect actually had, even for a name this repo has not yet gitignored.
+#:
+#: A TRACKED path is never in scope, regardless of (a) or (b): a file `git ls-files` already
+#: lists is published or seed data, not private state a test could leak -- see
+#: `relay/selfimprove/archive.py::_DEFAULT_ARCHIVE`, which is deliberately the opposite of
+#: private (its own docstring: "THE DEFAULT PATH IS THE PUBLISHED ONE").
+STATE_FILE_EXTENSIONS = (".json", ".jsonl", ".db", ".sqlite", ".log", ".txt", ".prev")
+
 
 def _names_a_record_dir(value_node):
     """True if any string literal in this expression names a marker directory.
@@ -101,14 +127,168 @@ def _names_a_record_dir(value_node):
     return False
 
 
+def _call_name(fn):
+    """The bare name a Call's func resolves to: `.join` from `os.path.join`, `Path` from
+    `pathlib.Path`, whichever attribute or name sits at the tip of the chain."""
+    if isinstance(fn, ast.Attribute):
+        return fn.attr
+    if isinstance(fn, ast.Name):
+        return fn.id
+    return None
+
+
+def _const_index(slice_node):
+    """The literal int inside a `[N]` subscript, for `.parents[N]`. py3.9+ hands the index
+    expression directly as `.slice` (no `ast.Index` wrapper to unwrap)."""
+    if isinstance(slice_node, ast.Constant) and isinstance(slice_node.value, int):
+        return slice_node.value
+    return None
+
+
+def _eval_file_relative_path(node, file_path):
+    """Best-effort static evaluation of a path expression rooted at `__file__`, to `file_path`
+    (the real, absolute path of the module being scanned).
+
+    NOT A GENERAL EVALUATOR -- a NARROW one, covering only the shapes this repository actually
+    uses to locate a file beside its own module: `os.path.join`/`os.path.dirname`, pathlib's
+    `Path(...)`, a no-op `.resolve()`/`.abspath()`, `.parent`/`.parents[N]`, and the `/` join
+    operator. Anything else -- a path assembled at call time, built from an imported constant,
+    or through a spelling this does not recognise -- returns None, which means "not resolved"
+    rather than "not a record"; see STATE_FILE_EXTENSIONS above for what that gap costs and
+    what it does not.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name) and node.id == "__file__":
+        return file_path
+    if isinstance(node, ast.Call):
+        name = _call_name(node.func)
+        if name == "join":
+            parts = [_eval_file_relative_path(a, file_path) for a in node.args]
+            if parts and all(p is not None for p in parts):
+                return os.path.join(*parts)
+            return None
+        if name == "dirname" and len(node.args) == 1:
+            v = _eval_file_relative_path(node.args[0], file_path)
+            return os.path.dirname(v) if v is not None else None
+        if name in ("resolve", "abspath", "normpath"):
+            # A no-op here: file_path is already the absolute path we were handed, and this
+            # walker has no cwd of its own to resolve a relative one against.
+            if isinstance(node.func, ast.Attribute):
+                return _eval_file_relative_path(node.func.value, file_path)
+            if node.args:
+                return _eval_file_relative_path(node.args[0], file_path)
+            return None
+        if name == "Path" and len(node.args) == 1:
+            return _eval_file_relative_path(node.args[0], file_path)
+        return None
+    if isinstance(node, ast.Attribute):
+        if node.attr == "parent":
+            v = _eval_file_relative_path(node.value, file_path)
+            return os.path.dirname(v) if v is not None else None
+        return None
+    if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "parents"):
+        base = _eval_file_relative_path(node.value.value, file_path)
+        idx = _const_index(node.slice)
+        if base is None or idx is None:
+            return None
+        for _ in range(idx + 1):
+            base = os.path.dirname(base)
+        return base
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+        left = _eval_file_relative_path(node.left, file_path)
+        right = _eval_file_relative_path(node.right, file_path)
+        if left is not None and right is not None:
+            return os.path.join(left, right)
+        return None
+    return None
+
+
+def _beside_module_candidates(tree, path):
+    """(targets, resolved-absolute-path) for every module-level constant whose value resolves,
+    via `_eval_file_relative_path`, to a path built from this module's own `__file__`.
+
+    Returns candidates, not verdicts -- classification (ignored? tracked? state-shaped?) needs
+    every candidate in the repo at once, so `git check-ignore` runs as one batched call rather
+    than one process per constant (see `_git_ignored_batch`)."""
+    out = []
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        targets = _const_targets(node)
+        if not targets:
+            continue
+        # MUST ACTUALLY MENTION __file__. Without this, a plain string constant such as
+        # `AGENT_URL = ""` recurses into the Constant base case of the evaluator below and
+        # comes back "resolved" to an empty path built from nothing -- it was never a location
+        # relative to this module at all, just a literal that happens to be a valid string.
+        if not any(isinstance(n, ast.Name) and n.id == "__file__" for n in ast.walk(node.value)):
+            continue
+        resolved = _eval_file_relative_path(node.value, path)
+        if resolved is not None:
+            out.append((targets, resolved))
+    return out
+
+
+def _git_ignored_batch(paths):
+    """The subset of these absolute paths `git check-ignore` reports as ignored, in ONE process
+    rather than one per candidate -- fleet_constants() runs on every collection of this file.
+
+    BYTES, NOT `text=True`. subprocess writes a text-mode `input=` through a wrapper that
+    translates every "\\n" to os.linesep before it reaches the pipe, so on Windows each line
+    but the last picked up a trailing "\\r" -- which is now part of the pathname as far as
+    `git check-ignore` is concerned, so an exact-filename pattern like `.unlock_state.json` no
+    longer matches its own corrupted echo. Measured while writing this: 18 candidates in, only
+    the 2 whose pattern matched on a directory PREFIX (`/.jobs/`, `ui/*.exe`) survived: the
+    stray `\\r` sits after the filename, which a prefix match tolerates and an exact one does
+    not. Encoding the input ourselves and decoding the output the same way sends the bytes
+    unmodified in both directions.
+    """
+    rels = sorted({os.path.relpath(p, REPO).replace("\\", "/") for p in paths})
+    if not rels:
+        return set()
+    proc = subprocess.run(["git", "check-ignore", "--stdin", "-v"], cwd=REPO,
+                          input="\n".join(rels).encode("utf-8"), capture_output=True)
+    stdout = proc.stdout.decode("utf-8", "replace")
+    ignored_rel = set()
+    for line in stdout.splitlines():
+        # `<source>:<linenum>:<pattern>\t<pathname>` -- only ignored paths are printed at all.
+        parts = line.split("\t", 1)
+        if len(parts) == 2:
+            ignored_rel.add(parts[1])
+    return {os.path.join(REPO, *r.split("/")) for r in ignored_rel}
+
+
+def _classify_beside_module(candidates, tracked):
+    """Which (module, CONSTANT) pairs among the beside-module candidates are in scope -- see
+    STATE_FILE_EXTENSIONS above for the exact rule (ignored, OR state-shaped and beside the
+    module; never a path `git ls-files` already tracks)."""
+    ignored = _git_ignored_batch([resolved for _m, _t, resolved, _d in candidates])
+    out = set()
+    for mod, targets, resolved, module_dir in candidates:
+        rel = os.path.relpath(resolved, REPO).replace("\\", "/")
+        if rel.startswith(".."):
+            continue  # outside the repo entirely -- not this walker's business
+        if rel in tracked:
+            continue  # published/seed data git already tracks, not private state
+        ext_ok = (os.path.splitext(rel)[1] in STATE_FILE_EXTENSIONS
+                  and os.path.dirname(resolved) == module_dir)
+        if resolved in ignored or ext_ok:
+            out |= {(mod, t) for t in targets}
+    return out
+
+
 def fleet_constants():
     """(module, CONSTANT) for every module-level constant naming an operator-record directory.
 
     A TRIPWIRE, NOT A PROOF. It reads the source for a constant whose text mentions one of the
-    marker directories; a path assembled at call time, or built from a name this does not know,
-    passes straight through. What it removes is the failure that actually happened five times
-    here: a shared record nobody thought about. Its own docstring said as much when it only
-    knew .fleet, and knowing one more name does not make it complete.
+    marker directories, or -- since 2026-09-24 -- one that resolves to a gitignored or
+    state-shaped path beside its own module (see STATE_FILE_EXTENSIONS above); a path assembled
+    at call time, or built from a name neither pass knows, still passes straight through. What
+    it removes is the failure that actually happened five times here plus once more in this
+    shape: a shared record nobody thought about. Its own docstring said as much when it only
+    knew .fleet, and knowing two more shapes does not make it complete.
 
     OVER `git ls-files`, NOT OVER THE FILESYSTEM, since 2026-09-14. Walking the directory sees
     whatever happens to be lying in the checkout, and on this machine that included two
@@ -116,10 +296,13 @@ def fleet_constants():
     CI -- which only has the tracked tree -- reported both entries as naming something that does
     not exist AND could not import one of them. The tree that gets pushed is the only tree whose
     answer matters; a walk over anything wider produces a table that is right on exactly one
-    machine.
+    machine. The same tracked list also EXCLUDES a beside-module candidate below: a path
+    `git ls-files` already carries is published or seed data, not private state.
     """
     out = subprocess.check_output(["git", "ls-files"], cwd=REPO).decode("utf-8", "replace")
+    tracked = set(out.splitlines())
     found = set()
+    beside_module = []
     for rel in out.splitlines():
         if not rel.endswith(".py") or "__pycache__" in rel:
             continue
@@ -133,7 +316,14 @@ def fleet_constants():
             tree = ast.parse(src)
         except Exception:
             continue
-        found |= {(_module_path(path), n) for n in _record_constants(src, tree)}
+        mod = _module_path(path)
+        declared = _record_constants(src, tree)
+        found |= {(mod, n) for n in declared}
+        for targets, resolved in _beside_module_candidates(tree, path):
+            if set(targets) <= declared:
+                continue  # already found by the marker-based passes; nothing new to classify
+            beside_module.append((mod, targets, resolved, os.path.dirname(path)))
+    found |= _classify_beside_module(beside_module, tracked)
     return found
 
 
