@@ -49,8 +49,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
-from tools import skill_lessons  # noqa: E402
-from tools.skill_candidates import SKILLS_DIR, candidates, existing_skill_names  # noqa: E402
+from tools import skill_candidates, skill_lessons  # noqa: E402
+from tools.skill_candidates import SKILLS_DIR, existing_skill_names  # noqa: E402
 
 #: Where proposals go. Outside `skills/`, so nothing here is discovered, digested or trusted.
 PROPOSALS_DIR = os.path.join(REPO, ".fleet", "skill_proposals")
@@ -178,6 +178,24 @@ def _quote_instruction(goal):
             + "元の全文は台帳にあり、ここには引かない。")
 
 
+def _frontmatter(name, description):
+    """The `name:` and `description:` lines, EMITTED BY THE PARSER THAT WILL READ THEM BACK.
+
+    The description used to be pasted between double quotes by hand, with `"` swapped for `'`
+    and nothing else escaped. A YAML double-quoted scalar treats backslash as an escape, so an
+    instruction naming a Windows path the usual way (`D:\\共有\\経理\\...`) produced `\\共`,
+    `\\経`... -- invalid escapes -- and the store refused the proposal on import. Those are
+    exactly the jobs `_PATH` exists to find. Quoting by hand is a second YAML serialiser that
+    has to be complete; `yaml.safe_dump` is the serialiser the store's `yaml.safe_load` is the
+    inverse of, so whatever the instruction contains (backslashes, quotes, `:`, `#`, tabs)
+    round-trips to the same string. `width` is unbounded so the value is never folded.
+    """
+    import yaml
+    return yaml.safe_dump({"name": name, "description": description}, allow_unicode=True,
+                          sort_keys=False, default_flow_style=False,
+                          width=float("inf")).rstrip("\n")
+
+
 def _body(group, paths, contracts, lessons, name):
     """The proposal text. Sections are omitted rather than filled with a placeholder.
 
@@ -187,9 +205,8 @@ def _body(group, paths, contracts, lessons, name):
     # THE PART A PERSON WROTE, not the composed string that was sent. See
     # `skill_lessons.operator_instruction` for what quoting the whole thing produced.
     goal = skill_lessons.operator_instruction(group["examples"][0])
-    lines = ["---", "name: %s" % name,
-             'description: "PROPOSED DRAFT -- not reviewed. %s"'
-             % goal[:160].replace('"', "'").replace("\n", " "),
+    lines = ["---", _frontmatter(name, "PROPOSED DRAFT -- not reviewed. "
+                                 + goal[:160].replace("\n", " ")),
              "---", "",
              "# %s （提案・未承認）" % name, "",
              "> このファイルは `tools/skill_draft` が台帳から組み立てた**提案**である。",
@@ -241,8 +258,10 @@ def _body(group, paths, contracts, lessons, name):
 SKILL_MATCH_SIMILARITY = 0.12
 
 
-def _skill_texts(skills_dir=SKILLS_DIR):
+def _skill_texts(skills_dir=None):
     """{skill name: its SKILL.md}, for matching work against what is already written down."""
+    if skills_dir is None:
+        skills_dir = SKILLS_DIR
     out = {}
     for name in existing_skill_names(skills_dir):
         path = os.path.join(skills_dir, name, "SKILL.md")
@@ -275,14 +294,26 @@ def matching_skill(goal, texts):
     return best if score >= SKILL_MATCH_SIMILARITY else ""
 
 
-def propose(ledger=None, skills_dir=SKILLS_DIR, include_benchmarks=False):
+def propose(ledger=None, skills_dir=None, include_benchmarks=False):
     """Every Skill the record can support, and every one it cannot, with the reason.
 
     THE REFUSALS ARE RETURNED, NOT DROPPED. A generator that silently emits only what it managed
     is impossible to judge: nobody can tell a corpus with little in it from a generator that is
     quietly failing. The counts of both are what makes this measurable.
+
+    ONE LEDGER FOR BOTH READERS, and the defaults are read NOW, not when this module was
+    imported. `ledger` used to reach skill_lessons.pairs() only; the candidates -- the thing a
+    proposal is made of -- were read through `candidates()`'s own default, bound at import to
+    the operator's real .fleet/socket_route.jsonl. So propose(ledger=X) proposed from the live
+    ledger whatever X was, and a redirect of skill_candidates.LEDGER could not reach it either.
+    `None` means "the module's current value", looked up at call time, for the ledger and for
+    skills_dir alike.
     """
-    got = candidates(include_benchmarks=include_benchmarks)
+    if ledger is None:
+        ledger = skill_candidates.LEDGER
+    if skills_dir is None:
+        skills_dir = SKILLS_DIR
+    got = skill_candidates.candidates(ledger=ledger, include_benchmarks=include_benchmarks)
     lessons = skill_lessons.pairs(ledger=ledger, include_benchmarks=include_benchmarks)
     skill_texts = _skill_texts(skills_dir)
 
@@ -343,13 +374,22 @@ def propose(ledger=None, skills_dir=SKILLS_DIR, include_benchmarks=False):
     return out
 
 
-def write(result, directory=PROPOSALS_DIR):
+def write(result, directory=None):
     """Write proposals under .fleet. Returns the paths written.
 
     A proposal is rewritten every run rather than versioned: it is derived entirely from the
     ledger, so the current one is the only one that is true, and a directory of stale proposals
     is a directory nobody reads.
+
+    `directory=None` MEANS PROPOSALS_DIR AS IT IS NOW. The default used to be
+    `directory=PROPOSALS_DIR`, evaluated once when this module was imported -- before
+    conftest's redirect of PROPOSALS_DIR could run -- so write(result), which is exactly how
+    scripts/selfimprove_driver.refresh_skill_proposals calls it, wrote the operator's real
+    .fleet/skill_proposals even under pytest. Reading the module constant at call time is what
+    makes the redirect (and any other override of it) reach the write.
     """
+    if directory is None:
+        directory = PROPOSALS_DIR
     written = []
     for proposal in result["new"]:
         folder = os.path.join(directory, proposal["name"])

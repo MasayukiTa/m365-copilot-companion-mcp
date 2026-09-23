@@ -11,6 +11,8 @@ Approval is keyed to a digest of the whole Skill directory.  Any change to
 """
 from __future__ import annotations
 
+import copy
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -19,9 +21,16 @@ import re
 import secrets
 import shutil
 import sqlite3
+import tempfile
+import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
+from time import sleep as _sleep
+# The racy-timestamp check compares file mtimes with the real clock; bound here so a test
+# that swaps this module's `time` for a fake clock does not reach into it.
+from time import time_ns as _time_ns
 from typing import Any, Iterable
 
 import yaml
@@ -196,11 +205,211 @@ def load_bundle(path: str | Path, scope: str = "external") -> Skill:
     )
 
 
+# ------------------------------------------------------------------------ the bundle cache
+#
+# WHY IT EXISTS. Every tool call built a new SkillStore and ran discover() at least once --
+# skill_match runs it three or four times -- and discover() re-read, re-resolved and re-hashed
+# every file of every bundle and asked SQLite two questions per Skill on a fresh connection.
+# Measured 2026-09-24 at 500 Skills (Windows, NTFS, antivirus on): ~17 s per call, about half
+# in path resolution / stat / hashing and a third in those queries.
+#
+# WHAT IT IS KEYED ON. One entry per bundle directory, keyed by the directory's path under the
+# RESOLVED root and validated by the bundle's listing: every entry below it as
+# (relative path, mtime_ns, size), taken with os.scandir -- which on Windows reads those from
+# the directory itself, without opening a file. An unchanged listing reuses the parsed Skill
+# (or the recorded load error) and its digest; a changed one re-reads just that bundle through
+# load_bundle(), the uncached reader, so what is cached is always exactly what that reader
+# produced. Bundles that vanished from a root are dropped when that root is next scanned.
+# Nothing that is a symlink, junction or other reparse point -- the bundle directory itself or
+# anything inside it -- is ever cached: those are loaded uncached every time, which is also
+# where load_bundle() refuses them.
+#
+# THE APPROVAL INVARIANT, AND HOW THE CACHE KEEPS IT. Trust is a fact about a digest, so a
+# cached digest must never outlive the content it was computed from. A listing can fail to
+# change when the content did in two ways, and each has its own guard:
+#
+# 1. RACY TIMESTAMPS (accidental). A same-size rewrite landing in the same timestamp tick as the
+#    write the cache already saw leaves (mtime_ns, size) identical. This is git's "racily
+#    clean" problem and gets git's answer: an entry vouches for its content only once every file
+#    in it is older than the moment the listing was taken by more than _RACY_MARGIN_NS (2 s --
+#    FAT's granularity, the coarsest in use). After that, any later write necessarily carries a
+#    different mtime. Until then the bundle is simply re-read on every call.
+#
+# 2. DELIBERATE (mtime restored with os.utime / SetFileTime after an edit), or a writer that
+#    still holds the file open (NTFS updates the directory's copy of size/mtime lazily, on
+#    close). A listing cannot see either. So the listing is trusted only to LIST and MATCH;
+#    everything that hands approved content to a caller or records a trust decision re-hashes
+#    the actual bytes of that one bundle first -- get(strict=True) under render(),
+#    read_resource(), request_approval() and confirm_approval(), the winner of match(), and
+#    _sync_gate_approvals() (which never used the cache). A mismatch drops the entry and the
+#    answer is recomputed from the real content. Cost: one bundle, not five hundred.
+#    The residual exposure is metadata only -- a forged-mtime edit to a trusted bundle's
+#    description could show in skill_list until anything loads it -- and forging an mtime needs
+#    the same write access as forging skills.sqlite3's trust row directly, which this store has
+#    never defended against.
+
+#: How much older than the listing every file must be before an entry vouches for content.
+_RACY_MARGIN_NS = 2_000_000_000
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+#: Roots remembered at once. A long pytest session scans hundreds of tmp roots exactly once
+#: each; a server scans its two or four forever.
+_CACHE_MAX_ROOTS = 32
+
+
+@dataclass(frozen=True)
+class _CacheEntry:
+    signature: tuple
+    skill: Skill | None          # scope-free: the scope is re-applied on every read
+    error: str | None
+    declared: str
+    key: str                     # SkillStore._key(skill.path), computed once
+
+
+_CACHE: "OrderedDict[str, dict[str, _CacheEntry]]" = OrderedDict()
+_CACHE_LOCK = threading.Lock()
+
+
+def _is_link(entry: os.DirEntry) -> bool:
+    if entry.is_symlink():
+        return True
+    try:
+        attrs = getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0)
+    except OSError:
+        return True
+    return bool(attrs & _FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _listing(bundle: str) -> tuple[tuple, int, set[str]] | None:
+    """(signature, newest file mtime_ns, top-level names) of a bundle, or None if uncacheable.
+
+    Directories appear by name only: their own mtimes change for reasons that do not touch the
+    digest, and a file added or removed below one already changes the file rows.
+    """
+    rows: list[tuple[str, int, int]] = []
+    newest = 0
+    top: set[str] = set()
+    stack = [("", bundle)]
+    while stack:
+        prefix, path = stack.pop()
+        with os.scandir(path) as it:
+            for entry in it:
+                if not prefix:
+                    top.add(entry.name)
+                if _is_link(entry):
+                    return None
+                rel = prefix + entry.name
+                if entry.is_dir(follow_symlinks=False):
+                    rows.append((rel + "/", -1, -1))
+                    stack.append((rel + "/", entry.path))
+                    continue
+                st = entry.stat(follow_symlinks=False)
+                rows.append((rel, st.st_mtime_ns, st.st_size))
+                newest = max(newest, st.st_mtime_ns)
+    rows.sort()
+    return tuple(rows), newest, top
+
+
+def _forget_bundle(path: Path) -> None:
+    """Drop the cache entry for one bundle directory (resolved path), wherever it is held."""
+    key = os.path.normcase(str(path))
+    with _CACHE_LOCK:
+        for entries in _CACHE.values():
+            entries.pop(key, None)
+
+
+def clear_bundle_cache() -> None:
+    """Forget every cached bundle (tests, and anyone who distrusts the listing)."""
+    with _CACHE_LOCK:
+        _CACHE.clear()
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write `path` by rename from a temporary file NO OTHER WRITER CAN BE USING.
+
+    Every writer of one approval question used the same temporary name, <token>.json.tmp, and
+    os.replace()d it. On Windows a rename fails while another writer still has that file open,
+    so two request_approval() calls for one Skill at the same moment crashed with WinError 32
+    instead of sharing the question. mkstemp gives each writer its own name in the same
+    directory (same volume, so the rename stays atomic).
+
+    The bounded retry is for the DESTINATION, a different and inherent Windows condition: a
+    reader that has the gate file open (the cockpit, or _sync_gate_approvals reading it) blocks
+    a rename onto it for as long as its read lasts. That hold ends by itself in milliseconds,
+    every time, so waiting for it is the handling rather than a mask; past ~1 s it is not that
+    and the error is raised.
+    """
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        for attempt in range(20):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if attempt == 19:
+                    raise
+                _sleep(0.05)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+#: The argument placeholders render() substitutes. See render() for the grammar in words.
+_PLACEHOLDER = re.compile(
+    r"\$ARGUMENTS\[([0-9]+)\]"                  # $ARGUMENTS[N]
+    r"|\$ARGUMENTS(?![A-Za-z0-9_])"             # $ARGUMENTS
+    r"|\$([0-9])(?![0-9]|[.,][0-9])"            # $N, one digit, not the start of a number
+)
+
+
+def substitute_arguments(body: str, arguments: str = "") -> str:
+    """Fill a Skill body's argument placeholders, in ONE pass. The grammar:
+
+    * ``$ARGUMENTS`` -- the whole argument string as typed. Not a placeholder when followed by
+      an ASCII letter, digit or ``_`` (``$ARGUMENTS_X`` is left alone); any other character,
+      Japanese included, may follow it.
+    * ``$ARGUMENTS[N]`` -- the Nth argument, N a non-negative decimal integer.
+    * ``$N`` -- shorthand for ``$ARGUMENTS[N]``, where N is exactly ONE digit 0-9 that is not
+      followed by another digit, nor by ``.`` or ``,`` and then a digit.
+    * Arguments are the string split on whitespace, counted from 0; the full-width space an IME
+      types separates them too. A missing argument is the empty string.
+    * Everything else is literal. So ``$100``, ``$5,000`` and ``$1.50`` stay as written -- a
+      ``$`` followed by a number is money, not a placeholder -- while ``$1`` followed by a
+      space, a letter or the end of a sentence is a placeholder. A body that must print a
+      one-digit dollar amount writes it as ``$5.00`` or ``USD 5``.
+
+    ONE PASS, and this is half of the fix. The old code replaced ``$ARGUMENTS`` and then each
+    of ``$0``..``$9`` over the RESULT, so text the user typed was scanned again as template:
+    arguments ``ACME $0`` rendered as ``ACME ACME``, and ``Refunds up to $100`` with arguments
+    ``Mr. Smith`` became ``Refunds up to Smith00``. Here every placeholder is found in the
+    body as written and replaced once; substituted text is never re-read.
+    """
+    parts = (arguments or "").split()
+
+    def fill(m: re.Match) -> str:
+        index = m.group(1) if m.group(1) is not None else m.group(2)
+        if index is None:
+            return arguments or ""
+        n = int(index)
+        return parts[n] if n < len(parts) else ""
+
+    return _PLACEHOLDER.sub(fill, body)
+
+
 class SkillStore:
     """SQLite trust store and Skill registry for one project/user."""
 
     def __init__(self, project_root: str | Path, db_path: str | Path | None = None,
-                 gate_dir: str | Path | None = None):
+                 gate_dir: str | Path | None = None, use_cache: bool = True):
+        # use_cache=False is the reference reader: every bundle re-read and re-hashed and every
+        # trust state queried one Skill at a time, exactly as before the cache existed. The
+        # cached path must give identical answers (tests/test_skills_business_robustness.py
+        # compares them); see the comment above _CacheEntry for how it earns that.
+        self.use_cache = use_cache
         self.project_root = Path(project_root).expanduser().resolve()
         self.db_path = Path(db_path).expanduser().resolve() if db_path else default_state_db()
         self.gate_dir = Path(gate_dir).expanduser().resolve() if gate_dir else self._default_gate_dir()
@@ -355,29 +564,175 @@ class SkillStore:
         # unquoted ':' in its description is invalid YAML, so the Skill never appears
         # in any listing and no error is raised anywhere -- it just does not exist,
         # with nothing to debug.
-        self.invalid: dict[str, str] = {}
+        invalid: dict[str, str] = {}
+        # Keys of `invalid` whose latest entry came from a `name:` a broken file DECLARES
+        # rather than from the folder it sits in.
+        declared_only: set[str] = set()
+        outcomes = self._outcomes_cached() if self.use_cache else self._outcomes_uncached()
+        for skill_md, skill, error, declared in outcomes:
+            if skill is not None:
+                selected[skill.name] = skill
+                continue
+            # The bundle is never partially exposed to the model, but the
+            # reason is recorded so a human can be told what to fix. Record it
+            # under the folder name AND under the `name:` the file declares:
+            # a broken bundle is usually looked up by the name its author
+            # wrote, which need not match the folder it sits in.
+            folder = skill_md.parent.name
+            invalid[folder] = error
+            declared_only.discard(folder)
+            if declared and declared != folder:
+                invalid[declared] = error
+                declared_only.add(declared)
+        # A DECLARED NAME THAT A REAL SKILL ANSWERS TO IS NOT BROKEN. A second folder whose
+        # SKILL.md merely claims an existing name (a copy, an impostor) is refused -- and is
+        # still reported under its own folder -- but recording its error under the claimed
+        # name too made the real, approved, loadable Skill show up as "invalid" in skill_list,
+        # contradicting get() and skill_load. The alias exists so a name that resolves to
+        # NOTHING can say why; when the name does resolve, it has nothing to explain.
+        for name in declared_only & set(selected):
+            del invalid[name]
+        self.invalid = invalid
+        return sorted(selected.values(), key=lambda s: s.name)
+
+    def _outcomes_uncached(self):
+        """(skill_md, Skill-with-trust | None, error | None, declared name) per bundle, in
+        discovery order: every bundle re-read and every trust state queried on its own."""
         for scope, root in self.roots():
             if not root.is_dir():
                 continue
             for skill_md in sorted(root.glob("*/SKILL.md")):
                 try:
                     skill = load_bundle(skill_md.parent, scope)
-                    provenance, trust = self._state_for(skill)
-                    selected[skill.name] = Skill(**{
-                        **skill.__dict__, "provenance": provenance, "trust": trust
-                    })
                 except SkillError as exc:
-                    # The bundle is never partially exposed to the model, but the
-                    # reason is recorded so a human can be told what to fix. Record it
-                    # under the folder name AND under the `name:` the file declares:
-                    # a broken bundle is usually looked up by the name its author
-                    # wrote, which need not match the folder it sits in.
-                    self.invalid[skill_md.parent.name] = str(exc)
-                    declared = _declared_name(skill_md)
-                    if declared and declared != skill_md.parent.name:
-                        self.invalid[declared] = str(exc)
+                    yield skill_md, None, str(exc), _declared_name(skill_md)
                     continue
-        return sorted(selected.values(), key=lambda s: s.name)
+                provenance, trust = self._state_for(skill)
+                yield skill_md, dataclasses.replace(
+                    skill, provenance=provenance, trust=trust), None, ""
+
+    def _candidates(self, root: Path):
+        """What sorted(root.glob("*/SKILL.md")) yields, as (skill_md, bundle dir entry,
+        listing | None), with each bundle's listing taken on the way.
+
+        glob's own test for "*/SKILL.md" is a stat() per subdirectory -- a file open on
+        Windows, 500 of them for 500 Skills -- when the listing this needs anyway already says
+        whether SKILL.md is there. Where the listing cannot say it the way glob would (a link,
+        or a name that differs only in case, which a case-insensitive filesystem matches)
+        the answer is glob's own: Path.exists().
+        """
+        found = []
+        with os.scandir(root) as it:
+            entries = list(it)
+        for entry in entries:
+            try:
+                if not entry.is_dir():          # follows links, as glob's "*/" does
+                    continue
+            except OSError:
+                continue
+            skill_md = root / entry.name / "SKILL.md"
+            listing = None
+            taken = _time_ns()
+            if not _is_link(entry):
+                listing = _listing(entry.path)
+            if listing is not None and "SKILL.md" in listing[2]:
+                present = True
+            elif listing is not None and not any(n.lower() == "skill.md" for n in listing[2]):
+                present = False
+            else:
+                present = skill_md.exists()
+            if present:
+                found.append((skill_md, entry, listing, taken))
+        found.sort(key=lambda row: row[0])
+        return found
+
+    def _outcomes_cached(self):
+        """_outcomes_uncached, answered from the bundle cache wherever the listing allows."""
+        state = None
+        for scope, root in self.roots():
+            if not root.is_dir():
+                continue
+            root_key = os.path.normcase(str(root.resolve()))
+            with _CACHE_LOCK:
+                previous = _CACHE.get(root_key, {})
+            current: dict[str, _CacheEntry] = {}
+            for skill_md, entry, listing, taken in self._candidates(root):
+                key = os.path.normcase(os.path.join(root_key, entry.name))
+                cached = previous.get(key)
+                if listing is not None and cached is not None and \
+                        cached.signature == listing[0]:
+                    hit = cached
+                    current[key] = cached
+                else:
+                    try:
+                        skill = load_bundle(skill_md.parent, scope)
+                        hit = _CacheEntry(listing[0] if listing else (), skill, None, "",
+                                          self._key(skill.path))
+                    except SkillError as exc:
+                        hit = _CacheEntry(listing[0] if listing else (), None, str(exc),
+                                          _declared_name(skill_md), "")
+                    # Only a listing whose every file is safely older than the moment it was
+                    # taken may vouch for this content next time; see _RACY_MARGIN_NS.
+                    if listing is not None and listing[1] < taken - _RACY_MARGIN_NS:
+                        current[key] = hit
+                if hit.skill is None:
+                    yield skill_md, None, hit.error, hit.declared
+                    continue
+                if state is None:
+                    state = self._all_states()
+                provenance, trust = self._state_from(hit.key, hit.skill.digest, *state)
+                yield skill_md, dataclasses.replace(
+                    hit.skill, scope=scope, metadata=copy.deepcopy(hit.skill.metadata),
+                    provenance=provenance, trust=trust), None, ""
+            with _CACHE_LOCK:
+                _CACHE[root_key] = current
+                _CACHE.move_to_end(root_key)
+                while len(_CACHE) > _CACHE_MAX_ROOTS:
+                    _CACHE.popitem(last=False)
+
+    def _all_states(self) -> tuple[dict[str, str], dict[str, str]]:
+        """Every recorded provenance and approved digest, in two queries instead of two per
+        Skill. The tables hold one row per bundle path ever recorded, so reading them whole
+        is the batch."""
+        with self._connect() as db:
+            sources = {row[0]: row[1] for row in
+                       db.execute("SELECT source_path, provenance FROM skill_sources")}
+            trusted = {row[0]: row[1] for row in
+                       db.execute("SELECT source_path, digest FROM skill_trust")}
+        return sources, trusted
+
+    @staticmethod
+    def _state_from(key: str, digest: str, sources: dict[str, str],
+                    trusted: dict[str, str]) -> tuple[str, str]:
+        """_state_for's decision, from _all_states' rows."""
+        provenance = sources.get(key, "external")
+        approved = trusted.get(key)
+        if approved is not None and hmac.compare_digest(approved, digest):
+            trust = "trusted"
+        elif approved is not None:
+            trust = "changed"
+        else:
+            trust = "untrusted"
+        return provenance, trust
+
+    def _verified(self, skill: Skill) -> bool:
+        """Do this Skill's bytes on disk still hash to the digest it carries? (See the comment
+        above _CacheEntry: the listing is trusted to list and match, never to vouch for content
+        that is about to be handed over or approved.) On a mismatch the cache entry is dropped,
+        so the next discover() reads the real content."""
+        return self._verified_digest(skill.path, skill.scope, skill.digest)
+
+    def _verified_digest(self, path: Path, scope: str, digest: str) -> bool:
+        if not self.use_cache:
+            return True
+        try:
+            fresh = load_bundle(path, scope)
+        except SkillError:
+            fresh = None
+        if fresh is not None and hmac.compare_digest(fresh.digest, digest):
+            return True
+        _forget_bundle(path)
+        return False
 
     def invalid_bundles(self) -> dict[str, str]:
         """Folder name -> why its SKILL.md could not be loaded (after discover())."""
@@ -385,7 +740,18 @@ class SkillStore:
             self.discover()
         return dict(self.invalid)
 
-    def get(self, name: str) -> Skill:
+    def get(self, name: str, strict: bool = False) -> Skill:
+        """The Skill called `name`. strict=True re-hashes its bytes before returning it --
+        required wherever its content is handed over or a trust decision is recorded."""
+        for _attempt in range(3):
+            skill = self._get(name)
+            if not strict or self._verified(skill):
+                return skill
+        # Three consecutive mismatches: the bundle is being rewritten under us. Refuse rather
+        # than hand over content nobody has hashed.
+        raise SkillError(f"Skill {name} is changing on disk; try again")
+
+    def _get(self, name: str) -> Skill:
         match = next((s for s in self.discover() if s.name == name), None)
         if not match:
             # A folder of that name that failed to parse is the likeliest reason a
@@ -413,10 +779,15 @@ class SkillStore:
         return rows
 
     def request_approval(self, name: str) -> dict[str, Any]:
-        skill = self.get(name)
+        # strict: the digest written into the question is the one a person will be trusting.
+        skill = self.get(name, strict=True)
         if skill.trust == "trusted":
             return {"status": "already-trusted", "skill": skill.public_metadata()}
         now = time.time()
+        # One transaction, and its first statement (the DELETE) takes SQLite's write lock, so
+        # a second request for the same Skill waits and then finds this one's row: one
+        # question per decision (tests/test_skills_business_lifecycle.py,
+        # test_simultaneous_requests_share_one_question).
         with self._connect() as db:
             db.execute("DELETE FROM approval_challenges WHERE expires_at < ?", (now,))
             existing = db.execute(
@@ -486,18 +857,30 @@ class SkillStore:
         }
 
     def confirm_approval(self, name: str, token: str) -> dict[str, Any]:
-        skill = self.get(name)  # Re-hash immediately before trusting.
         token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
         now = time.time()
+        # READ THE CHALLENGE BEFORE get(). get() runs discover(), and discover() runs
+        # _sync_gate_approvals(), which deletes every expired challenge first -- so by the time
+        # this looked, an expired token had always already vanished and the "has expired"
+        # branch below was unreachable: a person who was simply too slow was told their token
+        # was WRONG. What was there before the sweep decides which of the two it is.
+        with self._connect() as db:
+            before = db.execute(
+                "SELECT expires_at FROM approval_challenges WHERE token_hash=?", (token_hash,)
+            ).fetchone()
+        skill = self.get(name, strict=True)  # Re-hash immediately before trusting.
         with self._connect() as db:
             row = db.execute(
                 "SELECT * FROM approval_challenges WHERE token_hash=?", (token_hash,)
             ).fetchone()
             if not row:
+                if (before is not None and before["expires_at"] < now) or \
+                        self._gate_expired(token, now):
+                    raise SkillError("approval token has expired; request approval again")
                 raise SkillError("approval token is invalid")
             if row["expires_at"] < now:
                 db.execute("DELETE FROM approval_challenges WHERE token_hash=?", (token_hash,))
-                raise SkillError("approval token has expired")
+                raise SkillError("approval token has expired; request approval again")
             if row["source_path"] != self._key(skill.path) or not hmac.compare_digest(
                 row["digest"], skill.digest
             ):
@@ -549,9 +932,7 @@ class SkillStore:
             "answer": None,
         }
         path = self.gate_dir / f"{token}.json"
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, path)
+        _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
         try:
             from tools.notify_ops import notify_approval_gate
             notify_approval_gate("Skill approval needed / Skill承認", question[:180], path)
@@ -565,11 +946,30 @@ class SkillStore:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             payload.update({"answered": True, "answer": answer, "answered_at": time.time()})
-            tmp = path.with_suffix(path.suffix + ".tmp")
-            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            os.replace(tmp, path)
+            _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
         except (OSError, json.JSONDecodeError):
             return
+
+    #: The only shape request_approval() ever issues. Checked before a caller-supplied token is
+    #: used as a file name, so "../x" cannot reach outside the gate directory.
+    _TOKEN_RE = re.compile(r"gate_skill_[0-9a-f]{16}")
+
+    def _gate_expired(self, token: str, now: float) -> bool:
+        """Did this token exist and run out? Its challenge row is deleted on expiry, but the
+        question file stays behind marked `outcome: expired` (see _mark_gate_expired) -- the
+        one durable record that it was a real token and not a wrong one."""
+        if not self._TOKEN_RE.fullmatch(token or ""):
+            return False
+        try:
+            payload = json.loads((self.gate_dir / f"{token}.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        if payload.get("outcome") == "expired":
+            return True
+        try:
+            return not payload.get("answered") and float(payload.get("expires_at")) < now
+        except (TypeError, ValueError):
+            return False
 
     def sync_approvals(self) -> int:
         """外から呼べる入口。押された承認を信頼状態へ取り込み、扱った件数を返す。
@@ -649,10 +1049,7 @@ class SkillStore:
                      "有効期限が切れました。元の操作からやり直してください。"),
         })
         try:
-            tmp = gate_path.with_suffix(gate_path.suffix + ".tmp")
-            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
-                           encoding="utf-8")
-            os.replace(tmp, gate_path)
+            _atomic_write_text(gate_path, json.dumps(payload, ensure_ascii=False, indent=2))
         except OSError:
             return
 
@@ -710,16 +1107,29 @@ class SkillStore:
         provenance, trust = self._state_for(copied)
         return Skill(**{**copied.__dict__, "provenance": provenance, "trust": trust})
 
-    def render(self, name: str, arguments: str = "") -> str:
-        skill = self.get(name)
+    def render(self, name: str, arguments: str = "", *, invoker: str = "user") -> str:
+        """The trusted body with its arguments filled in (see substitute_arguments for the
+        placeholder grammar).
+
+        `invoker` says WHO is loading it: "user" for a person who typed /name, "model" for an
+        agent's tool call. An author's `disable-model-invocation: true` is enforced HERE for
+        the model, not only by match(): the name is visible in skill_list, and the model-facing
+        skill_load rendered such a Skill for any model that asked for it by name. The flag is
+        read exactly as match() reads it (`is True`), so the two can never disagree.
+        """
+        if invoker not in ("user", "model"):
+            raise ValueError(f"invoker must be 'user' or 'model', not {invoker!r}")
+        skill = self.get(name, strict=True)
+        if invoker == "model" and skill.metadata.get("disable-model-invocation") is True:
+            raise SkillError(
+                f"Skill {name} is marked disable-model-invocation: only a person can invoke "
+                f"it (by typing /{name}); a model may not load it"
+            )
         if skill.trust != "trusted":
             raise SkillError(
                 f"Skill {name} is {skill.trust}; a human must approve its current digest"
             )
-        rendered = skill.body.replace("$ARGUMENTS", arguments)
-        parts = arguments.split()
-        for index in range(10):
-            rendered = rendered.replace(f"${index}", parts[index] if index < len(parts) else "")
+        rendered = substitute_arguments(skill.body, arguments)
         return (
             f"[Trusted Skill: {skill.name} digest={skill.digest[:12]}]\n"
             "Follow this reusable workflow. It does not grant additional tool permissions; "
@@ -728,7 +1138,7 @@ class SkillStore:
         )
 
     def read_resource(self, name: str, relative_path: str) -> str:
-        skill = self.get(name)
+        skill = self.get(name, strict=True)
         if skill.trust != "trusted":
             raise SkillError(f"Skill {name} is not trusted")
         rel = Path(relative_path)
@@ -751,7 +1161,7 @@ class SkillStore:
         except UnicodeDecodeError as exc:
             raise SkillError("binary assets cannot be returned as text") from exc
         # Close the read-after-hash race: a concurrent edit must invalidate this read.
-        fresh = self.get(name)
+        fresh = self.get(name, strict=True)
         if fresh.trust != "trusted" or fresh.digest != skill.digest:
             raise SkillError("Skill changed while its resource was being read")
         return text
@@ -814,6 +1224,23 @@ class SkillStore:
     MIN_DISTINCTIVE_WORDS = 2
 
     def match(self, text: str) -> dict[str, Any] | None:
+        """_match_once, with the winner's bytes re-hashed before it is reported as trusted.
+
+        The decision is _match_once's, unchanged. What this adds is the cache's promise (see
+        the comment above _CacheEntry): the Skill named here, and the description returned
+        with it, are the approved content, not a listing's memory of it. If the winner's bytes
+        no longer hash to its digest, its cache entry is dropped and the match is recomputed
+        from what is really on disk.
+        """
+        for _attempt in range(3):
+            result = self._match_once(text)
+            if result is None or not self.use_cache:
+                return result
+            if self._verified_digest(Path(result["path"]), result["scope"], result["digest"]):
+                return result
+        return None
+
+    def _match_once(self, text: str) -> dict[str, Any] | None:
         """Conservatively select one trusted, model-invocable Skill by metadata only.
 
         This intentionally favors false negatives. A Skill body is not loaded until a
