@@ -994,64 +994,12 @@ class SelfImproveDashboardWindow : Window
         return differing.Count == 0;
     }
 
-    // Whether self-improvement has ever been engaged with on THIS machine, independent of
-    // whether the checksums above currently match. Used by the cockpit's health strip to
-    // decide whether the "self-improvement check" dot belongs on screen at all.
-    //
-    // WHY THE ANCHOR AND NOT THE BASELINE. frozen_baseline.json (read above) is tracked in
-    // git, so it exists on every checkout, including a machine where nobody has ever run the
-    // self-improvement loop -- that is what made the dot always-on and always red there,
-    // reporting a fact nobody on that machine could act on. The anchor at AnchorPath()
-    // (~/.selfimprove_frozen_anchor) is different: it lives outside the repo, in the
-    // operator's own profile, and is written only by frozen.py's snapshot/re-sign path --
-    // by hand from the dashboard, or by the loop's own re-sign cycle once it has actually
-    // run. frozen.py's own anchor_state() already treats its absence as unavoidable and
-    // expected on a fresh clone; this reuses that same fact rather than inventing a second
-    // one.
-    internal static bool SelfImproveInUse()
-    {
-        try { return File.Exists(AnchorPath()); }
-        catch (Exception) { return false; }
-    }
-
-    // Pure decision for the health strip's 7th dot -- no file I/O, no WPF. Given the facts
-    // that FleetCockpit's poll loop already computed (SelfImproveInUse(), FrozenMatches()'s
-    // ok/drift), this is the ENTIRE policy: hidden and Gray when self-improvement has never
-    // been engaged with here; Green only on a positive match; NO_BASELINE (evidence expected
-    // and absent) is Red, never Gray, whenever the feature IS in use; anything else that
-    // differs is Yellow. Extracted so a test can drive the policy directly with synthetic
-    // inputs -- inUse/ok/drift -- instead of staging real baseline/anchor files on disk, and
-    // so FleetCockpit.cs's dot-coloring and the dashboard never implement this twice.
-    internal static class FrozenGate
-    {
-        internal const string Hidden = "hidden";
-        internal const string Gray = "gray";
-        internal const string Green = "green";
-        internal const string Yellow = "yellow";
-        internal const string Red = "red";
-
-        internal struct Result
-        {
-            public bool Visible;
-            public string Color;
-            public string DetailKey;   // localization key (T(...) in FleetCockpit.cs)
-        }
-
-        internal static Result Decide(bool inUse, bool ok, List<string> drift)
-        {
-            if (!inUse)
-                return new Result { Visible = false, Color = Gray, DetailKey = "hs_frozen_not_in_use" };
-            if (ok)
-                return new Result { Visible = true, Color = Green, DetailKey = "hs_frozen_ok" };
-            if (drift != null && drift.Count == 1 && drift[0] == "NO_BASELINE")
-                // NOT GRAY, even though inUse is what usually pairs with Gray's absence-branch
-                // above: a machine that IS in use and has no baseline is evidence that was
-                // expected and is missing, which this project's rule (see FleetCockpit.cs,
-                // "grey means there is no evidence and none is expected") reserves for Red.
-                return new Result { Visible = true, Color = Red, DetailKey = "hs_frozen_none" };
-            return new Result { Visible = true, Color = Yellow, DetailKey = "hs_frozen_drift" };
-        }
-    }
+    // SelfImproveInUse() / FrozenGate used to live here, feeding the cockpit health strip's
+    // 7th dot (added 8ce5c47, 2026-09-19; removed after owner feedback on 12b06fd,
+    // 2026-09-24 -- the label did not fit the strip and the strip was the wrong place for it:
+    // the self-improvement loop already refuses to run on drift, and this dashboard already
+    // shows the same fact below with its own re-sign button). Removed with the dot; nothing
+    // else called them.
 
     UIElement BuildAuthority()
     {
