@@ -51,14 +51,27 @@ def skill_list() -> str:
 
 
 def _invalid_hint(reason: str) -> str:
-    """Turn a parser message into the concrete edit that fixes it."""
+    """Turn a parser message into the concrete edit that fixes it.
+
+    KEYED ON THE MESSAGE relay.skills RAISES FOR EACH FAULT, not on a word several of them
+    share. This used to test for "yaml" first, and the message for a SKILL.md with no
+    frontmatter at all -- "must start with YAML frontmatter delimited by ---", the commonest
+    beginner mistake, plain Markdown -- contains that word too. The author was told to quote a
+    description they had never written instead of to add the --- block. Each branch now names
+    the one message it answers; the delimiter faults are tested before the YAML-syntax one.
+    """
     text = (reason or "").lower()
-    if "yaml" in text or "mapping values" in text:
+    if ("must start with yaml frontmatter" in text
+            or "opening delimiter" in text or "closing delimiter" in text):
+        return ("SKILL.md の先頭に --- だけの行を置き、name: と description: を書いたあと、"
+                "もう一度 --- だけの行で閉じてください（その下に手順本文）。")
+    if "frontmatter must be a mapping" in text:
+        return ("--- と --- の間は「name: ...」「description: ...」のような"
+                "キー: 値 の形で書いてください。")
+    if "invalid skill.md yaml" in text or "mapping values" in text:
         return ("SKILL.md の frontmatter が YAML として壊れています。"
                 "description に ':' や '#' が含まれる場合は "
                 'description: "..." のように引用符で囲んでください。')
-    if "frontmatter" in text:
-        return "SKILL.md の先頭を --- で開き、--- で閉じてください。"
     if "no SKILL.md" in reason:
         return "フォルダ直下に SKILL.md を置いてください。"
     return "SKILL.md を修正してから再度 skill_list を実行してください。"
@@ -234,8 +247,14 @@ def skill_request_approval(name: str = "") -> str:
         for target in targets:
             try:
                 review = store.request_approval(target)
+            except SkillError as exc:
+                # THE REASON, NOT ONLY ITS CLASS. "(SkillError)" told neither the agent nor
+                # the person it relays to that the SKILL.md lacks a description, or that the
+                # name does not exist -- every other tool here passes the message through.
+                failed.append("%s (%s)" % (target, exc))
+                continue
             except Exception as exc:
-                failed.append("%s (%s)" % (target, type(exc).__name__))
+                failed.append("%s (%s: %s)" % (target, type(exc).__name__, exc))
                 continue
             if review.get("status") == "already-trusted":
                 already.append(target)
@@ -257,9 +276,15 @@ def skill_request_approval(name: str = "") -> str:
 
 
 def skill_load(name: str, arguments: str = "") -> str:
-    """Load and render one trusted Skill. Untrusted or changed bundles are refused."""
+    """Load and render one trusted Skill. Untrusted or changed bundles are refused.
+
+    This is the MODEL's door, so it says so: a Skill whose author set
+    `disable-model-invocation: true` is refused here (the store enforces it for
+    invoker="model"), not only left out of skill_match. The name is visible in skill_list, so
+    hiding it from matching alone let a model load a procedure its author reserved for people.
+    """
     try:
-        rendered = _store().render(name, arguments)
+        rendered = _store().render(name, arguments, invoker="model")
         # LOADING IS THE STRONGER SIGNAL. Matching says the worker looked; loading says it
         # took the procedure. Both are recorded because the difference between them is a
         # finding in its own right -- a worker that matches and then does not load has

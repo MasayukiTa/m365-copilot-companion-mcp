@@ -641,6 +641,13 @@ def _skill_admin(line: str, repo_root: str | None = None) -> bool:
         elif cmd == "skill-import":
             parts = [part.strip() for part in raw.rsplit("|", 1)]
             source = parts[0]
+            # EXPLORER'S "COPY AS PATH" (パスのコピー) WRAPS THE PATH IN DOUBLE QUOTES, and that
+            # is how an office user copies a folder path. A path cannot begin and end with a
+            # quote character on Windows, so one matching pair around the whole argument is
+            # quoting, never part of the name; single quotes are accepted the same way for
+            # people who type them. Anything else is passed through untouched.
+            if len(source) >= 2 and source[0] == source[-1] and source[0] in "\"'":
+                source = source[1:-1].strip()
             scope = parts[1] if len(parts) == 2 else "project"
             if not source:
                 print("usage: /skill-import <path> [| project|personal]")
