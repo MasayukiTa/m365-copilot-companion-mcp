@@ -39,6 +39,12 @@ MACHINE_BOUND = {
         "the dev tunnel is owned by the account that hosts it",
     "MCP_TUNNEL_URL":
         "derived from the tunnel this machine hosts",
+    # The stamp that says WHICH machine minted MCP_TUNNEL_URL (bootstrap.py _this_host,
+    # setup_devtunnel.ps1 Get-ThisHost). Carried, it names the old machine beside a URL that
+    # was dropped, i.e. it claims provenance for a value that is no longer there -- the exact
+    # state bootstrap.py refuses to write ("STAMPED ONLY BESIDE A URL").
+    "MCP_TUNNEL_HOST":
+        "names the machine that minted MCP_TUNNEL_URL",
     # Points at a host reachable from the machine it was configured on.
     "SWE_EVAL_HOST":
         "names a host resolved from the original machine",
@@ -101,8 +107,17 @@ def merge_for_new_machine(old_text: str, current_text: str = "") -> dict:
         carried.append(key)
 
     # Whatever this machine already established stays, including its own machine-bound values.
-    for key, value in parse_env(current_text):
-        merged[key] = value
+    #
+    # AN EMPTY LOCAL VALUE IS NOT "ESTABLISHED". The loop above already decided that -- it
+    # carries the old value when the local one is blank (`local[key]` is falsy) and lists the
+    # key in `carried` -- and this loop then overwrote the carried value with the blank one, so
+    # `A=` came out while `carried` said A had been carried. Measured 2026-09-24:
+    # merge_for_new_machine("A=1\n", "A=\n") -> lines ["A=", ...], carried ["A"]. Iterating
+    # `local` (last occurrence wins, as dotenv applies it) and skipping a blank that would
+    # replace a carried value makes the two loops agree with each other and with the docstring.
+    for key, value in local.items():
+        if value or key not in merged:
+            merged[key] = value
 
     for key, value in BEHAVIOURAL_DEFAULTS.items():
         if key not in merged:
@@ -239,3 +254,47 @@ def problems(environ=None) -> list:
     except Exception:
         pass
     return found
+
+
+def machine_bound_keys_in(text: str) -> "list[str]":
+    """The keys of `text` that merge_for_new_machine would DROP on a move, in file order.
+
+    ONE COPY OF THE RULES. scripts/setup_devtunnel.ps1 has to decide what to set aside when
+    .env was carried from another machine, and it used to carry its own answer ("the URL")
+    while this module -- the classification written for exactly that move -- had no caller
+    (D7 in the 2026-09-24 new-PC review): the tunnel NAME travelled, both PCs hosted one
+    tunnel, and Copilot Studio's calls were split between them. It now asks here instead of
+    keeping a second list. Only key names come back; a value never leaves this function.
+    """
+    out = []
+    for key, _why in merge_for_new_machine(text or "")["dropped"]:
+        if key not in out:
+            out.append(key)
+    return out
+
+
+def _main(argv) -> int:
+    """`python tools/env_portability.py machine-bound <env-file>` -> one `dropped:<KEY>` line
+    per machine-bound key present, then `done:<count>`. Stdlib only and runnable as a plain
+    file, so a PowerShell caller needs any Python 3, not the project's .venv. Values are never
+    printed: this file holds every secret on the machine."""
+    if len(argv) != 3 or argv[1] != "machine-bound":
+        print("error:usage: env_portability.py machine-bound <env-file>")
+        return 2
+    try:
+        with open(argv[2], "r", encoding="utf-8-sig") as fh:
+            text = fh.read()
+    except Exception as exc:                       # noqa: BLE001
+        # The type and the path only. The path is ours; an OSError message is the path too.
+        print("error:cannot read %s (%s)" % (argv[2], type(exc).__name__))
+        return 2
+    keys = machine_bound_keys_in(text)
+    for key in keys:
+        print("dropped:%s" % key)
+    print("done:%d" % len(keys))
+    return 0
+
+
+if __name__ == "__main__":
+    import sys as _sys
+    raise SystemExit(_main(_sys.argv))
