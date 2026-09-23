@@ -14,6 +14,7 @@ attribute, patch it to their own capture list, and restore it in a finally --
 that pattern layers on top of this fixture without conflict, since this
 fixture's stub is just a (harmless) no-op capture, not the real emitter.
 """
+import hashlib
 import io
 import os
 import pytest
@@ -500,6 +501,132 @@ def _no_writes_to_the_live_records(tmp_path_factory, monkeypatch):
                 pass
 
     yield base
+
+
+def _fingerprint(path):
+    """(exists, size, sha256-or-None) for `path`. Reads the file only to hash it -- the digest
+    is a fingerprint, never the content, and nothing that calls this ever holds or prints the
+    plaintext. An OSError while stat'ing/reading (permission denied, a transient lock) collapses
+    to (None, None, None) -- "could not verify" -- so a filesystem hiccup gives the SAME answer
+    on both sides of a before/after comparison instead of masquerading as a real change.
+    """
+    from pathlib import Path as _P
+
+    try:
+        p = _P(path)
+        if not p.is_file():
+            return (False, None, None)
+        size = p.stat().st_size
+        h = hashlib.sha256()
+        with open(p, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 16), b""):
+                h.update(chunk)
+        return (True, size, h.hexdigest())
+    except OSError:
+        return (None, None, None)
+
+
+#: Modules on LIVE_RECORD_REDIRECTS (above) whose real, unpatched default is documented --
+#: in that very table's own comments -- as NOT living directly under .fleet/, so
+#: _real_dotenv_and_fleet_state_targets must not assume "fleet_dir / <redirect filename>" for
+#: them. Found by reading every entry on that table for the phrase describing where the real
+#: file actually is (grep for "repo root" / "NOT UNDER .fleet" / "beside its own module" turns
+#: up exactly these three; add to this set if a future entry documents another one):
+#:   * tools.memory_ops        -- .memory_state.json is AT THE REPO ROOT (that entry's own
+#:                                 comment: a test "wrote the operator's real
+#:                                 .memory_state.json at the repo root ... until this redirect
+#:                                 existed").
+#:   * tools.trace_ops / tools.runlog_ops -- RUNS_DIR is `~/.companion_runs`, under the user's
+#:                                 HOME directory (that entry's own comment says so verbatim:
+#:                                 "THE OPERATOR'S TRACE DIRECTORY, WHICH IS NOT UNDER .fleet").
+#:   * relay.selfimprove.apply -- DEFAULT_STORE sits BESIDE ITS OWN MODULE
+#:                                 (`relay/selfimprove/active_genome.json`), naming no marker
+#:                                 directory at all (that entry's own comment, under the
+#:                                 "FOURTH CLASS" heading above).
+_FLEET_TARGET_MODULE_EXCEPTIONS = frozenset({
+    "tools.memory_ops", "tools.trace_ops", "tools.runlog_ops", "relay.selfimprove.apply",
+})
+
+
+def _real_dotenv_and_fleet_state_targets():
+    """The REAL repo .env, plus every real top-level .fleet/<file> that LIVE_RECORD_REDIRECTS
+    (above) names, EXCEPT the documented exceptions in _FLEET_TARGET_MODULE_EXCEPTIONS whose
+    real default lives somewhere else entirely (see that set's own comment for each one) --
+    and except any redirect filename that is not a plain top-level name (contains a path
+    separator, or is "." -- a whole-directory marker, not one file) since those name a
+    subdirectory or a directory, not a single file this function can fingerprint.
+
+    DELIBERATELY STRING-ONLY, NO IMPORTS. An earlier version of this function imported every
+    module on LIVE_RECORD_REDIRECTS to read each constant's real (unpatched) value straight
+    from the attribute -- more precise in principle, but measured at ~6 seconds of import cost
+    PER SESSION even for a single targeted test file that touches none of these modules, which
+    fails the "cheap" bar this canary exists to meet: a session-scoped autouse fixture that
+    taxes every run, including a one-test debugging loop, defeats its own purpose if it is the
+    slow part of running that one test. The redirect filenames on LIVE_RECORD_REDIRECTS were
+    already chosen to match each constant's real basename (see that table's own comments, which
+    repeatedly quote the REAL filename measured on the operator's machine, e.g. "223 lines in
+    toolset_shadow.jsonl") -- trusting that convention plus the three hand-verified exceptions
+    above is the cheap version of the same answer.
+    """
+    from pathlib import Path as _P
+
+    root = _P(__file__).resolve().parent
+    fleet_dir = root / ".fleet"
+    targets = {root / ".env"}
+    for module_path, consts in LIVE_RECORD_REDIRECTS.items():
+        if module_path in _FLEET_TARGET_MODULE_EXCEPTIONS:
+            continue
+        for filename in consts.values():
+            if not filename or filename in (".", "..") or "/" in filename or "\\" in filename:
+                continue
+            targets.add(fleet_dir / filename)
+    return sorted(targets)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _real_dotenv_and_fleet_state_must_not_change():
+    """SESSION-SCOPED CANARY: the whole test session must leave the owner's REAL .env, and the
+    real top-level .fleet/ state files LIVE_RECORD_REDIRECTS names, byte-for-byte untouched.
+
+    TWICE IN ONE DAY (2026-09-24) a test run reached real operator state anyway, through two
+    DIFFERENT mechanisms neither of the existing safeguards covered: a test wrote
+    relay/selfimprove/active_genome.json through a path built at runtime, before that constant
+    existed on LIVE_RECORD_REDIRECTS (see the "FOURTH CLASS" comment above, added the same day
+    this was found); separately, scripts/test_bootstrap.py's DevTunnelNeverBlocksTests pointed
+    bootstrap.ROOT at the real checkout while exercising the new "set aside a carried .env's
+    tunnel keys" step (D7), and for about a minute commented out the owner's real
+    MCP_TUNNEL_* lines in the real .env -- found and put back by hand (see that test class's own
+    "A TEMPORARY ROOT, ALWAYS" comment, added the same day as its fix).
+
+    LIVE_RECORD_REDIRECTS and the per-test fixture above already redirect every KNOWN write
+    target, one entry at a time. This is the BACKSTOP, not a replacement for that table: it does
+    not know which file a test SHOULD have redirected, only that the one file this entire
+    repository ultimately depends on (.env) -- and the .fleet/ files already named on that table
+    -- must read the same at the end of the session as they did at the start. That is exactly
+    what catches a redirect that silently failed to take (an import-order surprise, the
+    `except Exception: continue` above swallowing a real problem) and a code path like
+    test_bootstrap's own ROOT swap, which reaches the real path directly and was never a
+    LIVE_RECORD_REDIRECTS case to begin with.
+
+    SESSION-scoped, not per-test: fingerprinting several dozen files is cheap but not free, and
+    the property this proves -- "the session as a whole left these alone" -- does not need
+    re-proving after every one of several thousand tests. NEVER reads a byte of .env for any
+    purpose other than feeding it to sha256: the fingerprint is (exists, size, digest), and the
+    failure message below prints only paths and sizes, never contents.
+    """
+    targets = _real_dotenv_and_fleet_state_targets()
+    before = {p: _fingerprint(p) for p in targets}
+    yield
+    changed = [p for p in targets if _fingerprint(p) != before[p]]
+    if changed:
+        pytest.fail(
+            "LIVE-STATE CANARY (conftest._real_dotenv_and_fleet_state_must_not_change): this "
+            "test session modified real operator state that tests must never touch -- every "
+            "write to one of these files should have gone through LIVE_RECORD_REDIRECTS (see "
+            "conftest.py) or an equivalent per-test redirect instead. Changed file(s):\n" +
+            "\n".join("  %s (was %r, now %r)" % (p, before[p], _fingerprint(p)) for p in changed),
+            pytrace=False,
+        )
 
 
 @pytest.fixture(autouse=True)
