@@ -84,7 +84,19 @@ function Ensure-EnvDefaults {
             # else: the user chose this value. Leave it alone, and do not claim it later.
         }
         $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-        if ($changed) { [System.IO.File]::WriteAllText($path, $text, $utf8NoBom) }
+        if ($changed) {
+            # ATOMIC (D28, new-PC review 2026-09-24). This runs on EVERY start_all, which makes it
+            # the most frequent .env writer there is, and WriteAllText truncates before it
+            # writes: a start interrupted in between left a partial .env, and the next setup run
+            # minted a new MCP_API_KEY without a word. Temp file beside it, then one rename.
+            $tmp = $path + ".tmp-" + $PID
+            [System.IO.File]::WriteAllText($tmp, $text, $utf8NoBom)
+            try {
+                [System.IO.File]::Replace($tmp, $path, [NullString]::Value)
+            } finally {
+                if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+            }
+        }
         # The record is rewritten even when the file was not, so a value the user has since
         # matched to our default by hand is not mistaken for ours on some later upgrade.
         [System.IO.File]::WriteAllText(

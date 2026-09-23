@@ -17,11 +17,86 @@ REM    setup.bat --only NAME  Run a single step by name.
 REM
 REM  No admin rights are required. Where Python is missing we prefer 'uv'
 REM  (Astral) downloaded into a per-user directory, with py/python fallbacks.
+REM
+REM  Knobs (environment variables, all optional):
+REM    SETUP_UNBLOCK=1        remove Mark-of-the-Web from this folder without asking
+REM    SETUP_IGNORE_POLICY=1  skip the execution-policy / language-mode preflight
+REM    SETUP_PREFER_UV=1      ignore Python on PATH; use uv's own Python 3.12
+REM    UV_INSTALLER_URL=...   where to fetch uv's installer (a mirror on a closed network)
 REM ===========================================================================
+
+REM --- 0. The install path itself (D23) -------------------------------------------------
+REM CHECKED BEFORE DELAYED EXPANSION IS SWITCHED ON, because that is what breaks: with it on,
+REM every "!" in %~dp0 is eaten, so a folder named "a!b" silently becomes "ab" wherever this
+REM file or quickstart.bat expands its own location, and every later path points nowhere. The
+REM comparison below only works while "!" is still an ordinary character. A UNC path fails
+REM `cd /d` outright (cmd cannot make one current). Both are refused with the fix named,
+REM instead of failing somewhere downstream with a message about something else.
+setlocal EnableExtensions DisableDelayedExpansion
+set "SETUP_HERE=%~dp0"
+set "RC=1"
+if "%SETUP_HERE:~0,2%"=="\\" goto :bad_unc
+if not "%SETUP_HERE:!=%"=="%SETUP_HERE%" goto :bad_bang
 setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 
 set "PYEXE="
+REM The oldest Python the requirements install on (fastmcp, mcp, anyio and ddgs declare >=3.10;
+REM see MIN_PYTHON in scripts\bootstrap.py -- test_install_path_python_version.py keeps the two
+REM equal). Exit code 3 = runs but too old, anything else non-zero = does not run.
+set "PY_MIN_CHECK=import sys; sys.exit(0 if sys.version_info[:2] >= (3, 10) else 3)"
+set "PY_MIN_TEXT=3.10"
+
+REM --- 0b. Can this PC run this project's scripts at all? (D18) --------------------------
+REM Group-Policy execution policy, Mark-of-the-Web on files from a downloaded ZIP, Constrained
+REM Language Mode and a disabled Windows Script Host each defeat a later step silently. The
+REM preflight names whichever is present and the exact next step. It is run through
+REM Invoke-Expression, NOT -File: a policy that blocks script files would block the check too.
+REM See scripts\preflight_policy.ps1 for the exit codes branched on here.
+if defined SETUP_IGNORE_POLICY goto :after_preflight
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$PreflightRoot = (Get-Location).Path; iex (Get-Content -Raw -LiteralPath 'scripts\preflight_policy.ps1')"
+set "PF_RC=!ERRORLEVEL!"
+if "!PF_RC!"=="3" goto :offer_unblock
+if "!PF_RC!"=="4" goto :offer_unblock
+if "!PF_RC!"=="0" goto :after_preflight
+echo.
+echo ACTION NEEDED: this PC's policy stops this project's scripts ^(see above^).
+echo   Nothing was changed. Follow the NEXT STEP above, then run setup.bat again.
+set "RC=1" & goto :done
+
+:offer_unblock
+echo.
+if defined SETUP_UNBLOCK goto :do_unblock
+choice /C YN /N /M "   Remove the downloaded-from-the-internet mark from this folder's files now? [Y/N] "
+if "!ERRORLEVEL!"=="1" goto :do_unblock
+if "!PF_RC!"=="4" (
+    echo   Not removed. Windows refuses these scripts while they carry the mark, so setup
+    echo   cannot continue. Run setup.bat again and answer Y, or use the command above.
+    set "RC=1" & goto :done
+)
+echo   Left as it is.
+goto :after_preflight
+
+:do_unblock
+echo   Removing the mark from every file under this folder ...
+powershell -NoProfile -Command "Get-ChildItem -LiteralPath . -Recurse -File -Force -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue"
+REM CHECKED AGAIN, NOT ASSUMED: Unblock-File can be refused per file, and a policy block that
+REM was not only about the mark would still be there.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$PreflightRoot = (Get-Location).Path; iex (Get-Content -Raw -LiteralPath 'scripts\preflight_policy.ps1')" >nul
+set "PF_RC=!ERRORLEVEL!"
+if "!PF_RC!"=="0" (
+    echo   Done: this folder's scripts can now run.
+    goto :after_preflight
+)
+if "!PF_RC!"=="3" (
+    echo   Done; some files still carry the mark ^(they could not be changed^), but scripts run.
+    goto :after_preflight
+)
+echo   The scripts are still refused after removing the mark. Run setup.bat again to see
+echo   the reason, and follow the NEXT STEP it prints.
+set "RC=1" & goto :done
+
+:after_preflight
 
 REM --- Corporate TLS interception (ALL routes) -----------------------------------------
 REM uv is a Rust binary carrying its OWN root certificates; it does not read the
@@ -52,6 +127,22 @@ if defined CABUNDLE (
     set "UV_SYSTEM_CERTS=1"
 )
 
+REM --- Proxy (D10) -------------------------------------------------------------------------
+REM uv, pip and git take a proxy only from HTTPS_PROXY; none reads the proxy Windows is set up
+REM with. On an explicit-proxy network the browser and PowerShell worked and those three failed,
+REM and the failure text below talked about certificates. Derive it from this PC's own settings
+REM (Internet Options, a PAC script, netsh winhttp) unless one is already set. Scoped by
+REM setlocal like the certificate variables above.
+set "SETUP_PROXY="
+if defined HTTPS_PROXY set "SETUP_PROXY=!HTTPS_PROXY!"
+if not defined SETUP_PROXY for /f "usebackq delims=" %%P in (`powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\detect_proxy.ps1" 2^>nul`) do set "SETUP_PROXY=%%P"
+if defined SETUP_PROXY (
+    if not defined HTTPS_PROXY set "HTTPS_PROXY=!SETUP_PROXY!"
+    if not defined HTTP_PROXY set "HTTP_PROXY=!SETUP_PROXY!"
+    if not defined NO_PROXY set "NO_PROXY=localhost,127.0.0.1,::1"
+    echo Using this PC's proxy for downloads: !SETUP_PROXY!
+)
+
 
 REM --- 1. Prefer the project venv if it already exists ---------------------
 REM EXISTENCE IS NOT RUNNABILITY. bootstrap.py is the repair logic, and a repair tool that
@@ -59,61 +150,125 @@ REM can only be launched by the interpreter it is meant to repair is no repair a
 REM copied from another machine (folder copy / OneDrive sync / ZIP restore) carries a
 REM python.exe whose base Python has moved or is gone, so it exists on disk yet cannot execute
 REM -- and launching bootstrap.py with it dies before any of that repair runs. So PROBE it the
-REM same way we already probe py/python below (a trivial 'import sys'), and only adopt it if it
-REM actually runs. If it does not, fall through to the py/python/uv routes, which can rebuild
-REM the venv; do NOT set PYEXE to a dead interpreter.
+REM same way we already probe py/python below, and only adopt it if it actually runs AND is new
+REM enough (D8: a venv built on Python 3.9 runs fine and can never hold the requirements). If
+REM not, fall through to the py/python/uv routes, which rebuild the venv; do NOT set PYEXE to
+REM an interpreter that cannot do the job.
 if exist ".venv\Scripts\python.exe" (
-    ".venv\Scripts\python.exe" -c "import sys" >nul 2>nul
-    if not errorlevel 1 (
+    ".venv\Scripts\python.exe" -c "!PY_MIN_CHECK!" >nul 2>nul
+    set "VRC=!ERRORLEVEL!"
+    if "!VRC!"=="0" (
         set "PYEXE=.venv\Scripts\python.exe"
         goto :have_python
     )
-    echo .venv\Scripts\python.exe exists but could not run; looking for another Python.
+    if "!VRC!"=="3" (
+        echo .venv runs a Python older than !PY_MIN_TEXT!; it will be rebuilt on a newer one.
+    ) else (
+        echo .venv\Scripts\python.exe exists but could not run; looking for another Python.
+    )
 )
 
 REM --- 2. Existing per-user Python on PATH ---------------------------------
+REM NEW ENOUGH, NOT MERELY PRESENT (D8). Any Python 3 used to win here over uv's pinned 3.12, so
+REM a PC whose `py -3` was 3.9 built the venv on it and then looped on "pip install failed
+REM (network or a wheel build)". Too old = say so and fall through to uv.
+REM SETUP_PREFER_UV=1 skips this step: a PATH Python that is new enough but broken in some other
+REM way (a corporate build missing ensurepip, say) can be bypassed without uninstalling it, and CI
+REM uses it to exercise the uv route on a runner that has Python on PATH.
+if "!SETUP_PREFER_UV!"=="1" goto :find_uv
+REM `call` BEFORE EVERY PATH-FOUND INTERPRETER. A `python` that is a .bat/.cmd shim (pyenv-win
+REM installs exactly that) run WITHOUT call hands control to the shim and never comes back:
+REM setup.bat simply ended, rc 0, nothing printed. Found by the install-path tests with a .cmd
+REM stub, 2026-09-24. `call` is harmless in front of a real .exe.
 where py >nul 2>nul
 if not errorlevel 1 (
-    py -3 -c "import sys" >nul 2>nul
-    if not errorlevel 1 (
+    call py -3 -c "!PY_MIN_CHECK!" >nul 2>nul
+    set "PRC=!ERRORLEVEL!"
+    if "!PRC!"=="0" (
         set "PYEXE=py -3"
         goto :have_python
+    )
+    if "!PRC!"=="3" (
+        set "OLDVER="
+        for /f "delims=" %%V in ('py -3 -c "import sys; print(sys.version.split()[0])" 2^>nul') do set "OLDVER=%%V"
+        echo The Python found by 'py -3' ^(!OLDVER!^) is older than !PY_MIN_TEXT!, which this project needs.
+        echo Skipping it; setup will use uv's own Python 3.12 instead ^(no admin, nothing else changes^).
     )
 )
 where python >nul 2>nul
 if not errorlevel 1 (
-    python -c "import sys" >nul 2>nul
-    if not errorlevel 1 (
+    call python -c "!PY_MIN_CHECK!" >nul 2>nul
+    set "PRC=!ERRORLEVEL!"
+    if "!PRC!"=="0" (
         set "PYEXE=python"
         goto :have_python
     )
+    if "!PRC!"=="3" (
+        set "OLDVER="
+        for /f "delims=" %%V in ('python -c "import sys; print(sys.version.split()[0])" 2^>nul') do set "OLDVER=%%V"
+        echo The 'python' on PATH ^(!OLDVER!^) is older than !PY_MIN_TEXT!, which this project needs.
+        echo Skipping it; setup will use uv's own Python 3.12 instead ^(no admin, nothing else changes^).
+    )
 )
 
+:find_uv
 REM --- 3. uv (Astral) already installed under the user profile -------------
-set "UVEXE=%LOCALAPPDATA%\Microsoft\WinGet\Links\uv.exe"
-if not exist "!UVEXE!" set "UVEXE=%USERPROFILE%\.local\bin\uv.exe"
-if not exist "!UVEXE!" set "UVEXE=.setup\bin\uv.exe"
-if exist "!UVEXE!" goto :use_uv
+REM RUN, NOT MERELY FOUND (D20). An interrupted download can leave a truncated .setup\bin\uv.exe
+REM that exists and cannot execute; the existence check adopted it and every later run failed
+REM at `uv python install` with certificate advice. Each candidate is executed; a broken copy in
+REM OUR folder is deleted so the download below replaces it, one elsewhere is only skipped.
+set "UVEXE="
+if exist ".setup\bin\uv.exe" (
+    ".setup\bin\uv.exe" --version >nul 2>nul
+    if errorlevel 1 (
+        echo .setup\bin\uv.exe is present but does not run ^(an interrupted download?^); replacing it.
+        del /f /q ".setup\bin\uv.exe" >nul 2>nul
+    )
+)
+for %%U in ("%LOCALAPPDATA%\Microsoft\WinGet\Links\uv.exe" "%USERPROFILE%\.local\bin\uv.exe" ".setup\bin\uv.exe") do (
+    if not defined UVEXE if exist "%%~U" (
+        "%%~U" --version >nul 2>nul
+        if errorlevel 1 (
+            echo Found "%%~U" but it does not run; ignoring it.
+        ) else (
+            set "UVEXE=%%~U"
+        )
+    )
+)
+if defined UVEXE goto :use_uv
 
 REM --- 4. Download uv into a per-user dir (NO admin) -----------------------
 echo.
-echo No Python interpreter was found on PATH.
+echo No suitable Python interpreter was found on PATH.
 echo Attempting a no-admin install of 'uv' (Astral) into .setup\bin ...
 echo.
 if not exist ".setup\bin" mkdir ".setup\bin"
-set "UVEXE=.setup\bin\uv.exe"
-REM Astral publish a standalone uv.exe; download it with PowerShell (no admin).
+if not defined UV_INSTALLER_URL set "UV_INSTALLER_URL=https://astral.sh/uv/install.ps1"
+REM Astral publish a standalone uv.exe; download it with PowerShell (no admin). The proxy line
+REM makes the installer's own downloads use the proxy found above, with this Windows sign-in
+REM for a proxy that asks for one.
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$ErrorActionPreference='Stop';" ^
   "try {" ^
+  "  if ($env:HTTPS_PROXY) { [System.Net.WebRequest]::DefaultWebProxy = New-Object System.Net.WebProxy($env:HTTPS_PROXY, $true) };" ^
+  "  [System.Net.WebRequest]::DefaultWebProxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials;" ^
   "  $env:UV_INSTALL_DIR = (Resolve-Path '.setup\bin').Path;" ^
   "  $env:UV_NO_MODIFY_PATH = '1';" ^
-  "  Invoke-RestMethod -UseBasicParsing https://astral.sh/uv/install.ps1 | Invoke-Expression;" ^
+  "  Invoke-RestMethod -UseBasicParsing $env:UV_INSTALLER_URL | Invoke-Expression;" ^
   "} catch { Write-Host ('uv download failed: ' + $_.Exception.Message); exit 1 }"
-if exist ".setup\bin\uv.exe" set "UVEXE=.setup\bin\uv.exe"
-if not exist "!UVEXE!" (
+set "UVEXE="
+if exist ".setup\bin\uv.exe" (
+    ".setup\bin\uv.exe" --version >nul 2>nul
+    if not errorlevel 1 set "UVEXE=.setup\bin\uv.exe"
+)
+if not defined UVEXE (
     echo.
-    echo ACTION NEEDED: Could not auto-install 'uv', and no Python was found.
+    echo ACTION NEEDED: Could not auto-install 'uv', and no suitable Python was found.
+    if defined SETUP_PROXY (
+        echo   This PC uses a proxy ^(!SETUP_PROXY!^) and the download went through it. If the
+        echo   error above mentions the proxy, 407, or a timeout, the proxy refused it: ask IT
+        echo   to allow astral.sh and github.com for your account, then re-run setup.bat.
+    )
     echo   Option A ^(recommended, no admin^): install uv manually, then re-run setup.bat
     echo       powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://astral.sh/uv/install.ps1 ^| iex"
     echo   Option B ^(per-user python.org, no admin^): download the installer from
@@ -132,24 +287,61 @@ REM CHECK THE EXIT CODE. This was unchecked, so a failed download fell through t
 REM "uv venv" -- which failed for the same reason -- and the operator was shown one
 REM message about the second failure and none about the first.
 if errorlevel 1 goto :uv_failed
-if not exist ".venv\Scripts\python.exe" (
+REM PROBED, NOT MERELY PRESENT (D20). A .venv\Scripts\python.exe left by an interrupted
+REM `uv venv`, or one on a too-old Python, used to be kept because it existed, and bootstrap was
+REM then launched with that interpreter -- so the repair in bootstrap never got to run, every
+REM run. An unusable one is removed and rebuilt here.
+set "VENV_OK="
+if exist ".venv\Scripts\python.exe" (
+    ".venv\Scripts\python.exe" -c "!PY_MIN_CHECK!" >nul 2>nul
+    if not errorlevel 1 set "VENV_OK=1"
+)
+if not defined VENV_OK if exist ".venv" (
+    echo Removing the unusable .venv so it can be built again ...
+    rmdir /s /q ".venv" >nul 2>nul
+)
+if not defined VENV_OK if exist ".venv" (
+    echo.
+    echo ACTION NEEDED: the old .venv folder could not be removed ^(a file in it is in use^).
+    echo   Close any window or program started from this folder ^(a running server, an editor,
+    echo   a terminal^), delete the .venv folder by hand, then run setup.bat again.
+    set "RC=1" & goto :done
+)
+if not defined VENV_OK (
     REM --seed installs pip into the venv. Without it uv creates a perfectly good venv
     REM with NO pip, and the bootstrap's health probe reads that as "broken" and tries to
     REM delete it -- which is how a fresh machine ended up being told to remove .venv by
     REM hand, for a venv that was working.
-    "!UVEXE!" venv --seed .venv
+    REM --python 3.12 PINS the interpreter just installed. Without it uv picks the first Python
+    REM it discovers, which can be the very too-old one skipped above (D8).
+    "!UVEXE!" venv --seed .venv --python 3.12
 )
 if exist ".venv\Scripts\python.exe" (
-    set "PYEXE=.venv\Scripts\python.exe"
-    goto :have_python
+    ".venv\Scripts\python.exe" -c "!PY_MIN_CHECK!" >nul 2>nul
+    if not errorlevel 1 (
+        set "PYEXE=.venv\Scripts\python.exe"
+        goto :have_python
+    )
 )
 
 :uv_failed
 echo.
 echo ACTION NEEDED: 'uv' could not provision a Python.
 echo.
-echo   If the error above says "invalid peer certificate: UnknownIssuer", this
-echo   network inspects TLS and uv cannot see this machine's root certificates.
+if defined SETUP_PROXY (
+    echo   This PC reaches the internet through a proxy: !SETUP_PROXY!
+    echo   Setup passed it to uv. If the error above mentions the proxy, "407", "tunnel",
+    echo   "connection refused" or a timeout, the proxy is what refused the download:
+    echo     - ask IT to allow github.com and astral.sh through the proxy for your account;
+    echo     - if the proxy needs a user name and password, set it in this window first:
+    echo         set HTTPS_PROXY=http://USER:PASSWORD@proxy-host:port
+    echo       and run setup.bat again from the same window.
+    echo.
+    echo   Only if the error above says "invalid peer certificate: UnknownIssuer" instead:
+) else (
+    echo   If the error above says "invalid peer certificate: UnknownIssuer", this
+    echo   network inspects TLS and uv cannot see this machine's root certificates.
+)
 echo   Setup already tried to export them automatically. If it still fails:
 echo.
 echo   Option A: run setup.bat again -- the export is refreshed each run.
@@ -169,8 +361,26 @@ set "RC=1" & goto :done
 :have_python
 REM Hand off to the real, resumable logic. %* forwards --status / --reset / --only.
 echo Using Python interpreter: !PYEXE!
-!PYEXE! scripts\bootstrap.py %*
+call !PYEXE! scripts\bootstrap.py %*
 set "RC=%ERRORLEVEL%"
+goto :done
+
+:bad_unc
+echo.
+echo ACTION NEEDED: this folder is on a network path: "%SETUP_HERE%"
+echo   Windows' command prompt cannot run setup from a \\server\share location.
+echo   Copy the whole folder to a local drive, for example
+echo       %USERPROFILE%\m365-copilot-companion
+echo   and run setup.bat ^(or quickstart.bat^) from there.
+goto :done
+
+:bad_bang
+echo.
+echo ACTION NEEDED: the folder path contains a "!" character:
+echo       "%SETUP_HERE%"
+echo   The command prompt drops "!" from paths inside these setup scripts, so every file
+echo   would be looked for in the wrong place. Rename the folder ^(or move it^) to a path
+echo   without "!", for example %USERPROFILE%\m365-copilot-companion, and run it from there.
 goto :done
 
 :done
@@ -183,4 +393,4 @@ if not defined FROM_QUICKSTART (
     echo read the output above. Press any key to close.
     pause >nul
 )
-endlocal & exit /b %RC%
+endlocal & endlocal & exit /b %RC%

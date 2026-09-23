@@ -74,12 +74,23 @@ def test_the_credential_lines_use_show_only(transcript):
     # Source-level and stated as such: writing .env end to end would mint real credentials and
     # touch the operator's own file. What is pinned is that neither call site can reach the
     # transcript, which is what the alerts were about.
+    #
+    # RESHAPED 2026-09-24 (D1): the values are no longer printed on one line each but framed by
+    # _show_secrets_box and repeated at the end of the run. The property pinned is unchanged:
+    # every place a value is printed is show_only, and the box has no other output path.
     import inspect
-    src = inspect.getsource(B)
-    for label in ("Your Bearer token (MCP_API_KEY): ", "Your unlock password:"):
-        i = src.index(label)
-        line = src[src.rindex(chr(10), 0, i) + 1:src.index(chr(10), i)]
-        assert "show_only(" in line, "this line still reaches the transcript: %s" % line.strip()
+    box = inspect.getsource(B._show_secrets_box)
+    assert "show_only(" in box
+    assert "log(" not in box.replace("show_only(", "") and "_transcribe(" not in box, \
+        "the secrets box can reach the transcript"
+    src = inspect.getsource(B.step_gen_env)
+    values = ("api_key", "unlock_code", "minted_api", "minted_unlock")
+    for line in src.splitlines():
+        code = line.split("#", 1)[0]
+        if "log(" in code or "_transcribe(" in code:
+            assert not any(v in code for v in values), \
+                "a credential value reaches log/_transcribe: %s" % line.strip()
+    assert src.count("_remember_and_show(") == 2, "a credential display left the box"
 
 
 def test_the_transcript_still_says_the_credentials_were_shown(transcript):

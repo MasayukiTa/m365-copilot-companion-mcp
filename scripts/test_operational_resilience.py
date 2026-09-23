@@ -1,3 +1,4 @@
+import sys
 from pathlib import Path
 
 
@@ -404,8 +405,14 @@ def test_the_tunnel_access_decision_is_asked_recorded_and_applied():
     assert 'tunnel_access_choice' in qs, "the decision is not recorded"
     # asked BEFORE the tunnel is created, because the grant is part of creating it
     assert qs.index("choice /C ATN") < qs.index("STEP 4/7")
-    # default stays off: the env line is only written on an explicit A
-    assert 'if "!TUNNEL_ACCESS!"=="anonymous" (' in qs
+    # default stays off: the env line is only written on an explicit A. Since 2026-09-24 (D4)
+    # the A branch is a jump to the one place that sets the key, and N/T REMOVE it -- executed,
+    # not read, in scripts/test_install_path_batch.py (test_quickstart_*).
+    assert 'if "!TUNNEL_ACCESS!"=="anonymous" goto :access_anonymous' in qs
+    code = "\n".join(l for l in qs.splitlines() if not l.strip().lower().startswith("rem"))
+    sets = [i for i in range(len(code)) if code.startswith("env_file.py set MCP_TUNNEL_ALLOW_ANONYMOUS", i)]
+    assert len(sets) == 1 and sets[0] > code.index(":access_anonymous"), \
+        "the anonymous opt-in is written somewhere other than the explicit-A branch"
     # and tenant access is applied, not printed
     assert "[string]$TenantId" in dt
     # D16 (2026-09-24, `devtunnel access create --help`): --tenant is a flag and takes no id, so
@@ -755,8 +762,19 @@ def test_appending_to_env_cannot_join_the_new_key_onto_the_last_one():
 
     code = "\n".join(l for l in qs.splitlines() if not l.strip().lower().startswith("rem"))
     assert '>> ".env" echo' not in code, "an append that can join lines is back"
-    assert code.count("[IO.File]::AppendAllText") >= 2
-    assert "$b[$b.Length-1] -ne 10" in code, "nothing checks for the trailing newline"
+    # SINCE 2026-09-24 (D28) quickstart writes .env only through scripts/env_file.py, which
+    # replaces the file atomically; the two PowerShell appends are gone. The property is now
+    # checked by RUNNING the writer on a file whose last line has no newline.
+    assert "[IO.File]::AppendAllText" not in code, "a raw append to .env is back"
+    assert r'scripts\env_file.py set MCP_IMPL_AGENT_URL' in code
+    import tempfile
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import env_file
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / ".env"
+        p.write_bytes(b"MCP_API_KEY=abc")                      # no trailing newline
+        env_file.set_key(p, "MCP_IMPL_AGENT_URL", "https://x.invalid/a")
+        assert p.read_bytes().splitlines() == [b"MCP_API_KEY=abc", b"MCP_IMPL_AGENT_URL=https://x.invalid/a"]
 
 
 def test_the_access_choice_beats_the_file_and_the_environment():
@@ -778,15 +796,27 @@ def test_the_access_choice_beats_the_file_and_the_environment():
     # standing opt-in -- executed in scripts/test_setup_devtunnel_access_and_identity.py.
     assert "$AccessMode = Resolve-AccessMode $ForceAnonymous.IsPresent $TenantId $anonSetting" in dt
     assert "-ForceAnonymous" in qs and "ANON_FLAG" in qs
-    # replaced, not appended: an older line further up would otherwise keep winning
-    assert r"MCP_TUNNEL_ALLOW_ANONYMOUS\s*=" in qs
+    # replaced, not appended: an older line further up would otherwise keep winning.
     # AND WRITTEN AS UTF-8 ON BOTH SIDES. The rewrite used Set-Content -Encoding ASCII, which
     # replaces every non-ASCII byte with a question mark, and read with a bare Get-Content,
     # which decodes as the ANSI codepage. Measured on a .env carrying one Japanese comment:
     # ASCII write destroyed it, fixing only the write turned it into mojibake, and fixing both
     # round-trips it unchanged. No BOM, because that is what everything here reads back.
-    assert "[IO.File]::WriteAllLines($p, $keep, (New-Object System.Text.UTF8Encoding($false)))" in qs
-    assert "Get-Content $p -Encoding UTF8" in qs
+    # SINCE 2026-09-24 (D28) the writer is scripts/env_file.py; the same three properties are
+    # checked by running it on the .env this docstring describes (=0 further up, a Japanese
+    # comment). quickstart itself is run end to end in scripts/test_install_path_batch.py.
+    assert r'"!QS_PY!" scripts\env_file.py set MCP_TUNNEL_ALLOW_ANONYMOUS 1' in qs
+    import tempfile
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import env_file
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / ".env"
+        before = "# 日本語のコメント\r\nMCP_TUNNEL_ALLOW_ANONYMOUS=0\r\nMCP_API_KEY=k\r\n"
+        p.write_bytes(before.encode("utf-8"))
+        env_file.set_key(p, "MCP_TUNNEL_ALLOW_ANONYMOUS", "1")
+        raw = p.read_bytes()
+        assert not raw.startswith(b"\xef\xbb\xbf")
+        assert raw.decode("utf-8") == before.replace("ANONYMOUS=0", "ANONYMOUS=1")
     assert "-Encoding ASCII" not in qs, "an ASCII rewrite of .env destroys non-ASCII values"
 
 

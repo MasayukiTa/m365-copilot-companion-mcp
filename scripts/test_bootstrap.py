@@ -103,7 +103,13 @@ class StateMachineTests(unittest.TestCase):
 
         present = Path(self.tmp.name) / "python.exe"
         present.write_text("", encoding="utf-8")
-        with mock.patch.object(bootstrap, "VENV_PYTHON", present):
+        # A WORKING venv is the premise, so it is stated: since 2026-09-24 (D20) an existing
+        # venv that cannot run is cleared too, and an empty file cannot run. The requirements
+        # hash is stated for the same reason (D5): a stale hash clears install_deps by design.
+        state["install_deps_requirements_sha256"] = bootstrap.requirements_hash()
+        bootstrap.save_state(state, self.state_file)
+        with mock.patch.object(bootstrap, "VENV_PYTHON", present), \
+                mock.patch.object(bootstrap, "_venv_usable", return_value=True):
             rec = RecordingSteps(["ensure_venv", "install_deps", "verify"])
             rc = bootstrap.run_all(steps=rec.steps, state_file=self.state_file)
 
@@ -273,6 +279,19 @@ class DevTunnelNeverBlocksTests(unittest.TestCase):
     and interactive sign-in happen later at quickstart STEP 4. On a clean PC
     (devtunnel CLI absent) it must WARN and return normally so the bootstrap
     keeps going instead of walling the novice."""
+
+    # A TEMPORARY ROOT, ALWAYS (added 2026-09-24). These tests patch _read_env_value and left
+    # ROOT pointing at the checkout; once step_dev_tunnel learned to set aside a carried .env's
+    # tunnel keys (D7), a run of this class REWROTE THE CHECKOUT'S REAL .env -- measured, on the
+    # owner's machine, and put back by hand. Nothing in this class may reach a real .env again.
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_root = bootstrap.ROOT
+        bootstrap.ROOT = Path(self._tmp.name)
+
+    def tearDown(self):
+        bootstrap.ROOT = self._orig_root
+        self._tmp.cleanup()
 
     def test_missing_devtunnel_returns_done_not_action_needed(self):
         # find_executable -> None (CLI not on PATH), and force the winget-Links

@@ -1,0 +1,187 @@
+name: Install path (setup.bat end to end)
+
+# THE INSTALL PATH ITSELF, RUN ON A CLEAN WINDOWS (D31, new-PC review 2026-09-24).
+#
+# ci.yml's Windows job installs the requirements with plain pip on a setup-python 3.10 and unit
+# tests bootstrap.py; nothing ran setup.bat. So the things only a real run can show -- which
+# interpreter setup.bat picks (D8), whether a fresh venv is built and verified, whether an LF
+# checkout's labels work (D17), what .env comes out (D6), whether an odd install path breaks it
+# (D23) -- reached users first. This runs the real setup.bat, non-interactively, on a clean
+# checkout, in two shapes that between them cover both line-ending settings and both
+# interpreter routes:
+#
+#   crlf-python : core.autocrlf=true,  the runner's Python on PATH, plain path
+#   lf-uv       : core.autocrlf=false, SETUP_PREFER_UV=1 (uv downloads its own 3.12),
+#                 installed under a path with an apostrophe and parentheses
+#
+# devtunnel is a STUB first on PATH (logs argv, prints canned output): nothing real is created.
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "setup.bat"
+      - "quickstart.bat"
+      - "requirements.txt"
+      - ".env.example"
+      - ".gitattributes"
+      - "scripts/bootstrap.py"
+      - "scripts/env_file.py"
+      - "scripts/preflight_policy.ps1"
+      - "scripts/detect_proxy.ps1"
+      - "scripts/ca_bundle.ps1"
+      - ".github/workflows/install-path.yml"
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  setup-bat:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: crlf-python
+            autocrlf: "true"
+            prefer_uv: "0"
+            dir: "companion"
+          - name: lf-uv
+            autocrlf: "false"
+            prefer_uv: "1"
+            dir: "it's a companion (1)"
+    name: setup.bat (${{ matrix.name }})
+    env:
+      TARGET_DIR: ${{ matrix.dir }}
+
+    steps:
+      # Set BEFORE checkout: this is what decides the working-tree line endings.
+      - name: Line-ending conversion for this checkout
+        shell: powershell
+        run: git config --global core.autocrlf ${{ matrix.autocrlf }}
+
+      - uses: actions/checkout@v7
+
+      - name: Every batch file is CRLF whatever autocrlf says (.gitattributes, D17)
+        shell: powershell
+        run: |
+          $bad = @()
+          foreach ($f in (git ls-files '*.bat' '*.cmd')) {
+            $b = [IO.File]::ReadAllBytes((Join-Path $PWD $f))
+            $lf = 0; $crlf = 0
+            for ($i = 0; $i -lt $b.Length; $i++) {
+              if ($b[$i] -eq 10) { if ($i -gt 0 -and $b[$i - 1] -eq 13) { $crlf++ } else { $lf++ } }
+            }
+            if ($lf -gt 0) { $bad += "$f ($lf LF-only line(s))" }
+          }
+          if ($bad) { $bad; exit 1 }
+          Write-Host "all batch files are CRLF"
+
+      - name: Place the checkout at the install path under test
+        shell: powershell
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP $env:TARGET_DIR
+          robocopy $env:GITHUB_WORKSPACE $target /E /XD .git /NFL /NDL /NJH /NJS | Out-Null
+          if ($LASTEXITCODE -ge 8) { exit 1 }
+          Write-Host "installing into: $target"
+
+      - name: Stub devtunnel first on PATH
+        shell: powershell
+        run: |
+          $d = Join-Path $env:RUNNER_TEMP 'stubbin'
+          New-Item -ItemType Directory -Force -Path $d | Out-Null
+          $log = Join-Path $env:RUNNER_TEMP 'devtunnel_argv.log'
+          $lines = @(
+            '@echo off',
+            ('>>"' + $log + '" echo %*'),
+            'if /i "%~1 %~2"=="user show" (echo Logged in as test@example.invalid using Microsoft.& exit /b 0)',
+            'if /i "%~1"=="show" (echo Tunnel ID : %~2.jpe1& echo   Port 8000 https://%~2-8000.jpe1.devtunnels.ms/& exit /b 0)',
+            'exit /b 0'
+          )
+          [IO.File]::WriteAllLines((Join-Path $d 'devtunnel.cmd'), $lines)
+          Add-Content -Path $env:GITHUB_PATH -Value $d
+
+      - name: Run setup.bat (first run)
+        shell: cmd
+        env:
+          FROM_QUICKSTART: "1"
+          SETUP_UNBLOCK: "1"
+          SETUP_PREFER_UV: ${{ matrix.prefer_uv }}
+        run: |
+          cd /d "%RUNNER_TEMP%\%TARGET_DIR%"
+          call setup.bat < NUL
+          if errorlevel 1 exit /b 1
+
+      - name: Check state.json, the venv and .env against .env.example
+        shell: powershell
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP $env:TARGET_DIR
+          $state = Get-Content -Raw (Join-Path $root '.setup\state.json') | ConvertFrom-Json
+          $steps = 'ensure_venv','install_deps','gen_env','check_edge','dev_tunnel','gen_connector','verify'
+          $missing = @($steps | Where-Object { -not $state.done.$_ })
+          if ($missing) { "state.json: not done: $($missing -join ', ')"; exit 1 }
+          if (-not $state.install_deps_requirements_sha256) { 'state.json: no requirements hash (D5)'; exit 1 }
+
+          $py = Join-Path $root '.venv\Scripts\python.exe'
+          & $py -c "import sys; print(sys.version); assert sys.version_info >= (3, 10)"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if ($env:TARGET_DIR -ne 'companion') {
+            & $py -c "import sys; assert sys.version_info[:2] == (3, 12), sys.version"
+            if ($LASTEXITCODE -ne 0) { 'the uv route did not use its pinned 3.12'; exit 1 }
+          }
+
+          function Get-Keys([string]$path) {
+            Get-Content -LiteralPath $path -Encoding UTF8 |
+              Where-Object { $_ -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=' } |
+              ForEach-Object { $Matches[1] } | Sort-Object -Unique
+          }
+          $want = @(Get-Keys (Join-Path $root '.env.example') | Where-Object { $_ -ne 'MCP_UNLOCK_PASSWORD' })
+          $have = @(Get-Keys (Join-Path $root '.env'))
+          # Secrets and the machine-specific tunnel record are the only permitted differences.
+          $extra = @('MCP_UNLOCK_PASSWORD_PROTECTED', 'MCP_TUNNEL_NAME', 'MCP_TUNNEL_URL', 'MCP_TUNNEL_HOST')
+          $lack = @($want | Where-Object { $have -notcontains $_ })
+          $surplus = @($have | Where-Object { $want -notcontains $_ -and $extra -notcontains $_ })
+          if ($lack -or $surplus) { "missing: $($lack -join ', ')"; "unexpected: $($surplus -join ', ')"; exit 1 }
+          if ($have -notcontains 'MCP_UNLOCK_PASSWORD_PROTECTED') { 'no protected unlock password'; exit 1 }
+          Write-Host ".env keys match .env.example ($($want.Count) keys)"
+
+          $argv = Get-Content (Join-Path $env:RUNNER_TEMP 'devtunnel_argv.log') -ErrorAction SilentlyContinue
+          $argv
+          if ($argv -match '--anonymous|--allow-anonymous') { 'anonymous access was granted without being chosen'; exit 1 }
+
+      - name: Second run resumes and still verifies
+        shell: cmd
+        env:
+          FROM_QUICKSTART: "1"
+          SETUP_PREFER_UV: ${{ matrix.prefer_uv }}
+        run: |
+          cd /d "%RUNNER_TEMP%\%TARGET_DIR%"
+          call setup.bat < NUL > second_run.txt 2>&1
+          set RC=%ERRORLEVEL%
+          type second_run.txt
+          if not "%RC%"=="0" exit /b 1
+          findstr /r /c:"install_deps  *already done" second_run.txt >nul || exit /b 1
+          findstr /c:"registered tool count" second_run.txt >nul || exit /b 1
+
+      - name: A changed requirements.txt is noticed (D5)
+        shell: powershell
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP $env:TARGET_DIR
+          $py = Join-Path $root '.venv\Scripts\python.exe'
+          & $py (Join-Path $root 'scripts\bootstrap.py') --check-deps
+          if ($LASTEXITCODE -ne 0) { 'fresh install reported stale'; exit 1 }
+          Add-Content -Path (Join-Path $root 'requirements.txt') -Value '# changed by CI'
+          & $py (Join-Path $root 'scripts\bootstrap.py') --check-deps
+          if ($LASTEXITCODE -ne 3) { "a changed requirements.txt was not noticed (exit $LASTEXITCODE)"; exit 1 }
+
+      - name: Upload the setup transcript
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: setup-transcript-${{ matrix.name }}
+          path: ${{ runner.temp }}/${{ matrix.dir }}/.setup/bootstrap.log
+          if-no-files-found: ignore
