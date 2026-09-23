@@ -41,12 +41,21 @@ _OK = b'{"ok": true}'
 _ANSWER = ('{"decision":"BLOCK_AND_RETRY","categories":["destructive"],"reason":"rm -rf of the home directory deletes all user files"}')
 
 class _Stub(http.server.BaseHTTPRequestHandler):
+    """Speaks the bridge's contract: POST only, X-Bridge-Token required (bridge/bridge_auth.py)."""
     hits = []
+    token = None
     def log_message(self, *a):
         pass
     def do_GET(self):
+        self.send_response(405); self.end_headers()
+    def do_POST(self):
         from urllib.parse import urlparse
         path = urlparse(self.path).path
+        n = int(self.headers.get("Content-Length") or 0)
+        if n:
+            self.rfile.read(n)
+        if self.headers.get("X-Bridge-Token") != type(self).token:
+            self.send_response(401); self.end_headers(); return
         type(self).hits.append(path)
         if path in ("/new", "/status"):
             self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
@@ -67,8 +76,11 @@ def test_get_routes_bridge():
     os.environ["MCP_JUDGE_BACKEND"] = "bridge"; importlib.reload(jb)
     assert jb.get() is jb.bridge_judge
 
-def test_fresh_conversation_before_turn_and_verdict_parses():
+def test_fresh_conversation_before_turn_and_verdict_parses(tmp_path, monkeypatch):
+    from bridge import bridge_auth
+    monkeypatch.setenv(bridge_auth.TOKEN_DIR_ENV, str(tmp_path))
     _Stub.hits = []; srv = _serve()
+    _Stub.token, _ = bridge_auth.install_token(srv.server_address[1])
     os.environ["MCP_BRIDGE_PORT"] = str(srv.server_address[1])
     os.environ["MCP_JUDGE_BACKEND"] = "bridge"; importlib.reload(jb)
     req = cj.build_request("rm -rf ~", "/home/u", user_messages=["clean tmp"])
@@ -96,8 +108,4 @@ def test_live_roundtrip_opt_in():
     print("live verdict:", out)
 
 if __name__ == "__main__":
-    test_get_routes_bridge()
-    test_fresh_conversation_before_turn_and_verdict_parses()
-    test_unreachable_bridge_is_require_human_not_allow()
-    test_live_roundtrip_opt_in()
-    print("ok")
+    sys.exit(pytest.main([__file__, "-q", "-s"]))

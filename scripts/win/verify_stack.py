@@ -61,7 +61,14 @@ def newest_source_mtime():
 
 
 def bridge_status():
+    """/status WITH the bridge token when there is one: without it the bridge withholds the
+    conversation id this report prints (bridge/bridge_auth.py). No token file -> the token-free
+    answer, which still carries everything else."""
+    from bridge import bridge_auth
     try:
+        if bridge_auth.read_token(bridge_auth.port_of(BRIDGE)):
+            with bridge_auth.request(BRIDGE, "/status", method="GET", timeout=8) as r:
+                return json.load(r)
         with urllib.request.urlopen(BRIDGE + "/status", timeout=8) as r:
             return json.load(r)
     except Exception as exc:

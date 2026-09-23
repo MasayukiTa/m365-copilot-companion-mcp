@@ -335,9 +335,22 @@ class BridgeAgent:
         Connection: close is not decoration -- see the module docstring. `event: done` is
         checked first so a keep-alive server that never closes still terminates the read.
         """
+        # AN AUTHENTICATED POST. The bridge refuses GET on everything that drives the page and
+        # wants its per-start token (bridge/bridge_auth.py); the query becomes the form body.
+        from bridge import bridge_auth
+        token = bridge_auth.read_token(self.port)
+        if not token:
+            raise RuntimeError("no bridge token at %s -- the bridge on :%d is not running or "
+                               "is older than this client" % (bridge_auth.token_path(self.port),
+                                                              self.port))
+        route, _, form = path.partition("?")
+        body = form.encode("ascii")
         s = socket.create_connection((self.host, self.port), timeout=15)
-        s.sendall(("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n"
-                   % (path, self.host)).encode())
+        s.sendall(("POST %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n%s: %s\r\n"
+                   "Content-Type: application/x-www-form-urlencoded\r\n"
+                   "Content-Length: %d\r\n\r\n"
+                   % (route, self.host, bridge_auth.TOKEN_HEADER, token, len(body))).encode()
+                  + body)
         s.settimeout(timeout or self.timeout)
         buf = b""
         started = time.time()

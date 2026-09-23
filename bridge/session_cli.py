@@ -243,21 +243,34 @@ def render_verdict(verdict: dict) -> str:
 
 # HTTP layer (thin; mocked/stubbed in tests)
 
+def _bridge_auth():
+    """bridge/bridge_auth.py, whether this runs as `python bridge/session_cli.py` (repo root not
+    on sys.path) or is imported as bridge.session_cli."""
+    try:
+        from bridge import bridge_auth
+    except ImportError:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from bridge import bridge_auth
+    return bridge_auth
+
+
 class BridgeClient:
+    """Every call is an authenticated POST (X-Bridge-Token, see bridge/bridge_auth.py) except
+    the liveness probe, which asks the token-free /status."""
+
     def __init__(self, base_url: str | None = None, timeout: float = 10.0):
         self.base_url = base_url or bridge_base_url()
         self.timeout = timeout
 
     def _get(self, path: str, params: dict | None = None):
-        url = self.base_url + path
-        if params:
-            url += "?" + urllib.parse.urlencode(params)
-        with urllib.request.urlopen(url, timeout=self.timeout) as resp:
+        with _bridge_auth().request(self.base_url, path, params, timeout=self.timeout) as resp:
             return resp.read()
 
     def is_up(self) -> bool:
         try:
-            self._get("/")
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(self.base_url + "/status", timeout=self.timeout) as resp:
+                resp.read()
             return True
         except Exception:
             return False
@@ -287,8 +300,7 @@ class BridgeClient:
 
     def _sse_lines(self, path: str, params: dict):
         """Yield raw decoded text lines from an SSE endpoint."""
-        url = self.base_url + path + "?" + urllib.parse.urlencode(params)
-        with urllib.request.urlopen(urllib.request.Request(url), timeout=None) as resp:
+        with _bridge_auth().request(self.base_url, path, params, timeout=None) as resp:
             for raw in resp:
                 yield raw.decode("utf-8", errors="replace")
 

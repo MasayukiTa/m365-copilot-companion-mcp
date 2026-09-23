@@ -607,7 +607,9 @@ def test_every_borrowing_endpoint_gives_the_page_back_except_upload():
     """
     import inspect
 
-    src = inspect.getsource(B.Handler.do_GET)
+    # _route is the dispatch table (it was do_GET until every request went through
+    # Handler._dispatch's auth check, 2026-09-24).
+    src = inspect.getsource(B.Handler._route)
     assert src.count("borrow_page") == 5
     assert src.count("return_page") == 4
 

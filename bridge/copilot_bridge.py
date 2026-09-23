@@ -18,11 +18,18 @@ Setup (once):
   * In .env set the bare agent URL of YOUR agent (the one with the MCP connector):
       MCP_IMPL_AGENT_URL=https://m365.cloud.microsoft/chat/agent/T_....<id>
   * Run:  .venv\\Scripts\\python.exe bridge\\copilot_bridge.py
-  * Open http://127.0.0.1:8765
+  * Talk to it from the CopilotChat window (ui/CopilotChat.exe) or bridge/session_cli.py.
+
+EVERY REQUEST IS AUTHENTICATED (2026-09-24). State changes and page reads are POST only and
+must carry the per-start token from bridge/bridge_auth.py in X-Bridge-Token; anything a
+browser would send (Origin, Referer, a cross-site Sec-Fetch-Site, a non-loopback Host) is
+refused. The in-browser chat page this used to serve at / could not authenticate and is gone.
+See bridge/bridge_auth.py for the model and Handler._dispatch for the enforcement.
 """
 from __future__ import annotations
 
 import hashlib
+import hmac
 import http.client
 import json
 import logging
@@ -383,6 +390,7 @@ from relay.copilot_autopilot_relay import COPILOT_SELECTORS, CopilotWebDriver, P
 from relay.relay_fleet import CONSENT_MARKERS
 from bridge import session_store as S
 from bridge import review_command
+from bridge import bridge_auth
 from relay.skills import SkillError, SkillStore, format_skill_list
 # tool_probe is stdlib-only (see its module docstring) -- cheap to import here regardless of
 # the heavy relay chain already loaded above. Used by the idle tool-call self-probe, see the
@@ -3630,62 +3638,231 @@ def _scrape_history():
     return out
 
 
-PAGE_HTML = """<!doctype html><html lang="ja"><head><meta charset="utf-8">
+# THE IN-BROWSER CHAT PAGE IS GONE, and this is why. It streamed through
+# `new EventSource('/stream?msg=...')` -- a GET with no credential, which is precisely the request
+# shape any other web page could also make the browser send to 127.0.0.1. A page that could
+# authenticate would have to be handed the token, and serving the token to whoever asks for /
+# hands it to every local process too. So / now says where the chat went, and nothing more.
+PAGE_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Copilot (local bridge)</title>
-<style>
-  :root{color-scheme:dark}
-  *{box-sizing:border-box}
-  body{margin:0;background:#1a1a1a;color:#e8e8e8;font:15px/1.6 -apple-system,Segoe UI,Roboto,sans-serif}
-  header{padding:12px 18px;border-bottom:1px solid #333;font-weight:600;color:#c9a36a}
-  #log{max-width:820px;margin:0 auto;padding:18px}
-  .msg{margin:14px 0;display:flex;gap:10px}
-  .who{flex:0 0 64px;color:#888;font-size:13px;padding-top:2px}
-  .body{white-space:pre-wrap;word-break:break-word;flex:1}
-  .user .body{color:#9ecbff}
-  .bar{position:sticky;bottom:0;background:#1a1a1a;border-top:1px solid #333;padding:12px}
-  form{max-width:820px;margin:0 auto;display:flex;gap:8px}
-  textarea{flex:1;resize:none;background:#252525;color:#e8e8e8;border:1px solid #3a3a3a;border-radius:8px;padding:10px;font:inherit}
-  button{background:#c9a36a;color:#1a1a1a;border:0;border-radius:8px;padding:0 18px;font-weight:600;cursor:pointer}
-  button:disabled{opacity:.5;cursor:default}
-  .cursor::after{content:"\\25ae";color:#c9a36a;animation:b 1s steps(1) infinite}
-  @keyframes b{50%{opacity:0}}
-</style></head><body>
-<header>● Copilot — local bridge (Python + Edge, no Node)</header>
-<div id="log"></div>
-<div class="bar"><form id="f">
-  <textarea id="q" rows="2" placeholder="メッセージを入力 (Enter で送信)"></textarea>
-  <button id="send" type="submit">送信</button>
-</form></div>
-<script>
-const log=document.getElementById('log'),q=document.getElementById('q'),btn=document.getElementById('send'),f=document.getElementById('f');
-function add(who,cls){const m=document.createElement('div');m.className='msg '+cls;
-  const w=document.createElement('div');w.className='who';w.textContent=who;
-  const b=document.createElement('div');b.className='body';m.append(w,b);log.append(m);
-  window.scrollTo(0,document.body.scrollHeight);return b;}
-function ask(text){
-  add('You','user').textContent=text;
-  const out=add('Copilot','asst');out.classList.add('cursor');
-  btn.disabled=true;
-  const es=new EventSource('/stream?msg='+encodeURIComponent(text));
-  es.onmessage=e=>{const d=JSON.parse(e.data);
-    if(d.replace!==undefined){out.textContent=d.replace;window.scrollTo(0,document.body.scrollHeight);}
-    else if(d.delta){out.textContent+=d.delta;window.scrollTo(0,document.body.scrollHeight);}};
-  es.addEventListener('done',()=>{out.classList.remove('cursor');es.close();btn.disabled=false;q.focus();});
-  es.onerror=()=>{out.classList.remove('cursor');es.close();btn.disabled=false;};
-}
-f.onsubmit=e=>{e.preventDefault();const t=q.value.trim();if(!t)return;q.value='';ask(t);};
-q.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();f.requestSubmit();}});
-</script></body></html>"""
+<title>Copilot bridge</title>
+<style>body{margin:0;padding:24px;background:#1a1a1a;color:#e8e8e8;
+font:15px/1.6 -apple-system,Segoe UI,Roboto,sans-serif}code{color:#c9a36a}</style>
+</head><body>
+<p>This is the local Copilot bridge. It no longer serves a browser chat page: every request
+must carry the bridge token, which a browser page cannot hold safely.</p>
+<p>Use the <code>CopilotChat</code> window (<code>ui\\CopilotChat.exe</code>) or
+<code>python bridge\\session_cli.py</code>.</p>
+</body></html>"""
+
+
+#: Every path the bridge serves. Anything else is a 404 -- after the browser checks, so a web
+#: page cannot use the 404/200 difference to probe what is here either.
+BRIDGE_ROUTES = frozenset({
+    "/", "/stream", "/goal", "/stop", "/new", "/status", "/conv", "/switch", "/sessions",
+    "/adopt", "/resume", "/send", "/history", "/delete", "/forget", "/agent_conversations",
+    "/upload",
+})
+
+#: Answered to a GET, and without a token -- each with a REDUCED answer (see Handler._route):
+#:   /        the static note above
+#:   /status  liveness and busy flags only. scripts/supervisor.ps1, scripts/stale_server_check.py,
+#:            scripts/status.py and scripts/start_all.ps1 read turn_running/busy from here to
+#:            decide whether a restart would kill a live turn; none of them needs a secret for
+#:            that, and "the bridge is unreadable" must not turn into "the bridge is busy".
+#:   /conv    liveness only; the conversation URL is withheld without a token.
+#:            scripts/start_all.ps1 and scripts/doctor.ps1 probe it to see whether the process
+#:            holding :8765 is a working bridge.
+#: Everything else is POST-only and needs the token.
+BRIDGE_OPEN_ROUTES = frozenset({"/", "/status", "/conv"})
+
+#: The largest POST body read. A message is text; nothing legitimate comes near this.
+BRIDGE_MAX_BODY = 8 * 1024 * 1024
+
+#: Host header values a native client sends. A browser that reached 127.0.0.1 through a
+#: rebinding DNS name sends that NAME, which is the whole of the DNS-rebinding defence.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "[::1]"})
+
+#: Set by main() once the listening socket is bound (bridge_auth.install_token). None means no
+#: token was ever installed, and every token-requiring request is then refused -- fail closed.
+BRIDGE_TOKEN: "str | None" = None
+
+_UPDATE_HINT = "rebuild the chat window (ui\\rebuild_ui.ps1) or update the client"
+
+
+def bridge_request_refusal(method, path, headers, expected_token):
+    """(status, reason phrase, detail) for a request the bridge must refuse, or None. Pure.
+
+    ORDER IS DELIBERATE. The browser checks run first and on EVERY path, /status included:
+    a browser has no business here at all, and answering it anything -- even a 404 -- tells a
+    hostile page what exists. Then the method, then the token.
+
+    The reason phrase is what an OLD client shows the person: .NET's WebException message is
+    "(405) <reason phrase>", so the phrase itself says what to do. ASCII only (it goes out in
+    the status line).
+    """
+    host = (headers.get("Host") or "").strip().lower()
+    if host:
+        hostname = host.split("]")[0] + "]" if host.startswith("[") else host.rsplit(":", 1)[0]
+        if hostname not in _LOOPBACK_HOSTS:
+            return (403, "Forbidden - Host is not loopback",
+                    "Host %r is not a loopback name; refused (DNS rebinding)" % host[:80])
+    if headers.get("Origin") is not None:
+        return (403, "Forbidden - browser origin",
+                "requests carrying an Origin header are refused: the bridge takes no "
+                "browser traffic")
+    if headers.get("Referer") is not None:
+        return (403, "Forbidden - browser referer",
+                "requests carrying a Referer header are refused: the bridge takes no "
+                "browser traffic")
+    site = headers.get("Sec-Fetch-Site")
+    if site is not None and site.strip().lower() not in ("none", "same-origin"):
+        return (403, "Forbidden - cross-site request",
+                "Sec-Fetch-Site %r is refused: the bridge takes no browser traffic" % site[:40])
+    if method == "OPTIONS":
+        # NEVER a positive preflight. No Access-Control-* header is ever sent by this server,
+        # so a browser can never be told a cross-origin request with X-Bridge-Token is allowed.
+        return (403, "Forbidden - no cross-origin access", "CORS preflight refused")
+    if path not in BRIDGE_ROUTES:
+        return (404, "Not Found", "no such endpoint")
+    if method not in ("GET", "POST"):
+        return (405, "Method Not Allowed", "only GET (status probes) and POST are served")
+    if method == "GET" and path not in BRIDGE_OPEN_ROUTES:
+        return (405, "Method Not Allowed - this bridge takes POST with X-Bridge-Token; "
+                + _UPDATE_HINT,
+                "%s changes state or reads the page, so it is POST-only and needs the %s "
+                "header (see bridge/bridge_auth.py); %s" % (path, bridge_auth.TOKEN_HEADER,
+                                                           _UPDATE_HINT))
+    supplied = headers.get(bridge_auth.TOKEN_HEADER)
+    if supplied is None and path in BRIDGE_OPEN_ROUTES:
+        return None                      # the reduced, token-free answer
+    if not expected_token:
+        return (503, "Service Unavailable - bridge token not initialised",
+                "the bridge has no token installed, so nothing that needs one is served")
+    if supplied is None:
+        return (401, "Unauthorized - missing X-Bridge-Token; " + _UPDATE_HINT,
+                "%s needs the %s header; the token is in %s"
+                % (path, bridge_auth.TOKEN_HEADER, "the per-user bridge token file"))
+    if not hmac.compare_digest(supplied.strip().encode("utf-8", "replace"),
+                               expected_token.encode("utf-8")):
+        return (401, "Unauthorized - wrong X-Bridge-Token",
+                "the token does not match this bridge (it may have restarted: re-read the "
+                "token file)")
+    return None
 
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    # ── the door. Every request, whatever its method, goes through _dispatch. ─────────────────
+
     def do_GET(self):
-        global ACTIVE_SID
+        self._dispatch("GET")
+
+    def do_POST(self):
+        self._dispatch("POST")
+
+    def do_OPTIONS(self):
+        self._dispatch("OPTIONS")
+
+    def do_PUT(self):
+        self._dispatch("PUT")
+
+    def do_DELETE(self):
+        self._dispatch("DELETE")
+
+    def _refuse(self, code, reason, detail):
+        body = json.dumps({"ok": False, "error": detail, "refused": code},
+                          ensure_ascii=False).encode("utf-8")
+        self.send_response(code, reason)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        if code == 405:
+            self.send_header("Allow", "POST")
+        self.end_headers()
+        self.wfile.write(body)
+
+    #: What an OLD chat window shows when it streams with a bare GET. Bilingual because it is
+    #: displayed verbatim, as the answer bubble.
+    OUTDATED_CLIENT_TEXT = (
+        "[bridge error: このチャット画面はブリッジより古いため、送信できませんでした（何も送信されて"
+        "いません）。ui\\rebuild_ui.ps1 を実行して画面を更新してください。 / This chat window is "
+        "older than the bridge, which now requires POST with X-Bridge-Token -- nothing was sent. "
+        "Run ui\\rebuild_ui.ps1 to update it.]")
+
+    def _refuse_as_stream(self):
+        """A GET /stream or /goal from an old client: refused -- nothing runs -- but answered as
+        the stream it expects, carrying the instruction.
+
+        WHY NOT THE 405. The old window reads a stream body only on a 200; on any error it shows
+        .NET's WebException message, and .NET substitutes its OWN localized text for a known
+        status ("(405) メソッドは使用できません", measured) -- the reason phrase that says what to
+        do never reaches the person. The text is framed as "[bridge error: ...]" because every
+        old stream reader already treats that marker as a failed turn, not an answer
+        (tools/judge_backend.py, bench/companionbench/agents.py). Only reached by a request that
+        passed every browser check, so this is not something a web page can use.
+        """
+        body = ("data: %s\n\nevent: done\ndata: {}\n\n"
+                % json.dumps({"replace": self.OUTDATED_CLIENT_TEXT, "refused": 405},
+                             ensure_ascii=False)).encode("utf-8")
+        self.send_response(200, "OK - refused, client outdated")
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Bridge-Refused", "405")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _dispatch(self, method):
         parsed = urllib.parse.urlparse(self.path)
+        body = b""
+        if method in ("POST", "PUT", "DELETE"):
+            # READ THE BODY BEFORE ANY REFUSAL. Closing a socket with unread bytes in its
+            # receive buffer makes Windows send RST, and the client then reports "connection
+            # reset" instead of the refusal that explains itself.
+            if self.headers.get("Transfer-Encoding"):
+                self._refuse(411, "Length Required", "chunked bodies are not accepted")
+                return
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                self._refuse(400, "Bad Request", "unreadable Content-Length")
+                return
+            if n < 0 or n > BRIDGE_MAX_BODY:
+                self._refuse(413, "Payload Too Large", "body over %d bytes" % BRIDGE_MAX_BODY)
+                return
+            body = self.rfile.read(n) if n else b""
+        refusal = bridge_request_refusal(method, parsed.path, self.headers, BRIDGE_TOKEN)
+        if refusal is not None:
+            if refusal[0] in (401, 403, 503):
+                logger.warning("bridge refused %s %s: %s", method, logsafe(parsed.path),
+                               refusal[2])
+            if refusal[0] == 405 and method == "GET" and parsed.path in ("/stream", "/goal"):
+                self._refuse_as_stream()
+                return
+            self._refuse(*refusal)
+            return
+        authed = self.headers.get(bridge_auth.TOKEN_HEADER) is not None   # validated above
+        if body:
+            ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if ctype != "application/x-www-form-urlencoded":
+                self._refuse(415, "Unsupported Media Type",
+                             "POST bodies are application/x-www-form-urlencoded")
+                return
+            try:
+                form = body.decode("ascii")
+            except UnicodeDecodeError:
+                self._refuse(400, "Bad Request", "a form body is percent-encoded ASCII")
+                return
+            # The handlers read parse_qs(parsed.query); the form fields join the query string,
+            # so every handler below is unchanged by the move from GET to POST.
+            parsed = parsed._replace(query=(parsed.query + "&" + form) if parsed.query else form)
+        self._route(parsed, authed)
+
+    def _route(self, parsed, authed):
+        global ACTIVE_SID
         if parsed.path == "/":
             body = PAGE_HTML.encode("utf-8")
             self.send_response(200)
@@ -3793,7 +3970,7 @@ class Handler(BaseHTTPRequestHandler):
                 store = S.store_stats() or {}
             except Exception as exc:
                 store = {"error": "%s: %s" % (type(exc).__name__, str(exc)[:80])}
-            self._json({
+            status = {
                 "ok": True,
                 "transport": "socket" if _on_socket() else ("page" if DRIVER else "none"),
                 "socket_enabled": BRIDGE_SOCKET,
@@ -3812,9 +3989,25 @@ class Handler(BaseHTTPRequestHandler):
                 "pid": os.getpid(),
                 "started": _PROCESS_STARTED,
                 "python": platform.python_version(),
-            })
+                "authenticated": authed,
+            }
+            if not authed:
+                # WITHOUT THE TOKEN: liveness and the busy flags, nothing that names a
+                # conversation. The restart gates (supervisor.ps1, stale_server_check.py,
+                # start_all.ps1) read only turn_running/busy; a caller that wants the ids sends
+                # the token (scripts/win/verify_stack.py does).
+                status.pop("conversation", None)
+                status.pop("active_sid", None)
+            self._json(status)
             return
         if parsed.path == "/conv":         # current conversation URL (for saving)
+            if not authed:
+                # LIVENESS ONLY. start_all.ps1 and doctor.ps1 ask /conv "is this a working
+                # bridge?" and need a 200 for yes; the URL is the page's, so it needs the token.
+                # Answered before the lock: a probe must not queue behind a turn.
+                self._json({"ok": True, "url": "", "url_withheld": True,
+                            "note": "send X-Bridge-Token to read the conversation url"})
+                return
             if not PAGE_LOCK.acquire(blocking=False):
                 self._json({"ok": False, "error": "busy"}); return
             try:
@@ -7204,6 +7397,22 @@ def main():
                        exc_info=True)
 
     srv = _SingleBindHTTPServer(("127.0.0.1", port), Handler)
+    # THE TOKEN IS WRITTEN AFTER THE BIND, NEVER BEFORE. A second instance that loses the bind
+    # (or exits at the single-instance guard above) must not overwrite the token of the bridge
+    # that is actually serving -- that would lock every client out of a healthy bridge.
+    # Nothing is served until serve_forever(), so no request can see BRIDGE_TOKEN unset.
+    global BRIDGE_TOKEN
+    try:
+        BRIDGE_TOKEN, _acl = bridge_auth.install_token(port)
+    except Exception as exc:
+        # FAIL CLOSED. Serving with a token in a file other accounts can read is serving
+        # without one; serving with no token at all refuses everything anyway. Say so and stop.
+        logger.error("bridge: could not write an owner-only token file (%s: %s); refusing to "
+                     "serve", type(exc).__name__, exc)
+        srv.server_close()
+        raise SystemExit(3)
+    print("copilot bridge: token file %s (owner-only: %s)"
+          % (bridge_auth.token_path(port), " ".join(str(_acl).split())[:200]), flush=True)
     print("copilot bridge: http://127.0.0.1:%d" % port, flush=True)
     srv.serve_forever()
 

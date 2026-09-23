@@ -855,6 +855,7 @@ _SANDBOX_NAMES = (
     "auth_rejections_pytest_%s.jsonl",
     "notify_source_pytest_%s.log",
     "bridge_undelivered_pytest_%s.jsonl",
+    "bridge_token_pytest_%s",
 )
 
 _atexit.register(_drop_this_runs_sandbox)
@@ -948,6 +949,15 @@ _os.environ.setdefault(
 _os.environ.setdefault(
     "MCP_BRIDGE_UNDELIVERED_FILE",
     _sandbox_path("bridge_undelivered_pytest_%s.jsonl"))
+
+
+# And the bridge's token directory. This is not a record but a live credential: a test that
+# called bridge_auth.install_token without it would ROTATE THE RUNNING BRIDGE'S TOKEN, and every
+# open chat window would be refused until it re-read the file. Resolved at call time, so a test
+# that moves it again (monkeypatch.setenv) still wins.
+_os.environ.setdefault(
+    "MCP_BRIDGE_TOKEN_DIR",
+    _sandbox_path("bridge_token_pytest_%s"))
 
 
 @pytest.fixture(autouse=True)

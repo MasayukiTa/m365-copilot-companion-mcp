@@ -55,9 +55,15 @@ def bridge_http(tmp_path, monkeypatch):
         "the store is not isolated; refusing to run rather than write into the real one"
 
     import bridge.copilot_bridge as B
+    from bridge import bridge_auth
     from http.server import HTTPServer
 
+    # THE TOKEN, AS main() INSTALLS IT -- into a directory of this test's own. /send is POST-only
+    # and needs X-Bridge-Token since 2026-09-24 (bridge/bridge_auth.py).
+    monkeypatch.setenv(bridge_auth.TOKEN_DIR_ENV, str(tmp_path / "token"))
     srv = HTTPServer(("127.0.0.1", 0), B.Handler)
+    token, _ = bridge_auth.install_token(srv.server_address[1])
+    monkeypatch.setattr(B, "BRIDGE_TOKEN", token)
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
     try:
@@ -69,7 +75,14 @@ def bridge_http(tmp_path, monkeypatch):
 
 
 def _get(base, path, timeout=15):
-    with urllib.request.urlopen(base + path, timeout=timeout) as r:
+    """The chat window's request, byte for byte: an authenticated POST whose body is the query
+    string exactly as it was built (ui/BridgeClient.cs sends it unchanged), not re-encoded."""
+    from bridge import bridge_auth
+    route, _, form = path.partition("?")
+    req = urllib.request.Request(base + route, data=form.encode("ascii"), method="POST")
+    req.add_header(bridge_auth.TOKEN_HEADER, bridge_auth.read_token(bridge_auth.port_of(base)))
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
