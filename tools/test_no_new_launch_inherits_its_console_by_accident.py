@@ -126,7 +126,13 @@ BASELINE = {
     "scripts/bootstrap.py::_provision_dev_tunnel::subprocess.Popen": 1,
     "scripts/bootstrap.py::_seed_pip::subprocess.call": 1,
     "scripts/bootstrap.py::step_ensure_venv::subprocess.call": 1,
-    "scripts/bootstrap.py::step_install_deps::subprocess.call": 2,
+    # 2026-09-24: step_install_deps became a thin lock-acquire wrapper around
+    # _install_deps_locked (7034f0b, "installs repair what pip breaks"), which also added a
+    # third call: a --force-reinstall pass for distributions pip's own upgrade left broken
+    # (see the comment above the `before = {spec for spec, _ in _broken_distributions(py)}`
+    # line in scripts/bootstrap.py::_install_deps_locked). None of the three decide a console
+    # policy, same as every other pip-install call already in this table.
+    "scripts/bootstrap.py::_install_deps_locked::subprocess.call": 3,
     "scripts/change_scope.py::_git::subprocess.run": 1,
     "scripts/check_integration_evidence.py::_git::subprocess.run": 1,
     "scripts/check_integration_evidence.py::references::subprocess.run": 1,

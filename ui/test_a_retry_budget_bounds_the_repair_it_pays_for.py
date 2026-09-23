@@ -36,10 +36,15 @@ import re
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 COCKPIT = os.path.join(REPO, "ui", "FleetCockpit.cs")
+SELFIMPROVE_DASHBOARD = os.path.join(REPO, "ui", "SelfImproveDashboard.cs")
 
 
 def _src():
     return io.open(COCKPIT, encoding="utf-8").read()
+
+
+def _dashboard_src():
+    return io.open(SELFIMPROVE_DASHBOARD, encoding="utf-8").read()
 
 
 def _body(signature, src=None):
@@ -104,12 +109,25 @@ def test_the_cap_is_still_consulted():
 
     THE FIRST DRAFT ASSERTED A SPELLING and failed on the declaration's column alignment --
     `AUTOFIX_MAX_ATTEMPTS      = 3;`. The property is "it is declared and it is a small positive
-    number", so that is what is matched."""
+    number", so that is what is matched.
+
+    UPDATED 2026-09-24 (61348a2, "cross-process gates for automatic bring-up"): the in-process
+    comparison `_autoFixAttempts >= AUTOFIX_MAX_ATTEMPTS` moved out of MaybeAutoFix entirely --
+    a budget of a THIS-PROCESS field bound nothing across the very relaunches it existed to
+    stop, so the count is now persisted to .fleet/autofix_budget.json and the comparison lives
+    in AutoFixBudget.Decide (ui/SelfImproveDashboard.cs), which MaybeAutoFix reaches through
+    TryConsumeAutoFixBudget. Both ends of that handoff are checked here: the call site still
+    passes AUTOFIX_MAX_ATTEMPTS, and Decide still bounds attempts against it."""
     body = _body("void MaybeAutoFix()")
-    assert "_autoFixAttempts >= AUTOFIX_MAX_ATTEMPTS" in body
+    assert "TryConsumeAutoFixBudget(fault, AUTOFIX_MAX_ATTEMPTS, AUTOFIX_BUDGET_WINDOW_S" in body, (
+        "MaybeAutoFix no longer hands its cap to the persisted budget check")
     m = re.search(r"AUTOFIX_MAX_ATTEMPTS\s*=\s*(\d+)", _src())
     assert m, "the cap is no longer declared"
     assert 1 <= int(m.group(1)) <= 10, "an unattended repair budget of %s" % m.group(1)
+
+    decide_body = _body("internal static Decision Decide(", src=_dashboard_src())
+    assert "kept.Count < maxAttempts" in decide_body, (
+        "AutoFixBudget.Decide no longer bounds attempts against the cap it was given")
 
 
 def test_a_green_streak_is_what_clears_a_budget():

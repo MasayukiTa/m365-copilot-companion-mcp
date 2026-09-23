@@ -730,7 +730,25 @@ jobs:
             scripts/probes/test_the_probe_matches_the_recording.py \
             scripts/probes/test_a_cut_observation_must_announce_the_cut.py \
             scripts/test_devtunnel_download.py \
-            tests/test_ledger_attribution_reaches_the_ledger.py
+            tests/test_ledger_attribution_reaches_the_ledger.py \
+            bridge/test_a_finished_fold_costs_no_scan.py \
+            bridge/test_the_bridge_refuses_what_a_browser_can_send.py \
+            relay/test_a_fleet_start_does_not_walk_a_workspace.py \
+            relay/test_task_router_exact_approval.py \
+            scripts/test_update_from_release.py \
+            tests/test_health_route.py \
+            tests/test_launch_gate_asks_only_what_it_reads.py \
+            tools/test_notify_ops_gate_reachability.py \
+            ui/test_the_frozen_dot_has_no_untranslated_jargon.py \
+            ui/test_the_startup_loop_has_a_backstop.py \
+            ui/test_the_bridge_client_sends_the_token.py \
+            scripts/test_preflight_wsh_and_start_all_fallback.py \
+            scripts/test_quickstart_exit_code.py \
+            scripts/test_quickstart_lock.py \
+            scripts/test_setup_devtunnel_signature.py \
+            scripts/test_setup_uv_installer_policy.py \
+            scripts/test_shortcuts_without_wsh.py \
+            scripts/test_start_all_splash_can_be_minimized.py
 
       - name: Run script-style tracer tests
         run: python tools/test_trace.py
@@ -869,7 +887,7 @@ jobs:
         env:
           REQUIRE_CSC: "1"
         run: |
-          python -m pytest -rsx tools/test_a_windowless_launch_really_has_no_window.py ui/test_the_ui_and_the_fleet_agree_on_the_command_channel.py ui/test_the_chat_window_sends_what_was_typed.py ui/test_both_windows_can_be_constructed.py ui/test_a_submitted_task_is_on_top_at_once.py scripts/test_a_silent_death_leaves_its_exit_code.py scripts/test_a_runner_that_dies_before_argparse_is_recorded.py scripts/test_supervisor_reresolves_python.py scripts/test_supervisor_port_owner.py scripts/test_supervisor_fleet_resume_guard.py scripts/test_a_submitted_job_is_picked_up_at_once.py scripts/test_setup_devtunnel_access_and_identity.py scripts/test_doctor_reports_the_last_start.py scripts/test_unlock_password_is_retrievable.py scripts/test_start_all_install_path.py scripts/test_a_bridge_restart_respects_a_live_turn.py scripts/test_install_path_powershell.py scripts/test_install_path_batch.py scripts/test_heal_tunnel_notice_survives_an_apostrophe_path.py scripts/test_a_failing_entry_point_says_why.py scripts/test_generated_tunnel_name_matches_across_languages.py scripts/test_start_all_dependency_drift_check.py
+          python -m pytest -rsx tools/test_a_windowless_launch_really_has_no_window.py ui/test_the_ui_and_the_fleet_agree_on_the_command_channel.py ui/test_the_chat_window_sends_what_was_typed.py ui/test_both_windows_can_be_constructed.py ui/test_a_submitted_task_is_on_top_at_once.py scripts/test_a_silent_death_leaves_its_exit_code.py scripts/test_a_runner_that_dies_before_argparse_is_recorded.py scripts/test_supervisor_reresolves_python.py scripts/test_supervisor_port_owner.py scripts/test_supervisor_fleet_resume_guard.py scripts/test_a_submitted_job_is_picked_up_at_once.py scripts/test_setup_devtunnel_access_and_identity.py scripts/test_doctor_reports_the_last_start.py scripts/test_unlock_password_is_retrievable.py scripts/test_start_all_install_path.py scripts/test_a_bridge_restart_respects_a_live_turn.py scripts/test_install_path_powershell.py scripts/test_install_path_batch.py scripts/test_heal_tunnel_notice_survives_an_apostrophe_path.py scripts/test_a_failing_entry_point_says_why.py scripts/test_generated_tunnel_name_matches_across_languages.py scripts/test_start_all_dependency_drift_check.py ui/test_the_bridge_client_sends_the_token.py ui/test_the_startup_loop_has_a_backstop.py scripts/test_preflight_wsh_and_start_all_fallback.py scripts/test_quickstart_exit_code.py scripts/test_quickstart_lock.py scripts/test_setup_devtunnel_signature.py scripts/test_setup_uv_installer_policy.py scripts/test_shortcuts_without_wsh.py scripts/test_start_all_splash_can_be_minimized.py
 
       # The keyboard table lives here rather than on the ubuntu job because
       # tools/desktop_input.py binds ctypes.windll.user32 at import, so the module cannot
