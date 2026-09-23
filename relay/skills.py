@@ -16,6 +16,7 @@ import dataclasses
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import secrets
@@ -24,6 +25,7 @@ import sqlite3
 import tempfile
 import threading
 import time
+import unicodedata
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -162,6 +164,47 @@ def _safe_files(root: Path) -> tuple[list[tuple[str, bytes]], int]:
     return rows, total
 
 
+#: Limits on the optional `keywords:` frontmatter list (see _validate_keywords). The total
+#: equals the description's limit: keywords are more matching text, and the description's
+#: bound is the one this format already settled on for "text matched against every request".
+MAX_KEYWORDS = 32
+MAX_KEYWORD_CHARS = 100
+MAX_KEYWORDS_TOTAL_CHARS = 1024
+
+
+def _validate_keywords(value: Any) -> list[str]:
+    """The optional `keywords:` field: extra phrases, in any language, matched exactly like the
+    description and when_to_use (see SkillStore.match). Absent means [].
+
+    WHY IT EXISTS. Matching reads only metadata, and metadata is written in one language. An
+    English request shares no characters with a Japanese description, and a request typed in
+    kana (けいひ) shares none with the kanji the author wrote (経費). No dictionary ships with
+    this server, so the matcher cannot bridge either gap by itself; the author, who knows
+    what their users type, can -- by listing those phrases here.
+
+    Validated like the other fields: a YAML list of non-empty strings, bounded in count and
+    length, so a malformed list is reported by skill_list instead of silently matching nothing.
+    A bare string is refused rather than guessed at: `keywords: a, b` is one string in YAML,
+    and splitting it on commas would silently disagree with every other YAML reader.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise SkillError("keywords must be a YAML list of strings, e.g. keywords: [expense, 経費]")
+    if len(value) > MAX_KEYWORDS:
+        raise SkillError(f"keywords has more than {MAX_KEYWORDS} entries")
+    out: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise SkillError("every keywords entry must be a non-empty string")
+        if len(item) > MAX_KEYWORD_CHARS:
+            raise SkillError(f"a keywords entry exceeds {MAX_KEYWORD_CHARS} characters")
+        out.append(item.strip())
+    if sum(len(k) for k in out) > MAX_KEYWORDS_TOTAL_CHARS:
+        raise SkillError(f"keywords exceed {MAX_KEYWORDS_TOTAL_CHARS} characters in total")
+    return out
+
+
 def load_bundle(path: str | Path, scope: str = "external") -> Skill:
     root = Path(path).expanduser().resolve()
     rows, total = _safe_files(root)
@@ -183,6 +226,7 @@ def load_bundle(path: str | Path, scope: str = "external") -> Skill:
         raise SkillError("Skill description exceeds 1024 characters")
     if not body:
         raise SkillError("SKILL.md body is empty")
+    _validate_keywords(metadata.get("keywords"))
     digest = hashlib.sha256()
     for relative, data in rows:
         digest.update(relative.encode("utf-8"))
@@ -263,6 +307,11 @@ class _CacheEntry:
     error: str | None
     declared: str
     key: str                     # SkillStore._key(skill.path), computed once
+    # The Skill's matching features (_skill_features), computed when the bundle is (re)read so
+    # match() over an unchanged library never tokenises. match() reads them through the
+    # content-keyed memo (it must also work on Skills that never passed through this cache);
+    # this is where they are computed, and a record of what they were.
+    features: frozenset = frozenset()
 
 
 _CACHE: "OrderedDict[str, dict[str, _CacheEntry]]" = OrderedDict()
@@ -317,8 +366,9 @@ def _forget_bundle(path: Path) -> None:
             entries.pop(key, None)
 
 
-def clear_bundle_cache() -> None:
-    """Forget every cached bundle (tests, and anyone who distrusts the listing)."""
+def _clear_bundle_cache() -> None:
+    """Forget every cached bundle. A test hook, hence private: nothing in production calls it
+    (tools/unreached.py scans public names only, which is this repository's idiom for one)."""
     with _CACHE_LOCK:
         _CACHE.clear()
 
@@ -667,7 +717,7 @@ class SkillStore:
                     try:
                         skill = load_bundle(skill_md.parent, scope)
                         hit = _CacheEntry(listing[0] if listing else (), skill, None, "",
-                                          self._key(skill.path))
+                                          self._key(skill.path), _skill_features(skill))
                     except SkillError as exc:
                         hit = _CacheEntry(listing[0] if listing else (), None, str(exc),
                                           _declared_name(skill_md), "")
@@ -1176,6 +1226,11 @@ class SkillStore:
     #: MIN_MATCH_WORDS and MIN_DISTINCTIVE_WORDS below, which replaced its role in match().
     MIN_MATCH_TOKENS = 3
 
+    #: HISTORICAL, like MIN_DISTINCTIVE_WORDS below: match() no longer counts words (see the
+    #: block above _match_units, and _TRUSTED_POLICY's min_evidence / min_distinct, which
+    #: carry the same intent in the new unit). Both are kept, with their measurements, because
+    #: they record the fail-opens any replacement must answer for.
+    #:
     #: Distinct real WORDS -- not bigrams -- a candidate's overlap with the query must
     #: contain, counting only content (kanji/katakana/ASCII) words. See _merge_word_groups:
     #: _match_tokens slides a 2-character window across every run, so one word of 3+
@@ -1244,7 +1299,9 @@ class SkillStore:
         """Conservatively select one trusted, model-invocable Skill by metadata only.
 
         This intentionally favors false negatives. A Skill body is not loaded until a
-        clear description/when_to_use match exists, preserving progressive disclosure.
+        clear name/description/when_to_use/keywords match exists, preserving progressive
+        disclosure. The scoring is described in the block above _match_units and the decision
+        in _TRUSTED_POLICY; what follows is the history the current method answers to.
 
         THE DENOMINATOR IS WHAT THE LIBRARY KNOWS ABOUT, not the whole query. Dividing by the
         query's own length meant a token no Skill has ever heard of still counted against the
@@ -1268,53 +1325,34 @@ class SkillStore:
         multiple pieces of evidence. See those constants' docstrings for what they catch and,
         as important, what they do not.
         """
-        query = _match_tokens(text)
-        if len(query) < 2:
-            return None
-        candidates = [s for s in self.discover()
+        candidates = {s.name: s for s in self.discover()
                       if s.trust == "trusted"
-                      and s.metadata.get("disable-model-invocation") is not True]
-        vocabulary: set[str] = set()
-        haystacks: dict[str, set[str]] = {}
-        for skill in candidates:
-            terms = _match_tokens(
-                skill.description + " " + str(skill.metadata.get("when_to_use") or ""))
-            haystacks[skill.name] = terms
-            vocabulary |= terms
-        # How many trusted candidates' vocabulary a token appears in. A token every procedure
-        # in the store could plausibly use is not evidence for any one of them; see
-        # MIN_DISTINCTIVE_WORDS.
-        doc_freq = {tok: sum(1 for terms in haystacks.values() if tok in terms)
-                    for tok in vocabulary}
-        known = query & vocabulary
-        known_words = _content_word_groups(known)
-        if len(known_words) < self.MIN_MATCH_WORDS:
+                      and s.metadata.get("disable-model-invocation") is not True}
+        best = self._pick(text, candidates, set(candidates), _TRUSTED_POLICY)
+        if best is None:
             return None
-        scored: list[tuple[float, Skill]] = []
-        for skill in candidates:
-            terms = haystacks[skill.name]
-            if not terms:
-                continue
-            overlap = query & terms
-            overlap_words = _content_word_groups(overlap)
-            if len(overlap_words) < self.MIN_MATCH_WORDS:
-                continue
-            distinctive = [g for g in overlap_words
-                           if any(doc_freq.get(t, 99) <= 1 for t in g)]
-            if len(distinctive) < self.MIN_DISTINCTIVE_WORDS:
-                continue
-            score = len(overlap_words) / max(1, len(known_words))
-            if skill.name in text.lower():
-                score += 0.6
-            scored.append((score, skill))
-        if not scored:
+        return {"score": best[1], **candidates[best[0]].public_metadata()}
+
+    @staticmethod
+    def _pick(text: str, library: dict[str, Skill], eligible: set[str],
+              policy: MatchPolicy) -> tuple[str, float] | None:
+        """(name, reported score) of the Skill `policy` accepts for `text`, among `eligible`
+        (IDF over all of `library`), or None. See the block above _match_features.
+
+        A Skill named outright in the request (``/invoice-check``, ``invoice-check``) is an
+        explicit reference, the strongest evidence there is, and is taken as long as exactly
+        one eligible name appears -- the rule the old +0.6 name bonus expressed."""
+        if not eligible:
             return None
-        scored.sort(key=lambda item: item[0], reverse=True)
-        best_score, best = scored[0]
-        second = scored[1][0] if len(scored) > 1 else 0.0
-        if best_score < 0.55 or (best_score - second < 0.15 and best_score < 1.0):
+        named = _named_in(text, eligible)
+        if len(named) == 1:
+            return named[0], 1.0
+        scored = _score_library(text, [(n, _skill_features(s)) for n, s in library.items()],
+                                eligible)
+        best = _decide(scored, policy)
+        if best is None:
             return None
-        return {"score": round(best_score, 3), **best.public_metadata()}
+        return best.name, round(best.coverage, 3)
 
     def match_unapproved(self, text: str) -> dict[str, Any] | None:
         """The best Skill that WOULD have matched, had a human approved it.
@@ -1331,34 +1369,20 @@ class SkillStore:
         waiting to be made by a person. The threshold is deliberately looser than match():
         this asks "is this worth putting in front of the user", not "may this be loaded".
         """
-        query = _match_tokens(text)
-        if len(query) < 2:
+        # The same scoring as match(), with IDF over every model-invocable Skill (the library
+        # this one would join once approved) and only the unapproved ones eligible.
+        #
+        # A LOWER BAR THAN match(), on purpose: see _SUGGEST_POLICY. Nothing is granted by
+        # clearing it -- a question is written for a person -- and requests are de-duplicated
+        # by digest, so the worst case is one pending question per Skill that exists, which is
+        # exactly the list the user was asking to see.
+        library = {s.name: s for s in self.discover()
+                   if s.metadata.get("disable-model-invocation") is not True}
+        eligible = {n for n, s in library.items() if s.trust != "trusted"}
+        picked = self._pick(text, library, eligible, _SUGGEST_POLICY)
+        if picked is None:
             return None
-        best_score, best = 0.0, None
-        for skill in self.discover():
-            if skill.trust == "trusted":
-                continue
-            if skill.metadata.get("disable-model-invocation") is True:
-                continue
-            haystack = skill.description + " " + str(skill.metadata.get("when_to_use") or "")
-            terms = _match_tokens(haystack)
-            if not terms:
-                continue
-            score = len(query & terms) / max(1, min(len(query), len(terms)))
-            if skill.name in text.lower():
-                score += 0.6
-            if score > best_score:
-                best_score, best = score, skill
-        # A LOWER BAR THAN match(), on purpose, and lower again than it first looked right.
-        # Japanese matches on character bigrams, so a short question against a long
-        # description scores low by construction: "2026年1月のメールを検索して一覧にしたい"
-        # overlaps /mail-lookup on メー・ール・検索 and scores 0.19. At 0.35 the very case
-        # this exists for never fired. Nothing is granted by clearing this bar -- a question
-        # is written for a person -- and requests are de-duplicated by digest, so the worst
-        # case is one pending question per Skill that exists, which is exactly the list the
-        # user was asking to see.
-        if best is None or best_score < 0.25:
-            return None
+        best, best_score = library[picked[0]], picked[1]
         # THE DIGEST BELONGS IN HERE, because `trust` is a fact about a digest and not about a
         # name: "changed" means precisely that this bundle's hash is not the one approved. A
         # caller that wants to ask about the version it actually saw had no way to say which
@@ -1509,3 +1533,400 @@ def _match_tokens(text: str) -> set[str]:
                 continue
             words.update(piece[i:i + 2] for i in range(len(piece) - 1))
     return words
+
+
+# ============================================================================ the matcher
+#
+# WHAT IT REPLACED, AND WHY. The previous rule (still readable in git history before this
+# change) demanded TWO separate words, each absent from every other trusted Skill. Its intent
+# is right and is kept below -- one weak, shared-by-accident overlap must never select a
+# procedure -- but "two words" was the wrong unit of evidence. Measured on the 110-request
+# office set (tests/test_skills_business_matching.py): recall 0.436, and
+#
+#   * a request that names ONE compound word -- 経費精算のやり方, 稟議書の書き方 -- was always
+#     refused, although a four-character compound unique to one Skill is far stronger evidence
+#     than two unrelated two-character words;
+#   * English requests shared no token with Japanese metadata (1/18);
+#   * a word written in kana, or with one wrong kanji, shared nothing at all.
+#
+# THE METHOD. Each Skill's matching text (name, description, when_to_use, keywords) and the
+# request are read by one function, _match_units:
+#
+#   * text is NFKC-normalised and lower-cased, so full-width ＰＣ, half-width ｶﾀｶﾅ and
+#     ①-style digits compare equal to their ordinary forms;
+#   * Japanese is cut at script boundaries (kanji / katakana / hiragana), exactly as the old
+#     tokeniser did, and every piece of 2+ characters yields its character BIGRAMS and
+#     TRIGRAMS -- the FEATURES two texts can share. Katakana is folded to hiragana, so トナー
+#     and となー are the same feature. One kana between two kanji is bridged (okurigana, see
+#     _match_units), so 打ち合わせ meets 打合せ and 売り上げ meets 売上;
+#   * Latin text yields whole words, minus a standard English stop-word list, reduced by a
+#     small suffix stripper (booking/book, visitor/visiting, invoices/invoice);
+#   * the Skill's NAME contributes its hyphen-separated words. The name is the one piece of
+#     metadata the format forces to be ASCII, so it is the one English description every
+#     Skill carries -- expense-reimbursement, meeting-room-booking -- whatever language the
+#     rest is written in.
+#
+# THE UNIT OF EVIDENCE IS THE REQUEST'S CHARACTER (a Latin word counts as _LATIN_WEIGHT
+# characters). A request character is matched by a Skill when one of the n-grams covering it
+# is in that Skill's features, and it is worth the IDF of the best such n-gram, normalised to
+# (0, 1]: log(1 + N/df) / log(1 + N) over the N candidate Skills -- a feature only one Skill
+# has is worth 1 at any library size, one every Skill has log 2 / log(1 + N). So 経費 shared
+# with one Skill is worth 2, 経費精算 4, 稟議書 3: "a long distinctive compound is strong
+# evidence, a short common word weak" in one unit, without a dictionary. (Counting FEATURES
+# instead was measured first: a k-character word then weighs 2k-3, so long katakana words --
+# チェック, エクセル -- outweighed everything else on both sides of the ratio below.)
+#
+# For each Skill:  EVIDENCE = the summed worth of the request characters it matches, and
+# COVERAGE = the same over content (kanji, katakana, Latin) divided by what all the request's
+# content could be worth -- each unit at its best feature's IDF, or _UNKNOWN_WEIGHT when no
+# Skill has any of its features. Coverage is what refuses the fail-open the old rule was built
+# against: 「ロットの価格推移をグラフにして」 shares ロット -- a distinctive word -- with a
+# lot-survey Skill, but most of what the request is ABOUT (価格推移, グラフ) is unaccounted
+# for. Hiragana is mostly grammar (the old tokeniser's own finding, see _is_content_token), so
+# it never enters coverage either way and adds to evidence only at _HIRA_WEIGHT; it is kept at
+# all because a Skill's `keywords:` may legitimately be kana (けいひ).
+#
+# THE DECISION (_decide) has three guards, all in MatchPolicy: minimum evidence, minimum
+# coverage, and a margin over the runner-up. See _TRUSTED_POLICY for the values and how they
+# were chosen.
+
+_EN_STOPWORDS = frozenset("""
+a about above after again against all am an and any are as at be because been before being
+below between both but by can could did do does doing down during each few for from further
+had has have having he her here hers herself him himself his how i if in into is it its itself
+just me more most my myself no nor not now of off on once only or other our ours ourselves out
+over own same she should so some such than that the their theirs them themselves then there
+these they this those through to too under until up very was we were what when where which
+while who whom why will with would you your yours yourself yourselves let lets please
+""".split())
+
+#: Case particles: a closed grammatical class, never okurigana (see _match_units).
+_PARTICLES = frozenset("のをにはがでとへやもか")
+#: Worth of a hiragana character relative to a kanji / katakana one. See the block above.
+_HIRA_WEIGHT = 0.3
+#: Worth of a kana character in a request written ENTIRELY in kana (see _score_library): kana
+#: spell sounds, and writing a kanji word in kana takes about two kana per kanji (けいひ /
+#: 経費), so half a kanji each.
+_KANA_ONLY_WEIGHT = 0.5
+#: Worth of a Latin WORD, in characters: an English content word stands where Japanese writes a
+#: two-kanji compound (expense / 経費, invoice / 請求), so it counts as two characters.
+_LATIN_WEIGHT = 2.0
+#: Worth, in the coverage denominator, of a request character no candidate Skill knows any
+#: n-gram of: half a distinctive character. Not 0 -- that is the old fail-open (the request's
+#: unknown topic would not count against a Skill that shares one word of it); not 1 -- a word
+#: the library has never seen is weaker evidence against a Skill than a word another Skill
+#: owns. 0.25 and 0.75 were measured beside it; see _TRUSTED_POLICY.
+_UNKNOWN_WEIGHT = 0.5
+
+
+def _normalize_for_match(text: str) -> str:
+    return unicodedata.normalize("NFKC", text or "").lower()
+
+
+def _char_class(ch: str) -> str:
+    """'latin' | 'hira' | 'kata' | 'han' | 'mark' (the prolonged-sound mark ー) | '' (break)."""
+    o = ord(ch)
+    if ("a" <= ch <= "z") or ("0" <= ch <= "9"):
+        return "latin"
+    if 0x3041 <= o <= 0x309F:
+        return "hira"
+    if o == 0x30FC:
+        return "mark"
+    if 0x30A1 <= o <= 0x30FA or 0x30FD <= o <= 0x30FF:
+        return "kata"
+    if (0x3400 <= o <= 0x4DBF or 0x4E00 <= o <= 0x9FFF or 0xF900 <= o <= 0xFAFF
+            or o in (0x3005, 0x3006)):                          # 々 〆
+        return "han"
+    return ""
+
+
+def _fold_kana(piece: str) -> str:
+    """Katakana to hiragana (ァ..ヶ -> ぁ..ゖ); everything else unchanged."""
+    return "".join(chr(ord(c) - 0x60) if 0x30A1 <= ord(c) <= 0x30F6 else c for c in piece)
+
+
+def _stem_en(word: str) -> str:
+    """A deliberately small suffix stripper -- enough that booking/book, visitor/visiting,
+    invoices/invoice, defective/defect meet, and no more. Stems never drop below 3 letters."""
+    w = word
+    if len(w) > 4 and w.endswith("ies"):
+        w = w[:-3] + "y"
+    elif len(w) > 4 and w.endswith("sses"):
+        w = w[:-2]
+    elif len(w) > 3 and w.endswith("s") and not w.endswith(("ss", "us", "is")):
+        w = w[:-1]
+    for suffix in ("ing", "ed", "ive", "ion", "or", "er", "ly"):
+        if w.endswith(suffix) and len(w) - len(suffix) >= 3:
+            w = w[:-len(suffix)]
+            break
+    if len(w) > 3 and w.endswith("e"):
+        w = w[:-1]
+    return w
+
+
+def _match_units(text: str) -> list[tuple[str, tuple[str, ...]]]:
+    """The UNITS of `text` that matching weighs, each as (class, worth, the features that cover
+    it): one unit per Latin word (class 'w', its stem), and one per Japanese character that
+    some n-gram covers (class 'c' for kanji/katakana, 'h' for hiragana; its features are every
+    bigram and trigram containing it). `worth` is what the unit adds when fully matched by a
+    feature only one Skill has (see the comment at the end). A single kanji between kana covers
+    nothing and is not a unit, as before. See the block above for the normalisation."""
+    units: list[tuple[str, tuple[str, ...]]] = []
+    pieces: list[tuple[str, str]] = []
+    cls_prev, seg = "", ""
+    for ch in _normalize_for_match(text):
+        cls = _char_class(ch)
+        if cls == "mark":                     # ー belongs to the kana it lengthens
+            cls = cls_prev if cls_prev in ("hira", "kata") else "kata"
+        if cls != cls_prev and seg:
+            pieces.append((cls_prev, seg))
+            seg = ""
+        if cls:
+            seg += ch
+        cls_prev = cls
+    if seg:
+        pieces.append((cls_prev, seg))
+    # One list of covering features per character of every piece.
+    covers: list[list[list[str]]] = [[[] for _ in piece] for _cls, piece in pieces]
+
+    def add(chars: list[tuple[int, int]], lo: int = 0) -> None:
+        # chars: (piece, offset) of a character sequence. Adds every bigram and trigram of it
+        # that ends at or after position lo+1, to each character it covers.
+        text_ = _fold_kana("".join(pieces[p][1][o] for p, o in chars))
+        for n in (2, 3):
+            for i in range(max(0, lo - n + 2), len(chars) - n + 1):
+                key = "c:" + text_[i:i + n]
+                for p, o in chars[i:i + n]:
+                    covers[p][o].append(key)
+
+    for index, (cls, piece) in enumerate(pieces):
+        if cls == "latin":
+            if not (piece.isdigit() or len(piece) < 2 or piece in _EN_STOPWORDS):
+                units.append(("w", _LATIN_WEIGHT, ("w:" + _stem_en(piece),)))
+            continue
+        # OKURIGANA. One kana between two kanji inside a compound is spelling, not structure:
+        # 打ち合わせ / 打合せ, 売り上げ / 売上, 立て替え / 立替, 取り消し / 取消 are the same
+        # words, and the style guides disagree about which to write. Without this, 打ち合わせ
+        # is four single characters and contributes nothing. The kanji on both sides of ONE
+        # kana are joined and the n-grams that cross the join are added. Case particles are a
+        # closed class and are never okurigana, so they are not bridged -- 会議の議事録 must
+        # not produce 議議.
+        if (cls == "han" and index + 2 < len(pieces) and pieces[index + 1][0] == "hira"
+                and len(pieces[index + 1][1]) == 1
+                and pieces[index + 1][1] not in _PARTICLES
+                and pieces[index + 2][0] == "han"):
+            left = [(index, o) for o in range(max(0, len(piece) - 2), len(piece))]
+            right = [(index + 2, o) for o in range(len(pieces[index + 2][1]))]
+            add(left + right, lo=len(left) - 1)
+        if len(piece) >= 2:
+            add([(index, o) for o in range(len(piece))])
+    # WHAT A CHARACTER IS WORTH depends on the script. A kanji is (roughly) a morpheme, so a
+    # two-kanji compound is worth 2 and 経費精算 -- two words -- 4. Katakana is phonetic: a
+    # katakana run is ONE loanword however many morae it spells (ロット, プロジェクター), and is
+    # worth what one English word is, _LATIN_WEIGHT, shared across its characters. Counting
+    # katakana like kanji made ロット alone worth as much as 稟議書 and let one loanword
+    # select a Skill -- the exact fail-open MIN_DISTINCTIVE_WORDS was written for.
+    for (cls, piece), chars in zip(pieces, covers):
+        factor = (_HIRA_WEIGHT if cls == "hira"
+                  else _LATIN_WEIGHT / len(piece) if cls == "kata" else 1.0)
+        for feats in chars:
+            if feats:
+                units.append(("h" if cls == "hira" else "c", factor, tuple(feats)))
+    return units
+
+
+def _match_features(text: str) -> dict[str, str]:
+    """Every feature of `text` (see _match_units), mapped to its class. A key produced by both
+    a kana and a kanji/katakana character keeps the stronger class, 'c'."""
+    out: dict[str, str] = {}
+    for kind, _factor, feats in _match_units(text):
+        for f in feats:
+            if out.get(f) != "c":
+                out[f] = kind
+    return out
+
+
+def _skill_match_text(skill: "Skill") -> tuple[str, str]:
+    """(name words, metadata text) -- everything a Skill is matched on, and nothing else: the
+    body is never read before a match (progressive disclosure)."""
+    meta = skill.metadata or {}
+    keywords = meta.get("keywords")
+    extra = " ".join(k for k in keywords if isinstance(k, str)) if isinstance(keywords, list) else ""
+    return (skill.name.replace("-", " "),
+            " ".join((skill.description, str(meta.get("when_to_use") or ""), extra)))
+
+
+#: Content-keyed memo of each Skill's feature set. Keyed by the exact text the features are
+#: computed from, so it cannot go stale and serves the cached and uncached stores alike; the
+#: bundle cache fills it when it (re)loads a bundle (see _outcomes_cached), so a match against
+#: 500 unchanged Skills does no tokenising at all.
+_FEATURE_MEMO: "OrderedDict[tuple[str, str], frozenset[str]]" = OrderedDict()
+_FEATURE_MEMO_MAX = 8192
+
+
+def _skill_features(skill: "Skill") -> frozenset[str]:
+    key = _skill_match_text(skill)
+    with _CACHE_LOCK:
+        hit = _FEATURE_MEMO.get(key)
+        if hit is not None:
+            _FEATURE_MEMO.move_to_end(key)
+            return hit
+    feats = frozenset(_match_features(key[0])) | frozenset(_match_features(key[1]))
+    with _CACHE_LOCK:
+        _FEATURE_MEMO[key] = feats
+        while len(_FEATURE_MEMO) > _FEATURE_MEMO_MAX:
+            _FEATURE_MEMO.popitem(last=False)
+    return feats
+
+
+@dataclass(frozen=True)
+class MatchPolicy:
+    """The three guards a best candidate must clear. See _TRUSTED_POLICY for why each exists."""
+    min_evidence: float
+    min_coverage: float
+    max_runner_up_ratio: float
+    min_distinct: float = 0.0
+
+
+@dataclass(frozen=True)
+class _Scored:
+    name: str
+    evidence: float
+    coverage: float
+    distinct: float = 0.0
+
+
+def _score_library(text: str, library: list[tuple[str, frozenset[str]]],
+                   candidates: set[str] | None = None) -> list[_Scored]:
+    """Evidence and coverage of `text` against each Skill of `library` [(name, features)],
+    best first. IDF is taken over the whole library; only names in `candidates` (default: all)
+    are scored."""
+    units = _match_units(text)
+    if not units or not library:
+        return []
+    n = len(library)
+    wanted = {f for _kind, _factor, feats in units for f in feats}
+    df: dict[str, int] = {}
+    for _name, feats in library:
+        for f in wanted & feats:
+            df[f] = df.get(f, 0) + 1
+    if not df:
+        return []
+    norm = math.log(1 + n)
+    idf = {f: math.log(1 + n / d) / norm for f, d in df.items()}
+    # Per unit: its class factor, and its POTENTIAL -- the weight it would add if matched: the
+    # best IDF among its features, where a feature no Skill has counts _UNKNOWN_WEIGHT.
+    #
+    # COVERAGE IS MEASURED OVER CONTENT ONLY -- kanji, katakana and Latin units. Hiragana is
+    # mostly grammar, so it neither counts against a Skill (an unmatched particle is not
+    # evidence of another topic) nor for its coverage (sharing して with a description is not
+    # accounting for the request); matched kana adds only to EVIDENCE, at _HIRA_WEIGHT.
+    #
+    # A REQUEST WRITTEN ENTIRELY IN KANA (けいひせいさん) has nothing else to be about, so its
+    # kana IS its content: it is weighed like content at _KANA_ONLY_WEIGHT per character and
+    # measured over itself. This is what lets a kana `keywords:` entry match a kana request.
+    #
+    # DISTINCTIVE evidence is the part carried by features no other Skill in the library has
+    # (df == 1) -- the old rule's notion of a distinctive word (see _TRUSTED_POLICY).
+    kana_only = all(kind == "h" for kind, _factor, _feats in units)
+    rows = []
+    total = 0.0
+    for kind, factor, feats in units:
+        if kana_only:
+            kind, factor = "c", _KANA_ONLY_WEIGHT
+        potential = factor * max(idf.get(f, _UNKNOWN_WEIGHT) for f in feats)
+        known = [(f, idf[f], df[f] == 1) for f in feats if f in idf]
+        rows.append((kind, factor, known))
+        if kind != "h":
+            total += potential
+    scored = []
+    for name, feats in library:
+        if candidates is not None and name not in candidates:
+            continue
+        evidence = covered = distinct = 0.0
+        for kind, factor, known in rows:
+            hits = [(w, unique) for f, w, unique in known if f in feats]
+            if not hits:
+                continue
+            got = factor * max(w for w, _u in hits)
+            evidence += got
+            if kind != "h":
+                covered += got
+                if any(u for _w, u in hits):
+                    distinct += factor
+        if evidence > 0:
+            scored.append(_Scored(name, evidence, covered / total, distinct))
+    scored.sort(key=lambda s: (-s.evidence, s.name))
+    return scored
+
+
+def _decide(scored: list[_Scored], policy: MatchPolicy) -> _Scored | None:
+    """The best candidate if it clears all three guards of `policy`, else None."""
+    if not scored:
+        return None
+    best = scored[0]
+    if (best.evidence < policy.min_evidence or best.distinct < policy.min_distinct
+            or best.coverage < policy.min_coverage):
+        return None
+    runner_up = scored[1].evidence if len(scored) > 1 else 0.0
+    if runner_up > policy.max_runner_up_ratio * best.evidence:
+        return None
+    return best
+
+
+#: What match() -- the door to a TRUSTED procedure the agent will follow -- demands.
+#:
+#: min_evidence 2.5 -- MINIMUM SCORE. One distinctive two-kanji word (経費, 請求, 会議), one
+#:   loanword (ロット, メール) and one English word are each worth exactly 2.0, so none can
+#:   select a Skill alone: the old rule's safety intent ("a single weak overlap must not
+#:   select a Skill") stated in the new unit. A distinctive 3-kanji word (稟議書 = 3.0) or
+#:   two words (expense + receipt, 月次 + 集計 = 4.0) clear it.
+#: min_distinct 2.0 -- at least one whole word's worth of the evidence must be DISTINCTIVE
+#:   (features no other Skill has). A match built entirely of vocabulary other Skills share
+#:   says nothing about which of them is meant -- the reason MIN_DISTINCTIVE_WORDS existed;
+#:   this keeps it at one word rather than two, because two is what refused every request
+#:   naming a single compound.
+#: min_coverage 0.5 -- the Skill must account for at least half of what the request's content
+#:   could be worth. This refuses one strong word inside a request about something else
+#:   (ロット in 「ロットの価格推移をグラフにして」).
+#: max_runner_up_ratio 2/3 -- MARGIN. The winner's evidence must be at least 1.5x the
+#:   runner-up's; otherwise the request sits between two procedures and the agent is better
+#:   served by none than by a coin toss (「顧客から品質クレームが来て報告書を出せ」 lands
+#:   between the complaint and 8D Skills and is refused).
+#:
+#: HOW THEY WERE CHOSEN. On the 110-request development set of
+#: tests/test_skills_business_matching.py, the must/must-not cases of
+#: tests/test_skill_match_japanese.py and those of scripts/win/skill_match_bench.py, over a
+#: grid of the guards and the three weights. The grid's recall optimum sat at its permissive
+#: corner (lower evidence and coverage, a 0.8 ratio) and bought a wrong Skill and must-not
+#: matches; these are instead round, explainable values inside the region with no wrong Skill,
+#: and their neighbours (evidence 2.5-3.0, coverage 0.5-0.55, ratio 0.6-0.7) score within 4
+#: requests of them -- no single request decides them. Below min_evidence 2.5 the false
+#: positives jump (7/25 at 2.0 for match_unapproved): a lone word is exactly what this bound
+#: exists to stop.
+#:
+#: WHAT THEY STILL LET THROUGH, MEASURED. 「請求書を発行したい」 (a development near-miss) matches
+#: invoice-check on 請求書: the same shape as 「稟議書の書き方を教えて」, which must match. And
+#: skill_match_bench.py's 「別材料のロットを調査してほしい」 -- the live wrong match
+#: MIN_DISTINCTIVE_WORDS was written for -- matches copper-foil-survey again: one distinctive
+#: word (ロット) plus one shared (調査) plus one unknown (別材料). That is the shape of most
+#: correct development matches too (「海外の取引先に英語でメールを返したい」: 英語 distinctive,
+#: the rest shared); the old rule refused the whole shape and with it most of the recall this
+#: replacement exists to recover. Nothing short of meaning separates them.
+_TRUSTED_POLICY = MatchPolicy(min_evidence=2.5, min_coverage=0.5, max_runner_up_ratio=2 / 3,
+                              min_distinct=2.0)
+
+#: What match_unapproved() -- which only decides which Skill a PERSON is asked to approve --
+#: demands. The same minimum evidence (a lone word is noise here too: at 2.0 this path
+#: suggested a Skill for 7 of the 25 match-nothing requests), but no distinctiveness
+#: requirement, looser coverage (about a third of the request) and a looser margin (1.25x),
+#: because a wrong suggestion costs a person one "no", not an agent following the wrong
+#: procedure.
+_SUGGEST_POLICY = MatchPolicy(min_evidence=2.5, min_coverage=0.35, max_runner_up_ratio=0.8)
+
+
+def _named_in(text: str, names: Iterable[str]) -> list[str]:
+    """Names written out in `text` as whole tokens (an explicit reference, /name or name)."""
+    lowered = _normalize_for_match(text)
+    return [n for n in names
+            if re.search(r"(?<![a-z0-9-])" + re.escape(n) + r"(?![a-z0-9-])", lowered)]

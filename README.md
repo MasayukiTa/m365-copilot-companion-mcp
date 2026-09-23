@@ -163,6 +163,7 @@ git を使わないなら: GitHub ページの緑色の「**Code**」ボタン �
 
 - `/skills` で、Claude非依存の個人共通 `~/skills/`・プロジェクト固有 `skills/` と、Claude互換の `~/.claude/skills/`・`.claude/skills/` を一覧表示します。
 - `/<skill-name> 引数` で承認済み Skill を明示実行できます。信頼度の高い一致だけは通常文から自動選択されます。
+- 自動選択が見るのは `SKILL.md` の `name`・`description`・`when_to_use`・`keywords` だけです（本文は読みません）。`keywords:` は任意で、利用者が実際に打つ別の言い方を並べる YAML のリストです（例: `keywords: [expense claim, reimbursement, けいひせいさん]`）。英語での依頼や、かな書き・略語での依頼を日本語の Skill に届かせる手段はこれです。最大32件・1件100文字・合計1024文字、文字列以外や `keywords: a, b` のような1本の文字列は不正として `skill_list` に理由付きで表示されます。単語1つの一致だけでは選ばれません。
 - 自作はローカル端末で `/skill-create <name> | <description> | <instructions>`。作成時の内容だけが自動で信頼されます。
 - 外部Skillは `/skill-import <path>` で実行せず取り込み、`/skill-approve <name>` で内容・差分・スクリプトを確認します。承認待ちはフリート停止中でも FleetCockpit 上部の「承認」から開け、承認後もそのハッシュにしか効きません。
 - Skill承認は手順書の読込み許可だけです。shell、ファイル変更、外部送信は従来どおり `unlock` とフリートの `GO / ASK / STOP`・逐次承認に従います。
@@ -393,6 +394,7 @@ Once registered, open the agent's chat and paste the URL from the browser's addr
 
 - `/skills` lists product-neutral personal `~/skills/` and project `skills/` bundles plus Claude-compatible `~/.claude/skills/` and `.claude/skills/`, without loading their bodies.
 - Run an approved Skill explicitly with `/<skill-name> arguments`; only high-confidence metadata matches may be selected automatically.
+- Automatic selection reads only a `SKILL.md`'s `name`, `description`, `when_to_use` and `keywords` (never the body). `keywords:` is optional: a YAML list of other phrasings your users actually type, in any language (e.g. `keywords: [expense claim, reimbursement, けいひせいさん]`). It is how an English request, or one typed in kana or as an abbreviation, reaches a Skill written in Japanese. At most 32 entries, 100 characters each, 1024 in total; a non-string entry or a single string such as `keywords: a, b` makes the bundle invalid, with the reason shown by `skill_list`. A single shared word never selects a Skill on its own.
 - Create a local Skill from the terminal with `/skill-create <name> | <description> | <instructions>`.
 - Import an external folder without executing it using `/skill-import <path>`, then run `/skill-approve <name>`. FleetCockpit's persistent Approval Center shows the request even while the fleet is idle, including its digest, changed files, bundled scripts, and requested tools. Any content change invalidates that approval.
 - Skill approval permits loading instructions only. Shell, file mutations, and outbound actions still use the existing unlock and fleet `GO / ASK / STOP` gates.
