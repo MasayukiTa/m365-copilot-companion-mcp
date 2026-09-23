@@ -1209,13 +1209,18 @@ class CockpitWindow : Window
     //
     // A worker held at status "pending" ("待機列") is a DIFFERENT state -- the admission gate
     // holding a worker that exists -- and the two are shown apart on purpose.
-    class QueuedJob
-    {
-        public string Id;
-        public string Goal;
-        public double AgeS;
-        public string Where;       // "pending" = nothing has claimed it; "for_fleet" = handed off
-    }
+    //
+    // AND THEN IT WAS STILL INVISIBLE, because the queue was drawn only inside EmptyState():
+    // with a run live or anything in history, a submitted job did not appear until a worker
+    // existed for it. The queue is now one of three sources of a "submitted, not picked up
+    // yet" group drawn at the TOP of the list in every state (ui/SubmittedTasks.cs says what
+    // is merged and when an entry leaves). EmptyState and the published strip read the SAME
+    // merged list, through ReadQueuedJobs(), so the three cannot disagree.
+    readonly SubmittedTasks _submitted = new SubmittedTasks();
+    // Replaced wholesale on the UI thread each tick and never mutated afterwards, so the health
+    // poll's background thread can read it (PublishHealthStrip) without a lock.
+    volatile List<SubmittedView> _submittedNow = new List<SubmittedView>();
+    string _submittedSig = "";
 
     static string TasksDir()
     {
@@ -1223,59 +1228,77 @@ class CockpitWindow : Window
         return Path.GetFullPath(Path.Combine(exeDir, "..", ".fleet", "tasks"));
     }
 
-    List<QueuedJob> ReadQueuedJobs()
+    // What the "submitted" group shows right now: the merged list, newest first, as of the
+    // last tick. The one read EmptyState, the rows and PublishHealthStrip all share.
+    List<SubmittedView> ReadQueuedJobs()
     {
-        var outList = new List<QueuedJob>();
-        // NEVER THROWS INTO THE TICK. This runs every 700 ms beside the status read; a torn or
-        // half-written job file must not take the window down, and an unreadable queue is
-        // reported as an empty one rather than as a crash.
+        List<SubmittedView> now = _submittedNow;
+        return now ?? new List<SubmittedView>();
+    }
+
+    // Once per tick: read the three on-disk sources and merge them with this window's own
+    // submissions. NEVER THROWS INTO THE TICK -- SubmittedTasks.ReadFiles swallows a torn or
+    // half-written file, and anything else here leaves the previous list on screen.
+    //
+    // WHERE IT LOOKS, named here rather than inside SubmittedTasks so the panel's published
+    // strip (queue_dir) and this read cannot point at different places:
+    //   <state dir>/commands.d   add_goal commands no run has consumed yet
+    //   <tasks>/"pending"        fleet_submit's queue, not yet routed
+    //   <tasks>/"for_fleet"      routed, waiting for a fleet to start
+    void RefreshSubmitted(Dictionary<string, object> root)
+    {
         try
         {
-            string root = TasksDir();
-            string pend = Path.Combine(root, "pending");
-            if (Directory.Exists(pend))
-            {
-                foreach (string f in Directory.GetFiles(pend, "*.json"))
-                {
-                    var j = new QueuedJob { Where = "pending", Id = Path.GetFileNameWithoutExtension(f) };
-                    try
-                    {
-                        var o = _js.DeserializeObject(File.ReadAllText(f, Encoding.UTF8))
-                                as Dictionary<string, object>;
-                        if (o != null)
-                        {
-                            object pay;
-                            if (o.TryGetValue("payload", out pay))
-                            {
-                                var pd = pay as Dictionary<string, object>;
-                                if (pd != null) j.Goal = S(pd, "goal");
-                            }
-                            if (string.IsNullOrEmpty(j.Goal)) j.Goal = S(o, "goal");
-                        }
-                    }
-                    catch (Exception) { }
-                    try { j.AgeS = (DateTime.UtcNow - File.GetLastWriteTimeUtc(f)).TotalSeconds; }
-                    catch (Exception) { }
-                    outList.Add(j);
-                }
-            }
-            string handed = Path.Combine(root, "for_fleet");
-            if (Directory.Exists(handed))
-            {
-                foreach (string f in Directory.GetFiles(handed, "*.txt"))
-                {
-                    var j = new QueuedJob { Where = "for_fleet",
-                                            Id = Path.GetFileNameWithoutExtension(f) };
-                    try { j.Goal = File.ReadAllText(f, Encoding.UTF8); } catch (Exception) { }
-                    try { j.AgeS = (DateTime.UtcNow - File.GetLastWriteTimeUtc(f)).TotalSeconds; }
-                    catch (Exception) { }
-                    outList.Add(j);
-                }
-            }
+            string tasks = TasksDir();
+            List<SubmittedFile> files = SubmittedTasks.ReadFiles(
+                Path.Combine(_fleetDir, "commands.d"),
+                Path.Combine(tasks, "pending"),
+                Path.Combine(tasks, "for_fleet"));
+            List<SubmittedView> views = _submitted.Refresh(files, StartedOf(root),
+                                                           WorkersOf(root), NowUnix());
+            _submittedNow = views;
+            _submittedSig = SubmittedTasks.Signature(views, _lang == 0);
         }
         catch (Exception) { }
-        outList.Sort(delegate (QueuedJob a, QueuedJob b) { return b.AgeS.CompareTo(a.AgeS); });
-        return outList;
+    }
+
+    static string StartedOf(Dictionary<string, object> root)
+    {
+        return root == null ? "" : S(root, "started");
+    }
+
+    static List<Dictionary<string, object>> WorkersOf(Dictionary<string, object> root)
+    {
+        var l = new List<Dictionary<string, object>>();
+        object wo;
+        if (root != null && root.TryGetValue("workers", out wo) && wo is object[])
+            foreach (object o in (object[])wo)
+            {
+                var d = o as Dictionary<string, object>;
+                if (d != null) l.Add(d);
+            }
+        return l;
+    }
+
+    // THE INSTANT THIS WINDOW SUBMITS: put each goal in the "submitted" group before any file
+    // is read back, then re-render on the next dispatcher turn. BeginInvoke, not a direct
+    // ForceRender: AutoRetryScan calls RetryGoal from inside OnTick, and a nested OnTick there
+    // would re-enter the scan. The status.json read here is what a retry's goal is measured
+    // against -- the worker being retried is already on the board with this very goal text,
+    // and must not count as the new submission's worker (see SubmittedTasks.AddLocal).
+    void NoteSubmitted(IEnumerable<string> goals)
+    {
+        try
+        {
+            Dictionary<string, object> root = ReadStatus();
+            string started = StartedOf(root);
+            List<Dictionary<string, object>> workers = WorkersOf(root);
+            double now = NowUnix();
+            foreach (string g in goals)
+                _submitted.AddLocal(SubmittedTasks.GoalTextOf(g), now, started, workers);
+            Dispatcher.BeginInvoke(new Action(ForceRender));
+        }
+        catch (Exception) { }
     }
 
     static string OneLine(string text, int cap)
@@ -2900,8 +2923,13 @@ class CockpitWindow : Window
             for (int qi = 0; qi < qj.Count && qi < 20; qi++)
             {
                 if (qi > 0) sb.Append(',');
+                // `where` is the entry's source in the merged "submitted" group: local (this
+                // window, no file yet), command (commands.d), pending, for_fleet, or taken (its
+                // file was consumed and no worker exists yet). `unconfirmed` is the stale mark.
                 sb.Append("{\"id\":\"").Append(JsonEscape(qj[qi].Id ?? ""))
-                  .Append("\",\"where\":\"").Append(JsonEscape(qj[qi].Where ?? ""))
+                  .Append("\",\"where\":\"").Append(JsonEscape(qj[qi].Source ?? ""))
+                  .Append("\",\"unconfirmed\":").Append(qj[qi].Unconfirmed ? "true" : "false")
+                  .Append(",\"label\":\"").Append(JsonEscape(SubmittedTasks.Label(qj[qi], _lang == 0)))
                   .Append("\",\"age_s\":").Append(qj[qi].AgeS.ToString("F1", inv))
                   .Append(",\"goal_head\":\"").Append(JsonEscape(OneLine(qj[qi].Goal, 90)))
                   .Append("\"}");
@@ -5580,6 +5608,10 @@ class CockpitWindow : Window
         psi.CreateNoWindow = true;
         try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
         System.Diagnostics.Process.Start(psi);
+        // On top of the list NOW, before the new run's first snapshot exists. Every spawn path
+        // comes through here: the composer's StartFleet, a retry or bulk retry with no live run,
+        // and the continue flows (whose lines are {"text":..} objects -- GoalTextOf reads them).
+        NoteSubmitted(goals);
         return true;
     }
 
@@ -9965,6 +9997,7 @@ class CockpitWindow : Window
         catch (Exception) { }
 
         Dictionary<string, object> root = ReadStatus();
+        RefreshSubmitted(root);             // the "submitted, not picked up yet" group (top of the list)
         RefreshPauseEnabled(root);          // Pause is only meaningful for a live run; grey it out otherwise
         RefreshStoppingState(root);         // FIX B: resolve the optimistic "stopping" state once the sweep confirms it
         UpdateGateBanner(root);             // Bucket C TASK 2: show pending approval gates (blocks worker until answered)
@@ -9996,11 +10029,16 @@ class CockpitWindow : Window
             string resumeSig = resumeN > 0 ? ResumeStateSignature() : "";
             bool resumeDismissed = resumeN > 0 && ResumeStateDismissed(resumeSig);
             string isig = "IDLE" + _history.Count + (_dark ? "D" : "L") + _lang + "|q" + (_histQuery ?? "")
-                          + "|r" + resumeN + "|rs" + resumeSig + "|rd" + (resumeDismissed ? "1" : "0");
+                          + "|r" + resumeN + "|rs" + resumeSig + "|rd" + (resumeDismissed ? "1" : "0")
+                          + "|s" + _submittedSig;
             if (_lastSig != isig)
             {
                 _lastRoot = null;
                 var rows = new List<object>();
+                // FIRST, in the idle state too: a submission made while nothing runs (StartFleet
+                // before the run's first snapshot, fleet_submit, a for_fleet hand-off) is on top.
+                AppendSubmittedRows(rows);
+                int beforeRest = rows.Count;
                 if (resumeN > 0 && !resumeDismissed)
                 {
                     var rd = new Dictionary<string, object>();
@@ -10008,7 +10046,8 @@ class CockpitWindow : Window
                     rows.Add(MkRow(8, null, rd));   // resume affordance (idle + N>0 only)
                 }
                 AppendHistoryRows(rows, null);   // idle: no live run on board -> show all history
-                if (rows.Count == 0) rows.Add(MkRow(5, null, null));   // empty state when nothing to show
+                // empty state when nothing but (possibly) submitted rows is shown
+                if (rows.Count == beforeRest) rows.Add(MkRow(5, null, null));
                 SetRows(rows);
                 _lastSig = isig;
             }
@@ -10056,7 +10095,7 @@ class CockpitWindow : Window
         // PaintComposerMode: show "steer" surface while run is live.
         RefreshSpine(root, false);
         PaintComposerMode(runningNow);
-        string sig = Sig(root);
+        string sig = Sig(root) + "|s" + _submittedSig;
         if (sig == _lastSig) return;
         _lastSig = sig;
         RenderCards(root);
@@ -10830,8 +10869,18 @@ class CockpitWindow : Window
             if (_cardFilter == 3 && oc != "DONE") continue;
             shown.Add(w);
         }
-        // All tabs use display-rank order (active->pending->terminal). Tab 0 partitions below.
-        shown = StableByDisplayRank(shown);
+        // THE LIST'S ORDER, decided in one place (SubmittedTasks.Compose, executed by
+        // ui/test_a_submitted_task_is_on_top_at_once.py): the "submitted, not picked up yet"
+        // group first, then fresh pending workers (the newest tasks), active, older pending,
+        // terminal. The submitted group is shown on the All and Active tabs -- a task that was
+        // just sent is new work, not an approval request or a finished result.
+        List<SubmittedView> subs = (_cardFilter == 0 || _cardFilter == 1)
+            ? ReadQueuedJobs() : new List<SubmittedView>();
+        List<SubmittedDisplayItem> order = SubmittedTasks.Compose(subs, shown, NowUnix(),
+                                                                  IsTerminalForOrder);
+        shown = new List<Dictionary<string, object>>();
+        foreach (SubmittedDisplayItem it in order)
+            if (it.Worker != null) shown.Add(it.Worker);
 
         // stash for the converter (it rebuilds the toolbar row from these when a container recycles)
         _toolbarAll = workers;
@@ -10840,11 +10889,15 @@ class CockpitWindow : Window
         var rows = new List<object>();
         // Empty state (spec): no run yet and no history -> a calm centered suggestion block instead
         // of a blank workspace (the big top textarea is already gone -- it's the bottom composer now).
+        // Anything submitted still goes ABOVE it.
         if (workers.Count == 0 && _history.Count == 0)
         {
+            AppendSubmittedRows(rows, order);
             rows.Add(MkRow(5, null, null));
             return rows;
         }
+        // The submitted group: the first rows of the list, above the directive band.
+        AppendSubmittedRows(rows, order);
         // NOTE: the toolbar (すべて/実行中/承認待ち/完了 filter) is NO LONGER a scrolling row. It is
         // pinned in _pinnedToolbarHost above the list (see RefreshPinnedToolbar, called from
         // RenderCards). Row kind 0 is retained in the converter for safety but never emitted here.
@@ -11048,8 +11101,15 @@ class CockpitWindow : Window
             case 8:                                            // resume affordance: keyed on N
                 return "RA|" + g + "|" + (hist != null ? I(hist, "n") : 0)
                        + "|" + (hist != null ? S(hist, "signature") : "");
+            case 9:                                            // submitted, not picked up yet: key + label + dismiss
+            {
+                var sv = hist != null && hist.ContainsKey("view") ? hist["view"] as SubmittedView : null;
+                if (sv == null) return "SB|" + g;
+                return "SB|" + g + "|" + StableShortHash(sv.Key) + "|" + SubmittedTasks.Label(sv, _lang == 0)
+                       + "|" + (sv.Dismissable ? "x" : "-");
+            }
             case 4: return "DV|" + g;                          // "完了 (this run)" divider
-            case 5: return "ES|" + g;                          // empty state (static chrome)
+            case 5: return "ES|" + g + "|" + ReadQueuedJobs().Count;   // empty state: its headline counts the submitted group
             case 6:                                            // directive band: keyed on first-worker goal + started
                 return "DB|" + g + "|" + (w != null ? S(w, "goal") + "|" + S(w, "name") : "")
                        + "|tc" + (_toolbarAll.Count) + "|" + _directiveBandMeta;
@@ -11146,7 +11206,9 @@ class CockpitWindow : Window
         return null;
     }
 
-    // Tiny per-row model. Kind: 0=toolbar, 1=card, 2=history-header, 3=history-row, 4=completed-divider.
+    // Tiny per-row model. Kind: 0=toolbar, 1=card, 2=history-header, 3=history-row, 4=completed-divider,
+    // 5=empty state, 6=directive band, 7=date-group header, 8=resume affordance,
+    // 9=submitted-not-picked-up-yet (Hist["view"] is its SubmittedView).
     class Row
     {
         public int Kind;
@@ -11179,6 +11241,8 @@ class CockpitWindow : Window
             if (r.Kind == 5) return _w.EmptyState();
             if (r.Kind == 6) return _w.DirectiveBand(r.Worker);
             if (r.Kind == 7) return _w.HistoryGroupHeader(r.Hist != null ? S(r.Hist, "label") : "");
+            if (r.Kind == 9) return _w.SubmittedRow(
+                r.Hist != null && r.Hist.ContainsKey("view") ? r.Hist["view"] as SubmittedView : null);
             if (r.Kind == 8) return _w.ResumeAffordance(
                 r.Hist != null ? I(r.Hist, "n") : 0,
                 r.Hist != null ? S(r.Hist, "signature") : "");
@@ -11200,26 +11264,85 @@ class CockpitWindow : Window
     }
 
     // Default-view order: what is HAPPENING now floats to the top, finished work sinks to the
-    // bottom. Active (running/verifying/sending/...) -> pending (queued) -> terminal (done/freed/
-    // failed). Stable within each bucket so a worker keeps its place (and its W-name identity)
+    // bottom. Stable within each bucket so a worker keeps its place (and its W-name identity)
     // and cards do not jump around as unrelated workers tick. status.json lists workers in launch
     // order, so without this the earliest-launched (now-completed) workers stay pinned at the top.
-    static List<Dictionary<string, object>> StableByDisplayRank(List<Dictionary<string, object>> src)
+    //
+    // The order itself now lives in SubmittedTasks.Compose, where a test executes it: submitted
+    // (not picked up yet) -> fresh pending worker (the newest task; FRESH_PENDING_S says what
+    // "fresh" is) -> active -> older pending -> terminal. A pending worker used to sort below
+    // every active card however new it was, so the task just submitted was never the one on top.
+    // This is the terminal test that order uses; "freed" sinks with the finished ones, as before.
+    static bool IsTerminalForOrder(Dictionary<string, object> w)
     {
-        var outp = new List<Dictionary<string, object>>();
-        for (int rank = 0; rank <= 2; rank++)
-            foreach (Dictionary<string, object> w in src)
-                if (DisplayRank(w) == rank) outp.Add(w);
-        return outp;
+        return IsTerminalWorker(w) || S(w, "status") == "freed";
     }
 
-    // 0 = active (currently working), 1 = pending (queued, not yet started), 2 = terminal (done/
-    // freed/failed). Drives the default card order so the live worker is first and history sinks.
-    static int DisplayRank(Dictionary<string, object> w)
+    void AppendSubmittedRows(List<object> rows)
     {
-        if (IsTerminalWorker(w) || S(w, "status") == "freed") return 2;
-        if (S(w, "status") == "pending") return 1;
-        return 0;
+        AppendSubmittedRows(rows, SubmittedTasks.Compose(ReadQueuedJobs(), null, NowUnix(),
+                                                         IsTerminalForOrder));
+    }
+
+    // One row per submitted entry, in the order Compose gave them.
+    void AppendSubmittedRows(List<object> rows, List<SubmittedDisplayItem> order)
+    {
+        if (order == null) return;
+        foreach (SubmittedDisplayItem it in order)
+        {
+            if (it.Submitted == null) continue;
+            var d = new Dictionary<string, object>();
+            d["view"] = it.Submitted;
+            rows.Add(MkRow(9, null, d));
+        }
+    }
+
+    // A "submitted, not picked up yet" row: the label (state + age + where it is), then the goal
+    // on one line, trimmed like a card title. Drawn as a quiet bordered row, not a card: there is
+    // no worker behind it yet, so there is nothing to expand, steer or retry. The only action is
+    // the person's own dismiss, offered once SubmittedTasks says the entry may be dismissed (no
+    // file behind it, past the unconfirmed threshold) -- never on a fresh entry that the fleet
+    // may still pick up, and never on a timer.
+    UIElement SubmittedRow(SubmittedView v)
+    {
+        bool ja = _lang == 0;
+        var row = new Border {
+            BorderThickness = new Thickness(1), BorderBrush = Border, Background = BtnBg,
+            CornerRadius = new CornerRadius(Theme.RadCard),
+            Padding = new Thickness(16, 8, 16, 8), Margin = new Thickness(8, 8, 8, 4) };
+        var dp = new DockPanel { LastChildFill = true };
+        if (v != null && v.Dismissable)
+        {
+            var close = IconButton("close", 14, ja ? "この投入済みタスクの表示を消す" : "Dismiss this submitted task");
+            close.Width = 28; close.Height = 28; close.Margin = new Thickness(8, 0, 0, 0);
+            close.Padding = new Thickness(0); close.BorderThickness = new Thickness(0);
+            close.Background = Brushes.Transparent; close.Foreground = Muted;
+            close.Template = FlatButtonTemplate();
+            close.ToolTip = ja ? "消す（フリートの作業は取り消しません）"
+                               : "Dismiss (does not cancel anything in the fleet)";
+            string key = v.Key;
+            close.Click += delegate (object sender, RoutedEventArgs e)
+            {
+                e.Handled = true;
+                if (_submitted.Dismiss(key, NowUnix())) ForceRender();
+            };
+            DockPanel.SetDock(close, Dock.Right); dp.Children.Add(close);
+        }
+        var stack = new StackPanel();
+        stack.Children.Add(new TextBlock {
+            Text = SubmittedTasks.Label(v, ja),
+            // Full-strength text once an unconfirmed entry is stale: that is the one worth a look.
+            Foreground = (v != null && v.Unconfirmed && v.Stale) ? Fg : Muted,
+            FontSize = 11.5, FontWeight = FontWeights.SemiBold,
+            TextTrimming = TextTrimming.CharacterEllipsis });
+        stack.Children.Add(new TextBlock {
+            Text = OneLine(v != null ? v.Goal : "", 140),
+            Foreground = Fg, FontSize = 13, Margin = new Thickness(0, 2, 0, 0),
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            ToolTip = v != null ? v.Goal : "" });
+        dp.Children.Add(stack);
+        row.Child = dp;
+        return row;
     }
 
     // Feature B/C toolbar: filter selector + outcome summary + bulk-retry. Rebuilt each
@@ -11228,14 +11351,16 @@ class CockpitWindow : Window
     // no run and no history. Suggestions just pre-fill the bottom composer -- they don't launch.
     UIElement EmptyState()
     {
-        var outer = new Border { Margin = new Thickness(0, 80, 0, 0) };
-        var block = new StackPanel { MaxWidth = 520, HorizontalAlignment = HorizontalAlignment.Center };
-
         // A SUBMITTED JOB IS NOT "NO TASKS". status.json describes workers, and a job that has
         // been queued has none until a coordinator starts -- so this said "no fleet tasks"
         // while the queue held work, and an operator could not tell a submission that landed
-        // from one that went nowhere.
+        // from one that went nowhere. The list is the merged "submitted" group, the same one
+        // the rows above this block are drawn from.
         var queued = ReadQueuedJobs();
+        // Closer to the rows when there are submitted rows above it to read with.
+        var outer = new Border { Margin = new Thickness(0, queued.Count > 0 ? 24 : 80, 0, 0) };
+        var block = new StackPanel { MaxWidth = 520, HorizontalAlignment = HorizontalAlignment.Center };
+
         if (queued.Count > 0)
         {
             block.Children.Add(new TextBlock {
@@ -11251,21 +11376,9 @@ class CockpitWindow : Window
                 Foreground = Muted, FontSize = 12.5, TextWrapping = TextWrapping.Wrap,
                 TextAlignment = TextAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center,
                 Margin = new Thickness(0, 0, 0, 12) });
-            foreach (QueuedJob qj in queued)
-            {
-                string age = qj.AgeS < 90 ? string.Format("{0:0}s", qj.AgeS)
-                                          : string.Format("{0:0}m", qj.AgeS / 60.0);
-                string whereTxt = qj.Where == "for_fleet"
-                    ? (_lang == 0 ? "受け渡し済" : "handed off")
-                    : (_lang == 0 ? "未着手" : "unclaimed");
-                block.Children.Add(new TextBlock {
-                    Text = string.Format("• [{0}] {1}  ({2}, {3})", qj.Id, OneLine(qj.Goal, 70),
-                                         whereTxt, age),
-                    Foreground = Fg, FontSize = 12, TextWrapping = TextWrapping.Wrap,
-                    Margin = new Thickness(0, 0, 0, 4) });
-            }
-            block.Children.Add(new TextBlock {
-                Text = "", Margin = new Thickness(0, 0, 0, 12) });
+            // The entries themselves are NOT listed again here: they are the rows directly
+            // above this block (AppendSubmittedRows), drawn from this same list, so the count
+            // in the headline and the rows on screen cannot disagree.
         }
         else
         {
@@ -13705,6 +13818,7 @@ class CockpitWindow : Window
             var adds = new List<object>();
             adds.Add(RetryEntry(w));
             SendCommand(Cmd1("add_goal", adds));
+            NoteSubmitted(new List<string> { S(w, "goal") });   // on top now, not when the run reads it
             return;
         }
         string goal = S(w, "goal");
@@ -13757,6 +13871,7 @@ class CockpitWindow : Window
         if (live)
         {
             SendCommand(Cmd1("add_goal", adds));
+            NoteSubmitted(goalTexts);                 // on top now, not when the run reads it
         }
         else if (goalTexts.Count > 0)
         {
@@ -14065,7 +14180,7 @@ class CockpitWindow : Window
                 s2.ScrollToVerticalOffset(t);
             }), System.Windows.Threading.DispatcherPriority.Background);
         }
-        _lastSig = Sig(_lastRoot);
+        _lastSig = Sig(_lastRoot) + "|s" + _submittedSig;   // the same shape OnTick compares
     }
 
     // ── cockpit -> fleet control channel ─────────────────────────────────────────
