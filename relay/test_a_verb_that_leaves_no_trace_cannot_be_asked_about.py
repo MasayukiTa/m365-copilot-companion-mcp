@@ -83,7 +83,9 @@ def test_the_window_sets_it_only_for_the_verb():
     印が付くのは `forceNewGoal` のときだけで、無条件ではない。"""
     import io
 
-    src = io.open(os.path.join(REPO, "ui", "CopilotChat.cs"),
+    # ui/ChatSend.cs since 2026-09-24 -- and ui/test_the_chat_window_sends_what_was_typed.py now
+    # does execute it: new_task is present for `/goal` and ABSENT otherwise, case by case.
+    src = io.open(os.path.join(REPO, "ui", "ChatSend.cs"),
                   encoding="utf-8", errors="replace").read()
     i = src.index('g["new_task"]')
     line = src[src.rindex(chr(10), 0, i) + 1:src.index(chr(10), i)]

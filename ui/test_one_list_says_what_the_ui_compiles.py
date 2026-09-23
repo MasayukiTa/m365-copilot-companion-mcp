@@ -85,6 +85,18 @@ EXEMPT = {
     "ui/test_the_ui_and_the_fleet_agree_on_the_command_channel.py":
         "compiles ui/FleetCommands.cs ALONE into a throwaway console exe, on purpose: it is "
         "the cross-language contract test for that one file's writer, not a build of the UI",
+    "ui/test_the_chat_window_sends_what_was_typed.py":
+        "compiles ui/ChatSend.cs + ui/FleetCommands.cs with the test-only oracle and harness in "
+        "ui/testdata/ into a throwaway console exe: it runs the chat's send path without WPF, "
+        "which is the reason ChatSend.cs is its own file, not a build of the UI",
+}
+
+#: ui/*.cs that are compiled by a TEST and by no Build line, on purpose -- each with the test
+#: that compiles it. Not shipped, so rebuild_ui.ps1 must not list them; and checked both ways
+#: below: the file exists, and the named test really names it.
+COMPILED_BY_A_TEST = {
+    "ui/testdata/ChatDecisionsOriginal.cs": "ui/test_the_chat_window_sends_what_was_typed.py",
+    "ui/testdata/ChatSendHarness.cs": "ui/test_the_chat_window_sends_what_was_typed.py",
 }
 
 
@@ -164,11 +176,25 @@ def test_every_ui_source_is_compiled_into_something():
     if tracked is None:
         pytest.skip("git could not list the tracked files here")
     on_disk = {os.path.basename(p) for p in tracked
-               if p.startswith("ui/") and p.endswith(".cs")}
+               if p.startswith("ui/") and p.endswith(".cs") and p not in COMPILED_BY_A_TEST}
     compiled = {s for srcs in targets().values() for s in srcs}
     orphans = sorted(on_disk - compiled)
     assert not orphans, (
         "these ui/*.cs are in no build target in %s, so nothing compiles them: %s" % (OWNER, orphans))
+
+
+def test_a_test_only_source_is_really_compiled_by_its_test():
+    """**両方向。** COMPILED_BY_A_TEST の項目は、実在し、名指したテストが実際にそのパスを
+    書いていること。消えた項目・誰も読まなくなった項目が残れば、一覧は免罪符になる。"""
+    for src, test in sorted(COMPILED_BY_A_TEST.items()):
+        assert os.path.isfile(os.path.join(REPO, src)), "%s is listed but does not exist" % src
+        body = _read(test)
+        parts = src.split("/")[1:]          # ui/testdata/X.cs -> "testdata", "X.cs"
+        assert all('"%s"' % p in body for p in parts), (
+            "%s claims %s compiles it, but that test does not name it" % (src, test))
+    shipped = {s for srcs in targets().values() for s in srcs}
+    both = sorted(p for p in COMPILED_BY_A_TEST if os.path.basename(p) in shipped)
+    assert not both, "test-only sources ended up in a shipped Build line: %s" % both
 
 
 def test_every_named_source_exists():

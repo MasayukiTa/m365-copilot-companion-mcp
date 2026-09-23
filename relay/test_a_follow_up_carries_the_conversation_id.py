@@ -34,6 +34,11 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
 CHAT = os.path.join(REPO, "ui", "CopilotChat.cs")
+#: Where the follow-up payload is built since 2026-09-24. ui/test_the_chat_window_sends_what_was_typed.py
+#: RUNS it (and reads what it wrote back through fleet_runner.goals_from_command); the two
+#: shape checks below stay because they name the order of preference.
+SEND = os.path.join(REPO, "ui", "ChatSend.cs")
+FOLLOW_UP = "FleetSend DecideFleetSend(string text, string live, Conversation c, int lang)"
 FLEET = os.path.join(REPO, "relay", "relay_fleet.py")
 
 
@@ -51,7 +56,7 @@ def _cs_method(signature, path=CHAT):
 
 def test_a_follow_up_sends_the_conversation_id():
     """THE DEFECT. The goal dict carried only `follow_up_to`, the goal TEXT."""
-    body = _cs_method("void SendToFleetConversation(Conversation c, string text)")
+    body = _cs_method(FOLLOW_UP, path=SEND)
     assert 'g["resume_conv"]' in body, (
         "the follow-up no longer carries resume_conv, so the fleet is back to identifying the "
         "conversation by matching the wording of the original goal")
@@ -71,7 +76,7 @@ def test_the_row_it_reads_is_the_one_that_holds_the_id():
 def test_the_text_lookup_is_kept_as_a_fallback_and_not_as_the_route():
     """Removing it would break rows captured before the guid was recorded. Keeping it as the
     FIRST answer is what this file forbids."""
-    body = _cs_method("void SendToFleetConversation(Conversation c, string text)")
+    body = _cs_method(FOLLOW_UP, path=SEND)
     assert 'g["follow_up_to"]' in body, "the fallback for a row with no guid is gone"
     assert body.index('g["resume_conv"]') < body.index('g["follow_up_to"]'), (
         "the id must be offered before the text fallback")

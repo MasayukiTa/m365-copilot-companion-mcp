@@ -27,28 +27,21 @@ using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using System.Web.Script.Serialization;
 
-class Program { [STAThread] static void Main() { new Application().Run(new ChatWindow()); } }
-
-class Msg { public string Role; public string Text; public Msg(string r, string t) { Role = r; Text = t; } }
-
-class Conversation
+class Program
 {
-    public string Id = Guid.NewGuid().ToString("N").Substring(0, 12);
-    public string Title = "";        // empty = untitled (shows the localized default)
-    public string ConvUrl = "";
-    public string Source = "";
-    public double Ts = 0;
-    public string Transcript = "";   // disk jsonl path (fleet convs) -> open from disk, no scrape
-    public string Name = "";         // worker name (fallback to resolve the transcript by name)
-    public string Goal = "";         // fleet: the FULL goal text -- what identifies this
-                                     // conversation to socket_route.conversation_for_goal,
-                                     // so a follow-up can continue it. Title is truncated
-                                     // for display and must never be used for this.
-    public List<Msg> Messages = new List<Msg>();
-    public bool Untitled() { return string.IsNullOrEmpty(Title); }
+    [STAThread]
+    static void Main(string[] args)
+    {
+        // --selftest: construct the window the ordinary way, pump once, exit. See WindowSelfTest.cs.
+        if (args.Length >= 1 && args[0].Equals("--selftest", StringComparison.OrdinalIgnoreCase))
+            Environment.Exit(WindowSelfTest.Run(delegate { return new ChatWindow(); }));
+        new Application().Run(new ChatWindow());
+    }
 }
 
-class ChatWindow : Window
+// Msg and Conversation live in ChatSend.cs, with the send path that is compiled without WPF.
+
+class ChatWindow : Window, IChatSendEffects
 {
     readonly string _bridge = Environment.GetEnvironmentVariable("MCP_BRIDGE_URL") ?? "http://127.0.0.1:8765";
     static readonly string StoreDir = Path.Combine(
@@ -652,7 +645,9 @@ class ChatWindow : Window
         Content = root;
 
         // Set _convsPath BEFORE LoadConversations so DiscoverTranscripts and LoadSidebarState work.
-        string fleetDir = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", ".fleet"));
+        // --selftest reads and writes an empty scratch directory instead of the real .fleet.
+        string fleetDir = WindowSelfTest.Active ? WindowSelfTest.ScratchDir("chat-fleet")
+            : Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", ".fleet"));
         _openPath = Path.Combine(fleetDir, "open.json");
         _convsPath = Path.Combine(fleetDir, "conversations.json");
         _sidebarStatePath = Path.Combine(fleetDir, "sidebar_state.json");
@@ -1008,8 +1003,7 @@ class ChatWindow : Window
         catch { StopFollowingTranscript(); }
     }
 
-    static string SS(Dictionary<string, object> d, string k)
-    { return (d.ContainsKey(k) && d[k] != null) ? d[k].ToString() : ""; }
+    static string SS(Dictionary<string, object> d, string k) { return ChatSend.SS(d, k); }
 
     // status.json lives next to conversations.json (.fleet/). Read the worker dict whose
     // "conv_url" matches 'url' (the cockpit cards render exactly this live per-worker state).
@@ -1897,33 +1891,12 @@ class ChatWindow : Window
         catch { }
     }
 
-    // Read status.json and count ACTIVE fleet workers (status not terminal / not "pending").
-    // Terminal statuses: "done", "resolved", "failed", "error", "cancelled", "stopped".
-    // "pending" means queued but not yet started. Anything else (e.g. "running", "verifying",
-    // "planning") is considered actively working. Returns 0 when status.json is absent.
+    // Read status.json and count ACTIVE fleet workers -- status neither terminal nor "pending",
+    // by ChatSend.IsTerminalWorkerStatus, the one list the steer lookup uses too. Anything else
+    // (e.g. "running", "verifying", "planning") is actively working. 0 when status.json is absent.
     int ReadActiveFleetWorkerCount()
     {
-        try
-        {
-            string sp = Path.Combine(Path.GetDirectoryName(_convsPath), "status.json");
-            if (!File.Exists(sp)) return 0;
-            string txt;
-            using (var fsr = new FileStream(sp, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-            using (var sr = new StreamReader(fsr, Encoding.UTF8)) txt = sr.ReadToEnd();
-            var d = _cjs.DeserializeObject(txt) as Dictionary<string, object>;
-            if (d == null || !d.ContainsKey("workers") || !(d["workers"] is object[])) return 0;
-            int count = 0;
-            foreach (object o in (object[])d["workers"])
-            {
-                var w = o as Dictionary<string, object>;
-                if (w == null) continue;
-                string st = SS(w, "status").ToLowerInvariant();
-                if (st == "pending" || st == "done" || st == "resolved" || st == "failed"
-                    || st == "error" || st == "cancelled" || st == "stopped") continue;
-                count++;
-            }
-            return count;
-        }
+        try { return ChatSend.ActiveWorkerCount(Path.Combine(Path.GetDirectoryName(_convsPath), "status.json")); }
         catch { return 0; }
     }
 
@@ -2348,17 +2321,8 @@ class ChatWindow : Window
         return b;
     }
 
-    // First line only, ellipsis-trimmed to `max` chars. Shared by SendText (stored title) and the
-    // sidebar/header DISPLAY of long saved titles so a whole first message never fills a row.
-    static string TrimTitle(string s, int max)
-    {
-        if (string.IsNullOrEmpty(s)) return s;
-        int nl = s.IndexOfAny(new[] { '\r', '\n' });
-        if (nl >= 0) s = s.Substring(0, nl);
-        s = s.Trim();
-        if (s.Length > max) s = s.Substring(0, max) + "…";
-        return s;
-    }
+    // First line only, ellipsis-trimmed to `max` chars; the one definition is in ChatSend.cs.
+    static string TrimTitle(string s, int max) { return ChatSend.TrimTitle(s, max); }
 
     // Header title tracks the active conversation (Wave 2). Untitled -> localized "New chat".
     void RefreshHeadTitle()
@@ -2414,6 +2378,7 @@ class ChatWindow : Window
     // corporate proxy (which would make a local bridge look unreachable).
     void ProbeBridge()
     {
+        if (WindowSelfTest.Active) return;   // --selftest touches no network
         if (_reachProbing) return;
         _reachProbing = true;
         new Thread((ThreadStart)delegate
@@ -4661,175 +4626,89 @@ class ChatWindow : Window
     }
 
     // ── send / stream ───────────────────────────────────────────────────────────
-    void DoSend()
+    //
+    // THE DECISIONS AND THEIR ORDER LIVE IN ChatSend.cs, where a test runs them. What is left
+    // here is the window's half: the real effects behind IChatSendEffects (below). DoSend is
+    // what Enter and the Send button reach; SendText is also what the router bar's buttons call.
+    // Untested by execution: the WPF event reaching DoSend, and the effects' real bodies.
+    void DoSend() { ChatSend.DoSend(this); }
+
+    void SendText(string text) { ChatSend.SendText(this, text); }
+
+    // ── IChatSendEffects: the real effects of a send ─────────────────────────────
+    string IChatSendEffects.InputText() { return _input.Text; }
+    bool IChatSendEffects.SendEnabled() { return _send.IsEnabled; }
+    Conversation IChatSendEffects.CurrentConversation() { return _conv; }
+    Conversation IChatSendEffects.PageConversation() { return _pageConv; }
+    List<Conversation> IChatSendEffects.AllConversations() { return _all; }
+    bool IChatSendEffects.BridgeReachable() { return _bridgeReachable; }
+    bool IChatSendEffects.RouterShown() { return _routerShown; }
+    int IChatSendEffects.Lang() { return _lang; }
+    string IChatSendEffects.T(string key) { return T(key); }
+    string IChatSendEffects.CommandHelpText() { return CommandHelpText(); }
+
+    // .fleet/status.json beside the exe's parent -- the same path the fleet writes and the
+    // cockpit reads. Null when there is none; throws when it cannot be read.
+    string IChatSendEffects.ReadFleetStatus()
     {
-        var text = _input.Text.Trim();
-        if (text.Length == 0 || !_send.IsEnabled) return;
-        if (text.Equals("/help", StringComparison.OrdinalIgnoreCase))
-        {
-            _input.Clear();
-            AddUser(text);
-            AddAssistant(CommandHelpText());
-            return;
-        }
-
-        // #4: new-chat fallback -- nothing to send into yet, so start a fresh conversation first
-        // (also seeds _pageConv once /new succeeds).
-        if (_conv == null) NewChat();
-
-        // #4: bridge-reachability fallback -- re-probe once synchronously before refusing the send,
-        // since _bridgeReachable is only updated by the low-cadence background probe and may be stale.
-        if (!_bridgeReachable)
-        {
-            bool ok;
-            try { HttpGet("/conv", 5000); ok = true; } catch { ok = false; }
-            _bridgeReachable = ok;
-            if (!ok)
-            {
-                SetDot("offline");
-                AddAssistant(T("send_offline"));
-                _input.Text = text;   // put the trimmed text back so it isn't lost
-                _input.CaretIndex = _input.Text.Length;
-                // One-click recovery: bring the whole stack (bridge + relay) back up instead of
-                // leaving the user to go find a terminal. Idempotent -- safe even if some of the
-                // stack is already running.
-                ShowRecoveryBanner(T("send_offline"), T("retry_start_stack"), delegate
-                {
-                    HideBanner();
-                    // wscript + the VBS, NOT start_all.bat, AND NOT UseShellExecute. This
-                    // process is WPF and has no console of its own, so shell-executing a .bat
-                    // makes Windows give cmd.exe a brand new one -- a black window on the
-                    // operator's desktop, which is the single thing start_all.bat's own header
-                    // says it was rewritten to stop ("No console lingers"). The bat's entire
-                    // body is this same wscript line, so calling it directly loses nothing.
-                    // FleetCockpit.RunStartAll already does exactly this; this site was the
-                    // one copy that did not.
-                    try
-                    {
-                        var psi = new System.Diagnostics.ProcessStartInfo();
-                        psi.FileName = "wscript.exe";
-                        psi.Arguments = "\"" + Path.Combine(RepoRoot(), "scripts", "start_all_hidden.vbs") + "\"";
-                        psi.WorkingDirectory = RepoRoot();
-                        psi.UseShellExecute = false;
-                        psi.CreateNoWindow = true;
-                        System.Diagnostics.Process.Start(psi);
-                    }
-                    catch { }
-                });
-                return;
-            }
-            RefreshIdleDot();
-        }
-
-        // #3: while a fleet is at capacity, a native send would open a 4th heavy tab
-        // and blow the memory budget -> route it into the fleet queue instead. Prefix
-        // "!" forces priority (jumps the queue). Slash-commands are never rerouted.
-        int[] fs = FleetState();
-        if (fs[0] == 1 && fs[2] > 0 && fs[1] >= fs[2] && !text.StartsWith("/"))
-        {
-            bool force = text.StartsWith("!");
-            string body = force ? text.Substring(1).Trim() : text;
-            if (body.Length == 0) return;
-            _input.Clear(); HideRouter();
-            EnqueueToFleet(body, force);
-            AddUser(text);
-            AddAssistant(force ? T("fleet_forced") : T("fleet_queued"));
-            return;
-        }
-
-        // #2: research-intent auto-router -- propose the researcher (confirm, not auto,
-        // to avoid false positives), the way Claude Code surfaces a tool.
-        if (!text.StartsWith("/") && !_routerShown && DetectResearch(text))
-        {
-            ShowRouter(text);
-            return;
-        }
-        HideRouter();
-        _input.Clear();
-        SendText(text);
+        return ChatSend.ReadStatusFile(Path.Combine(FleetStateDir(), "status.json"));
     }
 
-    void SendText(string text)
+    void IChatSendEffects.ClearInput() { _input.Clear(); }
+    void IChatSendEffects.RestoreInput(string text)
     {
-        // Snapshot the conversation this send targets ONCE, up front. Everything below (and
-        // everything in Stream) must operate on `target`, never re-read the shared `_conv` field --
-        // a fleet-card open landing mid-send must not be able to redirect this reply elsewhere.
-        Conversation target = _conv;
+        _input.Text = text;
+        _input.CaretIndex = _input.Text.Length;
+    }
+    void IChatSendEffects.AddUser(string text) { AddUser(text); }
+    void IChatSendEffects.AddAssistant(string text) { AddAssistant(text); }
+    void IChatSendEffects.NewChat() { NewChat(); }
+    string IChatSendEffects.HttpGet(string path, int timeoutMs) { return HttpGet(path, timeoutMs); }
+    void IChatSendEffects.SetBridgeReachable(bool ok) { _bridgeReachable = ok; }
+    void IChatSendEffects.SetDot(string state) { SetDot(state); }
+    void IChatSendEffects.RefreshIdleDot() { RefreshIdleDot(); }
+    void IChatSendEffects.HideRouter() { HideRouter(); }
+    void IChatSendEffects.ShowRouter(string text) { ShowRouter(text); }
+    bool IChatSendEffects.AppendCommand(string key, object item) { return AppendCommand(key, item); }
+    void IChatSendEffects.SetPageConversation(Conversation c) { _pageConv = c; }
+    void IChatSendEffects.MarkSendInFlight() { _sendInFlight = true; }
+    void IChatSendEffects.RefreshConvList() { RefreshConvList(); }
+    void IChatSendEffects.StickToEnd() { StickToEnd(); }
 
-        // A FLEET CONVERSATION IS NOT ON THE PAGE, so none of the page-pinning doors below can
-        // open it and it used to fall through all three to send_unknown_conv. It belongs to a
-        // worker on a socket, and the fleet already accepts messages for one -- as a steer
-        // while it is live, as a follow-up goal once it is not.
-        if (target.Source == "fleet")
+    // The send was refused because the bridge is down. One-click recovery: bring the whole
+    // stack (bridge + relay) back up instead of leaving the user to go find a terminal.
+    // Idempotent -- safe even if some of the stack is already running.
+    void IChatSendEffects.ShowStartStackBanner(string message, string buttonLabel)
+    {
+        ShowRecoveryBanner(message, buttonLabel, delegate
         {
-            _input.Clear(); HideRouter();
-            SendToFleetConversation(target, text);
-            return;
-        }
+            HideBanner();
+            // wscript + the VBS, NOT start_all.bat, AND NOT UseShellExecute. This
+            // process is WPF and has no console of its own, so shell-executing a .bat
+            // makes Windows give cmd.exe a brand new one -- a black window on the
+            // operator's desktop, which is the single thing start_all.bat's own header
+            // says it was rewritten to stop ("No console lingers"). The bat's entire
+            // body is this same wscript line, so calling it directly loses nothing.
+            // FleetCockpit.RunStartAll already does exactly this; this site was the
+            // one copy that did not.
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo();
+                psi.FileName = "wscript.exe";
+                psi.Arguments = "\"" + Path.Combine(RepoRoot(), "scripts", "start_all_hidden.vbs") + "\"";
+                psi.WorkingDirectory = RepoRoot();
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                System.Diagnostics.Process.Start(psi);
+            }
+            catch { }
+        });
+    }
 
-        // ── page pinning: make sure the bridge page actually shows `target` before we send ──
-        if (!ReferenceEquals(target, _pageConv))
-        {
-            // A "sess:<guid>" IS NOT A URL AND MUST NOT GO TO /switch. /switch is
-            // `release_socket_driver()` followed by `_goto_settled(url)`: it drops the
-            // websocket and opens a tab. Every fleet conversation carries that shape, so the
-            // ordinary case was also the one that cost a browser -- and the archive rebuild
-            // would have made 3,469 of them.
-            //
-            // /resume takes a guid now and binds the session WITHOUT touching the page, then
-            // ensure_driver() continues the conversation over the socket
-            // (socket_route.driver_for(conversation_id=...), measured 2026-08-24). It answers
-            // {"via":"socket"} or {"via":"page"} so a fallback is visible rather than assumed.
-            string sref = target.ConvUrl ?? "";
-            if (sref.StartsWith("sess:"))
-            {
-                string sguid = sref.Substring("sess:".Length);
-                try { HttpGet("/resume?guid=" + Uri.EscapeDataString(sguid), 30000); _pageConv = target; }
-                catch { AddAssistant(T("send_wrong_page")); return; }
-            }
-            else if (!string.IsNullOrEmpty(target.ConvUrl))
-            {
-                try { HttpGet("/switch?url=" + Uri.EscapeDataString(target.ConvUrl), 15000); _pageConv = target; }
-                catch { AddAssistant(T("send_wrong_page")); return; }
-            }
-            else if (target.Source == "chat" && !string.IsNullOrEmpty(target.Name))
-            {
-                // A CONVERSATION WITH NO URL IS NOT AUTOMATICALLY UNREACHABLE. One captured
-                // over the socket is stored as "sess:<guid>", which is not something you
-                // can navigate to, so it registers with url="" and /switch has nothing to
-                // take. It does carry its sid, right here in Name, and /resume takes a sid
-                // and knows both stored shapes -- clicking the sidebar row for a sessref,
-                // navigating for a real URL.
-                //
-                // Without this, every conversation the socket captured fell through to the
-                // refusal below: visible in the list, impossible to continue. And the socket
-                // is now the ordinary path, so that was most of them.
-                //
-                // Gated on Source, because Name means two different things: the sid for a
-                // chat row, and the worker name (w0, w1) for a fleet row. Resuming a fleet
-                // row by "w0" would ask the store for a session that does not exist.
-                try { HttpGet("/resume?sid=" + Uri.EscapeDataString(target.Name), 20000);
-                      _pageConv = target; }
-                catch { AddAssistant(T("send_wrong_page")); return; }
-            }
-            else if (target.Messages.Count == 0)
-            {
-                try { HttpGet("/new", 15000); _pageConv = target; }
-                catch { AddAssistant(T("send_wrong_page")); return; }
-            }
-            else
-            {
-                AddAssistant(T("send_unknown_conv"));
-                return;
-            }
-        }
-
-        _sendInFlight = true;
-        target.Messages.Add(new Msg("U", text));
-        if (target.Untitled()) { target.Title = TrimTitle(text, 40); }   // ITEM 3a: first line, max 40 + ellipsis
-        if (!_all.Contains(target)) { _all.Insert(0, target); }
-        RefreshConvList();
-        AddUser(text);
+    // The window's half of a send that is going ahead: the assistant block with the typing
+    // dots, the Stop button, the busy dot, and the Stream thread for `target`.
+    void IChatSendEffects.BeginStream(string text, Conversation target)
+    {
         StackPanel outer;
         _pendingContent = AddAssistantContainer(out outer);
         _pendingOuter = outer;
@@ -4842,47 +4721,12 @@ class ChatWindow : Window
         ClearChips();   // the attached file(s) go with this message; reset the chip row
     }
 
-    // ── #3 fleet-aware routing ───────────────────────────────────────────────────
-    // returns [running(0/1), openTabs, maxConcurrent]
-    // The live worker for this conversation, or "" -- matched on the TRANSCRIPT PATH, which
-    // is unique per worker per run. Matching on the worker name instead would be wrong in the
-    // ordinary case: "w0" exists in every run there has ever been, and a steer addressed to a
-    // name is delivered by name, so an old conversation would steer a stranger.
-    string LiveWorkerFor(Conversation c)
-    {
-        try
-        {
-            if (c == null || string.IsNullOrEmpty(c.Transcript)) return "";
-            string sp = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", ".fleet", "status.json"));
-            if (!File.Exists(sp)) return "";
-            string txt;
-            using (var fsr = new FileStream(sp, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-            using (var sr = new StreamReader(fsr, Encoding.UTF8)) txt = sr.ReadToEnd();
-            var d = _cjs.DeserializeObject(txt) as Dictionary<string, object>;
-            if (d == null) return "";
-            if (!(d.ContainsKey("running") && Convert.ToBoolean(d["running"]))) return "";
-            if (!(d.ContainsKey("workers") && d["workers"] is object[])) return "";
-            foreach (object o in (object[])d["workers"])
-            {
-                var w = o as Dictionary<string, object>;
-                if (w == null) continue;
-                if (!string.Equals(SS(w, "transcript"), c.Transcript, StringComparison.OrdinalIgnoreCase)) continue;
-                string st = SS(w, "status");
-                // Terminal statuses mirror ReadActiveFleetWorkerCount's list; "pending" is
-                // queued-not-started, which cannot take a steer either.
-                if (st == "done" || st == "resolved" || st == "failed" || st == "error"
-                    || st == "cancelled" || st == "stopped" || st == "stuck" || st == "pending") return "";
-                return SS(w, "name");
-            }
-        }
-        catch { }
-        return "";
-    }
-
+    // ── the fleet command channel ────────────────────────────────────────────────
     // Send ONE command ({key: [item]}) to the running fleet, as a file of its own.
     //
     // This used to read all of .fleet/commands.json, append to `key` and write the file back --
-    // and so did EnqueueToFleet below, and so did FleetCockpit.cs's ReadCommands/WriteCommands.
+    // and so did EnqueueToFleet (now the capacity branch of ChatSend.DoSend), and so did
+    // FleetCockpit.cs's ReadCommands/WriteCommands.
     // FleetCockpit.exe and CopilotChat.exe are SEPARATELY BUILT PROCESSES (ui/rebuild_ui.ps1),
     // so no amount of care inside one of them could order the other: whichever wrote second
     // deleted the other's queued command, and a lost add_goal/steer looks exactly like one that
@@ -4904,153 +4748,7 @@ class ChatWindow : Window
         return Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", ".fleet"));
     }
 
-    // Put `text` to the fleet conversation `c`. Live worker -> a steer on its next turn.
-    // Otherwise -> a goal carrying resume_conv, the conversation's own durable id, which
-    // RelayWorker.__init__ uses directly. follow_up_to is the FALLBACK, for a row captured
-    // before guids were recorded: the fleet then matches on the goal's TEXT, which is a guess
-    // and says so in its own log line. This comment used to describe that fallback as the
-    // mechanism, which stopped being true when resume_conv was added below -- and stayed
-    // wrong for as long as relay/fleet_runner.goals_from_command was silently dropping the
-    // field, so the guess really was what ran.
-    void SendToFleetConversation(Conversation c, string text)
-    {
-        AddUser(text);
-        c.Messages.Add(new Msg("U", text));
-        string live = LiveWorkerFor(c);
-
-        // AN ESCAPE FROM THE STEER, BECAUSE ONLY THE PERSON TYPING KNOWS WHICH IT IS.
-        //
-        // While a worker is live, everything typed here becomes a steer -- see the branch
-        // below, which is deliberate and right for "keep going, but do it this way". It is
-        // wrong for "here is a different job", and until 2026-09-16 there was no way to say
-        // the second thing from this window.
-        //
-        // What that cost, observed live: a screen-inspection goal was running when an
-        // unrelated git-history question was typed into its conversation. One worker then
-        // held two tasks. The card showed the first goal's title above the second task's
-        // result; the refuter, holding only the original goal, ruled it unmet; the worker
-        // argued back about "an additional request from the user" to a judge that had never
-        // been told there was one; and it oscillated between the two for the rest of the run.
-        // The new task never appeared in the goal list either, because it never became a goal.
-        //
-        // The default is unchanged -- typing still steers. `/goal ` in front routes to the
-        // follow-up path below instead, which already exists and is strictly better for a new
-        // task: its own worker, its own card, its own judge, and resume_conv keeps it in this
-        // same conversation. Slash commands are an established idiom in these composers
-        // (docs/ADVANCED.md lists the goal-box set), so this adds a verb rather than a mode.
-        const string NEW_GOAL_PREFIX = "/goal ";
-        bool forceNewGoal = text.StartsWith(NEW_GOAL_PREFIX, StringComparison.OrdinalIgnoreCase);
-        if (forceNewGoal)
-        {
-            text = text.Substring(NEW_GOAL_PREFIX.Length).Trim();
-            if (text.Length == 0) { AddAssistant(T("fleet_goal_empty")); StickToEnd(); return; }
-            live = "";      // fall through to the follow-up goal path
-        }
-
-        if (live.Length > 0)
-        {
-            var it = new Dictionary<string, object>(); it["worker"] = live; it["text"] = text;
-            AddAssistant(AppendCommand("steer", it) ? T("fleet_steer_sent") : T("fleet_send_failed"));
-            RefreshConvList();
-            StickToEnd();
-            return;
-        }
-        // NO GOAL TEXT MEANS NO WAY TO NAME THE CONVERSATION, and guessing is the failure
-        // being fixed: a follow-up that silently becomes a fresh chat answers plausibly and
-        // is indistinguishable from a real continuation.
-        string goal = (c.Goal ?? "").Trim();
-        if (goal.Length == 0)
-        {
-            AddAssistant(T("fleet_no_goal"));
-            StickToEnd();
-            return;
-        }
-        var g = new Dictionary<string, object>();
-        // A FOLLOW-UP AND A NEW JOB NEED DIFFERENT FRAMING, and this path had only one.
-        // The wrapper below says "build on the work so far and answer only this", which is
-        // right for "also tell me X about what you just did" and wrong for "here is a
-        // different task" -- it would hand the new worker a goal that points at somebody
-        // else's work. `/goal` means the second thing, so it travels as the goal itself.
-        // resume_conv still keeps it in this conversation; only the framing differs.
-        g["text"] = forceNewGoal ? text : (_lang == 0
-            ? "【ユーザーからの追加指示】" + text + "\n直前までの作業内容を踏まえ、この追加指示に対してだけ答えてください。最初からやり直す必要はありません。完了なら DONE、無理なら FAIL と理由を書いてください。"
-            : "[follow-up from the user] " + text + "\nAnswer only this follow-up, building on the work so far. Do not start over. Write DONE when finished, or FAIL and why.");
-        // THE CONVERSATION BY ITS ID, WHICH THIS ROW HAS HAD ALL ALONG. `ConvUrl` is
-        // "sess:<guid>", read out of the transcript's own guid line a few hundred lines above.
-        // Until now the follow-up carried only `follow_up_to` -- the GOAL TEXT -- and the fleet
-        // looked the conversation up with socket_route.conversation_for_goal, matching on that
-        // text. Identity by wording: re-phrase the goal, or run it twice, and the follow-up
-        // lands in a conversation that never heard the question, or in a fresh one.
-        //
-        // docs/incidents/20260912_a_fleet_conversation_could_be_read_and_never_answered.md put
-        // it plainly -- "the identity existed and was durable the whole time ... the ability was
-        // built and nothing ever asked" -- and recorded that what looked like continuing through
-        // the fleet was "a new conversation with the context re-pasted by hand".
-        //
-        // relay_fleet takes `resume_conv` and runs it through _conversation_id_or_empty, which
-        // accepts exactly this shape. `follow_up_to` stays as the fallback for a row that has no
-        // guid (a conversation captured before the guid was recorded).
-        if (c.ConvUrl != null && c.ConvUrl.StartsWith("sess:", StringComparison.OrdinalIgnoreCase))
-            g["resume_conv"] = c.ConvUrl;
-        g["follow_up_to"] = goal;
-        g["priority"] = true;
-        // SAY WHICH VERB SENT THIS. A `/goal ` submission and an ordinary follow-up leave the
-        // same shape behind once the command file is consumed, so "has anyone ever used
-        // /goal" had no answer anywhere -- the standing list carried it as a mechanism that
-        // may never have fired, with no way to find out. The fleet turns this into one
-        // mechanisms.jsonl row; without it the question stays unanswerable however long it
-        // is asked.
-        if (forceNewGoal) g["new_task"] = true;
-        bool ok = AppendCommand("add_goal", g);
-        if (!ok) { AddAssistant(T("fleet_send_failed")); StickToEnd(); return; }
-        AddAssistant(FleetState()[0] == 1 ? T("fleet_follow_sent") : T("fleet_follow_idle"));
-        RefreshConvList();
-        StickToEnd();
-    }
-
-    int[] FleetState()
-    {
-        try
-        {
-            string sp = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", ".fleet", "status.json"));
-            if (!File.Exists(sp)) return new int[] { 0, 0, 0 };
-            string txt;
-            using (var fsr = new FileStream(sp, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-            using (var sr = new StreamReader(fsr, Encoding.UTF8)) txt = sr.ReadToEnd();
-            var d = _cjs.DeserializeObject(txt) as Dictionary<string, object>;
-            if (d == null) return new int[] { 0, 0, 0 };
-            bool running = d.ContainsKey("running") && Convert.ToBoolean(d["running"]);
-            bool idle = d.ContainsKey("idle") && Convert.ToBoolean(d["idle"]);
-            int open = d.ContainsKey("open_tabs") && d["open_tabs"] != null ? Convert.ToInt32(d["open_tabs"]) : 0;
-            int maxc = d.ContainsKey("max_concurrent") && d["max_concurrent"] != null ? Convert.ToInt32(d["max_concurrent"]) : 0;
-            return new int[] { (running && !idle) ? 1 : 0, open, maxc };
-        }
-        catch { return new int[] { 0, 0, 0 }; }
-    }
-
-    // THE THIRD COPY OF THE SAME WRITER, now gone. This had its own read-append-write of
-    // commands.json, racing AppendCommand above and FleetCockpit.exe's writer; worse, it wrote
-    // Encoding.UTF8 -- WITH a BOM -- while the other two wrote none, so the encoding of the
-    // shared channel depended on which button was pressed last. Both now go through
-    // FleetCommands.Write: one file per command, utf-8 without a BOM, always.
-    void EnqueueToFleet(string text, bool priority)
-    {
-        var item = new Dictionary<string, object>();
-        item["text"] = text; item["priority"] = priority;
-        AppendCommand("add_goal", item);
-    }
-
-    // ── #2 research-intent detection + confirm bar ───────────────────────────────
-    static readonly string[] _researchHints = {
-        "調査", "調べて", "深掘り", "リサーチ", "最新情報", "出典", "比較して", "下調べ",
-        "research", "investigate", "look up", "deep dive", "find out", "compare "
-    };
-    bool DetectResearch(string msg)
-    {
-        string m = msg.ToLower();
-        foreach (var h in _researchHints) if (m.Contains(h.ToLower())) return true;
-        return false;
-    }
+    // ── #2 research-intent confirm bar (the detection is ChatSend.DetectResearch) ──
 
     Border _routerBar; bool _routerShown; string _routerText = "";
     Button _routerResearch, _routerNormal; TextBlock _routerLbl;
@@ -5433,6 +5131,7 @@ class ChatWindow : Window
 
     string HttpGet(string path, int timeoutMs)
     {
+        if (WindowSelfTest.Active) throw new InvalidOperationException("--selftest touches no network: " + path);
         var req = (HttpWebRequest)WebRequest.Create(_bridge + path);
         req.Timeout = timeoutMs;
         req.ReadWriteTimeout = timeoutMs;
