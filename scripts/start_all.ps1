@@ -27,6 +27,7 @@ $root = Split-Path -Parent $scriptDir
 # reads. Named once so the tests can point them at a throwaway clone and a stub server
 # instead of this machine's live bridge.
 $script:venvPy = Join-Path $root ".venv\Scripts\python.exe"
+$script:bootstrapPy = Join-Path $scriptDir "bootstrap.py"
 $script:bridgeStatusUrl = "http://127.0.0.1:8765/status"
 
 # Shared PURE helpers (Get-SupervisorArgTunnel / Get-BareTunnelName /
@@ -533,6 +534,44 @@ function Invoke-PostUpdateTail {
             # process finish the current startup rather than leaving nothing
             # running.
         }
+    }
+}
+
+function Test-DependenciesAreStale([string]$VenvPy, [string]$BootstrapPy) {
+    # D5 of the new-PC install review: `git pull` (or a manual pull/merge) can add a line to
+    # requirements.txt, but nothing on the daily start path used to notice. bootstrap.py's own
+    # install_deps step stamps the sha256 of requirements.txt into .setup\state.json on success
+    # (DEPS_HASH_KEY); `bootstrap.py --check-deps` (added alongside that stamp) re-hashes the
+    # live file, compares it against the stamp, and exits 3 on a mismatch (or when install_deps
+    # was never marked done at all) and 0 when they match -- a single hash read plus one sha256
+    # over a small text file, so cheap enough to run on every daily start rather than only at
+    # setup time.
+    #
+    # NOT WIRED TO INSTALL ANYTHING. start_all.ps1 runs on the daily/logon path, often hidden
+    # (start_all.bat -> start_all_hidden.vbs -> window 0, exit code unread -- see this file's
+    # own header and start_all.bat's) and sometimes twice at once (Startup .lnk + Task, 15 s
+    # apart). `pip install -r requirements.txt` downloads packages, can take minutes, needs the
+    # same trusted-host/proxy handling setup.bat already has (D10), and two unserialised copies
+    # racing pip into one .venv is exactly the corruption 5.3 in the install-path review warns
+    # about. An unattended install failing silently inside a hidden window is a worse outcome
+    # than telling the operator once and pointing them at setup.bat, which they run
+    # interactively and only one at a time (quickstart_lock.ps1 / setup's own guard).
+    #
+    # Returns $false -- "not stale, or could not tell" -- when either path is missing (no venv
+    # yet, or a checkout without scripts\bootstrap.py): there is nothing this function can
+    # safely report in that state, and the OTHER startup checks (supervisor's own "no usable
+    # Python" refusal, the first-time setup gate) already cover "nothing is installed yet".
+    if ((-not $VenvPy) -or (-not (Test-Path -LiteralPath $VenvPy)) -or
+        (-not $BootstrapPy) -or (-not (Test-Path -LiteralPath $BootstrapPy))) {
+        return $false
+    }
+    try {
+        & $VenvPy $BootstrapPy --check-deps *> $null
+        return ($LASTEXITCODE -eq 3)
+    } catch {
+        # A python that cannot even be launched is not this function's question to answer --
+        # some other check (supervisor python resolution, doctor.ps1) already covers that.
+        return $false
     }
 }
 
@@ -1349,6 +1388,19 @@ function Invoke-Startup {
     } catch {
         # Never fatal. A machine that cannot run this still starts; it just keeps the fault it had.
         Write-Host "[setup] unlock-password check skipped ($($_.Exception.Message))"
+    }
+
+    # Dependency drift (D5): requirements.txt changed since the last successful setup/quickstart
+    # run and nothing here installs the difference -- see Test-DependenciesAreStale's own header
+    # for why this only reports rather than running pip. Counted, not just printed, same as the
+    # unlock-password repair above: the exit code is the number of startup problems.
+    try {
+        if (Test-DependenciesAreStale $script:venvPy $script:bootstrapPy) {
+            Write-Host "[setup] requirements.txt has changed since dependencies were last installed"
+            $script:startupFailures += "requirements.txt has changed since the last setup -- a dependency may be missing or out of date: run setup.bat"
+        }
+    } catch {
+        Write-Host "[setup] dependency-drift check skipped ($($_.Exception.Message))"
     }
 
     # Pre-flight update check (best-effort, non-blocking). Runs once before any service starts.
