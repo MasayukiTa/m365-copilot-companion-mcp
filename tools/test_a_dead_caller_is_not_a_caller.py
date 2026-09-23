@@ -170,7 +170,17 @@ def test_an_entrypoint_can_never_seed_the_iteration(tmp_path, monkeypatch):
 def test_it_reaches_a_fixed_point_well_inside_the_bound():
     """The bound is a guard against a bug in the loop, not a property of the data. If this
     starts needing every round, the loop is no longer converging and the count is not a fixed
-    point -- which would be a worse state than the leaves-only one it replaced."""
+    point -- which would be a worse state than the leaves-only one it replaced.
+
+    THE SECOND ASSERTION USED TO PIN AN ABSOLUTE COUNT ("> 80"), taken when this repository's
+    inventory held 96 rows. The 2026-09-24 C-1 burndown wired several dead subgraphs away (the
+    worktree_add/worktree_remove chain among them) and the inventory now holds 67 -- a real
+    improvement that an absolute threshold cannot distinguish from the iteration quietly
+    breaking. The property this line exists to guard is relative, not absolute: iterating must
+    still find MORE than a single pass would, on whatever the inventory's current size is. So it
+    is measured directly against a same-repository, same-moment `iterate=False` scan rather than
+    a number that drifts every time a burndown lands.
+    """
     calls = {"n": 0}
     real = U._without
 
@@ -187,28 +197,49 @@ def test_it_reaches_a_fixed_point_well_inside_the_bound():
     assert files, "git could not list the tracked files"
     rounds = calls["n"] / float(files)
     assert rounds <= 8, "the scan is not settling: %.1f rounds" % rounds
-    assert len(rows) > 80, "the iteration is reporting no more than a single pass did"
+    single_pass = U.scan(iterate=False)
+    assert single_pass is not None, "git could not list the tracked files"
+    assert len(rows) > len(single_pass), (
+        "the iteration is reporting no more than a single pass did: %d vs %d"
+        % (len(rows), len(single_pass)))
 
 
 def test_the_confirmed_subgraphs_that_are_still_dead_are_reported():
     """PINNED BY NAME, because each was found by hand and each would go quiet again if the
     iteration were removed.
 
-    `bench/skill_use_log.py::observe` WAS THE THIRD AND IS NOT PINNED ANY MORE, because it is
-    no longer an example of anything. It was reachable only from `compare_runs`, which nothing
-    called; on 2026-09-19 it gained a live caller (`report`, the reader that log had gone
-    three weeks without) and the scan correctly stopped reporting it. Holding a fixed instance
-    in a list of expected findings is the same defect the encoding inventory was caught with
-    the same day: an entry that was paid keeps reading as the current state.
+    `tools/coding_ops.py::worktree_add` / `::worktree_remove` WERE THE ORIGINAL PAIR AND ARE NOT
+    PINNED ANY MORE, for the same reason `observe` left the list below: 9b63a94 (the C-1
+    burndown) registered both as MCP tools, so they are reachable now and an example that got
+    fixed is no longer an example of a dead subgraph. Holding them here after that would be the
+    same defect this docstring already warns about for `observe` -- a pin that reads as the
+    current state after the thing it pins has changed.
 
-    WHAT IS PINNED IS THE MECHANISM, NOT THE CENSUS. Two genuinely dead subgraphs remain and
-    they still exercise it. If both are ever fixed, the honest move is another live example or
-    a constructed one -- not keeping these names after they stop being true.
+    THE CHAIN PINNED IN THEIR PLACE, verified with tools/unreached.py on 2026-09-24, is still
+    exactly the shape this test is for: `relay/solve_policy.py::plan_and_explain` (itself
+    unreached, not asserted here since PROTOCOL-adjacent entrypoints aren't the point) calls
+    `plan_solve`, which calls `relay/selfimprove/diversify.py::diversify` under an import alias
+    (`_diversify`), which calls `relay/selfimprove/propose.py::mutation_generator`. Each of the
+    three is reachable only through a caller that is itself unreached, so a single pass reports
+    none of the three and only the fixed-point iteration reveals them.
+
+    `bench/skill_use_log.py::observe` WAS THE THIRD OF THE ORIGINAL SET AND IS NOT PINNED ANY
+    MORE, because it is no longer an example of anything. It was reachable only from
+    `compare_runs`, which nothing called; on 2026-09-19 it gained a live caller (`report`, the
+    reader that log had gone three weeks without) and the scan correctly stopped reporting it.
+
+    WHAT IS PINNED IS THE MECHANISM, NOT THE CENSUS. If the solve_policy chain is ever wired or
+    deleted, the honest move is another live example or a constructed one -- not keeping these
+    names after they stop being true.
     """
     rows = {r[0] for r in U.scan()}
-    for name in ("tools/coding_ops.py::worktree_add",
-                 "tools/coding_ops.py::worktree_remove"):
+    for name in ("relay/solve_policy.py::plan_solve",
+                 "relay/selfimprove/diversify.py::diversify",
+                 "relay/selfimprove/propose.py::mutation_generator"):
         assert name in rows, "%s is hidden behind its dead caller again" % name
     assert "bench/skill_use_log.py::observe" not in rows, (
         "observe is unreached again -- `report` was the caller that took it off this list, "
         "and a pin that silently comes back true is not evidence")
+    assert "tools/coding_ops.py::worktree_add" not in rows, (
+        "worktree_add is unreached again -- it was registered as an MCP tool in 9b63a94, and "
+        "a pin that silently comes back true is not evidence")

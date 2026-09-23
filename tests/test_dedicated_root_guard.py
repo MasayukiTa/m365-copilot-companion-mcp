@@ -96,11 +96,15 @@ def test_realpath_failure_fails_closed(dedicated_worktree, monkeypatch):
 
 
 def test_refusal_names_the_alternative(shared_repo):
-    # 拒否理由には代替手段(git worktree add / create=True)が含まれる。
+    # 拒否理由には代替手段が含まれる。9b63a94 で `git worktree add` を直接使わせる文面から、
+    # 登録済み worktree_add ツールを指す文面に変わった -- 代替手段は生の git コマンドではなく
+    # 呼び出せるツール名で示されるべきなので、"worktree_add tool" を検証する。create=True
+    # (git checkout -b) 経由でその場に新ブランチを切る道も依然として案内されている。
     ok, reason = C._dedicated_root_ok(str(shared_repo), shared_repo)
     assert ok is False
-    assert "git worktree add" in reason
+    assert "worktree_add tool" in reason
     assert "create=True" in reason
+    assert "git checkout -b" in reason
 
 
 # ---- _realpath_strict --------------------------------------------------
