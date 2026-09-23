@@ -170,11 +170,36 @@ except Exception:
     def _autonomy_matches(_text, _patterns):
         return []
 
-try:
-    from tools.file_ops import _validate_path, ALLOWED_BASE
-except Exception:
-    _validate_path = None
-    ALLOWED_BASE = None
+# RESOLVED ON FIRST USE, NOT AT IMPORT. `tools.file_ops` imports `tools.security`, which imports
+# fastmcp and the server's auth stack -- and this module is run by the supervisor as
+# `task_router.py --once` every tick, usually to find an empty queue. Measured 2026-09-24: the
+# import alone took 3-12 s and ~89 MB per tick, and it was the largest single part of the ~26 s a
+# submitted job waited before anything picked it up. The two names stay module attributes because
+# tests set `task_router.ALLOWED_BASE` directly; `_UNRESOLVED` means "ask file_ops when needed".
+#
+# NOT FIXED IN tools/security.py, although that is where the heavy import lives: that file is in
+# the self-improvement frozen set, and a latency fix is not a reason to spend a re-sign.
+_UNRESOLVED = object()
+_validate_path = _UNRESOLVED
+ALLOWED_BASE = _UNRESOLVED
+
+
+def _file_ops_names():
+    """(validate_path, allowed_base) -- this module's attributes if set, else tools.file_ops'.
+
+    Same failure behaviour as the import it replaces: if file_ops cannot be imported, both are
+    None and the callers' existing `is None` branches take over."""
+    global _validate_path, ALLOWED_BASE
+    if _validate_path is _UNRESOLVED or ALLOWED_BASE is _UNRESOLVED:
+        try:
+            from tools.file_ops import _validate_path as _vp, ALLOWED_BASE as _ab
+        except Exception:
+            _vp, _ab = None, None
+        if _validate_path is _UNRESOLVED:
+            _validate_path = _vp
+        if ALLOWED_BASE is _UNRESOLVED:
+            ALLOWED_BASE = _ab
+    return _validate_path, ALLOWED_BASE
 
 try:
     from tools.notify_ops import notify_approval_gate
@@ -272,9 +297,10 @@ def _resolve_file_path(path, allow_outside):
 
     Returns (resolved_path_str, None) on success, or (None, error_message) on rejection.
     """
+    validate_path, _ = _file_ops_names()
     try:
-        if _validate_path is not None:
-            resolved = str(_validate_path(path))
+        if validate_path is not None:
+            resolved = str(validate_path(path))
         else:
             resolved = str(Path(path).expanduser().resolve())
     except PermissionError as e:
@@ -472,10 +498,11 @@ def _write_job_gate(token, question, context):
     Deliberately does NOT call tools/gate_ops.gate_ask(): that function calls
     require_unlocked(), which DENIES outside an HTTP request context, and task_router runs
     as a standalone process (no HTTP request in flight)."""
-    if ALLOWED_BASE is None:
+    _, allowed_base = _file_ops_names()
+    if allowed_base is None:
         return
     try:
-        gate_dir = ALLOWED_BASE / ".companion_gates"
+        gate_dir = allowed_base / ".companion_gates"
         gate_dir.mkdir(parents=True, exist_ok=True)
         gate_file = gate_dir / ("%s.json" % token)
         if gate_file.is_file():
@@ -499,10 +526,11 @@ def _write_job_gate(token, question, context):
 
 def _read_job_gate(token):
     """Read a gate file written by _write_job_gate(). Returns dict or None (missing/bad)."""
-    if ALLOWED_BASE is None:
+    _, allowed_base = _file_ops_names()
+    if allowed_base is None:
         return None
     try:
-        gate_file = ALLOWED_BASE / ".companion_gates" / ("%s.json" % token)
+        gate_file = allowed_base / ".companion_gates" / ("%s.json" % token)
         if not gate_file.is_file():
             return None
         return json.loads(gate_file.read_text(encoding="utf-8"))
