@@ -18,6 +18,13 @@ updater again: already-applied files are recognized by content hash and are not
 re-flagged as conflicts. The new release tag is only recorded, and success is
 only reported, once every file has been applied with zero conflicts.
 
+Every file is re-evaluated against the actual on-disk content on every run, so
+a conflict is never permanent: if you copy the release's saved version in
+yourself (or revert to the untouched original), the next run applies it
+normally. `--take-new` gives an explicit, no-manual-diffing way out: it backs
+up each locally modified file (never deletes it) under
+.update_take_new_backups/ and applies the release's version.
+
 ASCII / ENGLISH ONLY. This script must run on a fresh Windows install with only
 the standard library.
 """
@@ -25,6 +32,7 @@ the standard library.
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import json
 import shutil
@@ -75,6 +83,12 @@ MANIFEST_NAME = ".release_manifest.json"
 CONFLICT_DIR = ".update_conflicts"
 BACKUP_DIR = ".update_backups"
 JOURNAL_NAME = ".update_journal.json"
+TAKE_NEW_DIR = ".update_take_new_backups"
+TAKE_NEW_COMMAND = "update.bat --take-new"
+
+
+def take_new_folder_name() -> str:
+    return "take-new-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
 class UpdateError(Exception):
@@ -263,24 +277,36 @@ def apply_files(
     new_manifest: dict,
     old_manifest: dict,
     journal: dict,
-) -> tuple[int, int, int, list]:
+    take_new_root: Optional[Path] = None,
+) -> tuple[int, int, int, list, list]:
     """Copy staged files into root.
 
-    Returns (copied, already_applied, skipped, conflicts). `conflicts` is a
-    list of [rel_path, conflict_copy_path] for files whose on-disk content
-    differs from both the old release's recorded hash and the new release's
-    content -- i.e. a local edit that would otherwise be silently clobbered.
+    Every file is re-evaluated against what is actually on disk right now --
+    nothing is treated as "already handled" just because a previous run
+    flagged it. This is what makes a conflict resolvable: if the on-disk
+    file's hash now equals the new release's content (the person copied the
+    new version in themselves) or still equals the old release's recorded
+    hash (never touched), it is applied normally on this run, not re-flagged.
+
+    Returns (copied, already_applied, skipped, conflicts, taken_new).
+    `conflicts` is a list of [rel_path, conflict_copy_path] for files whose
+    on-disk content differs from both the old release's recorded hash and
+    the new release's content -- i.e. a local edit that would otherwise be
+    silently clobbered; the local file is left untouched.
+
+    If `take_new_root` is given, a would-be conflict is instead resolved
+    automatically: the local file is moved under `take_new_root` (never
+    deleted) and the release's version is applied. `taken_new` is a list of
+    [rel_path, backup_path] for those.
 
     Progress is journaled after every file so a crash or Ctrl+C partway
-    through can be resumed: on the next run, a file whose on-disk hash
-    already equals the new release's hash is recognized as done rather than
-    flagged as a conflict.
+    through can be resumed by simply running the updater again.
     """
     backup_root = root / BACKUP_DIR
     conflict_root = root / CONFLICT_DIR
-    applied = set(journal.setdefault("applied", []))
-    conflicts = journal.setdefault("conflicts", [])
-    conflicted_paths = {c[0] for c in conflicts}
+    applied: set[str] = set()
+    conflicts: list = []
+    taken_new: list = []
     copied = 0
     already = 0
     skipped = 0
@@ -291,68 +317,78 @@ def apply_files(
         if should_skip(rel):
             skipped += 1
             continue
-        if rel_str in conflicted_paths:
-            continue
 
         dest = root / rel
-        if rel_str in applied:
-            if dest.exists() and dest.is_file() and sha256(dest) == new_hash:
-                already += 1
-                continue
-            applied.discard(rel_str)
-
         src = staged_root / rel
+
         if dest.exists() and dest.is_file():
             dest_hash = sha256(dest)
             if dest_hash == new_hash:
+                # Already matches the release -- whether from a prior partial
+                # run, or because the person applied the fix themselves.
                 applied.add(rel_str)
-                journal["applied"] = sorted(applied)
-                save_journal(root, journal)
                 already += 1
-                continue
-            if rel_str in old_manifest and dest_hash == old_manifest[rel_str]:
+            elif rel_str in old_manifest and dest_hash == old_manifest[rel_str]:
+                # Unmodified relative to the old release: safe to overlay.
                 backup_existing(dest, rel, backup_root)
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dest)
                 applied.add(rel_str)
-                journal["applied"] = sorted(applied)
-                save_journal(root, journal)
                 copied += 1
-                continue
-            conflict_path = conflict_copy(src, rel, conflict_root)
-            conflicts.append([rel_str, str(conflict_path)])
-            conflicted_paths.add(rel_str)
-            journal["conflicts"] = conflicts
-            save_journal(root, journal)
-            continue
+            elif take_new_root is not None:
+                backup_path = take_new_root / rel
+                backup_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(dest), str(backup_path))
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dest)
+                applied.add(rel_str)
+                copied += 1
+                taken_new.append([rel_str, str(backup_path)])
+            else:
+                # Still a genuine local edit that differs from both the old
+                # and the new release: leave it alone and report it.
+                conflict_path = conflict_copy(src, rel, conflict_root)
+                conflicts.append([rel_str, str(conflict_path)])
+        else:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+            applied.add(rel_str)
+            copied += 1
 
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dest)
-        applied.add(rel_str)
         journal["applied"] = sorted(applied)
+        journal["conflicts"] = conflicts
+        journal["taken_new"] = taken_new
         save_journal(root, journal)
-        copied += 1
 
-    return copied, already, skipped, conflicts
+    return copied, already, skipped, conflicts, taken_new
 
 
 def remove_stale_files(
-    root: Path, old_manifest: dict, new_manifest: dict, journal: dict
-) -> tuple[list, list]:
+    root: Path,
+    old_manifest: dict,
+    new_manifest: dict,
+    journal: dict,
+    take_new_root: Optional[Path] = None,
+) -> tuple[list, list, list]:
     """Delete files the new release no longer ships.
 
-    A path removed only when the on-disk file still matches the OLD
-    release's recorded hash (i.e. never touched locally). A locally modified
-    file that upstream removed is moved into the conflicts area instead of
-    being deleted, and reported.
+    Re-evaluated fresh from disk every run (see apply_files): a path is only
+    ever deleted when the on-disk file still matches the OLD release's
+    recorded hash (i.e. never touched locally) -- that is a lossless,
+    reversible-in-spirit action, so it always happens, even without
+    --take-new. A locally modified file that upstream removed is left
+    untouched and reported as a conflict, unless `take_new_root` is given,
+    in which case it is moved under `take_new_root` (never deleted) and then
+    removed from the checkout, matching the new release's state.
+
+    Returns (deleted, removed_conflicts, taken_new).
     """
-    conflict_root = root / CONFLICT_DIR
-    deleted = list(journal.setdefault("deleted", []))
-    removed_conflicts = journal.setdefault("removed_conflicts", [])
-    handled = set(deleted) | {c[0] for c in removed_conflicts}
+    deleted: list = []
+    removed_conflicts: list = []
+    taken_new: list = []
 
     for rel_str in sorted(old_manifest):
-        if rel_str in new_manifest or rel_str in handled:
+        if rel_str in new_manifest:
             continue
         old_hash = old_manifest[rel_str]
         rel = Path(rel_str)
@@ -372,18 +408,23 @@ def remove_stale_files(
             dest.unlink()
             deleted.append(rel_str)
             journal["deleted"] = deleted
+        elif take_new_root is not None:
+            backup_path = take_new_root / rel
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(dest), str(backup_path))
+            taken_new.append([rel_str, str(backup_path)])
+            journal["taken_new"] = journal.get("taken_new", []) + [[rel_str, str(backup_path)]]
         else:
-            conflict_path = conflict_root / rel
-            conflict_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(dest), str(conflict_path))
-            removed_conflicts.append([rel_str, str(conflict_path)])
+            # No "new version" exists to show (upstream removed the file);
+            # the local copy is left exactly where it is.
+            removed_conflicts.append([rel_str, str(dest)])
             journal["removed_conflicts"] = removed_conflicts
         save_journal(root, journal)
 
-    return deleted, removed_conflicts
+    return deleted, removed_conflicts, taken_new
 
 
-def run_update(root: Path, force: bool = False) -> int:
+def run_update(root: Path, force: bool = False, take_new: bool = False) -> int:
     print("Checking latest GitHub Release...")
     try:
         data = fetch_release_data()
@@ -475,18 +516,26 @@ def run_update(root: Path, force: bool = False) -> int:
         new_manifest = load_manifest(extracted / MANIFEST_NAME)
         old_manifest = load_manifest(root / MANIFEST_NAME)
 
+        take_new_root: Optional[Path] = None
+        if take_new:
+            take_new_root = root / TAKE_NEW_DIR / take_new_folder_name()
+
         print("Applying files (preserving .env, .venv, memory, tools/auto, logs, and local state)...")
         try:
-            copied, already, skipped, conflicts = apply_files(
-                root, extracted, new_manifest, old_manifest, journal
+            copied, already, skipped, conflicts, taken_new_applied = apply_files(
+                root, extracted, new_manifest, old_manifest, journal, take_new_root=take_new_root
             )
-            deleted, removed_conflicts = remove_stale_files(
-                root, old_manifest, new_manifest, journal
+            deleted, removed_conflicts, taken_new_removed = remove_stale_files(
+                root, old_manifest, new_manifest, journal, take_new_root=take_new_root
             )
         except Exception as exc:
             print(f"Error: update interrupted while applying files: {exc}", file=sys.stderr)
             print("No release tag was recorded. Re-run the updater to resume.", file=sys.stderr)
             return 1
+
+        taken_new = list(taken_new_applied) + list(taken_new_removed)
+        for rel_str, backup_path in taken_new:
+            print(f"  Took the release's version of {rel_str}; your local copy is backed up at {backup_path}")
 
         all_conflicts = list(conflicts) + list(removed_conflicts)
         if all_conflicts:
@@ -494,9 +543,19 @@ def run_update(root: Path, force: bool = False) -> int:
                 f"Detected {len(all_conflicts)} conflict(s); {tag} was NOT recorded as "
                 "installed:"
             )
-            for rel_str, conflict_path in all_conflicts:
-                print(f"  CONFLICT: {rel_str} -> new version saved to {conflict_path}")
-            print("Resolve the conflicts (compare with the saved copies), then re-run the updater.")
+            for rel_str, conflict_path in conflicts:
+                print(f"  CONFLICT: {rel_str} -> the release's version was saved to {conflict_path}")
+            for rel_str, local_path in removed_conflicts:
+                print(
+                    f"  CONFLICT: {rel_str} -> removed from the release but locally "
+                    f"modified; left as-is at {local_path}"
+                )
+            print("Your files were not changed.")
+            print(
+                "To switch any of them to the new release's version instead (each local "
+                "copy is backed up first, never deleted), run:"
+            )
+            print(f"  {TAKE_NEW_COMMAND}")
             return 1
 
         manifest_src = extracted / MANIFEST_NAME
@@ -524,8 +583,16 @@ def run_update(root: Path, force: bool = False) -> int:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--force", action="store_true", help="update even when already on latest tag")
+    parser.add_argument(
+        "--take-new",
+        action="store_true",
+        help=(
+            "resolve any conflicts by backing up each locally modified file "
+            "(never deleting it) and applying the release's version instead"
+        ),
+    )
     args = parser.parse_args(argv)
-    return run_update(repo_root(), force=args.force)
+    return run_update(repo_root(), force=args.force, take_new=args.take_new)
 
 
 if __name__ == "__main__":

@@ -192,7 +192,7 @@ def test_interrupted_copy_then_rerun_completes_without_false_conflicts(tmp_path,
 # ---------------------------------------------------------------------------
 
 
-def test_local_edit_becomes_conflict_and_tag_is_not_advanced(tmp_path, monkeypatch):
+def test_local_edit_becomes_conflict_and_tag_is_not_advanced(tmp_path, monkeypatch, capsys):
     root = tmp_path / "install"
     install_old_root(root, {"main.py": b"old main\n", "config.py": b"old config\n"})
     # User hand-edited config.py; it no longer matches the old release's hash.
@@ -217,13 +217,19 @@ def test_local_edit_becomes_conflict_and_tag_is_not_advanced(tmp_path, monkeypat
     assert conflict_file.exists()
     assert conflict_file.read_bytes() == b"new config\n"
 
+    # The conflict message must give one explicit, copy-pasteable command
+    # that needs no manual diffing -- not just "resolve it yourself".
+    out = capsys.readouterr().out
+    assert ufr.TAKE_NEW_COMMAND in out
+    assert "update.bat --take-new" in out
+
 
 # ---------------------------------------------------------------------------
 # UPD-13: files removed upstream
 # ---------------------------------------------------------------------------
 
 
-def test_removed_upstream_file_deleted_when_unmodified_moved_when_modified(tmp_path, monkeypatch):
+def test_removed_upstream_file_deleted_when_unmodified_left_when_modified(tmp_path, monkeypatch):
     root = tmp_path / "install"
     install_old_root(
         root,
@@ -249,11 +255,115 @@ def test_removed_upstream_file_deleted_when_unmodified_moved_when_modified(tmp_p
     assert rc != 0
     assert ufr.local_tag(root) == OLD_TAG
 
+    # Unmodified removed file is deleted outright (lossless).
     assert not (root / "gone_unmodified.txt").exists()
+    # Locally modified removed file is left exactly where it was -- not
+    # deleted, not moved -- until the person acts (edit it back, or
+    # --take-new).
+    assert (root / "gone_modified.txt").read_bytes() == b"USER EDITED stale content 2\n"
+
+
+def test_conflict_resolved_by_copying_new_version_in_then_rerun_succeeds(tmp_path, monkeypatch):
+    root = tmp_path / "install"
+    install_old_root(root, {"main.py": b"old main\n", "config.py": b"old config\n"})
+    (root / "config.py").write_bytes(b"USER EDITED config\n")
+
+    zip_path, _ = build_release_zip(
+        tmp_path, {"main.py": b"new main\n", "config.py": b"new config\n"}
+    )
+    release_data = fake_release_data(f"{PACKAGE}.zip")
+    sha_text = sums_text_for(zip_path, f"{PACKAGE}.zip")
+    patch_network(monkeypatch, zip_path, sha_text, release_data)
+
+    rc1 = ufr.run_update(root, force=False)
+    assert rc1 != 0
+    assert ufr.local_tag(root) == OLD_TAG
+    conflict_file = root / ufr.CONFLICT_DIR / "config.py"
+    assert conflict_file.read_bytes() == b"new config\n"
+
+    # The person looks at the saved copy and decides to take it themselves,
+    # by hand, with no help from the tool -- this must not be re-flagged.
+    (root / "config.py").write_bytes(conflict_file.read_bytes())
+
+    rc2 = ufr.run_update(root, force=False)
+    assert rc2 == 0
+    assert ufr.local_tag(root) == TAG
+    assert (root / "config.py").read_bytes() == b"new config\n"
+
+
+def test_conflict_left_untouched_rerun_is_still_refused(tmp_path, monkeypatch):
+    root = tmp_path / "install"
+    install_old_root(root, {"main.py": b"old main\n", "config.py": b"old config\n"})
+    (root / "config.py").write_bytes(b"USER EDITED config\n")
+
+    zip_path, _ = build_release_zip(
+        tmp_path, {"main.py": b"new main\n", "config.py": b"new config\n"}
+    )
+    release_data = fake_release_data(f"{PACKAGE}.zip")
+    sha_text = sums_text_for(zip_path, f"{PACKAGE}.zip")
+    patch_network(monkeypatch, zip_path, sha_text, release_data)
+
+    rc1 = ufr.run_update(root, force=False)
+    assert rc1 != 0
+    assert ufr.local_tag(root) == OLD_TAG
+
+    # Rerun with nothing changed on disk: must still refuse, not silently
+    # succeed just because a previous run already saw this conflict.
+    rc2 = ufr.run_update(root, force=False)
+    assert rc2 != 0
+    assert ufr.local_tag(root) == OLD_TAG
+    assert (root / "config.py").read_bytes() == b"USER EDITED config\n"
+
+
+def test_take_new_backs_up_local_copy_and_applies_release_version(tmp_path, monkeypatch):
+    root = tmp_path / "install"
+    install_old_root(root, {"main.py": b"old main\n", "config.py": b"old config\n"})
+    (root / "config.py").write_bytes(b"USER EDITED config\n")
+
+    zip_path, _ = build_release_zip(
+        tmp_path, {"main.py": b"new main\n", "config.py": b"new config\n"}
+    )
+    release_data = fake_release_data(f"{PACKAGE}.zip")
+    sha_text = sums_text_for(zip_path, f"{PACKAGE}.zip")
+    patch_network(monkeypatch, zip_path, sha_text, release_data)
+
+    rc1 = ufr.run_update(root, force=False)
+    assert rc1 != 0  # unresolved conflict first
+
+    rc2 = ufr.run_update(root, force=False, take_new=True)
+    assert rc2 == 0
+    assert ufr.local_tag(root) == TAG
+    # Release version was applied.
+    assert (root / "config.py").read_bytes() == b"new config\n"
+    # The person's local edit was preserved under a take-new backup folder,
+    # never deleted.
+    backups = list((root / ufr.TAKE_NEW_DIR).glob("*/config.py"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == b"USER EDITED config\n"
+
+
+def test_take_new_also_resolves_a_removed_upstream_conflict(tmp_path, monkeypatch):
+    root = tmp_path / "install"
+    install_old_root(
+        root, {"main.py": b"old main\n", "gone_modified.txt": b"stale content\n"}
+    )
+    (root / "gone_modified.txt").write_bytes(b"USER EDITED stale content\n")
+
+    zip_path, _ = build_release_zip(tmp_path, {"main.py": b"new main\n"})
+    release_data = fake_release_data(f"{PACKAGE}.zip")
+    sha_text = sums_text_for(zip_path, f"{PACKAGE}.zip")
+    patch_network(monkeypatch, zip_path, sha_text, release_data)
+
+    rc1 = ufr.run_update(root, force=False)
+    assert rc1 != 0
+
+    rc2 = ufr.run_update(root, force=False, take_new=True)
+    assert rc2 == 0
+    assert ufr.local_tag(root) == TAG
     assert not (root / "gone_modified.txt").exists()
-    moved = root / ufr.CONFLICT_DIR / "gone_modified.txt"
-    assert moved.exists()
-    assert moved.read_bytes() == b"USER EDITED stale content 2\n"
+    backups = list((root / ufr.TAKE_NEW_DIR).glob("*/gone_modified.txt"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == b"USER EDITED stale content\n"
 
 
 if __name__ == "__main__":
