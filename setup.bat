@@ -59,6 +59,22 @@ set "PF_RC=!ERRORLEVEL!"
 if "!PF_RC!"=="3" goto :offer_unblock
 if "!PF_RC!"=="4" goto :offer_unblock
 if "!PF_RC!"=="0" goto :after_preflight
+REM PowerShell itself missing from PATH (cmd's own "command not found" errorlevel, 9009 --
+REM see scripts\test_a_failing_entry_point_says_why.py for why this is not localization-
+REM dependent) is NOT a policy block: nothing ran, so nothing was judged. Reporting it as one
+REM told an operator with no PowerShell at all ("this PC's policy stops this project's
+REM scripts") to ask IT for a script-execution exemption that has nothing to do with their
+REM actual problem, and stopped setup.bat before it ever reached the Python checks below --
+REM which is where a PC with no PowerShell and no Python needs to land, since that is the
+REM branch that names python.org / astral as the next step (D18 follow-up, 2026-09-24).
+if "!PF_RC!"=="9009" (
+    echo.
+    echo NOTE: PowerShell could not be started ^(not found on PATH: "!PATH!"^).
+    echo   This is not a policy block -- the check that looks for one needs PowerShell to run
+    echo   at all, so it could not be performed and is being skipped. Continuing with the
+    echo   Python checks below; if this PC also has no Python, that step names the next step.
+    goto :after_preflight
+)
 echo.
 echo ACTION NEEDED: this PC's policy stops this project's scripts ^(see above^).
 echo   Nothing was changed. Follow the NEXT STEP above, then run setup.bat again.

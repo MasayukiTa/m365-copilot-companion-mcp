@@ -132,13 +132,44 @@ def test_a_non_call_reference_never_creates_doubt():
 
 # ── and the end-to-end property, against the real repository ──────────────────────────────
 
-def test_the_scan_reports_more_than_the_bare_name_count_could():
-    """THE NO-OP DEFECT, pinned. The first version returned exactly what it returned before."""
-    rows = U.scan()
-    assert rows is not None
-    assert len(rows) > 70, (
+def test_the_scan_reports_more_than_the_bare_name_count_could(monkeypatch):
+    """THE NO-OP DEFECT, pinned.
+
+    THIS USED TO PIN AN ABSOLUTE COUNT ("> 70"), taken when this repository's inventory held
+    around 96 rows before a burndown. Same defect as the one already fixed in
+    `tools/test_a_dead_caller_is_not_a_caller.py::test_it_reaches_a_fixed_point_well_inside_the_
+    bound` (628f43d): a magic number pinned to the current inventory size cannot tell a real
+    improvement (fewer dead names) from the attribution quietly breaking. The property this test
+    exists for is relative -- attribution reports MORE than a bare-name count could -- not
+    absolute, so it is measured directly against a same-run, same-moment scan with attribution
+    disabled rather than a number that drifts every time a burndown lands.
+
+    `_attribute_calls` IS REPLACED WITH ITS OWN OPPOSITE EXTREME to get the "before" behaviour
+    without touching tools/unreached.py: the real function credits call positions and doubts
+    only what it cannot resolve; this fake credits nothing (`qualified` stays empty) and doubts
+    everything a bare Name/Attribute walk sees -- literally the "count every Name/Attribute"
+    design measured in this file's own module docstring at 411 ambiguous. Doubting a name marks
+    it ambiguous whenever it has more than one definition and any production reference, which is
+    exactly the old `if len(places) != 1 and prod_refs[name]: continue` rule this test guards
+    against regressing to. `iterate=False` on both sides isolates the attribution question from
+    the unrelated dead-caller iteration covered elsewhere.
+    """
+    def _bare(rel, tree, files, qualified, unattributable):
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name):
+                unattributable[node.id] += 1
+            elif isinstance(node, ast.Attribute):
+                unattributable[node.attr] += 1
+
+    real_rows = U.scan(iterate=False)
+    assert real_rows is not None, "git could not list the tracked files"
+    monkeypatch.setattr(U, "_attribute_calls", _bare)
+    bare_rows = U.scan(iterate=False)
+    assert bare_rows is not None, "git could not list the tracked files"
+    assert len(real_rows) > len(bare_rows), (
         "the scan is back to the bare-name count; the attribution is being discarded "
-        "(the first version filtered `places` and then fell through to `if prod_refs[name]`)")
+        "(the first version filtered `places` and then fell through to `if prod_refs[name]`): "
+        "%d vs %d" % (len(real_rows), len(bare_rows)))
 
 
 def test_what_cannot_be_attributed_is_carried_out_rather_than_dropped():

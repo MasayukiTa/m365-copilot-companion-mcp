@@ -203,8 +203,20 @@ def test_the_repo_wide_fixture_keeps_tests_out_of_the_live_queue():
 
 
 def test_this_suite_is_not_writing_to_the_real_queue():
-    """Belt and braces: the fixture above redirects it, and this asserts the redirection took."""
-    assert "live_records" in P.QUEUE_PATH or "Temp" in P.QUEUE_PATH or "tmp" in P.QUEUE_PATH.lower()
+    """Belt and braces: the fixture above redirects it, and this asserts the redirection took.
+
+    THIS USED TO CHECK THE PATH'S SPELLING ('live_records', 'Temp' or 'tmp' in it), and CI now
+    sets TMPDIR to the runner's own temp directory (/home/runner/work/_temp/...), which contains
+    none of those words though it is exactly as temporary as any other tmp_path. A spelling check
+    on a path is not a property of the path -- what matters is that the queue the suite writes to
+    is NOT the repository's real one, which is what the fixture exists to guarantee. So this
+    compares the redirected P.QUEUE_PATH against REAL_QUEUE (captured at import, before the
+    autouse fixture ran) rather than guessing at how a temp directory is usually named."""
+    import os
+    real = os.path.realpath(REAL_QUEUE)
+    redirected = os.path.realpath(P.QUEUE_PATH)
+    assert redirected != real, "the fixture did not move QUEUE_PATH off the real queue: %r" % (
+        P.QUEUE_PATH,)
 
 
 def test_a_refused_proposal_comes_back_after_it_was_dropped():
