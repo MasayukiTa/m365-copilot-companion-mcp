@@ -2139,10 +2139,10 @@ function Invoke-Startup {
 
     Write-Host ""
     if ($NoUi) {
-        Write-Host "Done. Background stack is up. Chat bridge: http://127.0.0.1:8765"
+        Write-Host "Done. Background stack is up (bridge status: http://127.0.0.1:8765/status)."
         Write-Host "Open the full UI manually with: wscript.exe `"$root\scripts\start_all_hidden.vbs`""
     } else {
-        Write-Host "Done. Chat UI: http://127.0.0.1:8765 (or the CopilotChat window). Fleet cockpit window is up."
+        Write-Host "Done. Chat: use the CopilotChat window. Fleet cockpit window is up."
         Write-Host "If a one-time M365 sign-in is needed, a visible Edge window will appear -- sign in there."
     }
 
