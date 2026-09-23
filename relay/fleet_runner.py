@@ -1280,7 +1280,9 @@ def _launch_blockers():
             "checkpoint", os.path.join(_repo_root(), "scripts", "win", "checkpoint.py"))
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        verdicts, _extras = mod.verdicts_now()
+        # memory=False: the gate reads verdicts, never extras["memory"], and that figure is
+        # a 4-5 s PowerShell query per browser -- 9.3 s of every launch, measured 2026-09-24.
+        verdicts, _extras = mod.verdicts_now(memory=False)
         return [(name, detail) for name, ok, detail in verdicts
                 if not ok and name in BLOCKING_INVARIANTS]
     except Exception as exc:
