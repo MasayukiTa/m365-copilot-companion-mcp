@@ -63,3 +63,43 @@ function Test-SupervisorTunnelDrift {
     if ([string]::IsNullOrEmpty($runBare) -or [string]::IsNullOrEmpty($envBare)) { return $false }
     return ($runBare -ne $envBare)
 }
+
+function Test-GeneratedTunnelName {
+    # A name THIS REPOSITORY GENERATES: the default tunnel name, optionally followed by a hex
+    # machine suffix (8 = the current scheme, 6 = the legacy setup_devtunnel.ps1 one -- see
+    # bootstrap.py's _legacy_machine_suffix). Such a name carries nothing user- or
+    # folder-derived -- the suffix is a hash of COMPUTERNAME/USERNAME, not either value
+    # verbatim -- which matters twice: it cannot be identifying on its own (D29 below), and
+    # its suffix says which machine made it even when .env has no separate host stamp (D7).
+    #
+    # THIRD COPY, CONSOLIDATED HERE 2026-09-24. This used to be Test-GeneratedTunnelName in
+    # setup_devtunnel.ps1 and, byte-for-byte except its name, Test-GeneratedTunnelNameDoctor in
+    # doctor.ps1 -- both hand-kept in sync with each other AND with bootstrap.py's
+    # _is_generated_tunnel_name. Only the two PowerShell copies move here: bootstrap.py's
+    # Python version stays where it is (a different language cannot dot-source this file), and
+    # Test-IdentifyingTunnelName -- the larger function that CALLS this one, and that also
+    # carries the SHA-256 leaked-token blocklist -- stays duplicated between
+    # setup_devtunnel.ps1 and doctor.ps1 on purpose: those two copies differ in which local
+    # variable holds the repo root ($root vs $repo), and merging a blocklist-bearing function
+    # into a "no top-level side effects, trivially dot-sourceable" utility file is a bigger
+    # change than this task asked for. Only the WHY-D29 rule -- "a generated name is exempt
+    # from the user/folder substring check" -- had drifted into three separate copies of the
+    # SAME regex, which is what this consolidation fixes.
+    #
+    # WHY D29 EXISTS AT ALL: without this exemption, Test-IdentifyingTunnelName's substring
+    # check fired on a generated name whenever USERNAME happened to occur inside
+    # "m365-copilot-companion-<hex>" (a user named "pan", "com", "on", or a hex-only name
+    # landing inside the suffix) -- the generated name was then thrown away, regenerated as the
+    # exact same name, and "The PUBLIC URL will change" printed on every run while nothing
+    # changed.
+    param(
+        [string]$Name,
+        # Matches setup_devtunnel.ps1's $DEFAULT_NAME / doctor.ps1's (now-removed)
+        # $DOCTOR_DEFAULT_NAME / bootstrap.py's DEFAULT_TUNNEL_NAME -- all three have always
+        # been the literal string below; a caller with a different default may still pass one.
+        [string]$DefaultName = "m365-copilot-companion"
+    )
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    return ($Name.Trim().ToLowerInvariant() -match
+        ('^' + [regex]::Escape($DefaultName) + '(-[0-9a-f]{6}|-[0-9a-f]{8}){0,2}$'))
+}

@@ -16,9 +16,12 @@ name IT GENERATED (Test-GeneratedTunnelName) from the USERNAME-substring check -
 user named e.g. "pan" or "com" had the generated name "m365-copilot-companion-<hex>" flagged as
 identifying on every run, purely because their username happens to occur inside the fixed
 default name or its hex suffix (D29). doctor.ps1 carries its OWN copy of
-Test-IdentifyingTunnelName (the header comment above it says to keep both, and bootstrap.py's,
-in sync by hand) and had not received the same exemption; this test covers the mirrored
-Test-GeneratedTunnelNameDoctor added alongside it.
+Test-IdentifyingTunnelName (the header comment above it says to keep it, and bootstrap.py's, in
+sync by hand); it used to carry a byte-for-byte second copy of the exemption too
+(Test-GeneratedTunnelNameDoctor), but as of 2026-09-24 that copy is gone -- the ONE exemption
+rule now lives in scripts/tunnel_name_util.ps1's Test-GeneratedTunnelName, which both
+setup_devtunnel.ps1 and doctor.ps1 dot-source, and this test extracts it from THAT file instead
+of from doctor.ps1.
 
 HOW THIS RUNS WITHOUT A LIVE STACK. Nothing here dot-sources doctor.ps1 (it has top-level
 side effects: it reads the real repo's .env, calls the real devtunnel CLI, hits
@@ -51,6 +54,7 @@ sys.path.insert(0, REPO)
 from tools import childproc  # noqa: E402  (see: repository ratchet against text=True)
 
 DOCTOR_PS1 = os.path.join(REPO, "scripts", "doctor.ps1")
+TUNNEL_NAME_UTIL_PS1 = os.path.join(REPO, "scripts", "tunnel_name_util.ps1")
 
 _POWERSHELL = (
     shutil.which("powershell")
@@ -90,11 +94,10 @@ def _extract_braced_block(text: str, start_marker: str) -> str:
 
 def _extract_var_line(text: str, var_name: str) -> str:
     """The single `$var_name = ...` assignment line (module-level constant), verbatim
-    including any trailing comment. Used for the constants Test-IdentifyingTunnelName /
-    Test-GeneratedTunnelNameDoctor close over ($DOCTOR_DEFAULT_NAME, $TOKEN_SHA256,
-    $FULLNAME_SHA256) that live outside the function bodies the brace-extractor grabs -- these
-    must come from the live file too, not be retyped here, or the test could pass against
-    values the source no longer has."""
+    including any trailing comment. Used for the constants Test-IdentifyingTunnelName closes
+    over ($TOKEN_SHA256, $FULLNAME_SHA256) that live outside the function bodies the
+    brace-extractor grabs -- these must come from the live file too, not be retyped here, or
+    the test could pass against values the source no longer has."""
     marker = "$" + var_name + " ="
     idx = text.index(marker)
     end = text.index("\n", idx)
@@ -108,6 +111,12 @@ def doctor_source() -> str:
 
 
 @pytest.fixture(scope="module")
+def tunnel_name_util_source() -> str:
+    with open(TUNNEL_NAME_UTIL_PS1, "r", encoding="utf-8") as fh:
+        return fh.read()
+
+
+@pytest.fixture(scope="module")
 def last_start_functions(doctor_source: str) -> str:
     """The two PURE helpers: parsing the summary file, and the staleness decision."""
     return (_extract_braced_block(doctor_source, "function Get-LastStartSummaryDoctor") + "\n\n" +
@@ -115,14 +124,15 @@ def last_start_functions(doctor_source: str) -> str:
 
 
 @pytest.fixture(scope="module")
-def identifying_name_functions(doctor_source: str) -> str:
-    # Constants the functions below close over, plus the functions themselves -- both must
-    # come from the live file (see _extract_var_line's docstring).
-    return (_extract_var_line(doctor_source, "DOCTOR_DEFAULT_NAME") + "\n" +
-            _extract_var_line(doctor_source, "TOKEN_SHA256") + "\n" +
+def identifying_name_functions(doctor_source: str, tunnel_name_util_source: str) -> str:
+    # Constants the functions below close over, plus the functions themselves -- all must
+    # come from the live file(s) (see _extract_var_line's docstring). Test-GeneratedTunnelName
+    # itself now comes from tunnel_name_util.ps1 (shared with setup_devtunnel.ps1), not from
+    # doctor.ps1 -- see this file's header comment.
+    return (_extract_var_line(doctor_source, "TOKEN_SHA256") + "\n" +
             _extract_var_line(doctor_source, "FULLNAME_SHA256") + "\n\n" +
             _extract_braced_block(doctor_source, "function Get-Sha256HexDoctor") + "\n\n" +
-            _extract_braced_block(doctor_source, "function Test-GeneratedTunnelNameDoctor") + "\n\n" +
+            _extract_braced_block(tunnel_name_util_source, "function Test-GeneratedTunnelName") + "\n\n" +
             _extract_braced_block(doctor_source, "function Test-IdentifyingTunnelName"))
 
 
@@ -373,7 +383,7 @@ def test_block_flags_a_stale_record_even_when_it_was_clean(
     assert "may be stale" in results[0]["name"]
 
 
-# ── Test-IdentifyingTunnelName / Test-GeneratedTunnelNameDoctor: the D29 mirror ─────────────
+# ── Test-IdentifyingTunnelName / Test-GeneratedTunnelName: the D29 exemption ────────────────
 
 def test_a_generated_name_is_not_flagged_even_when_username_is_a_substring(
         tmp_path, identifying_name_functions):
@@ -404,7 +414,7 @@ Emit "r" (Test-IdentifyingTunnelName "pan-personal-tunnel")
 @pytest.mark.parametrize("suffix_len", [6, 8])
 def test_generated_name_detector_accepts_both_suffix_lengths(tmp_path, identifying_name_functions, suffix_len):
     body = identifying_name_functions + _FMT_HEADER + (
-        'Emit "r" (Test-GeneratedTunnelNameDoctor "m365-copilot-companion-%s")\n'
+        'Emit "r" (Test-GeneratedTunnelName "m365-copilot-companion-%s")\n'
         % ("a" * suffix_len)
     ) + _FMT_FOOTER
     out = json.loads(_run_ps(tmp_path, body))
@@ -413,7 +423,7 @@ def test_generated_name_detector_accepts_both_suffix_lengths(tmp_path, identifyi
 
 def test_generated_name_detector_rejects_a_lookalike_with_extra_text(tmp_path, identifying_name_functions):
     body = identifying_name_functions + _FMT_HEADER + '''
-Emit "r" (Test-GeneratedTunnelNameDoctor "m365-copilot-companion-pan-12ab34cd")
+Emit "r" (Test-GeneratedTunnelName "m365-copilot-companion-pan-12ab34cd")
 ''' + _FMT_FOOTER
     out = json.loads(_run_ps(tmp_path, body))
     assert out["r"] is False, out
