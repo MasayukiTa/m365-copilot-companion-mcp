@@ -197,6 +197,17 @@ def _under(child: Path, parent: Path) -> bool:
         return False
 
 
+#: Hard ceiling on how many bytes of *content* (not counting the "N: " line-number prefixes)
+#: read_file will ever hand back, whatever start_line/max_lines asked for. OPS-17: the old
+#: implementation did `p.read_text().splitlines()` and only sliced afterwards, so max_lines=1
+#: against a multi-GB file still decoded and held the entire file in memory before throwing
+#: away everything but one line. This cap is the second half of the fix -- streaming (below)
+#: fixes the case a caller bounded correctly; this fixes the case nobody bounded at all
+#: (max_lines=None, or max_lines larger than the file), which would otherwise still try to
+#: return the whole file as one giant string.
+READ_FILE_MAX_OUTPUT_BYTES = 2_000_000  # ~2 MB of text
+
+
 def read_file(
     path: str,
     encoding: str = "utf-8",
@@ -210,6 +221,12 @@ def read_file(
         encoding: Text encoding.
         start_line: 1-based line number to start reading from.
         max_lines: Optional maximum number of lines to return.
+
+    Streams the file line-by-line rather than loading it whole: only the requested
+    line range (plus whatever falls under READ_FILE_MAX_OUTPUT_BYTES) is ever held in
+    memory, so a huge file with a small max_lines does not blow up peak memory (OPS-17).
+    Output is also hard-capped in bytes regardless of max_lines, so an unbounded read of
+    a huge file returns a clearly-marked partial result instead of everything at once.
     """
     try:
         p = _validate_path(path)
@@ -219,11 +236,33 @@ def read_file(
                 "Hint: to locate a file by name anywhere under a root, use "
                 "find_files(name_contains=..., path=...)."
             )
-        lines = p.read_text(encoding=encoding).splitlines()
+        # Stat before opening: settles "is this even a regular file" and gives the size
+        # used in the truncation note below, without decoding a single byte of content.
+        size = p.stat().st_size
         start = max(start_line - 1, 0)
         end = None if max_lines is None else start + max_lines
-        selected = lines[start:end]
-        return "\n".join(f"{idx}: {line}" for idx, line in enumerate(selected, start + 1))
+        selected: list[str] = []
+        content_bytes = 0
+        hit_cap = False
+        with p.open("r", encoding=encoding) as f:
+            for idx, raw_line in enumerate(f):
+                if idx < start:
+                    continue
+                if end is not None and idx >= end:
+                    break
+                line = raw_line.rstrip("\r\n")
+                content_bytes += len(line.encode(encoding, errors="replace")) + 1
+                if content_bytes > READ_FILE_MAX_OUTPUT_BYTES:
+                    hit_cap = True
+                    break
+                selected.append(f"{idx + 1}: {line}")
+        out = "\n".join(selected)
+        if hit_cap:
+            out += (
+                f"\n[read_file: truncated at {READ_FILE_MAX_OUTPUT_BYTES:,} bytes "
+                f"(file is {size:,} bytes); use start_line/max_lines to read further]"
+            )
+        return out
     except Exception as e:
         return f"[read_file error: {type(e).__name__}: {e}]"
 
