@@ -34,6 +34,7 @@ import platform
 import re
 import shutil
 import socket
+import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -97,7 +98,17 @@ owned = st.setdefault("owned", {})
 if a[:1] == ["--version"]:
     print("Tunnel CLI version: 1.0.0-stub"); sys.exit(0)
 if a[:2] == ["user", "show"]:
+    if st.get("not_logged_in"):
+        print("You are not logged in."); sys.exit(1)
     print("Logged in as test@example.com using Microsoft."); sys.exit(0)
+if a[:2] == ["user", "login"]:
+    # Simulates the real device-code/browser flow that blocks for minutes: if this is ever
+    # reached, the test's own bounded timeout is what fails it. N (no access chosen) must
+    # never reach this -- new-PC / Windows Sandbox report 2026-09-24 (unattended run with N
+    # still waited 120s then ~15 minutes on this exact call before failing).
+    import time
+    time.sleep(3600)
+    sys.exit(0)
 if a[:1] == ["list"]:
     if st.get("list_mode") == "garbled":
         sys.exit(0)
@@ -307,6 +318,24 @@ def test_none_after_anonymous_revokes_it_and_says_nothing_can_connect(tmp_path):
     assert "NOT READY" in rig.out and "press A" in rig.out, rig.out
     assert rig.live("MCP_TUNNEL_URL"), "the URL is still recorded for the re-run"
     assert not [c for c in rig.calls if c[:2] == ["access", "create"]]
+
+
+def test_none_and_not_signed_in_never_calls_login_and_ends_quickly(tmp_path):
+    """Windows Sandbox report, standard user, unattended: choosing N still ran STEP 4's sign-in
+    -- the 120s browser poll, then a device-code flow that blocked for ~15 minutes and failed
+    with 'Verification code expired'. N means no remote caller is wanted this run, so nothing
+    here needs an interactive Microsoft sign-in; that only happens once A or T is chosen. The
+    stub's `user login` sleeps for an hour -- if it is ever invoked this test's own bounded
+    timeout is what catches it (not a real 15-minute wait)."""
+    rig = Rig(tmp_path, "MCP_API_KEY=k\n", {"owned": {}, "not_logged_in": True})
+    try:
+        rig.run(timeout=30)
+    except subprocess.TimeoutExpired:
+        pytest.fail("setup_devtunnel.ps1 hung -- it must never call 'devtunnel user login' "
+                    "when no access (N) was chosen and the account is not signed in")
+    assert rig.rc == 3, rig.out
+    assert not [c for c in rig.calls if c[:2] == ["user", "login"]], rig.calls
+    assert not rig.live("MCP_TUNNEL_URL"), "no tunnel should be created without signing in first"
 
 
 # ── 2026-09-24 new-PC report: never end "ready" with grant none ─────────────────────────────

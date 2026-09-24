@@ -376,7 +376,8 @@ if not exist ".setup" mkdir ".setup"
 if /i "!PROV_SHORTCUT!"=="yes" (
     powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\make_desktop_shortcut.ps1"
 ) else (
-    echo   Desktop launcher skipped. Create it later with scripts\make_desktop_shortcut.ps1
+    echo   Desktop launcher skipped. Create it later by running quickstart.bat again and
+    echo   answering Y to this question.
 )
 if /i "!PROV_AUTOSTART!"=="yes" (
     powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\register-supervisor.ps1"
@@ -387,7 +388,8 @@ if /i "!PROV_AUTOSTART!"=="yes" (
         echo   else continues; start the stack from the Desktop launcher until this is fixed.
     )
 ) else (
-    echo   Logon autostart skipped. Register it later with scripts\register-supervisor.ps1
+    echo   Logon autostart skipped. Register it later by running quickstart.bat again and
+    echo   answering y to this question.
 )
 
 echo.
