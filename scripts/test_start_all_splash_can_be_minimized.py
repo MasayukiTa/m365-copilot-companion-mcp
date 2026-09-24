@@ -26,6 +26,11 @@ $ErrorActionPreference = 'Stop'
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($env:START_ALL_PATH, [ref]$null, [ref]$null)
 $fn = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Start-Splash' }, $true) | Select-Object -First 1
 if (-not $fn) { 'NO_FUNCTION'; exit 3 }
+# Start-Splash calls Get-JapaneseUiFont (scripts/win/ui_font.ps1) -- dot-source it so the
+# extracted function has it available, same as the real script does.
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+. (Join-Path (Split-Path -Parent $env:START_ALL_PATH) "win/ui_font.ps1")
 Invoke-Expression $fn.Extent.Text
 $s = Start-Splash
 if (-not $s) { 'NO_FORM'; exit 4 }

@@ -102,79 +102,110 @@ if (-not $fields -or $fields.Count -eq 0) {
 # --- build the form ------------------------------------------------------------------------
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-$form = New-Object System.Windows.Forms.Form
-$form.Text = "Copilot エージェント URL の設定 (.env)"
-$form.StartPosition = "CenterScreen"
-$form.FormBorderStyle = "FixedDialog"
-$form.MaximizeBox = $false
+# Japanese-capable font helper (see scripts/win/ui_font.ps1) -- without it, labels/textboxes
+# that never set an explicit .Font fall back to Microsoft Sans Serif, which has no Japanese
+# glyphs, and Windows font-links to a CHINESE fallback font on a non-Japanese system locale.
+. (Join-Path $PSScriptRoot "win/ui_font.ps1")
 
-$y = 12
-# Optional reason banner (shown when the relay pops this because an agent did not load).
-if ($Reason) {
-    $banner = New-Object System.Windows.Forms.Label
-    $banner.Text = $Reason
-    $banner.SetBounds(16, $y, 680, 50)
-    $banner.ForeColor = [System.Drawing.Color]::FromArgb(180, 60, 0)
-    $banner.Font = New-Object System.Drawing.Font($banner.Font, [System.Drawing.FontStyle]::Bold)
-    $form.Controls.Add($banner)
-    $y += 56
-}
+# Builds the dialog and returns it WITHOUT calling ShowDialog(), so it can be constructed and
+# inspected (e.g. by a test) without ever putting a window on screen. Takes everything it needs
+# as parameters rather than closing over script-scope variables, so it is independently callable.
+function New-ConfigureEnvForm {
+    param(
+        [array]$fields,
+        [string]$Reason,
+        [array]$lines,
+        [hashtable]$defaults
+    )
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Copilot エージェント URL の設定 (.env)"
+    $form.StartPosition = "CenterScreen"
+    $form.FormBorderStyle = "FixedDialog"
+    $form.MaximizeBox = $false
+    # Set BEFORE adding any control, so every control that never sets its own .Font ambiently
+    # inherits this one once parented (labels, textboxes, buttons below).
+    $form.Font = Get-JapaneseUiFont
+    # For the two BOLD labels below: reading a control's .Font BEFORE it is added to
+    # $form.Controls happens before WinForms' ambient-font inheritance kicks in, so
+    # $banner.Font / $lbl.Font at that point would still be the WinForms default (Microsoft
+    # Sans Serif), NOT $form.Font -- building bold variants from Get-JapaneseUiFont directly
+    # avoids that trap.
+    $jp = Get-JapaneseUiFont
 
-$intro = New-Object System.Windows.Forms.Label
-$intro.Text = "各エージェントの URL を貼り付けて [保存] を押すと .env に反映されます。" + [Environment]::NewLine +
-              "URL の取り方: M365 Copilot (https://m365.cloud.microsoft/chat) で対象エージェントを開き、アドレスバーの URL をコピー。"
-$intro.SetBounds(16, $y, 680, 40)
-$form.Controls.Add($intro)
-$y += 48
+    $y = 12
+    # Optional reason banner (shown when the relay pops this because an agent did not load).
+    if ($Reason) {
+        $banner = New-Object System.Windows.Forms.Label
+        $banner.Text = $Reason
+        $banner.SetBounds(16, $y, 680, 50)
+        $banner.ForeColor = [System.Drawing.Color]::FromArgb(180, 60, 0)
+        $banner.Font = New-Object System.Drawing.Font($jp.FontFamily, $jp.Size, [System.Drawing.FontStyle]::Bold)
+        $form.Controls.Add($banner)
+        $y += 56
+    }
 
-$boxes = @{}
-foreach ($f in $fields) {
-    $lbl = New-Object System.Windows.Forms.Label
-    $cur = Get-EnvVal $lines $f.Key
-    # When .env has no value, pre-fill the known-good default (Researcher / Analyst) so the
-    # field is usable with no typing. The main (T_) agent has no default -> stays blank.
-    if (-not $cur -and $defaults.ContainsKey($f.Key)) { $cur = $defaults[$f.Key] }
-    $lbl.Text = $f.Label + "   [" + $f.Key + "]"
-    $lbl.SetBounds(16, $y, 680, 18); $lbl.Font = New-Object System.Drawing.Font($lbl.Font, [System.Drawing.FontStyle]::Bold)
-    $form.Controls.Add($lbl)
-    $hint = New-Object System.Windows.Forms.Label
-    $hint.Text = $f.Hint
-    $hint.SetBounds(16, ($y + 20), 680, 18); $hint.ForeColor = [System.Drawing.Color]::DimGray
-    $form.Controls.Add($hint)
-    $tb = New-Object System.Windows.Forms.TextBox
-    $tb.SetBounds(16, ($y + 40), 672, 24); $tb.Text = $cur
-    $form.Controls.Add($tb)
-    $boxes[$f.Key] = $tb
-    $y += 78
-}
+    $intro = New-Object System.Windows.Forms.Label
+    $intro.Text = "各エージェントの URL を貼り付けて [保存] を押すと .env に反映されます。" + [Environment]::NewLine +
+                  "URL の取り方: M365 Copilot (https://m365.cloud.microsoft/chat) で対象エージェントを開き、アドレスバーの URL をコピー。"
+    $intro.SetBounds(16, $y, 680, 40)
+    $form.Controls.Add($intro)
+    $y += 48
 
-$save = New-Object System.Windows.Forms.Button
-$save.Text = "保存して閉じる"; $save.SetBounds(470, ($y + 6), 130, 30); $save.DialogResult = "OK"
-$form.Controls.Add($save); $form.AcceptButton = $save
-$cancel = New-Object System.Windows.Forms.Button
-$cancel.Text = "キャンセル"; $cancel.SetBounds(608, ($y + 6), 90, 30); $cancel.DialogResult = "Cancel"
-$form.Controls.Add($cancel); $form.CancelButton = $cancel
+    $boxes = @{}
+    foreach ($f in $fields) {
+        $lbl = New-Object System.Windows.Forms.Label
+        $cur = Get-EnvVal $lines $f.Key
+        # When .env has no value, pre-fill the known-good default (Researcher / Analyst) so the
+        # field is usable with no typing. The main (T_) agent has no default -> stays blank.
+        if (-not $cur -and $defaults.ContainsKey($f.Key)) { $cur = $defaults[$f.Key] }
+        $lbl.Text = $f.Label + "   [" + $f.Key + "]"
+        $lbl.SetBounds(16, $y, 680, 18); $lbl.Font = New-Object System.Drawing.Font($jp.FontFamily, $jp.Size, [System.Drawing.FontStyle]::Bold)
+        $form.Controls.Add($lbl)
+        $hint = New-Object System.Windows.Forms.Label
+        $hint.Text = $f.Hint
+        $hint.SetBounds(16, ($y + 20), 680, 18); $hint.ForeColor = [System.Drawing.Color]::DimGray
+        $form.Controls.Add($hint)
+        $tb = New-Object System.Windows.Forms.TextBox
+        $tb.SetBounds(16, ($y + 40), 672, 24); $tb.Text = $cur
+        $form.Controls.Add($tb)
+        $boxes[$f.Key] = $tb
+        $y += 78
+    }
 
-# Size the window to the content (so -Only shows a compact one-field dialog).
-$form.ClientSize = New-Object System.Drawing.Size(712, ($y + 50))
+    $save = New-Object System.Windows.Forms.Button
+    $save.Text = "保存して閉じる"; $save.SetBounds(470, ($y + 6), 130, 30); $save.DialogResult = "OK"
+    $form.Controls.Add($save); $form.AcceptButton = $save
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = "キャンセル"; $cancel.SetBounds(608, ($y + 6), 90, 30); $cancel.DialogResult = "Cancel"
+    $form.Controls.Add($cancel); $form.CancelButton = $cancel
 
-# A WinForms Form created in a WINDOWLESS-launched powershell (configure_env_hidden.vbs
-# runs `wscript ... Run(...,0)`) INHERITS the parent's SW_HIDE show-state and never
-# appears on screen -- ShowDialog() then blocks on an invisible window and the user sees
-# the .bat flash and "do nothing". Force it visible from Add_Shown with Win32 ShowWindow
-# (SW_SHOW=5, SW_RESTORE=9) + SetForegroundWindow, exactly like the startup splash fix.
-# (Note: $this = the firing form; do NOT use $form -- that mirrors the splash bug.)
-Add-Type -Namespace M365 -Name CfgWin -MemberDefinition @'
+    # Size the window to the content (so -Only shows a compact one-field dialog).
+    $form.ClientSize = New-Object System.Drawing.Size(712, ($y + 50))
+
+    # A WinForms Form created in a WINDOWLESS-launched powershell (configure_env_hidden.vbs
+    # runs `wscript ... Run(...,0)`) INHERITS the parent's SW_HIDE show-state and never
+    # appears on screen -- ShowDialog() then blocks on an invisible window and the user sees
+    # the .bat flash and "do nothing". Force it visible from Add_Shown with Win32 ShowWindow
+    # (SW_SHOW=5, SW_RESTORE=9) + SetForegroundWindow, exactly like the startup splash fix.
+    # (Note: $this = the firing form; do NOT use $form -- that mirrors the splash bug.)
+    Add-Type -Namespace M365 -Name CfgWin -MemberDefinition @'
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr h, int n);
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool SetForegroundWindow(System.IntPtr h);
 '@
-$form.Add_Shown({
-    try { [M365.CfgWin]::ShowWindow($this.Handle, 5) | Out-Null } catch {}
-    try { [M365.CfgWin]::ShowWindow($this.Handle, 9) | Out-Null } catch {}
-    try { [M365.CfgWin]::SetForegroundWindow($this.Handle) | Out-Null } catch {}
-    try { $this.Activate(); $this.BringToFront() } catch {}
-})
-$form.TopMost = $true
+    $form.Add_Shown({
+        try { [M365.CfgWin]::ShowWindow($this.Handle, 5) | Out-Null } catch {}
+        try { [M365.CfgWin]::ShowWindow($this.Handle, 9) | Out-Null } catch {}
+        try { [M365.CfgWin]::SetForegroundWindow($this.Handle) | Out-Null } catch {}
+        try { $this.Activate(); $this.BringToFront() } catch {}
+    })
+    $form.TopMost = $true
+
+    return @{ Form = $form; Boxes = $boxes; SaveButton = $save; CancelButton = $cancel }
+}
+
+$built = New-ConfigureEnvForm -fields $fields -Reason $Reason -lines $lines -defaults $defaults
+$form = $built.Form
+$boxes = $built.Boxes
 
 $result = $form.ShowDialog()
 if ($result -ne "OK") {

@@ -4312,7 +4312,7 @@ class ChatWindow : Window, IChatSendEffects
         var tb = new TextBox
         {
             Text = text, IsReadOnly = true, BorderThickness = new Thickness(0), Background = Brushes.Transparent,
-            TextWrapping = TextWrapping.Wrap, IsTabStop = false, FontFamily = new FontFamily("Segoe UI Variable, Segoe UI"), FontSize = 14
+            TextWrapping = TextWrapping.Wrap, IsTabStop = false, FontFamily = new FontFamily(Theme.UiFont), FontSize = 14
         };
         SetRef(tb, ForegroundProperty, "Fg");
         var bubble = new Border { Child = tb, CornerRadius = new CornerRadius(Theme.RadBubble), Padding = new Thickness(16, 12, 16, 12), Margin = new Thickness(40, 6, 0, 24), HorizontalAlignment = HorizontalAlignment.Right, MaxWidth = 560 };
@@ -4585,7 +4585,7 @@ class ChatWindow : Window, IChatSendEffects
     // POSITION problem rather than a cosmetic one: the reader is mid-sentence when the text
     // moves under them. These constants exist so the two paths cannot drift apart again, and
     // `test_an_answer_does_not_rewrap_when_it_settles` asserts both use them.
-    static readonly FontFamily BODY_FACE = new FontFamily("Segoe UI Variable, Segoe UI");
+    static readonly FontFamily BODY_FACE = new FontFamily(Theme.UiFont);
     const double BODY_SIZE = 14;
     static readonly Thickness BODY_PAD = new Thickness(0);
 
