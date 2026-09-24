@@ -62,6 +62,13 @@ def gate_ask(question: str, context: Optional[str] = None, notify: bool = True) 
     locked = require_unlocked()
     if locked:
         return locked
+    try:
+        from .approval_policy import current_approval_mode
+        if current_approval_mode() == "bypass":
+            return ("[gate_ask skipped: job_approval_mode=bypass -- no question was raised "
+                     "and none will be. Proceed using your own judgement.]")
+    except Exception:
+        pass
     token = gate_ask_local(question, context, notify)
     if not token:
         return "[gate_ask error: could not create gate]"
@@ -131,6 +138,25 @@ def gate_ask_local(question: str, context: Optional[str] = None,
     gate is history, not a standing rule, and pretending otherwise would auto-resolve a
     recurrence the operator never actually saw.
     """
+    try:
+        from .approval_policy import current_approval_mode, record_bypass_decision
+        if current_approval_mode() == "bypass":
+            # THE OWNER'S OWN WORDS: bypass means the product never asks a person, in any
+            # case, ever. This is the ONE place gate files get created (gate_ask the tool,
+            # and relay_fleet._raise_stuck_gate on a worker's behalf, both funnel through
+            # here) -- so this is the one place that has to refuse instead of writing one.
+            # Returning None (not a token) is not a new failure shape: every existing
+            # caller already treats "no token" as "raising a gate failed, fall back to
+            # your own prior behaviour" -- _raise_stuck_gate settles the worker STUCK with
+            # its own diagnosis instead, gate_ask reports why it declined. No gate file, no
+            # desktop toast, nothing written to .companion_gates.
+            record_bypass_decision(
+                "gate_ops.gate_ask_local", question,
+                "no gate raised; caller's existing no-human fallback applies "
+                "(worker settles STUCK / gate_ask declines)")
+            return None
+    except Exception:
+        pass
     try:
         _ensure()
         if dedupe_key:
