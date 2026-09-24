@@ -44,6 +44,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 
 #: Diagnostics for finished runs. Generous because they cost little and are the first thing
@@ -298,19 +299,32 @@ def stores(fleet_dir, now=None, dry_run=False, keep_days=None, names=None):
 #: references its path.
 CLONE_KEEP_DAYS = float(os.environ.get("MCP_FLEET_CLONE_DAYS", "14"))
 
-#: How often the clone sweep is actually allowed to run its walk, regardless of how often
-#: apply() itself is called. See the measurement note on workspace_clones() for why a walk that
-#: costs a fraction of a second per clone still needs a floor under how often it runs at all.
+#: How often the clone sweep is actually allowed to RUN, regardless of how often apply() itself
+#: is called. See the measurement note on workspace_clones() for why a walk over swe/work still
+#: needs a floor under how often it happens at all, even off the critical path.
 CLONE_SWEEP_HOURS = float(os.environ.get("MCP_FLEET_CLONE_SWEEP_HOURS", "24"))
 
-#: Sidecar recording when the clone sweep last actually walked swe/work, so the cost of the
-#: walk is amortized to at most once per CLONE_SWEEP_HOURS no matter how many times apply()
-#: runs in between -- fleet_runner.py calls apply() at the start of EVERY fleet run.
+#: Sidecar recording when the clone sweep last actually completed a walk over swe/work, so the
+#: cost is amortized to at most once per CLONE_SWEEP_HOURS no matter how many times apply() runs
+#: in between -- fleet_runner.py calls apply() at the start of EVERY fleet run.
 _CLONE_SWEEP_STATE_NAME = "clone_sweep_state.json"
+
+#: A clone mid-removal is renamed to this prefix BEFORE shutil.rmtree runs on it -- see
+#: _clone_sweep_run_once()'s own comment for why. Dotted so it never collides with a real clone
+#: name (benchmark harnesses do not check out repositories starting with a dot) and so a listing
+#: of swe/work makes an in-flight deletion obvious at a glance.
+_DELETING_PREFIX = ".deleting-"
+
+#: The sweep holds this lock file for as long as it runs -- measured worst case on the synthetic
+#: tree was under six minutes, so anything still holding the lock two hours later did not
+#: release it because it is running, it did not release it because it crashed. Stolen rather
+#: than honoured past this age, or a crash permanently wedges the sweep off.
+_CLONE_SWEEP_LOCK_NAME = "clone_sweep.lock"
+_CLONE_SWEEP_LOCK_STALE_HOURS = 2.0
 
 
 def _clone_sweep_due(fleet_dir, now, sweep_hours):
-    """Whether enough time has passed since the last walk to justify another one.
+    """Whether enough time has passed since the last COMPLETED walk to justify another one.
 
     Unreadable or missing state means "never swept" -- due, not skipped. A state file that
     cannot be parsed must not silently disable the sweep forever.
@@ -336,6 +350,54 @@ def _record_clone_sweep(fleet_dir, now):
         with io.open(tmp, "w", encoding="utf-8") as fh:
             json.dump({"last_swept_ts": now}, fh)
         os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _clone_sweep_lock_acquire(fleet_dir, now):
+    """Atomically claim the right to run the sweep, or return None if someone already has it.
+
+    O_CREAT|O_EXCL is the whole mechanism: the OS refuses the second create, so two sweeps
+    racing to start -- two fleets starting within the same throttle window, each deciding the
+    sweep is due before either has recorded completion -- can never both believe they hold it.
+    This is the ONLY thing that makes "two concurrent triggers run one sweep" true; the due-check
+    in workspace_clones() is not atomic across processes and cannot be the safety rail by itself.
+    """
+    path = os.path.join(fleet_dir, _CLONE_SWEEP_LOCK_NAME)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        try:
+            age_h = (now - os.path.getmtime(path)) / 3600.0
+        except OSError:
+            age_h = 0.0
+        if age_h < _CLONE_SWEEP_LOCK_STALE_HOURS:
+            return None
+        # STALE, NOT HELD. A prior sweep process died holding this; refusing to ever steal it
+        # would mean one crash disables clone cleanup forever, which is worse than the small
+        # chance of overlapping a genuinely-still-running sweep past its measured worst case.
+        try:
+            os.remove(path)
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except OSError:
+            return None
+    except OSError:
+        # fleet_dir itself missing or unwritable -- nothing to lock. apply() already checks
+        # fleet_dir exists before any rule runs, so in production this branch is defensive;
+        # a direct caller (a test, or a manual CLI invocation) gets a clean "did not sweep"
+        # rather than a raised exception.
+        return None
+    try:
+        os.write(fd, str(os.getpid()).encode("ascii"))
+    except OSError:
+        pass
+    os.close(fd)
+    return path
+
+
+def _clone_sweep_lock_release(lock_path):
+    try:
+        os.remove(lock_path)
     except OSError:
         pass
 
@@ -429,100 +491,222 @@ def _default_path_in_use(path):
     return False
 
 
-def workspace_clones(fleet_dir, now=None, dry_run=False, keep_days=None, sweep_hours=None,
-                     in_use=None):
-    """Remove a whole benchmark clone/workspace under swe/work, once it is both old and unused.
+def _finish_leftover_deletes(work_root, dry_run):
+    """Finish any `.deleting-*` directory a prior sweep renamed but never got to rmtree.
 
-    Removed AS ONE UNIT (shutil.rmtree on the clone's own top-level directory), never file by
-    file -- see the module-level comment on CLONE_KEEP_DAYS for why a per-file rule has no
-    business here. A directory qualifies only when BOTH hold:
-
-      * nothing anywhere inside it, recursively, has a newer mtime than `keep_days` -- checked
-        by _newest_mtime_and_size(), which walks the clone but costs no stat() beyond what
-        os.scandir()'s DirEntry already returns for free;
-      * `in_use(path)` is False, not None -- see _default_path_in_use(). None (the question
-        could not be answered) and True (it can) are both treated as "leave it alone": FAIL
-        CLOSED, the same rule _linked_sessions() states above, because acting on an unanswerable
-        in-use check is how a live checkout gets removed out from under a run reading it.
-
-    THROTTLED, NOT UNCONDITIONAL. Unlike every other rule in this file, this one does not run
-    on every apply() -- see CLONE_SWEEP_HOURS. Measured on a synthetic tree of the same shape
-    as the real swe/work (see the measurement note this function's commit message carries): the
-    walk is well under the ~60 s budget f7571a1 fixed, but it is not free either, and apply()
-    runs at the start of EVERY fleet start. A per-call cost that is individually cheap still
-    adds up if it runs on every start of a fleet that starts often, so the walk itself -- not
-    just the deletion -- is bounded to once per CLONE_SWEEP_HOURS via the sidecar state file.
-    A call inside the throttle window returns immediately, before touching swe/work at all: no
-    os.scandir() on it, no cost beyond reading the small state file.
-
-    Returns (freed_bytes, [clone names removed]), the same tuple shape every rule in this file
-    returns; dry_run reports what would be removed without calling rmtree.
+    Nothing checks age or in-use here: something already decided, in a PREVIOUS sweep, that
+    this directory should go, and the rename already took it out from under whatever path any
+    live process could still be watching. Re-deciding would only re-run a check that already
+    passed once and cannot un-happen.
     """
-    now = time.time() if now is None else now
-    keep_days = _setting("fleet_clone_days", CLONE_KEEP_DAYS) if keep_days is None else keep_days
-    sweep_hours = (_setting("fleet_clone_sweep_hours", CLONE_SWEEP_HOURS)
-                  if sweep_hours is None else sweep_hours)
-    in_use = _default_path_in_use if in_use is None else in_use
-
-    if not _clone_sweep_due(fleet_dir, now, sweep_hours):
-        return 0, []
-
-    work_root = os.path.join(fleet_dir, "swe", "work")
-    freed, removed = 0, []
-    if not os.path.isdir(work_root):
-        # DRY RUN WRITES NOTHING, NOT EVEN THE SIDECAR. apply(dry_run=True) is relied on
-        # elsewhere to touch nothing in fleet_dir at all -- see
-        # test_a_dry_run_removes_nothing in test_fleet_retention.py -- so the throttle stamp
-        # is recorded only on a real run. A dry run therefore does not amortize the walk cost
-        # the way a real run does, which is the correct trade: a diagnostic call must be
-        # side-effect free even at the cost of re-walking on the next dry run too.
-        if not dry_run:
-            _record_clone_sweep(fleet_dir, now)
-        return freed, removed
-
+    removed = []
     try:
         with os.scandir(work_root) as it:
-            children = list(it)
+            entries = list(it)
     except OSError:
-        return freed, removed
-
-    for e in children:
+        return removed
+    for e in entries:
+        if not e.name.startswith(_DELETING_PREFIX):
+            continue
         try:
+            # A .deleting- entry is always something THIS module renamed from a real
+            # directory it had already verified was not a junction; the checks below are
+            # defensive, not load-bearing, in case anything else ever lands a file matching
+            # the prefix.
             if e.is_symlink():
                 continue
             st = e.stat(follow_symlinks=False)
             if getattr(st, "st_file_attributes", 0) & _REPARSE_POINT:
                 continue
-            if not e.is_dir(follow_symlinks=False):
-                continue
         except OSError:
             continue
-
-        # The top-level directory's OWN mtime is deliberately not consulted here either, for
-        # the same reason _newest_mtime_and_size() does not track directory mtimes below it:
-        # it is a listing entry, not a file, and every real write inside the clone is already
-        # visible as a file mtime.
-        newest, size = _newest_mtime_and_size(e.path)
-        if (now - newest) / 86400.0 <= keep_days:
+        if dry_run:
+            removed.append(e.name)
             continue
-
-        used = in_use(e.path)
-        if used or used is None:
-            # FAIL CLOSED -- see _default_path_in_use()'s own docstring. `used is None` means
-            # the question could not be answered at all, and that is not a reason to guess.
+        try:
+            shutil.rmtree(e.path)
+            removed.append(e.name)
+        except OSError:
             continue
+    return removed
 
-        if not dry_run:
+
+def _clone_sweep_run_once(fleet_dir, keep_days, in_use, now, dry_run=False):
+    """Do the actual walk-and-delete over swe/work, synchronously, in whatever process calls
+    it. This is the function a background process (or a test) runs; workspace_clones() itself
+    never calls the parts of this that cost real time -- see its own docstring for why.
+
+    LOCKED FOR THE WHOLE CALL, not dry_run. O_CREAT|O_EXCL on a lock file is the only thing
+    that makes "two concurrent triggers run one sweep" true: two fleet starts landing in the
+    same throttle window can both decide a sweep is due and both launch one, and the decision
+    that only one of them actually runs has to be made by whichever of them gets here first,
+    atomically, not by whichever of them decided to launch first (that race is not atomic
+    across processes). The loser returns immediately, having touched nothing.
+
+    RENAME BEFORE RMTREE, on every deletion. shutil.rmtree() is not atomic -- it is thousands of
+    individual unlink() calls on a big clone -- and this function is meant to run detached,
+    where nothing guarantees it finishes: the process can be killed, the machine can sleep, a
+    disk fault can interrupt it partway through. A directory caught mid-rmtree under its ORIGINAL
+    name is ambiguous: is it a live clone that happens to be missing files, or a deletion that
+    stopped short? Renamed to `.deleting-<name>-<ts>` FIRST, the ambiguity is gone -- nothing
+    still watching the original path can find it there any more (the in-use check already
+    passed before the rename), and nothing mistakes a `.deleting-*` name for a live clone,
+    including this function on its own next call, which instead finishes it unconditionally via
+    _finish_leftover_deletes() before it looks for anything new to remove.
+    """
+    now = time.time() if now is None else now
+    freed, removed = 0, []
+    lock_path = None
+    if not dry_run:
+        lock_path = _clone_sweep_lock_acquire(fleet_dir, now)
+        if lock_path is None:
+            return 0, []
+    try:
+        work_root = os.path.join(fleet_dir, "swe", "work")
+        if not os.path.isdir(work_root):
+            return freed, removed
+
+        removed.extend(_finish_leftover_deletes(work_root, dry_run))
+
+        try:
+            with os.scandir(work_root) as it:
+                children = list(it)
+        except OSError:
+            return freed, removed
+
+        for e in children:
+            if e.name.startswith(_DELETING_PREFIX):
+                continue    # already handled above
             try:
-                shutil.rmtree(e.path)
+                if e.is_symlink():
+                    continue
+                st = e.stat(follow_symlinks=False)
+                if getattr(st, "st_file_attributes", 0) & _REPARSE_POINT:
+                    continue
+                if not e.is_dir(follow_symlinks=False):
+                    continue
             except OSError:
                 continue
-        freed += size
-        removed.append(e.name)
 
-    if not dry_run:
-        _record_clone_sweep(fleet_dir, now)
-    return freed, removed
+            # The top-level directory's OWN mtime is deliberately not consulted here, for the
+            # same reason _newest_mtime_and_size() does not track directory mtimes below it: it
+            # is a listing entry, not a file, and every real write inside the clone is already
+            # visible as a file mtime.
+            newest, size = _newest_mtime_and_size(e.path)
+            if (now - newest) / 86400.0 <= keep_days:
+                continue
+
+            used = in_use(e.path)
+            if used or used is None:
+                # FAIL CLOSED -- see _default_path_in_use()'s own docstring. `used is None`
+                # means the question could not be answered at all, and that is not a reason
+                # to guess.
+                continue
+
+            if dry_run:
+                freed += size
+                removed.append(e.name)
+                continue
+
+            deleting_path = os.path.join(
+                work_root, "%s%s-%d" % (_DELETING_PREFIX, e.name, int(now)))
+            try:
+                os.rename(e.path, deleting_path)
+            except OSError:
+                continue
+            try:
+                shutil.rmtree(deleting_path)
+            except OSError:
+                # Renamed but not fully removed -- exactly the state _finish_leftover_deletes()
+                # exists to clean up on the NEXT sweep. Still counted as freed/removed here:
+                # the clone's original name is already gone, which is the part that matters to
+                # a caller asking "is this still a live clone".
+                pass
+            freed += size
+            removed.append(e.name)
+
+        if not dry_run:
+            _record_clone_sweep(fleet_dir, now)
+        return freed, removed
+    finally:
+        if lock_path is not None:
+            _clone_sweep_lock_release(lock_path)
+
+
+def _spawn_clone_sweep_subprocess(fleet_dir, keep_days, now):
+    """The production launcher: a detached, low-priority child process that runs the sweep and
+    exits on its own. Never waited on -- Popen() returns as soon as the child is created, which
+    is the whole point: workspace_clones() must return before the sweep has done anything.
+
+    A SEPARATE PROCESS, not a thread. A thread dies with its parent -- if fleet_runner's own
+    process is what apply() runs inside and that process later exits or is killed (a fleet run
+    ending, a supervisor restart), a thread doing the sweep dies with it, silently, and the next
+    apply() sees `not due` was never true so does nothing until the throttle window closes on
+    its own. A separate process, once launched, survives the launcher exiting.
+    """
+    try:
+        creationflags = 0
+        if sys.platform == "win32":
+            creationflags = (getattr(subprocess, "CREATE_NO_WINDOW", 0) |
+                             getattr(subprocess, "DETACHED_PROCESS", 0) |
+                             getattr(subprocess, "IDLE_PRIORITY_CLASS", 0))
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        subprocess.Popen(
+            [sys.executable, "-m", "relay.fleet_retention", "--clone-sweep-worker",
+             "--dir", fleet_dir, "--keep-days", str(keep_days), "--now", str(now)],
+            cwd=repo_root, creationflags=creationflags, close_fds=True,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        # Launching is best-effort. A failed launch leaves the throttle state untouched, so
+        # the NEXT due apply() call tries again rather than this one raising into fleet_runner.
+        pass
+
+
+def workspace_clones(fleet_dir, now=None, dry_run=False, keep_days=None, sweep_hours=None,
+                     in_use=None, launcher=None):
+    """Remove whole benchmark clones/workspaces under swe/work, once each is both old and
+    unused -- but never do the removing (or even the walk that finds candidates) IN this call.
+
+    OFF THE CRITICAL PATH. Measured on a synthetic tree of the same shape as the real swe/work
+    (~100k files, ~60k dirs, 40 clones): the discovery walk alone is ~52 s and a walk that also
+    deletes is ~340 s. apply() runs at the start of EVERY fleet start, so doing either of those
+    inline is exactly the cost f7571a1 removed, reintroduced. This function instead only ever
+    does two cheap things before returning: read the small throttle state file to decide
+    whether a sweep is due, and, if so, hand off to `launcher` (real work happens in
+    _clone_sweep_run_once(), run by the launcher, never by this function). Both cost
+    microseconds; neither touches swe/work.
+
+    `launcher(fleet_dir, keep_days, now)` defaults to _spawn_clone_sweep_subprocess(), a
+    detached child process with its own lock file (_clone_sweep_lock_acquire(), inside
+    _clone_sweep_run_once()) so two callers deciding a sweep is due at the same moment still
+    only run one sweep between them. Tests inject a launcher that runs the same worker
+    function in-thread instead, so they can wait on it deterministically without spawning a
+    real process or invoking PowerShell.
+
+    dry_run BYPASSES THE LAUNCHER ENTIRELY and runs synchronously in this process. A dry run
+    exists to be read back immediately by its own caller (the --apply CLI printout, or a test
+    inspecting the report) and must never mutate anything, so there is no background process
+    for it to race with and no reason to defer it; see _clone_sweep_run_once(dry_run=True).
+
+    Returns (freed_bytes, [clone names]): for dry_run, what a real sweep would do right now;
+    otherwise (0, []) whether or not a sweep was actually launched -- the caller gets the
+    result later, from the sidecar state file's `last_swept_ts`, not from this call.
+    """
+    now = time.time() if now is None else now
+    keep_days = _setting("fleet_clone_days", CLONE_KEEP_DAYS) if keep_days is None else keep_days
+    sweep_hours = (_setting("fleet_clone_sweep_hours", CLONE_SWEEP_HOURS)
+                  if sweep_hours is None else sweep_hours)
+
+    if dry_run:
+        use = _default_path_in_use if in_use is None else in_use
+        return _clone_sweep_run_once(fleet_dir, keep_days, use, now, dry_run=True)
+
+    if not _clone_sweep_due(fleet_dir, now, sweep_hours):
+        return 0, []
+
+    launch = launcher if launcher is not None else _spawn_clone_sweep_subprocess
+    launch(fleet_dir, keep_days, now)
+    return 0, []
 
 
 #: Finished logs are gzipped rather than deleted. THIS IS THE RULE THAT MATTERS, and the
@@ -857,7 +1041,25 @@ if __name__ == "__main__":
     ap.add_argument("--apply", action="store_true",
                     help="actually delete (default is a dry run that only reports)")
     ap.add_argument("--dir", default=None)
+    # INTERNAL. This is the entry point _spawn_clone_sweep_subprocess() launches as a detached
+    # child process -- not meant to be typed by a person, though nothing stops it. Kept as a
+    # plain CLI flag rather than a separate script because a separate script is one more file
+    # whose relative import path could drift out of sync with this one.
+    ap.add_argument("--clone-sweep-worker", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--keep-days", type=float, default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--now", type=float, default=None, help=argparse.SUPPRESS)
     args = ap.parse_args()
+
+    if args.clone_sweep_worker:
+        fleet_dir = args.dir or os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".fleet")
+        keep_days = (args.keep_days if args.keep_days is not None
+                    else _setting("fleet_clone_days", CLONE_KEEP_DAYS))
+        now = args.now if args.now is not None else time.time()
+        freed, removed = _clone_sweep_run_once(fleet_dir, keep_days, _default_path_in_use, now)
+        print("clone sweep: %.1f MB freed, %d removed" % (freed / 1048576.0, len(removed)))
+        raise SystemExit(0)
+
     rep = apply(fleet_dir=args.dir, dry_run=not args.apply)
     print("%s  %s" % (rep["dir"], "(dry run)" if rep["dry_run"] else ""))
     for name, r in rep["rules"].items():
