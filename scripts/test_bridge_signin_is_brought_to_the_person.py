@@ -245,6 +245,37 @@ def test_the_run_record_is_read_for_when_the_last_start_began(tmp_path):
     assert m._last_start_all_began(str(tmp_path / "nope")) == 0.0
 
 
+def test_a_not_yet_merged_leave_record_is_seen_too(tmp_path):
+    """A leaving copy (2026-09-25) writes its record to start_all_runs.d/, not the jsonl file
+    directly -- see scripts/start_all.ps1's Write-StartAllRunRecordSpooled. Only the next
+    holder's bring-up folds it in, which can be minutes away; a double-click that produced that
+    leave record is a real 'started again' event NOW, and must re-arm the sign-in window without
+    waiting for that eventual merge."""
+    logs = tmp_path / ".setup" / "logs"
+    logs.mkdir(parents=True)
+    (logs / "start_all_runs.jsonl").write_text(
+        '{"ts":"2026-09-24T10:04:09.156+09:00","end":"x"}\n', encoding="utf-8")
+    spool = logs / "start_all_runs.d"
+    spool.mkdir()
+    (spool / "1-111.json").write_text('{"ts":"2026-09-24T12:00:00.000+09:00","end":"z"}', encoding="utf-8")
+    import datetime
+    want = datetime.datetime.fromisoformat("2026-09-24T12:00:00.000+09:00").timestamp()
+    assert m._last_start_all_began(str(tmp_path)) == want
+
+
+def test_a_torn_spool_write_does_not_crash_the_freshness_check(tmp_path):
+    logs = tmp_path / ".setup" / "logs"
+    logs.mkdir(parents=True)
+    (logs / "start_all_runs.jsonl").write_text(
+        '{"ts":"2026-09-24T10:04:09.156+09:00","end":"x"}\n', encoding="utf-8")
+    spool = logs / "start_all_runs.d"
+    spool.mkdir()
+    (spool / "1-111.json").write_text('{"ts": not json', encoding="utf-8")
+    import datetime
+    want = datetime.datetime.fromisoformat("2026-09-24T10:04:09.156+09:00").timestamp()
+    assert m._last_start_all_began(str(tmp_path)) == want
+
+
 def test_the_cli_prints_one_decision_line(stub, latch, capsys):
     stub.tabs = [ADFS]
     assert m.main(["--port", str(stub.port), "--bridge-watch", "--status-url",

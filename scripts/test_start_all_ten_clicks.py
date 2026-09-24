@@ -160,17 +160,50 @@ def kill_tree_processes(tree: Path) -> None:
         subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
 
 
+def _read_run_spool(tree: Path) -> list:
+    """Not-yet-merged leave records (Write-StartAllRunRecordSpooled / Merge-StartAllRunSpool,
+    2026-09-25): a leaver writes here, not to start_all_runs.jsonl directly any more, and only
+    the next holder's bring-up folds these in. A reader wanting "every run so far" -- this test,
+    scripts/ensure_m365_signin.py's _last_start_all_began -- must read both, the same as a
+    reader with production consequences would have to."""
+    d = tree / ".setup" / "logs" / "start_all_runs.d"
+    if not d.is_dir():
+        return []
+    out = []
+    for f in d.glob("*.json"):
+        try:
+            out.append(json.loads(f.read_text(encoding="utf-8")))
+        except (PermissionError, FileNotFoundError, ValueError):
+            continue      # a write in flight right now: the NEXT poll (or the eventual merge) sees it
+    return out
+
+
 def read_runs(tree: Path) -> list:
     p = tree / ".setup" / "logs" / "start_all_runs.jsonl"
     # Read while copies replace the file (temp + rename): for a moment it is not openable
     # (PermissionError on Windows while the rename is pending). Retry, never fail on that.
     for _ in range(50):
         if not p.is_file():
-            return []
-        try:
-            return [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
-        except (PermissionError, FileNotFoundError, ValueError):
-            time.sleep(0.1)
+            merged = []
+        else:
+            try:
+                merged = [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
+            except (PermissionError, FileNotFoundError, ValueError):
+                time.sleep(0.1)
+                continue
+        # DEDUPED BY PID: Merge-StartAllRunSpool writes the merged line to start_all_runs.jsonl
+        # and only THEN deletes the spool file, two separate operations -- a poll landing in
+        # that gap would otherwise see the same run in both lists and double-count it.
+        combined = merged + _read_run_spool(tree)
+        seen = set()
+        out = []
+        for r in combined:
+            key = r.get("pid")
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(r)
+        return out
     raise AssertionError("start_all_runs.jsonl stayed unreadable for 5 s")
 
 
