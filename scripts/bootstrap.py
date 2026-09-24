@@ -1279,7 +1279,6 @@ def _show_secrets_box(items: list, repeated: bool = False) -> None:
     show_only("    #  .env keeps the unlock password only in PROTECTED form, so opening .env")
     show_only("    #  will not show it. To see both again at any time, double-click")
     show_only("    #      copilot_studio_values.bat      (in this folder)")
-    show_only("    #  or run  scripts\\copilot_studio_values.ps1")
     show_only(bar)
     show_only("")
 
@@ -1997,7 +1996,7 @@ sign-in. The bootstrap does NOT automate the Studio UI.
 
 ## What you need
 
-- The server running locally:  `http://127.0.0.1:8000/mcp`  (start with `.\\scripts\\start.ps1`)
+- The server running locally:  `http://127.0.0.1:8000/mcp`  (start with `quickstart.bat` or `start_all.bat`)
 - A public HTTPS URL via Dev Tunnels:
   `https://<your-tunnel>-8000.<region>.devtunnels.ms/mcp`
 - Your Bearer key (from `.env`, `MCP_API_KEY`):
@@ -2312,7 +2311,12 @@ def run_all(steps=STEPS, state=None, state_file=STATE_FILE) -> int:
             return 1
     log("")
     log("All steps complete. Environment is ready.")
-    log("Next: start the server with  .\\scripts\\start.ps1")
+    # NOT .\scripts\start.ps1 -- a person never runs a .ps1 by hand; quickstart.bat (which calls
+    # this) and start_all.bat are the only entry points documented for that. quickstart.bat's own
+    # STEP 1 already reads this and moves straight on to its later steps, so this line is mainly
+    # seen when setup.bat/bootstrap.py are run on their own (--status, a retry, etc.).
+    log("Next: quickstart.bat continues automatically from here. To start the server on its "
+        "own (no quickstart), run start_all.bat.")
     repeat_minted_secrets()
     return 0
 
@@ -2371,19 +2375,24 @@ def reset_state(state_file: Path = STATE_FILE) -> int:
 #: prompt got no key (no keyboard reached it).
 TUNNEL_ACCESS_ADVICE = {
     "none": (
-        "STOPPED: the Dev Tunnel has NO access grant (N was chosen), so nothing remote --\n"
-        "Copilot Studio included -- can connect, and the remaining steps would fail.\n"
+        "STOPPED: no remote access was chosen (N), so nothing remote -- Copilot Studio\n"
+        "included -- can connect, and the remaining steps would fail. Nothing about that needs\n"
+        "fixing right now: local chat and the fleet already work without a Dev Tunnel, and no\n"
+        "Microsoft sign-in was needed for this run either.\n"
         "Run quickstart.bat again and press:\n"
         "  A  anonymous: what a Copilot Studio connector using an API key needs (the Bearer\n"
         "     token is then the only gate in front of the server), or\n"
         "  T  your Entra tenant only (not verified to work with an API-key connector).\n"
+        "Either one is when the Microsoft sign-in and the Dev Tunnel actually get created.\n"
         "\n"
-        "停止しました: Dev Tunnel にアクセス許可がありません（N を選択）。Copilot Studio を含め、\n"
-        "外部からは一切接続できないため、この先の手順は失敗します。\n"
+        "停止しました: 外部からの接続は選択されませんでした（N）。Copilot Studio を含め、外部からは\n"
+        "一切接続できないため、この先の手順は失敗します。今すぐ直す必要はありません -- ローカルの\n"
+        "チャットとフリートは Dev Tunnel なしでも動作します。今回は Microsoft のサインインも不要でした。\n"
         "quickstart.bat をもう一度実行し、次のどちらかを押してください:\n"
         "  A  匿名: API キーで接続する Copilot Studio のコネクタにはこれが必要です\n"
         "     （サーバーの前にある関門は Bearer トークンだけになります）\n"
-        "  T  自分の Entra テナントのみ（API キーのコネクタで通るかは未検証）"),
+        "  T  自分の Entra テナントのみ（API キーのコネクタで通るかは未検証）\n"
+        "どちらを選んでも、そのときに Microsoft のサインインと Dev Tunnel の作成が行われます。"),
     "unapplied": (
         "STOPPED: the access you chose (A or T) is not on the Dev Tunnel when read back, so\n"
         "nothing remote can connect yet. Run quickstart.bat again and press the same key. If it\n"

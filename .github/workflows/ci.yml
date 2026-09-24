@@ -340,6 +340,7 @@ jobs:
             scripts/test_install_path_batch.py \
             tools/test_file_scope_fails_closed.py \
             scripts/test_repair_unlock_output.py \
+            scripts/test_no_direct_ps1_py_advice.py \
             scripts/test_setup_devtunnel_access_and_identity.py \
             scripts/test_doctor_reports_the_last_start.py \
             scripts/test_unlock_password_is_retrievable.py \

@@ -590,9 +590,26 @@ if ($dtDir -and -not (@($env:Path -split ';') | Where-Object { $_.TrimEnd('\') -
 Write-Host ("      version: " + ((Dt --version) -join " "))
 
 # --- 2. ensure signed in ---------------------------------------------------------------------
+# N (no remote access chosen) MUST NOT reach the interactive sign-in below (Windows Sandbox
+# report, standard user, unattended, 2026-09-24): choosing N still ran the 120s browser poll,
+# then a device-code flow that blocked ~15 minutes and failed with "Verification code
+# expired". N means nothing remote is wanted THIS run -- local chat/fleet keep working without
+# a Dev Tunnel -- so nothing here needs a Microsoft sign-in yet. Checked BEFORE the browser/
+# device-code branches, not after: `devtunnel user login` itself is what blocks, and must never
+# be invoked here. This only matters when the account is not ALREADY signed in (an earlier A/T
+# run's sign-in is reused exactly as before, tunnel and all) -- `user show` is a fast local
+# credential read, not the interactive flow, so checking it first costs nothing.
 $who = (Dt user show) -join " "
 if ($who -match 'Logged in as') {
     Write-Host ("[2/4] sign-in: already signed in -- " + $who)
+} elseif ($AccessMode -eq "none") {
+    Write-Host "[2/4] sign-in: not signed in, and no remote access was chosen for this run (N)."
+    Write-Host "      Skipping the Microsoft sign-in -- it is not needed until Copilot Studio (or"
+    Write-Host "      any other remote caller) actually has to reach this machine. Local chat and"
+    Write-Host "      the fleet keep working without it. Re-run quickstart.bat and press A"
+    Write-Host "      (anonymous) or T (tenant) when you want that; the Dev Tunnel is created and"
+    Write-Host "      the sign-in happens then, not before."
+    exit 3
 } else {
     Write-Host "[2/4] sign-in required. A browser (or a device code) will appear -- complete the Entra ID / Microsoft sign-in."
     if ($DeviceCode) {
