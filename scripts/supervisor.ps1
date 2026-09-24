@@ -1789,6 +1789,59 @@ if ($portQueried -and -not $portOwner) {
 $tunnelMiss = 0
 $loggedIn = $null   # tri-state ($null unknown / $true / $false) -- log only on transition
 
+# -- TUNNEL STARTUP FAST PATH (begin) --------------------------------------------------------
+# THE SAME RULE AS THE SERVER'S, JUST ABOVE, APPLIED TO THE TUNNEL. Invoke-TunnelHostingCheck's
+# debounce (FailuresBeforeAction misses before Start-TunnelHost, see its "none" branch) is
+# correct for a LATER tick, where a miss might be a transient blip in a tunnel that was working.
+# It is not correct for the very FIRST tick: at supervisor START, "none" means nothing of ours
+# already hosts this tunnel, so there is nothing a fast re-host could knock over (unlike
+# Start-Server, whose first act is to kill whatever owns the port -- see the block above, and
+# why IT needed the same "nothing to protect" reasoning before it could skip its own debounce).
+#
+# MEASURED after a reboot (2026-09-24 11:33): the supervisor waited through four failed "tunnel
+# host connections = 0" checks -- about 80s at this loop's pace -- before hosting the tunnel at
+# all, even though nothing of ours was hosting it the moment this process started.
+#
+# ONLY "none" SKIPS THE DEBOUNCE. "foreign" and "shared" are never fought, at startup or any
+# other tick -- Resolve-TunnelHostingState already tells those apart from "none" correctly, so
+# this block only has to call it once and branch on the one state that means "go ahead".
+# $script:ForeignStreak is left at its initial 0 so a foreign/shared state discovered here still
+# goes through the loop's own $FailuresBeforeAction-gated report exactly as it would starting
+# from any other tick -- this fast path changes nothing about foreign/shared handling.
+if (Test-DevtunnelLoggedInCached) {
+    $startupConn = Get-TunnelHostConnections
+    $startupOurHost = $false
+    $startupLocalPid = $null
+    $startupTunnelPid = $null
+    if ($null -ne $startupConn -and $startupConn -ge 1) {
+        # Same probes Invoke-TunnelHostingCheck makes, only when connections might be ours.
+        $startupOurHost = Test-OurTunnelHostRunning
+        $startupLocalPid = Get-HealthPidAt "http://127.0.0.1:$Port/health" 5000
+        $startupTunnelPid = Get-TunnelServerPidBounded
+    }
+    $startupTunnelState = Resolve-TunnelHostingState -Connections $startupConn -OurHostRunning $startupOurHost `
+                                                      -LocalPid $startupLocalPid -TunnelPid $startupTunnelPid
+    Set-TunnelHostStatus -State $startupTunnelState -Connections $startupConn -OurHostRunning $startupOurHost `
+                         -LocalPid $startupLocalPid -TunnelPid $startupTunnelPid
+    # Seeds the tick loop's own state tracking so its first "was this contested before" check
+    # (Invoke-TunnelHostingCheck's $wasContested) starts from what is actually true right now,
+    # instead of from "" (which would read as "never contested" even if it already is).
+    $script:TunnelState = $startupTunnelState
+    if ($startupTunnelState -eq "none") {
+        Write-Log "tunnel host connections = 0 at startup -> hosting the tunnel now, without the debounce"
+        if (-not (Start-TunnelHost)) {
+            Clear-DevtunnelLoginCache "the startup re-host did not establish"
+        }
+    }
+} else {
+    # Not logged in at startup: do nothing to devtunnel (see Test-DevtunnelLoggedIn's own
+    # comment on why touching it while logged out is unsafe). Setting $loggedIn here, rather
+    # than leaving it $null, means the loop's first tick does not print a second "NOT logged
+    # in" line for the same fact this already established.
+    $loggedIn = $false
+}
+# -- TUNNEL STARTUP FAST PATH (end) ----------------------------------------------------------
+
 while ($true) {
     # Live self-correction ("never again" / defense-in-depth): if .env's MCP_TUNNEL_NAME
     # changed since this supervisor started hosting $TunnelName -- e.g. heal_tunnel.ps1's

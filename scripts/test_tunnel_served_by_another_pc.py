@@ -78,6 +78,16 @@ def _extract_line(text: str, needle: str) -> str:
     return text[text.rfind("\n", 0, idx) + 1:text.index("\n", idx)]
 
 
+def _extract_between(text: str, start_marker: str, end_marker: str) -> str:
+    start = text.index(start_marker)
+    end = text.index(end_marker, start)
+    # Back up to the start of the marker LINE and forward to the end of the end-marker line,
+    # so the extracted block is whole lines, not the two comment lines' bare substrings.
+    line_start = text.rfind("\n", 0, start) + 1
+    line_end = text.index("\n", end)
+    return text[line_start:line_end]
+
+
 def _free_port() -> int:
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -457,6 +467,173 @@ def test_the_main_loop_uses_the_new_check(sup):
     loop = src[src.index("\nwhile ($true) {"):]
     assert "Invoke-TunnelHostingCheck" in loop
     assert "if (Test-TunnelHosting)" not in loop, "the loop still decides on 'anybody hosts it'"
+
+
+# -- THE TUNNEL'S STARTUP FAST PATH: "none" hosts at once, without the four-tick debounce -------
+# Runs the REAL code between "nothing is listening on :$Port at startup" and `while ($true) {`
+# (marked in supervisor.ps1 by "TUNNEL STARTUP FAST PATH (begin)"/"(end)"), not a hand-written
+# stand-in -- so a change to the real startup block is what this exercises, the same way
+# run_supervisor_driver exercises the real Invoke-TunnelHostingCheck.
+
+_STARTUP_FUNCTIONS = (
+    "function Get-HealthServerPid", "function Get-TunnelHostConnections",
+    "function Test-IsTunnelHostCommandLine", "function Test-OurTunnelHostRunning",
+    "function Get-EnvTunnelUrl", "function Get-TunnelOrigin", "function Get-HealthPidAt",
+    "function Resolve-TunnelHostingState", "function Reset-TunnelProbeBackoff",
+    "function Get-TunnelServerPidBounded", "function Get-TunnelHostingAdvice",
+    "function Set-TunnelHostStatus", "function Clear-DevtunnelLoginCache",
+)
+_STARTUP_INIT = (
+    "$script:TunnelProbeSkip = 0", "$script:TunnelProbeBackoff = 1", "$script:TunnelProbeBackoffMax =",
+    "$script:TunnelStatusPath =", "$script:TunnelStatusKey =", "$script:TunnelState =",
+    "$script:ForeignStreak =",
+)
+
+_STARTUP_DRIVER_HEAD = r'''param(
+    [Parameter(Mandatory=$true)][string]$RootDir,
+    [Parameter(Mandatory=$true)][string]$DtCmd,
+    [Parameter(Mandatory=$true)][string]$StateFile,
+    [Parameter(Mandatory=$true)][int]$LocalPort,
+    [Parameter(Mandatory=$true)][string]$OutFile,
+    [string]$LoggedInStr = "true"
+)
+$ErrorActionPreference = "SilentlyContinue"
+$script:CapturedLog = New-Object System.Collections.Generic.List[string]
+function Write-Log($msg) { $script:CapturedLog.Add([string]$msg) }
+$Root = $RootDir
+$Port = $LocalPort
+$DevTunnel = $DtCmd
+$TunnelName = "abc-tunnel"
+$script:TunnelHostProc = $null
+$script:HostCalls = 0
+# NOT $LoggedIn / $loggedIn: PowerShell variable names are case-insensitive, and the real
+# startup block sets "$loggedIn = $null" right after this head runs -- a same-named stub
+# variable would be overwritten by that before Test-DevtunnelLoggedInCached ever reads it.
+$script:StubDevtunnelLoggedIn = ($LoggedInStr -eq "true")
+function Test-DevtunnelLoggedInCached { return $script:StubDevtunnelLoggedIn }
+# RECORDS instead of launching a real `devtunnel host`: what is under test is whether the
+# startup block DECIDES to host at once, not devtunnel itself.
+function Start-TunnelHost { $script:HostCalls++; return $true }
+. (Join-Path $RootDir "tunnel_name_util.ps1")
+'''
+
+_STARTUP_DRIVER_TAIL = r'''
+$r = [ordered]@{
+    hostCalls  = $script:HostCalls
+    log        = @($script:CapturedLog)
+    tunnelState = $script:TunnelState
+    loggedInVar = $loggedIn
+    status     = $(if (Test-Path $script:TunnelStatusPath) { Get-Content $script:TunnelStatusPath -Raw | ConvertFrom-Json } else { $null })
+}
+$r | ConvertTo-Json -Depth 8 | Set-Content -Path $OutFile -Encoding UTF8
+'''
+
+
+def run_startup_driver(supervisor_text: str, hosts, tunnel_pid, tunnel_status=200, logged_in=True):
+    """Runs the REAL startup fast-path block (extracted between its begin/end markers) against
+    the same stub devtunnel/HTTP servers run_supervisor_driver uses, with one state set before
+    the block runs once -- there is no loop here, only the single startup pass."""
+    work = tempfile.mkdtemp(prefix="sup_tunnel_startup_")
+    procs = []
+    try:
+        root = os.path.join(work, "repo")
+        stub = os.path.join(work, "stub")
+        os.makedirs(root)
+        os.makedirs(stub)
+        shutil.copy(NAME_UTIL_PS1, os.path.join(root, "tunnel_name_util.ps1"))
+        with open(os.path.join(stub, "dt_stub.py"), "w", encoding="utf-8") as fh:
+            fh.write(_DT_STUB_PY)
+        with open(os.path.join(stub, "devtunnel.cmd"), "wb") as fh:
+            fh.write(_DT_STUB_CMD.encode("ascii"))
+        http_py = os.path.join(stub, "http_stub.py")
+        with open(http_py, "w", encoding="utf-8") as fh:
+            fh.write(_HTTP_STUB_PY)
+        state = os.path.join(work, "state.json")
+        hits = os.path.join(work, "hits.txt")
+        with open(state, "w", encoding="utf-8") as fh:
+            json.dump({"hosts": hosts, "tunnel_pid": tunnel_pid, "tunnel_status": tunnel_status}, fh)
+        open(hits, "w").close()
+        local_port, tunnel_port = _free_port(), _free_port()
+        with open(os.path.join(root, ".env"), "w", encoding="utf-8") as fh:
+            fh.write("MCP_TUNNEL_NAME=abc-tunnel\nMCP_TUNNEL_URL=http://127.0.0.1:%d/mcp\n" % tunnel_port)
+        env = dict(os.environ, SUP_STATE=state, SUP_HITS=hits, SUP_PY=sys.executable,
+                   SUP_DT_LOG=os.path.join(work, "dt.log"))
+        for role, port in (("local", local_port), ("tunnel", tunnel_port)):
+            procs.append(subprocess.Popen([sys.executable, http_py, role, str(port)], env=env,
+                                          creationflags=childproc.headless_creationflags()))
+        deadline = time.time() + 20
+        for port in (local_port, tunnel_port):
+            while True:
+                try:
+                    socket.create_connection(("127.0.0.1", port), timeout=1).close()
+                    break
+                except OSError:
+                    assert time.time() < deadline, "stub server on %d did not listen" % port
+                    time.sleep(0.2)
+
+        parts = [_extract_line(supervisor_text, l) for l in _STARTUP_INIT]
+        parts += [_extract_braced_block(supervisor_text, f) for f in _STARTUP_FUNCTIONS]
+        parts.append(_extract_between(supervisor_text, "TUNNEL STARTUP FAST PATH (begin)",
+                                      "TUNNEL STARTUP FAST PATH (end)"))
+        # $loggedIn: the startup block sets it to $false on the not-logged-in branch; declared
+        # here (as the real file does at "$loggedIn = $null" just above the block) so that
+        # assignment lands somewhere real instead of silently creating a new local.
+        parts.insert(0, "$loggedIn = $null")
+        driver = os.path.join(work, "driver.ps1")
+        out = os.path.join(work, "out.json")
+        with open(driver, "w", encoding="utf-8") as fh:
+            fh.write(_STARTUP_DRIVER_HEAD + "\n\n" + "\n\n".join(parts) + "\n\n" + _STARTUP_DRIVER_TAIL)
+        proc = childproc.run(
+            [_POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", driver,
+             "-RootDir", root, "-DtCmd", os.path.join(stub, "devtunnel.cmd"), "-StateFile", state,
+             "-LocalPort", str(local_port), "-OutFile", out,
+             "-LoggedInStr", ("true" if logged_in else "false")],
+            env=env, timeout=120, creationflags=childproc.headless_creationflags())
+        assert proc.returncode == 0, "driver failed:\n%s\n%s" % (proc.stdout, proc.stderr)
+        with open(out, "r", encoding="utf-8-sig") as fh:
+            return json.load(fh)
+    finally:
+        for p in procs:
+            try:
+                p.kill()
+                p.wait(10)
+            except Exception:
+                pass
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_startup_hosts_at_once_when_nobody_hosts_it_no_debounce_wait():
+    r = run_startup_driver(_read(SUPERVISOR_PS1), hosts=0, tunnel_pid=None)
+    assert r["hostCalls"] == 1, "a tunnel nobody hosts at startup was not hosted at once"
+    assert r["tunnelState"] == "none"
+    # THE BEHAVIORAL DIFFERENCE FROM THE TICK LOOP: no "tunnel host connections = 0 (n/4)"
+    # miss-counting happened first -- this fired on the very first look, not the fourth.
+    assert not [l for l in r["log"] if "connections = 0 (" in l], r["log"]
+    assert any("at startup -> hosting the tunnel now, without the debounce" in l for l in r["log"]), r["log"]
+    assert r["status"]["state"] == "none"
+
+
+def test_startup_leaves_an_already_ours_tunnel_alone():
+    r = run_startup_driver(_read(SUPERVISOR_PS1), hosts=1, tunnel_pid=4242)
+    assert r["hostCalls"] == 0
+    assert r["tunnelState"] == "ours"
+    assert r["status"]["state"] == "ours"
+
+
+def test_startup_never_fights_a_tunnel_another_pc_is_serving():
+    r = run_startup_driver(_read(SUPERVISOR_PS1), hosts=1, tunnel_pid=None, tunnel_status=500)
+    assert r["hostCalls"] == 0, "the startup fast path fought a foreign tunnel"
+    assert r["tunnelState"] == "foreign"
+    assert r["status"]["state"] == "foreign"
+    # foreign/shared are reported only after $FailuresBeforeAction misses in the tick loop; the
+    # startup block itself must not have printed its own "tunnel FOREIGN" line early.
+    assert not [l for l in r["log"] if l.startswith("tunnel FOREIGN")], r["log"]
+
+
+def test_startup_does_not_touch_devtunnel_when_not_logged_in():
+    r = run_startup_driver(_read(SUPERVISOR_PS1), hosts=0, tunnel_pid=None, logged_in=False)
+    assert r["hostCalls"] == 0, "devtunnel was touched while not logged in"
+    assert r["loggedInVar"] is False
 
 
 # -- doctor.ps1 reads the supervisor's verdict, but only a live supervisor's ---------------------
