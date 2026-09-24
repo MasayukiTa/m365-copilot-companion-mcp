@@ -450,6 +450,103 @@ DELIBERATELY_NOT_REDIRECTED = {
     ("tools.notify_ops", "COCKPIT"):
         "a read-only path to the built FleetCockpit.exe this module launches; nothing writes "
         "through it, and both callers that would spawn it already refuse under pytest",
+
+    # ── THE FIFTH CLASS, 2026-09-24 -- a FUNCTION, not an assignment ────────────────────────
+    #
+    # tools/security.py's SEC-02/SEC-03 change (commit e25b7a3, "Require the unlock second
+    # factor by default; give grants ids and durable revocations") added three private helpers
+    # that each `return` a path built from STATE_FILE -- an already-redirected constant -- e.g.
+    #
+    #     def _generation_file() -> Path:
+    #         return STATE_FILE.parent / ".fleet" / "unlock_generation.json"
+    #
+    # relay/test_live_record_isolation.py's walker only read module-level ASSIGNMENTS, so a
+    # `def` that does nothing but compute and return a path was invisible to it -- the walker's
+    # own docstring already said as much ("derived through a function rather than an assignment,
+    # passes through both passes"). Widened 2026-09-24 to also credit a module-level function
+    # whose entire body is one `return <expr>`, when that expression names a marker directory
+    # directly or is built from a constant the marker-based passes already found -- the same
+    # fixpoint the assignment passes use, one syntactic shape further out.
+    #
+    # EVERY ENTRY BELOW IS SAFE BY DERIVATION, NOT BY BEING REDIRECTED HERE, and that is the
+    # point of writing it down rather than leaving it silently unclassified: a function cannot
+    # be handed to `monkeypatch.setattr(mod, const, <path>)` the way a constant can, since
+    # replacing a callable with a Path/str breaks every caller that still calls it. What makes
+    # each one safe is that it recomputes its answer from an ALREADY-redirected name on every
+    # call -- so once that name moves (by this table, or by the FLEET_STATE_DIR-shaped
+    # environment overrides above), the function moves with it for free. Three of the tools.
+    # security entries are proven, not asserted -- see
+    # test_the_three_unlock_helpers_follow_state_files_redirect in
+    # relay/test_live_record_isolation.py, which imports the module, redirects STATE_FILE the
+    # same way this file's own autouse fixture does, and calls all three.
+    ("tools.security", "_revocations_file"):
+        "returns STATE_FILE.parent / '.fleet' / 'unlock_revocations.json'; STATE_FILE is "
+        "already redirected above, and this recomputes from it on every call -- proven in "
+        "relay/test_live_record_isolation.py",
+    ("tools.security", "_generation_file"):
+        "returns STATE_FILE.parent / '.fleet' / 'unlock_generation.json'; same derivation as "
+        "_revocations_file, same proof",
+    ("tools.security", "_state_lock_file"):
+        "returns STATE_FILE.parent / '.fleet' / 'unlock_state.lock'; same derivation as "
+        "_revocations_file, same proof",
+    # THE OTHER FIFTEEN THE WIDENED WALK FOUND THE SAME DAY, across every package it sweeps --
+    # not because they are about unlock, but because a walker that only proves itself against
+    # the one module it was widened for is not proven at all. Each was read at its call site;
+    # none of them writes to the real .fleet outside a test that already redirects the constant
+    # it derives from.
+    ("relay.edge_disk_cap", "_fleet_dir"):
+        "read-only: worker_count() joins 'status.json' onto it but every caller may pass its "
+        "own fleet_dir, and the module writes nothing",
+    ("relay.orphan_reaper", "_work_root"):
+        "a benchmark work-tree path (.fleet/swe/work) used only to match a process's command "
+        "line by substring, never written through; candidates() accepts an explicit work_root",
+    ("relay.refuter_memory", "_default_path"):
+        "reachable only via RefuterMemory() with no path, from one production call site "
+        "(relay/relay_fleet.py) gated behind MCP_ADAPTIVE_REFUTER=1; no test sets that env var "
+        "and reaches the gated branch, and every RefuterMemory test constructs its own instance "
+        "with an explicit path (relay/test_refuter_memory.py, "
+        "relay/test_refuter_memory_recording.py)",
+    ("relay.selfimprove.branches", "_path"):
+        "falls back to DEFAULT_PATH, already redirected above (relay.selfimprove.branches)",
+    ("relay.selfimprove.ledger", "default_path"):
+        "falls back to DEFAULT_PATH, already redirected above (relay.selfimprove.ledger), and "
+        "first checks MCP_SELFIMPROVE_HYPOTHESES, which conftest also points at a per-run temp "
+        "file before this module is ever imported",
+    ("relay.task_router", "_autostart_path"):
+        "falls back to FLEET_STATE_DIR, already resolved through the environment variable "
+        "conftest points at a per-run temp directory (see FLEET_STATE_DIR's own entry above)",
+    ("relay.task_router", "_outcome_cursor_path"):
+        "same fallback to FLEET_STATE_DIR as _autostart_path, same protection",
+    ("relay.task_router", "_socket_route_path"):
+        "same fallback to FLEET_STATE_DIR as _autostart_path, same protection -- its own "
+        "docstring says so: 'a test that redirects one must be free to redirect the rest "
+        "identically'",
+    ("relay.task_router", "_p"):
+        "joins onto TASKS, already redirected above (relay.task_router); the redirected value "
+        "is a file rather than a directory, which is a naming mismatch and not an isolation gap "
+        "-- _p still resolves under the same per-test tmp base either way",
+    ("scripts.verify_secret_redaction", "leaked"):
+        "reads through LED, already exempted above in this same table for the reason that "
+        "importing this module executes it (sys.argv at module scope, SystemExit) -- a function "
+        "defined in a module no test can import is a function no test can call",
+    ("tools.contract_gate", "_seen_file"):
+        "derived from _CONTRACT_FILE, already exempted above ('the gate's tests build their own "
+        "contract path and none writes the live file -- measured byte-identical'); also cleared "
+        "around every test by this file's own _fresh_contract_gate_seen fixture, which calls "
+        "this exact function to find what to delete",
+    ("tools.contract_gate", "_retired_file"):
+        "derived from _CONTRACT_FILE, same exemption and the same _fresh_contract_gate_seen "
+        "fixture as _seen_file",
+    ("bridge.session_store", "_base_dir"):
+        "falls back to SESS_DIR, already redirected above (bridge.session_store), and first "
+        "checks MCP_SESSION_STORE_DIR, which this file's own session-scoped "
+        "_isolate_session_store fixture points at a temp directory before any test runs",
+    ("bridge.session_store", "_db_path"):
+        "derived from _base_dir(), same protection",
+    ("tools.tool_ledger", "_repo_path"):
+        "returns LEDGER_PATH, already redirected above (tools.tool_ledger); its own docstring "
+        "says why it is a function at all: 'resolved at call time so a test (and the repo-wide "
+        "isolation fixture) can move it'",
 }
 
 
@@ -543,9 +640,66 @@ def _fingerprint(path):
 #:                                 (`relay/selfimprove/active_genome.json`), naming no marker
 #:                                 directory at all (that entry's own comment, under the
 #:                                 "FOURTH CLASS" heading above).
+#:   * tools.security          -- STATE_FILE is `.unlock_state.json` AT THE REPO ROOT
+#:                                 (`Path(__file__).resolve().parent.parent / ".unlock_state.
+#:                                 json"`), a dotfile beside conftest.py itself, not inside
+#:                                 .fleet/ at all. Found 2026-09-24, the same day the entry was
+#:                                 added here, BY RUNNING THE COMPUTATION rather than reading it:
+#:                                 with the module left off this set, the old code silently
+#:                                 asked for the fingerprint of `.fleet/unlock_state.json` --
+#:                                 which has never existed on this machine -- so the canary could
+#:                                 never have detected a write to the real, 17KB, actively-written
+#:                                 `.unlock_state.json` it was meant to guard. See
+#:                                 _security_critical_targets() below for where its real path,
+#:                                 and the paths derived from it, are tracked instead -- as a
+#:                                 HARD FAIL, not the .fleet/ warning this exception set exists
+#:                                 to route everything else away from.
 _FLEET_TARGET_MODULE_EXCEPTIONS = frozenset({
     "tools.memory_ops", "tools.trace_ops", "tools.runlog_ops", "relay.selfimprove.apply",
+    "tools.security",
 })
+
+
+def _security_critical_targets():
+    """The unlock/lock-state ledgers, by their REAL (unredirected) absolute path -- checked as
+    a HARD FAIL below, not folded into the .fleet/ warning-only bucket.
+
+    WHY THESE GET A STRICTER GUARANTEE THAN THE REST OF .fleet/. The warning-only design lower
+    in this file is deliberate and measured: page_counts.jsonl legitimately grows every ~60s
+    while the bridge's CDP watchdog is running, so a byte-level change there is not evidence of
+    a test leak on this machine. Nothing plays that role for these seven files -- no scheduled
+    loop, watchdog, or background process writes an unlock grant, a revocation, a lock refusal,
+    or the token-gap counter; the ONLY way any of them changes is a real unlock/lock call. A
+    change here during a test session is therefore unambiguous, which is exactly what commit
+    e25b7a3 (SEC-02/SEC-03, "Require the unlock second factor by default; give grants ids and
+    durable revocations") needed and the general .fleet/ warning could not give it: the evidence
+    cited for switching MCP_REQUIRE_UNLOCK_TOKEN on is unlock_token_gap.json's count, and a
+    canary that can only warn about contamination in that count is a canary that lets the
+    contaminated number stand.
+
+    HARD-CODED, NOT DERIVED FROM LIVE_RECORD_REDIRECTS, because three of these seven --
+    tools.security's _revocations_file/_generation_file/_state_lock_file -- are FUNCTIONS, not
+    constants (see LIVE_RECORD_REDIRECTS' "FIFTH CLASS" entries above for why they cannot be
+    redirected the same way a constant is, and why that does not make them unsafe). Their real,
+    unpatched path is reproduced here from their own source rather than imported, for the same
+    "cheap, no imports" reason _real_dotenv_and_fleet_state_targets gives for the constant-based
+    half below -- these three are one-line functions that have not changed since e25b7a3 added
+    them, and re-deriving their answer here costs nothing an import would not also cost.
+    """
+    from pathlib import Path as _P
+
+    root = _P(__file__).resolve().parent
+    fleet_dir = root / ".fleet"
+    return sorted({
+        root / ".unlock_state.json",                    # tools.security.STATE_FILE
+        fleet_dir / "unlock_revocations.json",           # tools.security._revocations_file()
+        fleet_dir / "unlock_generation.json",            # tools.security._generation_file()
+        fleet_dir / "unlock_state.lock",                 # tools.security._state_lock_file()
+        fleet_dir / "lock_state.json",                   # tools.lock_state._STATE_FILE
+        fleet_dir / "lock_refusals.jsonl",               # tools.lock_state._LOG_FILE (refusals
+                                                          # AND record_granted's grant rows)
+        fleet_dir / "unlock_token_gap.json",             # tools.lock_state._TOKEN_GAP_FILE
+    })
 
 
 def _real_dotenv_target():
@@ -591,14 +745,31 @@ def _real_dotenv_and_fleet_state_targets():
             if not filename or filename in (".", "..") or "/" in filename or "\\" in filename:
                 continue
             targets.add(fleet_dir / filename)
+    # The unlock/lock-state ledgers are tracked separately (_security_critical_targets, above)
+    # because three of the seven are functions tools.security's own exception entry excludes
+    # from this loop -- but they still belong in the ONE set the fixture below fingerprints
+    # before/after, so a session that touches any of them is caught at all, before the fixture
+    # decides which bucket (hard fail vs warning) that touch falls into.
+    targets.update(_security_critical_targets())
     return sorted(targets)
 
 
 @pytest.fixture(autouse=True, scope="session")
 def _real_dotenv_and_fleet_state_must_not_change():
-    """SESSION-SCOPED CANARY: the whole test session must leave the owner's REAL .env
-    byte-for-byte untouched (HARD FAIL), and WARNS (does not fail) if a real top-level .fleet/
-    state file LIVE_RECORD_REDIRECTS names changes during the session.
+    """SESSION-SCOPED CANARY: the whole test session must leave the owner's REAL .env, and the
+    seven unlock/lock-state ledgers _security_critical_targets() names, byte-for-byte untouched
+    (HARD FAIL for both), and WARNS (does not fail) if any OTHER real top-level .fleet/ state
+    file LIVE_RECORD_REDIRECTS names changes during the session.
+
+    THE SECURITY-CRITICAL SET WAS ADDED 2026-09-24, alongside commit e25b7a3 (SEC-02/SEC-03).
+    Before it, these seven files sat in the same warning-only bucket as page_counts.jsonl --
+    correct for a file a live watchdog legitimately rewrites every ~60s, wrong for a file that
+    only changes when an actual unlock/lock/grant/revoke happens. tools.security's own STATE_FILE
+    entry had a second, sharper bug on top of that: it was never in _FLEET_TARGET_MODULE_
+    EXCEPTIONS, so this function's loop computed `fleet_dir / "unlock_state.json"` for it -- a
+    path that has never existed on this machine, since the real file is `.unlock_state.json` AT
+    THE REPO ROOT. The canary could not have caught a leak into the real file; it was
+    fingerprinting nothing. See _FLEET_TARGET_MODULE_EXCEPTIONS' own entry for tools.security.
 
     TWICE IN ONE DAY (2026-09-24) a test run reached real operator state anyway, through two
     DIFFERENT mechanisms neither of the existing safeguards covered: a test wrote
@@ -647,12 +818,15 @@ def _real_dotenv_and_fleet_state_must_not_change():
     size, digest), and every message below prints only paths, sizes and digests, never contents.
     """
     dotenv_path = _real_dotenv_target()
+    security_paths = set(_security_critical_targets())
     targets = _real_dotenv_and_fleet_state_targets()
     before = {p: _fingerprint(p) for p in targets}
     yield
     changed = [p for p in targets if _fingerprint(p) != before[p]]
     dotenv_changed = [p for p in changed if p == dotenv_path]
-    fleet_changed = [p for p in changed if p != dotenv_path]
+    security_changed = [p for p in changed if p != dotenv_path and p in security_paths]
+    fleet_changed = [p for p in changed
+                     if p != dotenv_path and p not in security_paths]
 
     if dotenv_changed:
         pytest.fail(
@@ -662,6 +836,21 @@ def _real_dotenv_and_fleet_state_must_not_change():
             "(see conftest.py), dotenv neutralisation, or an equivalent per-test redirect "
             "instead. Changed file(s):\n" +
             "\n".join("  %s (was %r, now %r)" % (p, before[p], _fingerprint(p)) for p in dotenv_changed),
+            pytrace=False,
+        )
+    if security_changed:
+        # HARD FAIL, UNLIKE THE GENERAL .fleet/ BUCKET BELOW -- see _security_critical_targets()
+        # and this fixture's own docstring for why these seven do not share page_counts.jsonl's
+        # excuse: nothing but a real unlock/lock/grant/revoke call ever writes one of them, so a
+        # change here during a test session is a leak, not routine production traffic.
+        pytest.fail(
+            "LIVE-STATE CANARY (conftest._real_dotenv_and_fleet_state_must_not_change): this "
+            "test session modified a real unlock/lock-state ledger, which only an actual "
+            "unlock/lock/grant/revoke call should ever touch -- every write from a test should "
+            "have gone through the tools.security / tools.lock_state redirects in "
+            "LIVE_RECORD_REDIRECTS (see conftest.py) instead. Changed file(s):\n" +
+            "\n".join("  %s (was %r, now %r)" % (p, before[p], _fingerprint(p))
+                      for p in security_changed),
             pytrace=False,
         )
     if fleet_changed:

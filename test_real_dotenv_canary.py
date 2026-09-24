@@ -64,6 +64,7 @@ from conftest import (
     _FLEET_TARGET_MODULE_EXCEPTIONS,
     _fingerprint,
     _real_dotenv_and_fleet_state_targets,
+    _security_critical_targets,
 )
 
 REPO = os.path.dirname(os.path.abspath(__file__))
@@ -124,13 +125,15 @@ def test_targets_include_a_known_fleet_file():
 
 
 def test_targets_exclude_the_documented_non_fleet_exceptions():
-    """The three (four, counting both tools.trace_ops and tools.runlog_ops) modules whose real
-    default is documented as living somewhere other than .fleet/ must not contribute a
+    """The four (five, counting both tools.trace_ops and tools.runlog_ops) modules whose real
+    default is documented as living somewhere other than .fleet/ must not contribute a WRONG
     .fleet/<name> target -- see _FLEET_TARGET_MODULE_EXCEPTIONS' own comment in conftest.py."""
     assert _FLEET_TARGET_MODULE_EXCEPTIONS == frozenset({
         "tools.memory_ops", "tools.trace_ops", "tools.runlog_ops", "relay.selfimprove.apply",
+        "tools.security",
     })
-    names = {p.name for p in _real_dotenv_and_fleet_state_targets()}
+    targets = _real_dotenv_and_fleet_state_targets()
+    names = {p.name for p in targets}
     # These are the redirect filenames of the excluded modules -- if the exclusion ever broke,
     # one of these would show up as a (wrong) .fleet/ target.
     assert "memory_state.json" not in names        # tools.memory_ops: really at the repo root
@@ -141,6 +144,37 @@ def test_targets_exclude_the_documented_non_fleet_exceptions():
     # only in the sense that its REAL location has one; the redirect string itself has none.
     # The module exception is what actually keeps a wrong .fleet/companion_runs entry out.
     assert "companion_runs" not in names
+    # tools.security's redirect filename is "unlock_state.json" (see LIVE_RECORD_REDIRECTS'
+    # "FOURTH CLASS" entry) -- the general loop, correctly excluded now, would otherwise add
+    # `.fleet/unlock_state.json`, a path this machine has never had. The REAL file
+    # (`.unlock_state.json`, at the repo root, no .fleet/ prefix at all) is tracked instead by
+    # _security_critical_targets(), asserted present below.
+    assert os.path.join(REPO, ".fleet", "unlock_state.json") not in [str(p) for p in targets]
+
+
+def test_targets_include_every_security_critical_ledger():
+    """_security_critical_targets() -- the seven unlock/lock-state files that get the HARD FAIL
+    treatment below, not the general .fleet/ warning -- must actually be in the fingerprinted
+    set, or the fixture would be comparing files it never looked at."""
+    from pathlib import Path
+
+    critical = set(_security_critical_targets())
+    assert len(critical) == 7
+    targets = set(_real_dotenv_and_fleet_state_targets())
+    assert critical <= targets
+    names = {p.name for p in critical}
+    assert names == {
+        ".unlock_state.json", "unlock_revocations.json", "unlock_generation.json",
+        "unlock_state.lock", "lock_state.json", "lock_refusals.jsonl",
+        "unlock_token_gap.json",
+    }
+    # The one entry with NO .fleet/ prefix at all -- the repo-root dotfile tools.security.
+    # STATE_FILE actually resolves to (note the leading dot: ".unlock_state.json", not
+    # "unlock_state.json" -- that filename is only the LIVE_RECORD_REDIRECTS entry's redirect
+    # name, chosen for the tmp sandbox and never claimed to match the real, dotted basename).
+    unlock_state = next(p for p in critical if p.name == ".unlock_state.json")
+    assert unlock_state == Path(os.path.join(REPO, ".unlock_state.json"))
+    assert (os.sep + ".fleet" + os.sep) not in str(unlock_state)
 
 
 def test_every_live_record_redirect_module_is_covered_or_excepted():
@@ -173,6 +207,20 @@ import os
 def test_a_test_that_writes_a_fleet_file():
     fleet_dir = os.path.join(r"%s", ".fleet")
     os.makedirs(fleet_dir, exist_ok=True)
+    with open(os.path.join(fleet_dir, "toolset_shadow.jsonl"), "a", encoding="utf-8") as fh:
+        fh.write("INJECTED_BY_THROWAWAY_TEST\\n")
+'''
+
+# toolset_shadow.jsonl (not lock_state.json, used here until 2026-09-24) is the example for the
+# WARNING-only proof below: lock_state.json moved into _security_critical_targets() that day and
+# is now a HARD FAIL (see test_a_write_to_a_security_ledger_in_the_clone_turns_that_sessions_
+# exit_red), so it stopped being an example of the asymmetry this test exists to pin.
+_THROWAWAY_SECURITY_WRITER = '''
+import os
+
+def test_a_test_that_writes_a_security_ledger():
+    fleet_dir = os.path.join(r"%s", ".fleet")
+    os.makedirs(fleet_dir, exist_ok=True)
     with open(os.path.join(fleet_dir, "lock_state.json"), "a", encoding="utf-8") as fh:
         fh.write("INJECTED_BY_THROWAWAY_TEST\\n")
 '''
@@ -202,7 +250,16 @@ def _run_nested_pytest(clone_dir: str, test_filename: str, test_source: str) -> 
     with open(test_path, "w", encoding="ascii") as fh:
         fh.write(test_source)
     return subprocess.run(
-        [_venv_python(), "-m", "pytest", "-p", "no:cacheprovider", test_filename, "-q"],
+        # -p no:pytest-bdd: this repo's own .venv carries a pytest_bdd build that raises
+        # `ImportError: cannot import name 'iterparentnodeids' from '_pytest.nodes'` against the
+        # installed pytest version -- true of the CLONE's .venv-less run too, since it borrows
+        # THIS repo's .venv interpreter (see _venv_python()), plugins and all. Every other
+        # pytest invocation in this repo already carries this flag; a nested subprocess call is
+        # still a pytest invocation. Without it every throwaway session below errors out before
+        # collecting a single test, which reads as "the canary did not fire" and is really
+        # "pytest never started".
+        [_venv_python(), "-m", "pytest", "-p", "no:cacheprovider", "-p", "no:pytest-bdd",
+         test_filename, "-q"],
         cwd=clone_dir, capture_output=True, timeout=180,
     )
 
@@ -271,7 +328,7 @@ def test_a_session_that_writes_nothing_stays_green(throwaway_clone):
 def test_a_write_to_a_fleet_file_in_the_clone_warns_but_stays_green(throwaway_clone):
     """The deliberate asymmetry (see this file's header docstring for the measured reason a
     .fleet/ change is only a warning, never a hard fail): writing to the clone's own
-    .fleet/lock_state.json must be REPORTED but must NOT turn the session red."""
+    .fleet/toolset_shadow.jsonl must be REPORTED but must NOT turn the session red."""
     proc = _run_nested_pytest(
         throwaway_clone, "test_throwaway_writes_fleet_file.py",
         _THROWAWAY_FLEET_WRITER % throwaway_clone,
@@ -282,7 +339,30 @@ def test_a_write_to_a_fleet_file_in_the_clone_warns_but_stays_green(throwaway_cl
         "a .fleet/ file change must warn, not fail the session:\n%s" % out
     )
     assert "LIVE-STATE CANARY WARNING" in out
-    assert "lock_state.json" in out
-    # And it must NOT be reported as the hard-fail variant.
+    assert "toolset_shadow.jsonl" in out
+    # And it must NOT be reported as either hard-fail variant.
     assert "LIVE-STATE CANARY (conftest._real_dotenv_and_fleet_state_must_not_change): this " \
            "test session modified the real repo .env" not in out
+    assert "modified a real unlock/lock-state ledger" not in out
+
+
+def test_a_write_to_a_security_ledger_in_the_clone_turns_that_sessions_exit_red(throwaway_clone):
+    """THE OTHER HALF OF THE 2026-09-24 CHANGE: unlike the general .fleet/ bucket proven above,
+    the seven unlock/lock-state ledgers are a HARD FAIL. Writing to the clone's own
+    .fleet/lock_state.json (one of _security_critical_targets()) must turn the session red, with
+    the security-specific message -- not the .env message, and not a mere warning."""
+    proc = _run_nested_pytest(
+        throwaway_clone, "test_throwaway_writes_security_ledger.py",
+        _THROWAWAY_SECURITY_WRITER % throwaway_clone,
+    )
+    out = (proc.stdout or b"").decode("utf-8", errors="replace") + (proc.stderr or b"").decode(
+        "utf-8", errors="replace")
+    assert proc.returncode != 0, (
+        "a write to a real unlock/lock-state ledger must fail the session, not just warn:\n%s"
+        % out
+    )
+    assert "LIVE-STATE CANARY" in out
+    assert "modified a real unlock/lock-state ledger" in out
+    assert "lock_state.json" in out
+    # And it must NOT be reported as the .env variant -- a different file changed.
+    assert "modified the real repo .env" not in out
