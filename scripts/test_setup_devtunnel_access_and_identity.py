@@ -46,6 +46,9 @@ sys.path.insert(0, os.path.join(REPO, "scripts"))
 
 from tools import childproc  # noqa: E402
 
+sys.path.insert(0, os.path.join(REPO, "tests"))
+from _install_path_harness import _PS51_DEFAULT_MODULE_PATH  # noqa: E402
+
 SETUP_PS1 = os.path.join(REPO, "scripts", "setup_devtunnel.ps1")
 DOCTOR_PS1 = os.path.join(REPO, "scripts", "doctor.ps1")
 
@@ -441,6 +444,14 @@ def _run_ps(tmp_path, body, env_over=None):
     p.write_text(body, encoding="utf-8")
     env = dict(os.environ)
     env.update(env_over or {})
+    # WINDOWS POWERSHELL 5.1'S OWN MODULE PATH, not ours. Under a pwsh 7 parent (the GitHub
+    # windows-latest default shell) the inherited PSModulePath makes 5.1 load pwsh's
+    # Microsoft.PowerShell.Security and Get-AuthenticodeSignature fails (d0190f9). Every spelling
+    # is removed first: os.environ keeps the inherited case ("PSMODULEPATH"), so assigning
+    # "PSModulePath" alone would hand the child both.
+    for k in [k for k in env if k.upper() == "PSMODULEPATH"]:
+        del env[k]
+    env["PSModulePath"] = _PS51_DEFAULT_MODULE_PATH
     proc = childproc.run([_POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(p)],
                          env=env, timeout=120)
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -448,7 +459,8 @@ def _run_ps(tmp_path, body, env_over=None):
 
 
 def test_the_machine_identity_is_bootstraps(tmp_path):
-    src = open(SETUP_PS1, encoding="utf-8").read()
+    # Moved from setup_devtunnel.ps1 to tunnel_name_util.ps1 (2026-09-24; heal_tunnel.ps1 shares it).
+    src = open(os.path.join(os.path.dirname(SETUP_PS1), "tunnel_name_util.ps1"), encoding="utf-8").read()
     fns = "\n".join(_extract(src, "function " + f) for f in
                     ("Get-ThisHost", "Get-ThisUser", "Get-MachineSuffix"))
     long_node = "A-Very-Long-HostName-20"

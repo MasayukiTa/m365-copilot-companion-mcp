@@ -62,18 +62,91 @@ Describe "Get-TunnelHealAction" {
         $result.TargetUrl | Should Be "https://shared-abcd.usw2.devtunnels.ms"
     }
 
-    It "not owned, no URL match, owns at least one -> rename_url" {
+    # 2026-09-24: this used to switch to the account's FIRST owned tunnel. With one account on
+    # two PCs that is as likely the other PC's tunnel as this one's -- the likeliest way a second
+    # PC with a copied .env hosted this PC's tunnel. Only this machine's own tunnel is adopted.
+    It "not owned, no URL match, owns only someone else's tunnel -> setup_needed (never the first one)" {
         $owned = @([PSCustomObject]@{ Id = "othertunnel.usw2"; Url = "https://shared-abcd.usw2.devtunnels.ms/" })
         $result = Get-TunnelHealAction -Name "notmine.usw2" -Url "https://completely-different.usw2.devtunnels.ms" -Owned $owned
+        $result.Action | Should Be "setup_needed"
+        $result.TargetId | Should Be ""
+    }
+
+    It "not owned, no URL match, this machine's own tunnel is owned -> rename_url to it, not to the first" {
+        $owned = @([PSCustomObject]@{ Id = "othertunnel.usw2"; Url = "https://shared-abcd.usw2.devtunnels.ms/" },
+                   [PSCustomObject]@{ Id = "m365-copilot-companion-0a1b2c3d.usw2"; Url = "https://mine-0a1b.usw2.devtunnels.ms/" })
+        $result = Get-TunnelHealAction -Name "notmine.usw2" -Url "https://completely-different.usw2.devtunnels.ms" -Owned $owned -OwnDefaults @("m365-copilot-companion-0a1b2c3d")
         $result.Action | Should Be "rename_url"
-        $result.TargetId | Should Be "othertunnel.usw2"
-        $result.TargetUrl | Should Be "https://shared-abcd.usw2.devtunnels.ms/"
+        $result.TargetId | Should Be "m365-copilot-companion-0a1b2c3d.usw2"
+        $result.TargetUrl | Should Be "https://mine-0a1b.usw2.devtunnels.ms/"
     }
 
     It "owns nothing -> setup_needed" {
         $owned = @()
         $result = Get-TunnelHealAction -Name "notmine.usw2" -Url "https://whatever.usw2.devtunnels.ms" -Owned $owned
         $result.Action | Should Be "setup_needed"
+    }
+}
+
+Describe "Get-TunnelHealAction -- the rules setup_devtunnel.ps1 applies" {
+    BeforeAll { . (Join-Path $PSScriptRoot "heal_tunnel.ps1") }
+
+    It "owned name hosted by ANOTHER machine, own tunnel exists -> rename_url to own" {
+        $owned = @([PSCustomObject]@{ Id = "custom.usw2"; Url = "https://custom-1.usw2.devtunnels.ms/"; HostConnections = 1; HostedHere = $false; Identifying = $false },
+                   [PSCustomObject]@{ Id = "m365-copilot-companion-0a1b2c3d.usw2"; Url = "https://mine-0a1b.usw2.devtunnels.ms/" })
+        $r = Get-TunnelHealAction -Name "custom.usw2" -Url "https://custom-1.usw2.devtunnels.ms/" -Owned $owned -OwnDefaults @("m365-copilot-companion-0a1b2c3d")
+        $r.Action | Should Be "rename_url"
+        $r.TargetId | Should Be "m365-copilot-companion-0a1b2c3d.usw2"
+    }
+
+    It "owned name hosted by another machine, no own tunnel -> refused (nothing changed)" {
+        $owned = @([PSCustomObject]@{ Id = "custom.usw2"; Url = "https://custom-1.usw2.devtunnels.ms/"; HostConnections = 2; HostedHere = $false; Identifying = $false })
+        $r = Get-TunnelHealAction -Name "custom.usw2" -Url "https://custom-1.usw2.devtunnels.ms/" -Owned $owned -OwnDefaults @("m365-copilot-companion-0a1b2c3d")
+        $r.Action | Should Be "refused"
+    }
+
+    It "owned name hosted by THIS machine -> kept (noop)" {
+        $owned = @([PSCustomObject]@{ Id = "custom.usw2"; Url = "https://custom-1.usw2.devtunnels.ms/"; HostConnections = 1; HostedHere = $true; Identifying = $false })
+        $r = Get-TunnelHealAction -Name "custom.usw2" -Url "https://custom-1.usw2.devtunnels.ms/" -Owned $owned -OwnDefaults @("m365-copilot-companion-0a1b2c3d")
+        $r.Action | Should Be "noop"
+    }
+
+    It "this machine's own name is kept even while another host is on it" {
+        $owned = @([PSCustomObject]@{ Id = "m365-copilot-companion-0a1b2c3d.usw2"; Url = "https://mine-0a1b.usw2.devtunnels.ms/"; HostConnections = 1; HostedHere = $false; Identifying = $false })
+        $r = Get-TunnelHealAction -Name "m365-copilot-companion-0a1b2c3d.usw2" -Url "https://mine-0a1b.usw2.devtunnels.ms/" -Owned $owned -OwnDefaults @("m365-copilot-companion-0a1b2c3d")
+        $r.Action | Should Be "noop"
+    }
+
+    It "an unknown host count is not evidence -> kept" {
+        $owned = @([PSCustomObject]@{ Id = "custom.usw2"; Url = "https://custom-1.usw2.devtunnels.ms/"; HostConnections = $null; HostedHere = $false; Identifying = $false })
+        $r = Get-TunnelHealAction -Name "custom.usw2" -Url "https://custom-1.usw2.devtunnels.ms/" -Owned $owned
+        $r.Action | Should Be "noop"
+    }
+
+    It "an identifying owned name is not kept" {
+        $owned = @([PSCustomObject]@{ Id = "leaky.usw2"; Url = "https://leaky-1.usw2.devtunnels.ms/"; HostConnections = 0; HostedHere = $false; Identifying = $true })
+        $r = Get-TunnelHealAction -Name "leaky.usw2" -Url "https://leaky-1.usw2.devtunnels.ms/" -Owned $owned
+        $r.Action | Should Be "refused"
+    }
+
+    It "URL match on a tunnel another machine hosts -> no repoint" {
+        $owned = @([PSCustomObject]@{ Id = "other.usw2"; Url = "https://shared-abcd.usw2.devtunnels.ms/"; HostConnections = 1; HostedHere = $false; Identifying = $false })
+        $r = Get-TunnelHealAction -Name "notmine.usw2" -Url "https://shared-abcd.usw2.devtunnels.ms" -Owned $owned
+        $r.Action | Should Be "setup_needed"
+    }
+
+    It ".env from another machine, own tunnel owned -> adopt_own" {
+        $owned = @([PSCustomObject]@{ Id = "m365-copilot-companion-0a1b2c3d.usw2"; Url = "https://mine-0a1b.usw2.devtunnels.ms/" })
+        $r = Get-TunnelHealAction -Name "custom.usw2" -Url "https://custom-1.usw2.devtunnels.ms/" -Owned $owned -ForeignReason "recorded on 'otherpc'" -OwnDefaults @("m365-copilot-companion-0a1b2c3d")
+        $r.Action | Should Be "adopt_own"
+        $r.TargetId | Should Be "m365-copilot-companion-0a1b2c3d.usw2"
+    }
+
+    It ".env from another machine, its name owned and no own tunnel -> set_aside, never kept" {
+        $owned = @([PSCustomObject]@{ Id = "custom.usw2"; Url = "https://custom-1.usw2.devtunnels.ms/"; HostConnections = 0; HostedHere = $false; Identifying = $false })
+        $r = Get-TunnelHealAction -Name "custom.usw2" -Url "https://custom-1.usw2.devtunnels.ms/" -Owned $owned -ForeignReason "recorded on 'otherpc'" -OwnDefaults @("m365-copilot-companion-0a1b2c3d")
+        $r.Action | Should Be "set_aside"
+        $r.TargetId | Should Be "m365-copilot-companion-0a1b2c3d"
     }
 }
 
