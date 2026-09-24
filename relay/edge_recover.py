@@ -255,9 +255,20 @@ def _surface_launcher_argv(ps1, flag, port, open_url=""):
     path that can actually (re)launch the browser (headless->headed kill+relaunch, or a fresh
     launch), so it is the only path where a target URL means anything. -Surface merely raises
     an already-headed window -- it never navigates -- so -Url would be a no-op there and is
-    deliberately omitted to match the launcher's own -Surface behavior."""
+    deliberately omitted to match the launcher's own -Surface behavior.
+
+    -Profile is ALWAYS passed explicitly, from _profile_for_port(port). start_companion_edge.ps1
+    now infers -Profile from whatever process is already listening on -Port when the caller
+    omits -Profile (see its "THE PROFILE FOLLOWS THE PORT" comment), which fixed the case where
+    surface() called it with no -Profile and it silently fell back to the companion's default
+    profile, aiming a bridge (:9223) sign-in relaunch at the FLEET's Edge (2026-09-24). But that
+    inference only has something to look at when a process is still listening on the port; if
+    the Edge for this port is not running at all (fully dead, not just headless), there is
+    nothing to infer from and it would fall back to the wrong default again. Passing -Profile
+    explicitly here removes that dependency entirely -- the caller already knows the right
+    profile via the same _profile_for_port the launcher's own default mirrors."""
     argv = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1,
-            flag, "-Port", str(port)]
+            flag, "-Port", str(port), "-Profile", _profile_for_port(port)]
     if open_url and flag == "-Foreground":
         argv += ["-Url", open_url]
     return argv
@@ -616,9 +627,27 @@ def should_recycle(edge_mb, free_mb, edge_cap_mb=None, free_floor_mb=None):
 
 
 def looks_like_login(url):
-    u = (url or "").lower()
-    return ("login.microsoftonline" in u or "login.live.com" in u
-            or "/signin" in u or "oauth2/authorize" in u)
+    """True if `url` is a sign-in wall waiting for a person.
+
+    ONE definition, shared repo-wide: delegates to relay.edge_auth.looks_like_signin_wall,
+    which is generic across identity providers (AD FS, SAML/WS-Fed, Okta, Ping, OneLogin,
+    Google -- not just login.microsoftonline/login.live.com). Before this delegation, THIS
+    function was one of four disagreeing definitions of "on a sign-in page" -- on 2026-09-24
+    a freshly set-up PC's bridge Edge sat on a federated tenant's AD FS page
+    (https://<sts>/adfs/ls/?...) and every :9222-path caller of this function (relay_fleet.py)
+    still called that page "nothing", so nobody surfaced the window. See edge_auth's module
+    docstring for the full story.
+
+    Falls back to the old, narrower login.microsoftonline/login.live.com/\\/signin/
+    oauth2-authorize check only if relay.edge_auth cannot be imported at all -- never
+    raises, matching every other function in this module."""
+    try:
+        from relay.edge_auth import looks_like_signin_wall
+        return looks_like_signin_wall(url)
+    except Exception:
+        u = (url or "").lower()
+        return ("login.microsoftonline" in u or "login.live.com" in u
+                or "/signin" in u or "oauth2/authorize" in u)
 
 
 def close_all_tabs(cdp_url="http://localhost:9222", connect_timeout_ms=8000,
