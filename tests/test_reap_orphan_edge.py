@@ -17,6 +17,17 @@ reap = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(reap)
 
 
+@pytest.fixture(autouse=True)
+def _fresh_edge_process_cache():
+    """browser_procs() now caches one combined process-table read per survey() call (a
+    2026-09-24 sandbox-startup fix: 3 PowerShell cold starts per run collapsed to 1). The
+    cache is module-level state, so a stale value from one test must never leak into the
+    next -- reset before AND after every test."""
+    reap.reset_edge_process_cache()
+    yield
+    reap.reset_edge_process_cache()
+
+
 @pytest.fixture
 def world(monkeypatch):
     """Describe a machine: which profiles have a browser, and which owners are alive."""
@@ -193,6 +204,63 @@ def test_owner_alive_reads_a_real_zero_as_gone(monkeypatch):
 def test_owner_alive_reads_a_positive_count_as_alive(monkeypatch):
     monkeypatch.setattr(reap, "_ps", lambda script, timeout=40: "2\n")
     assert reap.owner_alive("fleet_runner") is True
+
+
+def test_browser_procs_shares_one_process_table_read_across_profiles(monkeypatch):
+    """Sandbox measurement, 2026-09-24: on a fresh/idle machine (no Edge running at all --
+    the common case at daily startup) survey() used to spawn one powershell.exe PER entry
+    in OWNERS just to learn "0" for each -- 3 cold starts for zero information, paid on
+    every single start_all run. browser_procs() must now ask PowerShell ONCE per survey()
+    (whatever the number of profiles in OWNERS) and answer every profile from that one
+    process-table read; nothing is running, so owner_alive() is never reached either."""
+    calls = []
+
+    def fake_ps(script, timeout=40):
+        calls.append(script)
+        return ""
+
+    monkeypatch.setattr(reap, "_ps", fake_ps)
+    rows = reap.survey()
+    assert rows == []
+    assert len(calls) == 1, "browser_procs() re-queried PowerShell instead of sharing one read: %r" % calls
+
+
+def test_browser_procs_cache_still_lets_owner_alive_ask_its_own_question(monkeypatch):
+    """The shared cache only covers the "which Edge processes exist" question; a profile
+    that DOES have a browser still needs its own separate owner_alive() query (a different
+    process filter entirely) -- the cache must not short-circuit that."""
+    calls = []
+
+    def fake_ps(script, timeout=40):
+        calls.append(script)
+        if "msedge.exe" in script:
+            return (
+                'msedge.exe --user-data-dir=C:\\u\\copilot-companion-edge\t104857600\n'
+                'msedge.exe --user-data-dir=C:\\u\\copilot-eval-edge\t52428800\n'
+            )
+        return "0\n"
+
+    monkeypatch.setattr(reap, "_ps", fake_ps)
+    rows = reap.survey()
+    # 1 shared browser_procs() read + 1 owner_alive() read per profile that has a browser.
+    assert len(calls) == 3, calls
+    by_profile = {r["profile"]: (r["procs"], r["mb"]) for r in rows}
+    assert by_profile == {"copilot-companion-edge": (1, 100), "copilot-eval-edge": (1, 50)}, by_profile
+
+
+def test_browser_procs_cache_is_reset_between_survey_calls(monkeypatch):
+    """A later survey() in the same process (e.g. --stop re-checking after stopping one
+    profile) must see a fresh process table, not the first call's cached answer."""
+    calls = []
+
+    def fake_ps(script, timeout=40):
+        calls.append(1)
+        return ""
+
+    monkeypatch.setattr(reap, "_ps", fake_ps)
+    reap.survey()
+    reap.survey()
+    assert len(calls) == 2, "the second survey() reused the first survey()'s cached process table"
 
 
 def test_browser_procs_fails_safe_to_zero_when_powershell_cannot_be_run(monkeypatch):
