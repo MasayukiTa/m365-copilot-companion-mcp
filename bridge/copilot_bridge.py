@@ -5284,7 +5284,7 @@ class Handler(BaseHTTPRequestHandler):
         both. Raises on a driver/page error, exactly as _send_and_stream_once did before this
         was split out of _stream_text -- callers own the Esc/Stop-button + error-SSE handling.
         """
-        global _LAST_USER_TURN_TS, _BRIDGE_UNLOCK_ATTEMPTS, _BRIDGE_UNLOCK_PREFLIGHT_DONE
+        global _LAST_USER_TURN_TS
 
         # THE TURN GOES WHERE IT WAS ADDRESSED, OR IT DOES NOT GO. `sid` names the session
         # this message belongs to; the send below goes to whatever conversation the driver
@@ -5307,15 +5307,15 @@ class Handler(BaseHTTPRequestHandler):
 
         _LAST_USER_TURN_TS = time.time()   # see its module-level docstring: the tool probe reads this
         _turn_sent_at = _LAST_USER_TURN_TS  # boundary for the lock check at the end of this turn
-        turn_payload = msg
-        if not _BRIDGE_UNLOCK_PREFLIGHT_DONE:
-            _BRIDGE_UNLOCK_PREFLIGHT_DONE = True
-            pw = _bridge_unlock_password()
-            if pw and _BRIDGE_UNLOCK_ATTEMPTS < MAX_BRIDGE_UNLOCK_ATTEMPTS:
-                _BRIDGE_UNLOCK_ATTEMPTS += 1
-                turn_payload = (BRIDGE_UNLOCK_PREFIX % pw) + msg
-                logger.info("bridge proactive unlock: attempt %d/%d",
-                            _BRIDGE_UNLOCK_ATTEMPTS, MAX_BRIDGE_UNLOCK_ATTEMPTS)
+        # PROACTIVE UNLOCK ON THE FIRST TURN OF EACH CONVERSATION (see MAX_BRIDGE_UNLOCK_ATTEMPTS):
+        # every conversation is its own MCP session, and an unlock is bound to the session.
+        def _with_preflight(conv_key):
+            if _bridge_unlock_preflight_due(conv_key):
+                pw = _bridge_unlock_password()
+                if pw and _bridge_unlock_take(conv_key, "proactive"):
+                    return (BRIDGE_UNLOCK_PREFIX % pw) + msg
+            return msg
+        turn_payload = _with_preflight(_bridge_unlock_conv_key(sid))
         _prepare_capture_baseline(sid)
         final = self._send_and_stream_once(turn_payload, stream_out=stream_out)
         # The conversation can simply be out of budget. Every later turn then returns the
@@ -5324,6 +5324,9 @@ class Handler(BaseHTTPRequestHandler):
         # not a consent card and must not be mistaken for one.
         if isinstance(final, str) and _bridge_recycle_if_exhausted(final):
             _prepare_capture_baseline(ACTIVE_SID)
+            # A FRESH CHAT IS A NEW MCP SESSION: it gets its own proactive unlock (and its
+            # own budget), built from `msg` so a prefix is never doubled.
+            turn_payload = _with_preflight(_bridge_unlock_conv_key(sid))
             final = self._send_and_stream_once(turn_payload, stream_out=stream_out)
         if final is not None and _looks_like_consent(final):
             # Consent card, not a real answer -- do NOT show it to the user; auto-approve and
@@ -5358,19 +5361,17 @@ class Handler(BaseHTTPRequestHandler):
         # reports it in prose. Ask the server's own record instead, then unlock and redo
         # the turn -- the same shape as the consent retry above. The backend IP rotates,
         # so a few of these across a session are normal; the attempt cap stops a loop.
-        if _bridge_should_auto_unlock(_turn_sent_at):
+        _conv = _bridge_unlock_conv_key(sid)
+        if _bridge_should_auto_unlock(_turn_sent_at, _conv):
             pw = _bridge_unlock_password()
-            if pw:
-                _BRIDGE_UNLOCK_ATTEMPTS += 1
-                logger.info("bridge auto-unlock: attempt %d/%d",
-                            _BRIDGE_UNLOCK_ATTEMPTS, MAX_BRIDGE_UNLOCK_ATTEMPTS)
+            if not pw:
+                logger.warning("bridge auto-unlock: MCP_UNLOCK_PASSWORD not set locally")
+            elif _bridge_unlock_take(_conv, "auto"):
                 try:
                     final = self._send_and_stream_once(
                         (BRIDGE_UNLOCK_PREFIX % pw) + msg, stream_out=stream_out)
                 except Exception:
                     logger.warning("bridge auto-unlock turn raised", exc_info=True)
-            else:
-                logger.warning("bridge auto-unlock: MCP_UNLOCK_PASSWORD not set locally")
         return final
 
     def _stream_text(self, msg: str):
@@ -6266,9 +6267,82 @@ def _bridge_recycle_if_exhausted(resp):
 # write "淡々と事実とタスク結果のみ", so it paraphrases the tool error and the server's
 # literal marker never appears. tools/lock_state records the refusal where it happens; this
 # only asks whether one just did.
+#
+# A BUDGET PER CONVERSATION, NOT PER PROCESS (2026-09-24). With the unlock second factor enforced
+# by default (e25b7a3) an unlock is bound to the MCP session that made it, and every new Copilot
+# conversation is a new MCP session -- so every conversation needs its own unlock. This used to
+# be one proactive injection per bridge PROCESS and MAX_BRIDGE_UNLOCK_ATTEMPTS per process
+# lifetime: a bridge that stays up for days served its first three conversations and then
+# refused to unlock any later one, which surfaced as the agent asking a human for a password
+# that is in .env. Now: the proactive unlock runs on the first turn of each conversation, and
+# MAX_BRIDGE_UNLOCK_ATTEMPTS bounds the injections (proactive + reactive) WITHIN one
+# conversation. A conversation is the bridge session the turn is sent in (ACTIVE_SID): every
+# path that starts a new chat -- /new, the out-of-budget recycle, a resume -- gives it a new one.
+# The loop guard stays two-layered: the per-conversation cap stops an unlock loop inside one
+# chat, and a process-wide sliding window (MAX_BRIDGE_UNLOCKS_PER_WINDOW in
+# BRIDGE_UNLOCK_WINDOW_S) stops a runaway that keeps opening new conversations.
 MAX_BRIDGE_UNLOCK_ATTEMPTS = max(1, int(os.environ.get("MCP_BRIDGE_MAX_UNLOCK", "3")))
-_BRIDGE_UNLOCK_ATTEMPTS = 0
-_BRIDGE_UNLOCK_PREFLIGHT_DONE = False
+MAX_BRIDGE_UNLOCKS_PER_WINDOW = max(1, int(os.environ.get("MCP_BRIDGE_MAX_UNLOCK_PER_WINDOW", "20")))
+BRIDGE_UNLOCK_WINDOW_S = max(1.0, float(os.environ.get("MCP_BRIDGE_UNLOCK_WINDOW_S", "600")))
+#: conversation key -> {"attempts": int, "preflight": bool}; insertion-ordered, the oldest
+#: conversations are forgotten past _BRIDGE_UNLOCK_KEEP (a forgotten one only starts over).
+_BRIDGE_UNLOCK_BY_CONV = {}
+_BRIDGE_UNLOCK_KEEP = 256
+_BRIDGE_UNLOCK_TIMES = []
+_BRIDGE_UNLOCK_LOCK = threading.Lock()
+
+
+def _bridge_unlock_conv_key(sid=None):
+    """The conversation a turn is sent in: the active session, else the one it was queued for."""
+    return str(ACTIVE_SID or sid or "")
+
+
+def _bridge_unlock_state(key):
+    st = _BRIDGE_UNLOCK_BY_CONV.pop(key, None) or {"attempts": 0, "preflight": False}
+    _BRIDGE_UNLOCK_BY_CONV[key] = st                      # most recently used last
+    while len(_BRIDGE_UNLOCK_BY_CONV) > _BRIDGE_UNLOCK_KEEP:
+        _BRIDGE_UNLOCK_BY_CONV.pop(next(iter(_BRIDGE_UNLOCK_BY_CONV)))
+    return st
+
+
+def _bridge_unlock_budget_left(key):
+    """True while this conversation may still be sent an unlock. Does not consume."""
+    with _BRIDGE_UNLOCK_LOCK:
+        st = _BRIDGE_UNLOCK_BY_CONV.get(key)
+        return (st or {}).get("attempts", 0) < MAX_BRIDGE_UNLOCK_ATTEMPTS
+
+
+def _bridge_unlock_preflight_due(key):
+    """True exactly once per conversation: its first turn carries the proactive unlock."""
+    with _BRIDGE_UNLOCK_LOCK:
+        st = _bridge_unlock_state(key)
+        if st["preflight"]:
+            return False
+        st["preflight"] = True
+        return True
+
+
+def _bridge_unlock_take(key, why):
+    """Consume one unlock injection for this conversation, or refuse (and say why) when its
+    cap or the process-wide window is spent."""
+    now = time.time()
+    with _BRIDGE_UNLOCK_LOCK:
+        st = _bridge_unlock_state(key)
+        if st["attempts"] >= MAX_BRIDGE_UNLOCK_ATTEMPTS:
+            logger.warning("bridge %s unlock: this conversation already had %d unlock attempts; "
+                           "not sending another (loop guard)", why, st["attempts"])
+            return False
+        _BRIDGE_UNLOCK_TIMES[:] = [t for t in _BRIDGE_UNLOCK_TIMES if now - t < BRIDGE_UNLOCK_WINDOW_S]
+        if len(_BRIDGE_UNLOCK_TIMES) >= MAX_BRIDGE_UNLOCKS_PER_WINDOW:
+            logger.warning("bridge %s unlock: %d unlocks in the last %.0fs across conversations; "
+                           "not sending another (loop guard)", why, len(_BRIDGE_UNLOCK_TIMES),
+                           BRIDGE_UNLOCK_WINDOW_S)
+            return False
+        st["attempts"] += 1
+        _BRIDGE_UNLOCK_TIMES.append(now)
+        logger.info("bridge %s unlock: attempt %d/%d in this conversation", why, st["attempts"],
+                    MAX_BRIDGE_UNLOCK_ATTEMPTS)
+        return True
 
 BRIDGE_UNLOCK_PREFIX = (
     "【要解錠】書込/実行ツールは接続のIP単位ロック解除が必要です。まず最初に call_tool で "
@@ -6278,13 +6352,14 @@ BRIDGE_UNLOCK_PREFIX = (
 )
 
 
-def _bridge_should_auto_unlock(sent_at):
-    """True when THIS turn was refused for lock and a retry is still allowed.
+def _bridge_should_auto_unlock(sent_at, key=None):
+    """True when THIS turn was refused for lock and a retry is still allowed in THIS
+    conversation (`key`, default the active one).
 
     Scoped to the turn on purpose: "was anything refused lately" would let a refusal
     from an unrelated earlier call mark the next few minutes of replies as locked.
     """
-    if _BRIDGE_UNLOCK_ATTEMPTS >= MAX_BRIDGE_UNLOCK_ATTEMPTS:
+    if not _bridge_unlock_budget_left(_bridge_unlock_conv_key() if key is None else key):
         return False
     try:
         from tools import lock_state
