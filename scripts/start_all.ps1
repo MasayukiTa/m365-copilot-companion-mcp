@@ -788,6 +788,17 @@ function Get-ServerAction {
             $tmpIn = [System.IO.Path]::GetTempFileName()
             $tmpOut = [System.IO.Path]::GetTempFileName()
             $tmpErr = [System.IO.Path]::GetTempFileName()
+            # CI (windows-install-smoke, 2026-09-24) still got "tools/??.py" for a non-ASCII
+            # path with -X utf8 alone: that flag sets Python's default TEXT encoding, but a
+            # runner whose OS codepage cannot represent the character (not this machine's, so
+            # unreproducible here) can still have something in Python's own stdio setup fall
+            # back to it for the REDIRECTED-TO-A-FILE stdout stream. PYTHONIOENCODING pins the
+            # child's stdout/stderr encoding directly and explicitly, independent of the host's
+            # OS codepage or console state -- belt-and-suspenders with -X utf8, not a
+            # replacement for the stdin fix above (which is what makes the non-ASCII path
+            # readable in the first place).
+            $savedPyIoEnc = [Environment]::GetEnvironmentVariable("PYTHONIOENCODING", "Process")
+            [Environment]::SetEnvironmentVariable("PYTHONIOENCODING", "utf-8", "Process")
             try {
                 $text = ((@($ChangedPaths) | ForEach-Object { [string]$_ }) -join "`n") + "`n"
                 [System.IO.File]::WriteAllText($tmpIn, $text, (New-Object System.Text.UTF8Encoding($false)))
@@ -799,6 +810,7 @@ function Get-ServerAction {
                 $out = @(Get-Content -LiteralPath $tmpOut -Encoding UTF8 -ErrorAction SilentlyContinue)
                 return (ConvertTo-ServerActionResult $out ([int]$p.ExitCode))
             } finally {
+                [Environment]::SetEnvironmentVariable("PYTHONIOENCODING", $savedPyIoEnc, "Process")
                 Remove-Item -LiteralPath $tmpIn, $tmpOut, $tmpErr -Force -ErrorAction SilentlyContinue
             }
         }
