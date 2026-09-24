@@ -35,16 +35,14 @@ def test_zero_is_shown_as_keep_all_not_as_a_number():
     assert SRC.count('_retMb == 0 ? T("ret_keep")') >= 1
 
 
-def test_the_effect_is_spelled_out_before_it_happens():
-    """2つの数字から効果を推測させる設定は、一度入れて後悔するものになる。
-    何が消えるのかを文章で出し、無効時と色を変える。"""
-    assert "PaintRetentionNote" in SRC
-    i = SRC.index("void PaintRetentionNote()")
-    body = SRC[i:i + 2200]
-    assert "ret_off" in body, "無効時の説明が無い"
-    assert "Theme.Warning" in body, "有効時に警告色へ変えていない"
-    assert "より古い会話" in body and "起動時に削除" in body, "何がいつ消えるか書いていない"
-    assert "ret_whole" in body, "会話単位であることを伝えていない"
+def test_the_orange_explainer_note_is_gone():
+    """2026-09-24 オーナー判断: 保持設定の下にあったオレンジ色の説明文
+    (PaintRetentionNote / _retNote) は丸ごと削除。短くした文言に置き換えるのではなく、
+    行自体を無くす -- ステッパーの2行(保持日数・上限サイズ)だけが残る。"""
+    assert "PaintRetentionNote" not in SRC
+    assert "_retNote" not in SRC
+    assert '"ret_whole"' not in SRC
+    assert '"ret_off"' not in SRC
 
 
 def test_it_uses_the_existing_settings_controls():
