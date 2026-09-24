@@ -85,6 +85,8 @@ def _build_tree(tmp_path: Path) -> Path:
         shutil.copyfile(REPO_SCRIPTS / name, tree / "scripts" / name)
     shutil.copyfile(REPO_SCRIPTS / "win" / "convenience_marker.ps1",
                      tree / "scripts" / "win" / "convenience_marker.ps1")
+    shutil.copyfile(REPO_SCRIPTS / "win" / "wsh_vbs_check.ps1",
+                     tree / "scripts" / "win" / "wsh_vbs_check.ps1")
     # Content is irrelevant: these are only ever linked TO in these tests, never executed
     # (wscript.exe itself is never invoked, and start_all.ps1 is never run).
     (tree / "scripts" / "start_all_hidden.vbs").write_text(

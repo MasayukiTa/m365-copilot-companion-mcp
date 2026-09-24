@@ -119,6 +119,9 @@ def _build_tree(tmp_path: Path) -> Path:
     (tree / "scripts").mkdir(parents=True)
     crlf_copy(Path(START_ALL_BAT), tree / "start_all.bat")
     crlf_copy(Path(PREFLIGHT_PS1), tree / "scripts" / "preflight_policy.ps1")
+    (tree / "scripts" / "win").mkdir(parents=True, exist_ok=True)
+    crlf_copy(Path(REPO) / "scripts" / "win" / "wsh_vbs_check.ps1",
+              tree / "scripts" / "win" / "wsh_vbs_check.ps1")
     (tree / "scripts" / "start_all_hidden.vbs").write_text("' stub, never actually run by wscript stub\n",
                                                             encoding="ascii")
     (tree / "scripts" / "start_all.ps1").write_text(START_ALL_PS1_STUB, encoding="ascii")

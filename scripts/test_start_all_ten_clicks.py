@@ -63,6 +63,7 @@ BRINGUP_SEC = 6
 LEAVE_BOUND_SEC = 3.0
 
 _COPY = ["start_all.bat", "scripts/start_all_hidden.vbs", "scripts/preflight_policy.ps1",
+         "scripts/win/wsh_vbs_check.ps1",
          "scripts/tunnel_name_util.ps1", "scripts/update_recovery.ps1",
          "scripts/win/env_defaults.ps1", "scripts/win/convenience_marker.ps1"]
 

@@ -112,8 +112,10 @@ def test_an_unexplained_refusal_quotes_powershell(tmp_path):
 
 def _preflight_tree(tmp_path) -> Path:
     tree = tmp_path / "pf repo (1)"
-    (tree / "scripts").mkdir(parents=True)
+    (tree / "scripts" / "win").mkdir(parents=True)
     shutil.copyfile(H.REPO / "scripts" / "preflight_policy.ps1", tree / "scripts" / "preflight_policy.ps1")
+    shutil.copyfile(H.REPO / "scripts" / "win" / "wsh_vbs_check.ps1",
+                     tree / "scripts" / "win" / "wsh_vbs_check.ps1")
     (tree / "scripts" / "other.ps1").write_text("Write-Output ok\n", encoding="ascii")
     (tree / "start.bat").write_text("@echo off\r\n", encoding="ascii")
     return tree

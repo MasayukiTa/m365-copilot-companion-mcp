@@ -23,8 +23,17 @@ REM code can never catch this case; the registry has to be asked directly, first
 REM preflight already runs this same check at INSTALL time and only WARNs, so a policy flipped
 REM off afterwards (or never checked because SETUP_IGNORE_POLICY was set) would otherwise make
 REM every later double-click of this file silently do nothing, forever.
+REM
+REM scripts\win\wsh_vbs_check.ps1, NOT preflight_policy.ps1 (2026-09-25): this runs before the
+REM single-instance lock and the leave/wait/run decision even happen, so ten double-clicks at
+REM once means ten concurrent powershell.exe cold-starts here -- measured pushing an unrelated
+REM LEAVING copy's own internal timing over its bound (scripts\test_start_all_ten_clicks.py)
+REM purely from the CPU/IO cost of ten copies each parsing preflight_policy.ps1's full ~250
+REM lines. wsh_vbs_check.ps1 holds the same two registry-check functions (preflight_policy.ps1
+REM dot-sources it, so there is still exactly one copy of the registry paths) in a file a tenth
+REM the size, with nothing else to parse.
 set "WSH_OK=1"
-for /f "usebackq delims=" %%W in (`powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\preflight_policy.ps1" -CheckWshOnly 2^>nul`) do (
+for /f "usebackq delims=" %%W in (`powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\win\wsh_vbs_check.ps1" -CheckWshOnly 2^>nul`) do (
     if "%%W"=="WSH-ENABLED=0" set "WSH_OK=0"
 )
 if "!WSH_OK!"=="0" goto :wscript_fallback
