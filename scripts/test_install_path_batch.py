@@ -240,14 +240,15 @@ STUB_DEVTUNNEL = ("Add-Content -LiteralPath (Join-Path $PSScriptRoot '..\\devtun
                   "-Value ($args -join ' ')\r\nexit 1\r\n")
 
 
-def _quickstart_tree(root: Path, env_text: str) -> Path:
+def _quickstart_tree(root: Path, env_text: str, dt_exit: int = 1) -> Path:
     tree = root / "qs repo"
     (tree / "scripts").mkdir(parents=True)
     H.crlf_copy(H.REPO / "quickstart.bat", tree / "quickstart.bat")
     (tree / "setup.bat").write_text(STUB_SETUP, encoding="ascii")
     for s in ("quickstart_lock.ps1", "detect_proxy.ps1", "env_file.py"):
         shutil.copyfile(H.REPO / "scripts" / s, tree / "scripts" / s)
-    (tree / "scripts" / "setup_devtunnel.ps1").write_text(STUB_DEVTUNNEL, encoding="ascii")
+    (tree / "scripts" / "setup_devtunnel.ps1").write_text(
+        STUB_DEVTUNNEL.replace("exit 1", "exit %d" % dt_exit), encoding="ascii")
     (tree / ".env").write_bytes(env_text.encode("utf-8"))
     H.make_venv(tree)
     # A git checkout whose upstream cannot be reached: `git fetch` fails, the stale
@@ -279,9 +280,10 @@ def test_quickstart_n_removes_the_anonymous_opt_in_and_reports_a_failed_fetch(tm
     _needs_git()
     tree = _quickstart_tree(tmp_path, "MCP_API_KEY=k\r\n# — keep me\r\n"
                                       "MCP_TUNNEL_ALLOW_ANONYMOUS=1\r\nOTHER=1\r\n")
-    r = H.run_cmd("quickstart.bat", tree, _qs_env(tree), stdin="N\r\n")
+    r = H.run_cmd("quickstart.bat", tree, _qs_env(tree), stdin="N\r\nN\r\n")   # N, confirmed
     out = r.stdout + r.stderr
     assert (tree / "setup_ran.txt").exists(), out
+    assert "Press N again to confirm" in out, out
     # D25
     assert "COULD NOT CHECK FOR UPDATES" in out, out
     assert "Up to date." not in out
@@ -323,6 +325,66 @@ def test_quickstart_t_removes_the_opt_in_and_selects_tenant_mode(tmp_path):
     assert "access=tenant" in (tree / ".setup" / "tunnel_access_choice").read_text(encoding="ascii")
     args = (tree / "devtunnel_args.txt").read_text(encoding="utf-8", errors="replace")
     assert "-TenantId signed-in-account" in args and "-ForceAnonymous" not in args
+
+
+def _bootstrap_for_advice(tree):
+    """The real bootstrap.py is too heavy for this tree; its --tunnel-access-advice text is
+    what quickstart prints, so a stub that echoes the requested key proves the call."""
+    (tree / "scripts" / "bootstrap.py").write_text(
+        "import sys\nprint('ADVICE:' + sys.argv[-1])\n", encoding="ascii")
+
+
+def test_an_unanswered_access_prompt_stops_and_changes_nothing(tmp_path):
+    """New-PC report 2026-09-24: no key reached the prompt, it was recorded as N, and the run
+    ended with a tunnel nothing could connect to."""
+    _needs_git()
+    before = "MCP_TUNNEL_ALLOW_ANONYMOUS=1\r\nX=1\r\n"
+    tree = _quickstart_tree(tmp_path, before)
+    _bootstrap_for_advice(tree)
+    r = H.run_cmd("quickstart.bat", tree, _qs_env(tree), stdin="")
+    out = r.stdout + r.stderr
+    assert r.returncode == 3, out
+    assert "got no answer" in out and "ADVICE:unanswered" in out, out
+    assert not (tree / "devtunnel_args.txt").exists(), "STEP 4 ran without an answer"
+    assert (tree / ".env").read_bytes().decode("utf-8") == before
+    assert not (tree / ".setup" / "tunnel_access_choice").exists()
+    assert not (tree / ".setup" / "quickstart.lock").exists()
+
+
+def test_an_unconfirmed_n_becomes_the_key_pressed_next(tmp_path):
+    _needs_git()
+    tree = _quickstart_tree(tmp_path, "X=1\r\n")
+    r = H.run_cmd("quickstart.bat", tree, _qs_env(tree), stdin="N\r\nA\r\n")
+    out = r.stdout + r.stderr
+    assert "-ForceAnonymous" in (tree / "devtunnel_args.txt").read_text(encoding="utf-8",
+                                                                         errors="replace"), out
+    assert "access=anonymous" in (tree / ".setup" / "tunnel_access_choice").read_text(encoding="ascii")
+
+
+@pytest.mark.parametrize("dt_exit,key", [(3, "none"), (4, "unapplied")])
+def test_step4_without_a_grant_stops_instead_of_going_on(tmp_path, dt_exit, key):
+    """setup_devtunnel.ps1 exit 3 (no grant) / 4 (chosen grant not on the tunnel): stop at
+    STEP 4 with the reason and the key to press -- not STEP 5, not SETUP COMPLETE."""
+    _needs_git()
+    tree = _quickstart_tree(tmp_path, "MCP_TUNNEL_URL=https://x-8000.jpe1.devtunnels.ms/\r\n",
+                            dt_exit=dt_exit)
+    _bootstrap_for_advice(tree)
+    r = H.run_cmd("quickstart.bat", tree, _qs_env(tree), stdin="A\r\n")
+    out = r.stdout + r.stderr
+    assert r.returncode == dt_exit, out
+    assert "STOPPED" in out and ("ADVICE:" + key) in out, out
+    assert "Convenience setup" not in out and "STEP 5/7" not in out, out
+    assert not (tree / ".setup" / "quickstart.lock").exists()
+
+
+def test_the_advice_is_bilingual_and_names_the_key(capsys):
+    sys.path.insert(0, str(HERE))
+    import bootstrap as B
+    for k in ("none", "unapplied", "unanswered"):
+        assert B.main(["--tunnel-access-advice", k]) == 0
+        out = capsys.readouterr().out
+        assert "STOPPED" in out and "停止しました" in out, out
+    assert "press:" in B.TUNNEL_ACCESS_ADVICE["none"] and "  A  " in B.TUNNEL_ACCESS_ADVICE["none"]
 
 
 def test_a_second_quickstart_is_refused_before_it_changes_anything(tmp_path):

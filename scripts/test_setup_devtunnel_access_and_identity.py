@@ -149,9 +149,15 @@ if a[0] == "access":
         if extra:
             print("Unrecognized command or argument '%s'." % extra[0]); sys.exit(1)
         if "--anonymous" in a or "-a" in a:
+            # anon_noop: answer "conflict" (tolerated as already-there) WITHOUT granting, N times
+            if st.get("anon_noop", 0) > 0:
+                st["anon_noop"] -= 1; save()
+                print("Conflict: access control entry already exists"); sys.exit(1)
             acl.append("+Anonymous [connect]")
         if "--tenant" in a or "-t" in a:
-            acl.append("+Tenant [connect]")
+            if st.get("tenant_noop"):
+                save(); sys.exit(0)          # exit 0, nothing granted
+            acl.append(st.get("tenant_text", "+Tenant [connect]"))
         save(); sys.exit(0)
 if a[:1] == ["host"]:
     sys.exit(0)
@@ -292,11 +298,88 @@ def test_none_after_anonymous_revokes_it_and_says_nothing_can_connect(tmp_path):
     tenant. The anonymous grant from the earlier A must go, and the screen must say so."""
     name = "m365-copilot-companion-" + _this_suffix()
     rig = Rig(tmp_path, _mine_env(name), _anon_tunnel(name)).run("-TenantId", "")
-    assert rig.rc == 0, rig.out
+    # 3, NOT 0: set up and recorded, but not ready -- nothing remote can connect (new-PC report
+    # 2026-09-24: quickstart went on and ended with grant none).
+    assert rig.rc == 3, rig.out
     assert _all_acl(rig.state, name) == [], rig.state
     assert "has an ANONYMOUS grant from an earlier choice" in rig.out
     assert "ACCESS: NONE" in rig.out, rig.out
+    assert "NOT READY" in rig.out and "press A" in rig.out, rig.out
+    assert rig.live("MCP_TUNNEL_URL"), "the URL is still recorded for the re-run"
     assert not [c for c in rig.calls if c[:2] == ["access", "create"]]
+
+
+# ── 2026-09-24 new-PC report: never end "ready" with grant none ─────────────────────────────
+
+def test_a_fresh_run_with_no_choice_ends_not_ready_with_the_url_recorded(tmp_path):
+    rig = Rig(tmp_path, "MCP_API_KEY=k\n", {"owned": {}}).run()
+    name = "m365-copilot-companion-" + _this_suffix()
+    assert rig.rc == 3, rig.out
+    assert rig.live("MCP_TUNNEL_NAME") == name and rig.live("MCP_TUNNEL_URL")
+    assert _all_acl(rig.state, name) == []
+
+
+def test_anonymous_that_a_conflict_answer_did_not_grant_is_granted_again(tmp_path):
+    """`access create --anonymous` said "conflict" (tolerated) and granted nothing: this used
+    to end with a WARN and exit 0 on a tunnel nobody could reach."""
+    name = "m365-copilot-companion-" + _this_suffix()
+    st = {"owned": {name: {"tunnel": [], "ports": {"8000": []}}}, "anon_noop": 2}
+    rig = Rig(tmp_path, _mine_env(name), st).run("-ForceAnonymous")
+    assert rig.rc == 0, rig.out
+    assert "granting it again" in rig.out
+    assert "+Anonymous [connect]" in rig.state["owned"][name]["ports"]["8000"]
+    assert "ACCESS: ANONYMOUS" in rig.out
+
+
+def test_anonymous_that_never_shows_up_stops_with_exit_4(tmp_path):
+    name = "m365-copilot-companion-" + _this_suffix()
+    st = {"owned": {name: {"tunnel": [], "ports": {"8000": []}}}, "anon_noop": 99}
+    rig = Rig(tmp_path, _mine_env(name), st).run("-ForceAnonymous")
+    assert rig.rc == 4, rig.out
+    assert "press A" in rig.out and "access list" in rig.out, rig.out
+    assert "Dev Tunnel READY" not in rig.out
+
+
+def test_tenant_that_shows_no_entry_stops_with_exit_4(tmp_path):
+    rig = Rig(tmp_path, "MCP_API_KEY=k\n", {"owned": {}, "tenant_noop": True}).run("-TenantId", "x")
+    assert rig.rc == 4, rig.out
+    assert "press T" in rig.out, rig.out
+
+
+def test_a_tenant_entry_in_unseen_wording_is_a_grant_not_none(tmp_path):
+    """The real CLI's tenant wording has not been observed; any allow entry is not "none"."""
+    st = {"owned": {}, "tenant_text": "+Organization 72f988bf [connect]"}
+    rig = Rig(tmp_path, "MCP_API_KEY=k\n", st).run("-TenantId", "x")
+    assert rig.rc == 0, rig.out
+    assert "was not recognised" in rig.out
+
+
+def test_a_standalone_run_keeps_the_recorded_tenant_choice(tmp_path):
+    """doctor / heal_tunnel / start_all tell people to run this script alone to recreate a
+    tunnel. T lives only in .setup\\tunnel_access_choice, so that run used to resolve to none."""
+    rig = Rig(tmp_path, "MCP_API_KEY=k\n", {"owned": {}})
+    (rig.root / ".setup").mkdir()
+    (rig.root / ".setup" / "tunnel_access_choice").write_text("access=tenant\r\n", encoding="ascii")
+    rig.run()
+    name = "m365-copilot-companion-" + _this_suffix()
+    assert rig.rc == 0, rig.out
+    assert ["access", "create", name, "--tenant"] in rig.calls, rig.calls
+    assert "recorded by quickstart" in rig.out
+
+
+def test_a_recorded_none_or_anonymous_choice_grants_nothing_on_its_own(tmp_path):
+    """Anonymous still needs the documented opt-in (MCP_TUNNEL_ALLOW_ANONYMOUS); the choice
+    file alone never opens the tunnel to the internet."""
+    for choice in ("none", "anonymous"):
+        sub = tmp_path / choice
+        sub.mkdir()
+        rig = Rig(sub, "MCP_API_KEY=k\n", {"owned": {}})
+        (rig.root / ".setup").mkdir()
+        (rig.root / ".setup" / "tunnel_access_choice").write_text("access=%s\r\n" % choice,
+                                                                   encoding="ascii")
+        rig.run()
+        assert rig.rc == 3, (choice, rig.out)
+        assert not [c for c in rig.calls if c[:2] == ["access", "create"]], rig.calls
 
 
 def test_anonymous_is_still_granted_when_it_is_the_choice(tmp_path):

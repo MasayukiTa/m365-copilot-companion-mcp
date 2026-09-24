@@ -2365,6 +2365,44 @@ def reset_state(state_file: Path = STATE_FILE) -> int:
     return 0
 
 
+#: What quickstart.bat shows when STEP 4 ends without a usable tunnel access grant. Here, not in
+#: the .bat: cmd corrupts non-ASCII text, and this has to be readable in Japanese too.
+#: Keys: setup_devtunnel.ps1 exit 3 = "none", exit 4 = "unapplied"; "unanswered" = the A/T/N
+#: prompt got no key (no keyboard reached it).
+TUNNEL_ACCESS_ADVICE = {
+    "none": (
+        "STOPPED: the Dev Tunnel has NO access grant (N was chosen), so nothing remote --\n"
+        "Copilot Studio included -- can connect, and the remaining steps would fail.\n"
+        "Run quickstart.bat again and press:\n"
+        "  A  anonymous: what a Copilot Studio connector using an API key needs (the Bearer\n"
+        "     token is then the only gate in front of the server), or\n"
+        "  T  your Entra tenant only (not verified to work with an API-key connector).\n"
+        "\n"
+        "停止しました: Dev Tunnel にアクセス許可がありません（N を選択）。Copilot Studio を含め、\n"
+        "外部からは一切接続できないため、この先の手順は失敗します。\n"
+        "quickstart.bat をもう一度実行し、次のどちらかを押してください:\n"
+        "  A  匿名: API キーで接続する Copilot Studio のコネクタにはこれが必要です\n"
+        "     （サーバーの前にある関門は Bearer トークンだけになります）\n"
+        "  T  自分の Entra テナントのみ（API キーのコネクタで通るかは未検証）"),
+    "unapplied": (
+        "STOPPED: the access you chose (A or T) is not on the Dev Tunnel when read back, so\n"
+        "nothing remote can connect yet. Run quickstart.bat again and press the same key. If it\n"
+        "repeats, the lines above show what 'devtunnel access list' returned.\n"
+        "\n"
+        "停止しました: 選択したアクセス許可（A または T）が Dev Tunnel に設定されていません。\n"
+        "このままでは外部から接続できません。quickstart.bat をもう一度実行し、同じキーを押して\n"
+        "ください。繰り返す場合は、上に表示された 'devtunnel access list' の結果を確認してください。"),
+    "unanswered": (
+        "STOPPED: the question \"how should Copilot Studio reach this machine\" got no answer (no\n"
+        "keyboard input reached it), so nothing was granted and the tunnel was not set up.\n"
+        "Double-click quickstart.bat (so it runs in a window you can type into) and press A or T.\n"
+        "\n"
+        "停止しました: 「Copilot Studio からこの PC への接続方法」の質問に回答がありませんでした\n"
+        "（キーボード入力が届いていません）。何も許可せず、トンネルも設定していません。\n"
+        "quickstart.bat をダブルクリックで起動し、A または T を押してください。"),
+}
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Resumable environment bootstrap for m365-copilot-companion-mcp.",
@@ -2381,8 +2419,15 @@ def main(argv=None) -> int:
                         "path): lock, re-check, install if needed, record")
     g.add_argument("--list-unsatisfied", action="store_true", help=argparse.SUPPRESS)
     g.add_argument("--list-broken-dists", action="store_true", help=argparse.SUPPRESS)
+    g.add_argument("--tunnel-access-advice", choices=sorted(TUNNEL_ACCESS_ADVICE),
+                   help=argparse.SUPPRESS)
     parser.add_argument("--requirements", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+
+    if args.tunnel_access_advice:
+        # quickstart.bat STEP 4: prints only, changes nothing.
+        _print_safe(TUNNEL_ACCESS_ADVICE[args.tunnel_access_advice])
+        return 0
 
     if args.list_broken_dists:
         # Internal: step_install_deps asks the venv's python this after every pip install.
