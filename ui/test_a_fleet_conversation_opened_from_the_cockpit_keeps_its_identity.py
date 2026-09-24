@@ -173,7 +173,10 @@ def test_the_running_binary_carries_this_change():
         pytest.skip("no built binary here (CI)")
     with open(exe, "rb") as fh:
         blob = fh.read()
-    needle = "TranscriptMetaGoal".encode("utf-16-le")
+    # A METHOD NAME IS METADATA, NOT A STRING LITERAL. .NET keeps identifiers in the #Strings
+    # heap as UTF-8; only string literals live in #US as UTF-16. The first version searched for
+    # UTF-16 and failed against a binary that did carry the method -- measured 2026-09-24.
+    needle = "TranscriptMetaGoal".encode("utf-8")
     assert needle in blob, (
         "CopilotChat.exe predates this change -- rebuild it, or a fleet conversation opened "
         "from the cockpit still carries no goal")
