@@ -134,7 +134,29 @@ def add(files, reason: str, *, diff: str = "", command: str = "", detail: str = 
             "action": (action or "").strip(),
         })
         if notify:
-            _notify(pid, files, reason)
+            # BYPASS SUPPRESSES THE TOAST, NOT THE QUEUE. This is a self-improvement
+            # proposal, not a local-job run -- the same distinction request_approval() in
+            # relay/skills.py draws for Skill trust: bypass turns off ASKING about routine
+            # job execution, it was never a grant of "apply code changes to yourself
+            # without a person looking". So under bypass the card is still queued (`--list`
+            # / the dashboard still show it, still OPEN, still needs `resolve`) -- only the
+            # desktop toast that would interrupt someone is skipped, and that skip itself is
+            # written to the audit trail so it isn't invisible.
+            is_bypass = False
+            try:
+                from tools.approval_policy import current_approval_mode, record_bypass_decision
+                is_bypass = current_approval_mode() == "bypass"
+                if is_bypass:
+                    record_bypass_decision(
+                        "relay.selfimprove.pending.add",
+                        "判断待ち: %s -- %s" % (
+                            ", ".join(sorted(str(f) for f in (files or []))), reason),
+                        "queued, not notified (bypass never auto-approves self-improvement "
+                        "proposals); still awaiting explicit resolve()")
+            except Exception:
+                is_bypass = False
+            if not is_bypass:
+                _notify(pid, files, reason)
         return pid
     except Exception:
         return ""

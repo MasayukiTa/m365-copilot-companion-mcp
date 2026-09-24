@@ -304,7 +304,7 @@ def skill_request_approval(name: str = "") -> str:
         targets = [name] if name else [row["name"] for row in store.unapproved()]
         if not targets:
             return "(every Skill is already approved -- nothing to request)"
-        asked, already, failed = [], [], []
+        asked, already, failed, bypass_skipped = [], [], [], []
         for target in targets:
             try:
                 review = store.request_approval(target)
@@ -317,8 +317,15 @@ def skill_request_approval(name: str = "") -> str:
             except Exception as exc:
                 failed.append("%s (%s: %s)" % (target, type(exc).__name__, exc))
                 continue
-            if review.get("status") == "already-trusted":
+            status = review.get("status")
+            if status == "already-trusted":
                 already.append(target)
+            elif status == "bypass-not-asked":
+                # job_approval_mode=bypass: request_approval() deliberately raised no gate
+                # and granted no trust either -- see relay/skills.py's comment on this
+                # status. Surface it as its own bucket so this reads as "still untrusted,
+                # nobody was asked", not silently folded into "asked".
+                bypass_skipped.append(target)
             else:
                 asked.append(target)
         lines = []
@@ -327,10 +334,15 @@ def skill_request_approval(name: str = "") -> str:
                          + ", ".join("/" + n for n in asked))
         if already:
             lines.append("すでに承認済み: " + ", ".join("/" + n for n in already))
+        if bypass_skipped:
+            lines.append("job_approval_mode=bypass のため確認は行われず、未承認のままです"
+                         "（bypassはSkill信頼を自動付与しません）: "
+                         + ", ".join("/" + n for n in bypass_skipped))
         if failed:
             lines.append("要求できませんでした: " + ", ".join(failed))
-        lines.append("承認は人の操作です。承認センターで内容(digest とプレビュー)を"
-                     "確認して承認してください。")
+        if asked:
+            lines.append("承認は人の操作です。承認センターで内容(digest とプレビュー)を"
+                         "確認して承認してください。")
         return "\n".join(lines)
     except Exception as exc:
         return f"[skill_request_approval error: {type(exc).__name__}: {exc}]"

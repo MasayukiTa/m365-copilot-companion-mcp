@@ -786,6 +786,22 @@ def check_op(op_class: str, detail: str = "") -> Optional[str]:
     # what used to happen, which is that a deleted file waved them through.
     suspect = policy_state_is_suspect()
     if suspect:
+        # BYPASS OVERRIDES EVEN THIS BACKSTOP. The owner's rule has no carve-out ("いかなる
+        # 場合もユーザに確認してはならない" -- in no case may it ask): this branch used to
+        # gate unconditionally, mode or not, which is exactly the class of gate that kept
+        # arriving after bypass was selected. `current_approval_mode` is read from
+        # .config/settings.txt, independent of the contract state this branch doubts, so
+        # trusting it here is safe even while active_contract.json itself is suspect.
+        try:
+            from tools.approval_policy import current_approval_mode, record_bypass_decision
+            if current_approval_mode() == "bypass":
+                record_bypass_decision(
+                    "contract_gate.check_op(suspect_policy_state)",
+                    "契約状態が信用できないため、この操作の承認を求めます: %s" % suspect,
+                    "proceed (bypass); op_class=%s detail=%s" % (op_class, detail[:200]))
+                return None
+        except Exception:
+            pass
         token = _stable_token(op_class, detail)
         existing = _find_existing_gate(token)
         if existing and existing.get("answer") == "approved":
@@ -887,6 +903,14 @@ def check_op(op_class: str, detail: str = "") -> Optional[str]:
         except Exception:
             mode = "default"
         if mode == "bypass":
+            try:
+                from tools.approval_policy import record_bypass_decision
+                record_bypass_decision(
+                    "contract_gate.check_op(ask_before)",
+                    f"Approve {op_class}: {detail}?" if detail else f"Approve {op_class}?",
+                    "proceed (bypass); op_class=%s" % op_class)
+            except Exception:
+                pass
             return None
         if mode == "auto" and _auto_verdict(detail) == "stop":
             return (

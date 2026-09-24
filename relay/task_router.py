@@ -565,6 +565,14 @@ def job_gate(job_type, payload, mode):
     (decision, reason)."""
     payload = payload or {}
     if mode == "bypass":
+        try:
+            from tools.approval_policy import record_bypass_decision
+            record_bypass_decision(
+                "task_router.job_gate",
+                _job_gate_question(job_type, payload, _job_class_key(job_type, payload)),
+                "ALLOW (bypass); job_type=%s" % job_type)
+        except Exception:
+            pass
         return "ALLOW", "bypass"
 
     level, why = _static_risk(job_type, payload)
@@ -2409,6 +2417,31 @@ def _recheck_awaiting(now_ts=None):
         decision, why = job_gate(job_type, payload, _current_approval_mode(TASK_JOB_APPROVAL_MODE))
         if decision == "DENY":
             rec["status"], rec["error"] = "denied", why
+            try:
+                with open(_p("done", name), "w", encoding="utf-8") as f:
+                    json.dump(rec, f, ensure_ascii=False, indent=2)
+                os.remove(path)
+            except OSError:
+                pass
+            out.append(rec)
+            continue
+        if decision == "ALLOW":
+            # e.g. the operator switched to `bypass` (or `auto` cleared it) while this job
+            # sat in awaiting/ from an earlier, stricter mode. job_gate already logged the
+            # bypass decision if that's why; the only thing left is to NOT fall into the
+            # gate-lookup/-creation code below, which would raise exactly the question this
+            # mode exists to skip -- see the STUCK-unlock incident this whole file's bypass
+            # handling was written to close (gates kept arriving after bypass was chosen).
+            try:
+                fn = LOCAL_EXECUTORS.get(job_type)
+                if not fn:
+                    rec["status"], rec["error"] = "error", "no local executor for type %r" % job_type
+                else:
+                    rec["status"], rec["result"], rec["error"] = fn(payload)
+            except subprocess.TimeoutExpired:
+                rec["status"], rec["error"] = "error", "timeout after %ds" % LOCAL_TIMEOUT_S
+            except Exception as e:
+                rec["status"], rec["error"] = "error", "%s: %s" % (type(e).__name__, e)
             try:
                 with open(_p("done", name), "w", encoding="utf-8") as f:
                     json.dump(rec, f, ensure_ascii=False, indent=2)

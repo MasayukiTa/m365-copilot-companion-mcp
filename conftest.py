@@ -329,6 +329,14 @@ DELIBERATELY_NOT_REDIRECTED = {
     ("tools.gate_ops", "STOP_FILE"):
         "derived from GATE_DIR, which MCP_GATE_DIR already moves, and cleared around every "
         "test by the _no_leftover_kill_switch fixture",
+    # SAME SHAPE, SAME REASON, ADDED 2026-09-24: tools.approval_policy.record_bypass_decision's
+    # audit trail is read/appended by five call sites (gate_ops.gate_ask_local, both
+    # contract_gate.check_op branches, task_router.job_gate, relay.skills.request_approval,
+    # relay.selfimprove.pending.add) that all fire once a test drives job_approval_mode=bypass
+    # -- so this is redirected at import, exactly like GATE_DIR, not by a per-test fixture.
+    ("tools.approval_policy", "BYPASS_LOG_FILE"):
+        "resolved through MCP_BYPASS_LOG_FILE, which conftest sets at module scope before the "
+        "module is imported; the .fleet/bypass_decisions.jsonl path is only its fallback",
     # NOT A PATH -- A LIST OF REGEXES the destructive-command classifier matches against, one of
     # which happens to name `.companion_gates` because a shell that will `type` the approval
     # queue is destructive. Nothing is written through it. Same shape as
@@ -1265,6 +1273,7 @@ _SANDBOX_NAMES = (
     "bridge_undelivered_pytest_%s.jsonl",
     "bridge_token_pytest_%s",
     "signin_latch_pytest_%s",
+    "bypass_decisions_pytest_%s.jsonl",
 )
 
 _atexit.register(_drop_this_runs_sandbox)
@@ -1295,6 +1304,17 @@ _os.environ.setdefault(
 _os.environ.setdefault(
     "MCP_SKILLS_STATE_DB",
     _sandbox_path("skills_state_pytest_%s.sqlite3"))
+
+# tools.approval_policy.record_bypass_decision's audit trail. Same shape and same reason as
+# MCP_GATE_DIR just above: the module reads MCP_BYPASS_LOG_FILE once, at import, so this must
+# be set at conftest MODULE scope, before tools.approval_policy is imported by anything --
+# otherwise a test that drives job_approval_mode=bypass through ANY of the five call sites
+# that now call record_bypass_decision (gate_ops.gate_ask_local, contract_gate's two branches,
+# task_router.job_gate, relay.skills.request_approval, relay.selfimprove.pending.add) would
+# append its audit line to the real .fleet/bypass_decisions.jsonl.
+_os.environ.setdefault(
+    "MCP_BYPASS_LOG_FILE",
+    _sandbox_path("bypass_decisions_pytest_%s.jsonl"))
 
 # The local job store, which is a record and not a cache: relay/local_job_store.py defaults to
 # <repo>/.jobs/jobs.sqlite3 and MCP_LOCAL_JOB_DB is its override. Measured 2026-09-14: of 451
