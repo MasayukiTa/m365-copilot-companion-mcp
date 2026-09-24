@@ -24,7 +24,10 @@ from pathlib import Path
 import pytest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(REPO, "tests"))
+
+from tools import childproc  # noqa: E402
 
 from _install_path_harness import minimal_path, clean_env, _PS51_DEFAULT_MODULE_PATH  # noqa: E402
 
@@ -50,8 +53,7 @@ def _src_dir() -> str:
 
 
 def _ps(env, text):
-    r = subprocess.run([POWERSHELL, "-NoProfile", "-Command", text], env=env,
-                       capture_output=True, text=True, timeout=120)
+    r = childproc.run([POWERSHELL, "-NoProfile", "-Command", text], env=env, timeout=120)
     return r.stdout.strip()
 
 
@@ -94,9 +96,9 @@ class Rig:
                                         + "MCP_API_KEY=keep-me\n", encoding="utf-8")
 
     def heal(self):
-        r = subprocess.run([POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-                            str(self.root / "scripts" / "heal_tunnel.ps1")], env=self.env,
-                           capture_output=True, text=True, timeout=180)
+        r = childproc.run([POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                           str(self.root / "scripts" / "heal_tunnel.ps1")], env=self.env,
+                          timeout=180)
         return r.stdout
 
     def env_values(self) -> dict:

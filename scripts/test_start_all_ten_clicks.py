@@ -42,6 +42,7 @@ sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(REPO, "tests"))
 
 from _install_path_harness import crlf_copy, minimal_path, clean_env, _PS51_DEFAULT_MODULE_PATH  # noqa: E402
+from tools import childproc  # noqa: E402
 
 SYSROOT = os.environ.get("SystemRoot", r"C:\Windows")
 POWERSHELL = shutil.which("powershell") or os.path.join(
@@ -133,8 +134,7 @@ def tree_processes(tree: Path) -> list:
               "$_.CommandLine.IndexOf('%s', [StringComparison]::OrdinalIgnoreCase) -ge 0 } | "
               "ForEach-Object { '' + $_.ProcessId + '|' + $_.Name }" % str(tree).replace("'", "''"))
     enc = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
-    r = subprocess.run([POWERSHELL, "-NoProfile", "-EncodedCommand", enc],
-                       capture_output=True, text=True, timeout=120)
+    r = childproc.run([POWERSHELL, "-NoProfile", "-EncodedCommand", enc], timeout=120)
     out = []
     for line in r.stdout.splitlines():
         if "|" in line:
@@ -299,8 +299,8 @@ def test_who_waits_and_who_leaves_truth_table(tmp_path):
     body += "'RESULT:' + ($o | ConvertTo-Json -Compress)\n"
     p = tmp_path / "tt.ps1"
     p.write_text(body, encoding="utf-8-sig")
-    r = subprocess.run([POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(p)],
-                       capture_output=True, text=True, timeout=120)
+    r = childproc.run([POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(p)],
+                      timeout=120)
     line = [l for l in r.stdout.splitlines() if l.startswith("RESULT:")][-1]
     got = json.loads(line[len("RESULT:"):])
     rank = {"full": 3, "background (-NoUi)": 2, "core (-CoreOnly)": 1, "": 2}
