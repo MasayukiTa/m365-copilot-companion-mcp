@@ -105,11 +105,12 @@ function Get-PolicyFindings {
 
     if (-not $WshEnabled) {
         $findings += @{ Id = 'wsh-disabled'; Code = 0; Lines = @(
-            "WARNING: Windows Script Host (wscript) is disabled on this PC. start_all.bat, the",
-            "Desktop launcher and logon autostart all start through it, so they will do NOTHING",
-            "(no window, no error). Setup itself does not need it and continues.",
-            "NEXT STEP: ask IT to enable Windows Script Host for your account, or start the",
-            "stack directly with:",
+            "WARNING: Windows Script Host (wscript) is disabled, or has no VBScript engine, on",
+            "this PC. start_all.bat, the Desktop launcher and logon autostart all start through",
+            "it, so they will either do NOTHING (no window, no error) or show a blocking",
+            "'no script engine' popup on every click. Setup itself does not need it and continues.",
+            "NEXT STEP: ask IT to enable Windows Script Host (and the VBScript optional feature)",
+            "for your account, or start the stack directly with:",
             "    powershell -NoProfile -ExecutionPolicy Bypass -File ""$Root\scripts\start_all.ps1""") }
     }
     return ,$findings
@@ -155,13 +156,65 @@ function Test-WshEnabled {
     return $true
 }
 
+function Test-VbsEngineAvailable {
+    # START-?? (new-PC review, 2026-09-24): wscript.exe itself can start fine, with WSH fully
+    # "Enabled", and still have NOTHING able to run a .vbs -- some Windows 11 builds ship with
+    # the VBScript engine removed/deprecated (an optional Windows feature) while leaving the
+    # WSH Enabled registry key untouched. In that state wscript.exe opens a MODAL dialog
+    # ("script engine ... not registered" / Windows Script Host cannot find a script engine for
+    # ".vbs") and BLOCKS until someone clicks OK -- one modal per double-click of start_all.bat,
+    # never an error code, never anything on the WSH Enabled key Test-WshEnabled reads.
+    #
+    # Checked the same way Windows itself resolves a .vbs double-click, entirely through the
+    # registry (COM class lookup, no process, no UI, cannot show a dialog): .vbs's ProgID ->
+    # that ProgID's ScriptEngine name (defaults to "VBScript" when the key is absent, as stock
+    # Windows leaves it) -> that engine name's CLSID -> that CLSID's InprocServer32 DLL path ->
+    # the DLL file actually exists on disk. Any missing link means nothing will run a .vbs.
+    #
+    # PREFLIGHT_TEST_VBS_ENGINE (tests only): forces the answer, same convention as
+    # PREFLIGHT_TEST_WSH_ENABLED, so a test can exercise both branches without depending on
+    # whether the machine running the test happens to have the engine installed.
+    if ($env:PREFLIGHT_TEST_VBS_ENGINE -eq '0') { return $false }
+    if ($env:PREFLIGHT_TEST_VBS_ENGINE -eq '1') { return $true }
+    try {
+        $ext = Get-Item -LiteralPath 'Registry::HKEY_CLASSES_ROOT\.vbs' -ErrorAction Stop
+        $progId = [string]$ext.GetValue('')
+        if (-not $progId) { return $false }
+        $engine = 'VBScript'
+        $engineKey = Get-Item -LiteralPath ('Registry::HKEY_CLASSES_ROOT\' + $progId + '\ScriptEngine') -ErrorAction SilentlyContinue
+        if ($engineKey) {
+            $named = [string]$engineKey.GetValue('')
+            if ($named) { $engine = $named }
+        }
+        $clsidKey = Get-Item -LiteralPath ('Registry::HKEY_CLASSES_ROOT\' + $engine + '\CLSID') -ErrorAction SilentlyContinue
+        if (-not $clsidKey) { return $false }
+        $clsid = [string]$clsidKey.GetValue('')
+        if (-not $clsid) { return $false }
+        $dllKey = Get-Item -LiteralPath ('Registry::HKEY_CLASSES_ROOT\CLSID\' + $clsid + '\InprocServer32') -ErrorAction SilentlyContinue
+        if (-not $dllKey) { return $false }
+        $dll = ([string]$dllKey.GetValue('')).Trim('"')
+        if (-not $dll) { return $false }
+        $dll = [System.Environment]::ExpandEnvironmentVariables($dll)
+        return (Test-Path -LiteralPath $dll -PathType Leaf)
+    } catch { return $false }
+}
+
+function Test-CanRunVbs {
+    # The one question every caller actually has: will `wscript.exe foo.vbs` do the intended
+    # thing without popping a modal or silently no-op'ing? Both halves must hold.
+    return (Test-WshEnabled) -and (Test-VbsEngineAvailable)
+}
+
 # ---- entry points --------------------------------------------------------------------------
 if ($args -contains '-CheckWshOnly') {
     # START-16, 2026-09-24: start_all.bat (the DAILY launcher, run long after setup.bat's own
     # preflight already warned-and-continued past a disabled WSH) calls this on every run to
     # decide whether wscript.exe's hidden launcher can be trusted at all -- reusing this same
-    # Test-WshEnabled check rather than a second copy of the registry paths.
-    Write-Output ('WSH-ENABLED=' + [int](Test-WshEnabled))
+    # check rather than a second copy of the registry paths. The output name (WSH-ENABLED) is
+    # the established contract every caller (start_all.bat, make_desktop_shortcut.ps1,
+    # register-supervisor.ps1) greps for; it now also covers a missing VBScript engine
+    # (Test-CanRunVbs), which is a second, different way wscript can fail to do anything.
+    Write-Output ('WSH-ENABLED=' + [int](Test-CanRunVbs))
     exit 0
 }
 if ($args -contains '-ProbeOnly') {
@@ -182,7 +235,7 @@ if (-not $env:PREFLIGHT_NO_AUTORUN) {
     $up = [string](Get-ExecutionPolicy -Scope UserPolicy)
     $findings = Get-PolicyFindings -ProbeRan ([bool]$lang) -ProbeLanguage $lang -ProbeError $probeText `
         -MachinePolicy $mp -UserPolicy $up -MotwCount (Get-MotwCount $root) `
-        -WshEnabled (Test-WshEnabled) -Root $root
+        -WshEnabled (Test-CanRunVbs) -Root $root
     foreach ($f in $findings) {
         Write-Output ''
         foreach ($l in $f.Lines) { Write-Output ('  ' + $l) }
