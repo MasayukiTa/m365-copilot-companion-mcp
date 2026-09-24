@@ -225,6 +225,37 @@ def test_a_test_that_writes_a_security_ledger():
         fh.write("INJECTED_BY_THROWAWAY_TEST\\n")
 '''
 
+# THE 2026-09-24 FIX'S OWN PROOF, PAIRED WITH THE HARD-FAIL TEST ABOVE. This test's OWN body
+# writes nothing to the security ledger itself -- a genuinely SEPARATE python process, spawned
+# with subprocess.run against a small SCRIPT FILE (not a `-c` command-line string: an inline
+# `-c` script here goes through Windows argv re-quoting, which was measured to mangle an escaped
+# `\n` inside a quoted argument into a literal newline mid-string, splitting the child's own
+# source into an unterminated string literal -- a file sidesteps that entirely, the same way
+# every other subprocess call in this file already passes paths, never source, as arguments),
+# does that write, the same way a live supervisor/fleet-worker process would while a local
+# session runs. _install_security_write_watch (conftest.py) can only ever see writes made by
+# code running inside THIS interpreter, so this process's own builtins.open/os.replace patch
+# never fires for the child's write -- the canary must attribute the change to "production", not
+# to this session, and must NOT fail.
+_THROWAWAY_EXTERNAL_PROCESS_SECURITY_WRITER = '''
+import os
+import subprocess
+import sys
+
+def test_a_test_that_does_nothing_while_a_separate_process_writes_a_security_ledger():
+    here = r"%s"
+    fleet_dir = os.path.join(here, ".fleet")
+    os.makedirs(fleet_dir, exist_ok=True)
+    target = os.path.join(fleet_dir, "lock_state.json")
+    writer_path = os.path.join(here, "_external_process_writer.py")
+    with open(writer_path, "w", encoding="ascii") as fh:
+        fh.write("import sys\\n")
+        fh.write(
+            "open(sys.argv[1], 'a', encoding='utf-8').write('EXTERNAL_PROCESS_WRITE\\\\n')\\n"
+        )
+    subprocess.run([sys.executable, writer_path, target], check=True, timeout=30)
+'''
+
 
 def _venv_python() -> str:
     candidate = os.path.join(REPO, ".venv", "Scripts", "python.exe")
@@ -365,4 +396,27 @@ def test_a_write_to_a_security_ledger_in_the_clone_turns_that_sessions_exit_red(
     assert "modified a real unlock/lock-state ledger" in out
     assert "lock_state.json" in out
     # And it must NOT be reported as the .env variant -- a different file changed.
+    assert "modified the real repo .env" not in out
+
+
+def test_a_security_ledger_write_by_a_separate_process_warns_but_stays_green(throwaway_clone):
+    """THE FIX'S OWN PROOF, the negative half of the test directly above: the same file, changed
+    the same way, must NOT fail the session when the write is made by a genuinely SEPARATE OS
+    process instead of by code running inside the nested pytest session itself -- exactly the
+    scenario that was blocking every push while the fleet is busy (see conftest.py's
+    _install_security_write_watch and the fixture's own 2026-09-24 docstring addendum)."""
+    proc = _run_nested_pytest(
+        throwaway_clone, "test_throwaway_external_process_writes_security_ledger.py",
+        _THROWAWAY_EXTERNAL_PROCESS_SECURITY_WRITER % throwaway_clone,
+    )
+    out = (proc.stdout or b"").decode("utf-8", errors="replace") + (proc.stderr or b"").decode(
+        "utf-8", errors="replace")
+    assert proc.returncode == 0, (
+        "a security ledger write by a SEPARATE process (not this session's own code) must not "
+        "fail the session:\n%s" % out
+    )
+    assert "LIVE-STATE CANARY WARNING" in out
+    assert "lock_state.json" in out
+    # And it must NOT be reported as either hard-fail variant.
+    assert "modified a real unlock/lock-state ledger" not in out
     assert "modified the real repo .env" not in out

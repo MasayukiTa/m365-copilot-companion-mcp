@@ -702,6 +702,77 @@ def _security_critical_targets():
     })
 
 
+def _install_security_write_watch():
+    """Patch `builtins.open` and `os.replace`, for the life of the test session, so any write
+    that reaches one of `_security_critical_targets()`'s seven real paths FROM CODE RUNNING IN
+    THIS PYTEST PROCESS is recorded. This is the discriminator
+    `_real_dotenv_and_fleet_state_must_not_change` needs and could not get from a byte-level
+    diff alone: on the owner's live-install machine, the same seven files are also written by
+    an entirely separate, already-running OS process (the supervisor / fleet workers, through a
+    real unlock/lock/grant/revoke call over the gateway) for the whole time a local session
+    runs. A change with NO in-process write recorded is therefore production traffic, not a
+    test leak. A change WITH one is a leak, regardless of whether the write went through
+    tools.security's own API (unlock/grant_ip/revoke_ip, all funnelled through one `_transact`
+    choke point) or bypassed it entirely with a raw `open()`/`os.replace()` call the way
+    test_real_dotenv_canary.py's own hard-fail proof test does -- both are covered here because
+    both ultimately call one of these two primitives with the real path as an argument, from
+    code executing inside THIS interpreter, which is where the patch lives.
+
+    WHY THE PATCH SURFACE, NOT tools.security ITSELF. tools/security.py is FROZEN (this repo's
+    own standing instruction: never edit it). This patches the call surface from the test side
+    instead -- the same technique `_no_writes_to_the_live_records` above already uses to
+    redirect other modules' path constants -- so nothing about the frozen module changes, and
+    every write it performs (`_atomic_write`'s tempfile.mkstemp + os.fdopen + os.replace, and
+    tools.lock_state's plain `open(_LOG_FILE, "a", ...)`) is still visible here because both
+    resolve, eventually, to one of these two calls with the real path.
+
+    WHY A SEPARATE PROCESS IS INVISIBLE TO THIS, ON PURPOSE. Monkeypatching a name on THIS
+    process's `os`/`builtins` module objects has no effect whatsoever on another process's own
+    copy of them -- a live supervisor process replacing `.unlock_state.json` calls ITS OWN
+    `os.replace`, in its own address space, never this one. That is exactly the property this
+    canary needs: it must see every write this interpreter makes and none that another one
+    does.
+
+    Returns `(touched, restore)`: `touched` is a set of `os.path.normcase`d absolute path
+    strings, mutated in place as writes happen (read it after teardown, not during); `restore`
+    puts `builtins.open` and `os.replace` back and must be called exactly once.
+    """
+    import builtins
+
+    critical = {os.path.normcase(os.path.abspath(str(p))) for p in _security_critical_targets()}
+    touched = set()
+
+    def _note(path):
+        try:
+            key = os.path.normcase(os.path.abspath(os.fspath(path)))
+        except Exception:
+            return
+        if key in critical:
+            touched.add(key)
+
+    real_open = builtins.open
+    real_replace = os.replace
+
+    def _open(file, *args, **kwargs):
+        if isinstance(file, (str, bytes, os.PathLike)):
+            _note(file)
+        return real_open(file, *args, **kwargs)
+
+    def _replace(src, dst, *args, **kwargs):
+        if isinstance(dst, (str, bytes, os.PathLike)):
+            _note(dst)
+        return real_replace(src, dst, *args, **kwargs)
+
+    builtins.open = _open
+    os.replace = _replace
+
+    def restore():
+        builtins.open = real_open
+        os.replace = real_replace
+
+    return touched, restore
+
+
 def _real_dotenv_target():
     """The REAL repo .env's path -- conftest.py sits at the repo root, so this is always
     right beside it. A tiny function rather than a module constant so it re-resolves
@@ -760,6 +831,20 @@ def _real_dotenv_and_fleet_state_must_not_change():
     seven unlock/lock-state ledgers _security_critical_targets() names, byte-for-byte untouched
     (HARD FAIL for both), and WARNS (does not fail) if any OTHER real top-level .fleet/ state
     file LIVE_RECORD_REDIRECTS names changes during the session.
+
+    2026-09-24, LATER THE SAME DAY: "byte-for-byte untouched" for the seven ledgers turned out
+    to hard-fail every push made while the fleet is busy, because a live supervisor/bridge on
+    the owner's machine legitimately performs real unlock/lock/grant/revoke calls -- in its own,
+    separate OS process -- against these exact seven paths for the whole time a local session
+    runs; measured elsewhere as `sleep 30` alone changing the same four files with no test
+    running at all. A byte-level diff alone cannot tell that apart from an actual test leak, so
+    this fixture now also asks `_install_security_write_watch()` which of the seven, if any,
+    were touched by a write from CODE RUNNING IN THIS PYTEST PROCESS -- and hard-fails only
+    those. A change with no in-process write behind it is attributed to the concurrent
+    production process instead and only warns (see the `security_external` branch below). See
+    _install_security_write_watch's own docstring for how that attribution survives both
+    tools.security being FROZEN (never edited) and a leak that bypasses its API entirely with a
+    raw open()/os.replace() call.
 
     THE SECURITY-CRITICAL SET WAS ADDED 2026-09-24, alongside commit e25b7a3 (SEC-02/SEC-03).
     Before it, these seven files sat in the same warning-only bucket as page_counts.jsonl --
@@ -821,10 +906,25 @@ def _real_dotenv_and_fleet_state_must_not_change():
     security_paths = set(_security_critical_targets())
     targets = _real_dotenv_and_fleet_state_targets()
     before = {p: _fingerprint(p) for p in targets}
-    yield
+    touched_by_this_process, _restore_write_watch = _install_security_write_watch()
+    try:
+        yield
+    finally:
+        _restore_write_watch()
     changed = [p for p in targets if _fingerprint(p) != before[p]]
     dotenv_changed = [p for p in changed if p == dotenv_path]
-    security_changed = [p for p in changed if p != dotenv_path and p in security_paths]
+    security_changed_raw = [p for p in changed if p != dotenv_path and p in security_paths]
+    # SPLIT BY ATTRIBUTION, NOT JUST BY PATH. `_install_security_write_watch` (above) recorded
+    # every one of these seven paths that a write from CODE RUNNING IN THIS PROCESS actually
+    # reached. A path that changed but was never touched in-process was written by a separate,
+    # already-running production process (the supervisor / fleet workers) during the session --
+    # exactly the case that made this hard fail block every push while the fleet is busy, even
+    # though three commits behind it were independently verified green. A path that changed AND
+    # was touched in-process is unambiguous: nothing but this session's own code reached it.
+    security_leaked = [p for p in security_changed_raw
+                       if os.path.normcase(os.path.abspath(str(p))) in touched_by_this_process]
+    security_external = [p for p in security_changed_raw if p not in security_leaked]
+    security_changed = security_leaked
     fleet_changed = [p for p in changed
                      if p != dotenv_path and p not in security_paths]
 
@@ -842,7 +942,13 @@ def _real_dotenv_and_fleet_state_must_not_change():
         # HARD FAIL, UNLIKE THE GENERAL .fleet/ BUCKET BELOW -- see _security_critical_targets()
         # and this fixture's own docstring for why these seven do not share page_counts.jsonl's
         # excuse: nothing but a real unlock/lock/grant/revoke call ever writes one of them, so a
-        # change here during a test session is a leak, not routine production traffic.
+        # change here during a test session is a leak, not routine production traffic. THIS IS
+        # NOW "a change AND an in-process write", not just "a change" -- see
+        # _install_security_write_watch's own docstring for why that split exists and how it
+        # still catches a leak that bypasses tools.security's API entirely (a raw open()/
+        # os.replace() call from inside this process, the way this file's own hard-fail proof
+        # test does it), while no longer blaming a concurrent production process for a write
+        # this session's own code never made.
         pytest.fail(
             "LIVE-STATE CANARY (conftest._real_dotenv_and_fleet_state_must_not_change): this "
             "test session modified a real unlock/lock-state ledger, which only an actual "
@@ -852,6 +958,23 @@ def _real_dotenv_and_fleet_state_must_not_change():
             "\n".join("  %s (was %r, now %r)" % (p, before[p], _fingerprint(p))
                       for p in security_changed),
             pytrace=False,
+        )
+    if security_external:
+        # WARNING ONLY -- these seven paths changed, but never through a write this SESSION's
+        # own code made (see _install_security_write_watch): a live supervisor/bridge on this
+        # machine legitimately performs real unlock/lock/grant/revoke calls, in its own
+        # process, independent of any test, for as long as it runs. Reported so it can still be
+        # noticed, exactly like the general .fleet/ bucket below.
+        import warnings as _warnings
+
+        _warnings.warn(
+            "LIVE-STATE CANARY WARNING (conftest._real_dotenv_and_fleet_state_must_not_change): "
+            "%d real unlock/lock-state ledger(s) changed during this session with no write "
+            "traced back to this session's own code (NOT failing -- attributed to a concurrent "
+            "production process, e.g. a live supervisor/bridge on this machine; see "
+            "_install_security_write_watch's docstring). Changed file(s): " % len(security_external) +
+            "; ".join("%s (was %r, now %r)" % (p, before[p], _fingerprint(p)) for p in security_external),
+            stacklevel=1,
         )
     if fleet_changed:
         # WARNING ONLY -- see this fixture's own docstring for the measured reason (a live
