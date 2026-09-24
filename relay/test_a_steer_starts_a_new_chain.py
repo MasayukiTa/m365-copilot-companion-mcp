@@ -100,23 +100,21 @@ def test_the_continue_counter_was_already_reset_and_still_is():
 
 
 def test_the_chain_used_to_cross_a_steer():
-    """CHARACTERIZATION. The old code marked `_last_was_steer` and reset nothing else, so the
-    reset had to be absent from the steer branch for the defect to exist. Pinned as a source
-    fact because the behaviour it describes can no longer be produced at runtime.
-    """
-    src = open(os.path.join(REPO, "relay", "relay_fleet.py"), encoding="utf-8").read()
-    i = src.index("if self.steer_msgs:")
-    # Match the branch's own closing "else:" AT THE START OF A LINE (aligned with the "if"),
-    # not the first occurrence of the substring "else:" anywhere -- a comment right inside
-    # this branch narrates this exact slicing technique and quotes the word "else:" while
-    # doing so, which a bare src.index("else:", i) would match first and truncate the slice
-    # before the assertions below, giving a false failure.
-    close = src.index("\n        else:", i)
-    branch = src[i:close]
-    assert "self._last_was_steer = True" in branch
-    assert "self.no_progress = 0" in branch, (
+    """CHARACTERIZATION, at runtime rather than by reading source text. The old code marked
+    `_last_was_steer` and reset nothing else, so the reset had to be absent from the steer
+    branch for the defect to exist. A source-text slice of the branch used to pin this instead
+    (matching up to the branch's own closing `else`), but the branch's internal shape is free to
+    change -- it has already been refactored once (inline if/else -> a helper method) purely to
+    keep an earlier version of this same source slice from mismatching a comment that quoted the
+    word it was searching for. Asserting on the object's actual state after the branch runs is
+    immune to any such refactor and still fails if the reset regresses."""
+    w = _worker()
+    w.steer_msgs.append("別の角度で。")
+    w._begin_send()
+    assert w._last_was_steer is True, "steer を配ったターンで _last_was_steer が立っていない"
+    assert w.no_progress == 0, (
         "steer を配ったターンで繰り返しカウントが戻されていない")
-    assert "self.last_norm = None" in branch
+    assert w.last_norm is None, "steer を配ったターンで比較キーが戻されていない"
 
 
 def test_a_turn_with_no_steer_does_not_clear_the_chain():
