@@ -1,16 +1,34 @@
-"""workspace_clones() removes a whole benchmark clone under swe/work as one unit, once it is
-both old (nothing anywhere inside it, recursively, has a recent mtime) and unused (no live
-process's command line names its path) -- never file by file, which is what corrupts a
-checkout rather than cleaning it. See fleet_retention.py's own comment ahead of
-CLONE_KEEP_DAYS for the full reasoning and the STORE_SKIP precedent this follows.
+"""The swe/work clone sweep must never cost a fleet start anything.
+
+Measured on a synthetic ~100k-file/60k-dir tree of the same shape as the real swe/work: a
+discovery-only walk is ~52 s and a walk that also deletes is ~340 s -- both far past a
+per-fleet-start budget, and apply() runs at the start of EVERY fleet start. So
+workspace_clones() (the function apply() calls) never does the walk itself: it only decides
+whether a sweep is due and, if so, hands off to a launcher that runs the real work
+(_clone_sweep_run_once()) in a DETACHED PROCESS, off the critical path entirely. workspace_clones
+itself must return in well under the ~0.5 s ceiling regardless of how large swe/work is or how
+overdue the sweep is.
+
+Because the real work is detached, "removes a whole clone" and "workspace_clones() is fast and
+does not block" are two different claims and are tested separately:
+
+  * Correctness of WHAT gets removed (age, in-use, junctions, interrupted deletes, the lock) is
+    tested directly against _clone_sweep_run_once() -- the synchronous core the launcher runs.
+  * workspace_clones()'s own job -- deciding fast, launching, never scanning inline -- is tested
+    through workspace_clones() itself, with an injected launcher (a no-op spy for the
+    "must not block" tests, or a real background thread for "the sweep actually completes").
+    A THREAD launcher, not a subprocess, is used in tests so nothing here spawns a real process
+    or invokes PowerShell; the default production launcher (a detached subprocess) is exercised
+    manually via `python -m relay.fleet_retention --clone-sweep-worker`, not by these tests.
 
 Idioms mirrored from test_a_fleet_start_does_not_walk_a_workspace.py: `_touch`, the
 `_record_scandir` spy, and the junction test skipped off Windows.
 """
 import io
-import json
 import os
+import shutil
 import sys
+import threading
 import time
 
 import pytest
@@ -52,14 +70,28 @@ def _cannot_tell(path):
     return None
 
 
+def _thread_launcher(handles, in_use=_not_in_use):
+    """A launcher for tests: runs the real worker in a background thread instead of a
+    subprocess, so a test can `.join()` it deterministically without spawning anything real."""
+    def launcher(fleet_dir, keep_days, launch_now):
+        t = threading.Thread(target=R._clone_sweep_run_once,
+                             args=(fleet_dir, keep_days, in_use, launch_now))
+        t.start()
+        handles.append(t)
+    return launcher
+
+
+# ---------------------------------------------------------------------------
+# Correctness of the synchronous worker, _clone_sweep_run_once().
+# ---------------------------------------------------------------------------
+
 def test_an_old_unused_clone_is_removed_whole(tmp_path):
     now = time.time()
     clone = str(tmp_path / "swe" / "work" / "django__django-main")
     _touch(os.path.join(clone, "setup.py"), age_days=90, now=now)
     _touch(os.path.join(clone, ".git", "objects", "pack", "a.pack"), age_days=90, now=now)
 
-    freed, removed = R.workspace_clones(str(tmp_path), now=now, dry_run=False, keep_days=14,
-                                        in_use=_not_in_use)
+    freed, removed = R._clone_sweep_run_once(str(tmp_path), 14, _not_in_use, now)
 
     assert removed == ["django__django-main"]
     assert freed > 0
@@ -76,12 +108,9 @@ def test_a_clone_with_a_recent_file_deep_inside_is_kept(tmp_path):
     deep_recent = _touch(
         os.path.join(clone, "venv", "lib", "site-packages", "pkg", "new_dep", "mod.py"),
         age_days=1, now=now)
-    # Age the clone's OWN directory entry too, so a rule that only checked the top dir's mtime
-    # would wrongly call this old.
     os.utime(clone, (now - 90 * 86400.0, now - 90 * 86400.0))
 
-    freed, removed = R.workspace_clones(str(tmp_path), now=now, dry_run=False, keep_days=14,
-                                        in_use=_not_in_use)
+    freed, removed = R._clone_sweep_run_once(str(tmp_path), 14, _not_in_use, now)
 
     assert removed == []
     assert os.path.exists(deep_recent)
@@ -93,8 +122,7 @@ def test_an_in_use_clone_is_kept_regardless_of_age(tmp_path):
     clone = str(tmp_path / "swe" / "work" / "old_but_running")
     _touch(os.path.join(clone, "setup.py"), age_days=999, now=now)
 
-    freed, removed = R.workspace_clones(str(tmp_path), now=now, dry_run=False, keep_days=14,
-                                        in_use=_always_in_use)
+    freed, removed = R._clone_sweep_run_once(str(tmp_path), 14, _always_in_use, now)
 
     assert removed == []
     assert os.path.exists(clone)
@@ -108,24 +136,10 @@ def test_an_unanswerable_in_use_check_fails_closed(tmp_path):
     clone = str(tmp_path / "swe" / "work" / "cannot_tell")
     _touch(os.path.join(clone, "setup.py"), age_days=999, now=now)
 
-    freed, removed = R.workspace_clones(str(tmp_path), now=now, dry_run=False, keep_days=14,
-                                        in_use=_cannot_tell)
+    freed, removed = R._clone_sweep_run_once(str(tmp_path), 14, _cannot_tell, now)
 
     assert removed == []
     assert os.path.exists(clone)
-
-
-def test_dry_run_reports_without_touching_the_filesystem(tmp_path):
-    now = time.time()
-    clone = str(tmp_path / "swe" / "work" / "would_be_removed")
-    _touch(os.path.join(clone, "setup.py"), age_days=90, now=now)
-
-    freed, removed = R.workspace_clones(str(tmp_path), now=now, dry_run=True, keep_days=14,
-                                        in_use=_not_in_use)
-
-    assert removed == ["would_be_removed"]
-    assert freed > 0
-    assert os.path.exists(clone), "dry_run must not delete anything"
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="junctions are a Windows construct")
@@ -139,8 +153,7 @@ def test_a_junction_directly_under_work_is_never_entered_or_removed(tmp_path):
     os.makedirs(str(work))
     _winapi.CreateJunction(str(outside), str(work / "link"))
 
-    freed, removed = R.workspace_clones(str(tmp_path), now=now, dry_run=False, keep_days=14,
-                                        in_use=_not_in_use)
+    freed, removed = R._clone_sweep_run_once(str(tmp_path), 14, _not_in_use, now)
 
     assert removed == [], "a junction under swe/work must never be treated as a clone"
     assert os.path.exists(victim), "the junction target must never be entered, let alone removed"
@@ -158,52 +171,9 @@ def test_a_junction_nested_inside_a_clone_is_never_followed(tmp_path):
     _touch(str(clone / "setup.py"), age_days=90, now=now)
     _winapi.CreateJunction(str(outside), str(clone / "linked_in"))
 
-    R.workspace_clones(str(tmp_path), now=now, dry_run=False, keep_days=14, in_use=_not_in_use)
+    R._clone_sweep_run_once(str(tmp_path), 14, _not_in_use, now)
 
     assert os.path.exists(victim), "a junction nested inside a clone was followed out of it"
-
-
-def test_throttled_second_call_does_not_re_walk(tmp_path, monkeypatch):
-    now = time.time()
-    clone = str(tmp_path / "swe" / "work" / "some_clone")
-    _touch(os.path.join(clone, "setup.py"), age_days=90, now=now)
-
-    # First call: walk happens, records the sweep timestamp.
-    R.workspace_clones(str(tmp_path), now=now, dry_run=False, keep_days=14, in_use=_not_in_use,
-                       sweep_hours=24)
-    assert not os.path.exists(clone), "sanity: the first call should have removed it"
-
-    # Recreate something to remove, then call again within the throttle window.
-    clone2 = str(tmp_path / "swe" / "work" / "another_clone")
-    _touch(os.path.join(clone2, "setup.py"), age_days=90, now=now)
-    seen = _record_scandir(monkeypatch)
-
-    freed, removed = R.workspace_clones(str(tmp_path), now=now + 3600, dry_run=False,
-                                        keep_days=14, in_use=_not_in_use, sweep_hours=24)
-
-    assert removed == [], "a throttled call must not remove anything"
-    assert os.path.exists(clone2), "a throttled call must not have walked far enough to see it"
-    work = os.path.normcase(os.path.abspath(str(tmp_path / "swe" / "work")))
-    walked_into = [p for p in seen if p == work or p.startswith(work + os.sep)]
-    assert walked_into == [], "the throttled call re-walked swe/work: %s" % walked_into
-
-
-def test_a_call_after_the_throttle_window_walks_again(tmp_path):
-    now = time.time()
-    clone = str(tmp_path / "swe" / "work" / "some_clone")
-    _touch(os.path.join(clone, "setup.py"), age_days=90, now=now)
-
-    R.workspace_clones(str(tmp_path), now=now, dry_run=False, keep_days=14, in_use=_not_in_use,
-                       sweep_hours=1)
-
-    clone2 = str(tmp_path / "swe" / "work" / "another_clone")
-    _touch(os.path.join(clone2, "setup.py"), age_days=90, now=now)
-
-    freed, removed = R.workspace_clones(str(tmp_path), now=now + 2 * 3600, dry_run=False,
-                                        keep_days=14, in_use=_not_in_use, sweep_hours=1)
-
-    assert removed == ["another_clone"]
-    assert not os.path.exists(clone2)
 
 
 def test_perf_sanity_hundreds_of_files_no_extra_stat_per_file(tmp_path, monkeypatch):
@@ -233,10 +203,213 @@ def test_perf_sanity_hundreds_of_files_no_extra_stat_per_file(tmp_path, monkeypa
     monkeypatch.setattr(os.path, "getmtime", spy_getmtime)
 
     t0 = time.time()
-    freed, removed = R.workspace_clones(str(tmp_path), now=now, dry_run=False, keep_days=14,
-                                        in_use=_not_in_use)
+    freed, removed = R._clone_sweep_run_once(str(tmp_path), 14, _not_in_use, now)
     elapsed = time.time() - t0
 
     assert len(removed) == 5
     assert elapsed < 5.0, "walk over 2000 files took %.2fs" % elapsed
     assert len(calls) < 20, "%d os.stat/getmtime calls for 2000 files" % len(calls)
+
+
+# ---------------------------------------------------------------------------
+# Interrupted deletes: rename-before-rmtree, and the next sweep finishing the leftover.
+# ---------------------------------------------------------------------------
+
+def test_a_leftover_deleting_directory_is_finished_by_the_next_sweep(tmp_path):
+    now = time.time()
+    work_root = str(tmp_path / "swe" / "work")
+    leftover = os.path.join(work_root, ".deleting-half_gone-123456")
+    _touch(os.path.join(leftover, "remains.txt"), age_days=1, now=now)
+    # A live, recent, in-use clone beside it must be left alone -- proves the leftover cleanup
+    # is a targeted finish, not a second sweep pass over everything.
+    live_clone = str(tmp_path / "swe" / "work" / "live_clone")
+    _touch(os.path.join(live_clone, "setup.py"), age_days=1, now=now)
+
+    freed, removed = R._clone_sweep_run_once(str(tmp_path), 14, _not_in_use, now)
+
+    assert not os.path.exists(leftover)
+    assert os.path.exists(live_clone)
+    assert ".deleting-half_gone-123456" in removed
+
+
+def test_a_delete_interrupted_between_rename_and_rmtree_is_finished_next_time(
+        tmp_path, monkeypatch):
+    """Simulates the real failure mode: the rename succeeds (the clone's original name is
+    already gone -- nothing can mistake it for live any more) but rmtree itself is interrupted.
+    The leftover must survive as a `.deleting-*` name, never as the clone's own name, and the
+    NEXT sweep must finish it without needing to re-decide age or in-use."""
+    now = time.time()
+    clone = str(tmp_path / "swe" / "work" / "clone_a")
+    _touch(os.path.join(clone, "setup.py"), age_days=90, now=now)
+
+    real_rmtree = shutil.rmtree
+    calls = {"n": 0}
+
+    def flaky_rmtree(path, *a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("simulated interruption")
+        return real_rmtree(path, *a, **k)
+
+    monkeypatch.setattr(R.shutil, "rmtree", flaky_rmtree)
+
+    freed1, removed1 = R._clone_sweep_run_once(str(tmp_path), 14, _not_in_use, now)
+    work_root = str(tmp_path / "swe" / "work")
+    assert not os.path.exists(clone), "the original name must be gone even if rmtree failed"
+    leftovers = [n for n in os.listdir(work_root) if n.startswith(".deleting-")]
+    assert len(leftovers) == 1, "the interrupted delete must survive as a .deleting- name"
+
+    freed2, removed2 = R._clone_sweep_run_once(str(tmp_path), 14, _not_in_use, now + 1)
+
+    assert os.listdir(work_root) == [], "the next sweep must finish the leftover"
+
+
+# ---------------------------------------------------------------------------
+# The lock: two concurrent triggers must run only one sweep.
+# ---------------------------------------------------------------------------
+
+def test_two_concurrent_triggers_run_one_sweep(tmp_path):
+    now = time.time()
+    clone = str(tmp_path / "swe" / "work" / "clone_a")
+    _touch(os.path.join(clone, "setup.py"), age_days=90, now=now)
+
+    entered_in_use = threading.Event()
+    release_first = threading.Event()
+
+    def slow_not_in_use(path):
+        entered_in_use.set()
+        release_first.wait(timeout=5)
+        return False
+
+    results = []
+
+    def run_first():
+        results.append(R._clone_sweep_run_once(str(tmp_path), 14, slow_not_in_use, now))
+
+    t1 = threading.Thread(target=run_first)
+    t1.start()
+    assert entered_in_use.wait(timeout=5), "first sweep never reached its in-use check"
+
+    # The first call already holds the lock (acquired before the in-use check runs) --
+    # a second call attempted right now must bail out immediately, having done nothing.
+    freed2, removed2 = R._clone_sweep_run_once(str(tmp_path), 14, _not_in_use, now)
+
+    release_first.set()
+    t1.join(timeout=5)
+
+    assert (freed2, removed2) == (0, []), "a concurrent second sweep must not also run"
+    assert results[0][1] == ["clone_a"], "the first sweep should have done the work alone"
+
+
+# ---------------------------------------------------------------------------
+# workspace_clones() itself: fast, off the critical path, throttled.
+# ---------------------------------------------------------------------------
+
+def test_dry_run_reports_synchronously_without_touching_the_filesystem(tmp_path):
+    now = time.time()
+    clone = str(tmp_path / "swe" / "work" / "would_be_removed")
+    _touch(os.path.join(clone, "setup.py"), age_days=90, now=now)
+
+    freed, removed = R.workspace_clones(str(tmp_path), now=now, dry_run=True, keep_days=14,
+                                        in_use=_not_in_use)
+
+    assert removed == ["would_be_removed"]
+    assert freed > 0
+    assert os.path.exists(clone), "dry_run must not delete anything"
+
+
+def test_workspace_clones_returns_fast_even_when_a_sweep_is_due(tmp_path, monkeypatch):
+    now = time.time()
+    for c in range(5):
+        clone = str(tmp_path / "swe" / "work" / ("clone_%d" % c))
+        for i in range(200):
+            _touch(os.path.join(clone, "pkg", "mod_%03d.py" % i), age_days=90, now=now)
+
+    launched = []
+    seen = _record_scandir(monkeypatch)
+
+    t0 = time.time()
+    freed, removed = R.workspace_clones(
+        str(tmp_path), now=now, dry_run=False, keep_days=14,
+        launcher=lambda fleet_dir, keep_days, launch_now: launched.append(
+            (fleet_dir, keep_days, launch_now)))
+    elapsed = time.time() - t0
+
+    assert (freed, removed) == (0, []), "the result is not known synchronously"
+    assert elapsed < 0.5, "workspace_clones() took %.3fs to hand off" % elapsed
+    assert len(launched) == 1
+    assert launched[0][0] == str(tmp_path)
+    work = os.path.normcase(os.path.abspath(str(tmp_path / "swe" / "work")))
+    walked_into = [p for p in seen if p == work or p.startswith(work + os.sep)]
+    assert walked_into == [], "workspace_clones() itself scanned swe/work: %s" % walked_into
+
+
+def test_the_background_sweep_completes_and_removes_old_clones(tmp_path):
+    now = time.time()
+    clone = str(tmp_path / "swe" / "work" / "old_clone")
+    _touch(os.path.join(clone, "setup.py"), age_days=90, now=now)
+
+    handles = []
+    freed, removed = R.workspace_clones(str(tmp_path), now=now, dry_run=False, keep_days=14,
+                                        launcher=_thread_launcher(handles))
+
+    assert (freed, removed) == (0, [])
+    assert len(handles) == 1
+    handles[0].join(timeout=10)
+
+    assert not os.path.exists(clone), "the background sweep never removed the clone"
+
+
+def test_throttled_second_call_does_not_launch_or_scan(tmp_path, monkeypatch):
+    now = time.time()
+    clone = str(tmp_path / "swe" / "work" / "some_clone")
+    _touch(os.path.join(clone, "setup.py"), age_days=90, now=now)
+
+    handles = []
+    R.workspace_clones(str(tmp_path), now=now, dry_run=False, keep_days=14, sweep_hours=24,
+                       launcher=_thread_launcher(handles))
+    handles[0].join(timeout=10)
+    assert not os.path.exists(clone), "sanity: the first sweep should have removed it"
+
+    launched = []
+    seen = _record_scandir(monkeypatch)
+
+    freed, removed = R.workspace_clones(
+        str(tmp_path), now=now + 3600, dry_run=False, keep_days=14, sweep_hours=24,
+        launcher=lambda *a: launched.append(a))
+
+    assert launched == [], "a throttled call must not launch a sweep at all"
+    assert (freed, removed) == (0, [])
+    work = os.path.normcase(os.path.abspath(str(tmp_path / "swe" / "work")))
+    walked_into = [p for p in seen if p == work or p.startswith(work + os.sep)]
+    assert walked_into == [], "the throttled call touched swe/work: %s" % walked_into
+
+
+def test_a_call_after_the_throttle_window_launches_again(tmp_path):
+    now = time.time()
+    clone = str(tmp_path / "swe" / "work" / "some_clone")
+    _touch(os.path.join(clone, "setup.py"), age_days=90, now=now)
+
+    handles = []
+    R.workspace_clones(str(tmp_path), now=now, dry_run=False, keep_days=14, sweep_hours=1,
+                       launcher=_thread_launcher(handles))
+    handles[0].join(timeout=10)
+
+    clone2 = str(tmp_path / "swe" / "work" / "another_clone")
+    _touch(os.path.join(clone2, "setup.py"), age_days=90, now=now)
+
+    launched = []
+
+    def spy_launcher(fleet_dir, keep_days, launch_now):
+        launched.append(True)
+        t = threading.Thread(target=R._clone_sweep_run_once,
+                             args=(fleet_dir, keep_days, _not_in_use, launch_now))
+        t.start()
+        handles.append(t)
+
+    R.workspace_clones(str(tmp_path), now=now + 2 * 3600, dry_run=False, keep_days=14,
+                       sweep_hours=1, launcher=spy_launcher)
+
+    assert launched == [True]
+    handles[-1].join(timeout=10)
+    assert not os.path.exists(clone2)
