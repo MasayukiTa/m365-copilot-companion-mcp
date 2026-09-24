@@ -85,7 +85,7 @@ _FUNCS = ["Env-Value", "Get-UpdateCheckSkipReason", "Get-ParentProcessInfo",
           "Test-ShouldNotifyStartupFailures", "Send-StartupFailureNotice",
           "Ensure-ConvenienceProvisioning", "Test-ShortcutTargetsWscript", "Test-WshDisabled",
           "Get-Win32ProcessByPid", "ConvertFrom-WmiDate", "Get-LaunchLineage", "Get-StartAllMode",
-          "New-StartAllRunRecord", "Write-StartAllRunRecord"]
+          "New-StartAllRunRecord", "Write-StartAllRunRecord", "Record-PhaseTiming"]
 
 
 def _extract_braced_block(text: str, start_marker: str) -> str:
@@ -152,6 +152,7 @@ def _driver(functions, root, body, script_dir=None, venv_py=None, bridge=None):
         "$script:bridgeStatusUrl = %s" % _q(bridge or _refused_url()),
         "$script:startupFailures = @()",
         "$script:startupUnclear = @()",
+        "$script:phaseTimings = [ordered]@{}",
         "$script:splash = $null",
         "function Set-SplashStatus($s, [string]$t) { }",
         "function Pump-Splash($s) { }",
@@ -813,6 +814,74 @@ $ok = Write-StartAllRunRecord %s (New-StartAllRunRecord "failures")
     assert rec["lock"] == "got after waiting" and rec["lock_wait_s"] == 12.5, rec
     assert rec["failures"] == 2 and rec["outcome"] == "failures", rec
     assert rec["pid"] > 0 and rec["ts"] and rec["end"] and rec["reexec"] is False, rec
+
+
+# =============================================================== phase timing (profiling review)
+
+def test_run_record_carries_named_phase_timings(tmp_path, checkout, functions):
+    """Profiling review, 2026-09-24: a start_all run took 6-7 minutes in the Windows Sandbox and
+    start_all_runs.jsonl had only a lock wait and a total (ts/end) -- nothing said where the time
+    went. Record-PhaseTiming, called around each stage of Invoke-Startup, now lands a "phases"
+    map on every run record; this proves it round-trips through New-StartAllRunRecord and the
+    JSON line Write-StartAllRunRecord appends, without needing to run a real Invoke-Startup."""
+    runs = checkout / ".setup" / "logs" / "start_all_runs.jsonl"
+    body = r"""
+$NoUi = $true
+$script:runStartedAt = Get-Date
+$script:launch = Get-LaunchLineage
+$script:lockState = "got"
+$script:lockWaitSec = 0.0
+$script:startupFailures = @()
+$t0 = Get-Date
+Start-Sleep -Milliseconds 30
+Record-PhaseTiming "deps_sync" $t0
+$t1 = Get-Date
+Start-Sleep -Milliseconds 20
+Record-PhaseTiming "tunnel_confirm" $t1
+$ok = Write-StartAllRunRecord %s (New-StartAllRunRecord "ok")
+"RESULT:" + (@{ ok = $ok } | ConvertTo-Json -Compress)
+""" % _q(runs)
+    r = _result(_ps(tmp_path, _driver(functions, checkout, body)))
+    assert r["ok"] is True
+    rec = json.loads(runs.read_text(encoding="utf-8").splitlines()[-1])
+    assert set(rec["phases"].keys()) == {"deps_sync", "tunnel_confirm"}, rec
+    assert rec["phases"]["deps_sync"] >= 0.02, rec
+    assert rec["phases"]["tunnel_confirm"] >= 0.01, rec
+
+
+def test_a_run_with_no_phases_recorded_gets_an_empty_phases_map(tmp_path, checkout, functions):
+    # A run that fails before any phase runs (e.g. the lock timed out) must still produce a
+    # well-formed record a reader can index into -- {} rather than a missing key or null.
+    runs = checkout / ".setup" / "logs" / "start_all_runs.jsonl"
+    body = r"""
+$script:runStartedAt = Get-Date
+$script:launch = Get-LaunchLineage
+$script:lockState = "timed out"
+$script:lockWaitSec = 600.0
+$script:startupFailures = @('a')
+$ok = Write-StartAllRunRecord %s (New-StartAllRunRecord "lock timed out")
+"RESULT:" + (@{ ok = $ok } | ConvertTo-Json -Compress)
+""" % _q(runs)
+    r = _result(_ps(tmp_path, _driver(functions, checkout, body)))
+    assert r["ok"] is True
+    rec = json.loads(runs.read_text(encoding="utf-8").splitlines()[-1])
+    assert rec["phases"] == {}, rec
+
+
+def test_the_fleet_resume_phase_is_still_timed_when_coreonly_returns_early(tmp_path):
+    """CoreOnly's `return` sits INSIDE the fleet-resume/reaper block (see the comment above
+    Record-PhaseTiming "fleet_resume_and_reaper" in start_all.ps1); it is wrapped in try/finally
+    specifically so the early return still records the phase instead of silently skipping it."""
+    src = open(START_ALL, encoding="utf-8").read()
+    block = _extract_braced_block(src, "function Invoke-Startup")
+    t0 = block.index('$t0_fleetResume = Get-Date')
+    tryStart = block.index("try {", t0)
+    coreReturn = block.index("if ($CoreOnly) {", tryStart)
+    finallyRecord = block.index('Record-PhaseTiming "fleet_resume_and_reaper" $t0_fleetResume', coreReturn)
+    assert t0 < tryStart < coreReturn < finallyRecord
+    # the return itself sits between the try and the finally that records it
+    ret = block.index("return", coreReturn)
+    assert coreReturn < ret < finallyRecord
 
 
 def test_the_run_record_is_wired_where_the_launcher_is_still_alive(tmp_path):
