@@ -72,8 +72,24 @@ def gate_ask(question: str, context: Optional[str] = None, notify: bool = True) 
     )
 
 
+def _dedupe_token(dedupe_key: str) -> str:
+    """A deterministic token for `dedupe_key`, so two callers raising the SAME cause at
+    the same time collide on one filename instead of writing two.
+
+    sha256, not uuid: uuid is random by design and would defeat the whole point --
+    two workers hitting the identical question text must compute the identical token
+    without coordinating. 10 hex chars matches the entropy of the random tokens
+    elsewhere in this file (`uuid.uuid4().hex[:10]`), which is plenty for a namespace
+    this small (open gates number in the dozens, not millions).
+    """
+    import hashlib
+
+    return "gate_dd" + hashlib.sha256(dedupe_key.encode("utf-8")).hexdigest()[:10]
+
+
 def gate_ask_local(question: str, context: Optional[str] = None,
-                    notify: bool = True) -> Optional[str]:
+                    notify: bool = True, dedupe_key: Optional[str] = None,
+                    worker_label: Optional[str] = None) -> Optional[str]:
     """Raise a gate from IN-PROCESS code, with no unlock gate. Returns the bare token
     (or None on failure) rather than gate_ask's formatted human-readable string.
 
@@ -100,10 +116,57 @@ def gate_ask_local(question: str, context: Optional[str] = None,
     fleet_toolset.py's own denylist already says the other half out loud: a WORKER
     must not call gate_ask as a tool ("a worker must not create the approval it would
     then be answering"). This function is for the RELAY, not the worker.
+
+    DEDUPE, 2026-09-24. `_raise_stuck_gate` already refuses a SECOND gate for the SAME
+    worker ("if self._gate_token: return False") but nothing stopped a SECOND, THIRD, ...
+    worker from each raising their OWN gate for the identical cause -- measured the same
+    day: 8 fleet workers all hit "unlock exhausted after 4 attempts" within 12 minutes,
+    each posting the byte-identical question, so the owner got 8 desktop toasts asking
+    the same thing. `dedupe_key` (the caller passes the question text itself, by
+    default -- see relay_fleet._raise_stuck_gate) maps to a DETERMINISTIC filename via
+    `_dedupe_token`. If an OPEN (unanswered) gate already exists under that token,
+    later callers ATTACH to it (recorded in "workers") and get the SAME token back --
+    one file, one toast, one question -- instead of writing a new one. Once that gate
+    is answered, the next occurrence of the same cause opens a fresh one: an answered
+    gate is history, not a standing rule, and pretending otherwise would auto-resolve a
+    recurrence the operator never actually saw.
     """
     try:
         _ensure()
-        token = "gate_" + uuid.uuid4().hex[:10]
+        if dedupe_key:
+            token = _dedupe_token(dedupe_key)
+            gate_path = GATE_DIR / f"{token}.json"
+            if gate_path.is_file():
+                try:
+                    existing = json.loads(gate_path.read_text(encoding="utf-8"))
+                except Exception:
+                    existing = None
+                if existing is not None and not existing.get("answered"):
+                    # ATTACH, DON'T RE-ASK. Best-effort: a worker list that misses one
+                    # entry under a race is a cosmetic loss (the gate itself, and the
+                    # answer every attached worker polls for, are unaffected).
+                    try:
+                        workers = list(existing.get("workers") or [])
+                        label = worker_label or ""
+                        if label and label not in workers:
+                            workers.append(label)
+                            existing["workers"] = workers
+                            if context:
+                                contexts = dict(existing.get("contexts") or {})
+                                contexts[label] = context
+                                existing["contexts"] = contexts
+                            gate_path.write_text(
+                                json.dumps(existing, ensure_ascii=False, indent=2),
+                                encoding="utf-8")
+                    except Exception:
+                        pass
+                    return token
+                # Fall through: no gate on disk yet, or the one there is already
+                # answered -- either way this call creates (or re-creates) it below,
+                # using the SAME deterministic token so concurrent siblings still
+                # collide on one file rather than racing to create their own.
+        else:
+            token = "gate_" + uuid.uuid4().hex[:10]
         payload = {
             "token": token,
             "question": question,
@@ -112,10 +175,43 @@ def gate_ask_local(question: str, context: Optional[str] = None,
             "answered": False,
             "answer": None,
         }
+        if dedupe_key:
+            payload["dedupe_key"] = dedupe_key
+            payload["workers"] = [worker_label] if worker_label else []
+            if worker_label and context:
+                payload["contexts"] = {worker_label: context}
         gate_path = GATE_DIR / f"{token}.json"
-        gate_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        try:
+            # Atomic-ish: O_EXCL keeps two siblings racing on the SAME deterministic
+            # token from both writing a "first" version -- the loser attaches instead.
+            fd = os.open(str(gate_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False, indent=2))
+        except FileExistsError:
+            # Lost the race (or, for a non-deduped token, an impossibly unlucky uuid
+            # collision). Either way someone else's file is there now; attach to it
+            # exactly like the "already exists" branch above.
+            try:
+                existing = json.loads(gate_path.read_text(encoding="utf-8"))
+            except Exception:
+                existing = None
+            if existing is not None and not existing.get("answered"):
+                try:
+                    workers = list(existing.get("workers") or [])
+                    label = worker_label or ""
+                    if label and label not in workers:
+                        workers.append(label)
+                        existing["workers"] = workers
+                        gate_path.write_text(
+                            json.dumps(existing, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
+                except Exception:
+                    pass
+                return token
+            # The racing sibling's gate was already answered by the time we lost the
+            # race (vanishingly unlikely) -- there is nothing safe left to overwrite,
+            # so report success on the token that exists rather than raising.
+            return token
         if notify:
             notify_approval_gate("HITL gate - input needed", question[:180], gate_path)
         return token
