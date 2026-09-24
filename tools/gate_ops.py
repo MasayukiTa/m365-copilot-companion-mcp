@@ -161,10 +161,26 @@ def gate_ask_local(question: str, context: Optional[str] = None,
                     except Exception:
                         pass
                     return token
-                # Fall through: no gate on disk yet, or the one there is already
-                # answered -- either way this call creates (or re-creates) it below,
-                # using the SAME deterministic token so concurrent siblings still
-                # collide on one file rather than racing to create their own.
+                # THE DETERMINISTIC TOKEN IS TAKEN AND ANSWERED -- do NOT reuse it. The
+                # first cut of this function fell through to create-below using the SAME
+                # deterministic token, which meant "create" actually meant "collide": the
+                # O_CREAT|O_EXCL open below hits FileExistsError against the old answered
+                # file, the FileExistsError handler reads it back, sees answered=True, and
+                # returns THAT stale token -- so a brand-new occurrence of the same cause
+                # silently inherited an old answer instead of asking again. Caught by
+                # relay/test_a_worker_that_needs_a_person_should_say_so.py's own suite:
+                # two unrelated tests share the identical STUCK finding text, one answers
+                # its gate, and the next one's _poll_gate then read "answered" on a token
+                # it never itself raised. A random token for this one occurrence -- no
+                # longer deduped against anything, since there is nothing open left to
+                # dedupe against -- sidesteps the collision entirely; the NEXT caller
+                # within THIS gate's own now-open lifetime still dedupes normally, because
+                # the payload below still carries dedupe_key... except the filename must
+                # differ from the answered one, so it cannot be re-derived from dedupe_key
+                # by the same formula. Accept that (documented in the docstring above): a
+                # cause that recurs AFTER being answered opens a fresh, non-deterministic
+                # gate, exactly like dedupe_key=None.
+                token = "gate_" + uuid.uuid4().hex[:10]
         else:
             token = "gate_" + uuid.uuid4().hex[:10]
         payload = {
