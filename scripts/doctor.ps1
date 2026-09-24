@@ -853,11 +853,19 @@ foreach ($line in ($signinOut -split "`r?`n")) {
     }
 }
 
-# 5. Bridge Edge (:9223) -- optional, only for conversation history/scrape
-Check "edge_bridge" "Bridge Edge running (:9223 history/scrape) [optional]" `
+# 5. Bridge Edge (:9223) -- REQUIRED, not optional. This row used to say "[optional] ...
+#    history/scrape", from when the bridge's Edge was only used to scrape past-conversation
+#    history. It is not any more: every chat-window turn now runs on this Edge's CDP session
+#    (bridge/copilot_bridge.py drives the page, and captures the socket token, from the
+#    context on MCP_BRIDGE_CDP_PORT), so a doctor run that called this optional while
+#    "Chat backend serving" below (bridge_backend, required) and start_all's own summary both
+#    counted a down bridge Edge as a real problem was one fact reported two different ways on
+#    one screen. repair.ps1's registry entry for this same id (Key edge_bridge) already runs
+#    start_bridge.ps1 -Keepalive without calling it optional; this label and requiredness now
+#    say the same thing.
+Check "edge_bridge" "Bridge Edge running (:9223 -- the chat window's browser)" `
     { Test-EdgeCdp 9223 } `
-    "optional: powershell -File scripts\start_bridge.ps1 -Keepalive   (only needed for past-conversation history)" `
-    -Optional
+    "powershell -File scripts\start_bridge.ps1 -Keepalive"
 
 # 4c. The chat backend itself. edge_bridge above probes the Edge the bridge DRIVES; this is
 #     the HTTP server CopilotChat talks to, and nothing looked at it -- so a bridge that holds

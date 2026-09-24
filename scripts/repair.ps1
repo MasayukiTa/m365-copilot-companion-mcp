@@ -115,12 +115,39 @@ $tunnelSetupCmd     = "powershell -NoProfile -ExecutionPolicy Bypass -File `"$sc
 $tunnelHealCmd      = "powershell -NoProfile -ExecutionPolicy Bypass -File `"$scriptDir\heal_tunnel.ps1`""
 $uiRebuildCmd       = "powershell -NoProfile -ExecutionPolicy Bypass -File `"$repo\ui\rebuild_ui.ps1`" -NoLaunch"
 
+# THE FIX LINE IS FOR THE PERSON AT THE DESK, NOT FOR AN ENGINEER. This used to be a raw
+# PowerShell command ("powershell -File scripts\start_companion_edge.ps1 -Foreground ..."),
+# same defect class as doctor.ps1's old bridge fix line: start_bridge.ps1's supervisor and
+# relay.edge_recover.surface() (used by the fleet's own :9222 navigation loop) now bring the
+# Edge that needs sign-in to the front by themselves the moment a wall is hit, so the actual
+# instruction is "sign in in the window that appears" -- said in Japanese, matching doctor's
+# $bridgeSigninFixJa (scripts/doctor.ps1, ~line 822). Same text for both the companion
+# (m365_signin, :9222) and the bridge (m365_signin_9223) rows below: both Edges now surface
+# themselves the same way. Written as code points because this file is ASCII (Windows
+# PowerShell 5.1 reads a BOM-less file as the ANSI code page, which turns UTF-8 Japanese into
+# mojibake) -- see doctor.ps1's own comment on this same construction.
+$m365SigninFixJa = -join (@(
+    0x30C1,0x30E3,0x30C3,0x30C8,0x753B,0x9762,0x304C,0x4F7F,0x3046,0x0020,0x0045,0x0064,
+    0x0067,0x0065,0x0020,0x304C,0x30B5,0x30A4,0x30F3,0x30A4,0x30F3,0x753B,0x9762,0x3067,
+    0x6B62,0x307E,0x3063,0x3066,0x3044,0x307E,0x3059,0x3002,0x30B5,0x30A4,0x30F3,0x30A4,
+    0x30F3,0x304C,0x5FC5,0x8981,0x306B,0x306A,0x308B,0x3068,0x3001,0x305D,0x306E,0x0020,
+    0x0045,0x0064,0x0067,0x0065,0x0020,0x304C,0x81EA,0x52D5,0x3067,0x524D,0x9762,0x306B,
+    0x8868,0x793A,0x3055,0x308C,0x307E,0x3059,0x3002,0x8868,0x793A,0x3055,0x308C,0x305F,
+    0x0020,0x0045,0x0064,0x0067,0x0065,0x0020,0x3067,0x3001,0x4F1A,0x793E,0x306E,0x30A2,
+    0x30AB,0x30A6,0x30F3,0x30C8,0x3067,0x30B5,0x30A4,0x30F3,0x30A4,0x30F3,0x3057,0x3066,
+    0x304F,0x3060,0x3055,0x3044,0x3002,0x8868,0x793A,0x3055,0x308C,0x3066,0x3044,0x306A,
+    0x3044,0x5834,0x5408,0x306F,0x3001,0x30C7,0x30B9,0x30AF,0x30C8,0x30C3,0x30D7,0x306E,
+    0x300C,0x004D,0x0033,0x0036,0x0035,0x0020,0x0043,0x006F,0x006D,0x0070,0x0061,0x006E,
+    0x0069,0x006F,0x006E,0x300D,0x3092,0x3082,0x3046,0x4E00,0x5EA6,0x8D77,0x52D5,0x3059,
+    0x308B,0x3068,0x8868,0x793A,0x3055,0x308C,0x307E,0x3059,0x3002
+) | ForEach-Object { [char]$_ })
+
 $Registry = @{
     server_up       = @{ Tier = 'A'; Key = 'stack_start';    Cmd = $stackStartCmd;   Note = 'starts the MCP server (via supervisor.ps1, hosted by start_all.ps1)' }
     tunnel_serving  = @{ Tier = 'A'; Key = 'stack_start';    Cmd = $stackStartCmd;   Note = 'same stack start as server_up -- the supervisor also hosts the Dev Tunnel' }
     tunnel_owned    = @{ Tier = 'A'; Key = 'tunnel_heal';    Cmd = $tunnelHealCmd;   Note = 'repoints MCP_TUNNEL_NAME to a tunnel this account owns (URL-preserving when possible; safe to auto-run)' }
     edge_companion  = @{ Tier = 'A'; Key = 'edge_companion'; Cmd = $edgeCompanionCmd; Note = 'launches the dedicated companion Edge (:9222)' }
-    edge_bridge     = @{ Tier = 'A'; Key = 'edge_bridge';    Cmd = $edgeBridgeCmd;   Note = 'optional -- only run because edge_bridge actually failed' }
+    edge_bridge     = @{ Tier = 'A'; Key = 'edge_bridge';    Cmd = $edgeBridgeCmd;   Note = 'required -- every chat-window turn runs on this Edge (doctor.ps1 no longer calls it optional)' }
 
     tunnel_cli      = @{ Tier = 'B'; Key = 'tunnel_cli_install'; Cmd = $tunnelCliCmd;   Note = 'installs software (devtunnel CLI) -- confirm first' }
     tunnel_exists   = @{ Tier = 'B'; Key = 'tunnel_setup';       Cmd = $tunnelSetupCmd; Note = 're-creates the tunnel -- changes the public URL; the Copilot Studio connector may need updating' }
@@ -129,7 +156,14 @@ $Registry = @{
     ui_fleetcockpit = @{ Tier = 'B'; Key = 'ui_rebuild';         Cmd = $uiRebuildCmd;   Note = 'same rebuild as ui_copilotchat -- covers both apps' }
 
     tunnel_login    = @{ Tier = 'C'; Human = "Run:  devtunnel login   (opens a browser; the supervisor cannot host the tunnel until the CLI is logged in). Then re-run this." }
-    m365_signin     = @{ Tier = 'C'; Human = "Run:  powershell -File scripts\start_companion_edge.ps1 -Foreground   then complete the M365 (Entra ID) sign-in in the window that appears. It persists across restarts." }
+    m365_signin     = @{ Tier = 'C'; Human = $m365SigninFixJa }
+    # doctor.ps1 emits one m365_signin_<port> check per managed Edge profile it can read a
+    # verdict for (relay.edge_recover.MANAGED_EDGE_PROFILES); this is the well-known default
+    # for the bridge's own port (MCP_BRIDGE_CDP_PORT, else 9223 -- see doctor.ps1's
+    # $bridgeCdpPort). A non-default bridge port, or any other profile, still falls through to
+    # the "no automatic repair for <id>; see: <doctor's fix>" line, which already carries
+    # doctor's own per-profile text verbatim.
+    m365_signin_9223 = @{ Tier = 'C'; Human = $m365SigninFixJa }
     env_api_key     = @{ Tier = 'C'; Human = "No .env / Bearer. Run quickstart.bat (creates .env with a fresh Bearer + unlock password)." }
     agent_url       = @{ Tier = 'C'; Human = "Paste the Copilot Studio agent URL: double-click configure_env.bat (README STEP 4)." }
     auth_bearer     = @{ Tier = 'C'; Human = "Bearer rejected: the 'Bearer <MCP_API_KEY>' configured in Copilot Studio must match .env exactly." }
