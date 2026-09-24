@@ -129,6 +129,13 @@ $script:lockWaitSec = 0.0
 # startup the same before it wrote the holder record the others wait for.
 # =============================================================================================
 $script:startupFailures = @()
+# Problems that could not be confirmed either way (a bounded external check -- devtunnel CLI --
+# timed out or answered unreadably) go here, NOT into $script:startupFailures: they are not a
+# known-bad state, so they must not flip the run to "failures" or the exit code non-zero. But
+# they must not be silently "ok" either (2026-09-24 sandbox: a devtunnel CLI answer that could
+# not be read within 10 s meant the tunnel was never actually confirmed hosted, yet the run's
+# own record said outcome=ok) -- see the "unclear" outcome near the bottom of this file.
+$script:startupUnclear = @()
 
 
 # ---------------------------------------------------------------------------
@@ -1979,7 +1986,8 @@ function Test-TunnelServing {
         return
     }
     if ($login -eq "unknown") {
-        Write-Host "[tunnel] could not tell whether devtunnel is signed in (no clear answer within 10 s) -- not counted; doctor.bat checks it again." -ForegroundColor DarkGray
+        Write-Host "[tunnel] could not tell whether devtunnel is signed in (no clear answer within 10 s) -- not counted as a failure, but cannot confirm the tunnel is served; doctor.bat checks it again." -ForegroundColor DarkGray
+        $script:startupUnclear += "could not tell whether devtunnel is signed in (no answer within 10 s): cannot confirm the tunnel is served -- run doctor.bat"
         return
     }
     $tn = Env-Value "MCP_TUNNEL_NAME"
@@ -2001,7 +2009,8 @@ function Test-TunnelServing {
         Start-Sleep -Seconds $PollSec
     }
     if ($n -eq -2) {
-        Write-Host "[tunnel] could not read the state of '$tn' -- not counted; doctor.bat checks it again." -ForegroundColor DarkGray
+        Write-Host "[tunnel] could not read the state of '$tn' -- not counted as a failure, but cannot confirm the tunnel is served; doctor.bat checks it again." -ForegroundColor DarkGray
+        $script:startupUnclear += ("could not read the hosting state of Dev Tunnel '" + $tn + "': cannot confirm the tunnel is served -- run doctor.bat")
         return
     }
     Write-Host "[tunnel] Dev Tunnel '$tn' has no host connection after $HostWaitSec s -- Copilot Studio cannot reach this PC." -ForegroundColor Yellow
@@ -2122,13 +2131,16 @@ function Invoke-UiStep {
 # doctor.bat. A visible console (quickstart, a manual run) already shows the list, so it is not
 # repeated there.
 # ---------------------------------------------------------------------------
-function Write-StartupSummary([string]$Path, [string[]]$Failures, [string]$Mode) {
+function Write-StartupSummary([string]$Path, [string[]]$Failures, [string]$Mode, [string[]]$Unclear = @()) {
     try {
         $lines = @(("failures=" + @($Failures).Count),
                    ("when=" + (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")),
-                   ("mode=" + $Mode))
+                   ("mode=" + $Mode),
+                   ("unclear=" + @($Unclear).Count))
         foreach ($f in @($Failures)) { $lines += ("- " + (Hide-Secrets ([string]$f))) }
+        foreach ($u in @($Unclear)) { $lines += ("? " + (Hide-Secrets ([string]$u))) }
         if (@($Failures).Count -gt 0) { $lines += "fix: run doctor.bat for the specific fix for each line" }
+        if (@($Unclear).Count -gt 0) { $lines += "unclear ('?') lines were never confirmed either way -- run doctor.bat to check them" }
         $dir = Split-Path -Parent $Path
         if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
         $tmp = $Path + ".tmp"
@@ -2163,7 +2175,7 @@ function Send-StartupFailureNotice([string]$SummaryPath) {
         $py = $script:venvPy
         if (-not (Test-Path $py)) { return $false }
         $code = "import sys; sys.path.insert(0, sys.argv[1]); from tools.notify_ops import notify_desktop; " +
-                "ls = [l[2:].strip() for l in open(sys.argv[2], encoding='utf-8') if l.startswith('- ')]; " +
+                "ls = [l[2:].strip() for l in open(sys.argv[2], encoding='utf-8') if l.startswith('- ') or l.startswith('? ')]; " +
                 "notify_desktop('M365 Companion: %d startup problem(s)' % len(ls), chr(10).join(ls[:4] + ['Run doctor.bat for the fix for each.']), launch=sys.argv[3])"
         $uri = ([Uri]$SummaryPath).AbsoluteUri
         & $py -c $code $root $SummaryPath $uri 2>$null | Out-Null
@@ -2656,6 +2668,7 @@ function Invoke-Startup {
 # directly so it is NEVER blocked.
 $script:splash = $null
 $script:startupFailures = @()
+$script:startupUnclear = @()
 $script:lockTimedOut = $false           # Enter-StartAllLock gave up: nothing was started
 $script:supervisorStartedHere = $false  # this run started a supervisor that survived
 $script:supervisorDied = $false         # this run started one and it exited at once
@@ -2846,15 +2859,30 @@ if ($script:startupFailures.Count -gt 0) {
     Write-Host "  Run doctor.bat for the specific fix for each line." -ForegroundColor Yellow
     Write-Host ""
 }
+if (@($script:startupUnclear).Count -gt 0) {
+    Write-Host ""
+    Write-Host " $(@($script:startupUnclear).Count) thing(s) could not be confirmed either way:" -ForegroundColor DarkYellow
+    foreach ($u in $script:startupUnclear) { Write-Host ("  ? " + (Hide-Secrets $u)) -ForegroundColor DarkYellow }
+    Write-Host ""
+}
 
 # AND WHERE SOMEBODY WILL SEE IT when this ran hidden -- see Write-StartupSummary's header.
 $startMode = Get-StartAllMode
 $summaryPath = Join-Path $script:diagDir "start_all_summary.txt"
-$summaryWritten = Write-StartupSummary $summaryPath @($script:startupFailures) $startMode
+$summaryWritten = Write-StartupSummary $summaryPath @($script:startupFailures) $startMode @($script:startupUnclear)
 # WHO STARTED IT AND HOW IT ENDED (see Get-LaunchLineage), while the lock is still held.
-$runOutcome = $(if ($script:lockTimedOut) { "lock timed out" } elseif ($script:startupFailures.Count -gt 0) { "failures" } else { "ok" })
+# "unclear" (2026-09-24 sandbox finding): a check that could not be confirmed either way (the
+# devtunnel CLI did not answer within its 10 s bound) must not read as "ok" here -- a run whose
+# own jsonl record says outcome=ok is exactly what earlier hid a tunnel that was never actually
+# hosted. It is kept apart from "failures" (a KNOWN-bad state) so a transient CLI hiccup does
+# not flip the exit code or doctor's failure count; the jsonl and summary still say plainly that
+# something was never confirmed.
+$runOutcome = $(if ($script:lockTimedOut) { "lock timed out" }
+    elseif ($script:startupFailures.Count -gt 0) { "failures" }
+    elseif (@($script:startupUnclear).Count -gt 0) { "unclear" }
+    else { "ok" })
 $null = Write-StartAllRunRecord (Join-Path $script:diagDir "start_all_runs.jsonl") (New-StartAllRunRecord $runOutcome)
-if ($summaryWritten -and (Test-ShouldNotifyStartupFailures $script:startupFailures.Count ([bool]$NoUi) (Test-ConsoleVisible))) {
+if ($summaryWritten -and (Test-ShouldNotifyStartupFailures (@($script:startupFailures).Count + @($script:startupUnclear).Count) ([bool]$NoUi) (Test-ConsoleVisible))) {
     Send-StartupFailureNotice $summaryPath | Out-Null
 }
 Exit-StartAllLock
