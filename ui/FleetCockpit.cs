@@ -1050,10 +1050,20 @@ class CockpitWindow : Window
     int _autoRetryMax = 2;
     Dictionary<string, int> _autoRetryCount = new Dictionary<string, int>();
 
-    // Conversation retention. BOTH DEFAULT TO ZERO, WHICH MEANS KEEP EVERYTHING. This store
-    // exists because history was disappearing; a retention policy that starts deleting the day
-    // it ships is that same loss arriving on a schedule. The operator opts in.
-    int _retDays = 0;          // settings.txt session_retention_days= ; 0 = keep forever
+    // Conversation retention. OWNER DECISION 2026-09-24: _retDays now DEFAULTS TO 90, not 0.
+    // The store exists because history was disappearing, and a policy that started deleting
+    // the day it shipped would have been that same loss arriving on a schedule -- but the
+    // opt-in default meant operators who never found this dialog kept every conversation
+    // forever, unbounded, on purpose. 90 is now what "never touched this control" means. An
+    // operator who explicitly sets it to 0 still gets "keep everything": this field only ever
+    // starts at 90 when settings.txt has no session_retention_days line at all (LoadSettings,
+    // below, overwrites it -- including with 0 -- the moment the line exists). Mirrors
+    // bridge/session_store.py's DEFAULT_RETENTION_DAYS and tools/settings_keys.py's declared
+    // default for this key; test_the_panel_shows_the_same_default_the_fleet_uses
+    // (tools/test_a_setting_declares_when_it_takes_effect.py) and ui/test_retention_settings.py
+    // both fail if this literal drifts from either. _retMb is unrelated and unchanged: no
+    // owner decision touched the size cap, so it keeps defaulting to "no cap".
+    int _retDays = 90;         // settings.txt session_retention_days= ; 0 = keep forever, unset = 90
     int _retMb = 0;            // settings.txt session_max_mb=        ; 0 = no size cap
     TextBlock _retDaysValue, _retMbValue, _retNote;
 
@@ -7390,7 +7400,7 @@ class CockpitWindow : Window
         _autoMinus = ceilMinus; _autoPlus = ceilPlus;   // keep refs so UpdateAutoEnabled can grey them
         col.Children.Add(SettingsStepperRow(T("max_tabs2"), _autoValue, ceilMinus, ceilPlus, "autoscale_max"));
 
-        // ── Conversation retention: days + size cap, both defaulting to "keep everything" ──
+        // ── Conversation retention: days (default 90, since 2026-09-24) + size cap (default: no cap) ──
         col.Children.Add(SectionHeader(T("set_retention_section")));
         var retDMinus = MiniButton("−"); retDMinus.Click += delegate { SetRetDays(_retDays - (_retDays > 30 ? 30 : 7)); };
         var retDPlus = MiniButton("+"); retDPlus.Click += delegate { SetRetDays(_retDays + (_retDays >= 30 ? 30 : 7)); };

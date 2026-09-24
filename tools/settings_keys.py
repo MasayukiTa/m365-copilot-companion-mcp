@@ -171,10 +171,11 @@ KEYS = OrderedDict([
     # ---------------------------------------------------------------- bridge_start
     # The bridge applies retention once, at startup, deliberately: a timer that deletes
     # conversations while the operator is reading them is worse than a stale setting.
-    _k("session_retention_days", BRIDGE_START, None,
+    _k("session_retention_days", BRIDGE_START, 90.0,
        "bridge/session_store.py:read_retention via apply_retention",
        "Applied once when the bridge starts; changing it needs the bridge restarted. "
-       "None/0 means keep everything."),
+       "Owner decision 2026-09-24: unset now means 90 days, not forever. An explicit 0 is "
+       "still the operator choosing to keep everything -- only absent gets the default."),
 
     _k("session_max_mb", BRIDGE_START, None,
        "bridge/session_store.py:read_retention via apply_retention",
