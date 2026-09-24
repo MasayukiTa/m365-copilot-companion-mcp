@@ -201,3 +201,7 @@ if __name__ == "__main__":                                   # pragma: no cover 
         print("%3d  %s" % (inv[k], k))
     print("\n%d undecided launch sites in %d keys"
           % (sum(inv.values()), len(inv)))
+    detached = detached_uses()
+    for d in detached:
+        print("  detached (puts a console up two hops down): %s" % d)
+    print("%d detached launch flag(s)" % len(detached))
