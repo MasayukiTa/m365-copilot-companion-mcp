@@ -19,6 +19,9 @@ from tools import file_ops
     ".unlock_state.json",
     ".fleet/unlock_token_gap.json",
     ".fleet/lock_state.json",
+    ".fleet/unlock_revocations.json",
+    ".fleet/unlock_generation.json",
+    ".fleet/unlock_state.lock",
 ])
 def test_authorisation_state_is_refused(path):
     assert "Refusing" in str(file_ops.read_file(path))
@@ -41,6 +44,9 @@ def test_writing_to_it_is_refused_too():
     """Read-only would leave "overwrite the table with your own identity" open."""
     with pytest.raises(PermissionError):
         file_ops._validate_path(".unlock_state.json")
+    with pytest.raises(PermissionError):
+        # {} over this ledger would un-revoke every grant a stale table copy still carries.
+        file_ops._validate_path(".fleet/unlock_revocations.json")
 
 
 @pytest.mark.parametrize("path", ["README.md", "main.py", "tools/security.py"])

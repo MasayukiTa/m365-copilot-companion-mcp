@@ -1109,6 +1109,8 @@ def _install_deps_locked(state, *, pip_log, rerun, upgrade_pip) -> None:
 #: truth; this is the floor under it.
 _FALLBACK_DEFAULTS = (
     ("MCP_UNLOCK_TTL_DAYS", "30"),
+    # SEC-02: an unlocked identity alone never suffices. Also tools/security.py's own default.
+    ("MCP_REQUIRE_UNLOCK_TOKEN", "1"),
     ("MCP_ALLOWED_BASE", "~"),
     ("TASK_JOB_APPROVAL_MODE", "default"),
     ("MCP_TOOL_MAP", "1"),

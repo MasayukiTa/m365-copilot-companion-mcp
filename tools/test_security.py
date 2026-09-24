@@ -158,11 +158,14 @@ def test_save_state_atomic_goes_through_tempfile_plus_os_replace(monkeypatch):
 
     monkeypatch.setattr(os, "replace", spy_replace)
     sec.grant_ip("203.0.113.14")
-    assert len(calls) == 1
-    src, dst = calls[0]
+    # A grant also replaces the generation mark (.fleet/unlock_generation.json, SEC-03) the
+    # same way; the property is per file: STATE_FILE is replaced exactly once, from a temp file.
+    to_state = [(s, d) for s, d in calls if str(d) == str(sec.STATE_FILE)]
+    assert len(to_state) == 1
+    src, dst = to_state[0]
     assert str(src) != str(sec.STATE_FILE)
     assert str(src).endswith(".tmp")
-    assert str(dst) == str(sec.STATE_FILE)
+    assert all(str(s).endswith(".tmp") for s, _ in calls)
 
 
 def test_concurrent_grants_do_not_corrupt_the_state_file():

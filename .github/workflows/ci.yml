@@ -138,6 +138,7 @@ jobs:
             tests/test_dedicated_root_guard.py \
             tests/test_git_dedicated_root_guard.py \
             tests/test_unlock_token.py \
+            tests/test_unlock_revocation.py \
             tests/test_exec_via_gateway.py \
             tests/test_tool_map_pinning.py \
             scripts/test_watch_grade.py \
