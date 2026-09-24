@@ -53,9 +53,14 @@ pytestmark = pytest.mark.skipif(os.name != "nt" or not os.path.isfile(POWERSHELL
 
 LOCK_BASE = "Global\\m365-copilot-companion-start-all"
 BRINGUP_SEC = 6
-#: A copy that leaves must be gone this soon after its script started running (the owner's
-#: "~2 s", plus headroom for ten Windows PowerShell processes starting at once on one machine).
-LEAVE_BOUND_SEC = 4.0
+#: What the CODE of a leaving copy may spend: from the script's first line ("ts" in
+#: start_all_runs.jsonl) to its "already running" record ("end") -- the owner's "~2 s", with
+#: headroom for other suites loading the machine. PowerShell's own start-up before the first
+#: line ("proc_ts" -> "ts") is not the script's to spend; it is reported ("leaver_total_max_s")
+#: and not bounded. Measured under load, 2026-09-24: this was 5.3-6.6 s while the lineage used
+#: Get-CimInstance (2.7 s) and the run log was serialised through ConvertTo-Json (up to 2.5 s);
+#: after those two changes 1.1 s under the same load.
+LEAVE_BOUND_SEC = 3.0
 
 _COPY = ["start_all.bat", "scripts/start_all_hidden.vbs", "scripts/preflight_policy.ps1",
          "scripts/tunnel_name_util.ps1", "scripts/update_recovery.ps1",
@@ -206,6 +211,8 @@ def summarize(tree: Path, runs: list, t_launch: float, t_all_done: float) -> dic
     durations = [round(_parse_ts(r["end"]) - _parse_ts(r["ts"]), 2) for r in runs]
     leavers = [round(_parse_ts(r["end"]) - _parse_ts(r["ts"]), 2) for r in runs
                if r.get("outcome") == "already running"]
+    leaver_totals = [round(_parse_ts(r["end"]) - _parse_ts(r["proc_ts"]), 2) for r in runs
+                     if r.get("outcome") == "already running" and r.get("proc_ts")]
     return {
         "runs": len(runs),
         "bringups": kinds.count("bringup-start"),
@@ -216,6 +223,7 @@ def summarize(tree: Path, runs: list, t_launch: float, t_all_done: float) -> dic
         "outcomes": sorted(r.get("outcome") for r in runs),
         "durations_s": sorted(durations),
         "leaver_max_s": max(leavers) if leavers else None,
+        "leaver_total_max_s": max(leaver_totals) if leaver_totals else None,
         "wall_s": round(t_all_done - t_launch, 1),
     }
 

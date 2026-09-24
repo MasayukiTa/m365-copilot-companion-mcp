@@ -83,7 +83,7 @@ _FUNCS = ["Env-Value", "Get-UpdateCheckSkipReason", "Get-ParentProcessInfo",
           "Get-UiBuildState", "Invoke-UiStep", "Write-StartupSummary",
           "Test-ShouldNotifyStartupFailures", "Send-StartupFailureNotice",
           "Ensure-ConvenienceProvisioning", "Test-ShortcutTargetsWscript", "Test-WshDisabled",
-          "Get-LaunchLineage", "Get-StartAllMode",
+          "Get-Win32ProcessByPid", "ConvertFrom-WmiDate", "Get-LaunchLineage", "Get-StartAllMode",
           "New-StartAllRunRecord", "Write-StartAllRunRecord"]
 
 
