@@ -973,6 +973,92 @@ def _last_pip_error(pip_log: Path) -> str:
     return _redact_userinfo(pick[-1][:300]) if pick else ""
 
 
+#: The PEM setup.bat / start_all.ps1 build with scripts/ca_bundle.ps1: every root and
+#: intermediate this machine trusts (LocalMachine + CurrentUser), plus .setup/ca-extra.pem.
+CA_BUNDLE = ROOT / ".setup" / "ca-bundle.pem"
+
+#: The explicit, last-resort switch that turns pip's certificate checking OFF for PyPI.
+INSECURE_PIP_ENV = "SETUP_PIP_TRUSTED_HOST"
+
+_PYPI_HOSTS = ("pypi.org", "files.pythonhosted.org", "pypi.python.org")
+
+
+def _usable_pem(path: str | os.PathLike | None) -> str | None:
+    """`path` if it is a readable file holding at least one PEM certificate, else None. A path
+    that names nothing, or a DER .cer, given to pip --cert fails every download with an error
+    about the bundle rather than the network -- so it is not offered to pip at all."""
+    if not path:
+        return None
+    try:
+        p = Path(str(path).strip().strip('"'))
+        with open(p, "rb") as fh:
+            head = fh.read(1 << 20)
+    except OSError:
+        return None
+    return str(p) if b"-----BEGIN CERTIFICATE-----" in head else None
+
+
+def pip_tls_args() -> tuple:
+    """(pip arguments, one line saying what they are) for talking to PyPI (INST-09).
+
+    WHAT THIS REPLACED. Every install used to pass --trusted-host for the three PyPI hosts,
+    i.e. pip's certificate checking was OFF on every machine, every run -- the workaround for a
+    TLS-inspecting proxy whose root CA pip's bundled certifi does not carry. But setup.bat and
+    start_all.ps1 already export the roots this machine trusts (ca_bundle.ps1, which reads the
+    Windows stores the proxy's CA is deployed to), so the fix that keeps verification ON was
+    already on disk: point pip at it with --cert. ON THE COMMAND LINE, not only through
+    REQUESTS_CA_BUNDLE: a pre-set PIP_CERT / pip.ini `cert` would otherwise win, and the venv's
+    pip may be the pre-truststore one ensurepip seeded, which reads nothing else.
+
+    WHICH BUNDLE. PIP_CERT first (the operator's own pip setting), then the exported machine
+    bundle, then REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE, then SSL_CERT_FILE last -- on a real PC
+    here SSL_CERT_FILE is an operator's single-root .cer kept for another tool, which is not a
+    bundle PyPI can be verified against off that network.
+
+    NO BUNDLE is not a reason to disable anything: pip >= 24.2 verifies against the Windows
+    certificate store itself (truststore), the same store ca_bundle.ps1 reads -- so where that
+    export fails (it refuses when fewer than 5 roots are readable) pip's default is still the
+    right thing to try.
+
+    --trusted-host SURVIVES ONLY AS AN EXPLICIT OPT-IN (SETUP_PIP_TRUSTED_HOST=1), never as an
+    automatic fallback: a retry-without-verification on a certificate error is exactly what a
+    man-in-the-middle would provoke. When it is set, it is said, every run."""
+    if (os.environ.get(INSECURE_PIP_ENV) or "").strip() in ("1", "true", "yes"):
+        args = []
+        for h in _PYPI_HOSTS:
+            args += ["--trusted-host", h]
+        return args, ("pip TLS: certificate checking is OFF for %s because %s=1 is set. "
+                      "Remove it once .setup\\ca-extra.pem holds this network's root CA."
+                      % (", ".join(_PYPI_HOSTS), INSECURE_PIP_ENV))
+    for source, value in (("PIP_CERT", os.environ.get("PIP_CERT")),
+                          ("ca_bundle.ps1", CA_BUNDLE),
+                          ("REQUESTS_CA_BUNDLE", os.environ.get("REQUESTS_CA_BUNDLE")),
+                          ("CURL_CA_BUNDLE", os.environ.get("CURL_CA_BUNDLE")),
+                          ("SSL_CERT_FILE", os.environ.get("SSL_CERT_FILE"))):
+        pem = _usable_pem(value)
+        if pem:
+            return ["--cert", pem], "pip TLS: verified against %s (%s)" % (pem, source)
+    return [], ("pip TLS: verified against pip's own roots and the Windows certificate store "
+                "(no exported bundle at %s)" % CA_BUNDLE)
+
+
+def _looks_like_tls_failure(text: str) -> bool:
+    t = (text or "").upper()
+    return any(k in t for k in ("CERTIFICATE_VERIFY_FAILED", "SSLERROR", "SSLCERTVERIFICATIONERROR",
+                                "UNABLE TO GET LOCAL ISSUER", "SELF SIGNED CERTIFICATE IN"))
+
+
+def _tls_failure_advice(rerun: str) -> str:
+    return ("pip could not verify PyPI's certificate. This network inspects TLS with a root CA "
+            "this PC's certificate stores do not hold. Ask IT for that root CA (.cer or .pem), "
+            "save it as %s, and re-run %s -- it is added to the bundle and checking stays on. "
+            "Only if that is impossible: set %s=1 and re-run, which turns certificate checking "
+            "OFF for PyPI. / PyPI の証明書を検証できませんでした。社内のルート CA 証明書を "
+            "%s に置いて %s を再実行してください。"
+            % (ROOT / ".setup" / "ca-extra.pem", rerun, INSECURE_PIP_ENV,
+               ROOT / ".setup" / "ca-extra.pem", rerun))
+
+
 def step_install_deps(state: dict | None = None, state_file: Path = None, *,
                       pip_log: Path | None = None, rerun: str = RERUN_SETUP,
                       upgrade_pip: bool = True) -> None:
@@ -997,16 +1083,9 @@ def _install_deps_locked(state, *, pip_log, rerun, upgrade_pip) -> None:
     if not req.exists():
         raise StepError("requirements.txt not found at repo root.")
 
-    # Corporate TLS-inspecting proxy: its root CA is not in pip's bundled certifi store,
-    # so pip otherwise dies with SSL CERTIFICATE_VERIFY_FAILED ("unable to get local issuer
-    # certificate") on pypi.org / files.pythonhosted.org. Pass --trusted-host ON THE COMMAND
-    # LINE so the bypass applies regardless of whether a user/system pip.ini is read (the
-    # venv may be a uv-provisioned CPython that does not pick up %APPDATA%\pip\pip.ini).
-    trusted = [
-        "--trusted-host", "pypi.org",
-        "--trusted-host", "files.pythonhosted.org",
-        "--trusted-host", "pypi.python.org",
-    ]
+    # TLS: verified, with this machine's own trusted roots (INST-09). See pip_tls_args.
+    trusted, tls_note = pip_tls_args()
+    log("    " + tls_note)
 
     out = None
     if pip_log is not None:
@@ -1056,9 +1135,19 @@ def _install_deps_locked(state, *, pip_log, rerun, upgrade_pip) -> None:
     if rc != 0:
         if pip_log is not None:
             detail = _last_pip_error(pip_log) or "(pip printed nothing)"
+            try:
+                whole = Path(pip_log).read_text(encoding="utf-8", errors="replace")[-20000:]
+            except OSError:
+                whole = detail
+            if _looks_like_tls_failure(whole):
+                raise StepError("pip install -r requirements.txt failed: %s -- full pip output: "
+                                "%s. %s" % (detail, pip_log, _tls_failure_advice(rerun)))
             raise StepError(_pip_failure_message(
                 rerun, "%s -- full pip output: %s" % (detail, pip_log)))
-        raise StepError(_pip_failure_message(rerun))
+        # pip's own output went to this console, so the reader has the error text in front of
+        # them; say what to do if it is the certificate one.
+        raise StepError(_pip_failure_message(rerun) + " If pip's error above mentions "
+                        "CERTIFICATE_VERIFY_FAILED: " + _tls_failure_advice(rerun))
     if broken:
         where = (" -- full pip output: %s" % pip_log) if pip_log is not None else ""
         raise StepError(
