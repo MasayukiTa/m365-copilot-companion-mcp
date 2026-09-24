@@ -214,6 +214,8 @@ def _restore_worker(orig):
     RelayWorker.attach = orig["attach"]
     RelayWorker.poll = orig["poll"]
     RelayWorker.close = orig["close"]
+    if "tab_weight" in orig:
+        RelayWorker.tab_weight = orig["tab_weight"]
 
 
 # ── (b) continuous admission: completion frees a slot -> next admitted, no barrier ───────────
@@ -926,6 +928,94 @@ def test_soft_shrink_does_not_close_running_tabs():
         _restore_worker(orig)
 
 
+def _install_fake_socket_worker(monkey_state):
+    """Like _install_fake_worker, but attach() takes a SOCKET (page stays None, self.socket =
+    True) -- the tab_weight()==0 case that admits_another_tab's tab-weight math cannot bound,
+    since projected_peak sums tab_weight and a socket always contributes 0. `_holds_slot` (the
+    unit `_active_open()` counts) is True for a socket worker precisely so this fixture can
+    stand in for the production socket-route path without opening a browser."""
+    orig = {"attach": RelayWorker.attach, "poll": RelayWorker.poll, "close": RelayWorker.close,
+            "tab_weight": RelayWorker.tab_weight}
+
+    def fake_attach(self, context, agent_url):
+        self.socket = True
+        self.status = "waiting"
+        return True
+
+    def fake_poll(self):
+        if self.status in TERMINAL:
+            return True
+        cmd = monkey_state["control"].get(self.name, "waiting")
+        if cmd == "done":
+            self.status, self.outcome = "done", "DONE"
+            self.verified = True
+            return True
+        self.status = "waiting"
+        return False
+
+    def fake_close(self):
+        self.closed = True
+        self.socket = False
+        self.drv = None
+
+    def fake_tab_weight(self, assume_socket=None):
+        # DETERMINISTIC 0, regardless of the real (unopened, in this test) socket route --
+        # production's `assume_socket=_socket_open_now()` resolves the same way once the route
+        # is actually captured, and this fixture exists to exercise that state without one.
+        return 0
+
+    RelayWorker.attach = fake_attach
+    RelayWorker.poll = fake_poll
+    RelayWorker.close = fake_close
+    RelayWorker.tab_weight = fake_tab_weight
+    return orig
+
+
+def test_socket_workers_respect_the_live_cap():
+    """2026-09-25 OWNER: autoscale held mc_box[0] at 1 ("RAM-adjust 1..1 tab(s)") and the fleet
+    still grew to 41 workers with more than 10 running at once. Root cause: a socket worker's
+    tab_weight() is 0 (relay_fleet.py:4545, `main = 0 if self.socket ... else 1`) and stays 0
+    for as long as it runs, so `_projected_peak()` (the sum admission reserves against) never
+    grows past 0 once the fleet is on sockets -- `admits_another_tab` says yes to the entire
+    pending queue regardless of mc_box[0]. RAM was never the binding resource for these workers;
+    Microsoft's per-Dataverse-environment 100 RPM Copilot quota (quota_meter.py) is, and it does
+    not care whether a turn came over a socket or a tab -- concurrent socket workers still spend
+    it one at a time and 10+ at once is exactly how a burst of refusals happens.
+
+    This proves the fix (relay_fleet.py's admission loop ANDs a `_active_open() < max(1,
+    mc_box[0])` count gate onto the existing tab-weight gate -- _active_open() already counts
+    sockets, per _holds_slot's own docstring): with mc_box[0]==1 and three goals that all take
+    sockets, only ONE may be concurrently admitted at a time, and all three still complete."""
+    rf.avail_phys_mb = lambda: 64000.0
+    rf.free_disk_gb = lambda path=None: 500.0
+    state = {"control": {}}
+    orig = _install_fake_socket_worker(state)
+    try:
+        goals = ["g0", "g1", "g2"]
+        mc_box = [1]
+        observed = {"max_concurrent_sockets": 0}
+
+        def on_tick(workers):
+            open_now = sum(1 for w in workers
+                           if getattr(w, "socket", False) and w.status not in TERMINAL)
+            observed["max_concurrent_sockets"] = max(observed["max_concurrent_sockets"], open_now)
+            # finish whichever socket worker is open so the run can make progress
+            for w in workers:
+                if getattr(w, "socket", False) and w.status == "waiting":
+                    state["control"][w.name] = "done"
+                    break
+
+        res = run_relay_fleet(FakeContext(), goals, "http://agent", max_concurrent=1,
+                              mc_box=mc_box, poll_s=0, on_tick=on_tick,
+                              notify=lambda *a, **k: None)
+        check("socket_admission_all_goals_complete",
+              len(res) == 3 and all(r["outcome"] == "DONE" for r in res))
+        check("socket_admission_never_exceeded_cap_of_one",
+              observed["max_concurrent_sockets"] <= 1)
+    finally:
+        _restore_worker(orig)
+
+
 def test_tab_budget_admission():
     # A worker that fans out to 3 tabs consumes the whole 3-tab budget, so a 2nd worker waits --
     # "3 open tabs == parallelism 3", reactive, no human cap. All goals still complete (continuous).
@@ -1286,6 +1376,7 @@ def main():
     for _fn in (test_disk_floor_predicate,
                 test_tab_load_accounting,
                 test_tab_budget_admission,
+                test_socket_workers_respect_the_live_cap,
                 test_soft_shrink_does_not_close_running_tabs,
                 test_hysteresis_no_thrash,
                 test_continuous_admission_no_barrier,

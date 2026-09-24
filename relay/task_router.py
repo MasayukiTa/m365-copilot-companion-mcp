@@ -722,14 +722,48 @@ def fleet_is_live(state_dir=None) -> bool:
     decides whether a goal joins the current run or waits, and the failure it prevents is
     already on the record: two fleets share the one dedicated Edge and clobber each other's
     status.json, and the second run's work showed up as a phantom worker behind the first.
+
+    A STALE status.json IS NOT PROOF THE PROCESS DIED. `fleet_runner.on_tick` writes
+    status.json inside `try: ... except Exception: pass` (fleet_runner.py), so a write that
+    fails -- e.g. `_write_atomic`'s PermissionError against the cockpit's own reader losing its
+    retry race, or the disk floor being exhausted by a long, heavy run -- is swallowed silently
+    and the sweep loop keeps going with a live browser and live workers. Measured 2026-09-25:
+    a run that had grown to 41 workers over free RAM 2151 MB / free disk 0.6 GB went stale by
+    this reading while its process (and Edge window) were still very much alive, and
+    autostart's "a fleet is already running" gate read the stale file as "not live" and started
+    a SECOND fleet_runner on top of it -- two coordinator processes, two Edge windows, the
+    second one's workers counted as refusals by the first one's rate budget.
+    Before giving up on a stale/missing status.json, fall back to the OS-level signal:
+    fleet_runner writes `fleet_run_active.json` once at startup (pid/start_ts/argv) and clears
+    it on a clean exit (see fleet_runner._write_active_marker / ACTIVE_MARKER). If that marker
+    names a pid that is still running, the fleet is live even though its status snapshot is not
+    advancing -- join it, do not start a second one.
     """
     sd = state_dir or FLEET_STATE_DIR
     try:
         sp = os.path.join(sd, "status.json")
-        if not os.path.isfile(sp) or (time.time() - os.path.getmtime(sp)) > FLEET_LIVE_MAX_AGE_S:
+        if os.path.isfile(sp) and (time.time() - os.path.getmtime(sp)) <= FLEET_LIVE_MAX_AGE_S:
+            with open(sp, encoding="utf-8-sig") as fh:
+                return bool(json.load(fh).get("running"))
+    except Exception:
+        pass
+    return _active_marker_process_alive(sd)
+
+
+def _active_marker_process_alive(state_dir) -> bool:
+    """Fallback liveness read for a stale/unreadable status.json: is the pid recorded in
+    fleet_runner's `fleet_run_active.json` still running? Never raises; a missing/corrupt
+    marker or an unreadable pid answers False, same as "no fleet" did before this fallback
+    existed -- this only ADDS a way to say True, it never removes the old one.
+    """
+    try:
+        marker_path = os.path.join(state_dir, "fleet_run_active.json")
+        with open(marker_path, encoding="utf-8-sig") as fh:
+            rec = json.load(fh)
+        pid = rec.get("pid")
+        if pid is None:
             return False
-        with open(sp, encoding="utf-8-sig") as fh:
-            return bool(json.load(fh).get("running"))
+        return _pid_alive(pid)
     except Exception:
         return False
 
