@@ -95,14 +95,17 @@ def test_the_window_follows_the_ttl_it_is_derived_from(monkeypatch):
 def test_the_report_says_whether_enforcement_is_already_on(monkeypatch):
     monkeypatch.setenv("MCP_REQUIRE_UNLOCK_TOKEN", "1")
     assert LS.token_gap_report()["enforcing"] is True
-    monkeypatch.delenv("MCP_REQUIRE_UNLOCK_TOKEN", raising=False)
+    monkeypatch.setenv("MCP_REQUIRE_UNLOCK_TOKEN", "0")
     assert LS.token_gap_report()["enforcing"] is False
+    # Unset enforces since 2026-09-24 (SEC-02); only an explicit "0" is record-only.
+    monkeypatch.delenv("MCP_REQUIRE_UNLOCK_TOKEN", raising=False)
+    assert LS.token_gap_report()["enforcing"] is True
 
 
 # ── the reader that runs without being asked ──────────────────────────────────────────────
 
 def test_the_startup_line_names_the_callers_that_would_break(monkeypatch):
-    monkeypatch.delenv("MCP_REQUIRE_UNLOCK_TOKEN", raising=False)
+    monkeypatch.setenv("MCP_REQUIRE_UNLOCK_TOKEN", "0")
     for _ in range(5):
         _gap("203.0.113.9")
     _gap("203.0.113.4")
@@ -114,7 +117,7 @@ def test_the_startup_line_names_the_callers_that_would_break(monkeypatch):
 def test_silence_is_the_good_case(monkeypatch):
     """Nothing to say when the switch is already on, and nothing to say when it is free. A line
     that prints on every boot regardless is a line that stops being read."""
-    monkeypatch.delenv("MCP_REQUIRE_UNLOCK_TOKEN", raising=False)
+    monkeypatch.setenv("MCP_REQUIRE_UNLOCK_TOKEN", "0")
     assert LS.token_gap_warning() == "", "empty counter"
 
     monkeypatch.setenv("MCP_UNLOCK_TTL_DAYS", "30")

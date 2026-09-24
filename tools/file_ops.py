@@ -134,6 +134,12 @@ _SECURITY_STATE_NAMES = frozenset({
     ".unlock_state.json",
     "unlock_token_gap.json",
     "lock_state.json",
+    # The unlock table's companions (tools/security.py, SEC-03). Writing {} over the revocation
+    # ledger would un-revoke every grant a stale copy still carries; the generation mark and the
+    # lock file are the ordering and the mutual exclusion that ledger relies on.
+    "unlock_revocations.json",
+    "unlock_generation.json",
+    "unlock_state.lock",
     # THE CREDENTIALS FILE ITSELF. This list already refused the table of authorised
     # identities while leaving the API key readable in plain text one directory up, so a
     # caller could simply read the key and then be the operator.

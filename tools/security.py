@@ -1,3 +1,4 @@
+import contextlib
 import contextvars
 import hashlib
 import hmac
@@ -8,7 +9,17 @@ import secrets
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
+
+try:  # Windows: the cross-process lock on the state file (see _cross_process_lock)
+    import msvcrt as _msvcrt
+except ImportError:  # pragma: no cover - non-Windows
+    _msvcrt = None
+try:  # POSIX: same lock, for CI runners
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - Windows
+    _fcntl = None
 
 from fastmcp.server.dependencies import get_http_request
 
@@ -25,13 +36,249 @@ STATE_FILE = Path(__file__).resolve().parent.parent / ".unlock_state.json"
 TRUSTED_LOCAL_PEERS = {"127.0.0.1", "::1", "localhost"}
 
 
-def _load_state() -> dict:
-    if STATE_FILE.exists():
+# ─────────────────────────────────────────────────────────────────────────────────────
+# THE UNLOCK TABLE: grants with ids, a generation, and revocations that stay revoked (SEC-03).
+#
+# WHAT WAS WRONG. Every writer -- the server's unlock() and session refresh, the cockpit's
+# grant/revoke (`python -m tools.security ...`, a separate process) -- did read-modify-replace
+# on .unlock_state.json under a lock that only excluded THIS process's threads. A server write
+# that read the file just before the cockpit revoked an identity wrote its stale copy back just
+# after, and the revoked identity was unlocked again with its old tokens and sessions. Nothing
+# recorded that a revocation had happened, so nothing could notice the resurrection.
+#
+# THE SHAPE (the owner's: "一意のIDなどで管理されるのがあるべき姿"):
+#   * every grant -- an unlock() or a cockpit grant -- is its own record with a uuid4 id, its
+#     token hash, its expiry and the GENERATION of the write that created it; sessions are
+#     bound to the grant that authorised them (entry["session_grants"]);
+#   * a monotonically increasing generation orders grants against revocations: every write
+#     takes one more than the highest on record (on a grant, or on the ledger below) -- not a
+#     key of .unlock_state.json, whose top-level keys stay identities for every reader;
+#   * a revocation writes TOMBSTONES -- one per grant id, and one for the identity carrying the
+#     revocation's generation and time plus the revoked token hashes and sessions -- into a
+#     ledger no pre-change writer knows about (.fleet/unlock_revocations.json). Keeping them in
+#     the state file itself would lose them to exactly the stale read-modify-replace they exist
+#     to defeat;
+#   * every write re-reads BOTH files under a cross-process lock, drops whatever the tombstones
+#     cover, applies its own delta, bumps the generation and replaces atomically;
+#   * every READ applies the same tombstones, so a stale copy written by a writer that never
+#     took the lock (the server process still running the previous version of this file)
+#     authorises nothing even before the next write purges it.
+# Tombstones are pruned once everything they cover has expired, and never sooner than one full
+# grant lifetime (MCP_UNLOCK_TTL_DAYS), so the ledger stays bounded.
+# ─────────────────────────────────────────────────────────────────────────────────────
+
+#: Reserved top-level key, never written; skipped by every reader so a forwarded "address" of
+#: that spelling can never be mistaken for metadata or vice versa.
+_META_KEY = "_meta"
+
+#: Fields of an entry that are DERIVED from its grants on every write. Kept in the file because
+#: they are what readers (including the pre-change server, until it restarts) look at.
+_DERIVED_FIELDS = ("token_hashes", "token_sha256", "expires_at", "unlocked_at")
+
+
+def _revocations_file() -> Path:
+    """The tombstone ledger. Derived from STATE_FILE so redirecting one redirects both."""
+    return STATE_FILE.parent / ".fleet" / "unlock_revocations.json"
+
+
+def _state_lock_file() -> Path:
+    return STATE_FILE.parent / ".fleet" / "unlock_state.lock"
+
+
+def _generation_file() -> Path:
+    """The generation's high-water mark, written on every write. Without it the next generation
+    is derived from what is still on record, and a record removed by a writer outside the lock
+    (the pre-change server replacing the whole table) could hand out a generation twice."""
+    return STATE_FILE.parent / ".fleet" / "unlock_generation.json"
+
+
+def _read_json_file(path: Path) -> tuple[dict, bool]:
+    """(data, parsed). A missing file is ({}, True); unparseable or non-object content is
+    ({}, False) so each caller decides which way to fail.
+
+    An OSError other than "missing" is retried briefly (on Windows, opening a file another
+    process is replacing fails transiently) and then RAISED: "could not open it" must never be
+    confused with "it is empty", or a writer would replace the whole table with nothing.
+    """
+    for attempt in range(100):
         try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-    return {}
+            text = path.read_text(encoding="utf-8")
+            break
+        except FileNotFoundError:
+            return {}, True
+        except OSError:
+            if attempt == 99:
+                raise
+            time.sleep(0.005)
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return {}, False
+    if not isinstance(data, dict):
+        return {}, False
+    return data, True
+
+
+def _num(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _legacy_grant_id(ip: str, token_hash: str, unlocked_at: float) -> str:
+    """A stable id for a grant written before grants had ids. Derived, not random, so the read
+    path and the write path name the same legacy grant the same way."""
+    seed = token_hash if token_hash else "%s|%r" % (ip, unlocked_at)
+    return "legacy-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:20]
+
+
+def _grant_is_revoked(gid: str, grant: dict, idrev: dict, tomb: dict) -> bool:
+    if gid in tomb:
+        return True
+    if idrev:
+        gen = grant.get("generation")
+        if isinstance(gen, (int, float)) and not isinstance(gen, bool):
+            # Ordered by generation, not by clock: the lock serialises writers, so a grant
+            # created after the revocation has a strictly larger generation even when both
+            # happened inside one tick of a coarse Windows clock.
+            if gen <= _num(idrev.get("generation"), -1):
+                return True
+        elif _num(grant.get("issued_at")) <= _num(idrev.get("revoked_at"), -1):
+            # A grant written without a generation (legacy data, or the pre-change server
+            # still running) is ordered by its issue time instead.
+            return True
+        if grant.get("token_sha256") and grant["token_sha256"] in set(
+                idrev.get("token_hashes") or []):
+            return True
+    return False
+
+
+def _canonical_entry(ip: str, raw, rev: dict) -> "dict | None":
+    """One identity's entry in canonical form, with every revoked grant removed; None when no
+    grant survives. Accepts both the grant-id shape and the older flat shape (token_hashes /
+    token_sha256 / sessions with no grant ids), which becomes grants with derived ids."""
+    if not isinstance(raw, dict):
+        return None
+    idrev = ((rev.get("identities") or {}).get(ip)) or {}
+    tomb = rev.get("grants") or {}
+
+    grants = {gid: dict(g) for gid, g in (raw.get("grants") or {}).items()
+              if isinstance(gid, str) and isinstance(g, dict)}
+    bindings = {s: g for s, g in (raw.get("session_grants") or {}).items()
+                if isinstance(s, str) and isinstance(g, str)}
+    sessions = {s: float(t) for s, t in (raw.get("sessions") or {}).items()
+                if isinstance(s, str) and isinstance(t, (int, float))
+                and not isinstance(t, bool)}
+
+    # THE FLAT SHAPE. Tokens no grant accounts for, and sessions no grant is bound to, were
+    # written by code that did not know about grants. They become grants issued at the entry's
+    # unlocked_at, so a stale flat copy dated before a revocation is revoked with it.
+    covered = {g.get("token_sha256") for g in grants.values() if g.get("token_sha256")}
+    legacy_tokens = [h for h in (raw.get("token_hashes") or [])
+                     if isinstance(h, str) and h not in covered]
+    single = raw.get("token_sha256")
+    if isinstance(single, str) and single not in covered and single not in legacy_tokens:
+        legacy_tokens.append(single)
+    legacy_sessions = [s for s in sessions if s not in bindings]
+    if legacy_tokens or legacy_sessions or (not grants and "expires_at" in raw):
+        issued = _num(raw.get("unlocked_at"))
+        expires = _num(raw.get("expires_at"))
+        newest = None
+        for h in legacy_tokens:
+            newest = _legacy_grant_id(ip, h, issued)
+            grants.setdefault(newest, {"issued_at": issued, "expires_at": expires,
+                                       "token_sha256": h, "via": "legacy"})
+        if newest is None:
+            newest = _legacy_grant_id(ip, "", issued)
+            grants.setdefault(newest, {"issued_at": issued, "expires_at": expires,
+                                       "token_sha256": None, "via": "legacy"})
+        for s in legacy_sessions:
+            bindings[s] = newest
+
+    grants = {gid: g for gid, g in grants.items()
+              if not _grant_is_revoked(gid, g, idrev, tomb)}
+    if not grants:
+        return None
+    # A SESSION NAMED BY A REVOCATION stays revoked for every grant that revocation covered --
+    # but not for a grant issued AFTER it. A conversation whose identity the operator revoked
+    # and which then unlocks again with the password is authorised afresh, in the same
+    # Mcp-Session-Id; refusing that session for the tombstone's whole lifetime (30 days) would
+    # leave the token as its only path and send the model back to carrying it. Only a grant
+    # with a generation above the revocation's qualifies: a grant without one (legacy data, the
+    # pre-change server) cannot prove it came after.
+    revoked_sessions = set(idrev.get("sessions") or []) if idrev else set()
+    rev_gen = _num(idrev.get("generation"), -1) if idrev else -1
+
+    def _issued_after_revocation(gid: str) -> bool:
+        gen = grants[gid].get("generation")
+        return (isinstance(gen, (int, float)) and not isinstance(gen, bool)
+                and gen > rev_gen)
+
+    bindings = {s: g for s, g in bindings.items()
+                if g in grants and s in sessions
+                and (s not in revoked_sessions or _issued_after_revocation(g))}
+    sessions = {s: t for s, t in sessions.items() if s in bindings}
+
+    out = {k: v for k, v in raw.items()
+           if k not in _DERIVED_FIELDS and k not in ("grants", "session_grants", "sessions")}
+    out["grants"] = grants
+    out["session_grants"] = bindings
+    out["sessions"] = sessions
+    return _derive(out)
+
+
+def _grant_order(grants: dict) -> list:
+    """Oldest first. Stable, so legacy grants that share one issue time keep file order."""
+    return sorted(grants, key=lambda gid: (_num(grants[gid].get("issued_at")),
+                                           _num(grants[gid].get("generation"))))
+
+
+def _derive(entry: dict, now: "float | None" = None) -> dict:
+    """Fill the flat fields readers use from the grants. With `now`, the AUTHORISATION view:
+    tokens and sessions of expired grants are left out."""
+    grants = entry.get("grants") or {}
+    live = {gid for gid, g in grants.items()
+            if now is None or _num(g.get("expires_at")) > now}
+    entry["token_hashes"] = [grants[gid]["token_sha256"] for gid in _grant_order(grants)
+                             if gid in live and grants[gid].get("token_sha256")]
+    entry["expires_at"] = max((_num(g.get("expires_at")) for g in grants.values()), default=0.0)
+    issued = max((_num(g.get("issued_at")) for g in grants.values()), default=0.0)
+    if issued > 0:
+        entry["unlocked_at"] = issued
+    if now is not None:
+        bindings = entry.get("session_grants") or {}
+        entry["sessions"] = {s: t for s, t in (entry.get("sessions") or {}).items()
+                             if bindings.get(s) in live}
+    return entry
+
+
+def _canonical_state(raw: dict, rev: dict) -> dict:
+    out = {}
+    for ip, e in (raw or {}).items():
+        if ip == _META_KEY:
+            continue
+        ce = _canonical_entry(ip, e, rev)
+        if ce is not None:
+            out[ip] = ce
+    return out
+
+
+def _load_state() -> dict:
+    """The unlock table as it authorises: revoked grants removed, flat fields derived.
+
+    FAILS CLOSED on an unreadable tombstone ledger: without it nothing can say which grants
+    were revoked, and {} -- nobody unlocked -- is what an unreadable state file already meant.
+    """
+    try:
+        raw, _ = _read_json_file(STATE_FILE)
+        rev, rev_ok = _read_json_file(_revocations_file())
+    except OSError:
+        return {}
+    if not rev_ok:
+        return {}
+    now = time.time()
+    return {ip: _derive(e, now) for ip, e in _canonical_state(raw, rev).items()}
 
 
 def _save_state(state: dict) -> None:
@@ -39,18 +286,32 @@ def _save_state(state: dict) -> None:
     _atomic_write(state)
 
 
-def _atomic_write(state: dict) -> None:
+def _atomic_write(state: dict, path: "Path | None" = None) -> None:
     """Write via a temp file and os.replace, so a reader never sees a half-written file.
 
     `_load_state` returns {} on a parse error, and {} means nobody is unlocked. A plain
     `write_text` leaves a window in which every caller is refused.
+
+    The replace is retried briefly on PermissionError: on Windows it fails while any reader
+    has the target open, and every gated call opens this file.
     """
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(STATE_FILE.parent), suffix=".tmp")
+    target = Path(path) if path is not None else STATE_FILE
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(target.parent), suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(state, fh, indent=2)
-        os.replace(tmp, STATE_FILE)
+            # Unindented, one write: with indent, json falls back to its pure-Python encoder and
+            # streams hundreds of small chunks, which was most of the cost of a write on the hot
+            # path (session refresh) once each grant became its own record.
+            fh.write(json.dumps(state))
+        for attempt in range(200):
+            try:
+                os.replace(tmp, target)
+                break
+            except PermissionError:
+                if attempt == 199:
+                    raise
+                time.sleep(0.005)
     except Exception:
         try:
             os.unlink(tmp)
@@ -59,25 +320,203 @@ def _atomic_write(state: dict) -> None:
         raise
 
 
-#: Serialises read-modify-write ON THIS PROCESS. Two unlocks racing used to both read the
-#: file, both edit their own copy, and the second write erase the first -- so one client's
-#: authorisation disappeared the moment another unlocked. This does not coordinate across
-#: PROCESSES; the cockpit CLI runs separately, and a cross-process lock is the next step if
-#: that ever races in practice. Stated rather than implied, because "we take a lock" reads
-#: like more of a guarantee than this is.
+#: Serialises read-modify-write between THREADS of this process; `_cross_process_lock` below
+#: does the same between processes (the server and the cockpit's `python -m tools.security`).
+#: Both are taken, in this order, by `_transact` -- the one writer of the unlock table.
 _STATE_LOCK = threading.RLock()
+
+#: How long a writer waits for another process's write to finish. A write is milliseconds; the
+#: OS drops the lock when its holder dies, so only a hung holder can make this expire.
+_LOCK_TIMEOUT_S = 20.0
+
+_LOCK_HELD = threading.local()
+
+
+def _os_lock(fh) -> None:
+    if _msvcrt is not None:
+        fh.seek(0)
+        _msvcrt.locking(fh.fileno(), _msvcrt.LK_NBLCK, 1)
+    elif _fcntl is not None:
+        _fcntl.flock(fh.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+    else:  # pragma: no cover
+        raise RuntimeError("no cross-process file lock available on this platform")
+
+
+def _os_unlock(fh) -> None:
+    if _msvcrt is not None:
+        fh.seek(0)
+        _msvcrt.locking(fh.fileno(), _msvcrt.LK_UNLCK, 1)
+    elif _fcntl is not None:
+        _fcntl.flock(fh.fileno(), _fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def _cross_process_lock():
+    """Exclusive lock on a sidecar file, held for one read-modify-replace. Re-entrant per thread."""
+    if getattr(_LOCK_HELD, "depth", 0):
+        _LOCK_HELD.depth += 1
+        try:
+            yield
+        finally:
+            _LOCK_HELD.depth -= 1
+        return
+    path = _state_lock_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(path, "a+b")
+    try:
+        deadline = time.monotonic() + _LOCK_TIMEOUT_S
+        while True:
+            try:
+                _os_lock(fh)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("unlock state is locked by another process: %s" % path)
+                time.sleep(0.002)
+        _LOCK_HELD.depth = 1
+        try:
+            yield
+        finally:
+            _LOCK_HELD.depth = 0
+            try:
+                _os_unlock(fh)
+            except OSError:
+                pass
+    finally:
+        fh.close()
+
+
+class _Txn:
+    """What one write knows: its clock, its generation, and the tombstone ledger it may extend."""
+    __slots__ = ("now", "generation", "rev", "rev_changed")
+
+    def __init__(self, now: float, generation: int, rev: dict):
+        self.now = now
+        self.generation = generation
+        self.rev = rev
+        self.rev_changed = False
+
+
+def _longest_grant_lifetime_s() -> float:
+    return max(_num(os.environ.get("MCP_UNLOCK_TTL_DAYS", "30"), 30.0), 0.0) * 86400.0
+
+
+def _prune_revocations(tx: "_Txn") -> None:
+    """Drop tombstones whose every covered grant has expired. Bounded ledger."""
+    for key in ("grants", "identities"):
+        table = tx.rev.get(key)
+        if not isinstance(table, dict):
+            if table is not None:
+                tx.rev[key] = {}
+                tx.rev_changed = True
+            continue
+        dead = [k for k, v in table.items()
+                if not isinstance(v, dict) or _num(v.get("keep_until")) < tx.now]
+        for k in dead:
+            del table[k]
+        if dead:
+            tx.rev_changed = True
+
+
+def _record_revocation(tx: "_Txn", ip: str, entry: "dict | None") -> None:
+    """Tombstone every grant of `ip` and the identity itself, at this write's generation."""
+    grants_tomb = tx.rev.setdefault("grants", {})
+    idents = tx.rev.setdefault("identities", {})
+    prior = idents.get(ip) if isinstance(idents.get(ip), dict) else {}
+    tokens = set(prior.get("token_hashes") or [])
+    sessions = set(prior.get("sessions") or [])
+    keep = max(_num(prior.get("keep_until")), tx.now + _longest_grant_lifetime_s())
+    for gid, g in ((entry or {}).get("grants") or {}).items():
+        expires = _num(g.get("expires_at"))
+        keep = max(keep, expires)
+        grants_tomb[gid] = {"ip": ip, "revoked_at": tx.now, "generation": tx.generation,
+                            "keep_until": max(expires, tx.now + _longest_grant_lifetime_s())}
+        if g.get("token_sha256"):
+            tokens.add(g["token_sha256"])
+    sessions.update((entry or {}).get("sessions") or {})
+    idents[ip] = {"revoked_at": tx.now, "generation": tx.generation, "keep_until": keep,
+                  "token_hashes": sorted(tokens), "sessions": sorted(sessions)}
+    tx.rev_changed = True
+
+
+def _finalize_entry(ip: str, entry) -> "dict | None":
+    """Canonical form for the file: token cap applied, orphaned bindings dropped, flat fields
+    derived. None drops the identity."""
+    ce = _canonical_entry(ip, entry, {})
+    if ce is None:
+        return None
+    grants = ce["grants"]
+    # THE TOKEN CAP, per grant. The newest _MAX_TOKENS_PER_IDENTITY grants keep their tokens;
+    # an older grant loses its token and is kept only while a session is still bound to it, so
+    # a long-running session is not cut off because other workers unlocked after it.
+    with_token = [gid for gid in _grant_order(grants) if grants[gid].get("token_sha256")]
+    for gid in with_token[:-_MAX_TOKENS_PER_IDENTITY]:
+        grants[gid]["token_sha256"] = None
+        grants[gid]["retired"] = True
+    bound = set(ce["session_grants"].values())
+    for gid in [g for g, v in grants.items() if v.get("retired") and g not in bound]:
+        del grants[gid]
+    if not grants:
+        return None
+    return _derive(ce)
+
+
+def _transact(fn) -> dict:
+    """THE one writer of the unlock table: lock, re-read, apply tombstones, apply `fn`'s delta,
+    bump the generation, replace atomically. `fn(state, tx)` edits the canonical state in place
+    (or returns a replacement dict)."""
+    with _STATE_LOCK, _cross_process_lock():
+        raw, _ = _read_json_file(STATE_FILE)
+        rev, rev_ok = _read_json_file(_revocations_file())
+        if not rev_ok:
+            # Rewriting the ledger from {} would forget every revocation on record.
+            raise RuntimeError("unlock revocation ledger is unreadable: %s -- refusing to "
+                               "write the unlock table over it" % _revocations_file())
+        # THE GENERATION: one more than the highest ever handed out -- the high-water mark, or
+        # anything higher still on record (on a grant in the table, or on the ledger, which
+        # carries the generation of its last revocation). Strictly increasing across writes and
+        # processes; every revocation's generation is below every grant issued after it, which
+        # is the ordering `_grant_is_revoked` relies on. A missing or unparseable mark only
+        # loses the first of those three floors, never the ordering.
+        mark, _ = _read_json_file(_generation_file())
+        seen = [_num(rev.get("generation")), _num(mark.get("generation"))]
+        for ip, e in raw.items():
+            if ip != _META_KEY and isinstance(e, dict):
+                seen.extend(_num(g.get("generation")) for g in (e.get("grants") or {}).values()
+                            if isinstance(g, dict))
+        generation = int(max(seen)) + 1
+        tx = _Txn(time.time(), generation, rev)
+        _prune_revocations(tx)
+        state = _canonical_state(raw, rev)
+        result = fn(state, tx)
+        if isinstance(result, dict):
+            state = result
+        persisted = {}
+        for ip, e in state.items():
+            if ip == _META_KEY:
+                continue
+            fe = _finalize_entry(ip, e)
+            if fe is not None:
+                persisted[ip] = fe
+        # THE MARK BEFORE ANYTHING THAT USES ITS VALUE. A crash after this line leaves a gap in
+        # the sequence, which nothing relies on; the reverse order could reuse a generation.
+        _atomic_write({"generation": generation}, _generation_file())
+        if tx.rev_changed:
+            # LEDGER FIRST. A crash between the two writes then leaves a revoked entry in the
+            # table that every reader already ignores -- never a missing tombstone. Written
+            # only when it changed: the hot path (session refresh) stays one file write.
+            tx.rev["generation"] = generation
+            _atomic_write(tx.rev, _revocations_file())
+        _atomic_write(persisted)
+        return persisted
 
 
 def _update_state(mutate) -> dict:
-    """Read, apply `mutate`, and write back as one operation.
+    """Read, apply `mutate`, and write back as one operation (see `_transact`).
 
-    Every writer goes through here so that no two of them can interleave a read with another's
-    write. `mutate` receives the loaded dict and returns the dict to persist.
+    `mutate` receives the canonical state dict and returns the dict to persist.
     """
-    with _STATE_LOCK:
-        state = mutate(_load_state()) or {}
-        _atomic_write(state)
-        return state
+    return _transact(lambda state, tx: mutate(state))
 
 
 def derive_identity(peer_host: str, xff_header_value: str) -> tuple[bool, str]:
@@ -370,14 +809,19 @@ def _session_authorized(entry: dict, sess: str, now: float) -> bool:
     return (now - last) < _session_ttl_s()
 
 
-def _touch_session(entry: dict, sess: str, now: float) -> dict:
-    """Record `sess` as authorized for this identity as of `now`. Bounded by recency, not
-    insertion order: a session used a minute ago must never be the one evicted to make room
-    for one that was merely recorded earlier and has been idle since."""
+def _touch_session(entry: dict, sess: str, now: float, grant_id: str = "") -> dict:
+    """Record `sess` as authorized for this identity as of `now`, bound to `grant_id` (the grant
+    whose password or token authorised it), so revoking that grant revokes the session. Bounded
+    by recency, not insertion order: a session used a minute ago must never be the one evicted
+    to make room for one that was merely recorded earlier and has been idle since."""
     if not sess:
         return entry
     sessions = dict(entry.get("sessions") or {})
     sessions[sess] = now
+    if grant_id:
+        bindings = dict(entry.get("session_grants") or {})
+        bindings[sess] = grant_id
+        entry["session_grants"] = bindings
     # DROP THE DEAD BEFORE EVICTING THE LIVING. A session past its TTL authorizes nothing --
     # `_session_authorized` rejects it on age regardless of whether it is still in this table --
     # so keeping it costs a slot that a session which WOULD have been honoured then loses. With
@@ -391,13 +835,22 @@ def _touch_session(entry: dict, sess: str, now: float) -> dict:
     if len(sessions) > cap:
         sessions = dict(sorted(sessions.items(), key=lambda kv: kv[1])[-cap:])
     entry["sessions"] = sessions
+    if "session_grants" in entry:
+        entry["session_grants"] = {s: g for s, g in (entry.get("session_grants") or {}).items()
+                                   if s in sessions}
     return entry
 
 
-def _maybe_touch_session(ip: str, sess: str) -> None:
+def _maybe_touch_session(ip: str, sess: str, token_digest: str = "") -> None:
     """Refresh `sess`'s authorization for `ip`, throttled so a hot path does not become a disk
     write on every gated call. A session refreshed within the last quarter of its TTL is left
-    alone; anything older, or not yet recorded, gets one bounded write."""
+    alone; anything older, or not yet recorded, gets one bounded write.
+
+    `token_digest` is the hash of the token that authorised this call, "" when the session
+    itself did. The session is bound to that token's grant, or keeps the grant it already has;
+    if that grant is gone by the time of the write (revoked meanwhile), nothing is recorded --
+    a refresh must never create authorisation the table no longer holds.
+    """
     if not sess:
         return
     now = time.time()
@@ -405,14 +858,31 @@ def _maybe_touch_session(ip: str, sess: str) -> None:
     last = (entry.get("sessions") or {}).get(sess)
     if isinstance(last, (int, float)) and (now - last) < (_session_ttl_s() / 4.0):
         return
+    wrote = {"ok": False}
 
-    def _add(state):
-        e = dict(state.get(ip) or {})
-        e = _touch_session(e, sess, now)
-        state[ip] = e
-        return state
+    def _add(state, tx):
+        e = state.get(ip)
+        if not e:
+            return
+        grants = e.get("grants") or {}
+        if token_digest:
+            gid = next((g for g, v in grants.items()
+                        if v.get("token_sha256") == token_digest), "")
+        else:
+            gid = (e.get("session_grants") or {}).get(sess, "")
+        if not gid or gid not in grants:
+            return
+        state[ip] = _touch_session(e, sess, now, gid)
+        wrote["ok"] = True
 
-    _update_state(_add)
+    try:
+        _transact(_add)
+    except (OSError, RuntimeError):
+        # A refresh is an optimisation of a call that has ALREADY passed the gate; failing it
+        # must not fail the call. The next gated call simply tries again.
+        return
+    if not wrote["ok"]:
+        return
     # AFTER the write, not inside `_add`: `_update_state` may run its callback more than once,
     # and a ledger is only honest if a row means the table really changed. See
     # lock_state.record_granted -- the sessions table is capped and keeps only the latest
@@ -445,18 +915,27 @@ def _token_matches(entry: dict, presented: str) -> bool:
 
 
 def enforce_unlock_token() -> bool:
-    """Whether a matching token is REQUIRED, or merely recorded when present.
+    """Whether a matching token (or a session recorded at unlock) is REQUIRED. Default ON (SEC-02).
 
-    Default off, and deliberately so. Requiring it is the fix; requiring it before anyone has
-    unlocked under the new scheme would lock out every existing session at once, including
-    unattended ones, and an outage is how a security change gets reverted wholesale instead of
-    kept. Turn it on -- MCP_REQUIRE_UNLOCK_TOKEN=1 -- once the operators have re-unlocked.
+    It used to default off, and while off a caller holding only the API key could state the
+    forwarded address of an unlocked client and be let through -- the second factor was
+    recorded (lock_state.record_token_gap) but not required. It was off "until the operators
+    have re-unlocked", and the counter that was to say when has said it. Measured 2026-09-24 on
+    the production host, whose .env sets MCP_REQUIRE_UNLOCK_TOKEN=1: the gap counter holds 154
+    identity-only passes (2026-08-18 .. 2026-09-13 11:05; 146 from the Copilot Studio connector
+    egress, 8 from RFC 5737 test ranges) and has not moved since. What the old default would
+    have let through in the last 7 days is instead in lock_refusals.jsonl: 20 refusals, 17
+    sessions, all from that one egress, all with no token and a session never recorded for the
+    identity; each of the 9 sessions dated after 'granted' events began (2026-09-22) had no
+    grant in that session before its refusal, and 5 of them unlocked in the same session right
+    after it and went on. Nobody who had unlocked in the conversation was refused.
 
-    While it is off the gate is exactly as weak as it was, and `token_ok` on every refusal
-    record says whether the call WOULD have passed, so the switch can be flipped on evidence
-    rather than on hope.
+    So the default is the enforcing one, and it is the default IN THE CODE, not only in the
+    .env template: an install whose .env never received the key (configure_env creates one
+    before bootstrap's backfill runs) must not be the one that stays open. Only the explicit
+    value "0" turns enforcement off; anything else, including an empty value, enforces.
     """
-    return os.environ.get("MCP_REQUIRE_UNLOCK_TOKEN") == "1"
+    return os.environ.get("MCP_REQUIRE_UNLOCK_TOKEN", "1").strip() != "0"
 
 
 #: THE EXIT FOR A CALLER THAT CANNOT UNLOCK, which both refusals below were missing.
@@ -513,15 +992,17 @@ def require_unlocked() -> str | None:
     is_local, ip = _parse_request(req)
     if is_local:
         return None
-    if is_unlocked(ip):
+    # ONE READ OF THE TABLE PER CALL. `is_unlocked` and the entry below used to read it twice;
+    # each read is now two files plus the tombstone pass, on every gated call.
+    entry = (_load_state() or {}).get(ip) or {}
+    now = time.time()
+    if entry and entry.get("expires_at", 0) > now:
         # THE IP GOT US THIS FAR; THE TOKEN IS WHAT MAKES IT A SECOND KEY. The IP came out of
         # a header the caller controls, so on its own it proves possession of the API key and
         # nothing else. A token was issued to whoever supplied the password, and only its hash
         # was kept.
-        entry = (_load_state() or {}).get(ip) or {}
         presented = presented_token()
         ok = _token_matches(entry, presented)
-        now = time.time()
         # THE SESSION PATH. See _MAX_SESSIONS_PER_IDENTITY's header comment for the incident
         # this closes: the model loses the per-call token on long turns (318 refusals / 4
         # days measured 2026-09-06; confirmed again 2026-09-09 with capacity ruled out --
@@ -541,7 +1022,8 @@ def require_unlocked() -> str | None:
                 # be switched on without an outage.
                 lock_state.record_token_gap(ip)
             elif sess:
-                _maybe_touch_session(ip, sess)
+                _maybe_touch_session(ip, sess, "" if via_session else
+                                     hashlib.sha256(presented.encode("utf-8")).hexdigest())
             return None
         # WHY THIS TOKEN FAILED, WITHOUT EVER LOGGING THE TOKEN. Neither this ledger nor
         # tool_ledger's could previously say whether a refused call presented no token at all
@@ -568,10 +1050,13 @@ def require_unlocked() -> str | None:
         # True here -- it would already have returned None above -- so only two causes remain.
         session_state = ("none (no Mcp-Session-Id available for this call)" if not sess
                          else "unrecognized-or-expired")
+        # WHAT TO DO, NOT WHAT IS WRONG. The measured case (2026-09-17..24) is a conversation
+        # that never unlocked -- or unlocked in an earlier conversation -- and the old text sent
+        # agents to look for the password in files. Say the one action that works.
         msg = (
-            f"[locked: no valid unlock token for {ip!r}] The identity in the forwarding "
-            "header is not sufficient on its own. Call unlock(password='<password>') and "
-            "pass the returned `unlock_token` with the call. " + _HANDOFF_HINT
+            f"[locked: no valid unlock token for {ip!r}] This conversation is not unlocked. "
+            "Call unlock(password='<password>') again now, in this conversation, then retry "
+            "with the returned unlock_token. " + _HANDOFF_HINT
         )
         lock_state.record_locked(ip, msg, presented_digest=presented_digest, tokens_held=held,
                                  session_state=session_state)
@@ -626,32 +1111,25 @@ def unlock(password: str) -> str:
     # stall or fail oddly). A plain local, closed over by _add below.
     sess = _current_session_fingerprint() if session_auth_enabled() else ""
 
-    def _add(state):
-        entry = dict(state.get(ip) or {})
-        hashes = [h for h in (entry.get("token_hashes") or []) if isinstance(h, str)]
-        # Carry a pre-multi-token entry across without losing it.
-        if entry.get("token_sha256") and entry["token_sha256"] not in hashes:
-            hashes.append(entry["token_sha256"])
-        hashes.append(digest)
-        entry.update({
-            "expires_at": max(float(entry.get("expires_at") or 0), expires),
-            "unlocked_at": time.time(),
-            # BOUNDED. Every unlock adds one; without a cap the file grows forever and each
-            # comparison walks all of it. The oldest go first -- they are the ones whose
-            # holders have already re-unlocked.
-            "token_hashes": hashes[-_MAX_TOKENS_PER_IDENTITY:],
-        })
-        entry.pop("token_sha256", None)
+    def _add(state, tx):
+        # ONE GRANT, WITH ITS OWN ID. Several per identity (see above); the token cap is applied
+        # per grant by `_finalize_entry` -- the oldest lose their tokens first, they are the
+        # ones whose holders have already re-unlocked.
+        entry = state.get(ip) or {"grants": {}, "session_grants": {}, "sessions": {}}
+        gid = uuid.uuid4().hex
+        entry.setdefault("grants", {})[gid] = {
+            "issued_at": tx.now, "expires_at": expires, "token_sha256": digest,
+            "via": "password", "generation": tx.generation}
         # ESTABLISH THE SESSION HERE TOO, not only on a later token-matched call. A successful
         # unlock() IS itself an authorization event (the password matched) -- if the model's
         # very next call already omits the token, this is what saves it, instead of requiring
         # one prior token-matched call to have happened first. See _MAX_SESSIONS_PER_IDENTITY.
+        # Bound to this grant, so revoking the grant revokes the session with it.
         if sess:
-            entry = _touch_session(entry, sess, time.time())
+            entry = _touch_session(entry, sess, tx.now, gid)
         state[ip] = entry
-        return state
 
-    _update_state(_add)
+    _transact(_add)
     if sess:
         # The password matched, so this is an authorization event in its own right -- the same
         # one `_touch_session` records in the capped table above, written where it cannot be
@@ -797,23 +1275,18 @@ def grant_ip(ip: str, ttl_days: float | None = None) -> dict:
     now = time.time()
     expires = now + ttl_days * 86400
 
-    def _add(state):
-        # ADDED TO THE IDENTITY'S TOKENS, not written over them. Vouching for one more client
-        # behind a shared address must not evict the ones already there -- that was a second
-        # way for two legitimate clients to lock each other out.
-        entry = dict(state.get(ip) or {})
-        hashes = [h for h in (entry.get("token_hashes") or []) if isinstance(h, str)]
-        if entry.get("token_sha256") and entry["token_sha256"] not in hashes:
-            hashes.append(entry["token_sha256"])
-        hashes.append(digest)
-        entry.update({"expires_at": max(float(entry.get("expires_at") or 0), expires),
-                      "unlocked_at": now, "granted_by": "cockpit",
-                      "token_hashes": hashes[-_MAX_TOKENS_PER_IDENTITY:]})
-        entry.pop("token_sha256", None)
+    def _add(state, tx):
+        # A NEW GRANT BESIDE THE IDENTITY'S OTHERS, not written over them. Vouching for one more
+        # client behind a shared address must not evict the ones already there -- that was a
+        # second way for two legitimate clients to lock each other out.
+        entry = state.get(ip) or {"grants": {}, "session_grants": {}, "sessions": {}}
+        entry.setdefault("grants", {})[uuid.uuid4().hex] = {
+            "issued_at": tx.now, "expires_at": expires, "token_sha256": digest,
+            "via": "cockpit", "generation": tx.generation}
+        entry["granted_by"] = "cockpit"
         state[ip] = entry
-        return state
 
-    _update_state(_add)
+    _transact(_add)
     return {"ip": ip, "expires_at": expires, "unlocked_at": now, "ttl_days": ttl_days,
             "unlock_token": token}
 
@@ -830,12 +1303,16 @@ def revoke_ip(ip: str) -> bool:
     # exclude each other are no lock at all for the pair.
     seen = {"existed": False}
 
-    def _drop(state):
-        seen["existed"] = ip in state
-        state.pop(ip, None)
-        return state
+    def _drop(state, tx):
+        # TOMBSTONED, NOT ONLY DROPPED. Dropping alone is what a stale copy written back by
+        # another process undid; the tombstones make every grant revoked here stay revoked for
+        # readers and writers alike, whatever copy of the table they later see. Recorded even
+        # when nothing is live, since a stale copy may still be on its way.
+        entry = state.pop(ip, None)
+        seen["existed"] = entry is not None
+        _record_revocation(tx, ip, entry)
 
-    _update_state(_drop)
+    _transact(_drop)
     return seen["existed"]
 
 
