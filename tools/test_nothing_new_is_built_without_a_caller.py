@@ -137,6 +137,15 @@ NO_CALLER_BUT_TESTED = {
     "relay/selfimprove/compare.py::transport_versions_differ",   # 3 lines
     "relay/selfimprove/guards.py::is_domain_general",            # 3 lines
     "tools/security.py::clear_presented_token",                  # 2 lines
+    # LOST ITS ONLY CALLER 2026-09-24 (e25b7a3, SEC-02/SEC-03): require_unlocked() used to read
+    # is_unlocked(ip) and then read the state table again for the token check; that commit
+    # folded both into one read of the table per call, per its own comment at the call site.
+    # tools/security.py is in the self-improvement frozen set (owner re-signed after e25b7a3),
+    # so removing the now-uncalled function is a separate, owner-authorized change -- not this
+    # one. Still exercised directly by tests/test_unlock_revocation.py and
+    # tests/test_unlock_oracle.py, which assert the unlock-state semantics (expiry, revocation)
+    # it implements. See docs/unreached_burndown.md.
+    "tools/security.py::is_unlocked",                            # 11 lines, 3 test refs
 }
 
 BASELINE = NO_CALLER_NO_TEST | NO_CALLER_BUT_TESTED
@@ -341,6 +350,7 @@ REASONS: dict[str, tuple[str, str]] = {
     "tools/judge_backend.py::sampling_judge_async": ("deliberate", "docs/unreached_burndown.md"),
     "tools/judge_backend.py::ask_human_async": ("deliberate", "docs/unreached_burndown.md"),
     "tools/security.py::clear_presented_token": ("deliberate", "docs/unreached_burndown.md"),
+    "tools/security.py::is_unlocked": ("deliberate", "docs/unreached_burndown.md"),
 
     # relay (other) / bridge / scripts.
     "bridge/session_store.py::search_turns": ("deliberate", "docs/unreached_burndown.md"),
