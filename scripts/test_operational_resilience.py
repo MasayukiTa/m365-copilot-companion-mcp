@@ -522,13 +522,15 @@ def test_the_update_step_reads_its_result_and_stops_after_replacing_itself():
     assert ":do_pull" not in git_block, "a label is back inside a parenthesised block"
 
 
-def test_an_unanswerable_access_prompt_records_the_safe_answer():
+def test_an_unanswerable_access_prompt_stops_instead_of_recording_n():
     """MEASURED: with stdin closed, `choice` prints "ERROR: The file is either empty or does not
-    contain the valid choices" and sets none of the branches, leaving the variable empty. The
-    effect was already safe -- nothing is granted -- but nothing said so, and the recorded
-    decision was a blank. An absent answer is the same answer as N and is written down as one."""
+    contain the valid choices" and sets none of the branches, leaving the variable empty. That
+    was once recorded as N and the run went on to end with a tunnel nothing could connect to
+    (new-PC report 2026-09-24). No answer is not an answer: it stops, recording nothing. Run for
+    real in scripts/test_install_path_batch.py::test_an_unanswered_access_prompt_stops_..."""
     qs = (ROOT / "quickstart.bat").read_text(encoding="utf-8")
-    assert 'if "!TUNNEL_ACCESS!"=="" set "TUNNEL_ACCESS=none"' in qs
+    assert 'if "!TUNNEL_ACCESS!"=="" set "TUNNEL_ACCESS=none"' not in qs
+    assert 'if "!TUNNEL_ACCESS!"=="" goto :access_unanswered' in qs
 
 
 def test_start_all_reports_its_failure_count_and_quickstart_reads_it():

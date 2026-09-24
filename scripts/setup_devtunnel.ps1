@@ -11,6 +11,8 @@
 #   .\setup_devtunnel.ps1                 # install+login+ensure tunnel, print the URL
 #   .\setup_devtunnel.ps1 -DeviceCode     # force device-code sign-in (no browser)
 #   .\setup_devtunnel.ps1 -TunnelName foo # use/create a specific tunnel name
+# Exit codes: 0 ready (URL recorded, an access grant in place); 1 failed; 3 set up and URL recorded
+# but NO access grant (none chosen); 4 the chosen grant (A/T) is not on the tunnel when read back.
 param(
     [string]$TunnelName = "",     # empty -> reuse the existing tunnel if there is one, else create a default
     # Entra/tenant-scoped access, applied instead of being printed as a command to type. Empty
@@ -82,14 +84,33 @@ function Get-AllowAnonymous {
 # Order: -ForceAnonymous (the A just pressed), then -TenantId (the T just answered), then the
 # standing MCP_TUNNEL_ALLOW_ANONYMOUS opt-in, else none. Anything but anonymous now also
 # revokes an existing anonymous grant (section 3b).
-function Resolve-AccessMode([bool]$forceAnonymous, [string]$tenantId, [bool]$allowAnonymousSetting) {
+#
+# THE RECORDED T, FOR A RUN WITH NO ARGUMENTS (2026-09-24). T is not written to .env, only to
+# .setup\tunnel_access_choice (quickstart), so this script run on its own -- which doctor,
+# heal_tunnel and start_all all tell people to do to recreate a tunnel -- resolved to "none" and
+# left a recreated tunnel with no grant. A recorded "tenant" is now the standing choice after the
+# anonymous opt-in; anonymous itself still needs MCP_TUNNEL_ALLOW_ANONYMOUS (the documented opt-in).
+function Get-RecordedAccessChoice {
+    $p = Join-Path $root ".setup\tunnel_access_choice"
+    if (-not (Test-Path -LiteralPath $p)) { return "" }
+    foreach ($ln in @(Get-Content -LiteralPath $p -ErrorAction SilentlyContinue)) {
+        if ($ln -match '^\s*access=(\w+)') { return $matches[1].ToLowerInvariant() }
+    }
+    return ""
+}
+function Resolve-AccessMode([bool]$forceAnonymous, [string]$tenantId, [bool]$allowAnonymousSetting, [string]$recordedChoice = "") {
     if ($forceAnonymous) { return "anonymous" }
     if (-not [string]::IsNullOrWhiteSpace($tenantId)) { return "tenant" }
     if ($allowAnonymousSetting) { return "anonymous" }
+    if ($recordedChoice -eq "tenant") { return "tenant" }
     return "none"
 }
 $anonSetting = Get-AllowAnonymous
-$AccessMode = Resolve-AccessMode $ForceAnonymous.IsPresent $TenantId $anonSetting
+$recordedChoice = Get-RecordedAccessChoice
+$AccessMode = Resolve-AccessMode $ForceAnonymous.IsPresent $TenantId $anonSetting $recordedChoice
+if (-not $ForceAnonymous.IsPresent -and [string]::IsNullOrWhiteSpace($TenantId) -and -not $anonSetting -and $AccessMode -eq "tenant") {
+    Write-Host "      Tenant-only access, as recorded by quickstart in .setup\tunnel_access_choice."
+}
 $AllowAnonymous = ($AccessMode -eq "anonymous")
 if ($ForceAnonymous.IsPresent) {
     Write-Host "      Anonymous access was chosen for this run (-ForceAnonymous)."
@@ -940,13 +961,51 @@ if ($AllowAnonymous) {
                 exit 1
             }
         }
-        Write-Host "      The id you entered ($TenantId) is not passed to devtunnel -- it grants the tenant of"
-        Write-Host ("      the signed-in account (" + $who + ").")
+        if ($TenantId) {
+            Write-Host "      The id you entered ($TenantId) is not passed to devtunnel -- it grants the tenant of"
+            Write-Host ("      the signed-in account (" + $who + ").")
+        }
     }
 }
 
 # --- 3c. SAY WHICH ACCESS THE TUNNEL ENDS THIS RUN WITH, read back from the service. ----------
+# NEVER "READY" WITH NO GRANT (2026-09-24, new-PC report: quickstart finished, doctor then said
+# "No access grant: nothing remote can connect", and the owner had to re-run and press A). Three
+# ways this script ended a run with grant none and exit 0: N (or a prompt nobody answered) chosen;
+# A chosen, `access create` answered "conflict" (tolerated as already-there) while the list read
+# back showed nothing -- a WARN only; T chosen and the read-back showed no entry. Now:
+#   * a read-back that fails is retried before it is believed,
+#   * A that does not show up is granted once more and re-read; still absent -> exit 4,
+#   * T that shows no allow entry at all -> exit 4,
+#   * none chosen -> the tunnel and its URL are still set up and recorded, and the run ends with
+#     exit 3 saying exactly what to choose (quickstart stops there instead of reporting success).
+# The exit codes are quickstart's to explain (bootstrap.py --tunnel-access-advice, EN + JA).
+function Test-AnyAllowEntry([string]$text) { return [bool]($text -match '(?m)^\s*\+\s*\S') }
 $FinalAccess = Get-TunnelAccessGrant $target $Port
+for ($try = 0; ($null -eq $FinalAccess) -and ($try -lt 2); $try++) {
+    Start-Sleep -Seconds 2
+    $FinalAccess = Get-TunnelAccessGrant $target $Port
+}
+if ($AccessMode -eq "anonymous" -and $FinalAccess -and $FinalAccess -ne "anonymous") {
+    Write-Host "      the anonymous grant does not show in the access list read back -> granting it again"
+    [void](Dt access create $target --anonymous)
+    [void](Dt access create $target -p $Port --anonymous)
+    $FinalAccess = Get-TunnelAccessGrant $target $Port
+}
+$accessUnapplied = $false
+if ($AccessMode -eq "anonymous" -and $FinalAccess -and $FinalAccess -ne "anonymous") { $accessUnapplied = $true }
+if ($AccessMode -eq "tenant" -and $FinalAccess -eq "none") {
+    $rawA = Read-AccessLevel $target 0
+    $rawB = Read-AccessLevel $target $Port
+    if (Test-AnyAllowEntry ([string]$rawA + "`n" + [string]$rawB)) {
+        # An allow entry whose wording this parse does not know (the tenant entry's exact text has
+        # not been observed on a real tunnel). It is a grant; it is not "none".
+        $FinalAccess = "tenant"
+        Write-Host "      (the tenant entry's wording was not recognised; an allow entry is present)"
+    } else {
+        $accessUnapplied = $true
+    }
+}
 Write-Host ""
 switch ($FinalAccess) {
     "anonymous" {
@@ -960,8 +1019,8 @@ switch ($FinalAccess) {
         Write-Host "          If STEP 5's connection test fails, run quickstart.bat again and choose A."
     }
     "none" {
-        Write-Host "  ACCESS: NONE -- no remote client (Copilot Studio included) can connect to this tunnel."
-        Write-Host "          To allow it, run quickstart.bat again and choose A (anonymous) or T (tenant)."
+        Write-Host "  ACCESS: NONE -- no remote client (Copilot Studio included) can connect to this tunnel." -ForegroundColor Yellow
+        Write-Host "          To allow it, run quickstart.bat again and choose A (anonymous) or T (tenant)." -ForegroundColor Yellow
     }
     default {
         Write-Host "  ACCESS: COULD NOT BE READ BACK ('devtunnel access list $target' failed)." -ForegroundColor Yellow
@@ -975,9 +1034,14 @@ if ($AccessMode -ne "anonymous" -and $FinalAccess -eq "anonymous") {
     Write-Host "         then run quickstart.bat again." -ForegroundColor Red
     exit 1
 }
-if ($AccessMode -eq "anonymous" -and $FinalAccess -and $FinalAccess -ne "anonymous") {
-    Write-Host "  WARN: anonymous access was chosen and granted without error, but the access list read" -ForegroundColor Yellow
-    Write-Host "        back does not show it. Check with:  devtunnel access list $target" -ForegroundColor Yellow
+if ($accessUnapplied) {
+    $key = "A"
+    if ($AccessMode -eq "tenant") { $key = "T" }
+    Write-Host "  ERROR: '$AccessMode' access was chosen, but the tunnel's access list read back shows no" -ForegroundColor Red
+    Write-Host "         such grant, so nothing remote can connect. Run quickstart.bat again and press $key;" -ForegroundColor Red
+    Write-Host "         if this repeats, look at:  devtunnel access list $target   and" -ForegroundColor Red
+    Write-Host "                                    devtunnel access list $target -p $Port" -ForegroundColor Red
+    exit 4
 }
 
 # --- 4. host the tunnel so the public URL is assigned, then surface it ------------------------
@@ -1063,6 +1127,15 @@ try {
         # -Encoding UTF8 emits a BOM that breaks the .env parser.
         [IO.File]::WriteAllLines($envPath, $lines, (New-Object System.Text.UTF8Encoding($false)))
         Write-Host "Recorded MCP_TUNNEL_NAME and MCP_TUNNEL_URL in .env."
+        if ($FinalAccess -eq "none") {
+            # Set up, recorded -- and NOT ready: no grant was chosen (see 3c). Exit 3, never 0.
+            Write-Host ""
+            Write-Host "NOT READY: the tunnel has NO access grant, so Copilot Studio cannot connect to it." -ForegroundColor Yellow
+            Write-Host "  Run quickstart.bat again and press A (anonymous -- what a Copilot Studio connector" -ForegroundColor Yellow
+            Write-Host "  using an API key needs; the Bearer token is the only gate) or T (your Entra tenant" -ForegroundColor Yellow
+            Write-Host "  only; not verified to work with an API-key connector)." -ForegroundColor Yellow
+            exit 3
+        }
     } else {
         Write-Host "ERROR: .env not found at $envPath -- cannot record MCP_TUNNEL_URL."
         exit 1

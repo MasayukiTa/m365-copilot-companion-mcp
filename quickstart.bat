@@ -223,21 +223,36 @@ echo                    and shell tools are then on the public internet, gated
 echo                    ONLY by your Bearer token. Simplest, and least private.
 echo   [T] Tenant     - only accounts in the Entra tenant of the Microsoft account
 echo                    you sign devtunnel in with in STEP 4. More restrictive.
-echo   [N] Neither    - decide later. Copilot Studio will NOT connect until you do.
+echo   [N] Neither    - decide later. Copilot Studio will NOT connect, and quickstart
+echo                    STOPS after STEP 4 until you choose A or T.
 echo.
 set "TUNNEL_ACCESS="
 set "TENANT_ID="
 choice /C ATN /N /M "   Press A, T or N: "
 REM Read errorlevel IMMEDIATELY -- choice sets it (A=1, T=2, N=3) and any command
 REM in between resets it. Delayed expansion is on, so !ERRORLEVEL! is the runtime value.
-if "!ERRORLEVEL!"=="1" set "TUNNEL_ACCESS=anonymous"
-if "!ERRORLEVEL!"=="2" set "TUNNEL_ACCESS=tenant"
-if "!ERRORLEVEL!"=="3" set "TUNNEL_ACCESS=none"
-REM MEASURED: with stdin closed, `choice` prints "ERROR: The file is either empty or does not
-REM contain the valid choices" and sets none of the above, leaving this empty. The effect was
-REM already safe -- nothing is granted -- but nothing SAID so either, and the recorded decision
-REM was a blank. An absent answer is the same answer as N, and is now written down as one.
-if "!TUNNEL_ACCESS!"=="" set "TUNNEL_ACCESS=none"
+set "QS_CHOICE=!ERRORLEVEL!"
+if "!QS_CHOICE!"=="1" set "TUNNEL_ACCESS=anonymous"
+if "!QS_CHOICE!"=="2" set "TUNNEL_ACCESS=tenant"
+if "!QS_CHOICE!"=="3" set "TUNNEL_ACCESS=none"
+REM NO ANSWER IS NOT N (2026-09-24). MEASURED: with stdin closed, `choice` prints "ERROR: The file
+REM is either empty or does not contain the valid choices" and sets none of the above. That used
+REM to be recorded as N, the run went on, and it ended with a tunnel nothing could connect to
+REM (new-PC report: doctor said "No access grant", the owner re-ran and pressed A). Nobody chose
+REM anything, so nothing is recorded or changed: stop and say which key to press.
+if "!TUNNEL_ACCESS!"=="" goto :access_unanswered
+REM N IS CONFIRMED. A key pressed while STEP 1 was still installing waits in the console buffer
+REM and is read by `choice` the moment it runs -- an N nobody meant ends the run with no grant.
+if not "!TUNNEL_ACCESS!"=="none" goto :access_confirmed
+echo.
+echo   You pressed N: the tunnel gets NO access grant, nothing remote can connect, and
+echo   quickstart stops after STEP 4. Press N again to confirm, or A / T to choose now.
+choice /C ATN /N /M "   Press N to confirm, or A or T: "
+set "QS_CHOICE=!ERRORLEVEL!"
+if "!QS_CHOICE!"=="1" set "TUNNEL_ACCESS=anonymous"
+if "!QS_CHOICE!"=="2" set "TUNNEL_ACCESS=tenant"
+if not "!QS_CHOICE!"=="1" if not "!QS_CHOICE!"=="2" if not "!QS_CHOICE!"=="3" goto :access_unanswered
+:access_confirmed
 REM NO TENANT ID IS ASKED ANY MORE (D16). `devtunnel access create --help` (CLI 1.0.1516) shows
 REM --tenant is a FLAG meaning "the signed-in account's tenant"; it takes no id, so the GUID this
 REM prompted for was never usable and setup_devtunnel.ps1 no longer passes one. A non-empty
@@ -280,8 +295,8 @@ if not "!ANON_REMOVED!"=="removed" if not "!ANON_REMOVED!"=="absent" (
 echo   Any anonymous access already granted on the tunnel by an earlier run is REVOKED by
 echo   STEP 4 ^(setup_devtunnel^) now, so the tunnel is not left open to the internet.
 if "!TUNNEL_ACCESS!"=="none" (
-    echo   Recorded: no access grant. STEP 5's connection test will fail until you re-run
-    echo   quickstart.bat and choose A or T.
+    echo   Recorded: no access grant. STEP 4 still sets the tunnel up, then quickstart stops:
+    echo   nothing remote can connect until you re-run quickstart.bat and choose A or T.
 )
 goto :after_access_write
 :access_anonymous
@@ -308,6 +323,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\setup_devtunne
 REM Capture the Dev Tunnel setup exit code BEFORE any other command: a plain
 REM `set` succeeds and would RESET errorlevel to 0, so we must grab it first.
 set "DT_RC=%ERRORLEVEL%"
+REM 3 = set up with NO access grant (N); 4 = the chosen grant is not on the tunnel. Either way
+REM nothing remote can connect, so the run STOPS here rather than going on to STEP 5 and ending
+REM on a tunnel Copilot Studio cannot reach. The Japanese text comes from bootstrap.py (cmd
+REM corrupts non-ASCII in this file).
+if "%DT_RC%"=="3" goto :access_none_stop
+if "%DT_RC%"=="4" goto :access_unapplied_stop
 if not "%DT_RC%"=="0" (
     echo.
     echo Dev Tunnel setup did not finish. Read the message above, fix it, then
@@ -601,6 +622,33 @@ REM ---- subroutines and early exits (never reached by falling through) --------
 :release_lock
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\quickstart_lock.ps1" release >nul 2>nul
 exit /b 0
+
+:access_unanswered
+echo.
+echo   STOPPED: the access question got no answer ^(no keyboard input reached it^).
+echo   Nothing was granted or changed. Double-click quickstart.bat and press A or T.
+"!QS_PY!" scripts\bootstrap.py --tunnel-access-advice unanswered 2>nul
+call :release_lock
+pause
+exit /b 3
+
+:access_none_stop
+echo.
+echo   STOPPED: the Dev Tunnel has NO access grant, so Copilot Studio cannot connect.
+echo   Run quickstart.bat again and press A ^(anonymous^) or T ^(tenant^).
+"!QS_PY!" scripts\bootstrap.py --tunnel-access-advice none 2>nul
+call :release_lock
+pause
+exit /b 3
+
+:access_unapplied_stop
+echo.
+echo   STOPPED: the access you chose is not on the Dev Tunnel when read back.
+echo   Run quickstart.bat again and press the same key.
+"!QS_PY!" scripts\bootstrap.py --tunnel-access-advice unapplied 2>nul
+call :release_lock
+pause
+exit /b 4
 
 :qs_bad_unc
 echo.
