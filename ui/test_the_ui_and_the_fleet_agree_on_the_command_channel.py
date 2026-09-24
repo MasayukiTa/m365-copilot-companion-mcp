@@ -125,6 +125,18 @@ def test_every_field_survives_from_the_window_to_the_worker(sender, tmp_path):
         "the conversation id the window put on the command did not reach the worker"
 
 
+def test_what_the_ui_wrote_passes_the_fleets_schema(sender, tmp_path):
+    """The fleet validates every command before applying it (SEC-08). A schema stricter than
+    the real writer would refuse the cockpit, so the compiled writer's own bytes go through
+    the same gate _apply_command uses."""
+    from relay import fleet_runner as FR
+
+    _send(sender, tmp_path, resume_conv="sess:11111111-2222-3333-4444-555555555555")
+    cmd = FR.read_commands(str(tmp_path))[0]
+    box = []
+    assert FR.admit_command(cmd, str(tmp_path), box, log=lambda m: None), box
+
+
 def test_nothing_half_written_is_ever_visible(sender, tmp_path):
     """読み手は `.tmp` を飛ばす。書き手がその名前で置いて rename することが前提。"""
     _send(sender, tmp_path)

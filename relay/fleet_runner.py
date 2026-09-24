@@ -35,7 +35,9 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import math as _math
 import os
+import re as _re
 import sys
 
 from relay import outcomes as _outcomes
@@ -1363,7 +1365,7 @@ def _close_idle_copilot_pages(context) -> int:
 
 def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paused=False,
               ram_floor_mb=0.0, directive="", run_label="", goal_count=0, queued=0,
-              reunlock=None):
+              reunlock=None, command_rejections=None):
     from relay.relay_fleet import free_disk_gb
     total = len(workers)        # dynamic: goals can be added mid-run (native chat queue)
     done = sum(1 for w in workers if w.status in TERMINAL)
@@ -1412,6 +1414,11 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         # NEVER a password: apply_reunlock builds "reason" only from deliver_steers' own log
         # lines, which never format the turn text.
         "reunlock": reunlock,
+        # COMMANDS THIS RUN REFUSED (SEC-08), newest last, at most MAX_REJECTIONS_KEPT:
+        # {"ts","keys","errors"} from record_command_rejection. A command that fails the
+        # channel's schema is not applied at all, and without this a refused pause or floor
+        # change would look exactly like one the fleet ignored. Keys and reasons only.
+        "command_rejections": list(command_rejections or []),
         # Fleet-level directive (Bucket B): the single authoritative goal text when this run
         # was started from exactly one goal; "" when there are multiple independent goals (the
         # UI already handles multi-goal honestly and should NOT fabricate a summary). Only
@@ -1841,6 +1848,330 @@ def _watchdog_should_reset(status, stalled_s, now=None):
 
 COMMANDS_DIR = "commands.d"
 
+#: Where landing receipts go: <state_dir>/acks/<jid>.ack. The same layout relay/task_router's
+#: _ack_path builds on the sending side.
+ACKS_DIR = "acks"
+
+# ---------------------------------------------------------------- the command channel's schema
+#
+# EVERY FIELD IS CHECKED BEFORE ANY OF IT IS APPLIED (SEC-08). _apply_command used to take
+# whatever a file in commands.d/ said: a disk floor of 1e9 GB or -5, a RAM floor of NaN, a
+# steer of any size, an `ack` that named any path on the machine. Each field was coerced where
+# it was used and a bad one was swallowed by a blanket except -- so a malformed command did
+# half of what it said and nobody was told. Now a command either passes whole or is refused
+# whole, and the refusal is recorded where the operator looks (status.json's
+# `command_rejections`, the fleet console, and the landing receipt when there is one).
+#
+# THE NUMERIC BOUNDS ARE THE SETTINGS PANEL'S OWN. ui/FleetCockpit.cs clamps SetDiskFloor to
+# [0, 100] GB, SetRamFloor to [0, 65536] MB, and maxtabs / autoscale_max to [1, 100] (both at
+# load and on every change). A value the panel cannot produce is not one the channel accepts:
+# the file is not a second, wider settings UI. 0 stays legal for the disk floor because the
+# panel's own 強制開始 button sends exactly that.
+
+DISK_FLOOR_GB_BOUNDS = (0.0, 100.0)
+RAM_FLOOR_MB_BOUNDS = (0.0, 65536.0)
+TABS_BOUNDS = (1, 100)
+#: Goal / steer text. Generous: the chat window sends a pasted instruction verbatim.
+MAX_COMMAND_TEXT = 100_000
+#: A worker name, a reunlock target.
+MAX_NAME = 64
+#: A conversation reference or a working directory.
+MAX_REF = 4096
+#: Entries in one list-valued field (close, steer, add_goal).
+MAX_ITEMS = 200
+MAX_CHECKS = 50
+MAX_CHECKS_JSON = 65_536
+
+_COMMAND_KEYS = frozenset({
+    "close", "set_maxtabs", "set_disk_floor_gb", "set_ram_floor_mb", "set_autoscale",
+    "steer", "reunlock", "add_goal", "pause", "stop", "ack",
+})
+_AUTOSCALE_KEYS = frozenset({"on", "max", "default"})
+_STEER_KEYS = frozenset({"worker", "text"})
+#: Exactly the fields goals_from_command carries through.
+_GOAL_KEYS = frozenset({"text", "priority", "checks", "cwd", "jid", "follow_up_to",
+                        "resume_conv", "new_task"})
+
+#: A job id / ack stem: what task_router mints (uuid hex) with room for other callers' ids,
+#: and nothing that can name a different directory or a device.
+_ID_RE = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_WIN_DEVICE_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL"] + ["COM%d" % i for i in range(1, 10)]
+    + ["LPT%d" % i for i in range(1, 10)])
+_CONTROL = _re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _is_number(v) -> bool:
+    return (isinstance(v, (int, float)) and not isinstance(v, bool)
+            and _math.isfinite(v))
+
+
+def _is_whole(v) -> bool:
+    return _is_number(v) and float(v).is_integer()
+
+
+def _is_flag(v) -> bool:
+    return isinstance(v, bool) or (isinstance(v, int) and v in (0, 1))
+
+
+def _is_name(v, allow_empty=True) -> bool:
+    return (isinstance(v, str) and len(v) <= MAX_NAME and not _CONTROL.search(v)
+            and (allow_empty or bool(v.strip())))
+
+
+def _is_safe_id(v) -> bool:
+    return (isinstance(v, str) and bool(_ID_RE.match(v))
+            and v.split(".")[0].upper() not in _WIN_DEVICE_NAMES)
+
+
+def _text_ok(v, limit=MAX_COMMAND_TEXT) -> bool:
+    return isinstance(v, str) and len(v) <= limit
+
+
+def _in(v, bounds) -> bool:
+    return bounds[0] <= v <= bounds[1]
+
+
+def _ack_name(claimed):
+    """The receipt's file name taken from a command's `ack`, or None if it is not one."""
+    if not isinstance(claimed, str) or not claimed or len(claimed) > MAX_REF:
+        return None
+    name = claimed.replace("\\", "/").rsplit("/", 1)[-1]
+    if not name.endswith(".ack") or not _is_safe_id(name[:-len(".ack")]):
+        return None
+    return name
+
+
+def _same_dir(a, b) -> bool:
+    """Whether two paths name ONE directory: by file identity when both exist, else by their
+    fully resolved, case-folded spelling. Spelling alone would be fooled by 8.3 names and
+    junctions; identity alone cannot speak about a directory not created yet."""
+    try:
+        if os.path.isdir(a) and os.path.isdir(b):
+            return os.path.samefile(a, b)
+        return (os.path.normcase(os.path.realpath(a))
+                == os.path.normcase(os.path.realpath(b)))
+    except (OSError, ValueError):
+        return False
+
+
+def ack_receipt_path(state_dir, claimed):
+    """Where the landing receipt for a command whose `ack` says `claimed` is written, or None.
+
+    DERIVED HERE, NEVER TAKEN FROM THE FILE (SEC-08). read_commands used to makedirs() and
+    open(..., "w") whatever path the command named, so anything able to drop a JSON file into
+    commands.d/ could create directories and overwrite files anywhere this account can write,
+    including outside a folder the MCP file tools were scoped to. The receipt now always lands
+    in <state_dir>/acks/, under a file name checked to be a plain id; and a command whose
+    `ack` names any OTHER directory is refused rather than quietly redirected, because that is
+    not a sender that knows where this fleet lives.
+    """
+    name = _ack_name(claimed)
+    if name is None:
+        return None
+    acks = os.path.join(state_dir, ACKS_DIR)
+    if not _same_dir(os.path.dirname(claimed) or ".", acks):
+        return None
+    return os.path.join(acks, name)
+
+
+def validate_command(cmd, state_dir=None) -> list:
+    """Every reason `cmd` may not be applied; [] means it may. Never raises.
+
+    Strict on purpose: an unknown key is an error, not something to skip, because the
+    alternative is a command that did half of what its sender meant while reporting nothing.
+    Error strings name keys and limits, never the text a field carried -- a steer or a goal
+    is the operator's words and has no business in status.json. With `state_dir`, an `ack`
+    is also checked to name that state dir's own acks/ directory (see ack_receipt_path).
+    """
+    try:
+        return _validate_command(cmd, state_dir)
+    except Exception as exc:                           # a validator bug refuses, never admits
+        return ["validator error: %s" % type(exc).__name__]
+
+
+def _validate_command(cmd, state_dir):
+    if not isinstance(cmd, dict):
+        return ["command is %s, not an object" % type(cmd).__name__]
+    errs = []
+    if not cmd:
+        errs.append("empty command")
+    for k in cmd:
+        if k not in _COMMAND_KEYS:
+            errs.append("unknown key %r" % _CONTROL.sub("?", str(k))[:40])
+
+    def _items(key, v):
+        items = v if isinstance(v, list) else [v]
+        if len(items) > MAX_ITEMS:
+            errs.append("%s: %d entries, limit %d" % (key, len(items), MAX_ITEMS))
+            return []
+        return items
+
+    if "close" in cmd:
+        v = cmd["close"]
+        if not isinstance(v, list) or len(v) > MAX_ITEMS:
+            errs.append("close: must be a list of at most %d worker names" % MAX_ITEMS)
+        elif not all(_is_name(n, allow_empty=False) for n in v):
+            errs.append("close: every entry must be a worker name (1-%d chars)" % MAX_NAME)
+    if "set_maxtabs" in cmd:
+        v = cmd["set_maxtabs"]
+        if not (_is_whole(v) and _in(v, TABS_BOUNDS)):
+            errs.append("set_maxtabs: must be a whole number in [%d, %d]" % TABS_BOUNDS)
+    if "set_disk_floor_gb" in cmd:
+        v = cmd["set_disk_floor_gb"]
+        if not (_is_number(v) and _in(v, DISK_FLOOR_GB_BOUNDS)):
+            errs.append("set_disk_floor_gb: must be a number in [%g, %g]" % DISK_FLOOR_GB_BOUNDS)
+    if "set_ram_floor_mb" in cmd:
+        v = cmd["set_ram_floor_mb"]
+        if not (_is_number(v) and _in(v, RAM_FLOOR_MB_BOUNDS)):
+            errs.append("set_ram_floor_mb: must be a number in [%g, %g]" % RAM_FLOOR_MB_BOUNDS)
+    if "set_autoscale" in cmd:
+        v = cmd["set_autoscale"]
+        if not isinstance(v, dict):
+            errs.append("set_autoscale: must be an object")
+        else:
+            extra = sorted(str(k)[:20] for k in v if k not in _AUTOSCALE_KEYS)
+            if extra:
+                errs.append("set_autoscale: unknown key(s) %s" % extra[:5])
+            if "on" in v and not _is_flag(v["on"]):
+                errs.append("set_autoscale.on: must be true/false or 0/1")
+            for sub in ("max", "default"):
+                # None / 0 mean "not given" -- the reader has always skipped a falsy value.
+                if sub in v and v[sub] not in (None, 0) and not (
+                        _is_whole(v[sub]) and _in(v[sub], TABS_BOUNDS)):
+                    errs.append("set_autoscale.%s: must be a whole number in [%d, %d]"
+                                % ((sub,) + TABS_BOUNDS))
+    if "steer" in cmd:
+        for it in _items("steer", cmd["steer"]):
+            if isinstance(it, str):
+                ok = _text_ok(it)
+            elif isinstance(it, dict):
+                ok = (not (set(it) - _STEER_KEYS)
+                      and (it.get("worker") is None or _is_name(it.get("worker")))
+                      and _text_ok(it.get("text", "")))
+            else:
+                ok = False
+            if not ok:
+                errs.append("steer: each entry must be text or {worker, text} "
+                            "(worker <= %d chars, text <= %d chars)" % (MAX_NAME, MAX_COMMAND_TEXT))
+                break
+    if "reunlock" in cmd:
+        v = cmd["reunlock"]
+        if v is not None and not _is_name(v):
+            errs.append("reunlock: must be a worker name, \"\" or \"*\"")
+    if "add_goal" in cmd:
+        for it in _items("add_goal", cmd["add_goal"]):
+            why = _goal_item_error(it)
+            if why:
+                errs.append("add_goal: " + why)
+                break
+    for key in ("pause", "stop"):
+        if key in cmd and not _is_flag(cmd[key]):
+            errs.append("%s: must be true/false" % key)
+    if "ack" in cmd:
+        if _ack_name(cmd["ack"]) is None:
+            errs.append("ack: must name <state>/acks/<id>.ack")
+        elif state_dir is not None and ack_receipt_path(state_dir, cmd["ack"]) is None:
+            errs.append("ack: names a directory other than this fleet's acks/")
+    return errs
+
+
+def _goal_item_error(it):
+    if isinstance(it, str):
+        return "" if _text_ok(it) else "text longer than %d chars" % MAX_COMMAND_TEXT
+    if not isinstance(it, dict):
+        return "an entry is %s, not text or an object" % type(it).__name__
+    extra = sorted(str(k)[:20] for k in it if k not in _GOAL_KEYS)
+    if extra:
+        return "unknown key(s) %s" % extra[:5]
+    if it.get("text") is not None and not _text_ok(it["text"]):
+        return "text must be a string of at most %d chars" % MAX_COMMAND_TEXT
+    if it.get("follow_up_to") is not None and not _text_ok(it["follow_up_to"]):
+        return "follow_up_to must be a string of at most %d chars" % MAX_COMMAND_TEXT
+    for key in ("cwd", "resume_conv"):
+        v = it.get(key)
+        if v is not None and not (_text_ok(v, MAX_REF) and not _CONTROL.search(v)):
+            return "%s must be a string of at most %d chars" % (key, MAX_REF)
+    for key in ("priority", "new_task"):
+        if it.get(key) is not None and not _is_flag(it[key]):
+            return "%s must be true/false" % key
+    if it.get("jid") is not None and not _is_safe_id(it["jid"]):
+        return "jid must be a plain id"
+    checks = it.get("checks")
+    if checks is not None:
+        rows = checks if isinstance(checks, list) else [checks]
+        if not all(isinstance(c, dict) for c in rows) or len(rows) > MAX_CHECKS:
+            return "checks must be an object or a list of at most %d objects" % MAX_CHECKS
+        try:
+            size = len(json.dumps(checks, ensure_ascii=False))
+        except (TypeError, ValueError):
+            return "checks are not serialisable"
+        if size > MAX_CHECKS_JSON:
+            return "checks larger than %d bytes" % MAX_CHECKS_JSON
+    return ""
+
+
+#: How many refused commands status.json keeps. Enough to see a pattern, bounded so a flood of
+#: bad files cannot grow the file the cockpit re-reads every second.
+MAX_REJECTIONS_KEPT = 20
+
+
+def record_command_rejection(box, cmd, errors, log=None):
+    """Remember a refused command in `box` (surfaced as status.json's `command_rejections`)
+    and say so on the console. Records the command's KEYS and the reasons, never its values:
+    a steer or a goal is the operator's own words."""
+    say = log or (lambda m: print(m, flush=True))
+    keys = (sorted(_CONTROL.sub("?", str(k))[:40] for k in cmd)[:12]
+            if isinstance(cmd, dict) else [])
+    row = {"ts": time.time(), "keys": keys, "errors": list(errors)[:10]}
+    box.append(row)
+    del box[:-MAX_REJECTIONS_KEPT]
+    say("[command] REJECTED %s: %s" % (",".join(keys) or "(no keys)", "; ".join(row["errors"])))
+    return row
+
+
+def admit_command(cmd, state_dir, rejections, log=None) -> bool:
+    """The gate _apply_command passes every command through before touching anything.
+    True: apply it. False: it was refused and the refusal is already in `rejections`."""
+    errs = validate_command(cmd, state_dir)
+    if errs:
+        record_command_rejection(rejections, cmd, errs, log=log)
+        return False
+    return True
+
+
+def _write_receipt(state_dir, claimed, body) -> bool:
+    """Drop a landing receipt at the derived path. Never follows what already sits there.
+
+    Written to a temp file in acks/ and renamed over the target, so a link or a hard link
+    planted at the receipt's name is REPLACED, not written through. And acks/ itself must
+    resolve to a directory whose parent is the state dir: a junction put in its place would
+    otherwise carry the write somewhere else.
+    """
+    target = ack_receipt_path(state_dir, claimed)
+    if target is None:
+        return False
+    acks = os.path.dirname(target)
+    tmp = None
+    try:
+        os.makedirs(acks, exist_ok=True)
+        if not _same_dir(os.path.dirname(os.path.realpath(acks)), state_dir):
+            print("[command] ack NOT written: %s does not resolve inside the state dir"
+                  % ACKS_DIR, flush=True)
+            return False
+        tmp = "%s.%d.%d.tmp" % (target, os.getpid(), time.time_ns())
+        with open(tmp, "w", encoding="utf-8", newline="\n") as afh:
+            json.dump(body, afh, ensure_ascii=False)
+        os.replace(tmp, target)
+        return True
+    except OSError:
+        if tmp is not None:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return False
+
 
 def read_commands(state_dir) -> list:
     """Every pending command for this run, oldest first, CONSUMED as it is read.
@@ -1919,15 +2250,21 @@ def read_commands(state_dir) -> list:
         # could never be checked. When a command carries an `ack` path, drop a small
         # receipt there the moment before we delete the command: an audit can then tell a
         # goal a live fleet really picked up from one that vanished into the stale window.
+        #
+        # THE RECEIPT'S LOCATION IS DERIVED, NOT OBEYED (SEC-08): see ack_receipt_path. An
+        # `ack` naming anywhere but this state dir's acks/ gets no receipt, and the command it
+        # rode on is refused by _apply_command's validation. A command that is refused for any
+        # other reason still gets its receipt -- it WAS read, which is all a receipt claims --
+        # and the receipt says it was rejected and why, so the sender is not left re-sending.
         ack = (cmd or {}).get("ack") if isinstance(cmd, dict) else None
         if isinstance(ack, str) and ack:
-            try:
-                os.makedirs(os.path.dirname(ack), exist_ok=True)
-                with open(ack, "w", encoding="utf-8", newline="\n") as afh:
-                    json.dump({"read": True, "ts": time.time(), "file": name}, afh,
-                              ensure_ascii=False)
-            except OSError:
-                pass
+            body = {"read": True, "ts": time.time(), "file": name}
+            errs = validate_command(cmd, state_dir)
+            if errs:
+                body.update({"rejected": True, "errors": errs[:10]})
+            if not _write_receipt(state_dir, ack, body):
+                print("[command] no landing receipt for %s: its ack names no file in this "
+                      "fleet's %s/, or the write failed" % (name, ACKS_DIR), flush=True)
         try:
             os.remove(path)
         except OSError:
@@ -2600,6 +2937,8 @@ def main():
     reunlock_box = [None]               # last {"reunlock":...} outcome -- see apply_reunlock;
                                        # surfaced in status.json so the operator can tell whether
                                        # the button worked rather than watching silence
+    rejections_box = []                # commands refused by validate_command -- surfaced in
+                                       # status.json as command_rejections (SEC-08)
 
     def _drain_commands(workers):
         # cockpit -> fleet control channel. {"close":["w2"], "set_maxtabs":5}. Consume.
@@ -2610,6 +2949,11 @@ def main():
             _apply_command(cmd, workers)
 
     def _apply_command(cmd, workers):
+        # WHOLE OR NOT AT ALL (SEC-08). Checked before anything below touches a box, so a
+        # command with one bad field cannot half-apply; see validate_command for the schema
+        # and the settings-panel bounds it enforces.
+        if not admit_command(cmd, args.state_dir, rejections_box):
+            return
         try:
             by_name = {w.name: w for w in workers}
             for nm in cmd.get("close", []):
@@ -2692,8 +3036,9 @@ def main():
             # graceful stop: {"stop": true} cancels every worker and ends the run.
             if cmd.get("stop"):
                 stop_box[0] = True
-        except Exception:
-            pass
+        except Exception as exc:
+            print("[command] applying a validated command failed part-way: %s"
+                  % type(exc).__name__, flush=True)
 
     convs_path = os.path.join(args.state_dir, "conversations.json")
 
@@ -2814,7 +3159,8 @@ def main():
                                                  # a split's children live here until the
                                                  # next sweep admits them.
                                                  queued=len(add_box or []),
-                                                 reunlock=reunlock_box[0]))
+                                                 reunlock=reunlock_box[0],
+                                                 command_rejections=rejections_box))
         except Exception:
             pass
         _print_table(workers)

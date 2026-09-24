@@ -2268,12 +2268,27 @@ def _redact_unlock_password(text):
     対象は解錠パスワードだけではない。エージェントが .env の中身を読み上げた回が
     あり、API キーと HF トークンまで転写ログに平文で残っていた。名前で拾う共通の
     仕組みに寄せて、鍵が増えても取りこぼさないようにする。
+
+    FAILS CLOSED. The except here used to return the ORIGINAL text, so a redactor that could
+    not be imported or raised put the injected unlock password into the session ledger in
+    clear. It now returns _REDACTION_FAILED_MARKER and logs the failure. Only the ledger copy
+    is withheld: the turn was sent before this runs, from the unredacted text.
     """
     try:
         from tools.secret_store import redact_secrets
         return redact_secrets(text)
-    except Exception:
-        return text or ""
+    except Exception as exc:
+        try:
+            logger.warning("ledger redaction failed (%s); wrote %r instead of the text",
+                           type(exc).__name__, _REDACTION_FAILED_MARKER)
+        except Exception:
+            pass
+        return _REDACTION_FAILED_MARKER
+
+
+#: tools.secret_store.REDACTION_FAILED_MARKER, repeated for the case where that module could not
+#: be imported at all. A test holds the two equal.
+_REDACTION_FAILED_MARKER = "[redaction failed: content withheld]"
 
 
 def _persist_exchange(sid, user_msg, final_text):
