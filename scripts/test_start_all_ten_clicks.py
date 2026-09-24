@@ -102,7 +102,13 @@ def make_copy_text(src: str, lock_name: str) -> str:
     out = out[:j] + "\n    Invoke-TestBringUp; return" + out[j:]
     k = out.index("# Drive startup. Prefer a MODAL splash")
     assert out.count("# Drive startup. Prefer a MODAL splash") == 1
-    return out[:k] + TEST_HOOKS + "\n" + out[k:]
+    out = out[:k] + TEST_HOOKS + "\n" + out[k:]
+    # AND right before the entry decision, which runs near the TOP of the script, above the real
+    # Start-Splash etc. -- hence the hooks twice: this copy wins over the banner/notice functions
+    # the leaving path calls, the later one over the definitions that come after the entry.
+    e = out.index("# ONE STARTUP AT A TIME, DECIDED")
+    assert out.count("# ONE STARTUP AT A TIME, DECIDED") == 1
+    return out[:e] + TEST_HOOKS + "\n" + out[e:]
 
 
 def build_tree(base: Path, start_all_text: str) -> Path:
@@ -225,6 +231,13 @@ def summarize(tree: Path, runs: list, t_launch: float, t_all_done: float) -> dic
         "leaver_max_s": max(leavers) if leavers else None,
         "leaver_total_max_s": max(leaver_totals) if leaver_totals else None,
         "wall_s": round(t_all_done - t_launch, 1),
+        # Which leaving copies showed nothing (neither brought a banner forward nor the notice),
+        # and what each leaving copy's UI step was -- so a count that is off says who and why.
+        "leavers_without_ui": sorted(r["pid"] for r in runs if r.get("outcome") == "already running"
+                                     and not any(e["pid"] == r["pid"] and e["kind"] in ("front", "notice")
+                                                 for e in ev)),
+        "ui_events": sorted("%s:%s:%s" % (e["pid"], e["kind"], e["extra"]) for e in ev
+                            if e["kind"] in ("front", "notice")),
     }
 
 
@@ -325,11 +338,33 @@ def test_who_waits_and_who_leaves_truth_table(tmp_path):
 
 # ------------------------------------------------------------------------------ the tests
 
+def test_the_role_record_round_trips_without_convertfrom_json(tmp_path):
+    """The holder/waiter record is written and read in a fixed shape (no ConvertFrom-Json: its
+    first call costs ~0.33 s in a leaving copy). Round trip, and anything else is refused."""
+    src = _current_text()
+    fns = _extract(src, "ConvertTo-StartAllRoleJson") + "\n" + _extract(src, "ConvertFrom-StartAllRoleJson")
+    body = fns + r"""
+$t = ConvertTo-StartAllRoleJson 4242 638000000000000000 'background (-NoUi)' $true 197612
+$r = ConvertFrom-StartAllRoleJson $t
+$bad = @((ConvertFrom-StartAllRoleJson ''), (ConvertFrom-StartAllRoleJson '{"pid":"x"}'), (ConvertFrom-StartAllRoleJson ($t + 'junk')))
+'RESULT:' + (@{ t = $t; pid = $r.pid; started = [string]$r.started; mode = $r.mode; banner = $r.banner; hwnd = $r.hwnd
+               bad = @($bad | Where-Object { $_ }).Count; json = ($t | ConvertFrom-Json).mode } | ConvertTo-Json -Compress)
+"""
+    p = tmp_path / "rt.ps1"
+    p.write_text(body, encoding="utf-8-sig")
+    r = childproc.run([POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(p)], timeout=120)
+    got = json.loads([l for l in r.stdout.splitlines() if l.startswith("RESULT:")][-1][len("RESULT:"):])
+    assert got["pid"] == 4242 and got["started"] == "638000000000000000", got
+    assert got["mode"] == "background (-NoUi)" and got["banner"] is True and got["hwnd"] == 197612, got
+    assert got["bad"] == 0, got
+    assert got["json"] == "background (-NoUi)", "the fixed shape is still JSON other readers can parse"
+
+
 def _assert_one_bringup(s: dict, banners: int, fronts: int):
     assert s["runs"] == 10, s
     assert s["bringups"] == 1, s
     assert s["banners"] == banners, s
-    assert s["fronts"] == fronts and s["notices"] == 0, s
+    assert s["fronts"] == fronts and s["notices"] == 0, json.dumps(s)
     assert s["lock"].count("got") == 1 and s["lock"].count("busy") == 9, s
     assert s["outcomes"].count("already running") == 9, s
     assert s["leaver_max_s"] is not None and s["leaver_max_s"] <= LEAVE_BOUND_SEC, s

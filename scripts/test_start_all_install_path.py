@@ -76,6 +76,7 @@ _FUNCS = ["Env-Value", "Get-UpdateCheckSkipReason", "Get-ParentProcessInfo",
           "Get-ThisCheckoutServerProcesses", "Get-ServerStartEpoch", "ConvertTo-ServerActionResult",
           "Get-ServerAction", "Invoke-ServerAction", "Enter-StartAllLock", "Exit-StartAllLock",
           "Exit-StartAllWaiterSlot", "Remove-StartAllRoleRecord", "Get-StartAllRolePath",
+          "ConvertFrom-StartAllRoleJson",
           "Save-StartAllRunLines",
           "Get-FleetResumeSkipReason", "Get-ThisCheckoutFleetCoordinatorPids",
           "Resolve-DevTunnelExe", "Invoke-DevTunnelBounded", "Get-TunnelLoginState",
@@ -762,8 +763,27 @@ def test_the_run_record_is_wired_where_the_launcher_is_still_alive(tmp_path):
     a second); the record is written at the end before the lock is released, and on the
     self-update re-exec path, which never reaches the end."""
     src = open(START_ALL, encoding="utf-8").read()
-    capture = src.index("$script:launch = Get-LaunchLineage")
-    assert capture < src.index("function Invoke-Startup") < src.index("$ranViaSplash = $false")
+    # THE ORDER CHANGED ON PURPOSE (2026-09-24). This used to require the capture textually
+    # above `function Invoke-Startup`, i.e. near the top of the script. The property that
+    # protected is "read while the launcher is still alive": BEFORE the splash is built and
+    # Invoke-Startup runs, because the launcher (wscript) exits within a second. It still holds:
+    # the capture now sits right after the entry decision (Invoke-StartAllEntry); before it the
+    # script only defines functions and probes the lock, and between it and the splash
+    # ($ranViaSplash) only function definitions and dot-sources run. It moved because the lookup
+    # costs ~0.65 s under load, and every copy that finds a startup running (ten clicks) paid it
+    # before it could ask the lock, and the running
+    # startup paid it before writing the holder record the others wait for. A copy that leaves
+    # reads its own parent (-ParentOnly) right after deciding, before its record is written.
+    entry = src.index("$script:entryAction = Invoke-StartAllEntry")
+    capture = src.index("$script:launch = Get-LaunchLineage\n", entry)
+    assert entry < capture < src.index("$ranViaSplash = $false")
+    # The entry decision itself runs near the TOP (above the dot-sources and ~2,000 lines of
+    # definitions it does not need), so a copy that leaves pays for none of them.
+    assert entry < src.index("function Invoke-Startup") and entry < src.index('"tunnel_name_util.ps1")')
+    leave = src[entry:capture]
+    assert "Get-LaunchLineage -ParentOnly" in leave and leave.index("Get-LaunchLineage -ParentOnly") < leave.index("Invoke-StartAllLeave")
+    top = src[:src.index("function Hide-Secrets")]
+    assert "$script:launch = Get-LaunchLineage" not in top, "the lookup is back ahead of the lock probe"
     tail = src[src.index("$summaryWritten = Write-StartupSummary"):]
     assert tail.index("Write-StartAllRunRecord") < tail.index("Exit-StartAllLock")
     reexec = _extract_braced_block(src, "function Invoke-PostUpdateTail")
