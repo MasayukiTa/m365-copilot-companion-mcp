@@ -106,7 +106,13 @@ def test_the_chain_used_to_cross_a_steer():
     """
     src = open(os.path.join(REPO, "relay", "relay_fleet.py"), encoding="utf-8").read()
     i = src.index("if self.steer_msgs:")
-    branch = src[i:src.index("else:", i)]
+    # Match the branch's own closing "else:" AT THE START OF A LINE (aligned with the "if"),
+    # not the first occurrence of the substring "else:" anywhere -- a comment right inside
+    # this branch narrates this exact slicing technique and quotes the word "else:" while
+    # doing so, which a bare src.index("else:", i) would match first and truncate the slice
+    # before the assertions below, giving a false failure.
+    close = src.index("\n        else:", i)
+    branch = src[i:close]
     assert "self._last_was_steer = True" in branch
     assert "self.no_progress = 0" in branch, (
         "steer を配ったターンで繰り返しカウントが戻されていない")
