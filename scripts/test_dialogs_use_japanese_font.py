@@ -15,11 +15,14 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
+import sys
 
 import pytest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
+from tools import childproc  # noqa: E402  -- see tools/childproc.py: child output must not be
+
 HELPER = os.path.join(REPO, "scripts", "win", "ui_font.ps1")
 
 _BLOCK_COMMENT = re.compile(r"<#.*?#>", re.DOTALL)
@@ -33,9 +36,9 @@ _DOT_SOURCE = re.compile(r"^\s*\.\s*\(.*ui_font\.ps1.*\)", re.MULTILINE)
 
 
 def _tracked_ps1_files():
-    out = subprocess.run(["git", "ls-files", "--", "*.ps1"], cwd=REPO, capture_output=True,
-                          text=True, check=True).stdout
-    return [line.strip() for line in out.splitlines() if line.strip()]
+    r = childproc.run(["git", "ls-files", "--", "*.ps1"], cwd=REPO, capture_output=True,
+                       check=True)
+    return [line.strip() for line in r.stdout.splitlines() if line.strip()]
 
 
 def _strip_comments(text: str) -> str:
