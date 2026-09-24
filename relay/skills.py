@@ -935,6 +935,33 @@ class SkillStore:
         skill = self.get(name, strict=True)
         if skill.trust == "trusted":
             return {"status": "already-trusted", "skill": skill.public_metadata()}
+        # BYPASS: NO QUESTION, AND NO EXTRA TRUST EITHER. Job/shell approval and Skill trust
+        # are different questions -- bypass answers the first with "proceed" because that is
+        # what the operator turned off asking about, but a Skill's instruction text is
+        # untrusted content that can carry its own instructions (see the trust model this
+        # class implements). Silently trusting it under bypass would hand a prompt-injected
+        # Skill exactly the execution rights bypass was never asked to grant. So bypass
+        # answers this question with "still not trusted" -- fails closed, same as a person
+        # who was asked and had not yet said yes -- and, per the owner's rule, does so
+        # without writing a gate file or raising a toast.
+        try:
+            from tools.approval_policy import current_approval_mode, record_bypass_decision
+            if current_approval_mode() == "bypass":
+                record_bypass_decision(
+                    "relay.skills.SkillStore.request_approval",
+                    f"skill approval needed: {skill.path} (digest={skill.digest})",
+                    "not trusted (bypass never grants Skill trust); no gate raised")
+                return {
+                    "status": "bypass-not-asked",
+                    "skill": skill.public_metadata(),
+                    "detail": ("job_approval_mode=bypass: this Skill was NOT trusted and no "
+                               "approval question was raised. Bypass never grants Skill "
+                               "trust on its own -- a person must trust it explicitly "
+                               "(outside bypass, or via the Approval Centre) before it can "
+                               "be loaded."),
+                }
+        except Exception:
+            pass
         now = time.time()
         # One transaction, and its first statement (the DELETE) takes SQLite's write lock, so
         # a second request for the same Skill waits and then finds this one's row: one
