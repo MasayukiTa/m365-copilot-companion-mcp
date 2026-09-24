@@ -1045,6 +1045,7 @@ _SANDBOX_NAMES = (
     "notify_source_pytest_%s.log",
     "bridge_undelivered_pytest_%s.jsonl",
     "bridge_token_pytest_%s",
+    "signin_latch_pytest_%s",
 )
 
 _atexit.register(_drop_this_runs_sandbox)
@@ -1147,6 +1148,22 @@ _os.environ.setdefault(
 _os.environ.setdefault(
     "MCP_BRIDGE_TOKEN_DIR",
     _sandbox_path("bridge_token_pytest_%s"))
+
+
+# And the bridge sign-in latch (scripts/ensure_m365_signin.py::_latch_path), added 2026-09-24
+# alongside the sign-in-surfacing fix (e66af67): it defaults to <repo>/.fleet/signin_surfaced_
+# <port>.json, marking "already brought forward for this sign-in" so the supervisor does not
+# re-raise the window every poll. MCP_SIGNIN_LATCH_DIR was added as its escape hatch and its own
+# test file (scripts/test_bridge_signin_is_brought_to_the_person.py) already redirects it, either
+# through a local `latch` fixture or by passing the variable into a subprocess harness -- but
+# tools/test_an_escape_hatch_nobody_turns_on.py requires every location override that exists in
+# tracked source to be SET somewhere, not merely used correctly by the one file that happens to
+# remember, which is exactly the MCP_SKILLS_GATE_DIR shape this table exists to prevent
+# recurring. Belt and braces, same as MCP_BRIDGE_TOKEN_DIR above: resolved at call time in
+# _latch_path, so a test's own monkeypatch.setenv still wins over this default.
+_os.environ.setdefault(
+    "MCP_SIGNIN_LATCH_DIR",
+    _sandbox_path("signin_latch_pytest_%s"))
 
 
 @pytest.fixture(autouse=True)
