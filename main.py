@@ -219,6 +219,22 @@ mcp = FastMCP(
         "matched Skill encodes decisions that were verified against the real data, and "
         "improvising past it has produced confident wrong answers. Skill trust never "
         "grants extra execution rights; unlock and contract gates still apply. "
+        # 実測 2026-09-24: 「社内で使えるパワーポイントのskillsを探してほしい」に対し、
+        # skill_match が空だったことを理由に「このskillは存在しません」で打ち切り、
+        # ユーザーの言う『skills』(汎用語)をこのサーバの登録済みSkill(固有名)へすり替えた。
+        # NO MATCH IS A STATEMENT ABOUT THE LOCAL CATALOGUE, NOT ABOUT THE REQUEST. A
+        # skill_match/skill_list miss means only that no local procedure exists for this --
+        # it is not itself an answer, and it does not mean the thing the user asked about does
+        # not exist. When the user's own word ('skills' here) is broader than this server's
+        # Skill feature, or the request asks you to find/search for something, continue with
+        # your other tools until the request is actually done.
+        "A NO-MATCH RESULT MEANS THE LOCAL CATALOGUE HAS NOTHING FOR THIS -- it is not an "
+        "answer to the request and does not mean the thing the user asked about is "
+        "unavailable. Keep going with your other tools -- including any web or "
+        "external-repository search tool in the catalogue -- until the request is actually "
+        "done. Do not stop at 'no local skill matches' and ask the user whether to proceed "
+        "or whether to create one instead: that is not a completed answer to an explicit "
+        "request to search. "
         # 実測 2026-09-06, twice, and the second run corrected the first reading of the first.
         #
         # 10:49-10:51, from a phone: the agent obeyed RULE 1, then tried to do the work itself.

@@ -157,6 +157,17 @@ PANEL_LENSES = ("correctness", "edge", "security")
 #: a different campaign's stock figure; another processed the wrong cinema entirely. Those are
 #: defects in the SEARCH and they stay REFUTED. The change is only that a search which was
 #: actually carried out, and found nothing, is allowed to be finished.
+# EXTENDED 2026-09-24. The bullets above catch a search that was carried out and came up
+# empty; they had nothing for a search that was never carried out. Measured: a goal asking
+# to "探してほしい" (find/search) PowerPoint-design skills was answered from the local Skill
+# catalogue alone (skill_match, skill_list) -- no web/external search tool was ever called --
+# and the worker closed with "該当skillが無いため...指示ください" (no local skill, please advise)
+# instead of continuing the request. refuter#1 UPHELD it: the two bullets that existed did not
+# name "checked one narrow source when the goal implied more" or "asked the user instead of
+# finishing", so a report with exactly those two defects passed the same gate this preamble
+# built for "checked 1 of 9 subjects". Both new bullets are instances of the same principle
+# already stated above (a defect in the SEARCH stays refutable) -- they were missing sub-cases,
+# not a new rule.
 UNVERIFIABLE_PREAMBLE = (
     "【このゴールには機械的な検証条件がありません】調査・情報収集の課題です。コードの変更では"
     "ないので、ファイルやテストを開いて確かめる観点(境界値・例外処理・セキュリティ)は当てはまり"
@@ -171,6 +182,11 @@ UNVERIFIABLE_PREAMBLE = (
     "  - 別の対象・別の項目の情報を流用して判定している\n"
     "  - 報告された対象名と根拠が食い違っている\n"
     "  - 到達できなかった理由が書かれておらず、調べたのか調べていないのか区別できない\n"
+    "  - ゴールが『探して/調べて』のように広く探すことを求めているのに、社内の特定のカタログや"
+    "1つの狭い情報源しか調べておらず、他の一般的な手段(web検索・外部リポジトリ検索等)を試して"
+    "いない、かつ試さない理由も書かれていない\n"
+    "  - すでに明示されている依頼に対して、実行を終える代わりに『進めてよいか』『作成しましょう"
+    "か』とユーザーに次の指示を求めて終わっている(依頼はまだ遂行されていない)\n"
     "・同じ指摘を繰り返さないでください。前回と同じ理由で差し戻すくらいなら UPHELD です。"
 )
 
