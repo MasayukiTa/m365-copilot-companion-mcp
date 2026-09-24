@@ -835,16 +835,27 @@ def store_stats():
                                 if oldest else None)}
 
 
-def prune(max_age_days=None, max_mb=None, now=None):
+def prune(max_age_days=None, max_mb=None, now=None, limit=None):
     """Delete old sessions, oldest first, and hand the pages back. Returns what it did.
 
     NEITHER LIMIT IS ON BY DEFAULT, and that is deliberate. This store exists because
     conversations were losing their history; a retention policy that starts deleting the
-    moment it ships would be that same loss arriving on a schedule. The operator turns it on.
+    moment it ships would be that same loss arriving on a schedule. The operator turns it on
+    (or, since the 2026-09-24 owner decision, leaves session_retention_days unset and gets the
+    90-day default applied by apply_retention() below -- prune() itself still does nothing
+    unless a caller hands it a limit).
 
     Whole sessions go, never a slice of one. Half a conversation is worse than none of it:
     it reads as complete and is not, and anything re-supplying context after a recycle would
     quietly feed the model a version of events with the middle removed.
+
+    `limit` BOUNDS HOW MANY SESSIONS ONE CALL WILL REMOVE. A machine whose retention was never
+    configured before today's default can have years of history sitting past the new 90-day
+    line; deleting all of it in the same pass that runs at bridge startup would block that
+    startup for however long tens of thousands of DELETEs take. Passing a limit turns "prune
+    everything over the line" into "prune the oldest `limit` sessions over the line" -- still
+    oldest-first, still whole sessions, just bounded per call. A later bridge start prunes the
+    next batch.
     """
     now = time.time() if now is None else now
     removed, freed_before = [], store_stats()["bytes"]
@@ -852,8 +863,12 @@ def prune(max_age_days=None, max_mb=None, now=None):
     try:
         if max_age_days:
             cutoff = now - float(max_age_days) * 86400.0
-            rows = conn.execute(
-                "SELECT sid FROM sessions WHERE last_active_ts < ?", (cutoff,)).fetchall()
+            q = "SELECT sid FROM sessions WHERE last_active_ts < ? ORDER BY last_active_ts ASC"
+            params = [cutoff]
+            if limit:
+                q += " LIMIT ?"
+                params.append(int(limit))
+            rows = conn.execute(q, params).fetchall()
             removed.extend(r["sid"] for r in rows)
 
         if max_mb:
@@ -871,6 +886,8 @@ def prune(max_age_days=None, max_mb=None, now=None):
             scale = (total / max(sum(r["w"] for r in per), 1)) if per else 1.0
             for r in per:
                 if total <= budget:
+                    break
+                if limit and len(removed) >= limit:
                     break
                 if r["sid"] in removed:
                     continue
@@ -907,13 +924,37 @@ def prune(max_age_days=None, max_mb=None, now=None):
     return {"removed_sessions": len(removed), "sids": removed,
             "bytes_before": freed_before, "bytes_after": after["bytes"],
             "mb_after": after["mb"],
-            "still_over": bool(max_mb and after["mb"] > float(max_mb))}
+            "still_over": bool(max_mb and after["mb"] > float(max_mb)),
+            # True when `limit` cut this pass short -- there may be more sessions past the
+            # cutoff than this call was willing to remove. A later prune picks up the rest.
+            "batched": bool(limit and len(removed) >= limit)}
 
 
 #: The shared settings file the cockpit writes and the fleet reads. Retention lives here rather
 #: than in .env because it is a preference the operator changes from a dialog, not a deployment
 #: setting -- and because .env is rewritten by the release updater while this is not.
 SETTINGS_KEYS = ("session_retention_days", "session_max_mb")
+
+#: OWNER DECISION 2026-09-24. Absent used to mean "keep everything forever" -- the store exists
+#: because history was disappearing, and a policy that starts deleting the day it ships is that
+#: same loss arriving on a schedule. It shipped, operators did not find the dialog, and years of
+#: chat history piled up unbounded on machines nobody had told to turn retention on. 90 days is
+#: now what "never touched this setting" means. It is NOT what "chose 0" means: an operator who
+#: explicitly sets session_retention_days=0 in the cockpit (T("ret_keep")) still gets to keep
+#: everything -- see read_retention()'s explicit-zero handling below. tools/settings_keys.py
+#: declares the same number for session_retention_days; test_the_declared_default_is_the_one_
+#: the_code_uses (tools/test_a_setting_declares_when_it_takes_effect.py) and
+#: ui/test_retention_settings.py both fail if the two drift apart, or if FleetCockpit.cs's own
+#: `_retDays` field disagrees with either.
+DEFAULT_RETENTION_DAYS = 90.0
+
+#: How many sessions ONE apply_retention() call will remove by age. Bridge start is a single
+#: pass, not a loop, and a machine that has never had a limit before today's default can have
+#: years of sessions sitting past the new 90-day line -- deleting all of them before the bridge
+#: can accept its first turn would turn "add a default" into "the next startup hangs". Bounded
+#: per call; a later bridge start removes the next batch. Chosen well above what a normal
+#: install accumulates (thousands of sessions), so it only ever binds on that first catch-up.
+PRUNE_BATCH_LIMIT = 2000
 
 
 def _settings_path():
@@ -922,12 +963,22 @@ def _settings_path():
 
 
 def read_retention():
-    """(days, max_mb) from settings.txt. Either may be None, which means "keep everything".
+    """(days, max_mb) from settings.txt.
 
-    ABSENT AND ZERO BOTH MEAN OFF, and they have to, because a settings file written before
-    these keys existed has neither -- and a fresh install that read a missing key as "0 days"
-    would delete the operator's history on first run. The feature that exists to stop history
-    disappearing must not be the thing that deletes it.
+    max_mb is None when absent, unparseable, or <= 0 -- it has no default, "no cap" is what
+    absent has always meant, and the 2026-09-24 owner decision did not touch it.
+
+    days is THREE-VALUED, and the distinction matters because apply_retention() now has a
+    default to fall back to:
+      * None  -- the key is absent (or unparseable, or negative): the operator has never set
+                 this. apply_retention() applies DEFAULT_RETENTION_DAYS to it.
+      * 0.0   -- the key is present and explicitly "0": the operator chose "keep everything"
+                 (the cockpit shows this as T("ret_keep"), never as the number 0). This must
+                 stay distinguishable from "absent" or an explicit opt-out would silently be
+                 overridden by the new default the next time the bridge starts.
+      * > 0   -- the operator chose that many days.
+    A settings file written before this key existed has neither -- same as None, on purpose,
+    so an old install does not have its choice reinterpreted as anything but "never asked".
     """
     days = mb = None
     try:
@@ -943,11 +994,15 @@ def read_retention():
                     number = float(value)
                 except ValueError:
                     continue
-                if number <= 0:
-                    continue
                 if key == "session_retention_days":
-                    days = number
+                    if number == 0:
+                        days = 0.0                # explicit "keep everything" -- not absent
+                    elif number > 0:
+                        days = number
+                    # negative: garbled/invalid, treated the same as absent (unset)
                 else:
+                    if number <= 0:
+                        continue
                     mb = number
     except OSError:
         pass
@@ -955,16 +1010,23 @@ def read_retention():
 
 
 def apply_retention(now=None):
-    """Prune according to settings.txt. Returns the prune report, or None when nothing is set.
+    """Prune according to settings.txt, applying the 90-day default when the operator has
+    never set session_retention_days. Returns the prune report, or None when the effective
+    policy is "keep everything" (explicit 0 for days, and no size cap either).
 
     Called once at bridge start rather than on a timer. A retention pass that can fire in the
     middle of a turn is a retention pass that can delete the conversation being written to,
     and the difference between running it now and running it in an hour is not worth that.
+
+    The age-based half of the prune is BATCHED (see PRUNE_BATCH_LIMIT): the first pass on a
+    machine with years of unpruned history removes at most that many sessions, oldest first,
+    rather than blocking startup on however many thousands are past the line.
     """
     days, mb = read_retention()
-    if not days and not mb:
+    effective_days = DEFAULT_RETENTION_DAYS if days is None else days
+    if not effective_days and not mb:
         return None
-    return prune(max_age_days=days, max_mb=mb, now=now)
+    return prune(max_age_days=effective_days, max_mb=mb, now=now, limit=PRUNE_BATCH_LIMIT)
 
 
 def compact():

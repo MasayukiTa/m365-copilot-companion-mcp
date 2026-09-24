@@ -1,7 +1,9 @@
-"""会話の保持設定 UI。既定が『消さない』であることと、効果を言葉で出すこと。
+"""会話の保持設定 UI。既定が90日であることと、効果を言葉で出すこと。
 
-この保存層は履歴が失われるのを直すために在る。届いた日から削除を始める既定は、
-同じ損失が予定表に載るだけになる。だから 0 が既定で、0 は「消さない」を意味する。
+この保存層は履歴が失われるのを直すために在る。0(消さない)が既定だった時期は、
+この画面を一度も開かなかった端末で履歴が無期限に積み上がった。オーナー判断
+(2026-09-24)により、未設定(=設定ファイルに行が無い)の既定は90日になった。
+0 は既定ではなくなったが意味は変わらない -- 明示的に選べば今でも「消さない」。
 """
 import pathlib
 import re
@@ -10,11 +12,19 @@ SRC = (pathlib.Path(__file__).resolve().parent / "FleetCockpit.cs").read_text(
     encoding="utf-8-sig", errors="replace")
 
 
-def test_both_limits_default_to_keeping_everything():
-    """既定で削除が始まってはいけない。ここが 0 でなくなったら、
-    更新しただけの端末が起動時に履歴を捨てる。"""
-    assert re.search(r"int _retDays = 0;", SRC), "保持日数の既定が 0 でない"
-    assert re.search(r"int _retMb = 0;", SRC), "上限サイズの既定が 0 でない"
+def test_the_day_default_is_ninety_and_the_size_default_is_still_off():
+    """2026-09-24 オーナー判断: 未設定の既定は90日。サイズ上限のほうは対象外で、
+    今までどおり 0 (無効)のまま -- 別の設定で、別の判断。"""
+    assert re.search(r"int _retDays = 90;", SRC), "保持日数の既定が 90 でない"
+    assert re.search(r"int _retMb = 0;", SRC), "上限サイズの既定が 0 でない(対象外のはず)"
+
+
+def test_an_explicit_zero_still_means_keep_everything():
+    """既定が90日に変わっても、鍵に明示的に 0 と書いてあれば LoadSettings が上書きする
+    -- クランプは Math.Max(0, ...) で 0 を弾いていない。"""
+    i = SRC.index('ln.StartsWith("session_retention_days=")')
+    line = SRC[i:i + 200]
+    assert "Math.Max(0," in line, "0 を弾くクランプに変わっている"
 
 
 def test_zero_is_shown_as_keep_all_not_as_a_number():

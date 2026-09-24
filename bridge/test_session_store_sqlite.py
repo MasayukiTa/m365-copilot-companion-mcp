@@ -429,27 +429,47 @@ def test_the_suite_is_not_writing_into_the_operators_store():
 
 # ── 保持設定 ────────────────────────────────────────────────────────────────
 
-def test_a_settings_file_without_the_keys_deletes_nothing(box, monkeypatch, tmp_path):
+def test_a_settings_file_without_the_keys_applies_the_default(box, monkeypatch, tmp_path):
     """これらの鍵が生まれる前に書かれた settings.txt には、当然どちらも無い。
-    欠落を『0日』と読めば、新規インストールの初回起動で全履歴が消える。
-    履歴消失を止めるための機能が、履歴を消す側になってはいけない。"""
+
+    オーナー判断(2026-09-24)以前は、欠落を「消さない」と読んでいた -- 欠落を『0日』と
+    読めば、新規インストールの初回起動で全履歴が消えるから。だが「消さない」が既定で
+    在り続けた結果、この設定を一度も開かなかった端末で履歴が無期限に積み上がった。
+    今は欠落 = 90日。read_retention() 自身は変わらず None を返す(未設定は未設定のまま
+    観測できる)が、apply_retention() がその None を DEFAULT_RETENTION_DAYS で埋める。"""
     monkeypatch.setattr(ss, "_settings_path", lambda: str(tmp_path / "settings.txt"))
     (tmp_path / "settings.txt").write_text("maxtabs=3\nzoom=1.0\n", encoding="utf-8")
     assert ss.read_retention() == (None, None)
 
-    sess = ss.new_session(title="x")
-    ss.append_turn(sess["sid"], "user", "keep")
-    ss.touch(sess["sid"], last_active_ts=1000.0)
-    assert ss.apply_retention() is None
-    assert len(ss.all_turns(sess["sid"])) == 1
+    old = ss.new_session(title="old")
+    ss.append_turn(old["sid"], "user", "ancient")
+    ss.touch(old["sid"], last_active_ts=1000.0)          # far older than 90 days
+    fresh = ss.new_session(title="fresh")
+    ss.append_turn(fresh["sid"], "user", "recent")
+
+    out = ss.apply_retention()
+    assert out is not None, "unset no longer means 'do nothing' -- it means the 90-day default"
+    assert out["removed_sessions"] == 1 and out["sids"] == [old["sid"]]
+    assert ss.load(old["sid"]) is None, "older-than-default session was not pruned"
+    assert len(ss.all_turns(fresh["sid"])) == 1, "the recent session was pruned too"
 
 
 def test_zero_means_off_not_immediately(box, monkeypatch, tmp_path):
-    """0 は『0日保持』ではなく『無効』。ここを取り違えると一撃で全部消える。"""
+    """0 は『0日保持』ではなく『無効』。ここを取り違えると一撃で全部消える。
+
+    read_retention() は明示的な 0 を(90日の既定にすり替わらないよう)そのまま 0.0 で
+    返す -- 未設定の None とはここで区別する。session_max_mb=0 のほうは対象外の設定
+    なので、これまでどおり None(無効)のまま。"""
     monkeypatch.setattr(ss, "_settings_path", lambda: str(tmp_path / "settings.txt"))
     (tmp_path / "settings.txt").write_text(
         "session_retention_days=0\nsession_max_mb=0\n", encoding="utf-8")
-    assert ss.read_retention() == (None, None)
+    assert ss.read_retention() == (0.0, None)
+
+    sess = ss.new_session(title="x")
+    ss.append_turn(sess["sid"], "user", "keep")
+    ss.touch(sess["sid"], last_active_ts=1000.0)          # far in the past
+    assert ss.apply_retention() is None, "an explicit 0 must still mean keep everything"
+    assert len(ss.all_turns(sess["sid"])) == 1
 
 
 def test_a_configured_age_is_applied(box, monkeypatch, tmp_path):
@@ -468,6 +488,60 @@ def test_a_configured_age_is_applied(box, monkeypatch, tmp_path):
     assert ss.load(old["sid"]) is None and ss.load(fresh["sid"]) is not None
 
 
+def test_the_default_prune_never_touches_anything_newer_than_ninety_days(box, monkeypatch,
+                                                                          tmp_path):
+    """未設定(既定90日)で、90日ぎりぎり新しい会話は残り、90日より古い会話だけ消える。"""
+    monkeypatch.setattr(ss, "_settings_path", lambda: str(tmp_path / "settings.txt"))
+    (tmp_path / "settings.txt").write_text("maxtabs=3\n", encoding="utf-8")  # neither key set
+    now = 100_000_000.0
+    day = 86400.0
+
+    just_old = ss.new_session(title="just-old")
+    ss.append_turn(just_old["sid"], "user", "x")
+    ss.touch(just_old["sid"], last_active_ts=now - 91 * day)
+
+    just_new = ss.new_session(title="just-new")
+    ss.append_turn(just_new["sid"], "user", "x")
+    ss.touch(just_new["sid"], last_active_ts=now - 89 * day)
+
+    out = ss.apply_retention(now=now)
+    assert out["removed_sessions"] == 1 and out["sids"] == [just_old["sid"]]
+    assert ss.load(just_old["sid"]) is None, "older than 90 days should have been pruned"
+    assert ss.load(just_new["sid"]) is not None, "newer than 90 days must survive"
+
+
+def test_the_first_catch_up_prune_is_batched(box, monkeypatch, tmp_path):
+    """未設定の端末に何年分も履歴が溜まっていた場合、1回の起動で全部消そうとしない。
+    PRUNE_BATCH_LIMIT を小さく差し替え、古いセッションをその数より多く作って確認する。"""
+    monkeypatch.setattr(ss, "_settings_path", lambda: str(tmp_path / "settings.txt"))
+    (tmp_path / "settings.txt").write_text("maxtabs=3\n", encoding="utf-8")  # unset -> default
+    monkeypatch.setattr(ss, "PRUNE_BATCH_LIMIT", 3)
+
+    sids = []
+    for i in range(7):
+        s = ss.new_session(title="old-%d" % i)
+        ss.append_turn(s["sid"], "user", "x")
+        ss.touch(s["sid"], last_active_ts=1000.0 + i)      # all far older than 90 days
+        sids.append(s["sid"])
+
+    out = ss.apply_retention()
+    assert out["removed_sessions"] == 3, "the batch limit was not honoured: %r" % out
+    assert out["batched"] is True
+    # oldest first: the three removed are exactly the three earliest last_active_ts
+    assert out["sids"] == sids[:3]
+    remaining = {s["sid"] for s in ss.list_sessions()}
+    assert remaining == set(sids[3:]), "the batch removed the wrong sessions"
+
+    # later passes (as the next bridge starts would run) clear the rest, three at a time
+    out2 = ss.apply_retention()
+    assert out2["removed_sessions"] == 3
+    assert out2["batched"] is True
+    out3 = ss.apply_retention()
+    assert out3["removed_sessions"] == 1
+    assert out3["batched"] is False
+    assert ss.list_sessions() == []
+
+
 def test_a_garbled_value_is_ignored_rather_than_guessed(box, monkeypatch, tmp_path):
     """人が編集するファイル。数字でない行を 0 や 1 と読むより、無視するほうが安全。"""
     monkeypatch.setattr(ss, "_settings_path", lambda: str(tmp_path / "settings.txt"))
@@ -477,9 +551,14 @@ def test_a_garbled_value_is_ignored_rather_than_guessed(box, monkeypatch, tmp_pa
 
 
 def test_a_missing_settings_file_is_not_an_error(box, monkeypatch, tmp_path):
+    """No settings.txt at all reads the same as a settings.txt with neither key: read_retention
+    stays (None, None), and apply_retention now actually prunes (the 90-day default), rather
+    than raising OSError or silently doing nothing."""
     monkeypatch.setattr(ss, "_settings_path", lambda: str(tmp_path / "nope.txt"))
     assert ss.read_retention() == (None, None)
-    assert ss.apply_retention() is None
+    out = ss.apply_retention()
+    assert out is not None and out["removed_sessions"] == 0, (
+        "no sessions existed, so nothing to remove, but the call must not be a silent no-op")
 
 
 def test_the_bridge_prunes_at_startup_not_on_a_timer():

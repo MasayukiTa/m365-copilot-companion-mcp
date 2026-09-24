@@ -229,11 +229,16 @@ def test_the_declared_default_is_the_one_the_code_uses():
     of them ever had to agree."""
     from relay import fleet_runner as FR
     from relay import relay_fleet as RF
+    from bridge import session_store as SS
     assert RF.FLEET_RAM_FLOOR_MB == SK.default("ram_floor_mb")
     assert FR.RAM_FLOOR_DEFAULT_MB == SK.default("ram_floor_mb")
     assert RF.DEFAULT_DISK_FLOOR_GB == SK.default("disk_floor_gb")
     assert FR.DEFAULT_MAX_CONCURRENT == SK.default("maxtabs")
     assert FR.AUTOSCALE_CEILING_DEFAULT == SK.default("autoscale_max")
+    # 2026-09-24 owner decision: "no value in settings.txt" for session_retention_days went
+    # from forever to 90 days. Two readers of that default -- the bridge's own prune fallback
+    # and this table -- must not be allowed to drift the way ram_floor_mb's three did.
+    assert SS.DEFAULT_RETENTION_DAYS == SK.default("session_retention_days")
 
 
 @pytest.mark.parametrize("field,key", [
@@ -247,6 +252,10 @@ def test_the_declared_default_is_the_one_the_code_uses():
     # compared with what the fleet uses.
     ("_fleetScratchDays", "fleet_scratch_days"),
     ("_fleetCompressHours", "fleet_compress_hours"),
+    # 2026-09-24: the panel's own default changed from 0 ("keep everything") to 90, to match
+    # the bridge's new DEFAULT_RETENTION_DAYS -- see test_the_declared_default_is_the_one_the_
+    # code_uses, above, for the Python side of the same agreement.
+    ("_retDays", "session_retention_days"),
 ])
 def test_the_panel_shows_the_same_default_the_fleet_uses(field, key):
     """The panel's own default is what an operator reads off the screen on a machine that has
