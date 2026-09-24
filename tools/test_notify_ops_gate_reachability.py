@@ -100,6 +100,9 @@ def test_tilde_slash_expands_under_home(monkeypatch):
     assert N.resolve_gate_directory() == expected
 
 
+@pytest.mark.skipif(os.name != "nt", reason="';' is only Path.PathSeparator (and "
+                    "os.pathsep) on Windows; on POSIX resolve_gate_directory's os.pathsep "
+                    "split never fires and this asserts a Windows-only path shape")
 def test_only_the_first_root_of_a_semicolon_list_is_the_gate_root(monkeypatch, tmp_path):
     """Path.PathSeparator is ';' on Windows, and the C# side takes roots[0] -- a second or
     third allowed root must not silently become the gate directory."""
@@ -111,6 +114,10 @@ def test_only_the_first_root_of_a_semicolon_list_is_the_gate_root(monkeypatch, t
                                                        ".companion_gates")
 
 
+@pytest.mark.skipif(os.name != "nt", reason="a bare drive letter ('C:') is a Windows path "
+                    "concept -- POSIX has no drive letters, and both this test's expected "
+                    "value and resolve_gate_directory's own handling of it key off os.sep, "
+                    "which is not '\\' off Windows")
 def test_a_bare_drive_letter_gets_a_separator_before_the_folder(monkeypatch):
     monkeypatch.delenv("MCP_GATE_DIR", raising=False)
     monkeypatch.setenv("MCP_ALLOWED_BASE", "C:")
@@ -185,6 +192,8 @@ def test_a_gate_that_does_not_exist_yet_is_not_reachable(monkeypatch, tmp_path):
     assert reason == "gate file does not exist"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="8.3 short names and GetShortPathNameW "
+                    "(ctypes.windll) only exist on Windows")
 def test_a_short_and_long_spelling_of_the_same_directory_still_match(monkeypatch, tmp_path):
     """THE BUG THIS GUARDS AGAINST IN ui/FleetCockpit.cs ApprovalPromptWindow: a gate directory
     under %TEMP% is handed back in its 8.3 short form by some callers while the resolved

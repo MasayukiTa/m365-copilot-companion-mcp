@@ -45,9 +45,33 @@ def _registered(monkeypatch, **env):
 def _restore(monkeypatch):
     yield
     # Leave the module as the rest of the suite expects, WITHOUT reloading it here: a reload
-    # in teardown runs after monkeypatch has already put MCP_API_KEY back, and main.py reads
-    # that at import. The first version errored on every test for exactly that.
+    # in a fixture that depends on `monkeypatch` tears down BEFORE monkeypatch's own teardown
+    # (pytest tears down a fixture's dependents first), so it would run while MCP_API_KEY is
+    # still this test's synthetic value, not the real one. The first version tried that and
+    # errored on every test for exactly that. See `_reload_main_with_the_real_environment`
+    # below for the fixture that actually undoes the reload's leak, once it is safe to.
     monkeypatch.delenv("MCP_TOOL_MAP", raising=False)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _reload_main_with_the_real_environment():
+    """_registered() above reloads main.py under a synthetic MCP_API_KEY/MCP_TOOL_MAP* env on
+    every call. importlib.reload() rebinds EVERY module-level name -- API_KEY, TOOLS -- and
+    nothing in this file ever reloads it back, so the LAST reload here used to leak the
+    synthetic MCP_API_KEY into every test file that runs later in the same pytest session --
+    e.g. tests/test_health_route.py, whose bearer-token checks compare an incoming header
+    against `main.API_KEY` and silently got "test-key-not-a-real-one" instead of the real key
+    (CI, 2026-09-24: two of its tests failed with the full payload missing).
+
+    Unlike `_restore` above, THIS fixture has no dependency on `monkeypatch`, so pytest sets it
+    up before any function-scoped fixture in this module and tears it down after all of them --
+    once every test's own monkeypatch has already restored the real environment. That is the
+    one moment a reload here is safe, which is what makes this different from the version that
+    was reverted (see `_restore`'s docstring).
+    """
+    yield
+    import main
+    importlib.reload(main)
 
 
 # -- the measured failure ---------------------------------------------------------------------
