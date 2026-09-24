@@ -137,6 +137,19 @@ $script:startupFailures = @()
 # own record said outcome=ok) -- see the "unclear" outcome near the bottom of this file.
 $script:startupUnclear = @()
 
+# PHASE TIMING (profiling review, 2026-09-24). A Windows Sandbox run took 6-7 minutes and
+# nothing recorded WHERE the time went -- start_all_runs.jsonl had lock_wait_s and a total
+# (ts/end) but nothing in between, so every theory about the cause was a guess. Record-PhaseTiming
+# is called around each major stage of Invoke-Startup below; New-StartAllRunRecord adds the
+# whole map as "phases" on the run record next to the existing lock/outcome fields. PURE
+# arithmetic plus one hashtable write -- never throws, so a phase that itself fails still gets
+# its time recorded by the caller's own try/finally or by running to its next statement.
+$script:phaseTimings = [ordered]@{}
+function Record-PhaseTiming([string]$Name, [datetime]$Since) {
+    if (-not $script:phaseTimings) { $script:phaseTimings = [ordered]@{} }
+    $script:phaseTimings[$Name] = [math]::Round(((Get-Date) - $Since).TotalSeconds, 2)
+}
+
 
 # ---------------------------------------------------------------------------
 # ONE start_all AT A TIME (new-PC analysis D14).
@@ -578,6 +591,7 @@ function New-StartAllRunRecord([string]$Outcome) {
         failures         = @($script:startupFailures).Count
         outcome          = $Outcome
         holder_pid       = [int]$script:busyHolderPid
+        phases           = $(if ($script:phaseTimings) { $script:phaseTimings } else { [ordered]@{} })
     }
 }
 function Write-StartAllRunRecord([string]$Path, $Record, [int]$Keep = 500) {
@@ -2226,7 +2240,9 @@ function Invoke-Startup {
         # opening Copilot Studio to do. Asking here would be a deadlock.
         Write-Host "[setup] first-time interactive setup skipped (-CoreOnly)"
     } else {
+        $t0_setupGate = Get-Date
         Invoke-FirstTimeSetupGate
+        Record-PhaseTiming "setup_gate" $t0_setupGate
     }
 
     # A .ENV CARRIED FROM ANOTHER PC IS PRESENT AND UNUSABLE, WHICH NOTHING WAS LOOKING FOR.
@@ -2299,7 +2315,9 @@ function Invoke-Startup {
         Write-Host "[update] update check skipped ($updateSkip)"
     } else {
         Set-SplashStatus $script:splash "Checking for updates..."
+        $t0_updateCheck = Get-Date
         Check-ForUpdates
+        Record-PhaseTiming "update_check" $t0_updateCheck
     }
 
     # Dependency drift (D5): the venv is brought up to date with requirements.txt HERE -- after
@@ -2307,18 +2325,22 @@ function Invoke-Startup {
     # and before the supervisor (and so the server) is started below. See the block above
     # ConvertFrom-DepsSyncOutput. Whatever it cannot fix is counted into
     # $script:startupFailures with what failed and "re-run start_all.bat"; never setup.bat.
+    $t0_depsSync = Get-Date
     try {
         $null = Invoke-DependencySync $script:venvPy $script:bootstrapPy
     } catch {
         Write-Host "[deps] dependency update skipped ($($_.Exception.Message))"
         $script:startupFailures += "Python dependencies could not be checked: $($_.Exception.Message) -- re-run start_all.bat"
     }
+    Record-PhaseTiming "deps_sync" $t0_depsSync
 
     # Dev Tunnel self-heal (best-effort, non-blocking, runs even under -NoUi):
     # repoints MCP_TUNNEL_NAME/MCP_TUNNEL_URL to a tunnel this account actually
     # owns, BEFORE the supervisor (below) hosts it.
     Set-SplashStatus $script:splash "Checking the Dev Tunnel..."
+    $t0_tunnelHeal = Get-Date
     Invoke-TunnelHealPreflight
+    Record-PhaseTiming "tunnel_heal" $t0_tunnelHeal
 
     Write-Host "=== Daily startup (idempotent -- already-running parts are left as-is) ==="
 
@@ -2332,6 +2354,7 @@ function Invoke-Startup {
     #    forever. Detect that with Test-SupervisorTunnelDrift and restart on the correct
     #    tunnel; otherwise behave exactly as before.
     Set-SplashStatus $script:splash "Starting the MCP server and Dev Tunnel..."
+    $t0_supervisor = Get-Date
     function Start-FreshSupervisor([string]$tn) {
         # QUOTED. -ArgumentList elements are joined with spaces and not quoted, so an
         # install path containing one becomes two arguments and the launch fails.
@@ -2428,6 +2451,7 @@ function Invoke-Startup {
             Write-Host "[1/4] supervisor (MCP server + tunnel): already running -- left as-is"
         }
     }
+    Record-PhaseTiming "supervisor_start" $t0_supervisor
 
     # 1b) Collect browsers left behind by a previous session, BEFORE starting anything.
     #
@@ -2442,6 +2466,8 @@ function Invoke-Startup {
     # it is not running, so a fleet run or bridge that is already up is left strictly alone.
     # Report-and-stop rather than silence, because reclaiming a browser somebody is watching
     # in Task Manager should be explainable afterwards.
+    $t0_fleetResume = Get-Date
+    try {
     $reaper = Join-Path $root "scripts\win\reap_orphan_edge.py"
     $py = Join-Path $root ".venv\Scripts\python.exe"
     if ((Test-Path $reaper) -and (Test-Path $py)) {
@@ -2505,7 +2531,9 @@ function Invoke-Startup {
         Write-Host "[core] server and tunnel are up; browser, bridge and UI left for STEP 7"
         return
     }
+    } finally { Record-PhaseTiming "fleet_resume_and_reaper" $t0_fleetResume }
 
+    $t0_browserBridgeUi = Get-Date
     # 2) Companion Edge :9222 (the fleet / agent Edge). Idempotent; skip if the port answers.
     Set-SplashStatus $script:splash "Starting the agent browser..."
     if (Port-Up 9222) {
@@ -2630,6 +2658,7 @@ function Invoke-Startup {
     } else {
         Invoke-UiStep
     }
+    Record-PhaseTiming "browser_bridge_ui" $t0_browserBridgeUi
 
     Write-Host ""
     if ($NoUi) {
@@ -2642,7 +2671,9 @@ function Invoke-Startup {
 
     # 5) One-time convenience provisioning (Desktop icon + logon autostart). Runs last, after every
     #    service/UI above is already launched, so any failure here can never block real startup.
+    $t0_provisioning = Get-Date
     Ensure-ConvenienceProvisioning
+    Record-PhaseTiming "provisioning" $t0_provisioning
 
     if (-not $NoUi) {
         # Keep the splash up (BOUNDED ~20s) until a chat/cockpit window actually appears, then enforce
@@ -2669,6 +2700,7 @@ function Invoke-Startup {
 $script:splash = $null
 $script:startupFailures = @()
 $script:startupUnclear = @()
+$script:phaseTimings = [ordered]@{}
 $script:lockTimedOut = $false           # Enter-StartAllLock gave up: nothing was started
 $script:supervisorStartedHere = $false  # this run started a supervisor that survived
 $script:supervisorDied = $false         # this run started one and it exited at once
@@ -2711,6 +2743,7 @@ if (-not $ranViaSplash) {
 # and under -CoreOnly too, which is the start whose exit code quickstart reads before STEP 5
 # asks for a Copilot Studio connection test. Not after a lock timeout: nothing was started.
 if (-not $script:lockTimedOut) {
+    $t0_tunnelConfirm = Get-Date
     try {
         if ($script:supervisorDied) {
             Write-Host "[tunnel] not checked: the supervisor, which hosts it, did not start (see above)" -ForegroundColor DarkGray
@@ -2720,6 +2753,7 @@ if (-not $script:lockTimedOut) {
     } catch {
         Write-Host ("[tunnel] check skipped (" + $_.Exception.Message + ")") -ForegroundColor DarkGray
     }
+    Record-PhaseTiming "tunnel_confirm" $t0_tunnelConfirm
 }
 
 # THE SESSION EXPIRES AND NOTHING LOOKED. ensure_m365_signin is called from quickstart once, at
@@ -2791,6 +2825,7 @@ function Report-OtherProfileSignIns {
     }
 }
 
+$t0_m365Signin = Get-Date
 try {
     $signinPs = Join-Path $scriptDir "ensure_m365_signin.ps1"
     if ((Test-Path $signinPs) -and (-not $CoreOnly) -and (-not $script:lockTimedOut)) {
@@ -2842,6 +2877,8 @@ try {
     }
 } catch {
     Write-Host ("[m365] sign-in check skipped (" + $_.Exception.Message + ")") -ForegroundColor DarkGray
+} finally {
+    Record-PhaseTiming "m365_signin" $t0_m365Signin
 }
 
 # WHAT WENT WRONG, SAID OUT LOUD AT THE END. This script returns 0 whatever happens, so a
