@@ -214,7 +214,59 @@ if ($args -contains '-CheckWshOnly') {
     # the established contract every caller (start_all.bat, make_desktop_shortcut.ps1,
     # register-supervisor.ps1) greps for; it now also covers a missing VBScript engine
     # (Test-CanRunVbs), which is a second, different way wscript can fail to do anything.
-    Write-Output ('WSH-ENABLED=' + [int](Test-CanRunVbs))
+    #
+    # CACHED for a short TTL (scripts/test_start_all_ten_clicks.py, 2026-09-25): this runs
+    # BEFORE start_all.ps1's single-instance lock is even reached, so its own cost was invisible
+    # to LEAVE_BOUND_SEC but not to the machine -- ten start_all.bat double-clicks meant ten
+    # concurrent powershell.exe cold-starts each walking the full WSH + VBScript-engine registry
+    # chain (Test-CanRunVbs), and the resulting CPU/IO contention was measured pushing an
+    # unrelated LEAVING copy's own internal timing past its 3.0 s bound (leaver_max_s 3.02-3.78
+    # s across repeated runs) even though that copy never calls this script itself. A GPO or the
+    # VBScript engine does not change between two clicks a second apart, so the result is cached
+    # to a per-checkout temp file for PREFLIGHT_WSH_CACHE_TTL_SEC (default 60s, matching "once a
+    # policy is asked about, don't ask ten more times before the coffee is poured"); a stale
+    # positive/negative lives for at most that long, which was already true of the DAILY check
+    # this replaced (setup.bat's own preflight can be minutes-to-days stale). Best-effort: a
+    # cache read/write failure just falls back to the real check, never blocks it.
+    #
+    # NEVER cached when PREFLIGHT_TEST_WSH_ENABLED/PREFLIGHT_TEST_VBS_ENGINE force an answer:
+    # those exist so a test can flip the machine's simulated policy between two calls in the
+    # same process/tree (scripts/test_shortcuts_without_wsh.py's "self heals when WSH is
+    # disabled later", scripts/test_preflight_vbs_engine.py, scripts/test_preflight_wsh_and_
+    # start_all_fallback.py) and see the NEXT check reflect it immediately -- caching under a
+    # forced override broke exactly that (first FAILED run: the second, differently-forced call
+    # inside the TTL window kept reading the first call's cached answer). Production never sets
+    # these, so the real-registry path (the one under concurrency load) is unaffected.
+    $wshTtlSec = 60
+    if ($env:PREFLIGHT_TEST_WSH_ENABLED -or $env:PREFLIGHT_TEST_VBS_ENGINE) { $wshTtlSec = 0 }
+    elseif ($env:PREFLIGHT_WSH_CACHE_TTL_SEC) {
+        try { $wshTtlSec = [int]$env:PREFLIGHT_WSH_CACHE_TTL_SEC } catch { $wshTtlSec = 60 }
+    }
+    $wshCachePath = $null
+    if ($wshTtlSec -gt 0) {
+        try {
+            $md5 = [System.Security.Cryptography.MD5]::Create()
+            $keySrc = ([string]$PSScriptRoot).ToLowerInvariant()
+            $hash = [BitConverter]::ToString($md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($keySrc))).Replace('-', '')
+            $md5.Dispose()
+            $wshCachePath = Join-Path ([System.IO.Path]::GetTempPath()) ('m365-wsh-check-' + $hash + '.txt')
+            if (Test-Path -LiteralPath $wshCachePath) {
+                $ageSec = ((Get-Date).ToUniversalTime() - (Get-Item -LiteralPath $wshCachePath).LastWriteTimeUtc).TotalSeconds
+                if ($ageSec -ge 0 -and $ageSec -lt $wshTtlSec) {
+                    $cached = (Get-Content -LiteralPath $wshCachePath -Raw -ErrorAction Stop).Trim()
+                    if ($cached -match '^WSH-ENABLED=[01]$') {
+                        Write-Output $cached
+                        exit 0
+                    }
+                }
+            }
+        } catch { $wshCachePath = $null }
+    }
+    $wshResult = 'WSH-ENABLED=' + [int](Test-CanRunVbs)
+    if ($wshCachePath) {
+        try { [System.IO.File]::WriteAllText($wshCachePath, $wshResult) } catch { }
+    }
+    Write-Output $wshResult
     exit 0
 }
 if ($args -contains '-ProbeOnly') {
