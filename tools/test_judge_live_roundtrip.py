@@ -23,6 +23,24 @@ Every server built here therefore goes through register(), and the first test as
 thread the tool lands on, so a change to that wrapper fails here rather than silently disabling
 the judge.
 
+WHY `wrap=False` ALSO PASSES `run_in_thread=False` (2026-09-24). fastmcp used to run a bare
+`mcp.tool()(fn)` sync function INLINE on the loop thread -- there was no offload in the package,
+which is what made "unwrapped" and "on the loop thread" the same condition when this file was
+written. fastmcp 3.4.7 changed that default: `FunctionTool.run_in_thread` now defaults to
+`True` even for a bare registration, so an unwrapped sync tool is *also* dispatched to a worker
+thread by fastmcp itself, and `test_an_unwrapped_tool_cannot_and_says_why` stopped reproducing
+the mistake it exists to pin (`on_the_event_loop_thread()` came back `False` even without
+register()). That is a real change in the dependency, not flakiness: it reproduced in complete
+isolation, standalone, against `.venv`'s pinned fastmcp==3.4.7, before this fix.
+
+The defect this file pins -- a sync tool running ON the loop thread cannot make an outbound
+sampling request, and must refuse in milliseconds rather than deadlock -- is still real; it is
+just no longer fastmcp's *default* shape. `run_in_thread=False` asks fastmcp for that shape
+explicitly, which is also fastmcp's own documented escape hatch for callers with thread-affinity
+requirements (Windows COM, tkinter) who set the same flag for the same reason: to keep a sync
+call on the loop thread on purpose. Using it here keeps this test pinned to the mistake itself
+rather than to whichever way a given fastmcp release reaches it.
+
 In-memory transport: no network, no port, no browser, no Copilot. It proves the plumbing, not
 that the production client can do any of this -- that client declares its own capabilities and
 this file cannot speak for it.
@@ -49,12 +67,18 @@ def _server(fn, wrap=True):
 
     `wrap=False` reproduces the mistake above, and one test uses it deliberately to pin the
     difference -- so if register() ever stops offloading, the reason this file cares is already
-    written down beside the failure.
+    written down beside the failure. It also passes `run_in_thread=False`: fastmcp 3.4.7 offloads
+    even a bare sync tool to a worker thread by default (see the module docstring's 2026-09-24
+    note), so reproducing "runs on the loop thread" now takes an explicit ask, the same escape
+    hatch fastmcp documents for its own thread-affinity callers.
     """
     mcp = FastMCP("judge-roundtrip-test")
     # The deployment installs this too; without it there is no loop to fall back on.
     assert B.install(mcp), "the loop-capture middleware could not be installed"
-    mcp.tool()(register(fn) if wrap else fn)
+    if wrap:
+        mcp.tool()(register(fn))
+    else:
+        mcp.tool(run_in_thread=False)(fn)
     return mcp
 
 
