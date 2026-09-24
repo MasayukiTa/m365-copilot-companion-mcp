@@ -42,6 +42,8 @@ import io
 import json
 import os
 import re
+import shutil
+import subprocess
 import time
 
 #: Diagnostics for finished runs. Generous because they cost little and are the first thing
@@ -276,6 +278,250 @@ def stores(fleet_dir, now=None, dry_run=False, keep_days=None, names=None):
                 continue
             freed += _rm(p, dry_run)
             removed.append(os.path.relpath(p, fleet_dir))
+    return freed, removed
+
+
+#: swe/work never shrinks. STORE_SKIP (above) stops the per-file age rule from entering it, and
+#: that fix was correct as far as it went -- but "correct" there meant "does nothing", and
+#: nothing else in this file touches that directory either. Measured 2026-09-24: 1.27 GB across
+#: roughly a hundred thousand files, all of it benchmark clones, worktrees and pip targets that
+#: fleet_runner leaves behind once a run finishes with them, and none of it has ever been freed.
+#:
+#: The unit of deletion here is DIFFERENT IN KIND from every rule above. Every other rule in
+#: this file deletes individual files: a log, a rotation, a scratch file, one aged-out entry in
+#: a per-run store. Deleting individual files out of the MIDDLE of a git checkout is exactly
+#: the failure STORE_SKIP's docstring describes -- a pack file untouched for thirty days is
+#: still the repository, and removing it file-by-file does not clean the clone, it corrupts it.
+#: So this rule never deletes a file. It deletes a whole clone directory, as one atomic
+#: `shutil.rmtree`, once the WHOLE of it -- not its own directory entry, but everything nested
+#: inside it -- has gone untouched for the keep window, and only once nothing still running
+#: references its path.
+CLONE_KEEP_DAYS = float(os.environ.get("MCP_FLEET_CLONE_DAYS", "14"))
+
+#: How often the clone sweep is actually allowed to run its walk, regardless of how often
+#: apply() itself is called. See the measurement note on workspace_clones() for why a walk that
+#: costs a fraction of a second per clone still needs a floor under how often it runs at all.
+CLONE_SWEEP_HOURS = float(os.environ.get("MCP_FLEET_CLONE_SWEEP_HOURS", "24"))
+
+#: Sidecar recording when the clone sweep last actually walked swe/work, so the cost of the
+#: walk is amortized to at most once per CLONE_SWEEP_HOURS no matter how many times apply()
+#: runs in between -- fleet_runner.py calls apply() at the start of EVERY fleet run.
+_CLONE_SWEEP_STATE_NAME = "clone_sweep_state.json"
+
+
+def _clone_sweep_due(fleet_dir, now, sweep_hours):
+    """Whether enough time has passed since the last walk to justify another one.
+
+    Unreadable or missing state means "never swept" -- due, not skipped. A state file that
+    cannot be parsed must not silently disable the sweep forever.
+    """
+    path = os.path.join(fleet_dir, _CLONE_SWEEP_STATE_NAME)
+    try:
+        data = json.load(io.open(path, encoding="utf-8-sig"))
+        last = float(data.get("last_swept_ts") or 0)
+    except Exception:
+        return True
+    return (now - last) / 3600.0 >= sweep_hours
+
+
+def _record_clone_sweep(fleet_dir, now):
+    """Stamp that the walk just ran. TMP-THEN-REPLACE, the same atomic idiom conversations()
+    uses above: a crash mid-write must leave either the old stamp or the new one, never a
+    truncated file that makes every future call see a corrupt state and re-walk needlessly (or,
+    worse, a parse exception that some future caller mistakes for permission to skip a real
+    sweep -- which is why _clone_sweep_due treats unreadable as due, not as skip)."""
+    path = os.path.join(fleet_dir, _CLONE_SWEEP_STATE_NAME)
+    tmp = path + ".tmp"
+    try:
+        with io.open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"last_swept_ts": now}, fh)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _newest_mtime_and_size(root):
+    """The newest mtime and total byte size found anywhere under `root`, recursively, never
+    following a symlink or a junction.
+
+    REUSES _store_files()'s NO-STAT-PER-FILE TECHNIQUE RATHER THAN A SECOND PASS. On Windows a
+    DirEntry's stat(follow_symlinks=False) is populated from the directory listing NtQuery
+    already returned; os.walk() + os.path.getmtime() costs a real stat() syscall per file and
+    per directory, which is the exact cost STORE_SKIP exists to keep out of swe/work. This
+    function is the one place this rule is allowed to look at every file in a clone -- finding
+    the true recursive newest mtime has no cheaper definition -- so it must not also be the
+    place that reintroduces a stat-per-file walk.
+
+    A clone touched two days ago by a `pip install` in a venv six directories down is NOT stale
+    even though the clone's own top-level directory entry has not changed in months; that is
+    why the caller cannot use the top-level entry's own mtime and must call this.
+
+    FILE MTIMES ONLY, NOT DIRECTORY MTIMES. A directory's own mtime is bumped by adding or
+    removing an entry inside it -- which is exactly what writing a new file already does, at
+    the same instant -- so a real write is never missed by looking at files alone. Counting
+    directory mtimes too would add nothing a file mtime does not already cover, while making
+    the result depend on directory-entry churn (a rename, a delete) that leaves no file behind
+    to justify calling the clone anything but stale.
+    """
+    newest = 0.0
+    total = 0
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                entries = list(it)
+        except OSError:
+            continue
+        for e in entries:
+            try:
+                if e.is_symlink():
+                    continue
+                st = e.stat(follow_symlinks=False)
+                if getattr(st, "st_file_attributes", 0) & _REPARSE_POINT:
+                    continue
+                if e.is_dir(follow_symlinks=False):
+                    stack.append(e.path)
+                elif e.is_file(follow_symlinks=False):
+                    if st.st_mtime > newest:
+                        newest = st.st_mtime
+                    total += st.st_size
+            except OSError:
+                continue
+    return newest, total
+
+
+def _default_path_in_use(path):
+    """True/False/None: whether any LIVE process's command line names `path` -- None when the
+    question could not be answered at all.
+
+    Mirrors orphan_reaper.candidates()'s own technique (Win32_Process via CimInstance, matched
+    case-insensitively against the command line) because that module already established it as
+    the only real signal on Windows: fleet_runner's ACTIVE_MARKER records pid/argv/start_ts but
+    never a workspace path, so there is no marker to read here, only the process table itself.
+
+    None on ANY failure -- PowerShell not found, WMI refusing the query, a timeout, malformed
+    JSON -- so the caller can fail closed exactly as _linked_sessions() does above: an
+    unanswerable question about what is running must never be treated as "nothing is running".
+    """
+    norm = os.path.normcase(os.path.abspath(path))
+    ps = "Get-CimInstance Win32_Process | Select-Object CommandLine | ConvertTo-Json -Compress"
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=120)
+        if r.returncode != 0:
+            return None
+        rows = json.loads(r.stdout or "[]")
+    except Exception:
+        return None
+    if isinstance(rows, dict):
+        rows = [rows]
+    if not isinstance(rows, list):
+        return None
+    for row in rows:
+        try:
+            cmd = row.get("CommandLine") or ""
+        except AttributeError:
+            return None
+        if norm in os.path.normcase(cmd):
+            return True
+    return False
+
+
+def workspace_clones(fleet_dir, now=None, dry_run=False, keep_days=None, sweep_hours=None,
+                     in_use=None):
+    """Remove a whole benchmark clone/workspace under swe/work, once it is both old and unused.
+
+    Removed AS ONE UNIT (shutil.rmtree on the clone's own top-level directory), never file by
+    file -- see the module-level comment on CLONE_KEEP_DAYS for why a per-file rule has no
+    business here. A directory qualifies only when BOTH hold:
+
+      * nothing anywhere inside it, recursively, has a newer mtime than `keep_days` -- checked
+        by _newest_mtime_and_size(), which walks the clone but costs no stat() beyond what
+        os.scandir()'s DirEntry already returns for free;
+      * `in_use(path)` is False, not None -- see _default_path_in_use(). None (the question
+        could not be answered) and True (it can) are both treated as "leave it alone": FAIL
+        CLOSED, the same rule _linked_sessions() states above, because acting on an unanswerable
+        in-use check is how a live checkout gets removed out from under a run reading it.
+
+    THROTTLED, NOT UNCONDITIONAL. Unlike every other rule in this file, this one does not run
+    on every apply() -- see CLONE_SWEEP_HOURS. Measured on a synthetic tree of the same shape
+    as the real swe/work (see the measurement note this function's commit message carries): the
+    walk is well under the ~60 s budget f7571a1 fixed, but it is not free either, and apply()
+    runs at the start of EVERY fleet start. A per-call cost that is individually cheap still
+    adds up if it runs on every start of a fleet that starts often, so the walk itself -- not
+    just the deletion -- is bounded to once per CLONE_SWEEP_HOURS via the sidecar state file.
+    A call inside the throttle window returns immediately, before touching swe/work at all: no
+    os.scandir() on it, no cost beyond reading the small state file.
+
+    Returns (freed_bytes, [clone names removed]), the same tuple shape every rule in this file
+    returns; dry_run reports what would be removed without calling rmtree.
+    """
+    now = time.time() if now is None else now
+    keep_days = _setting("fleet_clone_days", CLONE_KEEP_DAYS) if keep_days is None else keep_days
+    sweep_hours = (_setting("fleet_clone_sweep_hours", CLONE_SWEEP_HOURS)
+                  if sweep_hours is None else sweep_hours)
+    in_use = _default_path_in_use if in_use is None else in_use
+
+    if not _clone_sweep_due(fleet_dir, now, sweep_hours):
+        return 0, []
+
+    work_root = os.path.join(fleet_dir, "swe", "work")
+    freed, removed = 0, []
+    if not os.path.isdir(work_root):
+        # DRY RUN WRITES NOTHING, NOT EVEN THE SIDECAR. apply(dry_run=True) is relied on
+        # elsewhere to touch nothing in fleet_dir at all -- see
+        # test_a_dry_run_removes_nothing in test_fleet_retention.py -- so the throttle stamp
+        # is recorded only on a real run. A dry run therefore does not amortize the walk cost
+        # the way a real run does, which is the correct trade: a diagnostic call must be
+        # side-effect free even at the cost of re-walking on the next dry run too.
+        if not dry_run:
+            _record_clone_sweep(fleet_dir, now)
+        return freed, removed
+
+    try:
+        with os.scandir(work_root) as it:
+            children = list(it)
+    except OSError:
+        return freed, removed
+
+    for e in children:
+        try:
+            if e.is_symlink():
+                continue
+            st = e.stat(follow_symlinks=False)
+            if getattr(st, "st_file_attributes", 0) & _REPARSE_POINT:
+                continue
+            if not e.is_dir(follow_symlinks=False):
+                continue
+        except OSError:
+            continue
+
+        # The top-level directory's OWN mtime is deliberately not consulted here either, for
+        # the same reason _newest_mtime_and_size() does not track directory mtimes below it:
+        # it is a listing entry, not a file, and every real write inside the clone is already
+        # visible as a file mtime.
+        newest, size = _newest_mtime_and_size(e.path)
+        if (now - newest) / 86400.0 <= keep_days:
+            continue
+
+        used = in_use(e.path)
+        if used or used is None:
+            # FAIL CLOSED -- see _default_path_in_use()'s own docstring. `used is None` means
+            # the question could not be answered at all, and that is not a reason to guess.
+            continue
+
+        if not dry_run:
+            try:
+                shutil.rmtree(e.path)
+            except OSError:
+                continue
+        freed += size
+        removed.append(e.name)
+
+    if not dry_run:
+        _record_clone_sweep(fleet_dir, now)
     return freed, removed
 
 
@@ -585,10 +831,12 @@ def apply(fleet_dir=None, now=None, dry_run=False):
                      ("rotations", rotations),
                      ("scratch", scratch),
                      ("stores", stores),
+                     ("workspace_clones", workspace_clones),
                      ("conversations", conversations),
                      ("cap_jsonl", cap_jsonl)):
         try:
-            if fn in (coordinator_logs, scratch, stores, compress, conversations):
+            if fn in (coordinator_logs, scratch, stores, compress, conversations,
+                     workspace_clones):
                 freed, items = fn(fleet_dir, now=now, dry_run=dry_run)
             else:
                 freed, items = fn(fleet_dir, dry_run=dry_run)
