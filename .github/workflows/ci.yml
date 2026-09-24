@@ -742,6 +742,7 @@ jobs:
             tests/test_health_route.py \
             tests/test_launch_gate_asks_only_what_it_reads.py \
             tools/test_notify_ops_gate_reachability.py \
+            tools/test_no_toast_that_nobody_can_answer.py \
             ui/test_the_frozen_dot_has_no_untranslated_jargon.py \
             ui/test_the_startup_loop_has_a_backstop.py \
             ui/test_the_bridge_client_sends_the_token.py \
