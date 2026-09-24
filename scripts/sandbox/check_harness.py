@@ -66,7 +66,10 @@ def check() -> list:
             cmd = ("$e=$null; [void][System.Management.Automation.Language.Parser]::ParseFile("
                    "'%s',[ref]$null,[ref]$e); if ($e.Count) { $e | %% { $_.Message + ' @' + "
                    "$_.Extent.StartLineNumber }; exit 1 }" % path.replace("'", "''"))
-            r = subprocess.run([ps, "-NoProfile", "-Command", cmd], capture_output=True)
+            # A parse check needs no console: capture_output reads its answer, and without
+            # CREATE_NO_WINDOW a run from a console-less parent would flash a window.
+            r = subprocess.run([ps, "-NoProfile", "-Command", cmd], capture_output=True,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             if r.returncode != 0:
                 problems.append("%s does not parse: %s" % (
                     os.path.basename(path), r.stdout.decode("utf-8", "replace").strip()))
