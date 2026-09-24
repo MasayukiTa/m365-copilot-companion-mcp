@@ -356,8 +356,32 @@ def _record_constants(src, tree):
     this repository's tests. That file's count is what decides whether MCP_REQUIRE_UNLOCK_TOKEN
     can be enforced, so the contamination was in the evidence for a security change.
 
-    STILL A TRIPWIRE, NOT A PROOF -- see fleet_constants(). A path assembled at call time, or
-    derived through a function rather than an assignment, passes through both passes.
+    STILL A TRIPWIRE, NOT A PROOF -- see fleet_constants(). A path assembled at call time,
+    through a spelling neither pass recognises, still passes through untouched.
+
+    THE THIRD PASS, ADDED 2026-09-24 for the SAME MISS ONE SYNTACTIC SHAPE FURTHER OUT.
+    tools/security.py's SEC-02/SEC-03 change (commit e25b7a3) added three private helpers --
+    `_revocations_file`, `_state_lock_file`, `_generation_file` -- each a one-line function that
+    `return`s a path built from `STATE_FILE`, an already-declared record constant:
+
+        def _generation_file() -> Path:
+            return STATE_FILE.parent / ".fleet" / "unlock_generation.json"
+
+    A `def` is not an `ast.Assign`, so the two passes above -- which only walk `tree.body` for
+    assignments -- never see it, exactly as this function's own docstring already warned
+    ("derived through a function rather than an assignment, passes through both passes"). Left
+    that way, the walker cannot tell a reader whether these three follow STATE_FILE's redirect
+    or write straight past it; the answer happens to be yes (verified in
+    test_a_security_function_derived_path_follows_state_file below), but a walker that has to be
+    trusted by inspection rather than by running is the same failure this whole module exists to
+    remove.
+
+    Deliberately NARROW: only a function whose ENTIRE body is one `return <expr>`, so a helper
+    that branches, mutates, or does anything besides compute a path is left for a human to
+    classify rather than silently swept in. Fixed points against the SAME `declared` set the
+    assignment passes built, so a function returning a marker literal directly, or built from an
+    already-declared constant (STATE_FILE, _STATE_FILE, ...), is credited by NAME -- the
+    function's own name stands in for the constant a caller would otherwise have redirected.
     """
     assigns, declared = [], set()
     for node in tree.body:
@@ -376,6 +400,37 @@ def _record_constants(src, tree):
         for targets, refs in assigns:
             if (refs & declared) and not set(targets) <= declared:
                 declared.update(targets)
+                changed = True
+
+    func_returns = []
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        body = node.body
+        # A DOCSTRING IS NOT A SECOND STATEMENT. `_revocations_file` and `_generation_file`
+        # (the other two of tools/security.py's three derived helpers) each open with one --
+        # "The tombstone ledger. Derived from STATE_FILE ..." -- and requiring the body to be
+        # exactly one statement missed both while finding only their undocumented sibling
+        # `_state_lock_file`. Stripping a leading `Expr(Constant(str))` before the length check
+        # is the same move `code_only()` above makes for the same reason: prose is not code.
+        if (body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            body = body[1:]
+        if len(body) != 1 or not isinstance(body[0], ast.Return):
+            continue
+        ret = body[0].value
+        if ret is None:
+            continue
+        refs = {n.id for n in ast.walk(ret) if isinstance(n, ast.Name)}
+        func_returns.append((node.name, refs))
+        if _names_a_record_dir(ret):
+            declared.add(node.name)
+    changed = True
+    while changed:
+        changed = False
+        for name, refs in func_returns:
+            if (refs & declared) and name not in declared:
+                declared.add(name)
                 changed = True
     return declared
 
@@ -547,3 +602,54 @@ def test_a_test_run_leaves_the_operators_trace_directory_alone():
         "RUNS_DIR still points at the operator's directory during tests: %s" % TO.RUNS_DIR)
     after = set(p.name for p in live.glob("*")) if live.is_dir() else set()
     assert after == before, "a test write reached the live trace directory: %s" % (after - before)
+
+
+# ── the three unlock helpers found by the third (function-return) pass ─────────────────────
+
+def test_the_walk_finds_all_three_unlock_helpers():
+    """THE INSTANCE THE THIRD PASS WAS ADDED FOR. commit e25b7a3 (SEC-02/SEC-03) added three
+    private helpers to tools/security.py that each `return` a path built from STATE_FILE, an
+    already-declared record constant. Two of the three open with a docstring, which is why the
+    function-body check strips a leading Expr(Constant(str)) before counting statements --
+    without that, only the undocumented third (`_state_lock_file`) was found."""
+    found = fleet_constants()
+    assert ("tools.security", "_revocations_file") in found
+    assert ("tools.security", "_generation_file") in found
+    assert ("tools.security", "_state_lock_file") in found
+
+
+def test_the_three_unlock_helpers_follow_state_files_redirect():
+    """THE MEASUREMENT THAT MATTERS, same shape as
+    test_a_test_that_records_a_gap_does_not_touch_the_live_file in
+    relay/test_a_derived_path_is_still_a_path.py: everything above is about SEEING the three
+    helpers; this is about whether they actually stay off the real tree once STATE_FILE moves.
+
+    Reproduces conftest's own autouse redirect by hand (monkeypatch.setattr(sec, "STATE_FILE",
+    ...)) rather than relying on it having already run, so this test states its own assumption
+    instead of trusting a fixture ordering it does not control -- and calls each helper, not
+    just prints where it lives, because a function that resolves elsewhere but is never invoked
+    would prove nothing about what actually gets written to.
+    """
+    import tempfile
+    from pathlib import Path
+
+    from tools import security as sec
+
+    real_state_file = os.path.join(REPO, ".unlock_state.json")
+    real_fleet_dir = os.path.join(REPO, ".fleet")
+
+    orig = sec.STATE_FILE
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            sec.STATE_FILE = Path(tmp) / "unlock_state.json"
+            for fn in (sec._revocations_file, sec._generation_file, sec._state_lock_file):
+                resolved = str(fn())
+                assert resolved != real_state_file
+                assert real_fleet_dir not in resolved, (
+                    "%s() still resolves into the real .fleet after STATE_FILE was redirected: "
+                    "%s" % (fn.__name__, resolved))
+                assert tmp in resolved, (
+                    "%s() did not follow the redirected STATE_FILE at all: %s"
+                    % (fn.__name__, resolved))
+    finally:
+        sec.STATE_FILE = orig
