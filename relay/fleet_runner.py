@@ -262,6 +262,12 @@ def merge_conv_rows(existing, entries, now=None):
                 fresh["name"] = nm
             if u and not row.get("url"):
                 fresh["url"] = u     # the url arrived after the row was made from a transcript
+            # Backfill only -- a row written before "goal" existed, or one whose goal write
+            # raced the read, must not stay permanently unaddressable. Never overwrites a goal
+            # already recorded (it cannot change for a given worker/attempt lineage anyway).
+            g = entry.get("goal") or ""
+            if g and not row.get("goal"):
+                fresh["goal"] = g
             if fresh:
                 row.update(fresh)
                 row["ts"] = time.time() if now is None else now
@@ -3152,6 +3158,17 @@ def main():
                                 # re-scrape (which fails for any conv whose agent the bridge
                                 # is not currently connected to).
                                 "transcript": tr,
+                                # THE FULL GOAL TEXT, UNTRUNCATED -- NOT `title`, which
+                                # make_title() cuts down for display. Before this field existed
+                                # the registry was the only continuously-updated feed the chat
+                                # window has while it is already open (DiscoverTranscripts only
+                                # scans once, at startup) and it carried no goal at all, so any
+                                # conversation reached through it -- including every interrupt
+                                # sent while the worker was still running -- had nothing for
+                                # DecideFleetSend to identify it by and refused with
+                                # fleet_no_goal even though the worker was live right there.
+                                # See docs/incidents/20260924_fleet_interrupt_no_goal.md.
+                                "goal": w.goal or "",
                                 "name": getattr(w, "name", ""), "ts": time.time()})
             # SEVEN ROWS, ONE TITLE. `make_title` is called once per row above, in isolation,
             # so rows whose goals share an opening come out identical -- and every child of a

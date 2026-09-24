@@ -1184,6 +1184,29 @@ class ChatWindow : Window, IChatSendEffects
         return msgs;
     }
 
+    // The goal text off a transcript's own first ("meta") line -- relay/relay_fleet.py's
+    // _Transcript writes it once, at file creation, and it never changes afterward (a retry
+    // opens a new attempt file with the SAME goal; see relay_fleet.py's fresh_replay). Used as
+    // the last-resort source of identity for a fleet conversation opened by click: the live
+    // status.json worker dict is the first choice (see OpenFromFleet) because it survives a
+    // finished worker's slot being reused, but a restarted fleet or an old run has no worker
+    // dict at all, only this file. Returns "" on any read/parse failure -- never throws.
+    string TranscriptMetaGoal(string path)
+    {
+        if (string.IsNullOrEmpty(path) || !TranscriptFileExists(path)) return "";
+        try
+        {
+            using (var sr = OpenTranscriptReader(path))
+            {
+                string first = sr.ReadLine();
+                if (string.IsNullOrEmpty(first)) return "";
+                var meta = _cjs.DeserializeObject(first) as Dictionary<string, object>;
+                return meta != null ? SS(meta, "goal") : "";
+            }
+        }
+        catch { return ""; }
+    }
+
     // One JSONL transcript line -> a turn, or nothing. Shared by the full read above and the
     // incremental live-follow below so the two can never disagree about what counts as a turn.
     //
@@ -1391,14 +1414,33 @@ class ChatWindow : Window, IChatSendEffects
                 // just openable a different way. A row with neither is still skipped -- there
                 // is nothing to show or open for it either way.
                 if (string.IsNullOrEmpty(url) && string.IsNullOrEmpty(transcript)) continue;
-                bool exists = false;
+                // THE FULL GOAL TEXT (relay/fleet_runner.py::_register_convs, added alongside
+                // this read). NOT "title": make_title() truncates that for display, and
+                // DecideFleetSend (ChatSend.cs) addresses a fleet conversation by the goal, not
+                // the title -- a follow-up or a mid-run interrupt sent through a row with no
+                // goal was refused (fleet_no_goal) even while the worker was live, because this
+                // registry poll is the ONLY feed that updates while the window is already open
+                // (DiscoverTranscripts only scans once, at startup).
+                string regGoal = SS(d, "goal");
+                Conversation existingC = null;
                 foreach (var c in _all)
                 {
-                    if (!string.IsNullOrEmpty(url) && c.ConvUrl == url) { exists = true; break; }
+                    if (!string.IsNullOrEmpty(url) && c.ConvUrl == url) { existingC = c; break; }
                     if (string.IsNullOrEmpty(url) && !string.IsNullOrEmpty(transcript)
-                        && c.Transcript == transcript) { exists = true; break; }
+                        && c.Transcript == transcript) { existingC = c; break; }
                 }
-                if (!exists)
+                if (existingC != null)
+                {
+                    // BACKFILL ONLY: a row discovered before the registry carried "goal", or one
+                    // whose identity was never set by OpenFromFleet (see there), must not stay
+                    // permanently unaddressable just because it already exists. Never overwrite
+                    // a goal/transcript this row already has.
+                    if (!string.IsNullOrEmpty(regGoal) && string.IsNullOrEmpty(existingC.Goal))
+                        existingC.Goal = regGoal;
+                    if (!string.IsNullOrEmpty(transcript) && string.IsNullOrEmpty(existingC.Transcript))
+                        existingC.Transcript = transcript;
+                    continue;
+                }
                 {
                     var c = new Conversation();
                     c.ConvUrl = url;
@@ -1406,6 +1448,7 @@ class ChatWindow : Window, IChatSendEffects
                     c.Source = SS(d, "source");
                     c.Transcript = transcript;   // disk jsonl -> open from disk, no scrape
                     c.Name = SS(d, "name");
+                    c.Goal = regGoal;
                     try { c.Ts = (d.ContainsKey("ts") && d["ts"] != null) ? Convert.ToDouble(d["ts"]) : 0; }
                     catch { c.Ts = 0; }
                     _all.Insert(0, c);   // newest on top (registry/fleet convs were appended below)
@@ -1636,6 +1679,17 @@ class ChatWindow : Window, IChatSendEffects
         if (string.IsNullOrEmpty(transcriptPath) && !string.IsNullOrEmpty(worker))
             transcriptPath = NewestTranscriptForWorker(worker);
 
+        // THE GOAL TEXT THAT IDENTIFIES THIS CONVERSATION TO THE FLEET (ChatSend.cs's
+        // DecideFleetSend addresses a follow-up / a live steer by c.Goal and c.Transcript, not
+        // by c.Title). Neither field was ever copied onto the Conversation object below -- the
+        // live worker dict and the transcript file both had the answer right here, and it was
+        // simply never read. That is what made an interrupt sent while the worker was still
+        // running, and a follow-up sent after it finished, both refuse identically: this
+        // method built the conversation the chat window actually sends through, and it always
+        // carried an empty Goal and an empty Transcript regardless of the worker's real state.
+        string liveGoal = wkr != null ? SS(wkr, "goal") : "";
+        string bestGoal = !string.IsNullOrEmpty(liveGoal) ? liveGoal : TranscriptMetaGoal(transcriptPath);
+
         // SOURCE PRIORITY:
         //  1. Persisted full-text transcript (jsonl) -- ALWAYS preferred when present. It is the
         //     whole conversation, untruncated, and reading it touches only disk (never the live
@@ -1685,6 +1739,22 @@ class ChatWindow : Window, IChatSendEffects
             Conversation c = null;
             foreach (var x in _all) { if (x.ConvUrl == key) { c = x; break; } }
             if (c == null) { c = new Conversation(); c.ConvUrl = key; c.Title = T("fleetview"); _all.Insert(0, c); }
+            // A FLEET CONVERSATION BY CONSTRUCTION -- UNLESS THIS ROW IS SOMETHING ELSE. This
+            // method is reached only for a fleet worker (cockpit "open") or a registry row with
+            // no cached messages yet (OpenConversation's "haven't loaded yet" branch, which also
+            // covers a plain Copilot-side orphan row when one shares this exact ConvUrl). DO NOT
+            // stamp Source over a row that already carries a real, different one -- only a stub
+            // with no source yet (the default "") is claimed here. DecideDoor (ChatSend.cs)
+            // routes a send by c.Source == "fleet"; a stub left at "" would fall through to the
+            // page-pinning doors instead, which have no key for it either (send_unknown_conv).
+            if (string.IsNullOrEmpty(c.Source)) c.Source = "fleet";
+            if (!string.IsNullOrEmpty(worker) && string.IsNullOrEmpty(c.Name)) c.Name = worker;
+            // NEVER BLANK OUT AN IDENTITY THIS ROW ALREADY HAD (e.g. from DiscoverTranscripts or
+            // the conversations.json registry sync) -- only fill in what is missing, and prefer
+            // whatever is freshest when both exist (the live/transcript reads just above this
+            // block are always at least as current as a poll from earlier).
+            if (!string.IsNullOrEmpty(transcriptPath)) c.Transcript = transcriptPath;
+            if (!string.IsNullOrEmpty(bestGoal)) c.Goal = bestGoal;
             c.Messages.Clear();
             foreach (var m in loaded) c.Messages.Add(m);
             _conv = c;
