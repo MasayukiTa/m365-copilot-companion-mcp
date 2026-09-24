@@ -316,10 +316,19 @@ OUTPUT_DISCIPLINE = _load_discipline()
 #: the same answer and the true answer was reachable without consulting any skill, so it
 #: measured nothing about whether the sentence works. A probe has to be a task whose CORRECT
 #: procedure is non-obvious and whose following is visible in the answer.
+# 実測 2026-09-24: 「社内で使えるパワーポイントのskillsを探してほしい」で skill_match が
+# 空だったところ、ワーカーは「このskillは存在しません」で打ち切り、外部検索を一度も試さない
+# まま DONE にした（refuter#1 は UPHELD）。「一致が無ければ通常どおり進めてよい」だけでは、
+# その「通常どおり」が具体的に何を指すか(web検索等の他の手段を使い切って依頼を最後まで
+# やる、であって、依頼そのものを『できない』と答えることではない)が書かれておらず、
+# 「一致が無い=この依頼の対象が存在しない」と読めてしまった。以下の一文で明示する。
 SKILL_SENTENCE = ("" if os.environ.get("MCP_NO_SKILL_SENTENCE") else
                   "承認済みの手順(スキル)がある作業は、それに従うこと。作業に入る前に call_tool で "
                   "skill_match を呼び、確度の高い一致があれば skill_load して**その手順どおりに**進める"
-                  "(自分で別の手順を作らない)。一致が無ければ通常どおり進めてよい。")
+                  "(自分で別の手順を作らない)。一致が無ければ通常どおり進めてよい"
+                  "(=それ以外の手持ちの手段、web検索等も使って依頼を最後まで遂行すること。"
+                  "『一致するスキルが無い』を『依頼された対象が存在しない』と読み替えて"
+                  "打ち切らないこと)。")
 
 PROTOCOL = (
     # ゲートウェイの説明を先頭に置く。規律文が先だと、ツールを探す前に
