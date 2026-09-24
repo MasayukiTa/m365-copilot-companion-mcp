@@ -371,6 +371,7 @@ jobs:
             scripts/test_diag_warmup_bias.py \
             scripts/test_recycle_report.py \
             scripts/win/test_env_defaults.py \
+            scripts/win/test_console_flash_watch.py \
             scripts/win/test_watch_client_ws.py \
             scripts/win/test_watch_tree_ws.py \
             ui/test_no_coloured_left_rails.py \
