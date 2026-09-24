@@ -100,6 +100,65 @@ def test_once_the_run_is_live_autostart_has_nothing_to_do(state):
     assert result["delivered"] == "add_goal"
 
 
+# -- a stale status.json is not proof the process died --------------------------------------
+#
+# 2026-09-25 OWNER: two `relay.fleet_runner` processes ran at once, each with its own Edge
+# window. `fleet_is_live` read status.json's mtime alone: fleet_runner.on_tick writes it inside
+# `except Exception: pass`, so a write that fails (a losing PermissionError race against the
+# cockpit's own reader, or a starved disk under a heavy run) is swallowed and the mtime simply
+# stops advancing even though the sweep loop -- and the browser, and every worker -- is still
+# alive. Once the file is older than FLEET_LIVE_MAX_AGE_S, the OLD fleet_is_live said "not
+# live" and a second fleet_runner was launched on top of the first. The fix adds a fallback:
+# when status.json is stale or unreadable, check the pid fleet_runner recorded once at startup
+# in fleet_run_active.json (ACTIVE_MARKER) -- if that process is still running, join it.
+
+def _write_active_marker(sd, pid):
+    with io.open(os.path.join(str(sd), "fleet_run_active.json"), "w", encoding="utf-8") as fh:
+        json.dump({"pid": pid, "start_ts": time.time(), "argv": [], "resume_argv": []}, fh)
+
+
+def test_a_stale_status_json_with_a_dead_marker_process_is_not_live(state, monkeypatch):
+    """The ordinary case this project already relied on: status.json goes stale because the
+    process actually died. No active-run marker at all -> still correctly "not live"."""
+    _live(state)
+    old = time.time() - TR.FLEET_LIVE_MAX_AGE_S - 5
+    os.utime(os.path.join(str(state), "status.json"), (old, old))
+    assert TR.fleet_is_live(str(state)) is False
+
+
+def test_a_stale_status_json_with_a_live_marker_process_is_still_live(state, monkeypatch):
+    """THE 2026-09-25 CASE. status.json is stale (its own write kept failing), but the pid
+    fleet_runner recorded at startup is still running -- must be read as live, or autostart
+    launches a second fleet_runner on top of the first, exactly as happened in production."""
+    _live(state)
+    old = time.time() - TR.FLEET_LIVE_MAX_AGE_S - 5
+    os.utime(os.path.join(str(state), "status.json"), (old, old))
+    _write_active_marker(state, pid=9999)
+    monkeypatch.setattr(TR, "_pid_alive", lambda pid: pid == 9999)
+    assert TR.fleet_is_live(str(state)) is True
+    # and the practical consequence: autostart must refuse to launch a second runner
+    may, why = TR.autostart_status(str(state))
+    assert may is False, why
+
+
+def test_a_missing_status_json_with_a_live_marker_process_is_still_live(state, monkeypatch):
+    """Same fallback, no status.json at all (e.g. deleted, or never written yet this run)."""
+    _write_active_marker(state, pid=7777)
+    monkeypatch.setattr(TR, "_pid_alive", lambda pid: pid == 7777)
+    assert TR.fleet_is_live(str(state)) is True
+
+
+def test_a_stale_status_json_with_the_markers_process_gone_is_not_live(state, monkeypatch):
+    """The marker exists but its pid is gone (a clean-exit marker that was never cleared, or a
+    crash before cleanup) -- must not be read as live forever."""
+    _live(state)
+    old = time.time() - TR.FLEET_LIVE_MAX_AGE_S - 5
+    os.utime(os.path.join(str(state), "status.json"), (old, old))
+    _write_active_marker(state, pid=1234)
+    monkeypatch.setattr(TR, "_pid_alive", lambda pid: False)
+    assert TR.fleet_is_live(str(state)) is False
+
+
 # -- and it does not spin ----------------------------------------------------------------------
 
 def test_a_launch_that_never_became_live_is_backed_off_not_retried(state, monkeypatch):

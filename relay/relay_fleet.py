@@ -8400,11 +8400,30 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         #
         # Tabs are different -- a tab is a real allocation -- and they are already governed:
         # tab_weight charges 1 for a tab and 0 for a socket, ram_room_for_tab gates each lazy
-        # side-page at the moment it opens, and the autoscale sets mc_box from free RAM. Adding a
-        # count-based gate on top of those charges sockets for something they do not use.
+        # side-page at the moment it opens, and the autoscale sets mc_box from free RAM.
+        #
+        # THAT ARGUMENT WAS ABOUT RAM. IT WAS NEVER TRUE OF THE COPILOT QUOTA. A socket worker
+        # weighs 0 tab_weight forever -- not just at admission but for every sweep it stays
+        # open -- so `projected_peak` (the sum admission reserves against) never grows past 0
+        # once the fleet is on sockets, and `admits_another_tab` says yes to the ENTIRE pending
+        # queue in the same run of sweeps regardless of mc_box[0]. Measured 2026-09-25, OWNER
+        # report: a run with autoscale holding mc_box[0] at 1 ("RAM-adjust 1..1 tab(s)") grew to
+        # 41 workers, more than 10 of them running at once -- the tab budget was never touched
+        # because nothing they were doing ever showed up in it. Each running worker still spends
+        # Microsoft's per-Dataverse-environment 100 RPM quota one generative turn at a time
+        # (see quota_meter.py), and that quota does not care whether the turn came over a socket
+        # or a tab -- ten-plus concurrent workers is exactly how 111 unlock refusals happened in
+        # 30 minutes on this run. So there IS a per-worker price after all, just not a RAM one:
+        # a COUNT gate, bounding how many workers may be concurrently admitted (tab or socket)
+        # regardless of tab_weight, applied on top of (never instead of) the tab-weight gate
+        # above. `_active_open()` already counts sockets (see _holds_slot's own docstring), so
+        # this reuses it rather than adding new bookkeeping. The `max(1, ...)` mirrors
+        # admits_another_tab's own empty-fleet bootstrap: a cap that reaches 0 must not stop the
+        # fleet forever with work queued and nothing running.
         while pending and admits_another_tab(
                 _active_open(), _projected_peak(),
-                pending[0].tab_weight(assume_socket=_socket_open_now()), mc_box[0]):
+                pending[0].tab_weight(assume_socket=_socket_open_now()), mc_box[0]) \
+                and _active_open() < max(1, mc_box[0]):
             # SPACING, AND IT SITS HERE BECAUSE THERE ARE TWO WAYS OUT OF THIS LOOP.
             # The first version of this guard was placed next to `pending.pop(0)` in the flat
             # branch, and the per-repo branch a few lines above pops with `pending.pop(pick)`
