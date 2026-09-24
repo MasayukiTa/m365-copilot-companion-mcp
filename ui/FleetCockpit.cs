@@ -1939,6 +1939,7 @@ class CockpitWindow : Window
         // BuildGateBanner() is NOT added here -- it is docked inside the run column (col1) so it
         // cannot overhang the timeline spine. See the comment at that call site.
         root.Children.Add(BuildCapBanner());
+        root.Children.Add(BuildRejectionBanner());
         // The composer docks to the BOTTOM (spec: agent-workspace feel, not a form). It must be
         // added before _list so the list — the LastChildFill element — fills the space above it.
         root.Children.Add(BuildInputBar());
@@ -2658,6 +2659,27 @@ class CockpitWindow : Window
             SetDot(0, HealthState.Green, T("hs_srv_detail_ok"), now);
 
         // 1) Tunnel: read MCP_TUNNEL_URL from ..\.env; GET <url>/health == 200. Gray if none.
+        //
+        // BUT FIRST: has the supervisor (scripts/supervisor.ps1, commit 57ad0d1) already worked
+        // out that ANOTHER PC is the one actually serving THIS PC's tunnel right now? A probe
+        // through the tunnel cannot tell "nobody is listening" from "someone else answered for
+        // me" -- both read as the same failed (or, for "shared", even a SUCCEEDING) GET -- so
+        // when .fleet\tunnel_host.json says foreign/shared, and the supervisor that wrote it is
+        // still alive, that verdict overrides the generic probe below: red, with the file's own
+        // plain message and action, not "server not reachable through the tunnel" -- which may
+        // even be false (a foreign host can answer fine) and which tells the operator to look in
+        // the wrong place either way. "ours"/"none" (or no file / dead supervisor) add nothing
+        // the probe does not already establish, so they fall through to it unchanged.
+        TunnelHostState tunHost = ReadTunnelHostState();
+        if (tunHost != null && (tunHost.State == "foreign" || tunHost.State == "shared"))
+        {
+            string detail = tunHost.Message;
+            if (!string.IsNullOrEmpty(tunHost.Action)) detail = detail + "  " + tunHost.Action;
+            if (string.IsNullOrEmpty(detail)) detail = T("hs_tun_detail_bad");  // file present, no text -- never show a blank dot
+            SetDot(1, HealthState.Red, detail, now);
+        }
+        else
+        {
         string tunnel = EnvValue("MCP_TUNNEL_URL");
         if (string.IsNullOrEmpty(tunnel))
             // AMBER, NOT GRAY. Gray reads as "no evidence expected" and shows no Fix button,
@@ -2698,6 +2720,7 @@ class CockpitWindow : Window
                        T("hs_tun_detail_other") + " (" + tunPid + " != " + locPid + ")", now);
             else
                 SetDot(1, HealthState.Green, T("hs_tun_detail_ok"), now);
+        }
         }
 
         // 2) Edge: CDP answers, AND a tab is actually on the agent.
@@ -2978,6 +3001,52 @@ class CockpitWindow : Window
         // guard would outlive the run it was guarding. When the runner's own pid marker says
         // no process exists, there is no run to protect, whatever the snapshot says.
         catch (Exception) { return !MarkerPidIsDead(); }
+    }
+
+    // Parsed .fleet\tunnel_host.json, written by scripts/supervisor.ps1 (commit 57ad0d1): the
+    // supervisor's own verdict on who is CURRENTLY serving this PC's tunnel. State is one of
+    // "ours" (this machine's supervisor owns it -- nothing to add), "none" (nobody -- the health
+    // probe below already says so), "foreign" (another PC's supervisor answered for this one) or
+    // "shared" (both this PC and another appear to be serving it). `message`/`action` are the
+    // supervisor's own plain-language explanation and suggested next step -- written once, at
+    // the place that actually knows which PC is which, rather than re-guessed here from a failed
+    // GET that looks identical for "nobody is listening".
+    class TunnelHostState
+    {
+        public string State = "";
+        public string Message = "";
+        public string Action = "";
+    }
+
+    // Read tunnel_host.json, but ONLY while the supervisor_pid it names is still alive. A file
+    // is a snapshot, not a subscription: a supervisor that has since exited (this PC's own
+    // supervisor started, superseding the foreign one; the operator killed it; a reboot) leaves
+    // its last verdict sitting on disk, and treating that stale verdict as still true would keep
+    // reporting a hijack that ended when the process that observed it did. Returns null on a
+    // missing file, a dead supervisor_pid, or any parse failure -- all three mean "this file has
+    // nothing to add right now", which the caller treats the same as state=="ours"/"none".
+    TunnelHostState ReadTunnelHostState()
+    {
+        try
+        {
+            string path = Path.Combine(Path.GetDirectoryName(ResolvePath(null)), "tunnel_host.json");
+            if (!File.Exists(path)) return null;
+            var d = _js.DeserializeObject(File.ReadAllText(path, Encoding.UTF8))
+                    as Dictionary<string, object>;
+            if (d == null) return null;
+            object pidObj;
+            if (!d.TryGetValue("supervisor_pid", out pidObj) || pidObj == null) return null;
+            int pid;
+            try { pid = Convert.ToInt32(pidObj); } catch (Exception) { return null; }
+            try { System.Diagnostics.Process.GetProcessById(pid); }
+            catch (ArgumentException) { return null; }   // the supervisor that wrote this is gone
+            var t = new TunnelHostState();
+            t.State = S(d, "state");
+            t.Message = S(d, "message");
+            t.Action = S(d, "action");
+            return t;
+        }
+        catch (Exception) { return null; }
     }
 
     // Whether the live run drives TABS at all. Under the socket route it does not: workers hold
@@ -4206,6 +4275,27 @@ class CockpitWindow : Window
         // UI thread like the other async tiers above so a slow repair pass cannot freeze the UI.
         if (server == HealthState.Red || tunnel == HealthState.Red)
         {
+            // ANOTHER PC IS SERVING THIS TUNNEL (state foreign/shared, scripts/supervisor.ps1,
+            // commit 57ad0d1) -- and if that is the ONLY reason this branch fired (server is
+            // fine), repair.ps1 has nothing to repair. Its Tier A for the tunnel IS start_all,
+            // which brings up THIS machine's own stack; it cannot make a different PC stop
+            // answering for this one. Running it anyway would not fix anything -- it would
+            // relaunch start_all every autofix cycle against a condition it structurally cannot
+            // change, spending the auto-fix retry budget (AUTOFIX_MAX_ATTEMPTS) on a loop with no
+            // exit. Tell the operator the supervisor's own diagnosis instead, the same way the
+            // Tier C (human-only, e.g. devtunnel login) branch below already does.
+            TunnelHostState tunHost = ReadTunnelHostState();
+            bool tunnelHijacked = tunnel == HealthState.Red && server != HealthState.Red
+                                 && tunHost != null
+                                 && (tunHost.State == "foreign" || tunHost.State == "shared");
+            if (tunnelHijacked)
+            {
+                string msg = tunHost.Message;
+                if (!string.IsNullOrEmpty(tunHost.Action)) msg = msg + "  " + tunHost.Action;
+                note(string.IsNullOrEmpty(msg) ? T("hs_tun_detail_bad") : msg);
+                done();
+                return;
+            }
             note(T("hs_fix_stack"));
             var t = new Thread(new ThreadStart(delegate
             {
@@ -8963,6 +9053,76 @@ class CockpitWindow : Window
         return _capBanner;
     }
 
+    // ── command_rejections banner ─────────────────────────────────────────────────────────
+    // status.json's `command_rejections` (relay/fleet_runner.py, e822fb6): every fleet command
+    // (from this cockpit, CopilotChat, or a stale/foreign writer) that validate_command refused
+    // is recorded here, newest last, up to MAX_REJECTIONS_KEPT=20. Before this the only place a
+    // refusal was visible was the fleet's own console log and a landing receipt nobody watching
+    // the cockpit would think to open -- an operator could send a bad set_disk_floor_gb or
+    // add_goal and see nothing happen, with no clue why. Plain, one line, not a modal: this is
+    // information about something that already happened and needs no decision from the operator.
+    Border _rejBanner;
+    TextBlock _rejBannerLbl;
+
+    UIElement BuildRejectionBanner()
+    {
+        _rejBanner = new Border();
+        _rejBanner.Visibility = Visibility.Collapsed;
+        _rejBanner.CornerRadius = new CornerRadius(Theme.RadPopover);
+        _rejBanner.BorderThickness = new Thickness(1);
+        _rejBanner.Padding = new Thickness(16, 8, 12, 8);
+        _rejBanner.Margin = new Thickness(24, 0, 16, 6);
+        DockPanel.SetDock(_rejBanner, Dock.Top);
+        _rejBannerLbl = new TextBlock();
+        _rejBannerLbl.VerticalAlignment = VerticalAlignment.Center; _rejBannerLbl.FontSize = 13;
+        _rejBannerLbl.TextWrapping = TextWrapping.Wrap;
+        _rejBanner.Child = _rejBannerLbl;
+        return _rejBanner;
+    }
+
+    // Reactively show the NEWEST rejection each tick (rows are append-only, newest last -- see
+    // record_command_rejection). Hides when the array is empty or unreadable. `keys`/`errors`
+    // are exactly what relay/fleet_runner.py's record_command_rejection recorded: the refused
+    // command's KEYS and validate_command's reasons, deliberately never the values a steer or a
+    // goal carried.
+    void UpdateRejectionBanner(Dictionary<string, object> root)
+    {
+        if (_rejBanner == null) return;
+        object ro;
+        object[] rows = (root != null && root.TryGetValue("command_rejections", out ro) && ro is object[])
+                        ? (object[])ro : null;
+        Dictionary<string, object> last = null;
+        if (rows != null)
+            for (int i = rows.Length - 1; i >= 0 && last == null; i--)
+                last = rows[i] as Dictionary<string, object>;
+        if (last == null)
+        {
+            _rejBanner.Visibility = Visibility.Collapsed;
+            return;
+        }
+        string keys = "";
+        object ko;
+        if (last.TryGetValue("keys", out ko) && ko is object[])
+            keys = string.Join(",", Array.ConvertAll((object[])ko, x => x == null ? "" : x.ToString()));
+        string errs = "";
+        object eo;
+        if (last.TryGetValue("errors", out eo) && eo is object[])
+            errs = string.Join("; ", Array.ConvertAll((object[])eo, x => x == null ? "" : x.ToString()));
+        string when = "";
+        if (last.ContainsKey("ts"))
+        {
+            try { when = AgeMinutesText((NowUnix() - Convert.ToDouble(last["ts"])) / 60.0); }
+            catch (Exception) { }
+        }
+        string msg = L(
+            "コマンドが拒否されました" + (when.Length == 0 ? "" : "（" + when + "）") + "：" +
+            (keys.Length == 0 ? "(キーなし)" : keys) + (errs.Length == 0 ? "" : " — " + errs),
+            "Command rejected" + (when.Length == 0 ? "" : " (" + when + ")") + ": " +
+            (keys.Length == 0 ? "(no keys)" : keys) + (errs.Length == 0 ? "" : " — " + errs));
+        _rejBannerLbl.Text = msg;
+        _rejBanner.Visibility = Visibility.Visible;
+    }
+
     // Reactively show/hide the capacity-wait banner each tick. Condition: a LIVE run with at least
     // one worker held at "pending"/"待機列" AND (disk below floor OR RAM conspicuously low). Once
     // the gate clears (or the run ends) the banner hides itself -- it never sticks.
@@ -10017,6 +10177,13 @@ class CockpitWindow : Window
         }
         if (_capForceBtn != null) { _capForceBtn.Background = Brushes.Transparent; _capForceBtn.Foreground = warn; _capForceBtn.BorderBrush = warn; }
         if (_capRestoreBtn != null) { _capRestoreBtn.Background = Brushes.Transparent; _capRestoreBtn.Foreground = Fg; _capRestoreBtn.BorderBrush = Border; }
+        if (_rejBanner != null)
+        {
+            _rejBanner.Background = CardBg;
+            _rejBanner.BorderThickness = new Thickness(1);
+            _rejBanner.BorderBrush = warn;
+            if (_rejBannerLbl != null) _rejBannerLbl.Foreground = Fg;
+        }
         Relabel();
     }
 
@@ -10116,6 +10283,7 @@ class CockpitWindow : Window
         RefreshStoppingState(root);         // FIX B: resolve the optimistic "stopping" state once the sweep confirms it
         UpdateGateBanner(root);             // Bucket C TASK 2: show pending approval gates (blocks worker until answered)
         UpdateCapBanner(root);              // TASK 1: surface the admission-gate wait reactively each tick
+        UpdateRejectionBanner(root);        // show the newest refused fleet command (SEC-08, e822fb6)
         // (the re-unlock receipt used to be turned into a panel note here; the harness now
         //  delivers unlocks itself and the receipt is read from status.json by status.py)
         bool idle = root == null || I(root, "total") == 0

@@ -167,10 +167,51 @@ def test_a_landed_goal_is_never_requeued_even_long_past_grace():
         e.close()
 
 
+def test_a_rejected_command_is_recorded_as_refused_not_dispatched():
+    """e822fb6 gap #1 (SEC-08 follow-up): fleet_landing_confirmed only checks that the ack file
+    EXISTS, so a command the fleet READ and REFUSED (validate_command) looked exactly like one
+    it queued -- the operator saw "dispatched", "landing_confirmed": True for a goal that was
+    never admitted. _reconcile_landings must tell the two apart via read_ack_receipt()'s
+    `rejected` flag, and job_status() must report "refused" IMMEDIATELY rather than eventually
+    decaying to "unknown" after JOB_STATUS_UNKNOWN_AFTER_S -- a refused command produces no
+    worker, so nothing will ever arrive later to say more."""
+    e = Env()
+    try:
+        e.status(running=True, age_s=0)
+        # A command the fleet's OWN validator refuses: add_goal text over MAX_COMMAND_TEXT.
+        st, res = tr.fleet_handoff("x" * (fr.MAX_COMMAND_TEXT + 1), "jidBAD", state_dir=e.tmp)
+        assert st == "dispatched", st   # handoff still queues it; the destination is right
+        # the fleet reads its command channel -> refuses this one, but still leaves a receipt:
+        # it WAS read, which is all a receipt claims.
+        cmds = fr.read_commands(e.tmp)
+        assert any("add_goal" in c for c in cmds), cmds
+        assert tr.fleet_landing_confirmed("jidBAD", state_dir=e.tmp), (
+            "the fleet DID read this command -- refusing to apply it is a different fact")
+        receipt = tr.read_ack_receipt("jidBAD", state_dir=e.tmp)
+        assert receipt and receipt.get("rejected") is True, receipt
+
+        out = tr._reconcile_landings(now_ts=7, state_dir=e.tmp)
+        assert len(out) == 1 and out[0]["status"] == "refused", out
+        assert out[0]["result"]["rejected"] is True
+        assert any("add_goal" in err for err in out[0]["result"]["errors"])
+        assert not os.path.exists(os.path.join(tr.TASKS, "awaiting_ack", "jidBAD.json"))
+        assert not os.path.exists(os.path.join(tr.TASKS, "for_fleet", "jidBAD.txt")), (
+            "a refused command must not be re-queued -- it would only be refused again")
+        assert os.path.isfile(os.path.join(tr.TASKS, "done", "jidBAD.outcome.json"))
+
+        got = tr.job_status("jidBAD", state_dir=e.tmp)
+        assert got["state"] == "refused" and got["status"] == "refused", got
+        assert any("add_goal" in err for err in got["result"]["errors"]), got
+        print("OK test_a_rejected_command_is_recorded_as_refused_not_dispatched")
+    finally:
+        e.close()
+
+
 if __name__ == "__main__":
     test_vanishing_window_goal_is_requeued_by_reconcile()
     test_real_landing_is_confirmed_and_marker_cleared()
     test_within_grace_no_ack_is_left_alone()
     test_a_reconciled_goal_is_not_requeued_a_second_time()
     test_a_landed_goal_is_never_requeued_even_long_past_grace()
+    test_a_rejected_command_is_recorded_as_refused_not_dispatched()
     print("ALL RECONCILE TESTS PASSED")

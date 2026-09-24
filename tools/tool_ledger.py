@@ -39,6 +39,14 @@ import uuid
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LEDGER_PATH = os.path.join(_REPO, ".fleet", "tool_events.jsonl")
 
+#: tools.secret_store.REDACTION_FAILED_MARKER, repeated for the case where that module could
+#: not be imported at all -- _append's redaction call below is best-effort and must fail closed
+#: even when the import itself is what failed, so it cannot rely on importing the marker from
+#: the same place. Mirrors bridge/copilot_bridge.py's and relay/relay_fleet.py's own copies; a
+#: test (tools/test_ledger_never_writes_a_secret.py) holds all three equal to
+#: tools.secret_store.REDACTION_FAILED_MARKER (SEC-18, e822fb6).
+_REDACTION_FAILED_MARKER = "[redaction failed: content withheld]"
+
 SCHEMA_VERSION = 1
 
 #: How much of an argument blob or a result is kept inline. Enough to recognise what happened,
@@ -334,8 +342,23 @@ def _append(row: dict) -> None:
         try:
             from tools.secret_store import redact_secrets
             line = redact_secrets(line)
-        except Exception:
-            pass
+        except Exception as exc:
+            # FAILS CLOSED (SEC-18 follow-up to e822fb6). This used to `except: pass`, which on
+            # an import failure -- or an exception escaping redact_secrets despite its own
+            # internal fail-closed handling -- left `line` exactly as built above: the row,
+            # UNREDACTED, about to be appended below. redact_secrets() already fails closed on
+            # its own (it returns tools.secret_store.REDACTION_FAILED_MARKER rather than raising
+            # or returning a partial value), so reaching this except at all means the IMPORT
+            # itself is what failed -- which is why the marker is a private copy here rather
+            # than something fetched from the module that could not be imported.
+            try:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "tool ledger redaction failed (%s); wrote %r instead of the row",
+                    type(exc).__name__, _REDACTION_FAILED_MARKER)
+            except Exception:
+                pass
+            line = _REDACTION_FAILED_MARKER
         with _LOCK:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             _rotate_if_large(path)

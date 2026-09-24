@@ -817,6 +817,29 @@ def fleet_landing_confirmed(jid: str, state_dir=None) -> bool:
         return False
 
 
+def read_ack_receipt(jid: str, state_dir=None):
+    """The parsed receipt body fleet_runner.read_commands wrote when it took `jid`'s command,
+    or None when there is none yet (not landed) or it cannot be read.
+
+    A SEPARATE QUESTION FROM fleet_landing_confirmed's PLAIN EXISTENCE CHECK (e822fb6 gap #1).
+    That commit made _apply_command validate every command before touching anything and, when
+    a command is refused, write the SAME receipt file anyway -- {"read": True, "rejected": True,
+    "errors": [...]} -- because the fleet still genuinely READ it off the channel; only applying
+    it was refused (see fleet_runner.read_commands' own comment on this). A caller that only
+    checks "does the ack file exist" cannot tell that apart from a command that was read AND
+    applied, and task_router._reconcile_landings did exactly that: it turned a rejected
+    add_goal into a done/ record saying "dispatched", "landing_confirmed": True -- the operator
+    told a goal had landed for a goal the fleet never queued at all. This is the read that lets
+    a caller check `rejected` before believing "landed" means "queued".
+    """
+    try:
+        with open(_ack_path(jid, state_dir), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
 def add_goal_to_live_fleet(goal: str, state_dir=None, priority: bool = False,
                            entry: dict = None, jid: str = None) -> None:
     """Append a goal to the running fleet's command channel.
@@ -1662,6 +1685,39 @@ def _reconcile_landings(now_ts=None, state_dir=None):
         jid = marker.get("id", name[:-5])
         goal = marker.get("goal", "")
         if fleet_landing_confirmed(jid, state_dir):
+            receipt = read_ack_receipt(jid, state_dir) or {}
+            if receipt.get("rejected"):
+                # THE FLEET READ THIS COMMAND AND REFUSED IT (e822fb6's admit_command /
+                # validate_command). "Landed" only ever meant "the fleet took it off the
+                # channel" -- it never meant "the fleet queued it as a goal". Recording this
+                # as "dispatched" told the operator a goal had joined the run when it never
+                # did, and nothing else was ever going to say otherwise: a refused command
+                # produces no worker, so no worker_done row will ever arrive to correct it,
+                # and job_status() would have sat on "dispatched"/"unknown" until
+                # JOB_STATUS_UNKNOWN_AFTER_S pretending the wait might still resolve. Written
+                # straight to the OUTCOME path (not a side "*.landed.json" file) so
+                # job_status()'s very first check -- os.path.isfile(outcome_path) -- reports
+                # "refused" immediately instead of decaying into "nothing further is known".
+                errors = list(receipt.get("errors") or [])
+                rec = {"id": jid, "type": "fleet_goal", "destination": "fleet", "ts_done": now_ts,
+                       "status": "refused",
+                       "detail": "the fleet command channel rejected this goal at admission",
+                       "result": {"landing_confirmed": True, "rejected": True,
+                                  "errors": errors, "ack": _ack_path(jid, state_dir)},
+                       "error": ("command rejected: " + "; ".join(errors))[:500] if errors
+                                else "command rejected"}
+                try:
+                    with open(_p("done", "%s.outcome.json" % jid), "w",
+                              encoding="utf-8") as fh:
+                        json.dump(rec, fh, ensure_ascii=False, indent=2)
+                except OSError:
+                    pass
+                try:
+                    os.remove(mpath)
+                except OSError:
+                    pass
+                out.append(rec)
+                continue
             rec = {"id": jid, "type": "fleet_goal", "destination": "fleet", "ts_done": now_ts,
                    "status": "dispatched", "result": {"landing_confirmed": True,
                    "ack": _ack_path(jid, state_dir)}, "error": None}
@@ -1958,6 +2014,11 @@ def job_status(jid, state_dir=None):
                    run that was later stopped, or one whose completion predates jid reaching
                    the ledger, no longer reads as though it were quietly still in progress --
                    it reads as exactly what is true, which is that nothing further is known.
+      "refused"    the fleet command channel READ this goal's add_goal command and REFUSED to
+                   apply it (validate_command / admit_command, e822fb6). `result.errors` names
+                   why. Definitive and immediate -- unlike "unknown" this never waits out
+                   JOB_STATUS_UNKNOWN_AFTER_S, because a refused command produces no worker and
+                   nothing will ever arrive later to say more.
       "not_found"  no done/ record exists for this jid at all.
       (anything else) the job's own recorded terminal status, unchanged -- local jobs
                    (ok/error/denied/awaiting_approval) and CLAUDE escalations already resolve
@@ -1969,8 +2030,17 @@ def job_status(jid, state_dir=None):
         try:
             with open(outcome_path, encoding="utf-8") as fh:
                 rec = json.load(fh)
-            return {"id": jid, "state": "finished", "status": rec.get("status"),
-                    "detail": "completion recorded by the fleet's own ledger",
+            # A REFUSED COMMAND IS WRITTEN TO THIS SAME PATH (see _reconcile_landings), not
+            # because a worker finished -- none ever ran -- but because this is the one place
+            # job_status already treats as terminal-and-checked-first, and re-deriving that
+            # here as a second file to check would risk missing it the way "landed"/
+            # "reconcile-requeued" records already are (see the "unknown" wording above: those
+            # are supplementary, base_path stays authoritative for them). `detail` is carried
+            # from the record when the writer set one (the refusal does); worker-outcome
+            # records never set it, so they keep the ledger wording unchanged.
+            state = "refused" if rec.get("status") == "refused" else "finished"
+            return {"id": jid, "state": state, "status": rec.get("status"),
+                    "detail": rec.get("detail") or "completion recorded by the fleet's own ledger",
                     "ts_done": rec.get("ts_done"), "result": rec.get("result")}
         except Exception:
             pass
