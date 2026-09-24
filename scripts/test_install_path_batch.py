@@ -98,8 +98,15 @@ def test_a_truncated_uv_is_run_found_dead_and_replaced(tmp_path):
     tree = H.setup_tree(tmp_path)
     (tree / ".setup" / "bin").mkdir(parents=True)
     (tree / ".setup" / "bin" / "uv.exe").write_bytes(b"MZ\x90\x00trunc")
+    # UV_INSTALLER_URL_ALLOW_UNTRUSTED=1: INST-10 (a3415bf) made setup.bat ignore a non-
+    # astral.sh UV_INSTALLER_URL and silently fall back to the real official installer, which
+    # would otherwise turn this into a real network install instead of exercising the download-
+    # failure path this test is for. The opt-in is setup.bat's own documented escape hatch for
+    # exactly that -- the trust boundary itself is covered separately by
+    # scripts/test_setup_uv_installer_policy.py.
     env = H.clean_env(tree, H.minimal_path(_stubbin(tmp_path)), SETUP_IGNORE_POLICY=1,
-                      UV_INSTALLER_URL="http://127.0.0.1:9/install.ps1")
+                      UV_INSTALLER_URL="http://127.0.0.1:9/install.ps1",
+                      UV_INSTALLER_URL_ALLOW_UNTRUSTED="1")
     r, out = _setup(tree, env)
     assert r.returncode == 1, out
     assert "does not run" in out and "replacing it" in out
