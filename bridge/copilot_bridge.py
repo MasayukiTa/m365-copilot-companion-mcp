@@ -1301,12 +1301,72 @@ def drain_pending_once(sid, pop_fn=None, max_n=50):
     return out
 
 
+#: The sign-in wall this bridge's page last landed on, for GET /status ("signin_wall"). None when
+#: the composer has rendered since. See _note_signin_wall.
+_SIGNIN_WALL = None
+
+
+def _is_signin_wall(url):
+    """ONE definition of "a sign-in page", shared with the doctor and the supervisor:
+    relay.edge_auth.looks_like_signin_wall. edge_recover.looks_like_login, used here before,
+    knew only login.microsoftonline / login.live.com -- a federated tenant's AD FS page
+    (https://<sts>/adfs/ls/...) was "not a login" to this file while the doctor called it one,
+    so on 2026-09-24 nothing brought the window forward."""
+    try:
+        from relay.edge_auth import looks_like_signin_wall
+        return looks_like_signin_wall(url or "")
+    except Exception:
+        try:
+            from relay.edge_recover import looks_like_login
+            return looks_like_login(url or "")
+        except Exception:
+            return False
+
+
+def _note_signin_wall(url):
+    """Record that the page is on a sign-in wall, for /status.
+
+    THE TAB DOES NOT STAY. Startup closes its page once startup is over, so a wall met at
+    startup is gone from the browser's tab list minutes later -- and scripts/start_bridge.ps1's
+    supervisor, which is what brings the window forward, reads the tab list. This is the record
+    that outlives the tab. Scheme, host and path only: a sign-in URL's query carries
+    login_hint= (an e-mail address)."""
+    global _SIGNIN_WALL
+    try:
+        import urllib.parse as _up
+        p = _up.urlsplit(url or "")
+        bare = "%s://%s%s" % (p.scheme, p.netloc, p.path)
+    except Exception:
+        bare = ""
+    if _SIGNIN_WALL is None:
+        logger.warning("sign-in page on the bridge Edge: %s -- the start_bridge supervisor "
+                       "brings the window forward for the person", bare)
+    _SIGNIN_WALL = {"url": bare, "at": time.time()}
+
+
+def _clear_signin_wall():
+    global _SIGNIN_WALL
+    _SIGNIN_WALL = None
+
+
+def _supervisor_owns_signin():
+    """True when scripts/start_bridge.ps1 -Keepalive is watching this bridge's browser.
+
+    THEN THIS PROCESS MUST NOT SURFACE THE WINDOW ITSELF. surface() on a HEADLESS Edge kills
+    it and relaunches it headed -- the very browser this process is connected to -- and each
+    call site here did that once PER CALL, so every /history against a wall fired it again. The
+    supervisor owns the browser's lifecycle and surfaces once per sign-in need; this process
+    only reports the wall (_note_signin_wall)."""
+    return os.environ.get("MCP_BRIDGE_SIGNIN_SUPERVISED", "").strip() == "1"
+
+
 def _wait_composer(timeout=40):
     surfaced = False
     force_timer = None
     for _ in range(timeout):
         PAGE.wait_for_timeout(1000)
         if PAGE.locator(COPILOT_SELECTORS["composer"]).count() > 0:
+            _clear_signin_wall()
             # If we surfaced the hidden Edge for sign-in, auth is now done (the
             # composer rendered) -> drop the window back to the background at once.
             if surfaced:
@@ -1322,9 +1382,12 @@ def _wait_composer(timeout=40):
         # page is still up, refresh the keeper's pause file every ~1s so a slow MFA login
         # is not re-minimized out from under the user (the 180s backoff would else expire).
         try:
-            from relay.edge_recover import surface, looks_like_login, touch_pause
-            if looks_like_login(PAGE.url):
-                if not surfaced:
+            from relay.edge_recover import surface, touch_pause
+            if _is_signin_wall(PAGE.url):
+                _note_signin_wall(PAGE.url)
+                if _supervisor_owns_signin():
+                    pass                       # reported above; the supervisor shows it
+                elif not surfaced:
                     # surface() now returns a TRUTHFUL bool (a headed process was actually
                     # verified) -- there is no notify/toast mechanism in this file to gate,
                     # but log the real outcome so a failed auto-surface is visible in logs
@@ -1363,6 +1426,10 @@ _REDIRECT_MARKERS = ("redirfrom", "csrtossr", "auth=2", "/login", "login.microso
 def _looks_redirected(landed_url, target_url=""):
     u = (landed_url or "").lower()
     if any(m in u for m in _REDIRECT_MARKERS):
+        return True
+    # A FEDERATED IdP's page is a landing too. None of the markers above name an AD FS host,
+    # so a goto of the bare agent URL that ended on https://<sts>/adfs/ls/ read as "settled".
+    if _is_signin_wall(landed_url or ""):
         return True
     g = _conv_guid(target_url)            # asked for a specific conversation ...
     if g and g.lower() not in u:          # ... but didn't land on it -> bounced
@@ -1877,11 +1944,15 @@ def _goto_settled(url, timeout=25000, tries=3, compose_wait=40):
                     pass
             return True
         try:
-            from relay.edge_recover import surface, looks_like_login, touch_pause
-            if looks_like_login(PAGE.url or ""):
+            from relay.edge_recover import surface, touch_pause
+            if _is_signin_wall(PAGE.url or ""):
+                _note_signin_wall(PAGE.url or "")
                 # Surface once so the user can sign in; keep the keeper backed off while the
                 # login page is still showing so a slow MFA login is not re-minimized.
-                if not surfaced:
+                # UNLESS THE SUPERVISOR OWNS IT -- see _supervisor_owns_signin.
+                if _supervisor_owns_signin():
+                    pass
+                elif not surfaced:
                     # surface() now returns a TRUTHFUL bool (verified headed process) -- no
                     # notify/toast mechanism exists in this file, but log a real failure so
                     # it is visible rather than silently assumed to have worked. Pass the
@@ -4005,6 +4076,12 @@ class Handler(BaseHTTPRequestHandler):
                 "started": _PROCESS_STARTED,
                 "python": platform.python_version(),
                 "authenticated": authed,
+                # WHETHER THIS BRIDGE'S PAGE IS STUCK ON A SIGN-IN PAGE. Read by
+                # scripts/ensure_m365_signin.py --bridge-watch, which is how the start_bridge
+                # supervisor knows to bring the window forward after startup has closed the
+                # tab the wall was on. The URL (IdP host) only with the token.
+                "signin_wall": _SIGNIN_WALL is not None,
+                "signin_wall_url": (_SIGNIN_WALL or {}).get("url", "") if authed else "",
             }
             if not authed:
                 # WITHOUT THE TOKEN: liveness and the busy flags, nothing that names a
@@ -5813,10 +5890,19 @@ def _find_or_open_agent(ctx):
             if opened_here:
                 pg.goto(url, wait_until="domcontentloaded")
                 logger.info("_find_or_open_agent: no reusable agent tab found -- opened a new one")
+            composed = False
             for _ in range(40):
                 pg.wait_for_timeout(1000)
                 if pg.locator(COPILOT_SELECTORS["composer"]).count() > 0:
+                    composed = True
                     break
+            # STARTUP MET A SIGN-IN PAGE AND SAID NOTHING. This wait is where a fresh PC's
+            # bridge first lands on the IdP, and it waited 40s and moved on; startup then
+            # closed the page, taking the only evidence with it. Say so, for /status.
+            if composed:
+                _clear_signin_wall()
+            elif _is_signin_wall(pg.url or ""):
+                _note_signin_wall(pg.url or "")
             _close_duplicate_agent_tabs(ctx, pg, url)   # self-heal any tabs left over from before
             return pg
         except Exception:
