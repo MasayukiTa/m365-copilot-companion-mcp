@@ -450,6 +450,34 @@ def substitute_arguments(body: str, arguments: str = "") -> str:
     return _PLACEHOLDER.sub(fill, body)
 
 
+class _ConnCtx:
+    """`with store._connect() as db:` over the store's one shared connection.
+
+    Same commit-on-success / rollback-on-exception contract as using a sqlite3.Connection
+    directly as a context manager (which is what every call site was written against), plus
+    holding the store's lock for the block's duration so the shared connection is never used
+    by two callers at once.
+    """
+    __slots__ = ("_store",)
+
+    def __init__(self, store: "SkillStore") -> None:
+        self._store = store
+
+    def __enter__(self) -> sqlite3.Connection:
+        self._store._conn_lock.acquire()
+        return self._store._conn
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        try:
+            if exc_type is None:
+                self._store._conn.commit()
+            else:
+                self._store._conn.rollback()
+        finally:
+            self._store._conn_lock.release()
+        return False
+
+
 class SkillStore:
     """SQLite trust store and Skill registry for one project/user."""
 
@@ -464,7 +492,55 @@ class SkillStore:
         self.db_path = Path(db_path).expanduser().resolve() if db_path else default_state_db()
         self.gate_dir = Path(gate_dir).expanduser().resolve() if gate_dir else self._default_gate_dir()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # ONE CONNECTION, NOT ONE PER STATEMENT. _connect() used to hand back a brand-new
+        # sqlite3.connect() every call, and callers open/close one on every query -- discover()
+        # alone opens several, and match() calls discover(). Measured building the 18-Skill
+        # test fixture (tests/test_skills_business_matching.py) and then running its 40
+        # office-request queries: 147 connections to build the store, 80 more for the queries,
+        # ~230 for what is a few hundred KB of data. Each open/close touches the main db file
+        # plus WAL's -wal/-shm siblings (PRAGMA journal_mode=WAL below), so that churn is 230
+        # chances for a Windows disk I/O error to land mid-operation -- real-time antivirus on
+        # this machine watches the temp directory these files live in during a test run, and
+        # the same directory shape exists in production under %LOCALAPPDATA%. A single
+        # connection reused for the store's lifetime, serialized by a lock (sqlite3 connections
+        # are not safe for concurrent use across threads, and SKILL_STORE in
+        # bridge/copilot_bridge.py is one process-wide instance), removes the amplification
+        # rather than papering over one failed open with a retry.
+        self._conn_lock = threading.Lock()
+        self._conn: sqlite3.Connection | None = None
+        # Which process opened self._conn. This project targets Windows, where
+        # multiprocessing defaults to "spawn" (a fresh interpreter, no inherited SkillStore)
+        # rather than "fork" -- but check anyway rather than assume: a forked child that
+        # inherited self._conn would share the parent's underlying OS handle and file offset,
+        # and the two processes issuing statements on it would corrupt each other's reads
+        # exactly the way this fix removes within one process. _connect() below reopens
+        # instead of reusing whenever getpid() no longer matches this.
+        self._conn_pid: int | None = None
         self._init_db()
+
+    def close(self) -> None:
+        """Release this store's one connection. Idempotent; safe to call more than once and
+        safe to call on a store that never opened one (use_cache=False readers that only ever
+        hit the bundle cache, or a store nobody queried)."""
+        with self._conn_lock:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                finally:
+                    self._conn = None
+                    self._conn_pid = None
+
+    def __del__(self) -> None:
+        # Best-effort: a store that falls out of scope without an explicit close() must not
+        # leave its connection open until some later, unrelated GC pass closes it -- on
+        # Windows an open sqlite handle can keep the -wal/-shm files locked against a fresh
+        # SkillStore over the SAME db_path (a test building a second store on one tmp_path,
+        # or a CLI invocation right after a server one). Exceptions during interpreter
+        # shutdown are swallowed: __del__ running that late has no safe way to report them.
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _default_gate_dir(self) -> Path:
         """Where approval questions are written.
@@ -496,10 +572,36 @@ class SkillStore:
         except Exception:
             return (self.project_root / ".companion_gates").resolve()
 
-    def _connect(self) -> sqlite3.Connection:
-        db = sqlite3.connect(str(self.db_path), timeout=10)
-        db.row_factory = sqlite3.Row
-        return db
+    def _connect(self) -> "_ConnCtx":
+        """A `with`-usable handle onto this store's ONE connection (see __init__), not a new
+        one. Every existing call site already reads `with self._connect() as db: ...` -- that
+        idiom is unchanged; only what it opens is. Acquires the lock for the duration of the
+        `with` block so two threads (or a reentrant call into another _connect() user while
+        one is still open) cannot interleave statements on the same connection -- checked: no
+        method in this file calls another `with self._connect()` user from inside its own
+        `with self._connect()` block, so this cannot deadlock against itself.
+
+        check_same_thread=False: the bridge keeps one process-wide SKILL_STORE
+        (bridge/copilot_bridge.py) serving a ThreadingHTTPServer's worker threads, and
+        fastmcp 3 runs sync tools in a thread pool by default -- so this connection is used
+        from whichever thread happens to call in, never only the one that created it. Safety
+        across those threads is this method's own lock, held for every `with` block's full
+        duration (see _ConnCtx), not sqlite3's default same-thread check.
+        """
+        pid = os.getpid()
+        with self._conn_lock:
+            if self._conn is None or self._conn_pid != pid:
+                if self._conn is not None:
+                    # A forked child inherited the parent's connection object; it must not
+                    # touch the parent's OS handle (see _conn_pid's docstring above) or close
+                    # it out from under the parent, so it is simply dropped in the child's
+                    # memory, unclosed here.
+                    self._conn = None
+                self._conn = sqlite3.connect(
+                    str(self.db_path), timeout=10, check_same_thread=False)
+                self._conn.row_factory = sqlite3.Row
+                self._conn_pid = pid
+        return _ConnCtx(self)
 
     def _init_db(self) -> None:
         with self._connect() as db:
