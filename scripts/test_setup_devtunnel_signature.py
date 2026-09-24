@@ -60,6 +60,35 @@ def test_a_genuine_microsoft_signed_binary_is_accepted(tmp_path):
     assert "O=Microsoft Corporation" in r.stdout, r.stdout
 
 
+@pytest.mark.skipif(not os.path.isfile(NOTEPAD), reason="notepad.exe not present on this machine")
+def test_a_polluted_psmodulepath_does_not_break_the_check(tmp_path, monkeypatch):
+    """Simulates the exact failure measured in CI, 2026-09-24 (a3415bf): this test process is
+    itself usually a child of pwsh (PowerShell 7) -- GitHub Actions windows-latest's default
+    shell for a `run:` step -- so a PSModulePath naming a pwsh-7-style Microsoft.PowerShell.
+    Security module dir FIRST is not a contrived input, it is what a real run already inherits.
+    Get-AuthenticodeSignature is a member of that module name; if the 5.1 child resolves the
+    name to pwsh 7's build (compiled for .NET (Core), not the .NET Framework CLR 5.1 runs on)
+    instead of its own, command auto-load fails to load it and the whole check reads as
+    "could not verify" -- exactly the untrusted-by-default outcome a supply-chain check must
+    refuse, not produce by accident. run_ps() (tests/_install_path_harness.py) is supposed to
+    hand the child its OWN default PSModulePath regardless of what this process inherited;
+    this proves it actually does, both by the check still succeeding and by the polluted
+    directory never reaching the child's own environment."""
+    hostile = tmp_path / "hostile_pwsh7_style_modules"
+    (hostile / "Microsoft.PowerShell.Security").mkdir(parents=True)
+    monkeypatch.setenv(
+        "PSModulePath",
+        str(hostile) + os.pathsep + os.environ.get("PSModulePath", ""))
+
+    script = (_function_text() + "\n$r = Test-DevTunnelSignature -Path '%s'\n" % NOTEPAD +
+             "Write-Output ('OK=' + [int]$r.Ok); Write-Output ('MODPATH=' + $env:PSModulePath)\n")
+    r = run_ps(script, tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "OK=1" in r.stdout, "the check itself failed under a polluted PSModulePath: %r" % r.stdout
+    assert str(hostile).lower() not in r.stdout.lower(), (
+        "the polluted PSModulePath reached the child unsanitized: %r" % r.stdout)
+
+
 @pytest.mark.skipif(not os.path.isfile(CSC), reason="csc.exe not available to build an unsigned stub")
 def test_an_unsigned_binary_is_refused(tmp_path):
     cs = tmp_path / "unsigned.cs"

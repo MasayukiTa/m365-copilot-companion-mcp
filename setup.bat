@@ -40,6 +40,23 @@ if not "%SETUP_HERE:!=%"=="%SETUP_HERE%" goto :bad_bang
 setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 
+REM --- 0a. Sanitize PSModulePath for every "powershell" (5.1) child below (a3415bf) -------
+REM powershell.exe inherits THIS process's environment, PSModulePath included. Run setup.bat
+REM from a PowerShell 7 (pwsh) terminal -- increasingly the default in Windows Terminal / VS
+REM Code, and the default shell GitHub Actions gives a windows-latest job -- and pwsh's own
+REM PSModulePath entries (its Modules dir) come first. Windows PowerShell 5.1 then resolves
+REM Get-AuthenticodeSignature to PWSH 7's own Microsoft.PowerShell.Security module -- built for
+REM .NET (Core), not the .NET Framework CLR 5.1 runs on -- and fails to load it: "the 'Get-
+REM AuthenticodeSignature' command was found in the module ..., but the module could not be
+REM loaded." That silently turns the uv.exe Authenticode check below (and any other Authenticode
+REM check spawned from this .bat) into "could not verify", which a supply-chain check must
+REM refuse rather than swallow (measured in CI, 2026-09-24: scripts\test_setup_uv_installer_
+REM policy.py and scripts\test_setup_devtunnel_signature.py both failed this way). Reset it to
+REM Windows PowerShell 5.1's own default (Microsoft's documented order: user, all-users, system)
+REM before any "powershell" child below runs, so command auto-load only ever sees ITS OWN
+REM modules regardless of what shell launched this .bat.
+set "PSModulePath=%UserProfile%\Documents\WindowsPowerShell\Modules;%ProgramFiles%\WindowsPowerShell\Modules;%SystemRoot%\System32\WindowsPowerShell\v1.0\Modules"
+
 set "PYEXE="
 REM The oldest Python the requirements install on (fastmcp, mcp, anyio and ddgs declare >=3.10;
 REM see MIN_PYTHON in scripts\bootstrap.py -- test_install_path_python_version.py keeps the two

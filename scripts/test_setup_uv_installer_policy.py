@@ -89,8 +89,35 @@ def _write_driver(tree: Path, body: str, extra_tail: str = "") -> Path:
     return p
 
 
+#: Windows PowerShell 5.1's own documented default PSModulePath (user, all-users, system).
+#: _run() below sets this for the driver.bat (and the "powershell" child it spawns internally
+#: for the Authenticode check) instead of letting it inherit ours. This test process usually
+#: runs under pwsh (PowerShell 7) -- GitHub Actions windows-latest's default shell for a `run:`
+#: step -- and pwsh's PSModulePath (its own Modules dir first) makes 5.1 resolve
+#: Get-AuthenticodeSignature to pwsh 7's own Microsoft.PowerShell.Security module (built for
+#: .NET (Core), not the .NET Framework CLR 5.1 runs on) and fail to load it. Measured in CI,
+#: 2026-09-24. `_extract_download_block()` above extracts only setup.bat's uv-download lines,
+#: not the PSModulePath fix setup.bat now carries near its own top (a3415bf) -- that fix
+#: protects a real run of the whole .bat, but not this narrower extracted snippet, so it is
+#: repeated here for the same reason.
+_PS51_DEFAULT_MODULE_PATH = os.pathsep.join([
+    os.path.join(os.environ.get("UserProfile", ""), "Documents", "WindowsPowerShell", "Modules"),
+    os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
+                 "WindowsPowerShell", "Modules"),
+    os.path.join(SYSROOT, "System32", "WindowsPowerShell", "v1.0", "Modules"),
+])
+
+
 def _run(tree: Path, env_extra: dict, driver_name="driver.bat"):
     env = dict(os.environ)
+    # os.environ on Windows keeps whatever case the process inherited the name in (measured:
+    # "PSMODULEPATH", all upper); env["PSModulePath"] below would otherwise ADD a second,
+    # differently-cased entry rather than replace it, and CreateProcess would hand the child
+    # BOTH -- silently undoing this override (measured against tests/_install_path_harness.py's
+    # run_ps(), which had exactly this bug first).
+    for _existing in [k for k in env if k.upper() == "PSMODULEPATH"]:
+        del env[_existing]
+    env["PSModulePath"] = _PS51_DEFAULT_MODULE_PATH
     env.update(env_extra)
     return childproc.run(["cmd", "/c", str(tree / driver_name)], cwd=str(tree), env=env, timeout=120)
 

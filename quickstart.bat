@@ -23,6 +23,16 @@ if not "%QS_HERE:!=%"=="%QS_HERE%" goto :qs_bad_bang
 setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 
+REM PSMODULEPATH, SANITIZED FOR EVERY "powershell" (5.1) CHILD BELOW (a3415bf). Same reason as
+REM setup.bat's own copy of this comment: powershell.exe inherits THIS process's environment,
+REM and a PowerShell 7 (pwsh) parent shell's PSModulePath makes Windows PowerShell 5.1 resolve
+REM Get-AuthenticodeSignature to pwsh 7's own (CLR-incompatible) Microsoft.PowerShell.Security
+REM and fail to load it -- silently turning STEP 4's devtunnel.exe Authenticode check into
+REM "could not verify". `call "%~dp0setup.bat"` below runs in its own setlocal scope, so its
+REM copy of this line does not survive back into this script's environment; this copy is what
+REM protects the setup_devtunnel.ps1 invocation later in THIS file.
+set "PSModulePath=%UserProfile%\Documents\WindowsPowerShell\Modules;%ProgramFiles%\WindowsPowerShell\Modules;%SystemRoot%\System32\WindowsPowerShell\v1.0\Modules"
+
 REM OVERALL RESULT (SF-15, 2026-09-24). Several checks below (the health check especially) used
 REM to route a failure to the same :after_banner tail as success, which then fell off the end of
 REM the file with no `exit /b`, so cmd's own default (0) was reported regardless -- a caller

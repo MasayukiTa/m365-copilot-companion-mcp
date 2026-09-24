@@ -29,6 +29,25 @@ POWERSHELL = shutil.which("powershell") or os.path.join(
     SYSROOT, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
 CSC = os.path.join(SYSROOT, "Microsoft.NET", "Framework64", "v4.0.30319", "csc.exe")
 
+#: Windows PowerShell 5.1's own documented default PSModulePath (user, all-users, system).
+#: run_ps() below sets this for every "powershell" (5.1) child it spawns instead of letting it
+#: inherit ours. This test process is usually itself a child of a PowerShell 7 (pwsh) shell --
+#: that is GitHub Actions windows-latest's default shell for a `run:` step, and this repo's
+#: pytest invocation runs under it -- and pwsh's PSModulePath (its own Modules dir first) makes
+#: 5.1 resolve a cmdlet like Get-AuthenticodeSignature to pwsh 7's own Microsoft.PowerShell.
+#: Security module (built for .NET (Core), not the .NET Framework CLR 5.1 runs on) and fail to
+#: load it: "the 'Get-AuthenticodeSignature' command was found in the module ..., but the
+#: module could not be loaded." Measured in CI, 2026-09-24: this took down
+#: scripts/test_setup_devtunnel_signature.py entirely, since every one of its cases goes
+#: through run_ps(). It is the same defect setup.bat/quickstart.bat now guard against for real
+#: users of a pwsh terminal (a3415bf) -- this is that same fix for the test's own child.
+_PS51_DEFAULT_MODULE_PATH = os.pathsep.join([
+    os.path.join(os.environ.get("UserProfile", ""), "Documents", "WindowsPowerShell", "Modules"),
+    os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
+                 "WindowsPowerShell", "Modules"),
+    os.path.join(SYSROOT, "System32", "WindowsPowerShell", "v1.0", "Modules"),
+])
+
 IS_WINDOWS = os.name == "nt"
 
 
@@ -53,11 +72,33 @@ def extract_ps_function(text: str, name: str) -> str:
 
 def run_ps(script_text: str, tmpdir: Path, timeout: int = 120, env=None):
     """Write `script_text` to a temp .ps1 (UTF-8 with BOM, so PS 5.1 reads it as UTF-8) and run
-    it with -File. Returns the CompletedProcess (stdout/stderr decoded)."""
+    it with -File. Returns the CompletedProcess (stdout/stderr decoded).
+
+    PSModulePath is reset to Windows PowerShell 5.1's own default (see
+    `_PS51_DEFAULT_MODULE_PATH` above) unless the caller's `env` already sets it -- this
+    process itself usually runs under pwsh (PowerShell 7), whose PSModulePath would otherwise
+    leak into the 5.1 child unchanged and break command auto-load for anything sharing a module
+    name with a pwsh-7-only module (Get-AuthenticodeSignature, measured 2026-09-24)."""
     p = Path(tmpdir) / ("drv_%d.ps1" % (abs(hash(script_text)) % 10 ** 8))
     p.write_bytes(b"\xef\xbb\xbf" + script_text.encode("utf-8"))
+    # `env` may be None (inherit ours -- which already HAS a PSModulePath, so a plain
+    # setdefault would keep the polluted one) or a caller-supplied dict that intentionally
+    # sets its own. Either way, override to the 5.1 default UNLESS the caller's dict already
+    # named PSModulePath explicitly -- that is the one way a caller opts out of this.
+    #
+    # os.environ on Windows keeps whatever CASE the process actually inherited the name in
+    # (measured here: "PSMODULEPATH", all upper) -- dict(os.environ) carries that same key
+    # verbatim, so assigning child_env["PSModulePath"] (mixed case) adds a SECOND, DIFFERENTLY
+    # -CASED entry instead of replacing it. subprocess/CreateProcess then hands the child BOTH,
+    # and the child's own (case-insensitive but first-match) lookup can still see the original,
+    # polluted one -- silently undoing this override. Strip every existing spelling first.
+    child_env = dict(os.environ) if env is None else dict(env)
+    for _existing in [k for k in child_env if k.upper() == "PSMODULEPATH"]:
+        del child_env[_existing]
+    if env is None or "PSModulePath" not in env:
+        child_env["PSModulePath"] = _PS51_DEFAULT_MODULE_PATH
     return childproc.run([POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(p)],
-                         timeout=timeout, env=env, cwd=str(tmpdir))
+                         timeout=timeout, env=child_env, cwd=str(tmpdir))
 
 
 def ps_functions(rel: str, *names: str) -> str:
