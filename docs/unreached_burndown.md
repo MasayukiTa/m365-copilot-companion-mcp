@@ -1219,6 +1219,7 @@ deliberate; the row above (the "sixteen" table) is corrected to point here inste
 | `judge_backend.py::sampling_judge_async` | deliberate | no registered MCP tool is async |
 | `judge_backend.py::ask_human_async` | deliberate | same; `KNOWN_EMPTY` in `tools/test_a_declared_field_is_a_written_field.py` |
 | `security.py::clear_presented_token` | deliberate | test-isolation twin of `set_presented_token`/`reset_presented_token` ([F], now decided) |
+| `security.py::is_unlocked` | deliberate | lost its only caller in `require_unlocked` (e25b7a3, SEC-02/SEC-03): "ONE READ OF THE TABLE PER CALL" folded the `_load_state()` lookup inline rather than through this wrapper, to avoid reading the state table twice per gated call. `tests/test_unlock_revocation.py` and `tests/test_unlock_oracle.py` still call it directly to assert the unlock-state semantics (expiry, revocation) it implements. Kept, unwired — `tools/security.py` is a self-improvement frozen file, and reintroducing a caller or deleting the function is a separate, owner-authorized change to that file, not part of this entry. |
 
 ### relay (other) / bridge / scripts (26 rows)
 
