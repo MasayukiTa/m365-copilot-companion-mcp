@@ -28,7 +28,7 @@ def _fn(name):
 
 def test_the_unlock_machinery_is_in_one_function():
     body = _fn("_run_one_turn")
-    assert "_BRIDGE_UNLOCK_PREFLIGHT_DONE" in body
+    assert "_bridge_unlock_preflight_due" in body
     assert "BRIDGE_UNLOCK_PREFIX % pw" in body
     assert "_bridge_should_auto_unlock" in body
 

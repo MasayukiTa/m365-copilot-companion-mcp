@@ -42,7 +42,7 @@ def test_the_unlock_turn_is_wired_into_the_shared_turn_helper():
     retry has to live there to cover both."""
     body = SOURCE[SOURCE.index("def _run_one_turn"):]
     body = body[:body.index("\n    def _stream_text")]
-    assert "_bridge_should_auto_unlock(_turn_sent_at)" in body
+    assert "_bridge_should_auto_unlock(_turn_sent_at, _conv)" in body
     assert "_send_and_stream_once" in body
     assert "BRIDGE_UNLOCK_PREFIX % pw" in body
 
@@ -50,16 +50,18 @@ def test_the_unlock_turn_is_wired_into_the_shared_turn_helper():
 def test_first_turn_proactively_unlocks_before_tool_discovery():
     body = SOURCE[SOURCE.index("def _run_one_turn"):]
     body = body[:body.index("\n    def _stream_text")]
-    assert "_BRIDGE_UNLOCK_PREFLIGHT_DONE" in body
-    assert "turn_payload = (BRIDGE_UNLOCK_PREFIX % pw) + msg" in body
+    assert "_bridge_unlock_preflight_due" in body
+    assert "return (BRIDGE_UNLOCK_PREFIX % pw) + msg" in body
     assert "_send_and_stream_once(turn_payload" in body
 
 
 def test_retries_are_capped_so_a_rotating_ip_cannot_loop():
     body = SOURCE[SOURCE.index("def _bridge_should_auto_unlock"):]
     body = body[:body.index("\ndef ")]
-    assert "MAX_BRIDGE_UNLOCK_ATTEMPTS" in body
-    assert "_BRIDGE_UNLOCK_ATTEMPTS +=" in SOURCE
+    assert "_bridge_unlock_budget_left" in body
+    take = SOURCE[SOURCE.index("def _bridge_unlock_take"):]
+    take = take[:take.index("\ndef ")]
+    assert "MAX_BRIDGE_UNLOCK_ATTEMPTS" in take and "MAX_BRIDGE_UNLOCKS_PER_WINDOW" in take
 
 
 def test_password_is_read_locally_and_never_persisted_into_the_agent():
@@ -79,7 +81,7 @@ def test_relay_and_bridge_share_one_password_reader():
 def test_the_check_is_scoped_to_the_turn_not_to_recent_history():
     """A refusal from an unrelated earlier call must not mark this turn as locked --
     CI caught exactly that contamination in the relay's version."""
-    assert "_bridge_should_auto_unlock(_turn_sent_at)" in SOURCE
+    assert "_bridge_should_auto_unlock(_turn_sent_at, _conv)" in SOURCE
     assert "locked_recently" not in SOURCE
 
 
@@ -101,7 +103,7 @@ def _lock_tmp(tmp_path, monkeypatch):
 def test_a_context_less_refusal_does_not_trigger_the_bridge(tmp_path, monkeypatch):
     import bridge.copilot_bridge as B
     LS = _lock_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(B, "_BRIDGE_UNLOCK_ATTEMPTS", 0, raising=False)
+    monkeypatch.setattr(B, "_BRIDGE_UNLOCK_BY_CONV", {})
     LS.record_locked("", "[locked: no HTTP request context] Call unlock(...) first.", ts=100.0)
     import time as _t
     monkeypatch.setattr(_t, "time", lambda: 101.0)
@@ -112,7 +114,7 @@ def test_a_real_refusal_still_triggers_the_bridge(tmp_path, monkeypatch):
     """フィルタは『誰のものか分からない拒否』を外すのであって、拒否を無視しない。"""
     import bridge.copilot_bridge as B
     LS = _lock_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(B, "_BRIDGE_UNLOCK_ATTEMPTS", 0, raising=False)
+    monkeypatch.setattr(B, "_BRIDGE_UNLOCK_BY_CONV", {})
     LS.record_locked("203.0.113.7", "[locked client IP: '203.0.113.7'] ...", ts=100.0)
     import time as _t
     monkeypatch.setattr(_t, "time", lambda: 101.0)
@@ -124,7 +126,7 @@ def test_a_blank_ip_from_a_real_request_still_triggers_the_bridge(tmp_path, monk
     見える失敗の側に倒す -- 静かに素通りさせない。"""
     import bridge.copilot_bridge as B
     LS = _lock_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(B, "_BRIDGE_UNLOCK_ATTEMPTS", 0, raising=False)
+    monkeypatch.setattr(B, "_BRIDGE_UNLOCK_BY_CONV", {})
     LS.record_locked("", "[locked client IP: ''] ...", ts=100.0)
     import time as _t
     monkeypatch.setattr(_t, "time", lambda: 101.0)
@@ -134,7 +136,7 @@ def test_a_blank_ip_from_a_real_request_still_triggers_the_bridge(tmp_path, monk
 def test_an_old_refusal_still_does_not_count(tmp_path, monkeypatch):
     import bridge.copilot_bridge as B
     LS = _lock_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(B, "_BRIDGE_UNLOCK_ATTEMPTS", 0, raising=False)
+    monkeypatch.setattr(B, "_BRIDGE_UNLOCK_BY_CONV", {})
     LS.record_locked("203.0.113.7", "[locked client IP: ...] ...", ts=50.0)
     import time as _t
     monkeypatch.setattr(_t, "time", lambda: 101.0)
@@ -147,7 +149,7 @@ def test_a_real_refusal_hidden_behind_a_later_context_less_one_still_triggers(tm
     実際にはロックされているターンを「ロックされていない」と判定していた。"""
     import bridge.copilot_bridge as B
     LS = _lock_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(B, "_BRIDGE_UNLOCK_ATTEMPTS", 0, raising=False)
+    monkeypatch.setattr(B, "_BRIDGE_UNLOCK_BY_CONV", {})
     LS.record_locked("203.0.113.7", "[locked client IP: '203.0.113.7'] ...", ts=100.0)
     LS.record_locked("", B.NO_CONTEXT_REFUSAL + " Denied ...", ts=101.0)
     import time as _t
@@ -159,7 +161,7 @@ def test_only_context_less_refusals_still_do_not_trigger(tmp_path, monkeypatch):
     """フィルタを「拒否が1件でもあれば」に緩めてはいけない。それが元の欠陥だった。"""
     import bridge.copilot_bridge as B
     LS = _lock_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(B, "_BRIDGE_UNLOCK_ATTEMPTS", 0, raising=False)
+    monkeypatch.setattr(B, "_BRIDGE_UNLOCK_BY_CONV", {})
     LS.record_locked("", B.NO_CONTEXT_REFUSAL + " a", ts=100.0)
     LS.record_locked("", B.NO_CONTEXT_REFUSAL + " b", ts=101.0)
     import time as _t
