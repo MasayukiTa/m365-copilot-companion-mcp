@@ -55,7 +55,11 @@ $Summary = [ordered]@{
     runs     = @()
 }
 function Save-Summary {
-    try { $Summary | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $Results $SummaryName) -Encoding UTF8 } catch { Log "summary write failed: $_" }
+    try {
+        $j = $Summary | ConvertTo-Json -Depth 10
+        Set-Content -LiteralPath (Join-Path $Results $SummaryName) -Value $j -Encoding UTF8
+        Log "summary saved ($($j.Length) chars)"
+    } catch { Log "summary write failed: $_" }
 }
 
 try { Add-Type -AssemblyName System.Windows.Forms, System.Drawing } catch { }
@@ -116,7 +120,7 @@ function Get-EnvSummary {
 
 function Get-StateJson {
     $p = Join-Path $App ".setup\state.json"
-    if (Test-Path -LiteralPath $p) { return (Get-Content -Raw -LiteralPath $p) }
+    if (Test-Path -LiteralPath $p) { return [System.IO.File]::ReadAllText($p) }
     return $null
 }
 
@@ -211,6 +215,7 @@ $ShotMarkers = @("dt_signin", "dt_devcode", "dt_fail", "boot_stopped", "action_n
 # code) -- so it is not used. Rows: text that must be on screen, keys, seconds to wait first.
 $TypedAnswers = @(
     @("Press A, T or N", "N", 2),
+    @("Press N to confirm, or A or T", "N", 2),
     # The window-holding `pause` after every stop: a person reads, then presses a key.
     @("Dev Tunnel setup did not finish", "ENTER", 8),
     @("Dev Tunnel URL is not ready", "ENTER", 8),
@@ -243,6 +248,7 @@ function Invoke-Quickstart {
     $seen = [ordered]@{}
     $shots = @{}
     $typed = @(); $typeDue = @{}
+    $lastLen = -1; $lastChange = Get-Date; $pauseTypedAt = -1
     $killDeadline = $null; $killReason = $null; $atKill = $null
     $fast = ($KillAfterMarker -and $KillDelaySec -eq 0)
     while ($true) {
@@ -269,6 +275,17 @@ function Invoke-Quickstart {
                 Log ("{0}: typed '{1}' for '{2}' rc={3}" -f $Tag, $ta[1], $ta[0], $trc)
                 $typeDue[$key] = $null
             }
+        }
+        # ANY OTHER `pause` (its prompt ends ". . ." in every language): after 20 s with the
+        # window unchanged a person presses a key. A prompt the rows above do not know -- the
+        # script gains new ones -- is otherwise a run stuck until the cap.
+        if ($text.Length -ne $lastLen) { $lastLen = $text.Length; $lastChange = Get-Date }
+        elseif ($text -match '\. \. \.\s*$' -and ((Get-Date) - $lastChange).TotalSeconds -gt 20 -and $pauseTypedAt -ne $text.Length) {
+            $trc = Send-Keys $p.Id "ENTER"
+            $pauseTypedAt = $text.Length
+            $at = [math]::Round(((Get-Date) - $start).TotalSeconds, 1)
+            $typed += ("{0}s typed 'ENTER' at an unlisted pause (typer rc={1})" -f $at, $trc)
+            Log ("{0}: typed ENTER at an unlisted pause rc={1}" -f $Tag, $trc)
         }
         if ($KillAfterMarker -and -not $killDeadline -and $seen.Contains($KillAfterMarker)) {
             $killDeadline = (Get-Date).AddSeconds($KillDelaySec)
@@ -323,9 +340,47 @@ function Get-StartAllProcs {
     })
 }
 
+# A modal error box (seen: "Windows Script Host" when this Windows has no VBScript engine) holds
+# the launcher until someone presses OK. A person would: screenshot it, then press OK.
+$DialogSrc = @"
+using System;
+using System.Runtime.InteropServices;
+public static class SbDialog {
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowW(string cls, string title);
+    [DllImport("user32.dll")] static extern bool PostMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
+    // The VISIBLE window (Process.MainWindowHandle): wscript also owns a hidden window with the
+    // same title, which FindWindow can return first -- measured, pressing that one does nothing.
+    public static bool PressOk(IntPtr h) {
+        if (h == IntPtr.Zero) return false;
+        bool a = PostMessageW(h, 0x0111, new IntPtr(1), IntPtr.Zero); // WM_COMMAND, IDOK
+        bool b = PostMessageW(h, 0x0010, IntPtr.Zero, IntPtr.Zero);   // WM_CLOSE, if IDOK was not it
+        return a || b;
+    }
+}
+"@
+try { Add-Type -TypeDefinition $DialogSrc } catch { }
+$ModalTitles = @("Windows Script Host")
+
 function Wait-StartAllIdle([string]$Tag, [int]$CapSec) {
     $start = Get-Date; $quiet = 0; $everSeen = $false; $peak = 0; $shotAt = $start.AddSeconds(45); $shot = $false
+    $script:dialogsPressed = @(); $script:pressCount = @{}
     while ($true) {
+        foreach ($mt in $ModalTitles) {
+            $visible = @(Get-Process | Where-Object { $_.MainWindowTitle -eq $mt })
+            $key = "$mt/$(if ($visible.Count) { $visible[0].Id })"
+            if ($visible.Count -gt 0 -and $script:pressCount[$key] -ge 3) { $visible = @() }
+            if ($visible.Count -gt 0) {
+                $script:pressCount[$key] = 1 + [int]$script:pressCount[$key]
+                $n = $script:dialogsPressed.Count + 1
+                Start-Sleep -Seconds 3
+                Save-Screen ("{0}.dialog{1}" -f $Tag, $n)
+                $ok = $false; try { $ok = [SbDialog]::PressOk($visible[0].MainWindowHandle) } catch { }
+                $at = [math]::Round(((Get-Date) - $start).TotalSeconds, 1)
+                $script:dialogsPressed += ("{0}s pressed OK on '{1}' ({2} pid {3}) ok={4}" -f $at, $mt, $visible[0].ProcessName, $visible[0].Id, $ok)
+                Log ("{0}: pressed OK on modal '{1}' ok={2}" -f $Tag, $mt, $ok)
+                Start-Sleep -Seconds 2
+            }
+        }
         $n = @(Get-StartAllProcs).Count
         if ($n -gt 0) { $everSeen = $true }
         if ($n -gt $peak) { $peak = $n }
@@ -360,7 +415,7 @@ function Invoke-StartAllClicks([string]$Tag, [int]$Clicks) {
     $bat = Join-Path $App "start_all.bat"
     $runsPath = Join-Path $App ".setup\logs\start_all_runs.jsonl"
     $linesBefore = 0
-    if (Test-Path -LiteralPath $runsPath) { $linesBefore = @(Get-Content -LiteralPath $runsPath).Count }
+    if (Test-Path -LiteralPath $runsPath) { $linesBefore = @([System.IO.File]::ReadAllLines($runsPath)).Count }
     $start = Get-Date
     $cmds = @()
     for ($i = 1; $i -le $Clicks; $i++) {
@@ -372,14 +427,14 @@ function Invoke-StartAllClicks([string]$Tag, [int]$Clicks) {
     $wait = Wait-StartAllIdle $Tag $StartAllCapSec
     $batRcs = @($cmds | ForEach-Object { if ($_.HasExited) { $_.ExitCode } else { "running" } })
     $newLines = @()
-    if (Test-Path -LiteralPath $runsPath) { $newLines = @(Get-Content -LiteralPath $runsPath | Select-Object -Skip $linesBefore) }
+    if (Test-Path -LiteralPath $runsPath) { $newLines = @([System.IO.File]::ReadAllLines($runsPath) | Select-Object -Skip $linesBefore) }
     $sumPath = Join-Path $App ".setup\logs\start_all_summary.txt"
-    $sum = $null; if (Test-Path -LiteralPath $sumPath) { $sum = Get-Content -Raw -LiteralPath $sumPath }
+    $sum = $null; if (Test-Path -LiteralPath $sumPath) { $sum = [System.IO.File]::ReadAllText($sumPath) }
     Save-Screen "$Tag.end"
     $r = [ordered]@{
         tag = $Tag; clicks = $Clicks; launch_spread_ms = $launchSpread
         elapsed_sec = [math]::Round(((Get-Date) - $start).TotalSeconds, 1)
-        wait = $wait; bat_exit_codes = $batRcs
+        wait = $wait; bat_exit_codes = $batRcs; modal_dialogs_pressed = $script:dialogsPressed
         start_all_runs_new_lines = $newLines; start_all_summary = $sum
         stack = (Get-StackSnapshot)
     }
@@ -552,8 +607,21 @@ function Invoke-AdminPhase {
 
     # Relay the user's output to the mapped results folder until it says it is done.
     $deadline = (Get-Date).AddMinutes(150)
+    $beat = Get-Date
     while ((Get-Date) -lt $deadline) {
         & robocopy.exe $ho $Results /E /R:0 /W:0 /NJH /NJS /NFL /NDL /NP | Out-Null
+        # HEARTBEAT: tells a frozen sandbox (no beats) from a stuck user phase (beats, no progress).
+        if (((Get-Date) - $beat).TotalSeconds -ge 60) {
+            $beat = Get-Date
+            try {
+                $os = Get-CimInstance Win32_OperatingSystem
+                $up = Get-Process -Id $upid -ErrorAction SilentlyContinue
+                $last = Get-Item (Join-Path $ho "progress.log") -ErrorAction SilentlyContinue
+                Log ("heartbeat: guest free MB={0} user_phase_alive={1} user_cpu_s={2} progress.log_mtime={3}" -f
+                    [int]($os.FreePhysicalMemory / 1024), [bool]$up, $(if ($up) { [int]$up.CPU } else { "-" }),
+                    $(if ($last) { $last.LastWriteTime.ToString("HH:mm:ss") } else { "-" }))
+            } catch { Log "heartbeat failed: $_" }
+        }
         if (Test-Path (Join-Path $ho "USER_DONE.json")) { break }
         if (-not (Get-Process -Id $upid -ErrorAction SilentlyContinue) -and -not (Test-Path (Join-Path $ho "USER_DONE.json"))) {
             Start-Sleep -Seconds 5
@@ -589,7 +657,7 @@ function Invoke-UserPhase {
         $Summary.runs += (Invoke-StartAllClicks "C3_ten_clicks" 10); Save-Summary
         # doctor is NOT launched: only quickstart.bat and start_all.bat may be (owner rule). A
         # doctor summary is read only if quickstart itself produced one.
-        $dsum = $null; $dp = Join-Path $App ".setup\logs\doctor_summary.txt"; if (Test-Path $dp) { $dsum = Get-Content -Raw $dp }
+        $dsum = $null; $dp = Join-Path $App ".setup\logs\doctor_summary.txt"; if (Test-Path $dp) { $dsum = [System.IO.File]::ReadAllText($dp) }
         $Summary.runs += [ordered]@{ tag = "C_final_observation"; doctor_summary_from_quickstart = $dsum; stack = (Get-StackSnapshot) }
         Copy-SetupLogs "C_final"
         Save-Screen "C_final"
