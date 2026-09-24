@@ -507,6 +507,8 @@ async def health(request: Request) -> JSONResponse:
     # pytest-covered -- so this cannot drift from what those tests assert.
     payload.update(_server_identity())
     payload.update(_auth_stats_summary())
+    # doctor's own negative probe, counted apart from auth_fail_10m (see _SELF_TEST_TRACKER).
+    payload.update(_self_test_summary())
     payload.update(_tool_probe_summary())
     # TWO TOOL PATHS, TWO FIELDS. tool_ok comes from the BRIDGE's idle self-probe and says
     # nothing about the fleet; on 2026-09-16 it was red -- truthfully -- while fleet workers
@@ -1299,6 +1301,175 @@ def _start_approval_watcher(period: float = 3.0) -> None:
     t.start()
 
 
+#: The header scripts/doctor.ps1 sends on the ONE request it expects to be refused: its negative
+#: probe (POST /mcp with no bearer) proves that auth is enforced at all.
+SELF_TEST_HEADER = b"x-mcp-self-test"
+
+#: Rejections of that probe, counted APART from the mismatch counter.
+#:
+#: THE DOCTOR WAS RAISING THE ALARM IT EXISTS TO READ. auth_fail_10m means "someone presented a
+#: key this server does not accept" -- the Copilot Studio key drifting from MCP_API_KEY -- and
+#: the cockpit turns the server dot amber on it. doctor's section 6 refuses itself on purpose,
+#: every run, and the cockpit's auto-repair runs doctor again and again: measured 2026-09-24,
+#: auth_fail_10m sat at 14-16 with no client misconfigured at all, and the dot said "suspect
+#: MCP_API_KEY mismatch". A self-inflicted alarm teaches people to ignore the real one.
+#:
+#: NOT A WAY TO HIDE A REJECTION. Only a request that is loopback with no forwarding headers
+#: (tools.security.derive_identity -- the same "local" the unlock gate uses -- plus no other
+#: Forwarded / X-Forwarded-* header) AND carries the marker lands here. Anything the tunnel
+#: forwards carries X-Forwarded-For and so still counts as a real rejection, marker or not; and a
+#: local caller that uses the marker is still counted, just under its own name.
+_SELF_TEST_TRACKER = None
+
+
+def _self_test_tracker():
+    global _SELF_TEST_TRACKER
+    if _SELF_TEST_TRACKER is None:
+        from tools.auth_stats import AuthFailureTracker
+        _SELF_TEST_TRACKER = AuthFailureTracker()
+    return _SELF_TEST_TRACKER
+
+
+def _self_test_summary() -> dict:
+    """{"self_test_rejections_10m": n} -- never raises."""
+    try:
+        return {"self_test_rejections_10m":
+                _self_test_tracker().summary()["auth_fail_10m"]}
+    except Exception:
+        return {"self_test_rejections_10m": 0}
+
+
+def _is_local_self_test(scope) -> bool:
+    """True iff this ASGI request is a loopback, unforwarded request carrying the marker."""
+    headers = scope.get("headers") or []
+    marker = False
+    xff_value = ""
+    for (hk, hv) in headers:
+        k = hk.lower()
+        if k == SELF_TEST_HEADER and hv.strip():
+            marker = True
+        elif k == b"x-forwarded-for":
+            xff_value = hv.decode("latin-1")
+        elif k == b"forwarded" or k.startswith(b"x-forwarded-"):
+            # Any other forwarding header also means a proxy handled this request.
+            return False
+    if not marker:
+        return False
+    client = scope.get("client")
+    peer_host = client[0] if client else ""
+    is_local, _ = derive_identity(peer_host, xff_value)
+    return bool(is_local)
+
+
+class _BearerPrefix:
+    """Tolerate an Authorization header that is the RAW API key (no scheme).
+
+    Copilot Studio's MCP connector labels the credential field "API key" (auth
+    type = API key, header name = Authorization), so a novice pastes the raw
+    MCP_API_KEY with NO "Bearer " prefix. StaticTokenVerifier then never sees a
+    valid bearer token and returns 401 with no clue. This middleware normalises
+    the header to "Bearer <value>" when the value does not already start
+    (case-insensitively) with "bearer " -- so both the correct "Bearer <key>"
+    form and the raw "<key>" form authenticate. Safe because this server only
+    uses static tokens: the rewrite just supplies the scheme the verifier wants
+    and the wrong key still fails downstream (401).
+
+    This MUST wrap the finished app as the OUTERMOST ASGI layer: FastMCP inserts
+    the auth (RequireAuth) middleware BEFORE anything passed via http_app(middleware=),
+    so a header rewrite handed to that param would run too late (after auth already
+    401'd). Wrapping the returned app puts the rewrite ahead of auth.
+
+    Being the outermost layer also makes this the one place that sees BOTH the
+    request (already normalised) and the final response status for /mcp -- so it
+    doubles as the observation point for tools.auth_stats: today's incident was
+    Copilot Studio's stored key desyncing from MCP_API_KEY, causing every /mcp
+    call to 401 with zero surfaced signal. record_response_start() below inspects
+    the outgoing "http.response.start" ASGI event for status 401 on the /mcp path
+    and calls tools.auth_stats.record_auth_failure(); everything is wrapped in
+    try/except so a bookkeeping bug can never break the real request/response.
+    doctor's own negative probe is the one exception -- see _SELF_TEST_TRACKER.
+
+    The recorded IP is derived from the raw ASGI `scope` (peer address plus any
+    X-Forwarded-For header) via tools.security.derive_identity() -- the SAME pure
+    helper _parse_request() uses for unlock decisions. This module only has a
+    scope dict, not a Starlette Request, but the derivation itself must not be
+    reimplemented here: if this and the unlock gate ever computed the IP
+    differently, the recorded origin would not match the IP the unlock gate
+    actually saw, making the data useless for anything an operator wants to do
+    with it.
+
+    Module level (it used to be defined inside the __main__ block) so the tests can wrap the
+    real app with it and see what a rejected request is counted as."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        is_mcp_path = False
+        if scope.get("type") == "http":
+            new_hdrs = []
+            changed = False
+            for (k, v) in (scope.get("headers") or []):
+                if k.lower() == b"authorization":
+                    val = v.strip()
+                    # Only rewrite when a value is present and it doesn't already
+                    # carry a bearer scheme (any casing: "Bearer", "bearer", ...).
+                    if val and not val.lower().startswith(b"bearer "):
+                        v = b"Bearer " + val
+                        changed = True
+                new_hdrs.append((k, v))
+            if changed:
+                scope = dict(scope)
+                scope["headers"] = new_hdrs
+            is_mcp_path = (scope.get("path") or "").startswith("/mcp")
+
+        if not is_mcp_path:
+            await self.app(scope, receive, send)
+            return
+
+        async def _send_and_observe(message):
+            # Observe the response status BEFORE forwarding it -- never delay or
+            # alter the real response. Any bookkeeping failure here must not
+            # prevent `send` from being called.
+            try:
+                if message.get("type") == "http.response.start" and message.get("status") == 401:
+                    if _is_local_self_test(scope):
+                        _self_test_tracker().record()
+                    else:
+                        from tools.auth_stats import record_auth_failure
+
+                        # Raw ASGI scope, not a Starlette Request: pull the peer
+                        # host and the raw X-Forwarded-For header value by hand,
+                        # then hand both to the SAME derivation _parse_request()
+                        # uses, rather than guessing at the IP independently here.
+                        client = scope.get("client")
+                        peer_host = client[0] if client else ""
+                        xff_value = ""
+                        for (hk, hv) in (scope.get("headers") or []):
+                            if hk.lower() == b"x-forwarded-for":
+                                xff_value = hv.decode("latin-1")
+                                break
+                        _, identity_ip = derive_identity(peer_host, xff_value)
+                        # AND WHAT DISTINGUISHES ONE CALLER FROM ANOTHER. The IP alone does
+                        # not: the devtunnel host forwards from localhost, so every caller
+                        # that arrives through it reads as 127.0.0.1. Measured 2026-09-17 --
+                        # four rejections raised the dot and left nothing to investigate.
+                        # The Authorization header is deliberately NOT read: a rejected key
+                        # is still a key, and this record is the last place one should land.
+                        _ua = ""
+                        for (hk, hv) in (scope.get("headers") or []):
+                            if hk.lower() == b"user-agent":
+                                _ua = hv.decode("latin-1")
+                                break
+                        record_auth_failure(ip=identity_ip,
+                                            path=(scope.get("path") or ""), agent=_ua)
+            except Exception:
+                pass
+            await send(message)
+
+        await self.app(scope, receive, _send_and_observe)
+
+
 if __name__ == "__main__":
     _install_faulthandler()
     _start_approval_watcher()
@@ -1341,108 +1512,8 @@ if __name__ == "__main__":
                 scope["headers"] = hdrs
             await self.app(scope, receive, send)
 
-    class _BearerPrefix:
-        """Tolerate an Authorization header that is the RAW API key (no scheme).
-
-        Copilot Studio's MCP connector labels the credential field "API key" (auth
-        type = API key, header name = Authorization), so a novice pastes the raw
-        MCP_API_KEY with NO "Bearer " prefix. StaticTokenVerifier then never sees a
-        valid bearer token and returns 401 with no clue. This middleware normalises
-        the header to "Bearer <value>" when the value does not already start
-        (case-insensitively) with "bearer " -- so both the correct "Bearer <key>"
-        form and the raw "<key>" form authenticate. Safe because this server only
-        uses static tokens: the rewrite just supplies the scheme the verifier wants
-        and the wrong key still fails downstream (401).
-
-        This MUST wrap the finished app as the OUTERMOST ASGI layer: FastMCP inserts
-        the auth (RequireAuth) middleware BEFORE anything passed via http_app(middleware=),
-        so a header rewrite handed to that param would run too late (after auth already
-        401'd). Wrapping the returned app puts the rewrite ahead of auth.
-
-        Being the outermost layer also makes this the one place that sees BOTH the
-        request (already normalised) and the final response status for /mcp -- so it
-        doubles as the observation point for tools.auth_stats: today's incident was
-        Copilot Studio's stored key desyncing from MCP_API_KEY, causing every /mcp
-        call to 401 with zero surfaced signal. record_response_start() below inspects
-        the outgoing "http.response.start" ASGI event for status 401 on the /mcp path
-        and calls tools.auth_stats.record_auth_failure(); everything is wrapped in
-        try/except so a bookkeeping bug can never break the real request/response.
-
-        The recorded IP is derived from the raw ASGI `scope` (peer address plus any
-        X-Forwarded-For header) via tools.security.derive_identity() -- the SAME pure
-        helper _parse_request() uses for unlock decisions. This module only has a
-        scope dict, not a Starlette Request, but the derivation itself must not be
-        reimplemented here: if this and the unlock gate ever computed the IP
-        differently, the recorded origin would not match the IP the unlock gate
-        actually saw, making the data useless for anything an operator wants to do
-        with it."""
-
-        def __init__(self, app):
-            self.app = app
-
-        async def __call__(self, scope, receive, send):
-            is_mcp_path = False
-            if scope.get("type") == "http":
-                new_hdrs = []
-                changed = False
-                for (k, v) in (scope.get("headers") or []):
-                    if k.lower() == b"authorization":
-                        val = v.strip()
-                        # Only rewrite when a value is present and it doesn't already
-                        # carry a bearer scheme (any casing: "Bearer", "bearer", ...).
-                        if val and not val.lower().startswith(b"bearer "):
-                            v = b"Bearer " + val
-                            changed = True
-                    new_hdrs.append((k, v))
-                if changed:
-                    scope = dict(scope)
-                    scope["headers"] = new_hdrs
-                is_mcp_path = (scope.get("path") or "").startswith("/mcp")
-
-            if not is_mcp_path:
-                await self.app(scope, receive, send)
-                return
-
-            async def _send_and_observe(message):
-                # Observe the response status BEFORE forwarding it -- never delay or
-                # alter the real response. Any bookkeeping failure here must not
-                # prevent `send` from being called.
-                try:
-                    if message.get("type") == "http.response.start" and message.get("status") == 401:
-                        from tools.auth_stats import record_auth_failure
-                        from tools.security import derive_identity
-
-                        # Raw ASGI scope, not a Starlette Request: pull the peer
-                        # host and the raw X-Forwarded-For header value by hand,
-                        # then hand both to the SAME derivation _parse_request()
-                        # uses, rather than guessing at the IP independently here.
-                        client = scope.get("client")
-                        peer_host = client[0] if client else ""
-                        xff_value = ""
-                        for (hk, hv) in (scope.get("headers") or []):
-                            if hk.lower() == b"x-forwarded-for":
-                                xff_value = hv.decode("latin-1")
-                                break
-                        _, identity_ip = derive_identity(peer_host, xff_value)
-                        # AND WHAT DISTINGUISHES ONE CALLER FROM ANOTHER. The IP alone does
-                        # not: the devtunnel host forwards from localhost, so every caller
-                        # that arrives through it reads as 127.0.0.1. Measured 2026-09-17 --
-                        # four rejections raised the dot and left nothing to investigate.
-                        # The Authorization header is deliberately NOT read: a rejected key
-                        # is still a key, and this record is the last place one should land.
-                        _ua = ""
-                        for (hk, hv) in (scope.get("headers") or []):
-                            if hk.lower() == b"user-agent":
-                                _ua = hv.decode("latin-1")
-                                break
-                        record_auth_failure(ip=identity_ip,
-                                            path=(scope.get("path") or ""), agent=_ua)
-                except Exception:
-                    pass
-                await send(message)
-
-            await self.app(scope, receive, _send_and_observe)
-
+    # _BearerPrefix (the outermost layer: raw-key -> "Bearer <key>", and the 401 observer) is
+    # defined at module level above, so the tests can wrap the real app with it.
     app = mcp.http_app(path="/mcp", transport="streamable-http",
                        json_response=True, middleware=[Middleware(_AcceptBoth)])
 
