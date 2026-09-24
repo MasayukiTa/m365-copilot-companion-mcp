@@ -1065,7 +1065,7 @@ class CockpitWindow : Window
     // owner decision touched the size cap, so it keeps defaulting to "no cap".
     int _retDays = 90;         // settings.txt session_retention_days= ; 0 = keep forever, unset = 90
     int _retMb = 0;            // settings.txt session_max_mb=        ; 0 = no size cap
-    TextBlock _retDaysValue, _retMbValue, _retNote;
+    TextBlock _retDaysValue, _retMbValue;
 
     // THE DENOMINATOR OF THE RATE STRIP, AND THE LINE ADMISSION HOLDS AT. Microsoft documents
     // 100 generative messages per minute per Dataverse environment, which is the default and
@@ -1545,6 +1545,15 @@ class CockpitWindow : Window
         // Settings panel (gear popup) -- consolidates the scattered toolbar controls
         if (k == "settings") return ja ? "設定" : "Settings";
         if (k == "set_tabs_section") return ja ? "並列タブ" : "Parallel tabs";
+        // Header chip "タブ X/Y". Y is the LIVE admission ceiling (shrinks/grows with free RAM);
+        // X is real browser tabs open right now. A shrink is soft -- it stops new tabs from
+        // opening, it does not close ones already running -- so X can sit above Y for a while as
+        // the fleet drains down to the new ceiling, and one worker mid fan-out (research +
+        // refuter side-pages) alone can be up to 3 of X. Neither is a bug; the tooltip says so
+        // instead of leaving "3/1" looking like a broken cap.
+        if (k == "tabs_chip_hint") return ja
+            ? "今開いているタブ数 / 上限（空きRAMで自動増減）。上限を下げても今動いている分は閉じません。次に空くまで新規だけ止めます。1ワーカーが調査・反論用の子タブを開くと、それだけで数字が上限を超えて見えることがあります。"
+            : "Open tabs now / the live ceiling (auto-adjusts with free RAM). Lowering the ceiling doesn't close tabs already running -- it only stops new ones until one frees up. One worker fanning out to research/refuter side-tabs can push the count above the ceiling by itself.";
         if (k == "set_retry_section") return ja ? "自動再試行" : "Auto-retry";
         if (k == "set_retention_section") return ja ? "会話の保持" : "Conversation retention";
         if (k == "set_rate_section") return ja ? "レート上限" : "Rate ceiling";
@@ -1569,12 +1578,6 @@ class CockpitWindow : Window
         if (k == "ret_days") return ja ? "保持日数" : "Keep for (days)";
         if (k == "ret_keep") return ja ? "消さない" : "keep all";
         if (k == "ret_mb") return ja ? "上限サイズ (MB)" : "Size cap (MB)";
-        if (k == "ret_off") return ja
-            ? "0 = 消さない（既定）。会話はローカルの SQLite に残り、タブを作り直しても失われません。"
-            : "0 = keep everything (default). Conversations live in local SQLite and survive a fresh tab.";
-        if (k == "ret_whole") return ja
-            ? "削除は会話単位です。途中だけ消えた会話は、完全な顔をして中身が抜けているため作りません。"
-            : "Whole conversations only -- a half-kept one reads as complete and is not.";
         if (k == "set_capacity_section") return ja ? "容量ガード" : "Capacity guard";
         if (k == "disk_floor") return ja ? "実行下限ディスク (GB)" : "Disk floor (GB)";
         if (k == "disk_floor_hint") return ja ? "空きディスクがこの値を下回るとタブ開放を待機します。" : "Pauses opening tabs when free disk drops below this.";
@@ -7269,7 +7272,6 @@ class CockpitWindow : Window
         _retDays = Math.Max(0, Math.Min(3650, v));
         SaveKey("session_retention_days", _retDays.ToString());
         if (_retDaysValue != null) _retDaysValue.Text = _retDays == 0 ? T("ret_keep") : _retDays.ToString();
-        PaintRetentionNote();
     }
 
     void SetRetMb(int v)
@@ -7280,7 +7282,6 @@ class CockpitWindow : Window
         _retMb = Math.Max(0, Math.Min(100000, v));
         SaveKey("session_max_mb", _retMb.ToString());
         if (_retMbValue != null) _retMbValue.Text = _retMb == 0 ? T("ret_keep") : _retMb.ToString();
-        PaintRetentionNote();
     }
 
     int RetMbStep() { return _retMb >= 1000 ? 500 : 100; }
@@ -7336,32 +7337,6 @@ class CockpitWindow : Window
             _fleetCompressHoursValue.Text = _fleetCompressHours.ToString();
     }
 
-    void PaintRetentionNote()
-    {
-        if (_retNote == null) return;
-        bool ja = _lang == 0;
-        if (_retDays == 0 && _retMb == 0)
-        {
-            _retNote.Text = T("ret_off");
-            _retNote.Foreground = Muted;
-            return;
-        }
-        // SAY WHAT WILL BE DELETED, IN WORDS, BEFORE IT IS. A retention setting whose effect
-        // the operator has to infer from two numbers is one they will set once and regret.
-        string what;
-        if (_retDays > 0 && _retMb > 0)
-            what = ja ? string.Format("{0}日より古い会話と、{1}MB を超えた分の古い会話を、起動時に削除します。", _retDays, _retMb)
-                      : string.Format("At startup, deletes conversations older than {0} days, and the oldest ones above {1} MB.", _retDays, _retMb);
-        else if (_retDays > 0)
-            what = ja ? string.Format("{0}日より古い会話を起動時に削除します。", _retDays)
-                      : string.Format("At startup, deletes conversations older than {0} days.", _retDays);
-        else
-            what = ja ? string.Format("{0}MB を超えた分の古い会話を起動時に削除します。", _retMb)
-                      : string.Format("At startup, deletes the oldest conversations above {0} MB.", _retMb);
-        _retNote.Text = what + " " + T("ret_whole");
-        _retNote.Foreground = Theme.Br(Theme.Warning(_dark));
-    }
-
     UIElement BuildSettingsPanel()
     {
         var card = new Border();
@@ -7411,12 +7386,6 @@ class CockpitWindow : Window
         var retMPlus = MiniButton("+"); retMPlus.Click += delegate { SetRetMb(_retMb + RetMbStep()); };
         _retMbValue = new TextBlock(); _retMbValue.Text = _retMb == 0 ? T("ret_keep") : _retMb.ToString();
         col.Children.Add(SettingsStepperRow(T("ret_mb"), _retMbValue, retMMinus, retMPlus, "session_max_mb"));
-
-        _retNote = new TextBlock();
-        _retNote.FontSize = 11; _retNote.TextWrapping = TextWrapping.Wrap;
-        _retNote.Margin = new Thickness(0, 2, 0, 2); _retNote.MaxWidth = 300;
-        PaintRetentionNote();
-        col.Children.Add(_retNote);
 
         // -- Rate ceiling: the line admission holds at, and the strip's denominator --
         col.Children.Add(SectionHeader(T("set_rate_section")));
@@ -10098,6 +10067,9 @@ class CockpitWindow : Window
         string label = _lang == 0 ? ("タブ " + open + "/" + cap) : ("Tabs " + open + "/" + cap);
         _workerChip.Text = label;
         _workerChip.Foreground = Theme.Br(Theme.Muted(_dark));
+        string hint = T("tabs_chip_hint");
+        _workerChip.ToolTip = hint;
+        if (_workerChipBorder != null) _workerChipBorder.ToolTip = hint;
     }
 
     void PaintWorkerChipBorder(Border b)
