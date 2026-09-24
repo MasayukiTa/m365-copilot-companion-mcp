@@ -216,6 +216,110 @@ def test_a_worker_with_a_standing_gate_does_not_raise_a_second():
     assert "a completely different question" not in gate["question"]
 
 
+def test_unlock_exhaustion_is_cancelled_when_the_server_already_granted_it():
+    """2026-09-24 INCIDENT (.fleet/lock_refusals.jsonl, 20:46-21:06): 8 fleet workers raised
+    the "unlock を4回投入したが解錠が続かない" gate. Session 74a529deaa442b2b -- one of them --
+    was refused 3 times over ~5 minutes (each refusal's presented_digest EMPTY, session_state
+    "unrecognized-or-expired"), then GRANTED 29 seconds after the last refusal: the model's
+    turn was slow to act on the injected unlock() instruction, not incapable of it.
+    MAX_UNLOCK_ATTEMPTS counts ATTEMPTS, not elapsed recovery time, so the gate fired anyway.
+
+    This reproduces that shape: drive a worker to the exhaustion boundary, then have the
+    SERVER'S OWN LEDGER record a grant exclusively attributable to that worker (the same
+    relay/turn_windows attribution _exclusively_refused already uses for refusals) before the
+    one-past-the-cap reply arrives. The worker must resume, not gate -- the question a human
+    gate would have asked ("did unlock ever actually work?") is one the record already
+    answers.
+    """
+    import time as _time
+
+    from relay import turn_windows as tw
+    from tools import lock_state as ls
+
+    orig_pw = rf._unlock_password
+    rf._unlock_password = lambda: "unit-test-password"
+    tw.reset()
+    try:
+        w = _fresh_worker("w_recovered_gate")
+        locked = ("[locked client IP: '203.0.113.11'] Call unlock(password='<password>') "
+                  "first. The unlock is stored per client IP for 30 days.")
+        for _ in range(MAX_UNLOCK_ATTEMPTS - 1):
+            w._decide(locked)
+        assert w._unlock_attempts == MAX_UNLOCK_ATTEMPTS
+
+        # EXCLUSIVE ATTRIBUTION: only this worker has an open turn window when the grant
+        # lands, so relay.turn_windows.belongs_to resolves it to `w` unambiguously.
+        tw.open_turn(w.name, _time.time() - 2)
+        ls.record_granted("203.0.113.11", "sess_recovered_test", via="password")
+
+        w._decide(locked)                       # one past the cap
+        assert w.status == "ready", (
+            "a grant the ledger already attributes to this worker must resume it, "
+            "not spend a human gate re-asking whether unlock worked")
+        assert w._gate_token is None
+        assert w._unlock_attempts == 0
+        assert w.status not in TERMINAL
+    finally:
+        rf._unlock_password = orig_pw
+        tw.reset()
+
+
+def test_unlock_exhaustion_still_gates_when_no_grant_is_attributable():
+    """The companion to the test above: _worker_recently_granted must be a narrow, provable
+    exception, not a general suppressor. With no grant recorded at all, exhaustion still
+    raises the human gate exactly as test_a_worker_past_the_unlock_attempts_raises_a_gate_
+    naming_what_it_needs already covers -- kept here as the explicit contrast so the two
+    behaviours are read side by side."""
+    from relay import turn_windows as tw
+
+    orig_pw = rf._unlock_password
+    rf._unlock_password = lambda: "unit-test-password"
+    tw.reset()
+    try:
+        w = _fresh_worker("w_not_recovered_gate")
+        locked = ("[locked client IP: '203.0.113.12'] Call unlock(password='<password>') "
+                  "first. The unlock is stored per client IP for 30 days.")
+        for _ in range(MAX_UNLOCK_ATTEMPTS - 1):
+            w._decide(locked)
+        w._decide(locked)                       # one past the cap, no grant recorded anywhere
+        assert w.status == "awaiting_gate"
+        assert w._gate_token
+    finally:
+        rf._unlock_password = orig_pw
+        tw.reset()
+
+
+def test_two_workers_with_the_identical_unlock_question_share_one_gate():
+    """DEDUPE, 2026-09-24: the same-day incident raised 8 separate gate files for the SAME
+    "unlock を4回投入したが解錠が続かない" question -- one per stuck worker, each its own
+    desktop toast, because _raise_stuck_gate's "one gate per worker at a time" guard only
+    ever looked at ITS OWN worker's standing token, never at whether some OTHER worker had
+    already asked the identical question. gate_ask_local's dedupe_key collapses this: two
+    workers hitting byte-identical exhaustion text must land on ONE gate token, and the
+    second worker's identity must be recorded on it rather than silently dropped."""
+    w1 = _fresh_worker("w_dedupe_a")
+    w2 = _fresh_worker("w_dedupe_b")
+    question = ("⚠ unlock を 4 回投入したが解錠が続かない。(1) MCP_REQUIRE_UNLOCK_TOKEN が "
+               "有効で、unlock_token を後続の call_tool に渡せていない、(2) 送信元IPが毎回"
+               "変わる、(3) パスワード不一致。のいずれか。")
+    raised1 = w1._raise_stuck_gate(question, "unlock exhausted after 4 attempts")
+    raised2 = w2._raise_stuck_gate(question, "unlock exhausted after 4 attempts")
+    assert raised1 is True
+    assert raised2 is True, "a SECOND worker with the identical question must still succeed"
+    assert w1._gate_token == w2._gate_token, "both workers must be attached to ONE gate"
+    gate = gate_get(w1._gate_token)
+    assert gate is not None
+    workers = gate.get("workers") or []
+    assert "w_dedupe_a" in workers and "w_dedupe_b" in workers
+    # ONE ANSWER RESOLVES BOTH. gate_answer only ever writes the one file both tokens share.
+    gate_answer(w1._gate_token, "MCP_REQUIRE_UNLOCK_TOKEN を確認しました、再開してください")
+    for w in (w1, w2):
+        terminal = w.poll()
+        assert terminal is False
+        assert w.status == "ready"
+        assert w._gate_token is None
+
+
 if __name__ == "__main__":
     raise SystemExit(
         __import__("pytest").main([__file__, "-q"])

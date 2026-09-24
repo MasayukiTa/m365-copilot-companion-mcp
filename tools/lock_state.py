@@ -454,6 +454,28 @@ def matching_records(since: float, now: Optional[float] = None) -> list:
     return out
 
 
+def granted_records(since: float, now: Optional[float] = None) -> list:
+    """Every 'granted' event recorded at or after `since` and still fresh. Oldest first.
+
+    THE THIRD READER OF THE SAME SCAN, after matching_records (refused) and classifications
+    (classified_locked) below -- same tail-read, same torn-line tolerance, same freshness
+    window, because those were each bought with an incident and a second copy of them would
+    be a second place for those lessons to rot.
+
+    WHY THIS EXISTS, 2026-09-24. relay_fleet._inject_unlock exhausts MAX_UNLOCK_ATTEMPTS on
+    a fixed ATTEMPT count, not on elapsed time -- so a worker whose Copilot turns are merely
+    slow can still be mid-flight on a call to unlock() that is about to succeed when the
+    budget runs out. Measured the same day: worker session 74a529deaa442b2b was refused
+    three times over roughly five minutes, then GRANTED 29 seconds after the last of those
+    refusals -- well inside the round-trip of one more auto-injected attempt. Before treating
+    the budget as exhausted and raising a human gate, the caller can ask the server's own
+    record whether the identity was, in fact, unlocked in the meantime; see
+    relay_fleet._worker_recently_granted, the one consumer.
+    """
+    rows = _scan(since, now)
+    return [r for r in rows if r.get("event") == "granted"]
+
+
 def classifications(since: float, now: Optional[float] = None) -> list:
     """Every `classified_locked` note a reader wrote at or after `since`. Oldest first.
 

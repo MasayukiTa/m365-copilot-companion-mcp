@@ -975,6 +975,62 @@ def _exclusively_refused(worker: str, since: float) -> bool:
     return False
 
 
+#: How far back _worker_recently_granted ASKS to look for a grant it can attribute to a
+#: worker about to be declared unlock-exhausted. Generous on purpose, because nothing on
+#: this worker tracks when its unlock streak began -- but the real ceiling is
+#: tools.lock_state.DEFAULT_FRESH_SEC (180s), which granted_records' underlying _scan
+#: enforces regardless of what is passed here (a record older than 180s from "now" is
+#: dropped even if `since` would have admitted it). 180s already covers the measured
+#: incident (a grant 29s after the last refusal); this constant is intentionally larger
+#: than that ceiling so a future change to DEFAULT_FRESH_SEC widens this for free instead
+#: of silently staying capped at today's number.
+_RECENT_GRANT_LOOKBACK_S = 1200.0
+
+
+def _worker_recently_granted(worker: str, lookback_s: float = _RECENT_GRANT_LOOKBACK_S) -> bool:
+    """Did the SERVER record this identity becoming unlocked recently, even though the last
+    reply this worker sent still looked locked?
+
+    THE INCIDENT THIS CLOSES, measured 2026-09-24 (.fleet/lock_refusals.jsonl, 20:46-21:06):
+    eight fleet workers exhausted MAX_UNLOCK_ATTEMPTS and raised a HITL gate reading "unlock
+    を4回投入したが解錠が続かない". Session 74a529deaa442b2b -- one of those eight -- was
+    refused three times over roughly five minutes (gaps of 176s and 82s between refusal and
+    the next auto-injected attempt), each refusal carrying an EMPTY presented_digest and
+    session_state "unrecognized-or-expired": the model's own turn was simply slow to act on
+    the injected unlock() instruction, not incapable of it. 29 seconds after the LAST of
+    those three refusals, the same session WAS granted (`{"event": "granted", ...,
+    "session": "74a529deaa442b2b", "via": "password"}`) -- inside the round-trip of one more
+    attempt, after the budget that triggers a human gate had already been spent counting
+    attempts rather than elapsed recovery time. The client IP never rotated (20.210.146.129
+    throughout every one of the eight incidents that day) and MCP_REQUIRE_UNLOCK_TOKEN /
+    MCP_UNLOCK_PASSWORD were both configured correctly -- so of the three causes
+    _inject_unlock's exhaustion message names, none was the actual cause for at least this
+    worker; it was still catching up.
+
+    Reuses _exclusively_refused's exact attribution (relay/turn_windows.belongs_to) against
+    'granted' events instead of 'refused' ones (tools/lock_state.granted_records). SAME
+    FALSE-NEGATIVE SHAPE: attribution resolves exclusively only ~10% of the time overall
+    (100% at 2 concurrent workers, 3% at 96 -- see _exclusively_refused's docstring), so a
+    False here means "not established", never "not granted". That asymmetry is why this may
+    only ever CANCEL a gate/STUCK that would otherwise fire, never suppress one that a
+    worker genuinely needs: on a False, _inject_unlock's existing behaviour is unchanged.
+    """
+    if not worker:
+        return False
+    try:
+        from tools import lock_state as _ls
+        from relay import turn_windows as _tw
+
+        since = time.time() - max(1.0, float(lookback_s))
+        for rec in _ls.granted_records(since):
+            ts = float(rec.get("ts") or 0)
+            if ts and _tw.belongs_to(worker, ts):
+                return True
+    except Exception:
+        return False
+    return False
+
+
 def _looks_locked(resp: str, since: float = 0.0, worker: str = "") -> bool:
     """True iff `resp` looks like the SERVER's require_unlocked() lock error, not a worker's
     prose that merely discusses/quotes the unlock() API (see the FALSE-POSITIVE FIX comment
@@ -4281,8 +4337,16 @@ class RelayWorker:
             return False
         context = "worker=%s trigger=%s goal=%s" % (
             self.name, trigger, (self.goal or "")[:200])
+        # DEDUPE ON THE QUESTION TEXT. Measured 2026-09-24: 8 workers hit "unlock
+        # exhausted after 4 attempts" within 12 minutes and each raised its OWN gate
+        # with the byte-identical question -- 8 toasts, 8 files, one real question.
+        # `question` is the worker's own diagnosis (see this method's docstring), so
+        # two workers converging on the identical text really is the identical cause;
+        # gate_ask_local's dedupe_key collapses them into one open gate that every
+        # attached worker polls (see _poll_gate below), and the owner answers once.
         try:
-            token = gate_ask_local(question, context=context)
+            token = gate_ask_local(question, context=context, dedupe_key=question,
+                                   worker_label=self.name)
         except Exception:
             token = None
         if not token:
@@ -4618,6 +4682,19 @@ class RelayWorker:
             # another attempt -- four gone in about eight seconds, and the message blamed
             # a rotating IP and a wrong password for a turn that was never sent. Every
             # sibling branch that sets self.job sets this too; this one did not.
+            self.status = "ready"
+            return
+        # BEFORE DECLARING EXHAUSTION, ASK THE SERVER WHETHER IT ALREADY RECOVERED. The
+        # budget above counts ATTEMPTS, not elapsed time -- see _worker_recently_granted's
+        # docstring for the measured incident (2026-09-24): a worker can still be mid-flight
+        # on a slow Copilot turn that is ABOUT to call unlock() successfully when the 4th
+        # attempt is counted. If the server's own ledger shows this worker's identity was
+        # granted since, the run is not stuck at all; resume it instead of spending a human
+        # gate on a question recovery already answered.
+        if _worker_recently_granted(self.name):
+            self._unlock_attempts = 0
+            self.job = self._task_anchor(CONTINUE_JOB)
+            self.reason = "unlock 済みをサーバ記録で確認 -> 再開(人への確認は不要と判断)"
             self.status = "ready"
             return
         # NAME THE CAUSE THAT ACTUALLY HAPPENS. This listed a rotating backend IP and a wrong
