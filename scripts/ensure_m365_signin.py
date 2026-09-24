@@ -265,26 +265,60 @@ def _last_start_all_began(repo: str = _REPO) -> float:
     start_all records every run in .setup/logs/start_all_runs.jsonl. A run that began AFTER the
     window was last shown is a new request to be shown it. The run that launched this bridge
     began before the window was shown, so it does not re-fire it.
+
+    ALSO CHECKS .setup/logs/start_all_runs.d/ (2026-09-25): a leaving copy (someone double-
+    clicked the icon while this app was already up) no longer writes start_all_runs.jsonl
+    directly -- see scripts/start_all.ps1's Write-StartAllRunRecordSpooled -- it writes its own
+    file there, and only the NEXT holder's bring-up folds it into the jsonl, which can be
+    minutes away. That leave already happened and is a real "started again" event; waiting for
+    the eventual merge to notice it would mean the exact double-click this function exists to
+    catch (a person clicking the icon because they don't see the window) stays invisible until
+    long after the person gave up.
     """
+    import datetime as _dt
+
+    def _ts_of(text: str):
+        text = text.strip()
+        if not text.startswith("{"):
+            return None
+        try:
+            ts = json.loads(text).get("ts") or ""
+            return _dt.datetime.fromisoformat(ts).timestamp()
+        except Exception:
+            return None
+
+    best = 0.0
     path = os.path.join(repo, ".setup", "logs", "start_all_runs.jsonl")
     try:
         with open(path, "rb") as f:
             f.seek(0, os.SEEK_END)
             f.seek(max(0, f.tell() - 16384))
             tail = f.read().decode("utf-8", "replace").splitlines()
+        for line in reversed(tail):
+            t = _ts_of(line)
+            if t is not None:
+                best = t          # newest-last in an append-only file: first hit is newest
+                break
     except Exception:
-        return 0.0
-    import datetime as _dt
-    for line in reversed(tail):
-        line = line.strip()
-        if not line.startswith("{"):
+        pass
+
+    spool_dir = os.path.join(repo, ".setup", "logs", "start_all_runs.d")
+    try:
+        names = os.listdir(spool_dir)
+    except Exception:
+        names = []
+    for name in names:
+        if not name.endswith(".json"):
             continue
         try:
-            ts = json.loads(line).get("ts") or ""
-            return _dt.datetime.fromisoformat(ts).timestamp()
+            with open(os.path.join(spool_dir, name), "r", encoding="utf-8") as f:
+                text = f.read()
         except Exception:
             continue
-    return 0.0
+        t = _ts_of(text)
+        if t is not None and t > best:
+            best = t
+    return best
 
 
 def _bridge_busy(status_url: str) -> bool:

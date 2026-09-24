@@ -428,6 +428,15 @@ function Invoke-StartAllClicks([string]$Tag, [int]$Clicks) {
     $batRcs = @($cmds | ForEach-Object { if ($_.HasExited) { $_.ExitCode } else { "running" } })
     $newLines = @()
     if (Test-Path -LiteralPath $runsPath) { $newLines = @([System.IO.File]::ReadAllLines($runsPath) | Select-Object -Skip $linesBefore) }
+    # A leaving copy's record can still be sitting unmerged in start_all_runs.d/ at this point
+    # (2026-09-25, Write-StartAllRunRecordSpooled/Merge-StartAllRunSpool) -- folded into the
+    # jsonl only by the NEXT holder's bring-up, not necessarily by the time this reads. Counted
+    # here too so a sandbox run's diagnostics do not undercount leaves that genuinely happened.
+    $spoolPath = Join-Path $App ".setup\logs\start_all_runs.d"
+    if (Test-Path -LiteralPath $spoolPath) {
+        $newLines += @(Get-ChildItem -LiteralPath $spoolPath -Filter "*.json" -File -ErrorAction SilentlyContinue |
+            ForEach-Object { try { [System.IO.File]::ReadAllText($_.FullName) } catch { $null } } | Where-Object { $_ })
+    }
     $sumPath = Join-Path $App ".setup\logs\start_all_summary.txt"
     $sum = $null; if (Test-Path -LiteralPath $sumPath) { $sum = [System.IO.File]::ReadAllText($sumPath) }
     Save-Screen "$Tag.end"

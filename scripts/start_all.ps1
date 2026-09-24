@@ -563,7 +563,11 @@ function Invoke-StartAllLeave {
     }
     $script:lockState = "busy"
     $script:lockWaitSec = [math]::Round(((Get-Date) - $script:runStartedAt).TotalSeconds, 1)
-    $null = Write-StartAllRunRecord (Join-Path $script:diagDir "start_all_runs.jsonl") (New-StartAllRunRecord "already running")
+    # SPOOLED, not Write-StartAllRunRecord (2026-09-25, scripts/test_start_all_ten_clicks.py):
+    # a leaving copy never shares a lock with another leaving copy -- see
+    # Write-StartAllRunRecordSpooled's own comment for why a shared mutex here does not scale
+    # to ten-at-once on the CI runner even after every earlier optimisation of that path.
+    $null = Write-StartAllRunRecordSpooled (Join-Path $script:diagDir "start_all_runs.d") (New-StartAllRunRecord "already running")
 }
 
 function Get-StartAllMode {
@@ -600,36 +604,115 @@ function New-StartAllRunRecord([string]$Outcome) {
         phases           = $(if ($script:phaseTimings) { $script:phaseTimings } else { [ordered]@{} })
     }
 }
-function Write-StartAllRunRecord([string]$Path, $Record, [int]$Keep = 500) {
-    # Append one JSON line, keeping the last $Keep (up to 50 more between trims, see
-    # Save-StartAllRunLines). Never throws.
-    # SERIALISED BY ITS OWN MUTEX, named after the file. It used to rely on the start_all lock
-    # being held; a copy that leaves because a startup is already running (Invoke-StartAllLeave)
-    # writes without it, and nine of those at once rewrote the file over each other.
-    # The line is built BEFORE the lock: ConvertTo-Json is the slow part, and nine copies leaving
-    # at once each held the lock through it (measured: up to 2.5 s of a leaver spent here).
-    $line = $null
-    try { $line = ($Record | ConvertTo-Json -Compress -Depth 3) } catch { return $false }
-    $lk = $null
+function Enter-StartAllRunLogLock([string]$Path) {
+    # The mutex Write-StartAllRunRecord and Merge-StartAllRunSpool both serialise on, named
+    # after the FILE (not a fixed name), so a different diagDir per test-tree cannot collide
+    # with another. Pulled out of Write-StartAllRunRecord (2026-09-25) so the merge path can
+    # take the IDENTICAL lock rather than a second, independently-named one. Caller releases
+    # with $lk.ReleaseMutex()/.Dispose() in a finally, same as before.
     try {
         $md5 = [System.Security.Cryptography.MD5]::Create()
         $hash = [BitConverter]::ToString($md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Path.ToLowerInvariant()))).Replace("-", "")
         $md5.Dispose()
         $lk = New-Object System.Threading.Mutex($false, ("Global\m365-start-all-runlog-" + $hash))
         try { [void]$lk.WaitOne(10000) } catch { }      # abandoned = ours; a timeout still writes
-    } catch { $lk = $null }
+        return $lk
+    } catch { return $null }
+}
+function Write-StartAllRunRecord([string]$Path, $Record, [int]$Keep = 500) {
+    # Append one JSON line, keeping the last $Keep (up to 50 more between trims, see
+    # Save-StartAllRunLines). Never throws.
+    # SERIALISED BY ITS OWN MUTEX (Enter-StartAllRunLogLock). It used to rely on the start_all
+    # lock being held; a copy that leaves because a startup is already running used to write
+    # here directly too, and nine of those at once rewrote the file over each other -- that
+    # copy now uses Write-StartAllRunRecordSpooled instead (2026-09-25), which needs no lock at
+    # all; THIS function is for the one caller per run that is never in a ten-at-once race: the
+    # holder's own final record, and the (also singular) self-update re-exec handoff.
+    # The line is built BEFORE the lock: ConvertTo-Json is the slow part, and nine copies leaving
+    # at once used to each hold the lock through it (measured: up to 2.5 s of a leaver spent
+    # here) -- moot for THIS caller now, kept because it was free and correct either way.
+    $line = $null
+    try { $line = ($Record | ConvertTo-Json -Compress -Depth 3) } catch { return $false }
+    $lk = Enter-StartAllRunLogLock $Path
     try {
         return (Save-StartAllRunLines $Path $line $Keep)
     } finally {
         if ($lk) { try { $lk.ReleaseMutex() } catch { }; try { $lk.Dispose() } catch { } }
     }
 }
+function Write-StartAllRunRecordSpooled([string]$SpoolDir, $Record) {
+    # WHAT A LEAVING COPY CALLS INSTEAD OF Write-StartAllRunRecord (2026-09-25,
+    # scripts/test_start_all_ten_clicks.py). Nine leaving copies used to serialise through ONE
+    # shared-file mutex (Write-StartAllRunRecord) -- already tuned once before (moving
+    # ConvertTo-Json outside the lock, cutting a measured 2.5 s), and STILL measured costing up
+    # to 3.87 s of queueing for the last-in-line copy on the CI runner (windows-latest, 2 vCPU,
+    # slower disk/Defender than this was ever tuned against) even after that fix. A leaving copy
+    # never needs to be seen by another leaving copy, only eventually folded into the one
+    # canonical file -- so it does not need a SHARED lock with them at all. Each gets its own
+    # file, named by a tick count and this process's pid (two leavers cannot share both), written
+    # temp-then-rename so nothing ever reads a half-written file. Read back and folded into
+    # start_all_runs.jsonl by Merge-StartAllRunSpool, called by the HOLDER once it is done, never
+    # on a leaving copy's own path -- see that function and its call site.
+    try {
+        if (-not (Test-Path -LiteralPath $SpoolDir)) { [void](New-Item -ItemType Directory -Force -Path $SpoolDir) }
+        $line = $null
+        try { $line = ($Record | ConvertTo-Json -Compress -Depth 3) } catch { return $false }
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        $name = ("{0}-{1}.json" -f [DateTime]::UtcNow.Ticks, $PID)
+        $final = Join-Path $SpoolDir $name
+        $tmp = $final + ".tmp"
+        [System.IO.File]::WriteAllText($tmp, $line, $utf8)
+        [System.IO.File]::Move($tmp, $final)
+        return $true
+    } catch { return $false }
+}
+function Merge-StartAllRunSpool([string]$SpoolDir, [string]$Path, [int]$Keep = 500) {
+    # Folds every file Write-StartAllRunRecordSpooled left behind into start_all_runs.jsonl,
+    # under the SAME mutex Write-StartAllRunRecord uses for that file (Enter-StartAllRunLogLock),
+    # so a direct write (the holder's own final record) and a merge can never race each other
+    # either. Called by the HOLDER, once, right before it writes its own final record (see the
+    # call site) -- NEVER on a leaving copy's path, which is the entire point: nothing about
+    # this function's cost is paid by any of the nine copies LEAVE_BOUND_SEC bounds.
+    #
+    # A reader wanting "every run so far" (ensure_m365_signin.py's freshness check,
+    # scripts/test_start_all_ten_clicks.py's read_runs, doctor if it ever reads this file) must
+    # ALSO read $SpoolDir directly for the window between a leave and the next merge -- a spooled
+    # record is real and already happened, not "not yet true" just because nobody has folded it
+    # into the jsonl file yet.
+    if (-not (Test-Path -LiteralPath $SpoolDir)) { return 0 }
+    $files = @(Get-ChildItem -LiteralPath $SpoolDir -Filter "*.json" -File -ErrorAction SilentlyContinue | Sort-Object Name)
+    if ($files.Count -eq 0) { return 0 }
+    $lines = New-Object System.Collections.Generic.List[string]
+    $toRemove = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    foreach ($f in $files) {
+        try {
+            $text = ([System.IO.File]::ReadAllText($f.FullName)).Trim()
+            if ($text) {
+                $null = $text | ConvertFrom-Json       # a torn write from a killed process must
+                $lines.Add($text)                       # never poison the merged file -- skip it,
+            }                                            # left for the NEXT merge to retry.
+            $toRemove.Add($f)
+        } catch { }
+    }
+    if ($lines.Count -eq 0) { return 0 }
+    $lk = Enter-StartAllRunLogLock $Path
+    try {
+        $null = Save-StartAllRunLinesMany $Path $lines.ToArray() $Keep
+    } finally {
+        if ($lk) { try { $lk.ReleaseMutex() } catch { }; try { $lk.Dispose() } catch { } }
+    }
+    foreach ($f in $toRemove) { try { [System.IO.File]::Delete($f.FullName) } catch { } }
+    return $lines.Count
+}
 function Save-StartAllRunLines([string]$Path, [string]$Line, [int]$Keep = 500, [int]$Slack = 50) {
     # Called under Write-StartAllRunRecord's lock with the line already built. .NET calls only,
-    # no cmdlet pipeline: this is the part the leaving copies queue for.
+    # no cmdlet pipeline. Historically this was also what nine leaving copies queued for at
+    # once (measured: up to 0.5 s each, then measured far worse on the CI runner) -- that path
+    # now goes through Write-StartAllRunRecordSpooled/Merge-StartAllRunSpool instead
+    # (2026-09-25), so this function's only callers today are Write-StartAllRunRecord's single
+    # holder/re-exec writes; Save-StartAllRunLinesMany (below) is Merge-StartAllRunSpool's.
     # APPENDED, and trimmed back to the last $Keep only once $Keep + $Slack lines have built up:
-    # a full read-write-replace on every line held the lock ~0.1 s each under load, and nine
-    # copies leaving at once queued behind each other for up to 0.5 s.
+    # a full read-write-replace on every line held the lock ~0.1 s each under load.
     try {
         $dir = [System.IO.Path]::GetDirectoryName($Path)
         if (-not [System.IO.Directory]::Exists($dir)) { [void][System.IO.Directory]::CreateDirectory($dir) }
@@ -656,6 +739,46 @@ function Save-StartAllRunLines([string]$Path, [string]$Line, [int]$Keep = 500, [
             try {
                 # [NullString]::Value, not $null: PowerShell passes $null to a string parameter
                 # as "", which File.Replace rejects -- measured: every replace failed, lines lost.
+                if ([System.IO.File]::Exists($Path)) { [System.IO.File]::Replace($tmp, $Path, [NullString]::Value) }
+                else { [System.IO.File]::Move($tmp, $Path) }
+                return $true
+            } catch { Start-Sleep -Milliseconds 50 }
+        }
+        try { [System.IO.File]::Delete($tmp) } catch { }
+        return $false
+    } catch { return $false }
+}
+function Save-StartAllRunLinesMany([string]$Path, [string[]]$NewLines, [int]$Keep = 500, [int]$Slack = 50) {
+    # Save-StartAllRunLines, generalised to append SEVERAL lines in one pass -- Merge-
+    # StartAllRunSpool folding N spooled leave-records into the file under one lock acquisition,
+    # rather than acquiring the lock once per record (which would just reintroduce the same
+    # per-record serialisation cost Write-StartAllRunRecordSpooled exists to avoid, one level
+    # up). Same shape and the same two paths (append-only under Keep+Slack, temp+replace once
+    # over it) as Save-StartAllRunLines; kept as a separate function rather than an overload so
+    # the well-tested single-line function is untouched.
+    if (-not $NewLines -or $NewLines.Count -eq 0) { return $true }
+    try {
+        $dir = [System.IO.Path]::GetDirectoryName($Path)
+        if (-not [System.IO.Directory]::Exists($dir)) { [void][System.IO.Directory]::CreateDirectory($dir) }
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        $lines = New-Object System.Collections.Generic.List[string]
+        if ([System.IO.File]::Exists($Path)) {
+            foreach ($l in [System.IO.File]::ReadAllLines($Path)) { if ($l -and $l.Trim()) { $lines.Add($l) } }
+        }
+        foreach ($nl in $NewLines) { $lines.Add($nl) }
+        if ($lines.Count -lt ($Keep + $Slack)) {
+            $blob = (($NewLines) -join "`r`n") + "`r`n"
+            for ($i = 0; $i -lt 40; $i++) {
+                try { [System.IO.File]::AppendAllText($Path, $blob, $utf8); return $true }
+                catch { Start-Sleep -Milliseconds 50 }
+            }
+            return $false
+        }
+        if ($lines.Count -gt $Keep) { $lines.RemoveRange(0, $lines.Count - $Keep) }
+        $tmp = $Path + "." + $PID + ".tmp"
+        [System.IO.File]::WriteAllLines($tmp, $lines.ToArray(), (New-Object System.Text.UTF8Encoding($false)))
+        for ($i = 0; $i -lt 40; $i++) {
+            try {
                 if ([System.IO.File]::Exists($Path)) { [System.IO.File]::Replace($tmp, $Path, [NullString]::Value) }
                 else { [System.IO.File]::Move($tmp, $Path) }
                 return $true
@@ -2958,6 +3081,12 @@ $runOutcome = $(if ($script:lockTimedOut) { "lock timed out" }
     elseif ($script:startupFailures.Count -gt 0) { "failures" }
     elseif (@($script:startupUnclear).Count -gt 0) { "unclear" }
     else { "ok" })
+# FOLD EVERY LEAVING COPY'S SPOOLED RECORD IN NOW, before this run's own line -- the one place
+# on the WHOLE machine that is guaranteed to run once per bring-up and never on a leaving
+# copy's path (see Write-StartAllRunRecordSpooled / Merge-StartAllRunSpool for why leaving
+# copies stopped writing start_all_runs.jsonl directly). Still under the single-instance lock
+# (the comment above), so no other copy can be mid-merge or mid-bring-up at the same time.
+$null = Merge-StartAllRunSpool (Join-Path $script:diagDir "start_all_runs.d") (Join-Path $script:diagDir "start_all_runs.jsonl")
 $null = Write-StartAllRunRecord (Join-Path $script:diagDir "start_all_runs.jsonl") (New-StartAllRunRecord $runOutcome)
 if ($summaryWritten -and (Test-ShouldNotifyStartupFailures (@($script:startupFailures).Count + @($script:startupUnclear).Count) ([bool]$NoUi) (Test-ConsoleVisible))) {
     Send-StartupFailureNotice $summaryPath | Out-Null

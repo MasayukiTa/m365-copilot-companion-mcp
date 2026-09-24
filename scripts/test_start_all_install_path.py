@@ -77,7 +77,8 @@ _FUNCS = ["Env-Value", "Get-UpdateCheckSkipReason", "Get-ParentProcessInfo",
           "Get-ServerAction", "Invoke-ServerAction", "Enter-StartAllLock", "Exit-StartAllLock",
           "Exit-StartAllWaiterSlot", "Remove-StartAllRoleRecord", "Get-StartAllRolePath",
           "ConvertFrom-StartAllRoleJson",
-          "Save-StartAllRunLines",
+          "Save-StartAllRunLines", "Save-StartAllRunLinesMany", "Enter-StartAllRunLogLock",
+          "Write-StartAllRunRecordSpooled", "Merge-StartAllRunSpool",
           "Get-FleetResumeSkipReason", "Get-ThisCheckoutFleetCoordinatorPids",
           "Resolve-DevTunnelExe", "Invoke-DevTunnelBounded", "Get-TunnelLoginState",
           "Get-TunnelHostCount", "Test-TunnelServing", "Get-BridgePollAttempts", "ConvertFrom-UiStaleLines",
@@ -850,6 +851,133 @@ $ok = Write-StartAllRunRecord %s (New-StartAllRunRecord "failures")
     assert rec["lock"] == "got after waiting" and rec["lock_wait_s"] == 12.5, rec
     assert rec["failures"] == 2 and rec["outcome"] == "failures", rec
     assert rec["pid"] > 0 and rec["ts"] and rec["end"] and rec["reexec"] is False, rec
+
+
+# =============================================================== spooled leave records (2026-09-25)
+#
+# scripts/test_start_all_ten_clicks.py: nine leaving copies serialising through ONE shared-file
+# mutex (Write-StartAllRunRecord) was measured costing up to 3.87 s of pure queueing on the CI
+# runner even after every earlier optimisation of that path. A leaving copy now writes its own
+# record to its own file under start_all_runs.d/ (Write-StartAllRunRecordSpooled, no lock at
+# all); the HOLDER folds the spool into start_all_runs.jsonl once, near the end of its own run
+# (Merge-StartAllRunSpool), never on a leaver's path.
+
+def test_a_spooled_record_is_its_own_file_and_needs_no_lock(tmp_path, checkout, functions):
+    spool = checkout / ".setup" / "logs" / "start_all_runs.d"
+    body = r"""
+$NoUi = $true
+$script:runStartedAt = Get-Date
+$script:launch = Get-LaunchLineage
+$script:lockState = "busy"
+$script:lockWaitSec = 0.3
+$script:busyHolderPid = 4242
+$ok = Write-StartAllRunRecordSpooled %s (New-StartAllRunRecord "already running")
+"RESULT:" + (@{ ok = $ok } | ConvertTo-Json -Compress)
+""" % _q(spool)
+    assert _result(_ps(tmp_path, _driver(functions, checkout, body)))["ok"] is True
+    files = list(spool.glob("*.json"))
+    assert len(files) == 1, files
+    assert not list(spool.glob("*.tmp")), "a .tmp was left behind -- the rename did not complete"
+    rec = json.loads(files[0].read_text(encoding="utf-8"))
+    assert rec["outcome"] == "already running" and rec["lock"] == "busy" and rec["holder_pid"] == 4242, rec
+
+
+def test_two_spooled_writers_never_collide(tmp_path, checkout, functions):
+    """Two leavers writing 'at once' (sequentially here, but through the SAME function, with no
+    lock between them) must not clobber each other -- each file name carries the writer's own
+    pid, and this test drives it with two different fake pids to prove that, not concurrency
+    timing (scripts/test_start_all_ten_clicks.py covers real concurrency end to end)."""
+    spool = checkout / ".setup" / "logs" / "start_all_runs.d"
+    body = r"""
+$script:launch = Get-LaunchLineage
+$script:lockState = "busy"
+$script:lockWaitSec = 0.1
+$results = @()
+foreach ($fakePid in @(111, 222)) {
+    $script:runStartedAt = Get-Date
+    $results += (Write-StartAllRunRecordSpooled %s (New-StartAllRunRecord "already running"))
+}
+"RESULT:" + (@{ results = $results } | ConvertTo-Json -Compress)
+""" % _q(spool)
+    r = _result(_ps(tmp_path, _driver(functions, checkout, body)))
+    assert r["results"] == [True, True], r
+    assert len(list(spool.glob("*.json"))) == 2, list(spool.iterdir())
+
+
+def test_merge_folds_the_spool_into_the_jsonl_and_empties_it(tmp_path, checkout, functions):
+    spool = checkout / ".setup" / "logs" / "start_all_runs.d"
+    spool.mkdir(parents=True)
+    runs = checkout / ".setup" / "logs" / "start_all_runs.jsonl"
+    runs.write_text('{"pid":1,"outcome":"ok","ts":"2026-09-25T00:00:00+09:00"}\n', encoding="utf-8")
+    (spool / "1-111.json").write_text(
+        '{"pid":111,"outcome":"already running","ts":"2026-09-25T00:00:01+09:00"}', encoding="utf-8")
+    (spool / "2-222.json").write_text(
+        '{"pid":222,"outcome":"already running","ts":"2026-09-25T00:00:02+09:00"}', encoding="utf-8")
+    body = r"""
+$n = Merge-StartAllRunSpool %s %s
+"RESULT:" + (@{ n = $n } | ConvertTo-Json -Compress)
+""" % (_q(spool), _q(runs))
+    assert _result(_ps(tmp_path, _driver(functions, checkout, body)))["n"] == 2
+    assert list(spool.glob("*.json")) == [], "merged spool files were not removed"
+    lines = [json.loads(l) for l in runs.read_text(encoding="utf-8").splitlines()]
+    assert [r["pid"] for r in lines] == [1, 111, 222], lines
+
+
+def test_merge_of_an_empty_spool_touches_nothing(tmp_path, checkout, functions):
+    spool = checkout / ".setup" / "logs" / "start_all_runs.d"
+    runs = checkout / ".setup" / "logs" / "start_all_runs.jsonl"
+    runs.parent.mkdir(parents=True)
+    runs.write_text('{"pid":1}\n', encoding="utf-8")
+    before = runs.read_text(encoding="utf-8")
+    body = r"""
+$n = Merge-StartAllRunSpool %s %s
+"RESULT:" + (@{ n = $n } | ConvertTo-Json -Compress)
+""" % (_q(spool), _q(runs))
+    assert _result(_ps(tmp_path, _driver(functions, checkout, body)))["n"] == 0
+    assert runs.read_text(encoding="utf-8") == before
+
+
+def test_a_torn_spool_file_is_skipped_not_fatal(tmp_path, checkout, functions):
+    """A leaver killed mid-write (Write-StartAllRunRecordSpooled's temp+rename makes this rare,
+    not impossible if the process dies between WriteAllText and Move) must not stop the OTHER,
+    valid records from being merged, and must not poison start_all_runs.jsonl with a line that
+    does not parse."""
+    spool = checkout / ".setup" / "logs" / "start_all_runs.d"
+    spool.mkdir(parents=True)
+    runs = checkout / ".setup" / "logs" / "start_all_runs.jsonl"
+    (spool / "1-111.json").write_text('{"pid":111,"outcome":"already running"}', encoding="utf-8")
+    (spool / "2-222.json").write_text('{"pid":222, not json', encoding="utf-8")  # torn
+    body = r"""
+$n = Merge-StartAllRunSpool %s %s
+"RESULT:" + (@{ n = $n } | ConvertTo-Json -Compress)
+""" % (_q(spool), _q(runs))
+    assert _result(_ps(tmp_path, _driver(functions, checkout, body)))["n"] == 1
+    lines = [json.loads(l) for l in runs.read_text(encoding="utf-8").splitlines()]
+    assert len(lines) == 1 and lines[0]["pid"] == 111, lines
+
+
+def test_merge_respects_the_500_line_cap_across_jsonl_plus_spool(tmp_path, checkout, functions):
+    spool = checkout / ".setup" / "logs" / "start_all_runs.d"
+    spool.mkdir(parents=True)
+    runs = checkout / ".setup" / "logs" / "start_all_runs.jsonl"
+    runs.parent.mkdir(parents=True, exist_ok=True)
+    # Keep=500, Slack=50 (Save-StartAllRunLinesMany's defaults): the trim only fires once the
+    # total reaches Keep+Slack, same as Save-StartAllRunLines -- 548 existing + 3 new = 551
+    # clears it, matching test_every_run_records_who_started_it_and_the_file_stays_bounded's use
+    # of 600 (well over) rather than something near the boundary that would take the untrimmed
+    # append-only fast path instead and make this test assert the wrong thing.
+    runs.write_text("".join('{"old":%d}\n' % i for i in range(548)), encoding="utf-8")
+    for i in range(3):
+        (spool / ("%d-%d.json" % (i, 1000 + i))).write_text('{"new":%d}' % i, encoding="utf-8")
+    body = r"""
+$n = Merge-StartAllRunSpool %s %s
+"RESULT:" + (@{ n = $n } | ConvertTo-Json -Compress)
+""" % (_q(spool), _q(runs))
+    assert _result(_ps(tmp_path, _driver(functions, checkout, body)))["n"] == 3
+    lines = [json.loads(l) for l in runs.read_text(encoding="utf-8").splitlines()]
+    assert len(lines) == 500, len(lines)
+    assert lines[0] == {"old": 51}, "the oldest lines were not the ones dropped"
+    assert [l.get("new") for l in lines[-3:]] == [0, 1, 2], lines
 
 
 # =============================================================== phase timing (profiling review)
