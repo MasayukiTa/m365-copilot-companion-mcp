@@ -88,18 +88,19 @@ if (-not (Test-Path $venvPython)) {
 # 3. Python dependencies
 # ---------------------------------------------------------------------------
 Write-Step "Installing Python dependencies"
-# Corporate TLS-inspecting proxy: its root CA is not in pip's bundled certifi store, so
-# pip otherwise dies with SSL CERTIFICATE_VERIFY_FAILED ("unable to get local issuer
-# certificate") on pypi.org / files.pythonhosted.org. Pass --trusted-host ON THE COMMAND
-# LINE so it works regardless of whether the user/system pip.ini is read (the venv here is
-# a uv-provisioned CPython, which may not pick up %APPDATA%\pip\pip.ini).
-$pipTrusted = @(
-    "--trusted-host", "pypi.org",
-    "--trusted-host", "files.pythonhosted.org",
-    "--trusted-host", "pypi.python.org"
-)
-& $venvPython -m pip install @pipTrusted --upgrade pip --quiet
-& $venvPython -m pip install @pipTrusted -r requirements.txt
+# Delegate to scripts/bootstrap.py's own install_deps step (INST-09) instead of shelling out
+# to pip directly here. That is the ONE place that decides pip's TLS args: verified against
+# this machine's exported CA bundle (ca_bundle.ps1) or pip's own truststore by default, and
+# only --trusted-host (certificate checking OFF) when the operator opts in with
+# SETUP_PIP_TRUSTED_HOST=1. This script used to carry its own hardcoded, unconditional
+# --trusted-host list -- a second copy of a workaround bootstrap.py has since replaced with a
+# verified default. Do not reintroduce a copy here; if pip needs different args, change
+# pip_tls_args() in bootstrap.py and every caller (this script, tools/env_ops.py) gets it.
+& $venvPython (Join-Path $repoRoot "scripts\bootstrap.py") --only install_deps
+if ($LASTEXITCODE -ne 0) {
+    Write-Warn2 "Dependency install failed (bootstrap.py --only install_deps exited $LASTEXITCODE)"
+    exit 1
+}
 Write-Ok "Dependencies installed"
 
 # ---------------------------------------------------------------------------
