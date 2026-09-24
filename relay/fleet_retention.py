@@ -47,6 +47,8 @@ import subprocess
 import sys
 import time
 
+from tools import childproc
+
 #: Diagnostics for finished runs. Generous because they cost little and are the first thing
 #: wanted when a run is being reconstructed; only the newest is ever read by code.
 COORDINATOR_KEEP_DAYS = float(os.environ.get("MCP_FLEET_LOG_DAYS", "14"))
@@ -471,7 +473,8 @@ def _default_path_in_use(path):
     try:
         r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
                            capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=120)
+                           errors="replace", timeout=120,
+                           creationflags=childproc.headless_creationflags())
         if r.returncode != 0:
             return None
         rows = json.loads(r.stdout or "[]")
