@@ -33,8 +33,10 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-#: Same pattern the doctor uses. ONE definition of "still on a login wall" -- two would drift,
-#: and then setup and the health check would disagree about whether this step is done.
+#: "An auth host", for LISTING leftovers, and the fallback wall test when relay/edge_auth cannot
+#: be imported. The wall test itself is edge_auth.looks_like_signin_wall (see _is_wall): ONE
+#: definition of "still on a login wall" -- two would drift, and then setup, the health check
+#: and the thing that shows the window would disagree about whether this step is done.
 LOGIN_RE = re.compile(
     r"login\.microsoftonline|login\.live\.com|/adfs/|adfs\.|/oauth2/authorize|/signin|login_hint=",
     re.I)
@@ -81,6 +83,24 @@ def _is_residue(url: str) -> bool:
     return edge_auth.looks_like_auth_bounce_residue(url)
 
 
+def _is_wall(url: str) -> bool:
+    """Is this tab an identity provider's sign-in page waiting for a person?
+
+    THE ANSWER LIVES IN relay/edge_auth (looks_like_signin_wall), for the reason _is_residue
+    gives. It matters more here than anywhere: the doctor reads this function, and the thing
+    that brings the bridge's window forward (scripts/start_bridge.ps1) reads it too, through
+    --check-only and --bridge-watch. When those two disagreed -- this file knew /adfs/, the
+    surfacing side did not -- the doctor said "sign in" about a page nothing would show.
+
+    If edge_auth cannot be imported, LOGIN_RE decides, which over-reports rather than skips.
+    """
+    try:
+        from relay import edge_auth
+    except Exception:
+        return bool(LOGIN_RE.search(url or ""))
+    return edge_auth.looks_like_signin_wall(url)
+
+
 def _bare(url: str) -> str:
     """scheme://host/path -- the identifying part, without the query string.
 
@@ -114,7 +134,7 @@ def state(port: int):
         # to look at a process that is fine.
         return None, "no Edge is answering on :%d" % port
     urls = [x.get("url") or "" for x in t]
-    walls = [u for u in urls if LOGIN_RE.search(u) and not _is_residue(u)]
+    walls = [u for u in urls if _is_wall(u) and not _is_residue(u)]
     if walls:
         # NAME THE TAB. "a sign-in page is open" is not enough to act on, and on 2026-09-23 it
         # was the whole of what the operator's screen said while the same FAIL kept coming back
@@ -139,7 +159,7 @@ def state(port: int):
     # M365 tab. Residue is not evidence of a wall and it is not evidence of a sign-in either,
     # so this is the third answer, said out loud -- otherwise the reason would be the tab-less
     # one and a reader would go looking for a browser with no tabs while two are open.
-    residue = sorted({_bare(u) for u in urls if LOGIN_RE.search(u)})
+    residue = sorted({_bare(u) for u in urls if LOGIN_RE.search(u) or _is_residue(u)})
     if residue:
         return None, ("only auth-bounce leftovers are open, which say nothing either way: %s"
                       % ", ".join(residue))
@@ -179,6 +199,168 @@ def _report_every_profile(primary_port: int):
                  " [primary]" if port == primary_port else "", why))
 
 
+# --------------------------------------------------------------------------------------------
+# The bridge's browser: bring the sign-in in front of the person, once.
+# --------------------------------------------------------------------------------------------
+#
+# WHAT WAS REPORTED, 2026-09-24. A freshly set-up PC: the doctor said the bridge Edge (:9223) was
+# on a sign-in page, and the person could not sign in without typing a command, because that
+# browser runs headless (--headless=new, parked at -32000,-32000) and nothing ever showed it.
+# The owner: "バックグラウンドのタブがフォアグラウンドには出てこなかった。これバグでしょ。" It was.
+#
+# scripts/start_bridge.ps1's keepalive supervisor owns the bridge Edge's lifecycle -- it is the
+# only thing that launches it headless or headed -- so it is the one that acts. This is the
+# decision it asks for on every poll, kept here so that it is the SAME "is there a wall" the
+# doctor reports (state() above) and so that it runs under pytest.
+
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+#: Decisions --bridge-watch can print. Only "surface" makes the supervisor do anything.
+BRIDGE_DECISIONS = ("surface", "already_surfaced", "deferred_turn_live",
+                    "signed_in", "no_wall", "cannot_tell")
+
+
+def _latch_path(port: int) -> str:
+    """The "already brought forward for this sign-in" mark, one per browser port.
+    MCP_SIGNIN_LATCH_DIR moves it (tests run the real CLI without writing the live .fleet)."""
+    d = os.environ.get("MCP_SIGNIN_LATCH_DIR") or os.path.join(_REPO, ".fleet")
+    return os.path.join(d, "signin_surfaced_%d.json" % int(port))
+
+
+def _read_latch(path: str):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return float(json.load(f).get("t") or 0.0)
+    except Exception:
+        return None
+
+
+def rearm(port: int, latch_path: str = None) -> bool:
+    """Forget that the window was already shown, so the next wall shows it again."""
+    p = latch_path or _latch_path(port)
+    try:
+        os.remove(p)
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
+
+
+def _write_latch(path: str, now: float, why: str) -> None:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"t": now, "why": why}, f)
+    except Exception:
+        pass
+
+
+def _last_start_all_began(repo: str = _REPO) -> float:
+    """When the most recent start_all run BEGAN (epoch seconds), or 0.0 if unknown.
+
+    WHY THIS RE-ARMS THE WINDOW. "Once per sign-in need" cannot mean "once per process": the
+    person who was away when the window came up needs a way to see it again that is not a
+    command. Starting the app again (the Desktop shortcut, or the logon start) is that way, and
+    start_all records every run in .setup/logs/start_all_runs.jsonl. A run that began AFTER the
+    window was last shown is a new request to be shown it. The run that launched this bridge
+    began before the window was shown, so it does not re-fire it.
+    """
+    path = os.path.join(repo, ".setup", "logs", "start_all_runs.jsonl")
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 16384))
+            tail = f.read().decode("utf-8", "replace").splitlines()
+    except Exception:
+        return 0.0
+    import datetime as _dt
+    for line in reversed(tail):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            ts = json.loads(line).get("ts") or ""
+            return _dt.datetime.fromisoformat(ts).timestamp()
+        except Exception:
+            continue
+    return 0.0
+
+
+def _bridge_busy(status_url: str) -> bool:
+    """Is a chat turn live on the bridge? The SAME rule the restart gates use
+    (scripts/stale_server_check._bridge_state: unreadable-but-present is busy), imported, not
+    copied. Surfacing the window takes the focus; doing that mid-turn takes it from a person who
+    is reading an answer."""
+    if not status_url:
+        return False
+    try:
+        import stale_server_check as _ssc
+    except Exception:
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import stale_server_check as _ssc
+        except Exception:
+            return True          # cannot ask -> treat as busy: deferring is the safe error
+    try:
+        return bool(_ssc._bridge_state(status_url)[1])
+    except Exception:
+        return True
+
+
+def _bridge_saw_wall(status_url: str):
+    """The bridge's own report (GET /status "signin_wall") that its page landed on a sign-in wall.
+
+    NEEDED BECAUSE THE TAB DOES NOT STAY. The bridge closes its startup page once startup ends,
+    so a wall it met at startup can be gone from the tab list by the time anybody looks --
+    and a watcher that only reads tabs would see nothing. Returns (bare_url or "") or None.
+    """
+    if not status_url:
+        return None
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(status_url, timeout=5) as r:
+            body = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+    if not isinstance(body, dict) or body.get("signin_wall") is not True:
+        return None
+    return str(body.get("signin_wall_url") or "")
+
+
+def bridge_signin_decision(port: int, status_url: str = "", latch_path: str = None,
+                           now: float = None, last_start_began: float = None):
+    """(decision, why) for the bridge's browser on `port`. See BRIDGE_DECISIONS.
+
+    * no wall            -> nothing to do. A confirmed sign-in also clears the latch.
+    * wall, already shown for this need and nobody has started the app since -> nothing.
+      ONCE PER NEED: a window that comes back every poll is one people learn to close.
+    * wall, a turn live  -> deferred; asked again on the next poll.
+    * wall               -> "surface", and the latch is set before returning, so a supervisor
+      that dies half-way cannot turn this into a loop.
+    """
+    now = time.time() if now is None else now
+    latch_path = latch_path or _latch_path(port)
+    ready, why = state(port)
+    if ready is True:
+        rearm(port, latch_path)
+        return "signed_in", why
+    reported = _bridge_saw_wall(status_url) if ready is None else None
+    if ready is None and reported is None:
+        return ("no_wall" if tabs(port) is not None else "cannot_tell"), why
+    if ready is not False:
+        why = "the bridge reported its page landed on a sign-in page%s" % (
+            (": " + reported) if reported else "")
+    shown_at = _read_latch(latch_path)
+    began = _last_start_all_began() if last_start_began is None else last_start_began
+    if shown_at is not None and not (began > shown_at):
+        return "already_surfaced", why
+    if _bridge_busy(status_url):
+        return "deferred_turn_live", why
+    _write_latch(latch_path, now, why)
+    return "surface", why
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--port", type=int, default=9222)
@@ -191,7 +373,25 @@ def main(argv=None):
                     help="also report EVERY managed Edge profile, not just --port. Each profile "
                          "is a separate browser with its own user-data-dir, so each has its own "
                          "sign-in state.")
+    ap.add_argument("--bridge-watch", action="store_true",
+                    help="for scripts/start_bridge.ps1: decide whether the bridge's browser on "
+                         "--port must be brought forward for a sign-in now. Prints "
+                         "'DECISION: <word>' and never touches a window itself.")
+    ap.add_argument("--status-url", default="",
+                    help="the bridge's GET /status, read to defer while a turn is live")
+    ap.add_argument("--rearm", action="store_true",
+                    help="forget that the window for --port was already shown (a new start)")
     a = ap.parse_args(argv)
+
+    if a.rearm:
+        rearm(a.port)
+        print("REARMED: %d" % a.port)
+        return 0
+    if a.bridge_watch:
+        decision, why = bridge_signin_decision(a.port, a.status_url)
+        print("  %s" % why)
+        print("DECISION: %s" % decision)
+        return 0
 
     if a.all:
         _report_every_profile(a.port)

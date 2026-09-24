@@ -67,6 +67,33 @@ $ErrorActionPreference = "Stop"
 # the scripts\win\ helpers are resolved against it (the relay reads the SAME repo-root .fleet).
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
+# THE PROFILE FOLLOWS THE PORT WHEN THE CALLER NAMED ONLY THE PORT.
+#
+# relay\edge_recover.surface(port=9223) runs this script with "-Foreground -Port 9223" and no
+# -Profile, so -Profile fell to the companion's default. Every check below then looked at the
+# FLEET's browser: Test-CompanionHeadless found the fleet's headless :9222 Edge, the
+# "headless -> headed" swap killed it, and the headed relaunch aimed the fleet's profile at the
+# bridge's port, which the bridge Edge still held. The bridge's sign-in window never appeared
+# -- which is what a freshly set-up PC reported on 2026-09-24.
+#
+# The browser already listening on -Port says which profile it is; ask it. Only when nothing
+# is listening does the default apply, exactly as before.
+if (-not $PSBoundParameters.ContainsKey('Profile') -and -not $env:MCP_EDGE_PROFILE) {
+    try {
+        $onPort = @(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction Stop |
+            Where-Object { $_.CommandLine -and $_.CommandLine -notmatch '--type=' -and
+                           $_.CommandLine -match ('--remote-debugging-port=' + $Port + '(\s|"|$)') })
+        if ($onPort.Count -gt 0) {
+            $udd = $null
+            if ($onPort[0].CommandLine -match '--user-data-dir="([^"]+)"') { $udd = $Matches[1] }
+            elseif ($onPort[0].CommandLine -match '--user-data-dir=(\S+)') { $udd = $Matches[1] }
+            if ($udd -and ((Split-Path -Parent $udd) -eq $env:LOCALAPPDATA)) {
+                $Profile = Split-Path -Leaf $udd
+            }
+        }
+    } catch { }
+}
+
 $dataDir = Join-Path $env:LOCALAPPDATA $Profile
 
 # Headless is the invariant recovery baseline. The marker is retained for compatibility and
@@ -100,6 +127,48 @@ public class Cw {
   [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll")] static extern int GetClassName(IntPtr h, StringBuilder s, int max);
   [DllImport("user32.dll")] static extern int GetWindowTextLength(IntPtr h);
+  [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] static extern bool AttachThreadInput(uint a, uint b, bool attach);
+  [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr h);
+  [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr h, uint flags);
+  [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int i);
+  [DllImport("user32.dll")] static extern int SetWindowLong(IntPtr h, int i, int v);
+  [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+  // IN FRONT, ON SCREEN, ON THE TASKBAR -- for a window a person has to type into.
+  // SetForegroundWindow alone is refused to a background process (the foreground lock), and the
+  // launcher runs from a hidden supervisor, so the sign-in window opened BEHIND whatever the
+  // person was using. Attaching to the foreground thread's input is the documented way to be
+  // allowed; TOPMOST-then-NOTOPMOST raises it even if activation is still refused. rehide()
+  // marks the window WS_EX_TOOLWINDOW to take it off the taskbar -- undone here, or the window
+  // would have no taskbar button to find it by. A window left at -32000,-32000 by a headless run
+  // is on no monitor; it is moved onto one.
+  public static bool Raise(IntPtr h) {
+    if (h == IntPtr.Zero) return false;
+    int ex = GetWindowLong(h, -20);
+    if ((ex & 0x80) != 0) {
+      ShowWindow(h, 0);
+      SetWindowLong(h, -20, (ex & ~0x80) | 0x40000);
+    }
+    ShowWindow(h, 9);                                   // SW_RESTORE
+    ShowWindow(h, 5);                                   // SW_SHOW
+    if (MonitorFromWindow(h, 0) == IntPtr.Zero) {       // MONITOR_DEFAULTTONULL: on no monitor
+      SetWindowPos(h, IntPtr.Zero, 80, 60, 0, 0, 0x0001 | 0x0004);
+    }
+    IntPtr fg = GetForegroundWindow();
+    uint unused;
+    uint fgThread = (fg == IntPtr.Zero) ? 0 : GetWindowThreadProcessId(fg, out unused);
+    uint me = GetCurrentThreadId();
+    bool attached = false;
+    if (fgThread != 0 && fgThread != me) { attached = AttachThreadInput(me, fgThread, true); }
+    try {
+      SetWindowPos(h, new IntPtr(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040);   // HWND_TOPMOST
+      SetWindowPos(h, new IntPtr(-2), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040);   // HWND_NOTOPMOST
+      BringWindowToTop(h);
+      return SetForegroundWindow(h);
+    } finally {
+      if (attached) { AttachThreadInput(me, fgThread, false); }
+    }
+  }
   delegate bool EnumProc(IntPtr h, IntPtr p);
   public static IntPtr Find(int[] pids) {
     IntPtr found = IntPtr.Zero;
@@ -215,9 +284,7 @@ function Test-CompanionCdp {
 if ($Surface) {
     $h = Get-CompanionWindow
     if ($h -ne [IntPtr]::Zero) {
-        [Cw]::ShowWindow($h, 5) | Out-Null    # SW_SHOW   (un-hide)
-        [Cw]::ShowWindow($h, 9) | Out-Null    # SW_RESTORE (un-minimize + activate)
-        [Cw]::SetForegroundWindow($h) | Out-Null
+        [Cw]::Raise($h) | Out-Null            # un-hide, restore, on-screen, in front
         Write-Host "Companion Edge brought to the foreground."
     } else {
         Write-Host "No companion Edge window found (is it running?)."
@@ -302,9 +369,7 @@ if ($listening) {
             # Already headed and reachable: just bring the existing window to the front.
             $h = Get-CompanionWindow
             if ($h -ne [IntPtr]::Zero) {
-                [Cw]::ShowWindow($h, 5) | Out-Null    # SW_SHOW
-                [Cw]::ShowWindow($h, 9) | Out-Null    # SW_RESTORE
-                [Cw]::SetForegroundWindow($h) | Out-Null
+                [Cw]::Raise($h) | Out-Null
                 Write-Host "Companion Edge already headed on port $Port; brought to the foreground."
             } else {
                 Write-Host "Companion Edge already reachable on port $Port; no window found to raise."
@@ -509,6 +574,21 @@ if ($Background) {
 if ($useHeadless) {
     $extra = (Get-Date).AddSeconds(5)
     while ((Get-Date) -lt $extra) { Park-CompanionWindowsOffscreen | Out-Null; Start-Sleep -Milliseconds 250 }
+}
+# A HEADED -Foreground LAUNCH IS FOR A PERSON, SO PUT IT IN FRONT OF THEM. This path is the
+# headless -> headed swap that sign-in uses, and it launched the window and stopped there:
+# launched from a hidden supervisor, Windows opened it behind whatever had the focus (or where
+# the profile last left it), and on 2026-09-24 the person never saw it. The window appears a
+# moment after CDP does, so wait for it.
+if ($ready -and $Foreground -and -not $useHeadless) {
+    $raiseBy = (Get-Date).AddSeconds(15)
+    $raised = $false
+    while (-not $raised -and (Get-Date) -lt $raiseBy) {
+        $h = Get-CompanionWindow
+        if ($h -ne [IntPtr]::Zero) { [Cw]::Raise($h) | Out-Null; $raised = $true; break }
+        Start-Sleep -Milliseconds 300
+    }
+    if (-not $raised) { Write-Host "Headed Edge is up but no window was found to bring forward." }
 }
 
 if ($ready) {

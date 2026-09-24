@@ -795,6 +795,44 @@ if ($signinVerdict -eq "cannot_tell") {
 # The rows are built from what the checker prints, and the checker takes its port list from
 # relay.edge_recover.MANAGED_EDGE_PROFILES. No list of ports lives in this file; that constant's
 # docstring records four separate outages caused by exactly such a copy.
+#
+# THE BRIDGE'S BROWSER IS NOT OPTIONAL. This row said "(optional)" for every non-primary profile,
+# while start_all counted the same sign-in as a startup problem -- one screen said WARN and the
+# next said FAIL about one fact. The code decides it: every chat-window turn runs on the bridge
+# Edge's session (bridge/copilot_bridge.py drives the page, and captures the socket token, from
+# the CDP context on MCP_BRIDGE_CDP_PORT), and "Chat backend serving" below is a REQUIRED check.
+# A backend that is up but signed out answers nothing. So the bridge's row is required; any other
+# profile (the evaluation browser) stays optional. The port is the one start_bridge.ps1 and the
+# bridge read: MCP_BRIDGE_CDP_PORT, else 9223.
+#
+# THE FIX LINE IS FOR THE PERSON AT THE DESK, NOT FOR AN ENGINEER. It was a PowerShell command.
+# start_bridge.ps1's supervisor now brings that window to the front by itself when sign-in is
+# needed, so what the person has to do is sign in in it -- said in Japanese. Written as code
+# points because this file is ASCII (Windows PowerShell 5.1 reads a BOM-less file as the ANSI
+# code page, which turns UTF-8 Japanese into mojibake).
+$bridgeCdpPort = "9223"
+if ($env:MCP_BRIDGE_CDP_PORT) { $bridgeCdpPort = $env:MCP_BRIDGE_CDP_PORT }
+elseif ($envv["MCP_BRIDGE_CDP_PORT"]) { $bridgeCdpPort = $envv["MCP_BRIDGE_CDP_PORT"] }
+# Reads: "The Edge the chat window uses is stopped on a sign-in page. When sign-in is needed that
+# Edge comes to the front by itself. Sign in with your work account in the Edge that appeared. If
+# it is not showing, start 'M365 Companion' on the Desktop again and it will appear."
+# (No Japanese literal even in this comment: a UTF-8 byte read as a cp932 lead byte can swallow
+# the newline that ends the comment.)
+$bridgeSigninFixJa = -join (@(
+    0x30C1,0x30E3,0x30C3,0x30C8,0x753B,0x9762,0x304C,0x4F7F,0x3046,0x0020,0x0045,0x0064,
+    0x0067,0x0065,0x0020,0x304C,0x30B5,0x30A4,0x30F3,0x30A4,0x30F3,0x753B,0x9762,0x3067,
+    0x6B62,0x307E,0x3063,0x3066,0x3044,0x307E,0x3059,0x3002,0x30B5,0x30A4,0x30F3,0x30A4,
+    0x30F3,0x304C,0x5FC5,0x8981,0x306B,0x306A,0x308B,0x3068,0x3001,0x305D,0x306E,0x0020,
+    0x0045,0x0064,0x0067,0x0065,0x0020,0x304C,0x81EA,0x52D5,0x3067,0x524D,0x9762,0x306B,
+    0x8868,0x793A,0x3055,0x308C,0x307E,0x3059,0x3002,0x8868,0x793A,0x3055,0x308C,0x305F,
+    0x0020,0x0045,0x0064,0x0067,0x0065,0x0020,0x3067,0x3001,0x4F1A,0x793E,0x306E,0x30A2,
+    0x30AB,0x30A6,0x30F3,0x30C8,0x3067,0x30B5,0x30A4,0x30F3,0x30A4,0x30F3,0x3057,0x3066,
+    0x304F,0x3060,0x3055,0x3044,0x3002,0x8868,0x793A,0x3055,0x308C,0x3066,0x3044,0x306A,
+    0x3044,0x5834,0x5408,0x306F,0x3001,0x30C7,0x30B9,0x30AF,0x30C8,0x30C3,0x30D7,0x306E,
+    0x300C,0x004D,0x0033,0x0036,0x0035,0x0020,0x0043,0x006F,0x006D,0x0070,0x0061,0x006E,
+    0x0069,0x006F,0x006E,0x300D,0x3092,0x3082,0x3046,0x4E00,0x5EA6,0x8D77,0x52D5,0x3059,
+    0x308B,0x3068,0x8868,0x793A,0x3055,0x308C,0x307E,0x3059,0x3002
+) | ForEach-Object { [char]$_ })
 foreach ($line in ($signinOut -split "`r?`n")) {
     $m = [regex]::Match($line, '^\s*PROFILE:\s+(\d+)\s+(\S+)\s+(\w+)(\s+\[primary\])?\s*\((.*)\)\s*$')
     if (-not $m.Success) { continue }
@@ -803,10 +841,16 @@ foreach ($line in ($signinOut -split "`r?`n")) {
     $pName = $m.Groups[2].Value
     $pVerdict = $m.Groups[3].Value
     if ($pVerdict -eq "cannot_tell") { continue }   # not running, or no page to judge from
-    Check "m365_signin_$pPort" "M365 signed in on $pName (:$pPort)" `
-        { $pVerdict -eq "signed_in" } `
-        "$($m.Groups[5].Value). This is a SEPARATE browser profile from the companion Edge, so signing in there did not sign in here: powershell -File scripts\start_companion_edge.ps1 -Port $pPort -Profile $pName -Foreground -Url https://m365.cloud.microsoft/chat" `
-        -Optional
+    if ($pPort -eq $bridgeCdpPort) {
+        Check "m365_signin_$pPort" "M365 signed in on the chat bridge Edge $pName (:$pPort) -- the chat window needs it" `
+            { $pVerdict -eq "signed_in" } `
+            ($bridgeSigninFixJa + " (" + $m.Groups[5].Value + ")")
+    } else {
+        Check "m365_signin_$pPort" "M365 signed in on $pName (:$pPort)" `
+            { $pVerdict -eq "signed_in" } `
+            "$($m.Groups[5].Value). This is a SEPARATE browser profile from the companion Edge, so signing in there did not sign in here: powershell -File scripts\start_companion_edge.ps1 -Port $pPort -Profile $pName -Foreground -Url https://m365.cloud.microsoft/chat" `
+            -Optional
+    }
 }
 
 # 5. Bridge Edge (:9223) -- optional, only for conversation history/scrape
@@ -1018,7 +1062,9 @@ function Get-LastStartSummaryDoctor([string]$Path) {
     #                                   fallback for when "when=" cannot be parsed
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
     $raw = $null
-    try { $raw = @(Get-Content -LiteralPath $Path -ErrorAction Stop) } catch { return $null }
+    # -Encoding UTF8: start_all writes this file as UTF-8 without a BOM, which Windows PowerShell
+    # 5.1 would otherwise read as the ANSI code page -- any non-ASCII line would come out garbled.
+    try { $raw = @(Get-Content -LiteralPath $Path -Encoding UTF8 -ErrorAction Stop) } catch { return $null }
     if (-not $raw -or $raw.Count -eq 0) { return $null }
     $failures = 0
     $when = $null
@@ -1094,10 +1140,18 @@ if (-not $script:lastStart) {
         $lsN = 0
         foreach ($lsLine in $script:lastStart.Lines) {
             $lsN++
+            # THE SAME SENTENCE AS THE ROW ABOVE FOR THE SAME FACT. start_all records the bridge's
+            # sign-in as "M365 sign-in needed on <profile> (:<port>)"; shown raw, the person got a
+            # WARN with a command above and a FAIL with a fragment here, about one sign-in.
+            $lsFix = $lsLine
+            $lsM = [regex]::Match($lsLine, '^M365 sign-in needed on \S+ \(:(\d+)\)')
+            if ($lsM.Success -and $lsM.Groups[1].Value -eq $bridgeCdpPort) {
+                $lsFix = $bridgeSigninFixJa + " (" + $lsLine + ")"
+            }
             Check ("last_start_" + $lsN) `
                 ("Last background start (" + $lsWhenText + ", " + $lsModeText + ") problem " + $lsN + " of " + $script:lastStart.Failures + $lsStaleSuffix) `
                 { $false } `
-                $lsLine
+                $lsFix
         }
     } else {
         # failures=N>0 but no "- " lines were readable (older/corrupt file format) -- still

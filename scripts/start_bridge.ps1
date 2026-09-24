@@ -74,13 +74,15 @@ if ($Keepalive) {
 # A VISIBLE window is shown ONLY when interactive sign-in is actually required (-Visible). An
 # already-authenticated launch must NEVER pop a Copilot window the user has to close -- that was
 # the wrong trigger. Idempotent: if :$CdpPort already listens it does nothing.
-function Ensure-Edge([switch]$Hard, [switch]$Visible) {
+function Ensure-Edge([switch]$Hard, [switch]$Visible, [string]$Url = "") {
     # Hashtable splat (NOT array splat): array splatting an int-typed -Port mis-binds ("cannot
     # convert '-Port' to Int32"), which silently broke every supervisor launch -- the Edge only
     # ever came up when start_companion_edge.ps1 was run by hand. Hashtable splat binds by name.
     $p = @{ Port = $CdpPort; Profile = $Profile }
     if ($Visible) { $p["Foreground"] = $true } else { $p["Headless"] = $true }
     if ($Hard)    { $p["HardReset"]  = $true }
+    # -Url: a VISIBLE relaunch for sign-in must open the sign-in, not the launcher's about:blank.
+    if ($Url)     { $p["Url"]        = $Url }
     & (Join-Path $PSScriptRoot "start_companion_edge.ps1") @p
     return ($LASTEXITCODE -eq 0)
 }
@@ -119,31 +121,123 @@ function Edge-IsHeaded {
 # end. When the grace period runs out we go headless ANYWAY: an unattended sign-in wall is not a
 # reason to keep flashing a window at an empty chair, and the next loop re-surfaces it if the
 # bridge hits the wall again.
+#
+# WAIT FOR THE WALL TO GO, NOT FOR THE FIRST MOMENT IT IS ABSENT. A headed relaunch opens the M365
+# page, which is not a wall for the first seconds before it redirects to the IdP -- and the old
+# loop, which only asked "is there a wall right now", demoted a window the person had not yet
+# seen. So: done when the wall has been absent for three checks in a row AND either it was seen
+# or a minute has passed. Returns "cleared" (the person finished), "closed" (the browser went
+# away -- they closed the window) or "timeout".
+#
+# The keeper pause file is refreshed every check: relay/edge_recover.touch_pause's rule, because
+# the minimise keeper otherwise re-minimises a window somebody is typing an MFA code into.
 function Demote-ToHeadless([int]$GraceMinutes = 15) {
-    if (-not (Edge-IsHeaded)) { return }
-    $deadline = (Get-Date).AddMinutes($GraceMinutes)
-    while ((Get-Date) -lt $deadline -and (Needs-SignIn)) { Start-Sleep -Seconds 5 }
-    if (Needs-SignIn) {
-        Write-Host "Sign-in still not completed after $GraceMinutes min -- returning the Edge to headless anyway."
-    } else {
+    if (-not (Edge-IsHeaded)) { return "not-headed" }
+    $started = Get-Date
+    $deadline = $started.AddMinutes($GraceMinutes)
+    $sawWall = $false; $clear = 0; $outcome = "timeout"
+    $pause = Join-Path $root ".fleet\edge_keep_pause"
+    while ((Get-Date) -lt $deadline) {
+        try { Set-Content -Path $pause -Value ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) -Encoding ascii } catch { }
+        if (-not (Test-Cdp)) { $outcome = "closed"; break }
+        if (Needs-SignIn) { $sawWall = $true; $clear = 0 }
+        else {
+            $clear++
+            if ($clear -ge 3 -and ($sawWall -or ((Get-Date) - $started).TotalSeconds -ge 60)) { $outcome = "cleared"; break }
+        }
+        Start-Sleep -Seconds 5
+    }
+    try { Remove-Item $pause -Force -ErrorAction SilentlyContinue } catch { }
+    if ($outcome -eq "cleared") {
         Write-Host "Sign-in complete -- returning the bridge Edge to headless (no window)."
+        # The need is over; the NEXT time the session expires, show the window again.
+        Invoke-SignInHelper @("--rearm") | Out-Null
+    } elseif ($outcome -eq "closed") {
+        Write-Host "The sign-in window was closed before the sign-in finished -- back to headless; it will not be reopened until the app is started again."
+    } else {
+        Write-Host "Sign-in still not completed after $GraceMinutes min -- returning the Edge to headless anyway."
     }
     Ensure-Edge -Hard | Out-Null
+    return $outcome
 }
 
-# True ONLY when the bridge Edge is parked on a REAL interactive sign-in page. The CsrToSSR
-# redirect (".../chat/?redirfrom=CsrToSSR&auth=2") auto-resolves for an authenticated profile and
-# is NOT a sign-in wall, so it is deliberately excluded -- this is the only condition under which a
-# window is surfaced.
-function Needs-SignIn {
+# ONE DEFINITION OF "ON A SIGN-IN PAGE", AND IT IS THE DOCTOR'S.
+#
+# This used to be its own regex -- login.microsoftonline / login.live.com / /oauth2/ -- while the
+# doctor asked scripts\ensure_m365_signin.py, which also knew a federated tenant's AD FS page
+# (https://<sts>/adfs/ls/). On 2026-09-24 a freshly set-up PC's bridge Edge sat on exactly that
+# page: the doctor said "sign in", this said "no wall", and no window was ever shown. Asking the
+# same checker the doctor asks makes that disagreement impossible rather than unlikely.
+# The CsrToSSR bounce (".../chat/?redirfrom=CsrToSSR&auth=2") is still not a wall there.
+$script:signinPy = Join-Path $PSScriptRoot "ensure_m365_signin.py"
+function Invoke-SignInHelper([string[]]$Extra) {
     try {
-        $c = (Invoke-WebRequest -UseBasicParsing -TimeoutSec 4 "http://127.0.0.1:$CdpPort/json").Content
-        return ($c -match 'login\.microsoftonline\.com|login\.live\.com|/oauth2/|//login\.')
-    } catch { return $false }
+        return (& $py $script:signinPy --port $CdpPort @Extra 2>&1 | Out-String)
+    } catch { return "" }
+}
+function Needs-SignIn {
+    return ((Invoke-SignInHelper @("--check-only")) -match 'VERDICT:\s*sign_in_needed')
+}
+
+# "Should the window come forward NOW?" -- asked of the checker, which also applies the rules:
+# once per sign-in need (a latch; starting the app again re-arms it), and never while a chat turn
+# is live on this bridge (GET /status only). Prints DECISION: <word>; only "surface" acts.
+function Get-SignInDecision {
+    $out = Invoke-SignInHelper @("--bridge-watch", "--status-url", "http://127.0.0.1:$BridgePort/status")
+    $m = [regex]::Match($out, 'DECISION:\s*(\w+)')
+    if ($m.Success) { return $m.Groups[1].Value }
+    return "cannot_tell"
+}
+
+# BRING THE SIGN-IN IN FRONT OF THE PERSON, then put the browser back.
+#
+# The bridge process is stopped first: relaunching its Edge headed pulls the browser out from
+# under it anyway, and a bridge left running would spend the sign-in reconnecting to a moving
+# target. Stopped as a TREE (taskkill /T): the venv's python.exe is a launcher whose child is the
+# real interpreter (measured: parent .venv\Scripts\python.exe, child Python310\python.exe). The
+# launcher's job object already takes the child down with it on this install -- /T is there so
+# that stays true on an interpreter whose launcher does not. Only this supervisor's own child is
+# touched. The loop restarts the bridge afterwards.
+function Show-SignIn($BridgeProc) {
+    Write-Host "Sign-in required on the bridge Edge (:$CdpPort) -- bringing its window to the front. Sign in there; it continues automatically."
+    if ($BridgeProc -and -not $BridgeProc.HasExited) {
+        try { & taskkill.exe /PID $BridgeProc.Id /T /F 2>&1 | Out-Null } catch { }
+        try { $BridgeProc.WaitForExit(15000) | Out-Null } catch { }
+    }
+    Ensure-Edge -Visible -Url "https://m365.cloud.microsoft/chat" | Out-Null
+    Demote-ToHeadless | Out-Null
+}
+
+# Run the bridge ONCE, watching its browser for a sign-in wall while it runs.
+#
+# WHY NOT `& $py $bridge`. That blocked this supervisor for the bridge's whole life -- hours --
+# so the only moment it could notice a sign-in page was after the bridge EXITED, and a bridge
+# sitting on a sign-in page does not exit: it serves, and every turn fails. That is the other
+# half of why the fresh PC's window never came forward. The child inherits this process's
+# stdout/stderr, so bridge.log is unchanged.
+$SignInPollSec = 20
+function Run-BridgeWatched {
+    $env:MCP_BRIDGE_SIGNIN_SUPERVISED = "1"   # the bridge reports walls; it does not surface them
+    $argList = @('"' + $bridge + '"') + $bridgeArgs
+    $proc = Start-Process -FilePath $py -ArgumentList $argList -NoNewWindow -PassThru
+    $null = $proc.Handle                        # without this, ExitCode reads empty in PS 5.1
+    while (-not $proc.HasExited) {
+        Start-Sleep -Seconds $SignInPollSec
+        if ($proc.HasExited) { break }
+        if ((Get-SignInDecision) -eq "surface") {
+            Show-SignIn $proc
+            return 0
+        }
+    }
+    $proc.WaitForExit()
+    $code = $proc.ExitCode
+    # It exited on its own. If it met a wall on the way out, the same decision applies.
+    if ((Get-SignInDecision) -eq "surface") { Show-SignIn $null }
+    return $code
 }
 
 # Initial bring-up: headless unless the user explicitly asked to sign in.
-if (-not (Ensure-Edge -Hard:$HardReset -Visible:$SignIn)) {
+if (-not (Ensure-Edge -Hard:$HardReset -Visible:$SignIn -Url $(if ($SignIn) { "https://m365.cloud.microsoft/chat" } else { "" }))) {
     Write-Host "Bridge Edge did not come up on :$CdpPort."
     exit 1
 }
@@ -182,17 +276,20 @@ Write-Host ""
 Write-Host "Starting bridge (headless):  UI http://127.0.0.1:$BridgePort   ->   Edge CDP :$CdpPort  (profile $Profile)"
 Write-Host "(The fleet's :9222 Edge is untouched -- you can run a SWE fleet at the same time.)"
 
+# A NEW SUPERVISOR IS A NEW START: the "already shown for this sign-in" mark from a previous run
+# is dropped, so a person who missed the window last time sees it again after a restart/logon.
+Invoke-SignInHelper @("--rearm") | Out-Null
+
 if (-not $Keepalive) {
-    & $py $bridge @bridgeArgs
-    # If the bridge could not reach the agent because a real sign-in wall is up, surface a window.
-    if (Needs-SignIn) { Write-Host "Sign-in required -> opening a visible window once."; Ensure-Edge -Hard -Visible | Out-Null }
-    exit $LASTEXITCODE
+    # Same watched run as the supervisor: a wall is surfaced while the bridge runs, not after.
+    exit (Run-BridgeWatched)
 }
 
 # Keepalive supervisor: keep the bridge (and its Edge) up across crashes / terminal closes. The
-# bridge runs headless; the ONLY time a window appears is right after the bridge exits having hit a
-# genuine sign-in wall -- then we relaunch the Edge VISIBLE so the user can sign in once, after
-# which it is put back to headless.
+# bridge runs headless; the ONLY time a window appears is when the bridge's browser is on a
+# genuine sign-in page (any IdP, including a federated AD FS) -- noticed WHILE the bridge runs
+# (Run-BridgeWatched), once per sign-in need and never mid-turn. Then the Edge is relaunched
+# VISIBLE and in front so the person can sign in, after which it is put back to headless.
 #
 # That last clause used to read "returns to headless on the next loop", and it was not true: the
 # next pass only rebuilds the Edge when Test-Cdp FAILS, and a perfectly healthy headed Edge
@@ -210,11 +307,8 @@ while ($true) {
         Write-Host "bridge Edge has a window but no sign-in wall is up -- returning it to headless..."
         Ensure-Edge -Hard | Out-Null
     }
-    & $py $bridge @bridgeArgs
-    if (Needs-SignIn) {
-        Write-Host "Sign-in required -> opening a visible window. Sign in to M365; it continues automatically."
-        Ensure-Edge -Hard -Visible | Out-Null
-        Demote-ToHeadless
-    }
+    # Watched: a sign-in wall is brought to the person WHILE the bridge runs (once per need,
+    # never mid-turn), then the Edge goes back to headless and this loop restarts the bridge.
+    Run-BridgeWatched | Out-Null
     Start-Sleep -Seconds 3
 }
