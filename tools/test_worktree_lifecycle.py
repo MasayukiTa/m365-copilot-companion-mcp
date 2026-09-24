@@ -339,10 +339,25 @@ def _import_main_and_probe(repo, tool_names):
     (no HTTP request context in this in-process call, so every gated tool refuses with its
     own real "[locked: no HTTP request context]" message, which is itself proof the call
     reached the real, gated function rather than a stub or an "unknown tool" catalogue miss).
+
+    THE REFUSAL IS REAL, AND SO IS WHERE IT USED TO GET LOGGED. Every refusal this probe
+    provokes runs tools.security.require_unlocked()'s real "no HTTP request context" branch,
+    which calls tools.lock_state.record_locked() -- and this subprocess is a raw
+    `python -c <code>` child, not a pytest worker, so it never imports this repo's conftest.py
+    and never gets conftest's autouse LIVE_RECORD_REDIRECTS patch. Measured 2026-09-24: a
+    session-scoped canary added the same day caught exactly six refusals landing in the real
+    .fleet/lock_refusals.jsonl and .fleet/lock_state.json after a ~40-minute relay/+tools/ run
+    -- three from this function's call in test_worktree_tools_are_registered_in_main, three from
+    test_call_tool_reaches_the_real_gated_worktree_functions, the two tests in this file that
+    pass all three tool names. Fixed the same way tests/_unlock_race_worker.py isolates its own
+    real subprocess workers: redirect tools.security.STATE_FILE and tools.lock_state's three
+    constants INSIDE the child, before any tool is called, to a directory this function creates
+    and removes -- never the operator's real .fleet.
     """
     import json as _json
     import os as _os
     import sys as _sys
+    import tempfile as _tempfile
 
     from tools.childproc import run as _child_run
 
@@ -356,26 +371,39 @@ def _import_main_and_probe(repo, tool_names):
     }
     payload = {"names": list(tool_names),
               "args": {n: args_by_tool.get(n, {}) for n in tool_names}}
-    code = (
-        "import sys; sys.path.insert(0, '.')\n"
-        "import json\n"
-        "payload = json.loads(sys.argv[1])\n"
-        "import main\n"
-        "present = {n: (n in main._ALL_TOOLS) for n in payload['names']}\n"
-        "results = {}\n"
-        "for n in payload['names']:\n"
-        "    if n in main._ALL_TOOLS:\n"
-        "        try:\n"
-        "            results[n] = main._ALL_TOOLS[n](**payload['args'][n])\n"
-        "        except Exception as e:\n"
-        "            results[n] = '[exception] %s: %s' % (type(e).__name__, e)\n"
-        "print('<<<' + json.dumps({'present': present, 'results': results}) + '>>>')\n"
-    )
-    # 180s, matching relay/test_fleet_toolset.py's own probe of the same import -- `main.py`
-    # itself is a heavy module to import fresh (its own comment: "IN A SUBPROCESS, AND THAT
-    # IS THE POINT" -- a clean interpreter is slow for the same reason it is correct).
-    out = _child_run([_sys.executable, "-c", code, _json.dumps(payload)],
-                     cwd=str(repo), env=env, timeout=180)
+    with _tempfile.TemporaryDirectory(prefix="worktree_probe_security_") as _isolate_dir:
+        env["_MCP_TEST_ISOLATE_SECURITY_STATE_DIR"] = _isolate_dir
+        code = (
+            "import sys; sys.path.insert(0, '.')\n"
+            "import json, os\n"
+            "from pathlib import Path\n"
+            "payload = json.loads(sys.argv[1])\n"
+            "import main\n"
+            # REDIRECTED HERE, AFTER main's imports registered every tool but BEFORE any tool
+            # is called -- same order conftest's autouse fixture uses, and for the same reason:
+            # patching the module attribute (not a copy) means every later call in THIS process
+            # reads the redirected path, exactly like the real fixture.
+            "from tools import security as _S, lock_state as _LS\n"
+            "_d = Path(os.environ['_MCP_TEST_ISOLATE_SECURITY_STATE_DIR'])\n"
+            "_S.STATE_FILE = _d / 'unlock_state.json'\n"
+            "_LS._STATE_FILE = _d / 'lock_state.json'\n"
+            "_LS._LOG_FILE = _d / 'lock_refusals.jsonl'\n"
+            "_LS._TOKEN_GAP_FILE = _d / 'unlock_token_gap.json'\n"
+            "present = {n: (n in main._ALL_TOOLS) for n in payload['names']}\n"
+            "results = {}\n"
+            "for n in payload['names']:\n"
+            "    if n in main._ALL_TOOLS:\n"
+            "        try:\n"
+            "            results[n] = main._ALL_TOOLS[n](**payload['args'][n])\n"
+            "        except Exception as e:\n"
+            "            results[n] = '[exception] %s: %s' % (type(e).__name__, e)\n"
+            "print('<<<' + json.dumps({'present': present, 'results': results}) + '>>>')\n"
+        )
+        # 180s, matching relay/test_fleet_toolset.py's own probe of the same import -- `main.py`
+        # itself is a heavy module to import fresh (its own comment: "IN A SUBPROCESS, AND THAT
+        # IS THE POINT" -- a clean interpreter is slow for the same reason it is correct).
+        out = _child_run([_sys.executable, "-c", code, _json.dumps(payload)],
+                         cwd=str(repo), env=env, timeout=180)
     body = out.stdout or ""
     assert "<<<" in body and ">>>" in body, (
         "could not probe main._ALL_TOOLS (rc=%s):\n%s\n%s"
