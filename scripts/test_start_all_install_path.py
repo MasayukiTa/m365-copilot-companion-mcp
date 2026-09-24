@@ -151,6 +151,7 @@ def _driver(functions, root, body, script_dir=None, venv_py=None, bridge=None):
         "$script:venvPy = %s" % _q(venv_py or sys.executable),
         "$script:bridgeStatusUrl = %s" % _q(bridge or _refused_url()),
         "$script:startupFailures = @()",
+        "$script:startupUnclear = @()",
         "$script:splash = $null",
         "function Set-SplashStatus($s, [string]$t) { }",
         "function Pump-Splash($s) { }",
@@ -544,19 +545,27 @@ _STUB_DT = "\r\n".join([
     "exit /b 0",
     ":user",
     'if "%STUB_LOGIN%"=="out" goto out',
+    'if "%STUB_LOGIN%"=="weird" goto userweird',
     "echo Logged in as test@x using Microsoft.",
     "exit /b 0",
     ":out",
     "echo Not logged in.",
     "exit /b 1",
+    ":userweird",
+    "echo some unrecognised CLI output that names neither state",
+    "exit /b 0",
     ":show",
     'if "%STUB_SHOW%"=="missing" goto missing',
+    'if "%STUB_SHOW%"=="weird" goto showweird',
     "echo Tunnel ID             : t1.jpe1",
     "echo Host connections      : %STUB_HOSTS%",
     "exit /b 0",
     ":missing",
     "echo Tunnel not found.",
     "exit /b 1",
+    ":showweird",
+    "echo some unrecognised CLI output that names neither state",
+    "exit /b 0",
     ""])
 
 
@@ -587,17 +596,65 @@ def test_the_tunnel_is_part_of_started(tmp_path, checkout, functions, login, sho
                LOCALAPPDATA=str(lad), PATH=";".join(path))
     body = r"""
 Test-TunnelServing -HostWaitSec 2 -PollSec 1
-"RESULT:" + (@{ failures = @($script:startupFailures) } | ConvertTo-Json -Compress)
+"RESULT:" + (@{ failures = @($script:startupFailures); unclear = @($script:startupUnclear) } | ConvertTo-Json -Compress)
 """
     r = _result(_ps(tmp_path, _driver(functions, checkout, body), env=env))
     if expect is None:
         assert r["failures"] == [], r
     else:
         assert len(r["failures"]) == 1 and expect in r["failures"][0], r
+    assert r["unclear"] == [], "a definite answer must not also be reported as unclear: %r" % r
     if stub_log.exists():
         verbs = {l.split()[0] + (" " + l.split()[1] if l.split()[0] == "user" else "")
                  for l in stub_log.read_text(encoding="ascii", errors="replace").splitlines() if l.strip()}
         assert verbs <= {"user show", "show"}, "a devtunnel verb that changes something: %s" % verbs
+
+
+@pytest.mark.parametrize("login,show,envline", [
+    # sandbox finding (2026-09-24): `devtunnel user show` timing out / answering unreadably used
+    # to be silently dropped -- not in $script:startupFailures, not in the summary, not in the
+    # jsonl outcome, which read plain "ok". Neither branch may join $script:startupFailures (a
+    # CLI hiccup is not a KNOWN-bad state), but neither may vanish either.
+    ("weird", "ok", "MCP_TUNNEL_NAME=t1"),   # `user show` answers unreadably -> Get-TunnelLoginState "unknown"
+    ("in", "weird", "MCP_TUNNEL_NAME=t1"),   # `show` answers unreadably -> Get-TunnelHostCount -2
+])
+def test_an_unreadable_tunnel_answer_is_reported_as_unclear_not_silently_ok(
+        tmp_path, checkout, functions, login, show, envline):
+    bin_dir, lad = tmp_path / "bin", tmp_path / "localappdata"
+    bin_dir.mkdir()
+    lad.mkdir()
+    (bin_dir / "devtunnel.cmd").write_text(_STUB_DT, encoding="ascii")
+    (checkout / ".env").write_text(envline + "\r\n", encoding="ascii")
+    sysroot = os.environ.get("SystemRoot", r"C:\Windows")
+    path = [str(bin_dir), os.path.join(sysroot, "System32"), sysroot]
+    env = dict(os.environ, STUB_LOG=str(tmp_path / "devtunnel_argv.log"), STUB_LOGIN=login,
+               STUB_SHOW=show, STUB_HOSTS="1", LOCALAPPDATA=str(lad), PATH=";".join(path))
+    body = r"""
+Test-TunnelServing -HostWaitSec 2 -PollSec 1
+"RESULT:" + (@{ failures = @($script:startupFailures); unclear = @($script:startupUnclear) } | ConvertTo-Json -Compress)
+"""
+    r = _result(_ps(tmp_path, _driver(functions, checkout, body), env=env))
+    assert r["failures"] == [], "an unreadable CLI answer must not be a KNOWN-bad failure: %r" % r
+    assert len(r["unclear"]) == 1 and "cannot confirm the tunnel is served" in r["unclear"][0], r
+
+
+def test_unclear_startup_state_is_not_reported_as_outcome_ok(tmp_path, checkout, functions):
+    """The run record (start_all_runs.jsonl) and the hidden-run summary must say plainly that
+    something was never confirmed, not "ok" -- that silent "ok" is exactly what let a sandbox
+    run pass with the tunnel never actually hosted (defect 2, 2026-09-24 sandbox review)."""
+    summary = checkout / ".setup" / "logs" / "start_all_summary.txt"
+    body = r"""
+$script:startupUnclear = @('could not tell whether devtunnel is signed in (no answer within 10 s): cannot confirm the tunnel is served -- run doctor.bat')
+$summaryWritten = Write-StartupSummary %s @($script:startupFailures) 'background (-NoUi)' @($script:startupUnclear)
+$runOutcome = $(if ($script:startupFailures.Count -gt 0) { "failures" } elseif (@($script:startupUnclear).Count -gt 0) { "unclear" } else { "ok" })
+"RESULT:" + (@{ written = $summaryWritten; outcome = $runOutcome } | ConvertTo-Json -Compress)
+""" % _q(summary)
+    r = _result(_ps(tmp_path, _driver(functions, checkout, body)))
+    assert r == {"written": True, "outcome": "unclear"}
+    lines = summary.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "failures=0"
+    assert "unclear=1" in lines
+    assert any(l.startswith("? could not tell whether devtunnel is signed in") for l in lines), lines
 
 
 # =============================================================== D27: UI exes vs their sources
