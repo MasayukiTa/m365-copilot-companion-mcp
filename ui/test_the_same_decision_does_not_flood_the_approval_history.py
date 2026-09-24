@@ -158,9 +158,16 @@ def test_bypass_and_auto_local_jobs_never_reach_the_gate_directory_at_all():
     router_path = os.path.join(UI, "..", "relay", "task_router.py")
     with open(router_path, encoding="utf-8") as fh:
         router = fh.read()
-    assert 'if mode == "bypass":\n        return "ALLOW", "bypass"' in router, (
+    assert 'if mode == "bypass":' in router, (
         "job_gate's bypass fast-path changed shape -- re-derive this test against the current "
         "behavior before assuming bypass gates ever reach the approval directory")
+    bypass_block = router[router.index('if mode == "bypass":'):router.index('level, why = _static_risk')]
+    assert 'return "ALLOW", "bypass"' in bypass_block, (
+        "bypass mode no longer returns ALLOW unconditionally -- re-derive this test")
+    assert '_write_job_gate' not in bypass_block, (
+        "bypass mode now writes a gate file on some path -- RefreshApprovalCenter's de-dup "
+        "(keyed on content, not on policy mode) may need a policy-aware exception to keep "
+        "hiding it from history")
     # In "auto" mode a clean payload also returns ALLOW without reaching _write_job_gate.
     auto_block = router[router.index('if mode == "auto":'):router.index('# mode == "default"')]
     assert '_write_job_gate' not in auto_block, (
