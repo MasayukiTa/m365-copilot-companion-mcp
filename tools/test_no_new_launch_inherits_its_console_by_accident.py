@@ -205,6 +205,38 @@ def test_the_baseline_does_not_outlive_the_sites_it_names():
           "repository rather than the day it was written.")
 
 
+def test_no_launch_detaches_its_child_from_every_console():
+    """「決めている」のに窓を出す唯一の決定。`DETACHED_PROCESS` は子からコンソールを奪い、
+    venv の python.exe が起こす本体の python.exe (孫) に**新しい見える窓**を割り当てさせる。
+    2026-09-24 に relay/fleet_retention.py の掃除プロセスがデスクトップに窓を出したのを
+    scripts/win/console_flash_watch.py が捕まえた。同じ発見の3件目。"""
+    uses = L.detached_uses(REPO)
+    assert not uses, (
+        "DETACHED_PROCESS in tracked code:\n  " + "\n  ".join(uses)
+        + "\n\nIt leaves the child with no console, so the venv launcher's grandchild (the real "
+          "interpreter) is given a NEW visible one. Use CREATE_NO_WINDOW alone "
+          "(tools.childproc.headless_creationflags): the child gets a console with no window "
+          "and its children inherit it.")
+
+
+def test_the_detached_scan_can_see_every_spelling(tmp_path):
+    """計器の検査: 3つの書き方すべてを拾い、説明の文章は拾わない。"""
+    import subprocess as _sp
+    (tmp_path / "m.py").write_text(
+        '"""DETACHED_PROCESS is explained here."""\n'
+        "import subprocess\n"
+        "# DETACHED_PROCESS in a comment\n"
+        "a = subprocess.DETACHED_PROCESS\n"
+        "b = getattr(subprocess, 'DETACHED_PROCESS', 0)\n"
+        "from subprocess import DETACHED_PROCESS\n"
+        "c = DETACHED_PROCESS\n", encoding="utf-8")
+    _sp.run(["git", "init", "-q", str(tmp_path)], check=True,
+            creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0))
+    _sp.run(["git", "-C", str(tmp_path), "add", "m.py"], check=True,
+            creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0))
+    assert L.detached_uses(str(tmp_path)) == ["m.py:4", "m.py:5", "m.py:7"]
+
+
 def test_the_scanner_still_sees_the_call_shape_it_is_looking_for():
     """**計器そのものの検査。** 走査が壊れて0件を返したら、上の2件は黙って通る。
 

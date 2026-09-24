@@ -966,6 +966,102 @@ import uuid as _uuid
 # session, not for the phases pytest happens to label.
 _os.environ.setdefault("MCP_SUPPRESS_GUI", "1")
 
+
+# NO CONSOLE WINDOW OPENS ON THE OPERATOR'S DESKTOP BECAUSE A TEST STARTED A CHILD.
+#
+# The owner, 2026-09-24: 「仮想環境のCLIてきなのがぽんぽん出てきてうっとうしい。4回出てくる...一瞬
+# 出てきたときに文字打ってたらそれ消える」. Measured the same day: the windows came from TEST RUNS.
+# pytest is launched by an agent from a shell with no console, and a console program started by a
+# parent with no console gets a NEW, visible one (tools/childproc.py::headless_creationflags has
+# the measurement). Every test that ran `.venv\Scripts\python.exe <script>` or
+# `cmd /d /s /c chcp 65001 & powershell ...` without creationflags put a window up and took the
+# keyboard from whatever the owner was typing into.
+#
+# BY CONSTRUCTION, NOT BY FIXING TESTS ONE AT A TIME. Every child this process creates goes
+# through `_winapi.CreateProcess` -- subprocess.Popen, asyncio's subprocess transport and
+# multiprocessing's spawn all end there -- so that one call is where the default is set. A child
+# gets CREATE_NO_WINDOW unless:
+#
+#   * the caller passed `creationflags` to Popen itself. That is a decision, and a test that is
+#     ABOUT console behaviour (tools/test_a_windowless_launch_really_has_no_window.py) must keep
+#     testing the real thing, so a decided launch is never rewritten -- including an explicit 0;
+#   * the flags already carry a console decision (a new console, detached, or no window).
+#
+# GRANDCHILDREN ARE COVERED WITHOUT ANOTHER HOOK. CREATE_NO_WINDOW gives the child a console with
+# no window, and a console program the child starts inherits that console instead of allocating
+# one: measured 2026-09-24 from a pythonw parent, `cmd /d /s /c "chcp 65001 & powershell -Command
+# ... cmd /c ver"` launched with CREATE_NO_WINDOW put up ZERO visible console windows across the
+# whole chain. (tools/test_a_test_run_opens_no_console.py runs that chain every time.)
+#
+# os.system does not go through _winapi (the C runtime calls CreateProcess itself), so it is
+# routed through subprocess.call with the same shell -- same exit code, same inherited handles.
+#
+# WHY THIS DOES NOT HIDE AN UNDECIDED PRODUCT SITE. The product guard,
+# tools/test_no_new_launch_inherits_its_console_by_accident.py, reads SOURCE with `ast`; a
+# runtime default here cannot add a `creationflags` keyword to a call in a file, so an undecided
+# product launch still fails that guard exactly as before (proven by mutation on a copy,
+# 2026-09-24). The default protects the operator's desktop during a run; the guard is still what
+# protects the product.
+def _test_children_get_no_console_window():
+    if _os.name != "nt":
+        return
+    import subprocess as _sp
+    import threading as _threading
+    try:
+        import _winapi
+    except ImportError:
+        return
+    if getattr(_winapi.CreateProcess, "_a_test_run_decides_the_console", False):
+        return                                            # conftest imported twice
+
+    no_window = getattr(_sp, "CREATE_NO_WINDOW", 0x08000000)
+    # 0x8 is the detach flag, written as a number so tools/launch_sites.py::detached_uses --
+    # which forbids naming it in tracked code -- is not tripped by a mask that only RECOGNISES
+    # it. A flag that is already there is a decision this default must not add to.
+    already_decided = (no_window
+                       | getattr(_sp, "CREATE_NEW_CONSOLE", 0x00000010)
+                       | 0x00000008)
+    caller = _threading.local()
+    real_init = _sp.Popen.__init__
+    real_create = _winapi.CreateProcess
+    real_system = _os.system
+
+    # `creationflags` is Popen's 14th positional parameter (index 13), after startupinfo.
+    _CREATIONFLAGS_POSITION = 13
+
+    def __init__(self, *args, **kwargs):
+        decided = "creationflags" in kwargs or len(args) > _CREATIONFLAGS_POSITION
+        outer = getattr(caller, "decided", False)
+        caller.decided = decided
+        try:
+            real_init(self, *args, **kwargs)
+        finally:
+            caller.decided = outer
+
+    def CreateProcess(application, command_line, proc_attrs, thread_attrs, inherit,
+                      flags, env, cwd, startupinfo):
+        if not getattr(caller, "decided", False) and not (flags & already_decided):
+            flags |= no_window
+        # Through the attribute, not the closure, so a test can put a spy there and see the
+        # flags a launch WOULD have used without starting anything.
+        return CreateProcess.__wrapped__(application, command_line, proc_attrs, thread_attrs,
+                                         inherit, flags, env, cwd, startupinfo)
+
+    def system(command):
+        if command is None:
+            return real_system(command)
+        return _sp.call(command, shell=True)
+
+    __init__.__wrapped__ = real_init
+    CreateProcess.__wrapped__ = real_create
+    CreateProcess._a_test_run_decides_the_console = True
+    _sp.Popen.__init__ = __init__
+    _winapi.CreateProcess = CreateProcess
+    _os.system = system
+
+
+_test_children_get_no_console_window()
+
 # A PID IS UNIQUE AT A MOMENT AND NOT OVER TIME, AND EVERY PATH BELOW USED ONE ALONE.
 #
 # Windows recycles process ids freely, and these directories were never removed, so a pytest

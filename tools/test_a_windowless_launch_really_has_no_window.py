@@ -21,6 +21,12 @@
 
 だからこのテストは **`pythonw.exe` を親にする**。ここを `python.exe` に戻すと、
 テストは通り続けたまま何も検査しなくなる。
+
+## 検査そのものが窓を出してはならない (2026-09-24)
+
+上の `visible=1` を毎回再現していたので、このファイルは実行のたびにオペレータの
+デスクトップへ窓を出していた。フラグ無しの側は `SW_HIDE` で起こし、**割り当て**
+(`has_console=1`) を検査する。見えるかどうかは割り当ての既定の表示状態で、欠陥の本体ではない。
 """
 from __future__ import annotations
 
@@ -50,9 +56,14 @@ import ctypes, json, os, subprocess, sys
 probe = sys.argv[1]
 out = {"parent_has_console": int(ctypes.windll.kernel32.GetConsoleWindow() != 0)}
 py = sys.executable.replace("pythonw.exe", "python.exe")
-for name, flags in (("noflags", 0), ("headless", int(sys.argv[3]))):
+# The defect case allocates a real console -- told to start HIDDEN, so the proof does not
+# itself put a window on the operator's desktop (see the module docstring).
+hidden = subprocess.STARTUPINFO()
+hidden.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+hidden.wShowWindow = 0  # SW_HIDE
+for name, flags, si in (("noflags", 0, hidden), ("headless", int(sys.argv[3]), None)):
     r = subprocess.run([py, "-c", probe], capture_output=True, text=True,
-                       creationflags=flags)
+                       creationflags=flags, startupinfo=si)
     out[name] = (r.stdout or "").strip()
 open(sys.argv[2], "w", encoding="utf-8").write(json.dumps(out))
 """
@@ -89,10 +100,17 @@ def test_the_parent_really_has_no_console(tmp_path):
     assert _measure(tmp_path)["parent_has_console"] == 0
 
 
-def test_without_the_flag_a_visible_window_appears(tmp_path):
+def test_without_the_flag_a_new_console_is_allocated(tmp_path):
     """**欠陥の側を先に見せる。** これが落ちるようになったら、Windows か venv の形が
-    変わったということで、そのときは下のテストも意味を失っている。"""
-    assert _measure(tmp_path)["noflags"] == "1,1", \
+    変わったということで、そのときは下のテストも意味を失っている。
+
+    **欠陥は「新しいコンソールが割り当てられる」こと。** 窓が見えるかはその割り当ての
+    既定の表示状態にすぎない。以前はここで `1,1`（見える窓）を確かめていて、**このテスト
+    自身が1回の実行でオペレータのデスクトップに窓を3回出していた** (2026-09-24、オーナーの
+    「4回出てくる」の苦情)。子を `SW_HIDE` で起こしても割り当ては起きる (実測: `1,0`、
+    クラス ConsoleWindowClass、デスクトップ上の新しい窓 0)。`CREATE_NO_WINDOW` は割り当て
+    そのものを消す (`0,0`) ので、下のテストとの差は同じく立つ。"""
+    assert _measure(tmp_path)["noflags"] == "1,0", \
         "the defect no longer reproduces, so the guard below is no longer guarding anything"
 
 

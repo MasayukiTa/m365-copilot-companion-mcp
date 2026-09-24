@@ -138,6 +138,41 @@ def scan_file(rel: str, repo=REPO) -> list:
     return found
 
 
+def detached_uses(repo=REPO) -> list:
+    """`rel:line` for every place tracked non-test Python names DETACHED_PROCESS in CODE.
+
+    A DECIDED SITE CAN STILL PUT A WINDOW UP, and this is the one decision that does. The
+    inventory above counts `creationflags=CREATE_NO_WINDOW | DETACHED_PROCESS` as decided, and
+    it is -- wrongly. DETACHED_PROCESS wins and leaves the child with NO console; every Python
+    launch here goes through the venv's python.exe, a launcher that starts the base interpreter
+    as its own child with no flags, and a console program started by a console-less parent is
+    given a NEW, VISIBLE console. Found three times, fixed one site at a time each time
+    (relay/task_router.py autostart, relay/selfimprove/guards.py, and on 2026-09-24
+    relay/fleet_retention.py's clone sweep, caught on the desktop by
+    scripts/win/console_flash_watch.py). This makes the fourth a test failure instead.
+
+    Matched on the AST -- `x.DETACHED_PROCESS`, a bare name, or the exact string a
+    `getattr(subprocess, "DETACHED_PROCESS", 0)` passes -- so comments and docstrings that
+    explain the finding do not trip it.
+    """
+    # Assembled, so the scanner's own source does not contain the name it forbids.
+    flag = "DETACHED" + "_PROCESS"
+    found = []
+    for rel in tracked_python(repo):
+        path = os.path.join(repo, rel)
+        try:
+            tree = ast.parse(io.open(path, encoding="utf-8", errors="replace").read())
+        except (OSError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            hit = ((isinstance(node, ast.Attribute) and node.attr == flag)
+                   or (isinstance(node, ast.Name) and node.id == flag)
+                   or (isinstance(node, ast.Constant) and node.value == flag))
+            if hit:
+                found.append("%s:%d" % (rel, node.lineno))
+    return sorted(found)
+
+
 def key(site: dict) -> str:
     """Identity of a launch SITE, stable across edits above it.
 

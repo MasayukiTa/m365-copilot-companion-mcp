@@ -650,8 +650,18 @@ def _spawn_clone_sweep_subprocess(fleet_dir, keep_days, now):
     try:
         creationflags = 0
         if sys.platform == "win32":
+            # CREATE_NO_WINDOW WITHOUT DETACHED_PROCESS -- the pair put a console window on the
+            # owner's desktop. Measured 2026-09-24 by scripts/win/console_flash_watch.py: a
+            # sweep launched here showed a Windows Terminal window (CASCADIA_HOSTING_WINDOW_CLASS
+            # + PseudoConsoleWindow) owned by the BASE python.exe. DETACHED_PROCESS wins over
+            # CREATE_NO_WINDOW and leaves the child with no console at all; sys.executable is
+            # the venv's python.exe, a launcher that starts the base interpreter as ITS child
+            # with no flags, and a console program started by a console-less parent gets a new,
+            # visible console. CREATE_NO_WINDOW alone gives the child a console with no window,
+            # which the grandchild inherits. The child still outlives this process either way:
+            # on Windows a child is never tied to its parent's lifetime. Same finding as
+            # relay/task_router.py's autostart launch and relay/selfimprove/guards.py.
             creationflags = (getattr(subprocess, "CREATE_NO_WINDOW", 0) |
-                             getattr(subprocess, "DETACHED_PROCESS", 0) |
                              getattr(subprocess, "IDLE_PRIORITY_CLASS", 0))
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         subprocess.Popen(
