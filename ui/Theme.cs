@@ -93,7 +93,10 @@ static class Theme
     public static string Press(bool d) { return d ? "#38FFFFFF" : "#26000000"; }
 
     // ── typography ────────────────────────────────────────────────────────────────
-    public const string UiFont   = "Segoe UI Variable, Segoe UI";
+    // Japanese fonts listed first so WPF's per-character font-fallback picks a Japanese glyph
+    // source before Windows font-linking substitutes a Chinese one on non-Japanese locales --
+    // same bug class as the WinForms fix in scripts/configure_env.ps1 and scripts/start_all.ps1.
+    public const string UiFont   = "Yu Gothic UI, Meiryo UI, Segoe UI Variable, Segoe UI";
     public const string CodeFont = "Cascadia Mono, Consolas";
     public const double FsTitle   = 16; // app title (semibold)
     public const double FsSection = 13; // section title (semibold)

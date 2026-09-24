@@ -32,6 +32,12 @@ $root = Split-Path -Parent $scriptDir
 $script:venvPy = Join-Path $root ".venv\Scripts\python.exe"
 $script:bootstrapPy = Join-Path $scriptDir "bootstrap.py"
 $script:bridgeStatusUrl = "http://127.0.0.1:8765/status"
+# Japanese-capable WinForms font helper (Get-JapaneseUiFont), dot-sourced once here so every
+# Form-building function below (Show-AlreadyRunningNotice, Start-Splash) can use it. See
+# scripts/win/ui_font.ps1 for why: a control with no explicit .Font falls back to Microsoft
+# Sans Serif (no Japanese glyphs), and Windows font-links to a CHINESE fallback font on a
+# non-Japanese system locale.
+. (Join-Path $scriptDir "win/ui_font.ps1")
 
 function Proc-Running([string]$pattern) {
     try {
@@ -502,7 +508,10 @@ function Show-AlreadyRunningNotice([int]$Ms = 1500) {
         $f.ShowInTaskbar = $false
         $l = New-Object System.Windows.Forms.Label
         $l.Text = Get-AlreadyRunningText (Get-StartAllUiLanguage)
-        $l.Font = New-Object System.Drawing.Font("Segoe UI", 11)
+        # Get-AlreadyRunningText returns real Japanese text when the UI language is "ja" -- a
+        # bare "Segoe UI" font does not cover Japanese and mis-renders it via Chinese font
+        # linking on a non-Japanese system locale (see scripts/win/ui_font.ps1).
+        $l.Font = Get-JapaneseUiFont -SizePoints 11
         $l.AutoSize = $false
         $l.Size = New-Object System.Drawing.Size(336, 46)
         $l.Location = New-Object System.Drawing.Point(12, 12)
@@ -888,6 +897,8 @@ function Env-Value([string]$key) {
 }
 
 function Show-OwnedDialog([string]$body, [string]$title, [string]$buttons, [string]$icon) {
+    # Checked for the Japanese-font-rendering fix (scripts/win/ui_font.ps1): every call site
+    # passes English-only text, so this MessageBox is not exposed to that bug -- left as-is.
     # Show a MessageBox that is guaranteed to appear in front, even when this script
     # runs hidden (window=0 from the vbs launcher). We parent the box on a TopMost owner
     # form so it is not lost behind other windows. Returns the DialogResult.
@@ -955,12 +966,19 @@ function Start-Splash {
         $f.ShowInTaskbar = $true
         $title = New-Object System.Windows.Forms.Label
         $title.Text = "M365 Companion"
-        $title.Font = New-Object System.Drawing.Font("Segoe UI", 13, [System.Drawing.FontStyle]::Bold)
+        # Both the title and status labels are English today, but Set-SplashStatus is called
+        # with arbitrary text (see call sites throughout this file) -- using the Japanese-capable
+        # font here for free consistency/future-proofing costs nothing (see scripts/win/ui_font.ps1).
+        $title.Font = Get-JapaneseUiFont -SizePoints 13 -Style ([System.Drawing.FontStyle]::Bold)
         $title.AutoSize = $true
         $title.Location = New-Object System.Drawing.Point(22, 20)
         $f.Controls.Add($title)
         $status = New-Object System.Windows.Forms.Label
         $status.Text = "Starting M365 Companion..."
+        # $status never set an explicit .Font before (WinForms default = Microsoft Sans Serif,
+        # 8.25pt) -- give it the same Japanese-capable font explicitly rather than leaving it on
+        # the buggy default.
+        $status.Font = Get-JapaneseUiFont -SizePoints 8.25
         $status.AutoSize = $false
         $status.Size = New-Object System.Drawing.Size(396, 22)
         $status.Location = New-Object System.Drawing.Point(24, 58)
