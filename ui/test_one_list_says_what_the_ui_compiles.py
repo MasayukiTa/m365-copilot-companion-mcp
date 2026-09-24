@@ -101,10 +101,10 @@ EXEMPT = {
         "ui/testdata/ into a throwaway console exe: it runs the chat's send path without WPF, "
         "which is the reason ChatSend.cs is its own file, not a build of the UI",
     "ui/test_a_fleet_interrupt_survives_a_supervisor_restart.py":
-        "compiles the same ui/ChatSend.cs + ui/FleetCommands.cs with the test-only oracle and "
-        "harness in ui/testdata/ (identical SOURCES list to "
-        "ui/test_the_chat_window_sends_what_was_typed.py) into a throwaway console exe: it runs "
-        "the send path's restart-time interrupt decision without WPF, not a build of the UI",
+        "compiles ui/FleetConvIdentity.cs + ui/ChatSend.cs with the test-only harness "
+        "ui/harness/FleetConvIdentityHarness.cs into a throwaway console exe: it replays "
+        "OpenFromFleet's/SyncRegistry's own merge-decision call sequences and feeds the result "
+        "into ChatSend's real send decision, without WPF, not a build of the UI",
     "ui/test_the_bridge_client_sends_the_token.py":
         "compiles ui/BridgeClient.cs with the test-only driver ui/testdata/BridgeClientHarness.cs "
         "into a throwaway console exe and runs it against a real bridge Handler on a free port: "
@@ -132,6 +132,7 @@ COMPILED_BY_A_TEST = {
     "ui/testdata/BridgeClientHarness.cs": "ui/test_the_bridge_client_sends_the_token.py",
     "ui/harness/SubmittedTasksHarness.cs": "ui/test_a_submitted_task_is_on_top_at_once.py",
     "ui/harness/StartupGateHarness.cs": "ui/test_the_startup_loop_has_a_backstop.py",
+    "ui/harness/FleetConvIdentityHarness.cs": "ui/test_a_fleet_interrupt_survives_a_supervisor_restart.py",
 }
 
 
