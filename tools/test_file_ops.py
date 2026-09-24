@@ -255,7 +255,7 @@ def test_read_file_max_lines_one_peak_memory_bounded_on_large_file(tmp_path):
     )
     result = subprocess.run(
         [sys.executable, str(probe)],
-        capture_output=True, text=True, timeout=120,
+        capture_output=True, text=True, timeout=120, errors="replace",
     )
     assert result.returncode == 0, (
         f"probe subprocess failed: stdout={result.stdout!r} stderr={result.stderr!r}"

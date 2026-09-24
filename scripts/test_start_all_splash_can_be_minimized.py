@@ -46,7 +46,8 @@ def _powershell():
 def test_the_splash_has_a_minimise_button_and_a_taskbar_entry():
     env = dict(os.environ, START_ALL_PATH=START_ALL)
     r = subprocess.run([_powershell(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-                        "-Command", _PROBE], capture_output=True, text=True, timeout=120, env=env)
+                        "-Command", _PROBE], capture_output=True, text=True, timeout=120, env=env,
+                       errors="replace")
     out = dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
     assert r.returncode == 0, (r.stdout, r.stderr)
     # The request itself.
