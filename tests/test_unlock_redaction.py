@@ -102,10 +102,62 @@ def test_bridge_redactor_exists_where_it_is_used():
 
 # ── 送る文そのものは伏せていないこと（動作を壊していない） ────────
 
-def test_the_bridge_sends_the_original_text_not_the_redacted_one():
-    src = _src(BRIDGE)
-    turn = src[src.index("turn_payload = msg"):]
-    turn = turn[:turn.index("def ", 200)] if "def " in turn[200:] else turn[:4000]
-    assert "_send_and_stream_once(turn_payload" in turn
-    assert "_send_and_stream_once(_redact" not in turn, \
-        "送る文を伏せると解錠が通らない"
+def test_the_bridge_sends_the_original_text_not_the_redacted_one(monkeypatch, tmp_path):
+    """Runtime check, not a source-string match (the shape of _run_one_turn changed under
+    commit 6b11ca3, "Bridge unlock budget per conversation instead of per process" -- a test
+    that greps for a literal `turn_payload = msg` breaks on any such refactor even when the
+    behaviour it cares about is untouched).
+
+    Drives the real Handler._run_one_turn (browser layer stubbed, as in
+    bridge/test_bridge_unlock_budget_per_conversation.py) and the real _persist_exchange
+    against a throwaway session store, then checks both halves at once: the text handed to
+    the stub (what would reach Copilot) still carries the secret, while the text landing in
+    the session store does not.
+    """
+    import importlib
+    import tempfile
+
+    import bridge.session_store as S
+    monkeypatch.setenv(S.STORE_DIR_ENV, tempfile.mkdtemp())
+    importlib.reload(S)
+
+    import bridge.copilot_bridge as B
+    import tools.lock_state as LS
+    import tools.secret_store as ss
+    monkeypatch.setattr(B, "S", S, raising=False)
+    monkeypatch.setattr(B, "_BRIDGE_UNLOCK_BY_CONV", {})
+    monkeypatch.setattr(B, "_BRIDGE_UNLOCK_TIMES", [])
+    monkeypatch.setattr(B, "_prepare_capture_baseline", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(B, "_bridge_unlock_password", lambda *a, **k: "", raising=False)
+    monkeypatch.setattr(ss, "secret_values", lambda environ=None: [PW])
+    # _run_one_turn ends by asking tools.lock_state whether THIS turn was refused for lock
+    # (_bridge_should_auto_unlock -> lock_state.matching_records). Unredirected, that reads
+    # the real ~/.companion_gates lock log the live supervisor on this machine writes to
+    # concurrently with every test run (see conftest.py's LIVE-STATE CANARY) -- the same
+    # live-file hazard bridge/test_bridge_unlock_budget_per_conversation.py's `rig` fixture
+    # redirects for exactly this reason. Redirected here too, to tmp_path.
+    monkeypatch.setattr(LS, "_LOG_FILE", Path(str(tmp_path / "refusals.jsonl")))
+    monkeypatch.setattr(LS, "_STATE_FILE", Path(str(tmp_path / "state.json")))
+
+    class _H(object):
+        def __init__(self):
+            self.sent = []
+
+        def _send_and_stream_once(self, payload, stream_out=True):
+            self.sent.append(payload)
+            return "ok, %s received" % PW
+
+    h = _H()
+    h._run_one_turn = B.Handler._run_one_turn.__get__(h, _H)
+    sid = S.new_session("c")["sid"]
+    monkeypatch.setattr(B, "ACTIVE_SID", sid, raising=False)
+
+    msg = "解錠します password=%s 続けます" % PW
+    final = h._run_one_turn(sid, msg, stream_out=False)
+
+    assert PW in h.sent[-1], "送る文を伏せると解錠が通らない"
+    B._persist_exchange(sid, msg, final)
+    stored = S.all_turns(sid)
+    for row in stored:
+        assert PW not in row["text"], row
+    assert any("<redacted>" in row["text"] for row in stored if row["role"] == "user")
