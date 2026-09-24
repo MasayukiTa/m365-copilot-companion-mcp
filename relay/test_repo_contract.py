@@ -111,8 +111,14 @@ def test_the_composed_body_still_ends_with_the_goal():
 #: images included, and reading them WAS the task. The sentence was producing good
 #: behaviour and the reason to change it had been withdrawn, so it went back. What was
 #: learned is recorded beside the sentence instead of spent as instruction bytes.
-_PROTOCOL_SHA256 = "245ea0237786483f99698d186564339528e9229477fde34fa2fb4ebabf97538a"
-_PROTOCOL_LEN = 1158
+#: RE-PINNED 2026-09-24 (+81 chars). SKILL_SENTENCE (relay/copilot_autopilot_relay.py,
+#: commit 6f5178f "Stop treating a skill_match miss as 'the request is impossible'") gained a
+#: parenthetical spelling out what "proceed as normal" means on a skill_match miss: keep using
+#: other means (web search etc.) to finish the goal, and don't read "no matching skill" as "the
+#: requested thing does not exist". A worker had stopped at the empty local catalogue and closed
+#: DONE without ever searching further, and refuter#1 upheld it. Intended content change; re-pin.
+_PROTOCOL_SHA256 = "34335083940c0ac8793235f7ebdbacb07127e060a17fb4de361bb2e8463c78c2"
+_PROTOCOL_LEN = 1239
 
 
 def _protocol():
