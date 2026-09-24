@@ -403,6 +403,8 @@ def _real_wscript_shortcut(tmp_path, desktop):
         shutil.copyfile(os.path.join(HERE, name), tree / "scripts" / name)
     shutil.copyfile(os.path.join(HERE, "win", "convenience_marker.ps1"),
                     tree / "scripts" / "win" / "convenience_marker.ps1")
+    shutil.copyfile(os.path.join(HERE, "win", "wsh_vbs_check.ps1"),
+                    tree / "scripts" / "win" / "wsh_vbs_check.ps1")
     (tree / "scripts" / "start_all_hidden.vbs").write_text("' stub\n", encoding="ascii")
     (tree / "scripts" / "start_all.ps1").write_text("# stub\n", encoding="ascii")
     env = dict(os.environ, PREFLIGHT_TEST_WSH_ENABLED="1", M365_COMPANION_DESKTOP_DIR=str(desktop))
@@ -433,6 +435,8 @@ def test_a_launcher_left_on_wscript_is_remade_once_wsh_is_disabled(tmp_path, che
     (stubs / "register-supervisor.ps1").write_text(_STUB_SCRIPT % {
         "log": _q(log), "name": "autostart", "lnk": _q(start / "M365 Companion.lnk")}, encoding="ascii")
     shutil.copyfile(os.path.join(HERE, "preflight_policy.ps1"), stubs / "preflight_policy.ps1")
+    (stubs / "win").mkdir(exist_ok=True)
+    shutil.copyfile(os.path.join(HERE, "win", "wsh_vbs_check.ps1"), stubs / "win" / "wsh_vbs_check.ps1")
     (checkout / ".setup" / "convenience_provisioned").write_text("shortcut=yes\r\nautostart=yes\r\n",
                                                                  encoding="ascii")
 
