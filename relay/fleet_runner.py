@@ -335,6 +335,21 @@ FOLLOW_UP_PROMPT = ("【ユーザーからの追加指示】%s\n"
                     "最初からやり直す必要はありません。"
                     + CLOSING_INSTRUCTION)
 
+#: Same follow-up mechanics, but honest about authorship for the ONE case this channel also
+#: carries that is not a human steer: relay_fleet._inject_unlock's own recovery payload,
+#: redelivered here because the worker it was meant for had already gone TERMINAL (stuck) by
+#: the time it was ready to resume. FOLLOW_UP_PROMPT's "【ユーザーからの追加指示】" ("additional
+#: instruction FROM THE USER") is true for a real steer and false for that payload -- and a
+#: false "from the user" label wrapped around text that hands over a password and directs a
+#: tool call is exactly what a safety-aligned model should treat as an injection and refuse.
+#: See relay_fleet.is_recovery_payload / SYSTEM_RECOVERY_PREFIX for the same distinction made
+#: on the sibling channel (steer_msgs); this is the follow-up channel's copy of it.
+SYSTEM_RECOVERY_FOLLOW_UP_PROMPT = (
+    "【システムからの運用連絡(このマシン上の自動復旧機構が生成した内容。ユーザー発言ではありません)】%s\n"
+    "直前までの作業内容を踏まえ、上記の運用上の指示にだけ従ってください。"
+    "最初からやり直す必要はありません。"
+    + CLOSING_INSTRUCTION)
+
 def _follow_up(worker, text, enqueue, say):
     """Queue the message as a new goal continuing `worker`'s conversation. True if queued.
 
@@ -354,7 +369,18 @@ def _follow_up(worker, text, enqueue, say):
             % worker.name)
         return False
     try:
-        enqueue({"text": FOLLOW_UP_PROMPT % text,
+        from relay.relay_fleet import is_recovery_payload as _is_recovery
+    except Exception:
+        _is_recovery = None
+    template = FOLLOW_UP_PROMPT
+    if _is_recovery is not None:
+        try:
+            if _is_recovery(text):
+                template = SYSTEM_RECOVERY_FOLLOW_UP_PROMPT
+        except Exception:
+            pass
+    try:
+        enqueue({"text": template % text,
                  "follow_up_to": goal,
                  "priority": True,
                  "cwd": getattr(worker, "cwd", "") or ""})
@@ -3242,8 +3268,20 @@ def main():
                                                  queued=len(add_box or []),
                                                  reunlock=reunlock_box[0],
                                                  command_rejections=rejections_box))
-        except Exception:
-            pass
+        except Exception as _status_exc:
+            # SILENT HERE USED TO MEAN INVISIBLE, AND task_router.fleet_is_live() TRUSTED THE
+            # FILE'S MTIME TO MEAN THE PROCESS. `_write_atomic`'s own docstring says a write
+            # that truly cannot land is "a real failure ... never a silent skip" and re-raises
+            # after its retry deadline -- but this bare `except: pass` caught that re-raise and
+            # threw it away, so a run wedged on a losing PermissionError race or a starved disk
+            # kept sweeping with live workers while status.json's mtime simply stopped moving.
+            # Measured 2026-09-25: exactly that let a live 41-worker run go undetected past
+            # FLEET_LIVE_MAX_AGE_S and a second fleet_runner started on top of it. Printing (a)
+            # gives the run's own log a trace of what happened instead of a wordless gap, and
+            # (b) does not change the non-fatal behaviour -- a status write must never be able
+            # to take the run down, so we still swallow and continue.
+            print("[status] WARN: could not write status.json this sweep: %s" % _status_exc,
+                  flush=True)
         _print_table(workers)
 
     from playwright.sync_api import sync_playwright
