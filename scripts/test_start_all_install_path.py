@@ -80,7 +80,7 @@ _FUNCS = ["Env-Value", "Get-UpdateCheckSkipReason", "Get-ParentProcessInfo",
           "Save-StartAllRunLines",
           "Get-FleetResumeSkipReason", "Get-ThisCheckoutFleetCoordinatorPids",
           "Resolve-DevTunnelExe", "Invoke-DevTunnelBounded", "Get-TunnelLoginState",
-          "Get-TunnelHostCount", "Test-TunnelServing", "ConvertFrom-UiStaleLines",
+          "Get-TunnelHostCount", "Test-TunnelServing", "Get-BridgePollAttempts", "ConvertFrom-UiStaleLines",
           "Get-UiBuildState", "Invoke-UiStep", "Write-StartupSummary",
           "Test-ShouldNotifyStartupFailures", "Send-StartupFailureNotice",
           "Ensure-ConvenienceProvisioning", "Test-ShortcutTargetsWscript", "Test-WshDisabled",
@@ -656,6 +656,26 @@ $runOutcome = $(if ($script:startupFailures.Count -gt 0) { "failures" } elseif (
     assert lines[0] == "failures=0"
     assert "unclear=1" in lines
     assert any(l.startswith("? could not tell whether devtunnel is signed in") for l in lines), lines
+
+
+# =============================================================== sandbox finding: bridge poll skip
+
+@pytest.mark.parametrize("impl_url,expected", [
+    ("", 0),                                  # unset -> the child can never serve /conv: skip the poll
+    ("http://127.0.0.1:9222/agent", 8),       # configured -> keep the full ~16s budget
+])
+def test_bridge_poll_attempts_is_zero_only_when_agent_url_is_unset(tmp_path, checkout, functions, impl_url, expected):
+    """Sandbox measurement, 2026-09-24: on a fresh install that stopped after the Dev Tunnel
+    step (MCP_IMPL_AGENT_URL never set), start_bridge.ps1's child exits at once on every single
+    relaunch of the -Keepalive wrapper -- :8765/conv can NEVER come up, so polling it for the
+    full ~16s on every start_all run (measured: 2 runs x ~16s in the sandbox) waited out a
+    precondition already known false before the loop started. A configured machine must still
+    get the full budget -- a slow first Edge bring-up is real and this must not shortcut it."""
+    body = r"""
+Get-BridgePollAttempts %s
+""" % _q(impl_url)
+    r = _ps(tmp_path, _driver(functions, checkout, body))
+    assert r.stdout.strip().splitlines()[-1].strip() == str(expected), r.stdout
 
 
 # =============================================================== D27: UI exes vs their sources

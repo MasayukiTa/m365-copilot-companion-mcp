@@ -437,7 +437,13 @@ function Invoke-StartAllEntry {
     while ($true) {
         $holder = Read-StartAllRoleRecord "holder"
         if ($holder -or ((Get-Date) -ge $deadline)) { break }
-        Start-Sleep -Milliseconds 100
+        # 25ms, not 100ms: a leaver's whole budget is LEAVE_BOUND_SEC (3s, see
+        # test_start_all_ten_clicks.py), and the holder record is normally written within a
+        # few ms of the holder taking the lock -- polling at 100ms granularity could add up
+        # to 75ms of pure rounding to a step that is supposed to be near-instant, on top of
+        # the same rounding in the waiter-record loop below. Tightened 2026-09-24 (CI:
+        # leaver_max_s 3.08s > the 3.0s bound) rather than raising the bound.
+        Start-Sleep -Milliseconds 25
     }
     $holderMode = ""
     if ($holder) { $holderMode = [string]$holder.mode; $script:busyHolderPid = [int]$holder.pid }
@@ -455,7 +461,7 @@ function Invoke-StartAllEntry {
                 # The waiter took its slot a moment ago and may not have written its record yet;
                 # without it there is no banner to bring forward (measured: 1 in 8 got the notice).
                 while (-not (Read-StartAllRoleRecord "waiter") -and ((Get-Date) -lt $deadline)) {
-                    Start-Sleep -Milliseconds 100
+                    Start-Sleep -Milliseconds 25
                 }
             }
         } catch { $act = "wait" }
@@ -915,6 +921,21 @@ function Env-Value([string]$key) {
         }
     } catch { }
     return ""
+}
+
+function Get-BridgePollAttempts([string]$ImplAgentUrl, [int]$MaxAttempts = 8) {
+    # PURE. How many times the new-bridge branch below should poll :8765/conv before giving
+    # up. start_bridge.ps1's own child exits at once with "No agent page. Set
+    # MCP_IMPL_AGENT_URL..." whenever that key is empty (see the -Keepalive wrapper comment
+    # at the call site) -- the wrapper then just keeps relaunching the same dead child forever,
+    # so /conv can NEVER come up. Polling the full $MaxAttempts * 2s in that state (measured:
+    # ~16s, every start_all run, on any machine that has not yet finished Copilot Studio setup
+    # -- e.g. a fresh install that stopped after the Dev Tunnel step) waits out a precondition
+    # already known false at the top of this function, not a fluke that a retry could catch.
+    # A machine WITH the URL set still gets the full budget: a slow first-run Edge bring-up
+    # plus a Python import is a real, sometimes-slow startup this must not shortcut.
+    if (-not $ImplAgentUrl) { return 0 }
+    return $MaxAttempts
 }
 
 function Show-OwnedDialog([string]$body, [string]$title, [string]$buttons, [string]$icon) {
@@ -2626,14 +2647,21 @@ function Invoke-Startup {
         # 3s, so the process is "still running" while nothing serves. /conv is the same
         # liveness signal this whole block already keys on, so that is what is checked. The
         # first-start Edge bring-up plus a Python import needs a few seconds before /conv can
-        # answer, so this polls rather than probing once.
+        # answer, so this polls rather than probing once -- UNLESS MCP_IMPL_AGENT_URL is empty,
+        # in which case the child cannot ever serve /conv (see Get-BridgePollAttempts) and the
+        # poll is skipped outright rather than waiting out the full ~16s on every single start.
+        $bridgePollAttempts = Get-BridgePollAttempts (Env-Value "MCP_IMPL_AGENT_URL")
         $bridgeUp = $false
-        for ($bi = 0; $bi -lt 8; $bi++) {
+        for ($bi = 0; $bi -lt $bridgePollAttempts; $bi++) {
             Start-Sleep -Seconds 2
             if (Http-Up "http://127.0.0.1:8765/conv") { $bridgeUp = $true; break }
         }
         if (-not $bridgeUp) {
-            $why = "bridge: started but :8765/conv did not answer within ~16s"
+            if ($bridgePollAttempts -eq 0) {
+                $why = "bridge: not polled -- MCP_IMPL_AGENT_URL is empty, so start_bridge.ps1 exits at once and :8765/conv can never answer"
+            } else {
+                $why = "bridge: started but :8765/conv did not answer within ~16s"
+            }
             try {
                 if (Test-Path "$bridgeLog.err") {
                     $brLines = @(Get-Content "$bridgeLog.err" -Tail 5 -ErrorAction Stop |

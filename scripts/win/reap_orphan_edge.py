@@ -126,20 +126,63 @@ def owner_alive(pattern):
     return out.isdigit() and int(out) > 0
 
 
-def browser_procs(profile):
-    """(count, total MB) for every Edge process on `profile`, children included."""
-    pred = "$_.CommandLine -and $_.CommandLine -match '%s'" % _profile_dir_regex(profile)
-    script = ("$p = Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | "
-              "Where-Object { %s }; "
-              "\"{0} {1}\" -f @($p).Count, [int](($p | "
-              "Measure-Object WorkingSetSize -Sum).Sum / 1MB)" % pred)
+#: Cache of every msedge.exe process's (CommandLine, WorkingSetSize-in-bytes), populated by
+#: the FIRST call to browser_procs() in a run and reused by the rest. None = not fetched yet;
+#: _PS_FAILED = fetched and PowerShell could not answer. reset_edge_process_cache() clears it
+#: (used by survey() so a fresh process table is read on the next call, and by tests).
+#:
+#: WHY. survey() calls browser_procs() once per entry in OWNERS (3 profiles today) -- and on
+#: an ordinary sandbox/fresh-PC run NONE of them have a browser yet, so all 3 calls used to
+#: spawn their own `powershell -NoProfile -Command Get-CimInstance ...` process just to learn
+#: "0". Sandbox measurement, 2026-09-24: this alone was 2 of the 3 powershell.exe cold starts
+#: paid by every start_all run's fleet_resume_and_reaper phase for no information gained --
+#: one combined query (grouped locally in Python instead of once per profile in PowerShell)
+#: answers every profile from a single process-table read.
+_EDGE_PROC_CACHE = None
+
+
+def reset_edge_process_cache():
+    global _EDGE_PROC_CACHE
+    _EDGE_PROC_CACHE = None
+
+
+def _fetch_all_msedge_procs():
+    """[(CommandLine, WorkingSetSize bytes), ...] for every msedge.exe process, or
+    `_PS_FAILED` if PowerShell could not answer. One process-table read for every profile
+    browser_procs() is asked about, instead of one PER profile."""
+    script = ("Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | "
+              "ForEach-Object { \"{0}`t{1}\" -f $_.CommandLine, $_.WorkingSetSize }")
     out = _ps(script)
     if out is _PS_FAILED:
+        return _PS_FAILED
+    rows = []
+    for line in out.splitlines():
+        line = line.rstrip("\r")
+        if not line.strip():
+            continue
+        cmd, sep, ws = line.rpartition("\t")
+        if not sep:
+            continue
+        try:
+            rows.append((cmd, int(ws)))
+        except ValueError:
+            continue
+    return rows
+
+
+def browser_procs(profile):
+    """(count, total MB) for every Edge process on `profile`, children included."""
+    global _EDGE_PROC_CACHE
+    if _EDGE_PROC_CACHE is None:
+        _EDGE_PROC_CACHE = _fetch_all_msedge_procs()
+    procs = _EDGE_PROC_CACHE
+    if procs is _PS_FAILED:
         return 0, 0
-    parts = out.split()
-    if len(parts) == 2 and parts[0].isdigit() and parts[1].lstrip("-").isdigit():
-        return int(parts[0]), int(parts[1])
-    return 0, 0
+    rx = re.compile(_profile_dir_regex(profile))
+    matched = [ws for cmd, ws in procs if cmd and rx.search(cmd)]
+    if not matched:
+        return 0, 0
+    return len(matched), int(sum(matched) / (1024 * 1024))
 
 
 def stop_profile(profile):
@@ -156,6 +199,7 @@ def stop_profile(profile):
 
 def survey(include_bridge=False):
     """What is running, who owns it, and is that owner alive. Pure reporting."""
+    reset_edge_process_cache()
     rows = []
     for profile, (who, pattern) in OWNERS.items():
         procs, mb = browser_procs(profile)
