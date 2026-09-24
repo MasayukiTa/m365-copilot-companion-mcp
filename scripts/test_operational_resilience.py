@@ -595,7 +595,10 @@ def test_auth_ok_end_to_end_means_more_than_not_401():
 
     auth = doctor[doctor.index('Check "auth_bearer"'):]
     auth = auth[:auth.index("Write-Host")]
-    assert "$noKey = Mcp-Status @{}" in auth, "nothing checks that a missing key is refused"
+    # The no-key probe carries doctor's self-test marker so main.py does not count it as a key
+    # mismatch (tests/test_doctor_self_test_is_not_a_key_mismatch.py); it still sends no key.
+    assert "$noKey = Mcp-Status @{ 'X-MCP-Self-Test' = 'doctor' }" in auth, \
+        "nothing checks that a missing key is refused"
     assert "($noKey -eq 401) -or ($noKey -eq 403)" in auth
     assert "$withKey -ge 200" in auth and "$withKey -lt 500" in auth, "5xx passes again"
     assert "$withKey -ne 404" in auth

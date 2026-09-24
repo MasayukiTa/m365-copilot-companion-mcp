@@ -779,11 +779,13 @@ if ($null -eq $existingNames) {
 # would rewrite .env and silently break an already-configured Copilot Studio
 # connector pointing at the old URL -- UNLESS that recorded (or explicitly passed)
 # name is itself identifying, in which case privacy wins (see the guard below).
+$tunnelNameSource = ""
+if ($TunnelName) { $tunnelNameSource = "the -TunnelName parameter" }
 if (-not $TunnelName) {
     $envPath0 = Join-Path $root ".env"
     if (Test-Path $envPath0) {
         foreach ($ln in Get-Content $envPath0 -Encoding UTF8) {
-            if ($ln -match '^MCP_TUNNEL_NAME=(.+)$') { $TunnelName = $matches[1].Trim(); break }
+            if ($ln -match '^MCP_TUNNEL_NAME=(.+)$') { $TunnelName = $matches[1].Trim(); $tunnelNameSource = ".env (MCP_TUNNEL_NAME)"; break }
         }
     }
 }
@@ -839,6 +841,56 @@ if ($TunnelName) {
     $reuse = $true
 } else {
     $target = $safeDefault
+}
+
+# NEVER ADOPT A TUNNEL ANOTHER MACHINE IS HOSTING RIGHT NOW (2026-09-24). "In this account's list"
+# is all the reuse above asks, and with one Microsoft account signed in on two PCs every tunnel
+# of either PC is in the list. Measured that day: a second PC hosted the first PC's tunnel, the
+# first PC's re-host was knocked off 27 s after it connected, and every call to the first PC's
+# URL went to the second PC. Two hosts on one tunnel cannot both be served; the one that took it
+# last wins until the other takes it back.
+#
+# So a tunnel that `devtunnel show` reports as hosted (Host connections >= 1) while no devtunnel
+# host on THIS machine hosts it is not adopted, whether its name came from .env (carried from
+# the other PC or not), the -TunnelName parameter, or the bare legacy default. This machine gets
+# its own default instead, and the run says so. This machine's OWN default names (current and
+# pre-D22 suffix) are exempt: they are this machine's by construction, so another host on them
+# is the other PC borrowing this one's tunnel, not a reason for this one to move. A count that
+# cannot be read is not evidence of anything and changes nothing.
+function Get-HostConnectionsFromShow([string[]]$showOutput) {
+    # PURE. The "Host connections : N" count from `devtunnel show`, or $null.
+    foreach ($l in @($showOutput)) {
+        if ($l -match '(?i)^\s*Host connections\s*:\s*(\d+)') { return [int]$matches[1] }
+    }
+    return $null
+}
+function Test-IsTunnelHostCommandLine([string]$CommandLine, [string]$Name) {
+    # PURE. `devtunnel host <name>` for this tunnel (bare id, with or without ".<cluster>").
+    # supervisor.ps1 carries the same rule; scripts/test_tunnel_served_by_another_pc.py runs both.
+    if (-not $CommandLine -or -not $Name) { return $false }
+    if ($CommandLine -notmatch '(?i)devtunnel(\.exe|\.cmd)?"?\s+host\s') { return $false }
+    $bare = (($Name -split '\.')[0]).ToLowerInvariant()
+    if (-not $bare) { return $false }
+    return ($CommandLine -match ('(?i)\shost\s+"?' + [regex]::Escape($bare) + '(\.[a-z0-9]+)?("|\s|$)'))
+}
+function Test-ThisMachineHostsTunnel([string]$name) {
+    $hosts = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+               Where-Object { Test-IsTunnelHostCommandLine ([string]$_.CommandLine) $name })
+    return ($hosts.Count -gt 0)
+}
+if ($reuse -and ($target -ne $safeDefault) -and ($target -ne $legacyDefault)) {
+    $hostCount = Get-HostConnectionsFromShow (Dt show $target)
+    if ($null -ne $hostCount -and $hostCount -ge 1 -and -not (Test-ThisMachineHostsTunnel $target)) {
+        $from = ""
+        if ($tunnelNameSource -and ($target -eq $TunnelName)) { $from = " (the name came from $tunnelNameSource)" }
+        Write-Host "[3/4] '$target' is in your account, but ANOTHER machine is hosting it right now${from}:" -ForegroundColor Yellow
+        Write-Host "      the relay reports $hostCount host connection(s) and no devtunnel host on this PC." -ForegroundColor Yellow
+        Write-Host "      Adopting it would make both PCs take turns serving one URL, so this PC gets its own" -ForegroundColor Yellow
+        Write-Host "      tunnel '$safeDefault' instead. Paste THIS PC's new URL (printed below) into the" -ForegroundColor Yellow
+        Write-Host "      Copilot Studio connector that should reach this PC; the other PC keeps '$target'." -ForegroundColor Yellow
+        $target = $safeDefault
+        $reuse = ($existingNames -contains $safeDefault)
+    }
 }
 
 if ($reuse) {

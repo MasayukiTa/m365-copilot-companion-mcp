@@ -636,6 +636,38 @@ TunnelCheck "tunnel_serving" "Dev Tunnel host serving (public URL -> THIS server
         $probe.Ok
     } `
     "the tunnel exists but is not being served -- run start_all.bat (the supervisor hosts it). If this stays red while the checks above are green, MCP_TUNNEL_URL in .env may be stale -- compare it to the URL shown by 'devtunnel show <name>'."
+# WHAT THE SUPERVISOR CONCLUDED. When another PC hosts this PC's tunnel, the probe above sees only
+# a timeout ("no answer from the public URL") -- measured 2026-09-24 -- which reads like "not
+# hosted" and sends the operator to start_all, i.e. to re-host, which is the fight the supervisor
+# now refuses. The supervisor can tell the two apart (the relay's host count vs. a host process
+# of this machine) and writes its verdict to .fleet\tunnel_host.json. Trusted only while the
+# supervisor that wrote it is alive, so a file left by a dead one cannot speak for the present.
+function Get-SupervisorTunnelVerdict {
+    try {
+        $p = Join-Path $repo ".fleet\tunnel_host.json"
+        if (-not (Test-Path -LiteralPath $p)) { return $null }
+        $j = Get-Content -LiteralPath $p -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if (-not $j -or -not $j.supervisor_pid) { return $null }
+        $sp = Get-CimInstance Win32_Process -Filter ("ProcessId=" + [int]$j.supervisor_pid) -ErrorAction SilentlyContinue
+        if (-not $sp -or ([string]$sp.CommandLine) -notlike "*supervisor.ps1*") { return $null }
+        return $j
+    } catch { return $null }
+}
+$script:supTunnel = Get-SupervisorTunnelVerdict
+if ($script:supTunnel -and ($script:supTunnel.state -eq "foreign" -or $script:supTunnel.state -eq "shared")) {
+    $lr = $script:results[-1]
+    if ($lr.id -eq "tunnel_serving" -and -not $lr.skipped) {
+        $probeWhy = $script:tunnelServingWhy
+        $script:tunnelServingWhy = ([string]$script:supTunnel.message + " To fix: " + [string]$script:supTunnel.action)
+        if ($probeWhy) { $script:tunnelServingWhy += (" [the probe itself saw: " + $probeWhy + "]") }
+        if ($lr.ok) {
+            # The probe got through (to this PC, this time) but the supervisor sees another host:
+            # say so, without turning a passing check red on the supervisor's word alone.
+            Write-Host ("         note (supervisor): " + $script:tunnelServingWhy) -ForegroundColor Yellow
+        }
+    }
+}
+
 # SAY WHY. The fixed advice above is for "not hosted"; a relay page or a second host needs a
 # different action, and the probe knows which it saw.
 $lastResult = $script:results[-1]
@@ -942,7 +974,11 @@ Check "auth_bearer" "Auth OK end-to-end (Bearer accepted on /mcp)" `
     {
         $key = $envv['MCP_API_KEY']; if (-not $key) { return $false }
         $withKey = Mcp-Status @{ Authorization = ("Bearer " + $key) }
-        $noKey = Mcp-Status @{}
+        # MARKED AS doctor's OWN. main.py counts a marked, loopback, unforwarded rejection as
+        # self_test_rejections_10m instead of auth_fail_10m: this probe is refused on purpose on
+        # every run, and counting it as a key mismatch turned the cockpit's server dot amber
+        # ("suspect MCP_API_KEY mismatch") from doctor alone -- auth_fail_10m measured 14-16.
+        $noKey = Mcp-Status @{ 'X-MCP-Self-Test' = 'doctor' }
         $script:authWithKey = $withKey
         $script:authNoKey = $noKey
         # MEASURED against this server: a correct key answers 400 -- the probe body is not a full

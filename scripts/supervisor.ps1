@@ -7,6 +7,9 @@
     1. The MCP server process dies        -> port 8000 stops responding -> restart it
     2. The Dev Tunnel host *silently drops* -> the devtunnel process stays alive but
        "Host connections" falls to 0 -> kill the stale host and re-host.
+    And one it must NOT fix by re-hosting: another PC hosting this PC's tunnel (connections >= 1,
+    no host of ours) -> reported in the log and .fleet\tunnel_host.json; see
+    Resolve-TunnelHostingState.
 
   Checking only whether the processes exist is NOT enough -- the tunnel host can be a
   live process with zero relay connections, which is exactly the state that breaks
@@ -503,12 +506,291 @@ function Test-PortListening {
     } catch { return $false }
 }
 
-function Test-TunnelHosting {
+function Get-TunnelHostConnections {
+    # The relay's "Host connections" count for $TunnelName, or $null when `devtunnel show` gave
+    # no readable count (offline, CLI hiccup). $null is treated like 0 by the callers, as the
+    # old boolean check always did.
     $out = & $DevTunnel show $TunnelName 2>$null | Out-String
-    if ($out -match 'Host connections\s*:\s*(\d+)') {
-        return ([int]$Matches[1]) -ge 1
+    if ($out -match 'Host connections\s*:\s*(\d+)') { return [int]$Matches[1] }
+    return $null
+}
+
+function Test-TunnelHosting {
+    # Does ANYBODY host the tunnel. Not the question the main loop asks any more -- see
+    # Resolve-TunnelHostingState -- but still the right one while a host we just launched is
+    # registering (Start-TunnelHost, which also requires that host to be alive).
+    $c = Get-TunnelHostConnections
+    return ($null -ne $c -and $c -ge 1)
+}
+
+# -- WHOSE HOST IS SERVING THIS PC'S TUNNEL (2026-09-24) ------------------------------------------
+# "Host connections >= 1" answers "does anybody host it", and the supervisor read that as "we
+# host it". Measured 2026-09-24 08:31-08:48: a second PC signed in to the same account hosted
+# THIS PC's tunnel. This PC's re-host "established" at 08:34:23 (the count was the other PC's),
+# exited 27 s later, and from then on the count stayed 1, so the supervisor saw "hosting" and
+# did nothing, while every request to this PC's URL went to the other PC and the cockpit's
+# tunnel dot was red. Re-hosting would not have helped either: two machines re-hosting one
+# tunnel knock each other off in a loop.
+#
+# THE QUESTION IS NOW THE COCKPIT'S: is THIS machine's server reachable through this tunnel --
+# GET <tunnel>/health answering with the pid our loopback /health reports (main.py's /health
+# returns {status, server_pid} to an unauthenticated tunnel caller, which is enough). And the
+# answer has three shapes that want three different responses:
+#   ours     the tunnel answers with our pid, or a devtunnel host of OURS is running and nothing
+#            contradicts it -> fine.
+#   none     nobody hosts it -> re-host after the debounce, exactly as before.
+#   foreign  it is hosted, but not by a host process of this machine -> ANOTHER PC is serving
+#            this PC's tunnel. Do not fight: say so once in the log and in .fleet\tunnel_host.json
+#            (which doctor reads), with what to do. When the other PC lets go the count falls to 0
+#            and this PC re-hosts by itself.
+#   shared   our host runs, but the tunnel answered with ANOTHER pid -> the relay is splitting the
+#            calls between this PC and another. Same response as foreign.
+function Test-IsTunnelHostCommandLine {
+    # PURE. `devtunnel host <name>` for THIS tunnel: the host verb followed by the tunnel's bare
+    # id as a whole token (with or without its ".<cluster>" suffix) -- so "abc" does not claim
+    # "abc-2". setup_devtunnel.ps1 carries the same rule (Test-IsTunnelHostCommandLine), and
+    # scripts/test_tunnel_served_by_another_pc.py runs both on the same command lines.
+    param([string]$CommandLine, [string]$Name)
+    if (-not $CommandLine -or -not $Name) { return $false }
+    if ($CommandLine -notmatch '(?i)devtunnel(\.exe|\.cmd)?"?\s+host\s') { return $false }
+    $bare = Get-BareTunnelName $Name
+    if (-not $bare) { return $false }
+    return ($CommandLine -match ('(?i)\shost\s+"?' + [regex]::Escape($bare) + '(\.[a-z0-9]+)?("|\s|$)'))
+}
+
+function Test-OurTunnelHostRunning {
+    # A devtunnel host for $TunnelName running ON THIS MACHINE: the one this supervisor launched,
+    # or any devtunnel.exe whose command line hosts this tunnel (a host started by hand, or by
+    # setup_devtunnel.ps1).
+    if ($script:TunnelHostProc) {
+        try {
+            $script:TunnelHostProc.Refresh()
+            if (-not $script:TunnelHostProc.HasExited) { return $true }
+        } catch { }
     }
-    return $false
+    $mine = @(Get-CimInstance Win32_Process -Filter "Name='devtunnel.exe'" -ErrorAction SilentlyContinue |
+              Where-Object { Test-IsTunnelHostCommandLine ([string]$_.CommandLine) $TunnelName })
+    return ($mine.Count -gt 0)
+}
+
+function Get-EnvTunnelUrl {
+    try {
+        $envp = Join-Path $Root ".env"
+        if (Test-Path $envp) {
+            $m = (Get-Content $envp | Where-Object { $_ -match '^\s*MCP_TUNNEL_URL\s*=' } | Select-Object -First 1)
+            if ($m) { return ($m -replace '^\s*MCP_TUNNEL_URL\s*=\s*', '').Trim() }
+        }
+    } catch { }
+    return ""
+}
+
+function Get-TunnelOrigin {
+    # PURE. MCP_TUNNEL_URL points at /mcp; /health is a sibling at the origin (the cockpit and
+    # doctor make the same correction).
+    param([string]$TunnelUrl)
+    if (-not $TunnelUrl) { return "" }
+    try { return ([Uri]$TunnelUrl).GetLeftPart([UriPartial]::Authority) } catch { return "" }
+}
+
+function Get-HealthPidAt {
+    # The server_pid a /health URL answers with, or $null (no answer, not a 200, a redirect to a
+    # sign-in page, or not main.py's JSON). No redirects: a relay sign-in page is not the server.
+    param([string]$Url, [int]$TimeoutMs = 6000)
+    if (-not $Url) { return $null }
+    try {
+        $req = [System.Net.HttpWebRequest]::Create($Url)
+        $req.Method = "GET"; $req.Timeout = $TimeoutMs; $req.ReadWriteTimeout = $TimeoutMs
+        $req.AllowAutoRedirect = $false
+        $req.Headers.Add("X-Tunnel-Skip-AntiPhishing-Page", "true")
+        $resp = $req.GetResponse()
+        $code = [int]$resp.StatusCode
+        $body = $null
+        try { $body = (New-Object System.IO.StreamReader($resp.GetResponseStream())).ReadToEnd() } finally { $resp.Close() }
+        if ($code -ne 200) { return $null }
+        return (Get-HealthServerPid $body)
+    } catch {
+        return $null
+    }
+}
+
+function Resolve-TunnelHostingState {
+    # PURE. See the block comment above for what each answer means.
+    param($Connections, [bool]$OurHostRunning, $LocalPid, $TunnelPid)
+    if ($LocalPid -and $TunnelPid -and ([int]$TunnelPid -eq [int]$LocalPid)) { return "ours" }
+    if ($null -eq $Connections -or [int]$Connections -lt 1) { return "none" }
+    if ($OurHostRunning) {
+        if ($LocalPid -and $TunnelPid) { return "shared" }
+        return "ours"
+    }
+    return "foreign"
+}
+
+# THE PROBE THROUGH THE TUNNEL IS BOUNDED. It is a remote round trip (up to 6 s), and in exactly
+# the state it matters most -- another PC serving the URL -- it can time out on every tick. After
+# a probe that got no answer the next one waits 1, 2, 4 ... ticks, capped at
+# $script:TunnelProbeBackoffMax (40 ticks, about 10 minutes); an answer resets it. The relay's
+# connection count is still read every tick, so "the other PC let go" is seen at once.
+$script:TunnelProbeSkip = 0
+$script:TunnelProbeBackoff = 1
+$script:TunnelProbeBackoffMax = 40
+
+function Reset-TunnelProbeBackoff {
+    $script:TunnelProbeSkip = 0
+    $script:TunnelProbeBackoff = 1
+}
+
+function Get-TunnelServerPidBounded {
+    if ($script:TunnelProbeSkip -gt 0) { $script:TunnelProbeSkip--; return $null }
+    $origin = Get-TunnelOrigin (Get-EnvTunnelUrl)
+    if (-not $origin) { return $null }
+    $p = Get-HealthPidAt ($origin + "/health") 6000
+    if ($null -eq $p) {
+        $script:TunnelProbeSkip = $script:TunnelProbeBackoff
+        $script:TunnelProbeBackoff = [int][math]::Min($script:TunnelProbeBackoff * 2, $script:TunnelProbeBackoffMax)
+    } else {
+        Reset-TunnelProbeBackoff
+    }
+    return $p
+}
+
+# THE STATUS FILE doctor reads (.fleet\tunnel_host.json; .fleet is gitignored). Written only when
+# the state or its wording changes -- not every tick -- atomically (temp file + move), no BOM.
+# supervisor_pid lets a reader tell a live answer from one a dead supervisor left behind.
+$script:TunnelStatusPath = Join-Path $Root ".fleet\tunnel_host.json"
+$script:TunnelStatusKey = ""
+
+function Get-TunnelHostingAdvice {
+    # PURE. @{ Message; Action } in plain words for a state.
+    param([string]$State, [string]$Name, $Connections, $LocalPid, $TunnelPid)
+    switch ($State) {
+        "foreign" {
+            return @{
+                Message = ("Another PC is serving this PC's tunnel '" + $Name + "': the relay reports " +
+                           $Connections + " host connection(s) and no devtunnel host of this PC is running, " +
+                           "so calls to this PC's URL go to that PC, not to this one. This supervisor will " +
+                           "not fight it for the tunnel (two PCs re-hosting one tunnel knock each other off).")
+                Action  = ("On the OTHER PC run quickstart.bat so it creates its own tunnel (and paste that " +
+                           "PC's new URL into its own Copilot Studio connector); then on THIS PC run " +
+                           "start_all.bat. This PC takes its tunnel back by itself as soon as the other PC " +
+                           "stops hosting it.")
+            }
+        }
+        "shared" {
+            return @{
+                Message = ("This PC hosts its tunnel '" + $Name + "', but so does another PC: the public URL " +
+                           "answered from server pid " + $TunnelPid + ", while this PC's server is pid " +
+                           $LocalPid + ", so the relay splits the calls between the two PCs.")
+                Action  = ("On the OTHER PC run quickstart.bat so it creates its own tunnel (and paste that " +
+                           "PC's new URL into its own Copilot Studio connector); then on THIS PC run " +
+                           "start_all.bat.")
+            }
+        }
+        "none" {
+            return @{ Message = ("Nobody is hosting this PC's tunnel '" + $Name + "'; the supervisor re-hosts it.")
+                      Action  = "" }
+        }
+        default {
+            return @{ Message = ("This PC is serving its tunnel '" + $Name + "'."); Action = "" }
+        }
+    }
+}
+
+function Set-TunnelHostStatus {
+    param([string]$State, $Connections, [bool]$OurHostRunning, $LocalPid, $TunnelPid)
+    $advice = Get-TunnelHostingAdvice -State $State -Name $TunnelName -Connections $Connections `
+                                      -LocalPid $LocalPid -TunnelPid $TunnelPid
+    $key = $State + "|" + $TunnelName + "|" + $advice.Message
+    if ($key -eq $script:TunnelStatusKey) { return }
+    try {
+        $dir = Split-Path -Parent $script:TunnelStatusPath
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
+        $doc = [ordered]@{
+            state                = $State
+            tunnel               = $TunnelName
+            since                = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssK")
+            host_connections     = $Connections
+            this_pc_host_running = $OurHostRunning
+            local_server_pid     = $LocalPid
+            tunnel_server_pid    = $TunnelPid
+            message              = $advice.Message
+            action               = $advice.Action
+            supervisor_pid       = $PID
+        }
+        $tmp = $script:TunnelStatusPath + ".tmp"
+        [IO.File]::WriteAllText($tmp, ($doc | ConvertTo-Json -Depth 3), (New-Object System.Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $tmp -Destination $script:TunnelStatusPath -Force -ErrorAction Stop
+        $script:TunnelStatusKey = $key
+    } catch { }
+}
+
+$script:TunnelState = ""
+$script:ForeignStreak = 0
+
+function Invoke-TunnelHostingCheck {
+    # One tick of tunnel management, once devtunnel is known to be logged in. Uses the main
+    # loop's $tunnelMiss / $loggedIn (script scope).
+    $conn = Get-TunnelHostConnections
+    $ourHost = $false
+    $localPid = $null
+    $tunnelPid = $null
+    if ($null -ne $conn -and $conn -ge 1) {
+        $ourHost = Test-OurTunnelHostRunning
+        $localPid = Get-HealthPidAt "http://127.0.0.1:$Port/health" 5000
+        $tunnelPid = Get-TunnelServerPidBounded
+    }
+    $state = Resolve-TunnelHostingState -Connections $conn -OurHostRunning $ourHost `
+                                        -LocalPid $localPid -TunnelPid $tunnelPid
+    $wasContested = ($script:TunnelState -eq "foreign" -or $script:TunnelState -eq "shared")
+
+    if ($state -eq "foreign" -or $state -eq "shared") {
+        # NOT A MISS: re-hosting is exactly what must not happen here.
+        $script:tunnelMiss = 0
+        $script:ForeignStreak++
+        if ($script:ForeignStreak -lt $FailuresBeforeAction) { return $state }
+        if ($script:TunnelState -ne $state) {
+            $advice = Get-TunnelHostingAdvice -State $state -Name $TunnelName -Connections $conn `
+                                              -LocalPid $localPid -TunnelPid $tunnelPid
+            Write-Log ("tunnel " + $state.ToUpper() + ": " + $advice.Message + " To fix: " + $advice.Action +
+                       " (details: .fleet\tunnel_host.json)")
+        }
+        $script:TunnelState = $state
+        Set-TunnelHostStatus -State $state -Connections $conn -OurHostRunning $ourHost `
+                             -LocalPid $localPid -TunnelPid $tunnelPid
+        return $state
+    }
+
+    $script:ForeignStreak = 0
+    if ($wasContested) {
+        Write-Log ("tunnel no longer served by another PC (now: " + $state + ", host connections = " + $conn + ")")
+    }
+    $script:TunnelState = $state
+    if ($state -eq "ours") {
+        $script:tunnelMiss = 0
+        Set-TunnelHostStatus -State "ours" -Connections $conn -OurHostRunning $ourHost `
+                             -LocalPid $localPid -TunnelPid $tunnelPid
+        return $state
+    }
+
+    # none: nobody hosts it -> the debounce and re-host this loop always did.
+    Set-TunnelHostStatus -State "none" -Connections $conn -OurHostRunning $false -LocalPid $null -TunnelPid $null
+    Clear-DevtunnelLoginCache "tunnel host connections = 0"
+    $script:tunnelMiss++
+    Write-Log "tunnel host connections = 0 ($($script:tunnelMiss)/$FailuresBeforeAction)"
+    if ($script:tunnelMiss -ge $FailuresBeforeAction) {
+        # NEVER RE-HOST ON A CACHED ANSWER. The cache was just dropped, so this asks
+        # the CLI live; only a clear "logged in" lets Start-TunnelHost touch devtunnel.
+        if ($script:DevtunnelLoginAnswerWasCached -and -not (Test-DevtunnelLoggedInCached)) {
+            Write-Log "devtunnel NOT logged in on the live re-check before re-hosting -> tunnel management PAUSED, not re-hosting."
+            $script:loggedIn = $false
+        } else {
+            if (-not (Start-TunnelHost)) {
+                Clear-DevtunnelLoginCache "the re-host did not establish"
+            }
+            Start-Sleep -Seconds 8
+        }
+        $script:tunnelMiss = 0
+    }
+    return $state
 }
 
 function Test-DevtunnelLoggedIn {
@@ -878,14 +1160,41 @@ function Start-TunnelHost {
     # -PASSTHRU SO THE MAIN LOOP CAN SEE THIS HOST EXIT. A host that exits is one of the three
     # events that drop the cached devtunnel login answer (see Test-DevtunnelLoggedInCached).
     $script:TunnelHostProc = $null
-    $script:TunnelHostProc = Start-Process -FilePath $DevTunnel -ArgumentList "host $TunnelName" -WindowStyle Hidden -PassThru
+    Reset-TunnelProbeBackoff
+    # ITS OUTPUT IS KEPT. On 2026-09-24 a host this supervisor launched exited 27 s after it
+    # "established", and the only record was that it had exited: the window was hidden and
+    # nothing was redirected, so whatever devtunnel said about why was gone. The host's output
+    # goes to .setup\logs\devtunnel-host.*.log (gitignored) and the main loop quotes its last
+    # lines when the host exits.
+    $logDir = Join-Path $Root ".setup\logs"
+    $script:TunnelHostOut = Join-Path $logDir "devtunnel-host.out.log"
+    $script:TunnelHostErr = Join-Path $logDir "devtunnel-host.err.log"
+    try {
+        if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force $logDir | Out-Null }
+        $script:TunnelHostProc = Start-Process -FilePath $DevTunnel -ArgumentList "host $TunnelName" -WindowStyle Hidden `
+            -RedirectStandardOutput $script:TunnelHostOut -RedirectStandardError $script:TunnelHostErr -PassThru
+    } catch {
+        Write-Log "devtunnel host output could not be redirected ($($_.Exception.Message)); starting without it"
+        $script:TunnelHostOut = $null
+        $script:TunnelHostErr = $null
+        $script:TunnelHostProc = Start-Process -FilePath $DevTunnel -ArgumentList "host $TunnelName" -WindowStyle Hidden -PassThru
+    }
     Write-Log "devtunnel host starting for $TunnelName (bin=$DevTunnel) ..."
     # A freshly-started host can take 15-30s to register with the relay. Block until it
     # actually shows >=1 connection (up to ~50s) so the monitor loop never kills a host
     # that is still in the middle of connecting (which would cause a restart churn loop).
     # RETURNS WHETHER IT ESTABLISHED: a re-host that does not is the third invalidation event.
+    # AND THE CONNECTION MUST BE OURS: a count of 1 while another PC hosts this tunnel said
+    # "established" on 2026-09-24 for a host that exited seconds later. So the host we launched
+    # must still be alive when the count is read, and if it exits first that is the answer.
     for ($i = 0; $i -lt 25; $i++) {
         Start-Sleep -Seconds 2
+        $exited = $false
+        try { $script:TunnelHostProc.Refresh(); $exited = $script:TunnelHostProc.HasExited } catch { $exited = $true }
+        if ($exited) {
+            Write-Log ("devtunnel host exited while starting" + (Get-TunnelHostExitDetail) + " (will retry next cycle)")
+            return $false
+        }
         if (Test-TunnelHosting) {
             Write-Log "devtunnel host established (after ~$([int](($i + 1) * 2))s)"
             return $true
@@ -895,6 +1204,28 @@ function Start-TunnelHost {
     return $false
 }
 $script:TunnelHostProc = $null
+$script:TunnelHostOut = $null
+$script:TunnelHostErr = $null
+
+function Get-TunnelHostExitDetail {
+    # " (code N; it said: ...)" for the host this supervisor launched, from its exit code and the
+    # last lines it wrote. Empty when nothing is known.
+    $parts = @()
+    try { if ($script:TunnelHostProc) { $parts += ("code " + $script:TunnelHostProc.ExitCode) } } catch { }
+    $said = @()
+    foreach ($f in @($script:TunnelHostErr, $script:TunnelHostOut)) {
+        if (-not $f) { continue }
+        try {
+            if (Test-Path -LiteralPath $f) {
+                $said += @(Get-Content -LiteralPath $f -Tail 3 -ErrorAction Stop | Where-Object { $_.Trim() } |
+                           ForEach-Object { $_.Trim() })
+            }
+        } catch { }
+    }
+    if ($said.Count -gt 0) { $parts += ("it said: " + (($said | Select-Object -Last 3) -join " | ")) }
+    if ($parts.Count -eq 0) { return "" }
+    return (" (" + ($parts -join "; ") + ")")
+}
 
 # ── Fleet coordinator auto-resume ───────────────────────────────────────────────
 # A fleet run (python -m relay.fleet_runner) killed by an unplanned reboot leaves
@@ -1527,6 +1858,10 @@ while ($true) {
             ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
         $TunnelName = $freshTn
         $tunnelMiss = 0
+        # A different tunnel: whatever was concluded about the old one's host does not carry over.
+        $script:ForeignStreak = 0
+        $script:TunnelState = ""
+        Reset-TunnelProbeBackoff
     }
 
     # The reaper, then the queue drain -- see Invoke-FleetReap / Invoke-QueueDrain for why each
@@ -1598,6 +1933,8 @@ while ($true) {
         $hostGone = $true
         try { $script:TunnelHostProc.Refresh(); $hostGone = $script:TunnelHostProc.HasExited } catch { $hostGone = $true }
         if ($hostGone) {
+            # SAY WHAT IT SAID. Exit code and last output lines (see Start-TunnelHost), once.
+            Write-Log ("the devtunnel host this supervisor launched has exited" + (Get-TunnelHostExitDetail))
             Clear-DevtunnelLoginCache "the devtunnel host this supervisor launched has exited"
             $script:TunnelHostProc = $null
         }
@@ -1614,27 +1951,9 @@ while ($true) {
     } else {
         if ($loggedIn -eq $false) { Write-Log "devtunnel now logged in -> resuming tunnel management" }
         $loggedIn = $true
-        if (Test-TunnelHosting) {
-            $tunnelMiss = 0
-        } else {
-            Clear-DevtunnelLoginCache "tunnel host connections = 0"
-            $tunnelMiss++
-            Write-Log "tunnel host connections = 0 ($tunnelMiss/$FailuresBeforeAction)"
-            if ($tunnelMiss -ge $FailuresBeforeAction) {
-                # NEVER RE-HOST ON A CACHED ANSWER. The cache was just dropped, so this asks
-                # the CLI live; only a clear "logged in" lets Start-TunnelHost touch devtunnel.
-                if ($script:DevtunnelLoginAnswerWasCached -and -not (Test-DevtunnelLoggedInCached)) {
-                    Write-Log "devtunnel NOT logged in on the live re-check before re-hosting -> tunnel management PAUSED, not re-hosting."
-                    $loggedIn = $false
-                } else {
-                    if (-not (Start-TunnelHost)) {
-                        Clear-DevtunnelLoginCache "the re-host did not establish"
-                    }
-                    Start-Sleep -Seconds 8
-                }
-                $tunnelMiss = 0
-            }
-        }
+        # ours / none (re-host after the debounce) / foreign or shared (another PC serves this
+        # PC's tunnel: report, do not fight) -- see Resolve-TunnelHostingState.
+        Invoke-TunnelHostingCheck | Out-Null
     }
 
     Wait-ForNextTick -Seconds $IntervalSeconds -Dir $PendingDir -ExpressPass {
