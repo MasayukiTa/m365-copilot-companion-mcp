@@ -132,51 +132,9 @@ function Dt {
 # The OLD identity is still recognised (Get-LegacyHost / Get-LegacyMachineSuffix) so an install
 # made before this change keeps its URL: its stamp counts as this machine and is rewritten to
 # the new form on the next successful run, and its `<default>-<sha1 6>` tunnel is reused.
-function Get-ThisHost {
-    $h = ""
-    try { $h = [System.Net.Dns]::GetHostName() } catch { $h = "" }
-    if ([string]::IsNullOrWhiteSpace($h)) { $h = "$env:COMPUTERNAME" }
-    return $h.Trim().ToLowerInvariant()
-}
-function Get-LegacyHost {
-    return ("$env:COMPUTERNAME").Trim().ToLowerInvariant()
-}
-function Get-ThisUser {
-    foreach ($v in @($env:LOGNAME, $env:USER, $env:LNAME, $env:USERNAME)) {
-        if ($v) { return $v }
-    }
-    return ""
-}
-function Get-MachineSuffix([string]$node = $null, [string]$user = $null) {
-    if (-not $node) { $node = "" }
-    if (-not $user) { $user = "" }
-    if ($PSBoundParameters.Count -eq 0) {
-        # bootstrap.py hashes platform.node() as returned (case preserved) and lowercases the
-        # whole seed afterwards; Get-ThisHost is already lowercased, which is the same result.
-        $node = Get-ThisHost
-        $user = Get-ThisUser
-    }
-    $seed = ("$node|$user").ToLowerInvariant()
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $bytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($seed))
-    } finally {
-        $sha.Dispose()
-    }
-    $hex = -join ($bytes | ForEach-Object { $_.ToString("x2") })
-    return $hex.Substring(0, 8)
-}
-function Get-LegacyMachineSuffix {
-    $seed = "$env:COMPUTERNAME|$env:USERNAME"
-    $sha1 = [System.Security.Cryptography.SHA1]::Create()
-    try {
-        $bytes = $sha1.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($seed))
-    } finally {
-        $sha1.Dispose()
-    }
-    $hex = -join ($bytes | ForEach-Object { $_.ToString("x2") })
-    return $hex.Substring(0, 6)
-}
+# Get-ThisHost / Get-LegacyHost / Get-ThisUser / Get-MachineSuffix / Get-LegacyMachineSuffix
+# live in tunnel_name_util.ps1 (dot-sourced above) since 2026-09-24, so heal_tunnel.ps1 -- which
+# runs on every start_all -- uses the same identity.
 # Test-GeneratedTunnelName (a name THIS repository generates, default + optional hex machine
 # suffix) now lives in tunnel_name_util.ps1, dot-sourced above -- it used to be defined here,
 # byte-for-byte duplicated (except its name) as Test-GeneratedTunnelNameDoctor in doctor.ps1,
@@ -186,57 +144,8 @@ function Get-LegacyMachineSuffix {
 
 # Privacy guard: some tunnel names leak an identifying (organization/user) token to the
 # GLOBAL devtunnels.ms namespace, which is visible to Microsoft and to the tunnel owner.
-# These two SHA-256 values are a blocklist of the specific leaked token and the specific
-# leaked full tunnel name seen in the wild -- the plaintext is intentionally never written
-# here; only its hash is, so this file cannot itself leak it. Hashing is over the UTF-8
-# bytes of the lowercased input, hex-encoded lowercase.
-$script:TOKEN_SHA256 = "2a0341296bb96dc7d205036f9f693427809772f6136a46f58b04a1c492de9e04"  # gitleaks:allow
-$script:FULLNAME_SHA256 = "5ba174b8e87faf4e8106e36a7cf5a901bbec3435d01fbd56914c2b0346858261"  # gitleaks:allow
-
-function Get-Sha256Hex([string]$s) {
-    $sha256 = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $bytes = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($s))
-    } finally {
-        $sha256.Dispose()
-    }
-    return (-join ($bytes | ForEach-Object { $_.ToString("x2") }))
-}
-
-# Detects whether a candidate dev tunnel name leaks an identifying token. Returns $true if
-# the name (or one of its hyphen/underscore/dot/space-separated tokens) is identifying,
-# $false otherwise (including an empty/whitespace name -- nothing to leak, "no name set").
-function Test-IdentifyingTunnelName([string]$name) {
-    if ([string]::IsNullOrWhiteSpace($name)) { return $false }
-    $lower = $name.ToLowerInvariant()
-
-    # 1. Whole-name blocklist hash match.
-    if ((Get-Sha256Hex $lower) -eq $script:FULLNAME_SHA256) { return $true }
-
-    # 2. Per-token blocklist hash match.
-    $tokens = @($lower -split '[^a-z0-9]+' | Where-Object { $_ })
-    foreach ($t in $tokens) {
-        if ((Get-Sha256Hex $t) -eq $script:TOKEN_SHA256) { return $true }
-    }
-
-    # 3. Generic runtime checks (no hash needed) -- catches folder-derived / user-derived
-    #    names on any machine, beyond the specific blocklist above.
-    #    NOT FOR A NAME THIS SCRIPT GENERATED. Those are the fixed default plus a hash, so they
-    #    carry nothing user- or folder-derived -- but the substring test below fired on them
-    #    whenever USERNAME happened to occur inside "m365-copilot-companion-<hex>" ("pan",
-    #    "com", "on", or a hex-only name inside the suffix). The generated name was then thrown
-    #    away, regenerated as the very same name, and "The PUBLIC URL will change" was printed
-    #    on every run while nothing changed (D29).
-    if (Test-GeneratedTunnelName $name) { return $false }
-    $repoLeaf = (Split-Path -Leaf $root).ToLowerInvariant()
-    $userName = ("$env:USERNAME").ToLowerInvariant()
-    foreach ($t in $tokens) {
-        if (($repoLeaf -and $t -eq $repoLeaf) -or ($userName -and $t -eq $userName)) { return $true }
-    }
-    if (($repoLeaf -and $lower.Contains($repoLeaf)) -or ($userName -and $lower.Contains($userName))) { return $true }
-
-    return $false
-}
+# Test-IdentifyingTunnelName (with its SHA-256 blocklist) lives in tunnel_name_util.ps1 since
+# 2026-09-24, shared with heal_tunnel.ps1; it reads this script's $root.
 
 # Non-fatal notes collected from tolerated (idempotent "already exists") non-zero devtunnel exits,
 # surfaced later only if the tunnel ultimately fails to come up -- so the real CLI text is visible
@@ -268,36 +177,9 @@ $script:DtWarnings = @()
 # merge_for_new_machine classifies what cannot travel, and this section sets aside the tunnel
 # keys it names -- one copy of the rules, not two. A .env with NO stamp and a custom name is
 # still left its name: nothing proves it foreign, and dropping a name this machine really owns
-# would change a working URL.
-function Get-PythonForHelpers {
-    # `return ,@(...)`: a one-element array returned plainly is unrolled to its string, and
-    # $py[0] is then the first CHARACTER of the path ("C") -- measured with the stub rig.
-    $venvPy = Join-Path $root ".venv\Scripts\python.exe"
-    if (Test-Path $venvPy) { return ,@($venvPy) }
-    # The classifier is stdlib-only, so any Python 3 will do when .venv does not exist yet.
-    $c = Get-Command python -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($c) { return ,@($c.Source) }
-    $c = Get-Command py -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($c) { return ,@($c.Source, "-3") }
-    return $null
-}
-# The MCP_TUNNEL_* keys of $envFile that merge_for_new_machine drops on a move, or $null when the
-# classifier could not be asked (no Python, or it did not answer in its documented shape).
-function Get-MachineBoundTunnelKeys([string]$envFile) {
-    $py = Get-PythonForHelpers
-    if (-not $py) { return $null }
-    $classifier = Join-Path $root "tools\env_portability.py"
-    if (-not (Test-Path $classifier)) { return $null }
-    $pyExe = $py[0]
-    $pyArgs = @()
-    if ($py.Count -gt 1) { $pyArgs = @($py[1..($py.Count - 1)]) }
-    $out = @(& $pyExe @pyArgs $classifier machine-bound $envFile 2>$null)
-    if ($LASTEXITCODE -ne 0) { return $null }
-    if (-not ($out | Where-Object { $_ -match '^done:\d+$' })) { return $null }
-    $keys = @($out | ForEach-Object { if ($_ -match '^dropped:(\S+)$') { $matches[1] } } |
-              Where-Object { $_ -like "MCP_TUNNEL_*" })
-    return ,$keys
-}
+# would change a working URL. The rule (Get-EnvTunnelProvenance), the classifier call
+# (Get-MachineBoundTunnelKeys) and the set-aside (ConvertTo-EnvLinesWithKeysAside) live in
+# tunnel_name_util.ps1 since 2026-09-24, so heal_tunnel.ps1 applies the same ones every start.
 $foreignWhy = ""
 try {
     $envPath1 = Join-Path $root ".env"
@@ -311,20 +193,9 @@ try {
         $recName   = ""
         if ($nameLine -match '^MCP_TUNNEL_NAME=(.+)$') { $recName = $matches[1].Trim() }
         $me        = Get-ThisHost
-        $legacyMe  = Get-LegacyHost
-        $stampIsMine = [bool]($recorded -and (($recorded -eq $me) -or ($recorded -eq $legacyMe)))
-        $foreignWhy = ""
-        if ($recorded -and -not $stampIsMine) {
-            $foreignWhy = "its tunnel was recorded on '$recorded', not this machine ('$me')"
-        } elseif (-not $recorded -and $recName -and (Test-GeneratedTunnelName $recName)) {
-            $sfxPart = $recName.Trim().ToLowerInvariant().Substring($DEFAULT_NAME.Length)
-            if ($sfxPart -match '^-([0-9a-f]+)') {
-                $sfx = $matches[1]
-                if (($sfx -ne (Get-MachineSuffix)) -and ($sfx -ne (Get-LegacyMachineSuffix))) {
-                    $foreignWhy = "its tunnel name '$recName' was generated on another machine (the suffix is not this machine's)"
-                }
-            }
-        }
+        $prov      = Get-EnvTunnelProvenance -RecordedHost $recorded -RecordedName $recName -DefaultName $DEFAULT_NAME
+        $stampIsMine = [bool]$prov.StampIsMine
+        $foreignWhy = [string]$prov.ForeignReason
         if ($stampIsMine -and ($recorded -ne $me)) {
             Write-Host "[0/4] .env's host stamp '$recorded' is this machine under its old (NetBIOS) name;"
             Write-Host "      it is rewritten as '$me' when this run records the URL."
@@ -344,18 +215,8 @@ try {
             Write-Host "      machines serve one URL and split Copilot Studio's calls between them, so these"
             Write-Host ("      are set aside (kept as comments): " + ($aside -join ", "))
             Write-Host "      This run gives this machine its own tunnel; paste its NEW URL into Copilot Studio."
-            $rewritten = @()
-            foreach ($ln in $envLines1) {
-                $k = ""
-                if ($ln -match '^([A-Za-z_][A-Za-z0-9_]*)=') { $k = $matches[1] }
-                if ($k -and ($aside -contains $k)) {
-                    $rewritten += "# set aside by setup_devtunnel.ps1: made on another machine, not valid on this one"
-                    $rewritten += ("# " + $ln)
-                } else {
-                    $rewritten += $ln
-                }
-            }
-            [IO.File]::WriteAllLines($envPath1, $rewritten, (New-Object System.Text.UTF8Encoding($false)))
+            $rewritten = ConvertTo-EnvLinesWithKeysAside $envLines1 $aside "set aside by setup_devtunnel.ps1: made on another machine, not valid on this one"
+            [IO.File]::WriteAllLines($envPath1, [string[]]$rewritten, (New-Object System.Text.UTF8Encoding($false)))
         } elseif ($urlLine -and -not $stampIsMine) {
             Write-Host "[0/4] .env holds a tunnel URL with no record of which machine minted it."
             Write-Host "      That address is not reachable unless this machine hosts that tunnel, so it is"
@@ -857,27 +718,8 @@ if ($TunnelName) {
 # pre-D22 suffix) are exempt: they are this machine's by construction, so another host on them
 # is the other PC borrowing this one's tunnel, not a reason for this one to move. A count that
 # cannot be read is not evidence of anything and changes nothing.
-function Get-HostConnectionsFromShow([string[]]$showOutput) {
-    # PURE. The "Host connections : N" count from `devtunnel show`, or $null.
-    foreach ($l in @($showOutput)) {
-        if ($l -match '(?i)^\s*Host connections\s*:\s*(\d+)') { return [int]$matches[1] }
-    }
-    return $null
-}
-function Test-IsTunnelHostCommandLine([string]$CommandLine, [string]$Name) {
-    # PURE. `devtunnel host <name>` for this tunnel (bare id, with or without ".<cluster>").
-    # supervisor.ps1 carries the same rule; scripts/test_tunnel_served_by_another_pc.py runs both.
-    if (-not $CommandLine -or -not $Name) { return $false }
-    if ($CommandLine -notmatch '(?i)devtunnel(\.exe|\.cmd)?"?\s+host\s') { return $false }
-    $bare = (($Name -split '\.')[0]).ToLowerInvariant()
-    if (-not $bare) { return $false }
-    return ($CommandLine -match ('(?i)\shost\s+"?' + [regex]::Escape($bare) + '(\.[a-z0-9]+)?("|\s|$)'))
-}
-function Test-ThisMachineHostsTunnel([string]$name) {
-    $hosts = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-               Where-Object { Test-IsTunnelHostCommandLine ([string]$_.CommandLine) $name })
-    return ($hosts.Count -gt 0)
-}
+# Get-HostConnectionsFromShow / Test-IsTunnelHostCommandLine / Test-ThisMachineHostsTunnel live in
+# tunnel_name_util.ps1 since 2026-09-24; heal_tunnel.ps1 applies the same rule on every start.
 if ($reuse -and ($target -ne $safeDefault) -and ($target -ne $legacyDefault)) {
     $hostCount = Get-HostConnectionsFromShow (Dt show $target)
     if ($null -ne $hostCount -and $hostCount -ge 1 -and -not (Test-ThisMachineHostsTunnel $target)) {

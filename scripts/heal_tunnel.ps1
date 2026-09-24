@@ -10,27 +10,50 @@
 # runs, before the supervisor starts hosting.
 #
 # CONTRACT: read-only except for a minimal, surgical .env rewrite (only the
-# MCP_TUNNEL_NAME line, and MCP_TUNNEL_URL only when it must change). Never
+# MCP_TUNNEL_NAME line, and MCP_TUNNEL_URL only when it must change; and, for a
+# .env carried from another machine, the MCP_TUNNEL_* keys env_portability.py
+# names -- set aside as comments, exactly as setup_devtunnel.ps1 does). Never
 # throws; every step is best-effort. If it cannot safely decide what to do, it
 # no-ops rather than guessing. Every devtunnel CLI call is bounded so a hung or
 # offline CLI cannot block the caller.
 #
+# THE SAME RULES AS setup_devtunnel.ps1 (2026-09-24). This script runs on EVERY
+# start_all, and it kept an owned .env name -- or switched to the account's FIRST
+# owned tunnel -- with no "is another machine hosting it" check, no privacy guard
+# and no "did this .env come from another machine" check: the likeliest way a
+# second PC with a copied .env hosted this PC's tunnel that day (57ad0d1). The
+# rules and helpers now come from tunnel_name_util.ps1, shared with setup:
+#   * never keep or adopt a tunnel `devtunnel show` reports as hosted while no
+#     devtunnel host on THIS machine hosts it -- except this machine's own
+#     generated names, which are this machine's by construction;
+#   * never keep or adopt an identifying name (Test-IdentifyingTunnelName);
+#   * a .env whose tunnel provably came from another machine
+#     (Get-EnvTunnelProvenance: a host stamp naming another machine, or a
+#     generated name with another machine's suffix) is not kept: its
+#     machine-bound keys (tools/env_portability.py) are set aside;
+#   * never switch to an ARBITRARY owned tunnel -- only to this machine's own.
+#
 # DECISION (see Get-TunnelHealAction, a pure function with no I/O):
-#   1. MCP_TUNNEL_NAME is owned by this account -> validate MCP_TUNNEL_URL
-#      against that owned tunnel's real forwarding URL:
-#      1a. URL matches (or already blank and gets filled in) -> ALREADY
-#          CORRECT. No-op. (the common case on a machine that has always been
-#          correctly set up -- left completely untouched.)
-#      1b. URL is stale/blank and the tunnel's real URL is known -> URL_FIX:
-#          rewrite only MCP_TUNNEL_URL (name is already right), then
-#          desktop-notify that the URL changed and must be re-pasted.
-#   2. Not owned (or empty), but an owned tunnel's forwarding URL equals the
-#      recorded MCP_TUNNEL_URL -> REPOINT: rewrite only MCP_TUNNEL_NAME to that
-#      owned tunnel's id. The public URL is UNCHANGED, so nothing needs to be
-#      re-pasted into Copilot Studio. Silent, zero-disruption.
-#   3. Not owned, no URL match, but the account owns at least one tunnel ->
-#      switch to that owned tunnel: rewrite MCP_TUNNEL_NAME and MCP_TUNNEL_URL,
-#      then desktop-notify that the URL changed and must be re-pasted.
+#   0. .env provably came from another machine -> ADOPT_OWN: set its tunnel keys
+#      aside and point at this machine's own tunnel when the account owns one
+#      (URL changes, re-paste; notified); else SET_ASIDE: set them aside, name
+#      this machine's own default (not created here) and notify that setup is
+#      needed -- the supervisor then has nothing foreign to host.
+#   1. MCP_TUNNEL_NAME is owned by this account:
+#      1a. identifying, or hosted by another machine right now (and not this
+#          machine's own name) -> RENAME_URL to this machine's own tunnel if the
+#          account owns one, else REFUSED: nothing changed, notified.
+#      1b. URL matches (or the real URL is unknown) -> no-op.
+#      1c. URL is stale/blank and the tunnel's real URL is known -> URL_FIX:
+#          rewrite only MCP_TUNNEL_URL, then notify (re-paste).
+#   2. Not owned (or empty), but a USABLE owned tunnel's forwarding URL equals the
+#      recorded MCP_TUNNEL_URL -> REPOINT: rewrite only MCP_TUNNEL_NAME. The
+#      public URL is UNCHANGED. Silent. (Usable = not identifying, and not hosted
+#      by another machine unless it is this machine's own.)
+#   3. Not owned, no URL match -> RENAME_URL to this machine's own tunnel if the
+#      account owns one (notified); otherwise SETUP_NEEDED -- never the account's
+#      first tunnel, which with one account on two PCs is as likely the other
+#      PC's as this one's.
 #   4. The account owns no tunnel at all -> do NOT create one here (that is
 #      setup_devtunnel.ps1's job); desktop-notify once that setup is needed.
 #
@@ -50,6 +73,11 @@ $scriptDir = $PSScriptRoot
 if (-not $scriptDir) { $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path }
 $root = Split-Path -Parent $scriptDir
 $envPath = Join-Path $root ".env"
+
+# The rules setup_devtunnel.ps1 applies (machine identity, "hosted by another machine", the
+# privacy guard, "came from another machine", env_portability's machine-bound keys). Functions
+# only; no top-level side effects.
+. (Join-Path $scriptDir "tunnel_name_util.ps1")
 
 # -----------------------------------------------------------------------------
 # devtunnel binary resolution -- mirrors supervisor.ps1 / doctor.ps1: prefer the
@@ -172,19 +200,79 @@ function Normalize-TunnelUrl([string]$u) {
     }
 }
 
+function Get-HealEntryField($Entry, [string]$Field, $Default) {
+    # PURE. An optional field of an $Owned entry ($Default when the caller did not supply it).
+    if ($Entry -and $Entry.PSObject.Properties[$Field]) { return $Entry.$Field }
+    return $Default
+}
+function Test-HealEntryHostedElsewhere($Entry) {
+    # PURE. `devtunnel show` counted a host, and it is not a devtunnel host on this machine. An
+    # unknown count ($null / not supplied) is not evidence of anything.
+    $hc = Get-HealEntryField $Entry 'HostConnections' $null
+    if ($null -eq $hc) { return $false }
+    return ([int]$hc -ge 1 -and -not [bool](Get-HealEntryField $Entry 'HostedHere' $false))
+}
+function Test-IsOwnDefaultTunnel([string]$Id, [string[]]$OwnDefaults) {
+    # PURE. One of THIS machine's generated names (Get-OwnDefaultTunnelNames).
+    if (-not $Id) { return $false }
+    $b = Get-BareTunnelId $Id
+    foreach ($d in @($OwnDefaults)) { if ($d -and ((Get-BareTunnelId $d) -eq $b)) { return $true } }
+    return $false
+}
+function Test-HealEntryUsable($Entry, [string[]]$OwnDefaults) {
+    # PURE. May this machine keep or adopt the tunnel? Not an identifying name, and not one
+    # another machine is hosting right now -- unless it is this machine's own name.
+    if ([bool](Get-HealEntryField $Entry 'Identifying' $false)) { return $false }
+    if (Test-IsOwnDefaultTunnel $Entry.Id $OwnDefaults) { return $true }
+    return (-not (Test-HealEntryHostedElsewhere $Entry))
+}
 function Get-TunnelHealAction {
     # PURE decision function. $Owned is an array of PSCustomObject with:
     #   Id  = the owned tunnel's id (bare or full -- either works)
     #   Url = that tunnel's forwarding URL, or "" if unknown/unresolved
-    # Returns a PSCustomObject: Action ('noop'|'repoint'|'rename_url'|'setup_needed'|'url_fix'),
-    # TargetId, TargetUrl, Note.
+    #   optional: HostConnections (int, or $null = unknown), HostedHere (bool: a devtunnel host
+    #   on THIS machine hosts it), Identifying (bool: Test-IdentifyingTunnelName)
+    # -ForeignReason: why .env's tunnel came from another machine (Get-EnvTunnelProvenance), or "".
+    # -OwnDefaults: this machine's own generated names (Get-OwnDefaultTunnelNames), preferred first.
+    # Returns a PSCustomObject: Action ('noop'|'repoint'|'rename_url'|'setup_needed'|'url_fix'|
+    # 'adopt_own'|'set_aside'|'refused'), TargetId, TargetUrl, Note.
     param(
         [string]$Name,
         [string]$Url,
-        [array]$Owned
+        [array]$Owned,
+        [string]$ForeignReason = "",
+        [string[]]$OwnDefaults = @()
     )
-    $ownedList = @($Owned)
+    $ownedList = @($Owned | Where-Object { $_ })
     $ownedIds = @($ownedList | ForEach-Object { $_.Id })
+
+    # This machine's own tunnel, if the account owns one whose URL is known: the ONLY tunnel
+    # this script ever switches to (never "the first one in the list").
+    $own = $null
+    foreach ($d in @($OwnDefaults)) {
+        $own = $ownedList | Where-Object { $d -and ((Get-BareTunnelId $_.Id) -eq (Get-BareTunnelId $d)) -and $_.Url } | Select-Object -First 1
+        if ($own) { break }
+    }
+
+    # 0. .env's tunnel was made on another machine: neither kept nor used to match a URL.
+    if ($ForeignReason) {
+        if ($own) {
+            return [PSCustomObject]@{
+                Action    = 'adopt_own'
+                TargetId  = $own.Id
+                TargetUrl = $own.Url
+                Note      = ".env came from another machine ($ForeignReason); its tunnel settings were set aside and this machine's own tunnel $($own.Id) is used; URL changed, re-paste required"
+            }
+        }
+        $fallbackName = ""
+        if (@($OwnDefaults).Count -gt 0) { $fallbackName = @($OwnDefaults)[0] }
+        return [PSCustomObject]@{
+            Action    = 'set_aside'
+            TargetId  = $fallbackName
+            TargetUrl = ''
+            Note      = ".env came from another machine ($ForeignReason); its tunnel settings were set aside -- run scripts\setup_devtunnel.ps1 (quickstart STEP 4) to create this machine's own tunnel"
+        }
+    }
 
     # 1. N is owned. That alone does not guarantee MCP_TUNNEL_URL is correct --
     #    .env can be stale (e.g. NAME and URL pasted in from different tunnels
@@ -193,6 +281,26 @@ function Get-TunnelHealAction {
     if ($Name -and (Test-TunnelNameOwned $Name $ownedIds)) {
         $bareName = Get-BareTunnelId $Name
         $match = $ownedList | Where-Object { (Get-BareTunnelId $_.Id) -eq $bareName } | Select-Object -First 1
+        # 1a. Owned is not enough to KEEP it: not an identifying name, and not a tunnel another
+        #     machine is hosting right now (this machine's own names excepted).
+        if ($match -and -not (Test-HealEntryUsable $match $OwnDefaults)) {
+            $why = "another machine is hosting it right now"
+            if ([bool](Get-HealEntryField $match 'Identifying' $false)) { $why = "its name is identifying" }
+            if ($own -and ((Get-BareTunnelId $own.Id) -ne $bareName)) {
+                return [PSCustomObject]@{
+                    Action    = 'rename_url'
+                    TargetId  = $own.Id
+                    TargetUrl = $own.Url
+                    Note      = "not keeping $Name ($why); switched to this machine's own tunnel $($own.Id); URL changed, re-paste required"
+                }
+            }
+            return [PSCustomObject]@{
+                Action    = 'refused'
+                TargetId  = $Name
+                TargetUrl = $Url
+                Note      = "tunnel $Name is not safe to host here ($why) and this machine has no tunnel of its own -- run scripts\setup_devtunnel.ps1"
+            }
+        }
         if ($match -and $match.Url) {
             if ((-not $Url) -or ((Normalize-TunnelUrl $Url) -ne (Normalize-TunnelUrl $match.Url))) {
                 return [PSCustomObject]@{
@@ -223,11 +331,12 @@ function Get-TunnelHealAction {
         }
     }
 
-    # 2. Not owned (or empty) -- but an owned tunnel's URL matches the recorded
+    # 2. Not owned (or empty) -- but a USABLE owned tunnel's URL matches the recorded
     #    URL -> silent, zero-disruption repoint (URL preserved).
     if ($Url) {
         $normU = Normalize-TunnelUrl $Url
         foreach ($o in $ownedList) {
+            if (-not (Test-HealEntryUsable $o $OwnDefaults)) { continue }
             if ($o.Url -and ((Normalize-TunnelUrl $o.Url) -eq $normU)) {
                 return [PSCustomObject]@{
                     Action    = 'repoint'
@@ -239,14 +348,74 @@ function Get-TunnelHealAction {
         }
     }
 
-    # 3. Not owned, no URL match, but the account owns at least one tunnel.
-    $first = $ownedList[0]
-    return [PSCustomObject]@{
-        Action    = 'rename_url'
-        TargetId  = $first.Id
-        TargetUrl = $first.Url
-        Note      = "switched to owned tunnel $($first.Id); URL changed, re-paste required"
+    # 3. Not owned, no URL match. Only THIS machine's own tunnel is a candidate: with one
+    #    account signed in on two PCs, "the first tunnel in the list" is as likely the other
+    #    PC's as this one's (that was $ownedList[0] until 2026-09-24).
+    if ($own) {
+        return [PSCustomObject]@{
+            Action    = 'rename_url'
+            TargetId  = $own.Id
+            TargetUrl = $own.Url
+            Note      = "switched to this machine's own tunnel $($own.Id); URL changed, re-paste required"
+        }
     }
+    return [PSCustomObject]@{
+        Action    = 'setup_needed'
+        TargetId  = ''
+        TargetUrl = ''
+        Note      = "no tunnel of this machine's own exists (not adopting another tunnel of the account) -- run scripts\setup_devtunnel.ps1"
+    }
+}
+
+function Set-EnvTunnelAsideAndPoint {
+    # For a .env carried from another machine: the machine-bound MCP_TUNNEL_* keys ($Keys, from
+    # env_portability.py) become comments (ConvertTo-EnvLinesWithKeysAside, as setup_devtunnel.ps1
+    # does), then MCP_TUNNEL_NAME=<this machine's tunnel> is appended -- and, when its URL is known,
+    # MCP_TUNNEL_URL and the MCP_TUNNEL_HOST stamp naming this machine. BOM state preserved;
+    # temp file + move. $false (nothing written) if an active MCP_TUNNEL_NAME line would remain.
+    param([Parameter(Mandatory = $true)][string]$EnvPath, [string[]]$Keys, [string]$NewName, [string]$NewUrl = "")
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($EnvPath)
+        $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+        $enc = New-Object System.Text.UTF8Encoding($false)
+        $off = 0
+        if ($hasBom) { $off = 3 }
+        $lines = @(($enc.GetString($bytes, $off, $bytes.Length - $off)) -split "`r?`n")
+        if ($lines.Count -gt 0 -and $lines[$lines.Count - 1] -eq "") { $lines = @($lines | Select-Object -First ($lines.Count - 1)) }
+        # NOT wrapped in @(): the helper returns its array with `return ,$out`, and @() around that
+        # makes a one-element array holding it -- measured: the .env became "System.Object[]".
+        $out = ConvertTo-EnvLinesWithKeysAside $lines $Keys "set aside by heal_tunnel.ps1: made on another machine, not valid on this one"
+        if ($out -isnot [array] -or $out.Count -lt $lines.Count) { return $false }
+        if ($out | Where-Object { $_ -match '^\s*MCP_TUNNEL_(NAME|URL|HOST)\s*=' }) { return $false }
+        if ($NewName) { $out += "MCP_TUNNEL_NAME=$NewName" }
+        if ($NewUrl) {
+            $out += "MCP_TUNNEL_URL=$NewUrl"
+            $out += ("MCP_TUNNEL_HOST=" + (Get-ThisHost))
+        }
+        $outBytes = $enc.GetBytes((($out -join "`r`n") + "`r`n"))
+        if ($hasBom) { $outBytes = [byte[]](0xEF, 0xBB, 0xBF) + $outBytes }
+        $tmpPath = "$EnvPath.heal_tmp_$([Guid]::NewGuid().ToString('N'))"
+        [System.IO.File]::WriteAllBytes($tmpPath, $outBytes)
+        Move-Item -LiteralPath $tmpPath -Destination $EnvPath -Force
+        return $true
+    } catch { return $false }
+}
+
+function Get-OwnedTunnelEntry([string]$Id) {
+    # One `devtunnel show`: the forwarding URL, the host-connection count, whether a devtunnel
+    # host on this machine hosts it, and whether the name is identifying.
+    $showOut = Invoke-DevTunnelBounded @('show', (Get-BareTunnelId $Id)) 8
+    $url = ""
+    $hc = $null
+    if ($showOut) {
+        $m = [regex]::Match($showOut, 'https://[A-Za-z0-9-]+\.[A-Za-z0-9-]+\.devtunnels\.ms\S*')
+        if ($m.Success) { $url = $m.Value }
+        $hc = Get-HostConnectionsFromShow ($showOut -split "`r?`n")
+    }
+    $here = $false
+    if ($null -ne $hc -and $hc -ge 1) { $here = [bool](Test-ThisMachineHostsTunnel $Id) }
+    return [PSCustomObject]@{ Id = $Id; Url = $url; HostConnections = $hc; HostedHere = $here
+                              Identifying = [bool](Test-IdentifyingTunnelName $Id) }
 }
 
 function Update-EnvTunnelFields {
@@ -347,6 +516,12 @@ function Invoke-TunnelHeal([switch]$DryRunMode) {
 
         $N = Read-EnvValue $envPath "MCP_TUNNEL_NAME"
         $U = Read-EnvValue $envPath "MCP_TUNNEL_URL"
+        $H = Read-EnvValue $envPath "MCP_TUNNEL_HOST"
+        # Did this .env's tunnel come from another machine? The same test setup_devtunnel.ps1's
+        # section 0 and bootstrap.py make (Get-EnvTunnelProvenance).
+        $prov = Get-EnvTunnelProvenance -RecordedHost $H -RecordedName $N
+        $foreignWhy = [string]$prov.ForeignReason
+        $ownDefaults = @(Get-OwnDefaultTunnelNames)
 
         # 2. owned tunnel ids from `devtunnel list`.
         $listOut = Invoke-DevTunnelBounded @('list') 8
@@ -371,29 +546,24 @@ function Invoke-TunnelHeal([switch]$DryRunMode) {
         #    MCP_TUNNEL_URL can be corrected even when the name itself is
         #    already right. In the not-owned case, resolve every owned
         #    tunnel's URL as before so repoint/rename_url can find a match.
+        #    Each entry also carries the host count, whether this machine hosts it and whether
+        #    the name is identifying (Get-OwnedTunnelEntry), which the decision now needs. This
+        #    machine's own generated names are always looked at: they are the only tunnel this
+        #    script may switch to.
         $owned = @()
-        if ($N -and (Test-TunnelNameOwned $N $ownedIds)) {
-            $bareN = Get-BareTunnelId $N
-            $showOut = Invoke-DevTunnelBounded @('show', $bareN) 8
-            $url = ""
-            if ($showOut) {
-                $m = [regex]::Match($showOut, 'https://[A-Za-z0-9-]+\.[A-Za-z0-9-]+\.devtunnels\.ms\S*')
-                if ($m.Success) { $url = $m.Value }
+        $ownOwned = @($ownedIds | Where-Object { Test-IsOwnDefaultTunnel $_ $ownDefaults })
+        if ($foreignWhy) {
+            foreach ($id in $ownOwned) { $owned += Get-OwnedTunnelEntry $id }
+        } elseif ($N -and (Test-TunnelNameOwned $N $ownedIds)) {
+            $owned = @(Get-OwnedTunnelEntry $N)
+            foreach ($id in $ownOwned) {
+                if ((Get-BareTunnelId $id) -ne (Get-BareTunnelId $N)) { $owned += Get-OwnedTunnelEntry $id }
             }
-            $owned = @([PSCustomObject]@{ Id = $N; Url = $url })
         } else {
-            foreach ($id in $ownedIds) {
-                $showOut = Invoke-DevTunnelBounded @('show', $id) 8
-                $url = ""
-                if ($showOut) {
-                    $m = [regex]::Match($showOut, 'https://[A-Za-z0-9-]+\.[A-Za-z0-9-]+\.devtunnels\.ms\S*')
-                    if ($m.Success) { $url = $m.Value }
-                }
-                $owned += [PSCustomObject]@{ Id = $id; Url = $url }
-            }
+            foreach ($id in $ownedIds) { $owned += Get-OwnedTunnelEntry $id }
         }
 
-        $decision = Get-TunnelHealAction -Name $N -Url $U -Owned $owned
+        $decision = Get-TunnelHealAction -Name $N -Url $U -Owned $owned -ForeignReason $foreignWhy -OwnDefaults $ownDefaults
 
         switch ($decision.Action) {
             'url_fix' {
@@ -429,6 +599,34 @@ function Invoke-TunnelHeal([switch]$DryRunMode) {
                     } else {
                         Write-Host "[heal_tunnel] rename_url decided but .env rewrite failed -- no-op"
                     }
+                }
+            }
+            { $_ -in @('adopt_own', 'set_aside') } {
+                if ($DryRunMode) {
+                    Write-Host "[heal_tunnel] DRY RUN: would set aside .env's tunnel keys ($foreignWhy) and set MCP_TUNNEL_NAME -> $($decision.TargetId)"
+                } else {
+                    # Which keys go is env_portability.py's decision, as in setup_devtunnel.ps1.
+                    # Unanswerable -> nothing is changed (no guessing), and the operator is told.
+                    $aside = Get-MachineBoundTunnelKeys $envPath
+                    if ($null -eq $aside) {
+                        Write-Host "[heal_tunnel] .env came from another machine ($foreignWhy), but tools\env_portability.py could not be run to decide what to set aside -- nothing changed"
+                        Send-TunnelHealNotice "Dev Tunnel belongs to another PC" "The .env on this PC names a tunnel made on another PC. Run quickstart.bat (STEP 4) or scripts\setup_devtunnel.ps1 to give this PC its own tunnel."
+                    } elseif (Set-EnvTunnelAsideAndPoint -EnvPath $envPath -Keys $aside -NewName $decision.TargetId -NewUrl $decision.TargetUrl) {
+                        Write-Host "[heal_tunnel] $($decision.Note)"
+                        if ($decision.Action -eq 'adopt_own') {
+                            Send-TunnelHealNotice "Dev Tunnel URL changed" "The .env on this PC came from another PC, so this PC now uses its own tunnel. New URL: $($decision.TargetUrl) -- paste it into the Copilot Studio MCP connector that should reach this PC."
+                        } else {
+                            Send-TunnelHealNotice "Dev Tunnel setup needed" "The .env on this PC came from another PC; its tunnel settings were set aside. Run quickstart.bat (STEP 4) or scripts\setup_devtunnel.ps1 to give this PC its own tunnel."
+                        }
+                    } else {
+                        Write-Host "[heal_tunnel] $($decision.Action) decided but .env rewrite failed -- no-op"
+                    }
+                }
+            }
+            'refused' {
+                Write-Host "[heal_tunnel] $($decision.Note)"
+                if (-not $DryRunMode) {
+                    Send-TunnelHealNotice "Dev Tunnel needs attention" "The tunnel named in .env is not safe to host on this PC (another PC is hosting it, or its name is identifying). Run scripts\setup_devtunnel.ps1 to give this PC its own tunnel."
                 }
             }
             'setup_needed' {

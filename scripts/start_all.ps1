@@ -579,6 +579,10 @@ function Invoke-PostUpdateTail {
                 # This run ends here without reaching the end of the script: record it now.
                 $null = Write-StartAllRunRecord (Join-Path $script:diagDir "start_all_runs.jsonl") (New-StartAllRunRecord "re-exec after update")
                 $env:MCP_STARTALL_REEXEC = "1"
+                # WHO THE FRESH COPY CONTINUES: a click that takes the lock in the moment between
+                # the release below and the fresh copy's start makes that copy wait for it rather
+                # than leave (Test-StartAllHandoff compares this with the fresh copy's parent).
+                $env:MCP_STARTALL_HANDOFF_PID = [string]$PID
                 # HAND THE LOCK OVER FIRST. The fresh copy waits on the single-instance lock;
                 # held until Environment.Exit below it would come back abandoned, which works,
                 # but a release is the clean hand-over rather than the recovery path.
@@ -1276,6 +1280,8 @@ while ((Get-Date) -lt $deadline) {
 # A SECOND COPY WAITS, IT DOES NOT QUIT. Every step here is idempotent, so running after the
 # first copy finishes is correct and cheap -- and quitting would lose what the second launch
 # was for: a double-click during a background logon start still has to open the windows.
+# (Since 2026-09-24 only the copies that NEED to wait do; the rest leave at entry -- see the block
+# above Get-RankOfStartAllMode.)
 # ---------------------------------------------------------------------------
 $script:startAllLock = $null
 function Enter-StartAllLock {
@@ -1341,10 +1347,290 @@ function Enter-StartAllLock {
     }
 }
 function Exit-StartAllLock {
+    Exit-StartAllWaiterSlot
     if (-not $script:startAllLock) { return }
+    # The record goes BEFORE the lock: a copy that then takes the lock must not find ours.
+    Remove-StartAllRoleRecord "holder"
     try { $script:startAllLock.ReleaseMutex() } catch { }
     try { $script:startAllLock.Dispose() } catch { }
     $script:startAllLock = $null
+}
+
+# ---------------------------------------------------------------------------
+# A COPY THAT FINDS A STARTUP ALREADY RUNNING DOES NOT QUEUE ANOTHER ONE (2026-09-24).
+#
+# "A second copy waits" (above) was written for the two logon launches, and it covered every
+# other way a second copy arrives too: a person double-clicking the desktop icon, or clicking it
+# ten times because nothing seemed to happen, and the cockpit's auto-repair (repair.ps1 -Auto runs
+# start_all.ps1 -NoUi -NoSplash). Each showed its own banner ("Another startup is already
+# running -- waiting..."), waited on the lock, and then ran the WHOLE bring-up again after the
+# first had finished: a stack of full start_alls, one banner each, queued for ~20 minutes that
+# day. Measured with scripts/test_start_all_ten_clicks.py: ten clicks = ten banners, ten
+# bring-ups one after the other.
+#
+# So the lock is probed at ENTRY (Invoke-StartAllEntry, before any banner exists), and a copy
+# that finds it held asks one question: does the running startup already do what this launch
+# was for? Coverage is by mode -- full (windows) > background -NoUi (services) > -CoreOnly
+# (supervisor only); a holder whose record cannot be read within ~1.5 s (not written yet, or an
+# older copy of this script that writes none) counts as background.
+#   * covered -> LEAVE within ~2 s: bring the running startup's banner to the front (or, when it
+#     shows none, a short notice that closes itself; a -NoUi / -NoSplash copy shows nothing),
+#     write "already running" to start_all_runs.jsonl, exit 0. Nothing is queued.
+#   * not covered -> WAIT, exactly as before. Who still waits, and why:
+#       - the post-update re-exec (MCP_STARTALL_HANDOFF_PID naming OUR parent, set by
+#         Invoke-PostUpdateTail): it IS the startup in progress, continued on the new code;
+#       - -CoreOnly: quickstart's synchronous step between STEP 4 and STEP 5, which reads this
+#         run's exit code and needs the supervisor up before it asks for a connection test;
+#       - a launch that needs MORE than the running one: a double-click (full) during a
+#         background logon start still has to open the windows -- the reason this lock was
+#         written to wait. Only ONE such copy waits (the "-waiter" mutex); every later one
+#         leaves and brings that waiter's banner forward.
+#     A waiting copy still keeps waiting past its 10 minutes while the holder installs Python
+#     dependencies (Test-DepsInstallInProgress, 7034f0b) -- unchanged.
+# Who holds the lock, and whether it shows a banner, is in .setup\start_all_holder.json (and
+# start_all_waiter.json for the one waiter), trusted only while that pid is alive with the same
+# start time.
+# ---------------------------------------------------------------------------
+$script:startAllLockName = "Global\m365-copilot-companion-start-all"
+$script:waiterSlot = $null
+$script:busyHolderPid = 0
+
+function Get-RankOfStartAllMode([string]$Mode) {
+    # PURE. How much of the stack a run of this mode (Get-StartAllMode) brings up.
+    switch ($Mode) {
+        "full" { return 3 }
+        "background (-NoUi)" { return 2 }
+        "core (-CoreOnly)" { return 1 }
+    }
+    return 0
+}
+function Get-StartAllBusyAction {
+    # PURE. What a copy that found the start_all lock held does: "leave", "wait", or "wait-one"
+    # (wait only if it can take the single waiter slot, else leave). See the block above.
+    param([string]$Mode, [string]$HolderMode, [bool]$Handoff)
+    if ($Handoff) { return "wait" }
+    if ($Mode -eq "core (-CoreOnly)") { return "wait" }
+    $h = Get-RankOfStartAllMode $HolderMode
+    if ($h -eq 0) { $h = 2 }
+    if ($h -ge (Get-RankOfStartAllMode $Mode)) { return "leave" }
+    return "wait-one"
+}
+function Test-TakeMutex($Mutex, [int]$Ms) {
+    # WaitOne, with an abandoned mutex taken as owned (see Enter-StartAllLock).
+    try { return [bool]$Mutex.WaitOne($Ms) } catch {
+        $inner = $_.Exception
+        while ($inner -and -not ($inner -is [System.Threading.AbandonedMutexException])) { $inner = $inner.InnerException }
+        return [bool]$inner
+    }
+}
+function Get-StartAllRolePath([string]$Role) {
+    return (Join-Path $root (".setup\start_all_" + $Role + ".json"))
+}
+function Write-StartAllRoleRecord([string]$Role, [bool]$Banner = $false, [long]$Hwnd = 0) {
+    try {
+        $p = Get-StartAllRolePath $Role
+        $dir = Split-Path -Parent $p
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        $started = 0
+        try { $started = (Get-Process -Id $PID).StartTime.ToUniversalTime().Ticks } catch { }
+        $rec = [ordered]@{ pid = $PID; started = $started; mode = (Get-StartAllMode); banner = $Banner; hwnd = $Hwnd }
+        $tmp = $p + "." + $PID + ".tmp"
+        [System.IO.File]::WriteAllText($tmp, ($rec | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
+        # Retried: the copies that leave READ this file while it is replaced (see Save-StartAllRunLines).
+        for ($i = 0; $i -lt 20; $i++) {
+            try { Move-Item -LiteralPath $tmp -Destination $p -Force -ErrorAction Stop; return $true }
+            catch { Start-Sleep -Milliseconds 25 }
+        }
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        return $false
+    } catch { return $false }
+}
+function Read-StartAllRoleRecord([string]$Role) {
+    # The record, only while the process that wrote it is alive: same pid AND same start time,
+    # so a record left by a killed copy (or a reused pid) is not believed.
+    try {
+        $p = Get-StartAllRolePath $Role
+        if (-not (Test-Path -LiteralPath $p)) { return $null }
+        $r = [System.IO.File]::ReadAllText($p) | ConvertFrom-Json
+        if (-not $r -or -not $r.pid) { return $null }
+        $proc = Get-Process -Id ([int]$r.pid) -ErrorAction Stop
+        try {
+            if ([long]$r.started -and ([math]::Abs($proc.StartTime.ToUniversalTime().Ticks - [long]$r.started) -gt 20000000)) { return $null }
+        } catch { }
+        return $r
+    } catch { return $null }
+}
+function Remove-StartAllRoleRecord([string]$Role) {
+    try {
+        $p = Get-StartAllRolePath $Role
+        if (-not (Test-Path -LiteralPath $p)) { return }
+        $r = [System.IO.File]::ReadAllText($p) | ConvertFrom-Json
+        if ($r -and ([int]$r.pid -eq $PID)) { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
+    } catch { }
+}
+function Exit-StartAllWaiterSlot {
+    if (-not $script:waiterSlot) { return }
+    Remove-StartAllRoleRecord "waiter"
+    try { $script:waiterSlot.ReleaseMutex() } catch { }
+    try { $script:waiterSlot.Dispose() } catch { }
+    $script:waiterSlot = $null
+}
+function Update-StartAllBannerRecord {
+    # Called when this copy's banner appears or goes: the copies that leave bring it forward.
+    $hwnd = 0
+    $shown = [bool]($script:splash)
+    if ($shown) { try { $hwnd = $script:splash.Form.Handle.ToInt64() } catch { $hwnd = 0 } }
+    if ($script:startAllLock) { $null = Write-StartAllRoleRecord "holder" $shown $hwnd }
+    elseif ($script:waiterSlot) { $null = Write-StartAllRoleRecord "waiter" $shown $hwnd }
+}
+function Test-StartAllHandoff {
+    # The post-update re-exec: Invoke-PostUpdateTail sets MCP_STARTALL_HANDOFF_PID to its own pid
+    # and starts this copy. Compared with OUR parent, so a process that merely inherited the
+    # variable (a window the re-exec'd run started, a repair that window launched) is not one.
+    $h = 0
+    try { $h = [int]$env:MCP_STARTALL_HANDOFF_PID } catch { $h = 0 }
+    return [bool]($h -gt 0 -and $script:launch -and ([int]$script:launch.parent_pid -eq $h))
+}
+function Invoke-StartAllEntry {
+    # "run": this copy holds the lock. "wait": Invoke-Startup waits for it (Enter-StartAllLock).
+    # "leave": a startup that covers this launch is running (see the block above).
+    $t0 = Get-Date
+    $handoff = Test-StartAllHandoff
+    $env:MCP_STARTALL_HANDOFF_PID = $null        # read once; not handed down to what this run starts
+    try {
+        $m = New-Object System.Threading.Mutex($false, $script:startAllLockName)
+    } catch {
+        return "wait"      # no lock possible (Constrained Language Mode): Enter-StartAllLock says so and runs
+    }
+    if (Test-TakeMutex $m 0) {
+        $script:startAllLock = $m
+        $null = Write-StartAllRoleRecord "holder" (-not $NoSplash) 0
+        return "run"
+    }
+    try { $m.Dispose() } catch { }
+    $holder = $null
+    $deadline = $t0.AddMilliseconds(1500)
+    while ($true) {
+        $holder = Read-StartAllRoleRecord "holder"
+        if ($holder -or ((Get-Date) -ge $deadline)) { break }
+        Start-Sleep -Milliseconds 100
+    }
+    $holderMode = ""
+    if ($holder) { $holderMode = [string]$holder.mode; $script:busyHolderPid = [int]$holder.pid }
+    $act = Get-StartAllBusyAction -Mode (Get-StartAllMode) -HolderMode $holderMode -Handoff $handoff
+    if ($act -eq "wait-one") {
+        $act = "leave"
+        try {
+            $w = New-Object System.Threading.Mutex($false, ($script:startAllLockName + "-waiter"))
+            if (Test-TakeMutex $w 0) {
+                $script:waiterSlot = $w
+                $null = Write-StartAllRoleRecord "waiter" (-not $NoSplash) 0
+                $act = "wait"
+            } else {
+                try { $w.Dispose() } catch { }
+                # The waiter took its slot a moment ago and may not have written its record yet;
+                # without it there is no banner to bring forward (measured: 1 in 8 got the notice).
+                while (-not (Read-StartAllRoleRecord "waiter") -and ((Get-Date) -lt $deadline)) {
+                    Start-Sleep -Milliseconds 100
+                }
+            }
+        } catch { $act = "wait" }
+    }
+    return $act
+}
+function Add-BannerWinType {
+    if ("M365.BannerWin" -as [type]) { return $true }
+    try {
+        Add-Type -Namespace M365 -Name BannerWin -MemberDefinition @"
+[DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+[DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+"@ -ErrorAction Stop
+        return $true
+    } catch { return $false }
+}
+function Show-RunningBanner([int]$BudgetMs = 1200) {
+    # Brings the banner of the running startup (or of the one copy waiting behind it) to the
+    # front. Returns that process's pid, or 0 when neither shows one within $BudgetMs.
+    $deadline = (Get-Date).AddMilliseconds($BudgetMs)
+    $typeOk = $false
+    while ($true) {
+        $expected = $false
+        foreach ($role in @("holder", "waiter")) {
+            $r = Read-StartAllRoleRecord $role
+            if (-not $r -or -not $r.banner) { continue }
+            $expected = $true
+            $h = [IntPtr]([long]$r.hwnd)
+            if ($h -eq [IntPtr]::Zero) { continue }       # created, handle not recorded yet
+            if (-not $typeOk) { $typeOk = Add-BannerWinType; if (-not $typeOk) { return 0 } }
+            if (-not [M365.BannerWin]::IsWindow($h)) { continue }
+            if ([M365.BannerWin]::IsIconic($h)) { [void][M365.BannerWin]::ShowWindow($h, 9) }   # SW_RESTORE
+            [void][M365.BannerWin]::SetForegroundWindow($h)
+            return [int]$r.pid
+        }
+        if ((-not $expected) -or ((Get-Date) -ge $deadline)) { return 0 }
+        Start-Sleep -Milliseconds 100
+    }
+}
+function Get-StartAllUiLanguage {
+    # "ja" or "en": MCP_NOTIFY_LANG, else the operator's UI culture -- the rule
+    # relay/selfimprove/authority_ledger.py ui_language() uses for the desktop notices.
+    $o = ("" + $env:MCP_NOTIFY_LANG).Trim().ToLowerInvariant()
+    if ($o -in @("ja", "en")) { return $o }
+    try { if ([System.Globalization.CultureInfo]::CurrentUICulture.TwoLetterISOLanguageName -eq "ja") { return "ja" } } catch { }
+    return "en"
+}
+function Get-AlreadyRunningText([string]$Lang) {
+    # PURE. Japanese is built from code points: this file has no BOM, so Windows PowerShell 5.1
+    # reads it in the ANSI code page and a literal would arrive mangled.
+    if ($Lang -eq "ja") {
+        return (-join (@(0x8D77, 0x52D5, 0x51E6, 0x7406, 0x306F, 0x3059, 0x3067, 0x306B, 0x9032, 0x884C, 0x4E2D, 0x3067, 0x3059) | ForEach-Object { [char]$_ }))
+    }
+    return "Startup is already in progress."
+}
+function Show-AlreadyRunningNotice([int]$Ms = 1500) {
+    # Shown only when the running startup has no banner to bring forward. Closes itself.
+    try {
+        Add-Type -AssemblyName System.Windows.Forms | Out-Null
+        Add-Type -AssemblyName System.Drawing | Out-Null
+        $null = Add-BannerWinType
+        $f = New-Object System.Windows.Forms.Form
+        $f.Text = "M365 Companion"
+        $f.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedToolWindow
+        $f.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+        $f.ClientSize = New-Object System.Drawing.Size(360, 70)
+        $f.TopMost = $true
+        $f.ShowInTaskbar = $false
+        $l = New-Object System.Windows.Forms.Label
+        $l.Text = Get-AlreadyRunningText (Get-StartAllUiLanguage)
+        $l.Font = New-Object System.Drawing.Font("Segoe UI", 11)
+        $l.AutoSize = $false
+        $l.Size = New-Object System.Drawing.Size(336, 46)
+        $l.Location = New-Object System.Drawing.Point(12, 12)
+        $l.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+        $f.Controls.Add($l)
+        $script:noticeForm = $f
+        $t = New-Object System.Windows.Forms.Timer
+        $t.Interval = [math]::Max(200, $Ms)
+        $t.Add_Tick({ try { $args[0].Stop() } catch { }; try { $script:noticeForm.Close() } catch { } })
+        # A form in a hidden (window 0) launch inherits SW_HIDE; show it explicitly (see Start-Splash).
+        $f.Add_Shown({ try { [void][M365.BannerWin]::ShowWindow($this.Handle, 5) } catch { } })
+        $t.Start()
+        [void]$f.ShowDialog()
+        try { $t.Dispose(); $f.Dispose() } catch { }
+    } catch { }
+}
+function Invoke-StartAllLeave {
+    Write-Host "[lock] a startup is already running (pid $script:busyHolderPid) and covers this launch -- not starting a second one"
+    if ((-not $NoUi) -and (-not $NoSplash)) {
+        $shown = 0
+        try { $shown = Show-RunningBanner } catch { $shown = 0 }
+        if (-not $shown) { Show-AlreadyRunningNotice }
+    }
+    $script:lockState = "busy"
+    $script:lockWaitSec = [math]::Round(((Get-Date) - $script:runStartedAt).TotalSeconds, 1)
+    $null = Write-StartAllRunRecord (Join-Path $script:diagDir "start_all_runs.jsonl") (New-StartAllRunRecord "already running")
 }
 
 function Get-FleetResumeSkipReason {
@@ -1645,11 +1931,29 @@ function New-StartAllRunRecord([string]$Outcome) {
         lock_wait_s      = $script:lockWaitSec
         failures         = @($script:startupFailures).Count
         outcome          = $Outcome
+        holder_pid       = [int]$script:busyHolderPid
     }
 }
 function Write-StartAllRunRecord([string]$Path, $Record, [int]$Keep = 500) {
-    # Append one JSON line, keeping only the last $Keep. Written while the start_all lock is still
-    # held, so two copies do not interleave their rewrites. Never throws.
+    # Append one JSON line, keeping only the last $Keep. Never throws.
+    # SERIALISED BY ITS OWN MUTEX, named after the file. It used to rely on the start_all lock
+    # being held; a copy that leaves because a startup is already running (Invoke-StartAllLeave)
+    # writes without it, and nine of those at once rewrote the file over each other.
+    $lk = $null
+    try {
+        $md5 = [System.Security.Cryptography.MD5]::Create()
+        $hash = [BitConverter]::ToString($md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Path.ToLowerInvariant()))).Replace("-", "")
+        $md5.Dispose()
+        $lk = New-Object System.Threading.Mutex($false, ("Global\m365-start-all-runlog-" + $hash))
+        try { [void]$lk.WaitOne(10000) } catch { }      # abandoned = ours; a timeout still writes
+    } catch { $lk = $null }
+    try {
+        return (Save-StartAllRunLines $Path $Record $Keep)
+    } finally {
+        if ($lk) { try { $lk.ReleaseMutex() } catch { }; try { $lk.Dispose() } catch { } }
+    }
+}
+function Save-StartAllRunLines([string]$Path, $Record, [int]$Keep = 500) {
     try {
         $line = ($Record | ConvertTo-Json -Compress -Depth 3)
         $dir = Split-Path -Parent $Path
@@ -1660,10 +1964,17 @@ function Write-StartAllRunRecord([string]$Path, $Record, [int]$Keep = 500) {
         }
         $lines += $line
         if ($lines.Count -gt $Keep) { $lines = $lines[($lines.Count - $Keep)..($lines.Count - 1)] }
-        $tmp = $Path + ".tmp"
+        $tmp = $Path + "." + $PID + ".tmp"
         [System.IO.File]::WriteAllLines($tmp, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
-        Move-Item -LiteralPath $tmp -Destination $Path -Force
-        return $true
+        # THE REPLACE IS RETRIED. A reader holding the file open (doctor, a tail, a test polling
+        # it) makes the rename fail with "access denied" for a moment; measured with ten clicks
+        # 200 ms apart, one "already running" line was lost that way and its .tmp left behind.
+        for ($i = 0; $i -lt 40; $i++) {
+            try { Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop; return $true }
+            catch { Start-Sleep -Milliseconds 50 }
+        }
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        return $false
     } catch { return $false }
 }
 function Test-ShouldNotifyStartupFailures([int]$Count, [bool]$NoUi, [bool]$ConsoleVisible) {
@@ -1707,11 +2018,22 @@ function Invoke-Startup {
     # FIRST, BEFORE ANYTHING IS WRITTEN OR STARTED: one copy of this script at a time (see
     # Enter-StartAllLock). The splash keeps painting while a second copy waits.
     $lockT0 = Get-Date
-    $gotLock = Enter-StartAllLock -OnWait {
-        Set-SplashStatus $script:splash "Another startup is already running -- waiting for it to finish..."
-    } -KeepWaitingWhile { Test-DepsInstallInProgress }
+    $heldAtEntry = [bool]$script:startAllLock
+    if ($heldAtEntry) {
+        # Taken at entry (Invoke-StartAllEntry), before the banner existed; its record is written.
+        $gotLock = $true
+    } else {
+        # Only a copy that must wait gets here (Invoke-StartAllEntry: the re-exec hand-over,
+        # -CoreOnly, or the ONE launch that needs more than the running startup does).
+        $gotLock = Enter-StartAllLock -Name $script:startAllLockName -OnWait {
+            Set-SplashStatus $script:splash "Another startup is already running -- waiting for it to finish..."
+        } -KeepWaitingWhile { Test-DepsInstallInProgress }
+    }
     $script:lockWaitSec = [math]::Round(((Get-Date) - $lockT0).TotalSeconds, 1)
     $script:lockState = $(if (-not $gotLock) { "timed out" } elseif ($script:lockWaitSec -ge 1) { "got after waiting" } else { "got" })
+    # The waiter slot is given up either way; a copy that now holds the lock records that it does.
+    Exit-StartAllWaiterSlot
+    if ($gotLock -and -not $heldAtEntry) { Update-StartAllBannerRecord }
     if (-not $gotLock) {
         $script:lockTimedOut = $true
         $script:startupFailures += "another start_all.ps1 held the startup lock for 10 minutes; this one did not start anything alongside it -- close it (Task Manager) and start again"
@@ -2199,9 +2521,18 @@ function Hide-Secrets([string]$text) {
     $t = [regex]::Replace($t, 'https://[A-Za-z0-9\-]+\.devtunnels\.ms\S*', 'https://<tunnel>.devtunnels.ms/...')
     return $t
 }
+# ONE STARTUP AT A TIME, DECIDED BEFORE ANY BANNER EXISTS: a copy that finds a startup already
+# running which covers it leaves here, in ~2 s, instead of queueing a second bring-up (see the
+# block above Get-RankOfStartAllMode for who still waits, and why).
+$script:entryAction = Invoke-StartAllEntry
+if ($script:entryAction -eq "leave") {
+    Invoke-StartAllLeave
+    exit 0
+}
 $ranViaSplash = $false
 try {
     if (-not $NoSplash) { $script:splash = Start-Splash }
+    Update-StartAllBannerRecord
     if ((-not $NoSplash) -and $script:splash -and $script:splash.Form) {
         $script:splash.Start = (Get-Date)
         $timer = New-Object System.Windows.Forms.Timer
@@ -2217,6 +2548,8 @@ try {
         $timer.Start()
         [void]$script:splash.Form.ShowDialog()
         try { $script:splash.Form.Dispose() } catch { }
+        # The banner is gone; a click from now on gets the short notice instead.
+        if ($script:startAllLock) { $null = Write-StartAllRoleRecord "holder" $false 0 }
         $ranViaSplash = $true
     }
 } catch { $ranViaSplash = $false }
@@ -2278,8 +2611,34 @@ function Report-OtherProfileSignIns {
         if (-not $m.Success) { continue }
         if ($m.Groups[4].Success -and $m.Groups[4].Value) { continue }
         if ($m.Groups[3].Value -ne "sign_in_needed") { continue }
-        Write-Host ("[m365] {0} (:{1}) is on a sign-in page -- it is a SEPARATE browser profile, so the companion's sign-in does not cover it. {2}" `
-            -f $m.Groups[2].Value, $m.Groups[1].Value, $m.Groups[5].Value) -ForegroundColor Yellow
+        # THE CHAT BRIDGE'S EDGE IS THE ONE THAT COUNTS (e66af67). The chat window needs it; any
+        # other managed profile (the eval browser) is optional, so it is printed, not counted.
+        $bp = $(if ($env:MCP_BRIDGE_CDP_PORT) { $env:MCP_BRIDGE_CDP_PORT } else { "9223" })
+        if ($m.Groups[1].Value -ne $bp) {
+            Write-Host ("[m365] {0} (:{1}) is on a sign-in page -- it is a SEPARATE browser profile, so the companion's sign-in does not cover it (optional). {2}" `
+                -f $m.Groups[2].Value, $m.Groups[1].Value, $m.Groups[5].Value) -ForegroundColor Yellow
+            continue
+        }
+        # The same sentence doctor.ps1 shows ($bridgeSigninFixJa -- keep the two arrays equal),
+        # built from code points: this file has no BOM, so Windows PowerShell 5.1 reads it in
+        # the ANSI code page and a Japanese literal would arrive mangled.
+        $fixJa = -join (@(
+            0x30C1,0x30E3,0x30C3,0x30C8,0x753B,0x9762,0x304C,0x4F7F,0x3046,0x0020,0x0045,0x0064,
+            0x0067,0x0065,0x0020,0x304C,0x30B5,0x30A4,0x30F3,0x30A4,0x30F3,0x753B,0x9762,0x3067,
+            0x6B62,0x307E,0x3063,0x3066,0x3044,0x307E,0x3059,0x3002,0x30B5,0x30A4,0x30F3,0x30A4,
+            0x30F3,0x304C,0x5FC5,0x8981,0x306B,0x306A,0x308B,0x3068,0x3001,0x305D,0x306E,0x0020,
+            0x0045,0x0064,0x0067,0x0065,0x0020,0x304C,0x81EA,0x52D5,0x3067,0x524D,0x9762,0x306B,
+            0x8868,0x793A,0x3055,0x308C,0x307E,0x3059,0x3002,0x8868,0x793A,0x3055,0x308C,0x305F,
+            0x0020,0x0045,0x0064,0x0067,0x0065,0x0020,0x3067,0x3001,0x4F1A,0x793E,0x306E,0x30A2,
+            0x30AB,0x30A6,0x30F3,0x30C8,0x3067,0x30B5,0x30A4,0x30F3,0x30A4,0x30F3,0x3057,0x3066,
+            0x304F,0x3060,0x3055,0x3044,0x3002,0x8868,0x793A,0x3055,0x308C,0x3066,0x3044,0x306A,
+            0x3044,0x5834,0x5408,0x306F,0x3001,0x30C7,0x30B9,0x30AF,0x30C8,0x30C3,0x30D7,0x306E,
+            0x300C,0x004D,0x0033,0x0036,0x0035,0x0020,0x0043,0x006F,0x006D,0x0070,0x0061,0x006E,
+            0x0069,0x006F,0x006E,0x300D,0x3092,0x3082,0x3046,0x4E00,0x5EA6,0x8D77,0x52D5,0x3059,
+            0x308B,0x3068,0x8868,0x793A,0x3055,0x308C,0x307E,0x3059,0x3002
+        ) | ForEach-Object { [char]$_ })
+        Write-Host ("[m365] " + $fixJa + " (" + $m.Groups[2].Value + " :" + $m.Groups[1].Value + ", " + $m.Groups[5].Value + ")") -ForegroundColor Yellow
+        # English and exact: doctor.ps1 maps this line (for the bridge port) to the same sentence.
         $script:startupFailures += ("M365 sign-in needed on " + $m.Groups[2].Value + " (:" + $m.Groups[1].Value + ")")
     }
 }

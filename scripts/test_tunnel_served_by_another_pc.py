@@ -111,7 +111,9 @@ _EXPECT = {"exe": True, "exeCluster": True, "bare": True, "cmdStub": True, "pref
 
 def test_both_scripts_recognise_this_tunnels_host_the_same_way(tmp_path):
     sup = _read(SUPERVISOR_PS1)
-    setup = _read(SETUP_PS1)
+    # setup_devtunnel.ps1's copy moved to tunnel_name_util.ps1 (2026-09-24), which it and
+    # heal_tunnel.ps1 dot-source; the comparison is now supervisor vs that shared one.
+    setup = _read(NAME_UTIL_PS1)
     lines = ["$ErrorActionPreference = 'Stop'", ". '%s'" % NAME_UTIL_PS1,
              _extract_braced_block(sup, "function Test-IsTunnelHostCommandLine")]
     setup_fn = _extract_braced_block(setup, "function Test-IsTunnelHostCommandLine")
