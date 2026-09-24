@@ -28,6 +28,12 @@ processes, ports, screenshots.
 * `AC` -- **A** `quickstart.bat` straight through on the fresh sandbox (the access
   question is answered `N`, as typed), then **C** `start_all.bat`: one click, a second
   click right after it settles, then ten clicks at the same moment.
+* `C` -- quickstart run up to the devtunnel sign-in and closed there (the most of an
+  install a person can make without a devtunnel account), then the three `start_all.bat`
+  runs above. Use this one; `AC` spends ~15 min waiting for the device code to expire.
+* All scenarios run as a local STANDARD user the driver creates (never in Administrators);
+  answers are typed into the real console (never a redirected stdin), and a modal error box
+  is screenshotted, then OK is pressed, as a person would.
 * `B` -- `quickstart.bat` killed (process tree, like closing the window) 25 s into the
   dependency install, run again and killed the moment `.env` preparation starts, then run
   again to show it resumes and finishes the same steps (stopped once it reaches the
