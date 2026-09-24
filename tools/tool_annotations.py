@@ -127,10 +127,11 @@ TOOL_ANNOTATION_OVERRIDES: dict[str, dict[str, bool]] = {
     "outlook_create_event": {"openWorldHint": True},  # send_invite=True notifies external attendees; not marked destructive (event/invite can be cancelled)
 
     # --- ODBC: local write helper vs. remote database query ---
-    # odbc_query is read-only (no require_unlocked call) AND open-world (it queries a
-    # remote/corporate DB). readOnlyHint + openWorldHint is a valid MCP combination
-    # (reads, no side effects, but reaches an external service), so both are set.
-    "odbc_query": {"openWorldHint": True},  # read-only query against a remote/corporate DB
+    # odbc_query is now require_unlocked()-gated (2026-09-24: database reads sit behind
+    # the same unlock as writes, per the owner's decision) AND open-world (it queries a
+    # remote/corporate DB). readOnlyHint is derived False now that it is gated;
+    # openWorldHint is still set explicitly here since derivation cannot see it.
+    "odbc_query": {"openWorldHint": True},  # gated query against a remote/corporate DB
     "odbc_to_excel": {"openWorldHint": True},  # queries a remote database AND writes a local file (gated, not read-only)
 
     # --- web: read-only BUT open-world (they reach external hosts over the network) ---

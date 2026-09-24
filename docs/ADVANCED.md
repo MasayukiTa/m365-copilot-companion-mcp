@@ -14,7 +14,7 @@ relay / fleet の細かい制御、bridge UI、ODBC 接続、ツール自己生�
 |---|---|---|---|
 | **コード実行** | `run_python`, `shell_exec`, `run_python_in_background`, `run_in_background`, `job_wait`, `job_status`, `job_output`, `job_list`, `job_kill` | 🟢 | コードを走らせる、長いやつは投げて待つ、暴走したら殺す |
 | **PowerShell** | `pwsh_exec`, `pwsh_exec_file`, `shell_which` | 🪟 | PowerShell 5.1 / 7 を直接叩く（`-NoProfile -NonInteractive -ExecutionPolicy Bypass` 込み） |
-| **プロセス / サービス / レジストリ** | `process_list`, `process_info`, `process_kill`, `service_status`, `registry_read` | 🪟📦`psutil` | タスクマネージャ + サービス + レジストリの読み口（kill は unlock 必須） |
+| **プロセス / サービス / レジストリ** | `process_list`, `process_info`, `process_kill`, `service_status`, `registry_read` | 🪟📦`psutil` | タスクマネージャ + サービス + レジストリの読み口（kill と registry_read は unlock 必須。レジストリには自動ログオンのパスワード等が平文で入り得るため） |
 | **ファイル I/O** | `read_file`, `write_file`, `append_file`, `list_directory`, `glob`, `find_files`, `copy_path`, `move_path`, `trash_path`, `create_directory`, `delete_path` | 🟢 | 許可ディレクトリ内のファイルを自在に。`trash_path` はゴミ箱送りで復元可 |
 | **ファイル/ディスク調査** | `hash_file`, `find_duplicates`, `dir_size`, `file_metadata` | 🟢 | ハッシュ・重複検出・容量・メタ情報 |
 | **編集・検索** | `grep`, `replace_in_file`, `multi_edit`, `diff_files`, `python_check` | 🟢 | 原子的な複数編集 |
@@ -26,12 +26,12 @@ relay / fleet の細かい制御、bridge UI、ODBC 接続、ツール自己生�
 | **PowerPoint** | `create_pptx`, `pptx_from_markdown`, `pptx_info`, `pptx_add_slide`, `pptx_add_image`, `pptx_add_table`, `pptx_replace_image` | 🟢 | スライド生成・画像/表埋込 |
 | └ PNG 自己確認 | `pptx_export_png` | 🪟📦`PowerPoint 本体` | 各スライドを PNG 化して目視 |
 | **Word (.docx)** | `create_docx`, `docx_from_markdown`, `docx_info`, `read_docx` | 🟢 | 文書生成と読解 |
-| **Outlook**（ローカル退避路） | `outlook_inbox`, `outlook_send_mail`, `outlook_calendar`, `outlook_create_event` | 🪟📦`Outlook 本体` | Graph コネクタが使えない時用。COM で今ログイン中の Outlook を借りる。送信は既定で下書き保存 |
-| **クリップボード / スクリーン** | `clipboard_get`, `clipboard_set`, `screenshot` | 🪟 | 「いまコピーしたこれ見て」「いま画面に映ってるもの撮って」 |
+| **Outlook**（ローカル退避路） | `outlook_inbox`, `outlook_send_mail`, `outlook_calendar`, `outlook_create_event` | 🪟📦`Outlook 本体` | Graph コネクタが使えない時用。COM で今ログイン中の Outlook を借りる。送信は既定で下書き保存。4つとも unlock 必須（読み取りも本人のメール/予定表なので） |
+| **クリップボード / スクリーン** | `clipboard_get`, `clipboard_set`, `screenshot` | 🪟 | 「いまコピーしたこれ見て」「いま画面に映ってるもの撮って」。`clipboard_get`/`clipboard_set` は unlock 必須 |
 | **図 / 数式** | `render_diagram`☁, `render_mermaid_png`☁, `render_math`🟢 | ☁ Kroki / `render_math` は外部不要 | アーキ図と数式を生成。社外秘は render_diagram に出さない |
 | **Web** | `web_fetch`, `web_search`, `web_search_news`, `github_file` | ☁ | DuckDuckGo 検索・URL 取得。Copilot 標準検索が使えれば不要 |
 | **DB (SQLite)** | `sqlite_tables`, `sqlite_schema`, `sqlite_query`, `sqlite_to_excel` | 🟢 | ローカル `.sqlite` を read-only で |
-| **DB (ODBC)** | `odbc_drivers`, `odbc_connections`, `odbc_tables`, `odbc_columns`, `odbc_query`, `odbc_to_excel` | 📦`ODBC ドライバ`+接続設定 | 社内 SQL Server / Azure SQL。Windows/Entra 認証継承、read-only 強制 |
+| **DB (ODBC)** | `odbc_drivers`, `odbc_connections`, `odbc_tables`, `odbc_columns`, `odbc_query`, `odbc_to_excel` | 📦`ODBC ドライバ`+接続設定 | 社内 SQL Server / Azure SQL。Windows/Entra 認証継承、read-only 強制。実データ/スキーマを返す `odbc_query`/`odbc_tables`/`odbc_columns`/`odbc_to_excel` は unlock 必須（`odbc_drivers`/`odbc_connections` は接続の存在確認のみなので不要） |
 | **永続記憶** | `memory_save`, `memory_load`, `memory_list`, `memory_delete` | 🟢 | セッション横断のメモ |
 | **スケジュール** | `schedule_create`, `schedule_list`, `schedule_info`, `schedule_run_now`, `schedule_delete` | 🪟 | 「毎週金曜 9 時に週報生成」 |
 | **ファイル監視** | `watcher_start`, `watcher_events`, `watcher_stop` | 📦`watchdog` | フォルダ変更検知 |

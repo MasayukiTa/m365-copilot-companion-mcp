@@ -21,7 +21,9 @@ Important caveats:
   * The host must have Microsoft Outlook installed and a profile configured.
   * Older Outlook builds may pop a "an application is trying to send mail"
     confirmation dialog when sending; recent M365 Outlook usually does not.
-  * Send operations require an unlock per IP just like other write tools.
+  * Every tool here requires an unlock per IP, sends and reads alike (2026-09-24:
+    inbox/calendar reads return the operator's own mail and calendar, which is as
+    sensitive as a write).
   * All connections run in the user's identity. The agent has whatever
     mailbox / calendar access that user already has — nothing more.
 """
@@ -81,10 +83,16 @@ def outlook_inbox(limit: int = 20, unread_only: bool = False) -> str:
     Use it only when the desktop application itself is the point -- reading local-only
     items, or a state that exists in the installed client and nowhere on the server.
 
+    GATED: reads the operator's mail, so it requires the same per-IP unlock as a
+    write. Call unlock(password=...) first if refused.
+
     Args:
         limit: How many messages to return (newest first).
         unread_only: If true, only show unread items.
     """
+    locked = require_unlocked()
+    if locked:
+        return locked
     try:
         ol = _dispatch()
         try:
@@ -200,6 +208,10 @@ def outlook_calendar(
     over COM and reads only what that profile holds locally. Use this only when the installed
     client itself is the point.
 
+    GATED: reads the operator's calendar (attendees, locations, subjects), so it
+    requires the same per-IP unlock as a write. Call unlock(password=...) first
+    if refused.
+
     Args:
         days_ahead: How many days into the future to include (1 = today and
             tomorrow's start-of-day).
@@ -207,6 +219,9 @@ def outlook_calendar(
             if their start time has already passed.
         limit: Maximum events to return.
     """
+    locked = require_unlocked()
+    if locked:
+        return locked
     try:
         ol = _dispatch()
         try:
