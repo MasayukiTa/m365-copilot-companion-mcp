@@ -48,8 +48,8 @@ function Build($name, $sources) {
 # kept free of WPF so ui/test_the_chat_window_sends_what_was_typed.py can compile and run it.
 # BridgeClient.cs is the chat's only way to the bridge (authenticated POST + X-Bridge-Token),
 # kept free of WPF so ui/test_the_bridge_client_sends_the_token.py can run it against a bridge.
-Build "FleetCockpit" @("FleetCockpit.cs","SelfImproveDashboard.cs","Theme.cs","FleetCommands.cs","WindowSelfTest.cs","SubmittedTasks.cs")
-Build "CopilotChat"  @("CopilotChat.cs","Markdown.cs","Theme.cs","FleetCommands.cs","ChatSend.cs","WindowSelfTest.cs","BridgeClient.cs")
+Build "FleetCockpit" @("FleetCockpit.cs","SelfImproveDashboard.cs","Theme.cs","FleetCommands.cs","WindowSelfTest.cs","SubmittedTasks.cs","FleetConvIdentity.cs")
+Build "CopilotChat"  @("CopilotChat.cs","Markdown.cs","Theme.cs","FleetCommands.cs","ChatSend.cs","WindowSelfTest.cs","BridgeClient.cs","FleetConvIdentity.cs")
 
 # 3) Launch both fresh (cockpit first; it will not relaunch a stale chat because we launch the new one).
 if (-not $NoLaunch) {

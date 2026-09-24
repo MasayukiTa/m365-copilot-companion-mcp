@@ -19,38 +19,27 @@ worker when `c.Transcript` is non-empty AND matches the CURRENT status.json row 
 "fleet_steer_live" case, which proves that logic correct given a Conversation whose Goal and
 Transcript are already populated.
 
-The defect was upstream of ChatSend.cs entirely: nothing that builds a fleet Conversation
-object in ui/CopilotChat.cs ever copied Goal or Transcript onto it.
+The defect was upstream of ChatSend.cs entirely: nothing that built a fleet Conversation object
+in ui/CopilotChat.cs ever copied Goal or Transcript onto it. Fixed by commit 3c93b59
+(OpenFromFleet / SyncRegistry) and later pulled out of ui/CopilotChat.cs into
+ui/FleetConvIdentity.cs, a WPF-free static class, so the merge rules themselves -- not just their
+call sites -- can be run by a test (ui/test_a_fleet_interrupt_survives_a_supervisor_restart.py
+compiles and executes ui/FleetConvIdentity.cs + ui/ChatSend.cs directly, via
+ui/harness/FleetConvIdentityHarness.cs; that is the RUNTIME half of this coverage). THIS file
+stays source-text: it checks that ui/CopilotChat.cs actually WIRES UP the extracted decisions at
+both call sites, which a runtime test of FleetConvIdentity.cs alone cannot see (it could pass
+while OpenFromFleet or SyncRegistry called nothing, or called the wrong method).
 
   * OpenFromFleet() -- the method .fleet/open.json drives when a cockpit card is clicked
     (CheckOpenRequest) -- resolves the live worker dict (`wkr`) and the on-disk transcript path
-    (`transcriptPath`) itself, using both to render the conversation body, but never assigned
-    either onto the `Conversation c` object it hands to `_conv` -- the SAME object
-    ChatSend.SendText later reads `.Goal` and `.Transcript` from. A brand-new stub got neither
-    field, ever; a reused row (matched by ConvUrl) never had a missing field filled in even
-    when the live worker dict it just read had the answer in hand.
+    (`transcriptPath`) itself, then hands them to FleetConvIdentity.ResolveGoal / MergeForward /
+    MergeBackfillOnly to decide what lands on the `Conversation c` object it hands to `_conv` --
+    the SAME object ChatSend.SendText later reads `.Goal` and `.Transcript` from.
   * SyncRegistry() -- the poll of `.fleet/conversations.json`, the ONLY feed that updates a
     fleet conversation already in the sidebar while the window stays open (DiscoverTranscripts
-    scans the transcripts directory once, at startup) -- built its Conversation rows from
-    "url"/"title"/"source"/"transcript"/"name"/"ts" and never read a "goal" field, because the
-    registry never wrote one either (relay/fleet_runner.py's _register_convs carried only a
-    truncated, display-only `title`, made from the goal but not the goal itself).
-
-So a fleet conversation reached through EITHER of the window's two "open" paths carried a
-permanently empty Goal, and often an empty Transcript too -- refusing a follow-up or a
-mid-run interrupt identically, regardless of whether the worker had finished or was still on
-its current turn.
-
-Fixed by carrying the goal the rest of the way:
-  * relay/fleet_runner.py's `_register_convs` now writes `"goal": w.goal` into every registry
-    row, and `merge_conv_rows` backfills a missing "goal" onto an existing row without ever
-    overwriting one already recorded (relay/test_conv_registry_points_at_this_run.py).
-  * ui/CopilotChat.cs's SyncRegistry() reads that field and sets `c.Goal` -- on a fresh row and,
-    as a backfill, on one it finds already registered.
-  * ui/CopilotChat.cs's OpenFromFleet() resolves the best available goal (the live worker
-    dict's own "goal", falling back to the transcript's own first-line "goal" via the new
-    TranscriptMetaGoal() helper) and copies it, plus the transcript path it already computed,
-    onto `c` -- again without ever blanking a value the row already had.
+    scans the transcripts directory once, at startup) -- reads a "goal" field the registry now
+    writes (relay/fleet_runner.py's `_register_convs`) and backfills it via
+    FleetConvIdentity.MergeBackfillOnly, same never-overwrite rule as OpenFromFleet's Source/Name.
 """
 from __future__ import annotations
 
@@ -79,11 +68,15 @@ def _block(code: str, start: str, length: int = 3200) -> str:
 def test_open_from_fleet_resolves_a_goal_from_the_live_worker_or_the_transcript():
     """Both sources OpenFromFleet already has in hand at that point: the live status.json
     worker dict first (survives a finished worker whose slot has not been reused), the
-    transcript's own first-line "goal" as the fallback (survives a restarted fleet)."""
+    transcript's own first-line "goal" as the fallback (survives a restarted fleet). The
+    priority itself is FleetConvIdentity.ResolveGoal's job (see
+    ui/test_a_fleet_conversation_identity_merge_runs.py) -- this only checks the call site
+    passes it the right two values."""
     code = _code()
     body = _block(code, "void OpenFromFleet(string url, string worker, string transcriptHint)", 6500)
     assert 'string liveGoal = wkr != null ? SS(wkr, "goal") : ""' in body
     assert "TranscriptMetaGoal(transcriptPath)" in body
+    assert "FleetConvIdentity.ResolveGoal(liveGoal, TranscriptMetaGoal(transcriptPath))" in body
     assert "bestGoal" in body
 
 
@@ -91,27 +84,18 @@ def test_open_from_fleet_copies_goal_and_transcript_onto_the_conversation():
     """The Conversation object built/reused here is the SAME one ChatSend.SendText later reads
     .Goal and .Transcript from (it becomes `_conv`). Without this assignment the resolution
     above is dead: it renders the body correctly and still leaves the object that matters
-    empty."""
+    empty. The forward-merge rule itself (fresh non-empty value wins) is
+    FleetConvIdentity.MergeForward's job -- checked at runtime, not here."""
     code = _code()
     body = _block(code, "void OpenFromFleet(string url, string worker, string transcriptHint)", 6500)
-    assert "c.Transcript = transcriptPath" in body, (
+    assert "c.Transcript = FleetConvIdentity.MergeForward(c.Transcript, transcriptPath)" in body, (
         "the transcript path is computed and never stored on c -- LiveWorkerFor "
         "(ChatSend.cs) requires c.Transcript non-empty and will always answer "
         '"" (no live worker), so a mid-run interrupt cannot be steered')
-    assert "c.Goal = bestGoal" in body, (
+    assert "c.Goal = FleetConvIdentity.MergeForward(c.Goal, bestGoal)" in body, (
         "the resolved goal is never stored on c -- DecideFleetSend (ChatSend.cs) refuses "
         "fleet_no_goal whenever c.Goal is empty, regardless of whether a real goal was "
         "available")
-
-
-def test_open_from_fleet_never_blanks_an_identity_the_row_already_had():
-    """A reused row (found by matching ConvUrl) may already carry a correct Goal/Transcript
-    from DiscoverTranscripts or SyncRegistry; a transient miss here (no wkr, no meta line, e.g.
-    a slow disk read) must not stomp it back to empty."""
-    code = _code()
-    body = _block(code, "void OpenFromFleet(string url, string worker, string transcriptHint)", 6500)
-    assert 'if (!string.IsNullOrEmpty(transcriptPath)) c.Transcript = transcriptPath;' in body
-    assert 'if (!string.IsNullOrEmpty(bestGoal)) c.Goal = bestGoal;' in body
 
 
 def test_open_from_fleet_claims_source_fleet_only_for_an_unclaimed_row():
@@ -120,10 +104,12 @@ def test_open_from_fleet_claims_source_fleet_only_for_an_unclaimed_row():
     claimed, or the fleet channel is unreachable from this open path at all -- but a row already
     carrying a different, real source (e.g. a plain Copilot-side orphan sharing this exact
     ConvUrl, reached through OpenConversation's "haven't loaded yet" fallback) must not be
-    silently reclassified as a fleet conversation."""
+    silently reclassified as a fleet conversation. Backfill-only (claim iff currently empty) is
+    FleetConvIdentity.MergeBackfillOnly's job -- checked at runtime, not here."""
     code = _code()
     body = _block(code, "void OpenFromFleet(string url, string worker, string transcriptHint)", 6500)
-    assert 'if (string.IsNullOrEmpty(c.Source)) c.Source = "fleet";' in body
+    assert 'c.Source = FleetConvIdentity.MergeBackfillOnly(c.Source, "fleet")' in body
+    assert "c.Name = FleetConvIdentity.MergeBackfillOnly(c.Name, worker)" in body
 
 
 def test_transcript_meta_goal_helper_reads_only_the_first_line():
@@ -151,18 +137,17 @@ def test_sync_registry_sets_goal_on_a_freshly_discovered_row():
     assert "c.Goal = regGoal" in body
 
 
-def test_sync_registry_backfills_goal_on_a_row_it_already_knows_without_overwriting():
+def test_sync_registry_backfills_goal_via_the_extracted_merge_rule():
     """The registry poll runs continuously; a row it already added (in an earlier poll, or by
     DiscoverTranscripts at startup) must pick up a goal that only became available later, but a
     goal it already has must never be replaced -- the same rule merge_conv_rows enforces on the
-    relay side (relay/test_conv_registry_points_at_this_run.py)."""
+    relay side (relay/test_conv_registry_points_at_this_run.py), and the same rule
+    FleetConvIdentity.MergeBackfillOnly implements (checked at runtime, not here -- this only
+    checks the call site routes through it rather than re-inlining the guard)."""
     code = _code()
     body = _block(code, "void SyncRegistry()")
-    assert "existingC.Goal = regGoal" in body
-    backfill = _block(body, "if (existingC != null)", 500)
-    assert "string.IsNullOrEmpty(existingC.Goal)" in backfill, (
-        "the backfill is not conditioned on the existing goal being empty -- it would "
-        "overwrite a goal the row already has")
+    assert "existingC.Goal = FleetConvIdentity.MergeBackfillOnly(existingC.Goal, regGoal)" in body
+    assert "existingC.Transcript = FleetConvIdentity.MergeBackfillOnly(existingC.Transcript, transcript)" in body
 
 
 def test_the_running_binary_carries_this_change():
@@ -180,3 +165,6 @@ def test_the_running_binary_carries_this_change():
     assert needle in blob, (
         "CopilotChat.exe predates this change -- rebuild it, or a fleet conversation opened "
         "from the cockpit still carries no goal")
+    needle2 = "FleetConvIdentity".encode("utf-8")
+    assert needle2 in blob, (
+        "CopilotChat.exe predates the FleetConvIdentity extraction -- rebuild it")

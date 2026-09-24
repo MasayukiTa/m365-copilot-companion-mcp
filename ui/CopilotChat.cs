@@ -1434,11 +1434,11 @@ class ChatWindow : Window, IChatSendEffects
                     // BACKFILL ONLY: a row discovered before the registry carried "goal", or one
                     // whose identity was never set by OpenFromFleet (see there), must not stay
                     // permanently unaddressable just because it already exists. Never overwrite
-                    // a goal/transcript this row already has.
-                    if (!string.IsNullOrEmpty(regGoal) && string.IsNullOrEmpty(existingC.Goal))
-                        existingC.Goal = regGoal;
-                    if (!string.IsNullOrEmpty(transcript) && string.IsNullOrEmpty(existingC.Transcript))
-                        existingC.Transcript = transcript;
+                    // a goal/transcript this row already has -- the decision itself lives in
+                    // FleetConvIdentity.MergeBackfillOnly (see ui/FleetConvIdentity.cs) so a
+                    // test can run it directly instead of only reading this call site as text.
+                    existingC.Goal = FleetConvIdentity.MergeBackfillOnly(existingC.Goal, regGoal);
+                    existingC.Transcript = FleetConvIdentity.MergeBackfillOnly(existingC.Transcript, transcript);
                     continue;
                 }
                 {
@@ -1688,7 +1688,9 @@ class ChatWindow : Window, IChatSendEffects
         // method built the conversation the chat window actually sends through, and it always
         // carried an empty Goal and an empty Transcript regardless of the worker's real state.
         string liveGoal = wkr != null ? SS(wkr, "goal") : "";
-        string bestGoal = !string.IsNullOrEmpty(liveGoal) ? liveGoal : TranscriptMetaGoal(transcriptPath);
+        // Decision itself (which source wins) lives in FleetConvIdentity.ResolveGoal so a test
+        // can run it without WPF; see ui/FleetConvIdentity.cs.
+        string bestGoal = FleetConvIdentity.ResolveGoal(liveGoal, TranscriptMetaGoal(transcriptPath));
 
         // SOURCE PRIORITY:
         //  1. Persisted full-text transcript (jsonl) -- ALWAYS preferred when present. It is the
@@ -1747,14 +1749,14 @@ class ChatWindow : Window, IChatSendEffects
             // with no source yet (the default "") is claimed here. DecideDoor (ChatSend.cs)
             // routes a send by c.Source == "fleet"; a stub left at "" would fall through to the
             // page-pinning doors instead, which have no key for it either (send_unknown_conv).
-            if (string.IsNullOrEmpty(c.Source)) c.Source = "fleet";
-            if (!string.IsNullOrEmpty(worker) && string.IsNullOrEmpty(c.Name)) c.Name = worker;
-            // NEVER BLANK OUT AN IDENTITY THIS ROW ALREADY HAD (e.g. from DiscoverTranscripts or
-            // the conversations.json registry sync) -- only fill in what is missing, and prefer
-            // whatever is freshest when both exist (the live/transcript reads just above this
-            // block are always at least as current as a poll from earlier).
-            if (!string.IsNullOrEmpty(transcriptPath)) c.Transcript = transcriptPath;
-            if (!string.IsNullOrEmpty(bestGoal)) c.Goal = bestGoal;
+            // The merge decisions (claim Source only for an unclaimed row; never blank the
+            // Transcript/Goal the row already had) live in FleetConvIdentity.MergeBackfillOnly
+            // and .MergeForward -- see ui/FleetConvIdentity.cs -- so a test can run them
+            // directly instead of only reading this call site as text.
+            c.Source = FleetConvIdentity.MergeBackfillOnly(c.Source, "fleet");
+            c.Name = FleetConvIdentity.MergeBackfillOnly(c.Name, worker);
+            c.Transcript = FleetConvIdentity.MergeForward(c.Transcript, transcriptPath);
+            c.Goal = FleetConvIdentity.MergeForward(c.Goal, bestGoal);
             c.Messages.Clear();
             foreach (var m in loaded) c.Messages.Add(m);
             _conv = c;
