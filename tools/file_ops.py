@@ -169,8 +169,59 @@ _SECURITY_STATE_NAMES = frozenset({
 _SECURITY_STATE_DIRS = ("companion_runs", ".companion_runs", ".companion_gates")
 
 
+#: THE FLEET'S CONTROL CHANNEL (SEC-08). A file dropped into <fleet state>/commands.d/ is a
+#: command the running fleet obeys: close or add workers, change the admission floors, steer
+#: a conversation, or have the unlock password delivered into a worker's next turn. Handing
+#: that directory to write_file would let a worker reconfigure and redirect the fleet it runs
+#: in. acks/ holds the landing receipts task_router trusts as proof a goal was taken, and
+#: commands.json is the legacy single-file channel the fleet still reads.
+#:
+#: NARROWED, NOT CLOSED -- the same honest posture as .companion_gates above: run_python and
+#: shell_exec write files without passing through this module. An HMAC on each command would
+#: not change that either, since its key would have to sit where this same account (and so
+#: run_python) can read it; removing the file tools as the cheap route is what is available.
+_FLEET_CHANNEL_DIRS = ("commands.d", "acks")
+_FLEET_CHANNEL_FILES = ("commands.json",)
+
+
+def _fleet_state_roots():
+    roots = [Path(__file__).resolve().parent.parent / ".fleet"]
+    env = (os.environ.get("FLEET_STATE_DIR") or "").strip()
+    if env:
+        try:
+            roots.append(Path(env).expanduser().resolve())
+        except Exception:
+            pass
+    return roots
+
+
+def _is_fleet_channel(resolved: Path) -> bool:
+    low = [q.lower() for q in resolved.parts]
+    # Any `.fleet/commands.d` (or acks/, commands.json), wherever the checkout is ...
+    for i in range(len(low) - 1):
+        if low[i] == ".fleet" and (low[i + 1] in _FLEET_CHANNEL_DIRS
+                                   or (i + 2 == len(low) and low[i + 1] in _FLEET_CHANNEL_FILES)):
+            return True
+    # ... and the configured state dir by its own path, whatever it is called.
+    target = os.path.normcase(str(resolved))
+    for root in _fleet_state_roots():
+        base = os.path.normcase(str(root))
+        for d in _FLEET_CHANNEL_DIRS:
+            sub = os.path.join(base, os.path.normcase(d))
+            if target == sub or target.startswith(sub + os.sep):
+                return True
+        for f in _FLEET_CHANNEL_FILES:
+            if target == os.path.join(base, os.path.normcase(f)):
+                return True
+    return False
+
+
 def _refuse_security_state(resolved: Path, requested: str) -> None:
     """Raise if `resolved` is the server's own authorisation or audit state."""
+    if _is_fleet_channel(resolved):
+        raise PermissionError(
+            "Refusing to touch the fleet's command channel (%s). A file there is an order the "
+            "running fleet obeys; use fleet_submit to hand the fleet a goal." % requested)
     if resolved.name in _SECURITY_STATE_NAMES:
         raise PermissionError(
             "Refusing to touch the server's own authorisation state (%s). This file records "

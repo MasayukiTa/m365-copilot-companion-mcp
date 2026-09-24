@@ -1318,12 +1318,30 @@ def _redact_unlock_password(text: str) -> str:
     Not just the unlock password: an agent that read .env once echoed it back, and the
     API key and HF token landed in a transcript in clear text. Selection is by NAME in
     one shared place, so a newly added key is not missed the same way.
+
+    FAILS CLOSED. Both excepts here used to return the ORIGINAL text, so a redactor that
+    could not be imported or fell over wrote the injected unlock password into the transcript
+    verbatim. A failure now writes _REDACTION_FAILED_MARKER instead and says so on stderr.
+    Only the stored copy is withheld -- the turn itself was already composed and is sent
+    unredacted by its own path, so the live run is untouched.
     """
     try:
         from tools.secret_store import redact_secrets
         return redact_secrets(text)
-    except Exception:
-        return text or ""
+    except Exception as exc:
+        try:
+            import sys as _sys
+            _sys.stderr.write("[transcript] redaction failed (%s); wrote %r instead of the "
+                              "text\n" % (type(exc).__name__, _REDACTION_FAILED_MARKER))
+            _sys.stderr.flush()
+        except Exception:
+            pass
+        return _REDACTION_FAILED_MARKER
+
+
+#: The literal tools.secret_store.REDACTION_FAILED_MARKER holds, repeated here because the case
+#: it is for is the one where that module could not be imported. A test holds the two equal.
+_REDACTION_FAILED_MARKER = "[redaction failed: content withheld]"
 
 
 def _mcp_tunnel_url():
