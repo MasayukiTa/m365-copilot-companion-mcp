@@ -304,6 +304,7 @@ jobs:
             tools/test_python_gate.py \
             tools/test_powershell_hardening.py \
             tools/test_approval_policy.py \
+            tools/test_bypass_never_asks.py \
             tools/test_layer1_security.py \
             tools/test_data_report.py \
             tools/test_data_memory_hook.py \
