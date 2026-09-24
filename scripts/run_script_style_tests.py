@@ -83,6 +83,7 @@ SUITES = {
     "relay/test_repo_map.py": None,
     "relay/test_transient.py": None,
     "relay/test_unlock_inject.py": None,
+    "relay/test_unlock_redelivery_framing.py": None,
     "relay/test_watchdog.py": None,
 }
 

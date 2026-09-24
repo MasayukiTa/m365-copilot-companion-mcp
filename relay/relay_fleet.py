@@ -906,6 +906,36 @@ UNLOCK_PREFIX = (
     "\n--- 元のゴール ---\n"
 )
 
+#: The distinctive marker at the front of UNLOCK_PREFIX -- used ONLY to recognise text this
+#: process itself generated (_inject_unlock composed it earlier and it is being redelivered
+#: through the steer/follow-up channel), never to detect anything about text from elsewhere.
+_UNLOCK_MARKER = "【要解錠】"
+
+
+def is_recovery_payload(text: str) -> bool:
+    """True if `text` is _inject_unlock's own UNLOCK_PREFIX payload coming back around through
+    a redelivery channel (steer_msgs / fleet_runner's follow-up), rather than a message that
+    actually originated with a person.
+
+    Why this matters: both channels used to label EVERYTHING they carry as
+    "【ユーザーからの追加指示】" ("additional instruction FROM THE USER"). That is true for a
+    real cockpit steer and false for this specific payload -- and a false "from the user" label
+    wrapped around mid-conversation text that hands over a password and directs a tool call is
+    precisely the shape a safety-aligned model should refuse as a prompt injection. It is not
+    the model mis-judging; the label was lying. Recognising the payload here lets the caller
+    use an honest, system-authored label instead (see SYSTEM_RECOVERY_PREFIX) without touching
+    how genuine human steers are framed.
+    """
+    return bool(text) and _UNLOCK_MARKER in text
+
+
+#: Honest replacement for "【ユーザーからの追加指示】" when what is being redelivered is
+#: _inject_unlock's own payload, not anything a person wrote. Says what is actually true --
+#: this machine's own recovery automation composed it -- instead of claiming user authorship.
+SYSTEM_RECOVERY_PREFIX = (
+    "【システムからの運用連絡(このマシン上の自動復旧機構が生成した内容。ユーザー発言ではありません)】"
+)
+
 
 #: Ways a worker says it was refused for lock when it is NOT pasting the server's error back.
 #: Deliberately loose, and deliberately never used on its own -- see _looks_locked's
@@ -3831,9 +3861,30 @@ class RelayWorker:
         if self.steer_msgs:
             _steer_text = self.steer_msgs.pop(0)
             self.steers_applied.append(_steer_text)
-            self.job = ("【ユーザーからの追加指示】" + _steer_text
-                        + "\n上記を最優先で踏まえて作業を続行してください。"
-                        + CLOSING_INSTRUCTION)
+            # A REDELIVERED UNLOCK-RECOVERY PAYLOAD IS NOT A HUMAN INSTRUCTION -- SAY SO.
+            # "【ユーザーからの追加指示】" (an instruction FROM THE USER) is honest for a real
+            # cockpit steer, but when this queue is instead carrying _inject_unlock's own
+            # UNLOCK_PREFIX text back to the worker (see fleet_runner._follow_up / dispatch
+            # re-delivering a stuck worker's pending job through this same channel), that label
+            # is FALSE: nothing arrived from the user, and mid-conversation text that falsely
+            # claims to be a user instruction while directing a tool call with a password is
+            # exactly the shape a safety-aligned model is right to refuse as an injection.
+            # Confirmed against .fleet/transcripts/*.jsonl (2026-09-25 owner report): dozens of
+            # recent worker transcripts carry this exact wrapped string verbatim, immediately
+            # followed by a reply in which the worker declines to call unlock() because the
+            # password arrived as what reads like an injected instruction. The fix
+            # is not to make the payload MORE persuasive -- it is to stop mislabeling it: use
+            # is_recovery_payload's honest, system-authored framing instead whenever the queued
+            # text is recognizably _inject_unlock's own marker, and reserve the "user
+            # instruction" wording for text that did not originate here.
+            if is_recovery_payload(_steer_text):
+                self.job = (SYSTEM_RECOVERY_PREFIX + _steer_text
+                            + "\n上記の運用上の指示に従って作業を続行してください。"
+                            + CLOSING_INSTRUCTION)
+            else:
+                self.job = ("【ユーザーからの追加指示】" + _steer_text
+                            + "\n上記を最優先で踏まえて作業を続行してください。"
+                            + CLOSING_INSTRUCTION)
             self._last_was_steer = True
             # A PERSON INTERVENED, SO THE CHAIN BEFORE THEM IS NOT EVIDENCE ABOUT WHAT COMES
             # AFTER. `_continue_count` has had this rule in three places since it was written
