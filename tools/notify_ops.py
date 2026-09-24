@@ -127,7 +127,18 @@ def notify_approval_gate(title: str, body: str, gate_path: str | Path) -> str:
     blocked while the user decides.  It also provides the live confirmation,
     auto, and bypass policy controls.
     """
-    toast_result = notify_desktop(title, body) or "[notification handler returned no status]"
+    # A TOAST THAT NO CLICK CAN ANSWER IS NOISE. The gate has to be one the approval prompt
+    # can open (same question gate_is_reachable asks below); otherwise the person gets a
+    # notification, clicks it, and nothing happens -- observed 2026-09-24 with gates written
+    # into temp directories. Such a gate is not the operator's to answer, so it gets no toast.
+    try:
+        _reachable_for_toast = gate_is_reachable(Path(gate_path).expanduser().resolve())[0]
+    except Exception:
+        _reachable_for_toast = True   # cannot tell: notify rather than lose a real question
+    if not _reachable_for_toast:
+        toast_result = "[toast not shown: gate is outside the approval prompt's directory]"
+    else:
+        toast_result = notify_desktop(title, body) or "[notification handler returned no status]"
     # PYTEST_CURRENT_TEST IS NOT ENOUGH, AND THE GAP IS NOT SUBTLE. pytest sets it only while a
     # test FUNCTION runs; collection, session fixtures and teardown all run without it, and a
     # gate written in any of those phases opened a real window on the operator's desktop. It
@@ -329,6 +340,14 @@ def notify_desktop(
     # Production runtime never has this var set, so behavior there is unchanged.
     if os.environ.get("PYTEST_CURRENT_TEST"):
         return "[notify_desktop suppressed: running under pytest]"
+    # PYTEST_CURRENT_TEST DOES NOT REACH A CHILD PROCESS STARTED OUTSIDE A TEST FUNCTION, and
+    # the owner saw the result on 2026-09-24: a stack of "Skill approval needed" toasts from
+    # test runs, each naming a gate in a pytest temp directory, none of which a click could
+    # open. conftest sets MCP_SUPPRESS_GUI=1 at module scope, so every child inherits it --
+    # the same switch notify_approval_gate already honoured for its window, now honoured for
+    # the toast too.
+    if os.environ.get("MCP_SUPPRESS_GUI") == "1":
+        return "[notify_desktop suppressed: MCP_SUPPRESS_GUI]"
     try:
         if not title:
             return "[notify_desktop error: title is required]"
