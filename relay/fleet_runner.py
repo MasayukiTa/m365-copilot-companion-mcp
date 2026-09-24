@@ -710,7 +710,7 @@ def settings_autoretry():
     return (on and cap > 0), cap
 
 
-def build_settings_follower(disk_box, ram_box, mc_box, asc_box, path_fn=None):
+def build_settings_follower(disk_box, ram_box, mc_box, asc_box, path_fn=None, log=None):
     """Wire the settings file to the live boxes a running fleet reads.
 
     NAMED RATHER THAN INLINE so it can be exercised. It lived inside run(), which is 700 lines
@@ -723,23 +723,62 @@ def build_settings_follower(disk_box, ram_box, mc_box, asc_box, path_fn=None):
     The boxes are the live values themselves, shared with run_relay_fleet -- not copies. That
     is the whole mechanism: the sweep reads disk_box[0] each time it admits, so writing here
     changes the next decision without anything restarting.
+
+    BOUNDED THE SAME WAY THE COMMAND CHANNEL IS, WHICH THIS DID NOT DO (gap left by e822fb6).
+    That commit gave the cockpit -> running-fleet command channel a strict schema -- a
+    set_disk_floor_gb outside [0, 100] GB, a set_ram_floor_mb outside [0, 65536] MB, or a
+    set_maxtabs outside [1, 100] is refused (validate_command) -- but this follower reads the
+    SAME THREE KEYS out of the SAME settings.txt by a completely different path (the cockpit's
+    own live-push button vs. its "save the panel to disk, a running fleet notices next sweep"
+    path) and applied only a floor, no ceiling: `max(0.0, float(v))` accepted a disk floor of
+    1e9 GB or a NaN RAM floor from a hand-edited or foreign-written settings.txt. Two admission
+    paths into the same running fleet that disagree about what a valid number is would have
+    reopened exactly the hole SEC-08 closed for the other one.
+
+    CLAMPED, NOT IGNORED, MATCHING THE PANEL'S OWN CHOICE. ui/FleetCockpit.cs never refuses a
+    number outside range: SetDiskFloor/SetRamFloor/SetMaxTabs clamp with Math.Max/Math.Min
+    before writing settings.txt, and LoadSettings clamps AGAIN on the way back in with the
+    identical bounds -- so from the panel's own operator-facing behaviour, "this control does
+    not go past its ends" rather than "an out-of-range value is refused" is the whole design.
+    Silently dropping the update instead (as validate_command does for the command channel) would
+    make this follower behave differently from the panel it exists to mirror, for a file the
+    panel is the primary writer of. A value actually forced into range is worth one log line --
+    it means something wrote settings.txt outside what the panel itself can produce.
     """
     from relay.settings_follow import Follower
 
+    say = log or (lambda m: print(m, flush=True))
+
+    def _clamp_and_log(key, v, bounds, whole=False):
+        clamped = clamp_to_bounds(v, bounds, whole=whole)
+        if clamped is None:
+            say("[settings] %s=%r is not a finite number; ignored" % (key, v))
+            return None
+        if clamped != v:
+            say("[settings] %s=%r is outside [%s, %s]; clamped to %s"
+                % (key, v, bounds[0], bounds[1], clamped))
+        return clamped
+
     def _set_disk_floor(v):
-        disk_box[0] = max(0.0, float(v))
+        clamped = _clamp_and_log("disk_floor_gb", v, DISK_FLOOR_GB_BOUNDS)
+        if clamped is not None:
+            disk_box[0] = clamped
 
     def _set_ram_floor(v):
-        ram_box[0] = max(0.0, float(v))
+        clamped = _clamp_and_log("ram_floor_mb", v, RAM_FLOOR_MB_BOUNDS)
+        if clamped is not None:
+            ram_box[0] = clamped
 
     def _set_maxtabs(v):
+        clamped = _clamp_and_log("maxtabs", v, TABS_BOUNDS, whole=True)
+        if clamped is None:
+            return
         # Same split the cockpit's set_maxtabs command makes: under autoscale this knob
         # is the ceiling, otherwise it is the fixed cap.
-        n = max(1, int(v))
         if asc_box[0]:
-            asc_box[1] = n
+            asc_box[1] = clamped
         else:
-            mc_box[0] = n
+            mc_box[0] = clamped
 
     return (Follower(path_fn or _settings_path)
             .watch("disk_floor_gb", _set_disk_floor)
@@ -1930,6 +1969,31 @@ def _text_ok(v, limit=MAX_COMMAND_TEXT) -> bool:
 
 def _in(v, bounds) -> bool:
     return bounds[0] <= v <= bounds[1]
+
+
+def clamp_to_bounds(v, bounds, whole=False):
+    """`v` forced into `bounds` (inclusive) -- the SAME numeric range validate_command enforces
+    for this same knob (DISK_FLOOR_GB_BOUNDS / RAM_FLOOR_MB_BOUNDS / TABS_BOUNDS), so the command
+    channel and the settings-file follower cannot silently drift apart into two different
+    answers for "how big may this number be" (see build_settings_follower).
+
+    Returns None when `v` is not a finite number at all (NaN, +/-inf, or something that will
+    not convert to float) -- that is not "out of range", it is not a number, and the caller
+    leaves the live value untouched rather than adopting nonsense. Otherwise always returns a
+    number inside `bounds`, rounded to a whole number first when `whole` is set (mirrors
+    validate_command's _is_whole check for set_maxtabs / set_autoscale).
+    """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if not _math.isfinite(f):
+        return None
+    if whole:
+        f = round(f)
+    lo, hi = bounds
+    clamped = min(max(f, lo), hi)
+    return int(clamped) if whole else clamped
 
 
 def _ack_name(claimed):

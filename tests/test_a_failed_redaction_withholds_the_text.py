@@ -50,9 +50,11 @@ def test_the_markers_are_one_literal():
     import tools.secret_store as ss
     import relay.relay_fleet as rf
     import bridge.copilot_bridge as cb
+    import tools.tool_ledger as tl
     assert ss.REDACTION_FAILED_MARKER == MARKER
     assert rf._REDACTION_FAILED_MARKER == ss.REDACTION_FAILED_MARKER
     assert cb._REDACTION_FAILED_MARKER == ss.REDACTION_FAILED_MARKER
+    assert tl._REDACTION_FAILED_MARKER == ss.REDACTION_FAILED_MARKER
 
 
 def test_redact_secrets_withholds_the_whole_text_when_it_cannot_collect(monkeypatch, caplog):
@@ -186,3 +188,37 @@ def test_the_bridge_ledger_never_holds_the_canary(how, monkeypatch, caplog):
     assert CANARY not in caplog.text
     if how != "collect_raises":
         assert "ledger redaction failed" in caplog.text
+
+
+# ------------------------------------------------------------------ the tool ledger
+
+@pytest.mark.parametrize("how", ["collect_raises", "redactor_raises", "import_fails"])
+def test_the_tool_ledger_never_holds_the_canary(how, monkeypatch, tmp_path, caplog):
+    """tools/tool_ledger.py's _append had the same `except: pass` shape as the two above (SEC-18
+    follow-up, not part of e822fb6 itself): a redactor that could not be imported, or that raised
+    despite redact_secrets' own fail-closed handling, left the PRE-redaction JSON line -- the
+    row, secret and all -- to be appended unchanged. It must now write the shared marker instead,
+    exactly like the fleet transcript and the bridge ledger above."""
+    import tools.secret_store as ss
+    import tools.tool_ledger as tl
+    path = tmp_path / "tool_events.jsonl"
+    monkeypatch.setattr(tl, "_repo_path", lambda: str(path))
+    # NAME-BASED redaction (redact_args' SECRET_ARGS) runs first and would strip a "password"
+    # key before this ever reaches _append's VALUE-based redact_secrets() call -- exactly the
+    # gap tools/test_ledger_never_writes_a_secret.py's own "unlisted name" case exists for. An
+    # unlisted key + a held env secret is what actually exercises the code path under test.
+    monkeypatch.setenv("MCP_UNLOCK_PASSWORD", CANARY)
+    if how == "collect_raises":
+        monkeypatch.setattr(ss, "secret_values", _boom)
+    elif how == "redactor_raises":
+        monkeypatch.setattr(ss, "redact_secrets", _boom)
+    else:
+        monkeypatch.setitem(sys.modules, "tools.secret_store", None)   # import raises
+    with caplog.at_level(logging.WARNING):
+        tl.record_call("login", {"passphrase": CANARY})
+    stored = path.read_text(encoding="utf-8") if path.exists() else ""
+    assert CANARY not in stored, "the secret reached the tool ledger (%s)" % how
+    assert MARKER in stored, "the withheld marker was not written (%s)" % how
+    assert CANARY not in caplog.text
+    if how != "collect_raises":
+        assert "tool ledger redaction failed" in caplog.text
