@@ -16,6 +16,9 @@ param(
     [switch]$CoreOnly,
     [switch]$NoSplash
 )
+# THE SCRIPT'S FIRST LINE: "ts" in start_all_runs.jsonl (New-StartAllRunRecord). What the process
+# spent before it (PowerShell starting) is "proc_ts", read from the process, not from here.
+$script:runStartedAt = Get-Date
 
 $ErrorActionPreference = "Continue"
 # This script lives in <repo>\scripts. $root is the REPO ROOT (.env, .git, ui\ live there);
@@ -70,25 +73,41 @@ function Http-Up([string]$url) {
 # leaves its pid (ParentProcessId outlives it); a live pid whose process started AFTER this one
 # is a reused pid, not the parent, and is not reported as one.
 # ---------------------------------------------------------------------------
+function Get-Win32ProcessByPid([int]$Id) {
+    # One Win32_Process by its key, or $null. A [wmi] key lookup, NOT Get-CimInstance: this runs
+    # at the top of EVERY start_all, including the ones that only find a startup running and
+    # leave, and ten clicks at once measured Get-CimInstance (CimCmdlets autoload + a CIM
+    # session + a query) at ~1 s per process against ~0.35 s for this; under further load the
+    # lineage alone took 2.7 s of a leaver's life.
+    try { return [wmi]("Win32_Process.Handle='" + $Id + "'") } catch { return $null }
+}
+function ConvertFrom-WmiDate($Value) {
+    try { return [System.Management.ManagementDateTimeConverter]::ToDateTime([string]$Value) } catch { return $null }
+}
 function Get-LaunchLineage {
     $l = [ordered]@{ parent_pid = 0; parent_name = ""; parent_cmd = ""; grandparent_pid = 0; grandparent_name = "" }
     try {
-        $me = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $PID) -ErrorAction Stop
+        $me = Get-Win32ProcessByPid $PID
+        if (-not $me) { return $l }
         $l.parent_pid = [int]$me.ParentProcessId
-        $p = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $me.ParentProcessId) -ErrorAction SilentlyContinue
-        if ($p -and $p.CreationDate -le $me.CreationDate) {
+        $meAt = ConvertFrom-WmiDate $me.CreationDate
+        $p = Get-Win32ProcessByPid ([int]$me.ParentProcessId)
+        $pAt = $null
+        if ($p) { $pAt = ConvertFrom-WmiDate $p.CreationDate }
+        if ($p -and $pAt -and $meAt -and ($pAt -le $meAt)) {
             $l.parent_name = [string]$p.Name
             $l.parent_cmd = [string]$p.CommandLine
             $l.grandparent_pid = [int]$p.ParentProcessId
-            $g = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $p.ParentProcessId) -ErrorAction SilentlyContinue
-            $l.grandparent_name = $(if ($g -and $g.CreationDate -le $p.CreationDate) { [string]$g.Name } else { "(exited)" })
+            $g = Get-Win32ProcessByPid ([int]$p.ParentProcessId)
+            $gAt = $null
+            if ($g) { $gAt = ConvertFrom-WmiDate $g.CreationDate }
+            $l.grandparent_name = $(if ($g -and $gAt -and ($gAt -le $pAt)) { [string]$g.Name } else { "(exited)" })
         } else {
             $l.parent_name = "(exited)"
         }
     } catch { }
     return $l
 }
-$script:runStartedAt = Get-Date
 $script:launch = Get-LaunchLineage
 $script:lockState = "not reached"
 $script:lockWaitSec = 0.0
@@ -1916,6 +1935,7 @@ function New-StartAllRunRecord([string]$Outcome) {
     $l = $script:launch
     if (-not $l) { $l = @{} }
     return [ordered]@{
+        proc_ts          = $(try { (Get-Process -Id $PID).StartTime.ToString("yyyy-MM-ddTHH:mm:ss.fffzzz") } catch { "" })
         ts               = $script:runStartedAt.ToString("yyyy-MM-ddTHH:mm:ss.fffzzz")
         end              = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffzzz")
         pid              = $PID
@@ -1939,6 +1959,10 @@ function Write-StartAllRunRecord([string]$Path, $Record, [int]$Keep = 500) {
     # SERIALISED BY ITS OWN MUTEX, named after the file. It used to rely on the start_all lock
     # being held; a copy that leaves because a startup is already running (Invoke-StartAllLeave)
     # writes without it, and nine of those at once rewrote the file over each other.
+    # The line is built BEFORE the lock: ConvertTo-Json is the slow part, and nine copies leaving
+    # at once each held the lock through it (measured: up to 2.5 s of a leaver spent here).
+    $line = $null
+    try { $line = ($Record | ConvertTo-Json -Compress -Depth 3) } catch { return $false }
     $lk = $null
     try {
         $md5 = [System.Security.Cryptography.MD5]::Create()
@@ -1948,32 +1972,38 @@ function Write-StartAllRunRecord([string]$Path, $Record, [int]$Keep = 500) {
         try { [void]$lk.WaitOne(10000) } catch { }      # abandoned = ours; a timeout still writes
     } catch { $lk = $null }
     try {
-        return (Save-StartAllRunLines $Path $Record $Keep)
+        return (Save-StartAllRunLines $Path $line $Keep)
     } finally {
         if ($lk) { try { $lk.ReleaseMutex() } catch { }; try { $lk.Dispose() } catch { } }
     }
 }
-function Save-StartAllRunLines([string]$Path, $Record, [int]$Keep = 500) {
+function Save-StartAllRunLines([string]$Path, [string]$Line, [int]$Keep = 500) {
+    # Called under Write-StartAllRunRecord's lock with the line already built. .NET calls only,
+    # no cmdlet pipeline: this is the part the leaving copies queue for.
     try {
-        $line = ($Record | ConvertTo-Json -Compress -Depth 3)
-        $dir = Split-Path -Parent $Path
-        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-        $lines = @()
-        if (Test-Path -LiteralPath $Path) {
-            $lines = @([System.IO.File]::ReadAllLines($Path) | Where-Object { $_ -and $_.Trim() })
+        $dir = [System.IO.Path]::GetDirectoryName($Path)
+        if (-not [System.IO.Directory]::Exists($dir)) { [void][System.IO.Directory]::CreateDirectory($dir) }
+        $lines = New-Object System.Collections.Generic.List[string]
+        if ([System.IO.File]::Exists($Path)) {
+            foreach ($l in [System.IO.File]::ReadAllLines($Path)) { if ($l -and $l.Trim()) { $lines.Add($l) } }
         }
-        $lines += $line
-        if ($lines.Count -gt $Keep) { $lines = $lines[($lines.Count - $Keep)..($lines.Count - 1)] }
+        $lines.Add($Line)
+        if ($lines.Count -gt $Keep) { $lines.RemoveRange(0, $lines.Count - $Keep) }
         $tmp = $Path + "." + $PID + ".tmp"
-        [System.IO.File]::WriteAllLines($tmp, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::WriteAllLines($tmp, $lines.ToArray(), (New-Object System.Text.UTF8Encoding($false)))
         # THE REPLACE IS RETRIED. A reader holding the file open (doctor, a tail, a test polling
         # it) makes the rename fail with "access denied" for a moment; measured with ten clicks
         # 200 ms apart, one "already running" line was lost that way and its .tmp left behind.
         for ($i = 0; $i -lt 40; $i++) {
-            try { Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop; return $true }
-            catch { Start-Sleep -Milliseconds 50 }
+            try {
+                # [NullString]::Value, not $null: PowerShell passes $null to a string parameter
+                # as "", which File.Replace rejects -- measured: every replace failed, lines lost.
+                if ([System.IO.File]::Exists($Path)) { [System.IO.File]::Replace($tmp, $Path, [NullString]::Value) }
+                else { [System.IO.File]::Move($tmp, $Path) }
+                return $true
+            } catch { Start-Sleep -Milliseconds 50 }
         }
-        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        try { [System.IO.File]::Delete($tmp) } catch { }
         return $false
     } catch { return $false }
 }
