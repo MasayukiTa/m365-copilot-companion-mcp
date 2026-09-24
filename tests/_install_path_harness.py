@@ -92,11 +92,20 @@ def run_ps(script_text: str, tmpdir: Path, timeout: int = 120, env=None):
     # -CASED entry instead of replacing it. subprocess/CreateProcess then hands the child BOTH,
     # and the child's own (case-insensitive but first-match) lookup can still see the original,
     # polluted one -- silently undoing this override. Strip every existing spelling first.
+    #
+    # The caller's own value is read BEFORE the strip: the first version stripped every
+    # spelling and then only re-added the default, so a caller that named PSModulePath -- the
+    # documented opt-out -- had it deleted and the child ran with no module path at all.
     child_env = dict(os.environ) if env is None else dict(env)
+    caller_value = None
+    if env is not None:
+        for k, v in env.items():
+            if k.upper() == "PSMODULEPATH":
+                caller_value = v
     for _existing in [k for k in child_env if k.upper() == "PSMODULEPATH"]:
         del child_env[_existing]
-    if env is None or "PSModulePath" not in env:
-        child_env["PSModulePath"] = _PS51_DEFAULT_MODULE_PATH
+    child_env["PSModulePath"] = (_PS51_DEFAULT_MODULE_PATH if caller_value is None
+                                 else caller_value)
     return childproc.run([POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(p)],
                          timeout=timeout, env=child_env, cwd=str(tmpdir))
 
