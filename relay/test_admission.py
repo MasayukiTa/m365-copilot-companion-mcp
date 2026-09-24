@@ -817,6 +817,115 @@ def test_tab_load_accounting():
     check("tabload_pending_uncounted", w.tab_load() == 2)
 
 
+def test_soft_shrink_does_not_close_running_tabs():
+    """2026-09-24 OWNER: cockpit tab chip showed "3/1" -- 3 real browser tabs open against a
+    cap the fleet's own autoscale had just driven down to 1. Traced to `ram_target_cap`'s own
+    docstring: "A lower cap is SOFT: running tabs are not killed, we just stop opening new
+    ones until some finish (natural drain)." `mc_box[0]` (what the cockpit shows as the
+    denominator) is a LIVE ADMISSION ceiling, not a hard concurrent-tab limit -- it only gates
+    the NEXT open. This is BY DESIGN (confirmed: no worker.close() call anywhere gets fired by
+    a cap change, only by a worker going terminal -- see the sweep loop in run_relay_fleet).
+
+    This test proves the property end-to-end, not just the pure ram_target_cap math already
+    covered by test_hysteresis_no_thrash: start 2 workers under cap=2, shrink mc_box to 1
+    WHILE both are still open, and confirm (a) neither running worker is torn down by the
+    shrink, so open tab count can sit above the live cap for a while -- exactly the cockpit's
+    "N/M with N>M" reading -- and (b) admission of the 3rd goal stays blocked until enough
+    drains to fit the new, lower budget. Nothing here is a bug to fix; the fix for the
+    2026-09-24 report is the tooltip (ui/FleetCockpit.cs "tabs_chip_hint") explaining this,
+    plus this test so the property stays pinned."""
+    rf.avail_phys_mb = lambda: 64000.0
+    rf.free_disk_gb = lambda path=None: 500.0
+    state = {"control": {}}
+    orig = _install_fake_worker(state)
+    try:
+        goals = ["g0", "g1", "g2"]
+        mc_box = [2]                      # start admitting up to 2 concurrently
+        observed = {
+            "shrunk": False,
+            "open_exceeded_cap_after_shrink": False,
+            "third_admitted_while_over_cap": False,
+        }
+        # EXPLICIT PHASES, NOT RE-DERIVED FROM WORKER STATE EACH TICK. An earlier version of
+        # this test inferred "what to do next" from the live worker statuses and had a hole:
+        # once the two started workers were both terminal, nothing told it to also drain w2,
+        # so the fleet sat at open_now==1==cap forever and the test hung (a live python.exe
+        # spinning at poll_s=0, found and killed by pid during review). A phase counter that
+        # only ever advances is easy to prove terminates; state re-derived from live objects
+        # is not, once a THIRD actor (w2) exists that the earlier branches didn't plan for.
+        phase = {"n": 0, "ticks": 0}
+
+        def on_tick(workers):
+            phase["ticks"] += 1
+            by = {w.name: w for w in workers}
+            w0, w1, w2 = by.get("w0"), by.get("w1"), by.get("w2")
+            open_now = sum(1 for w in workers
+                           if getattr(w, "page", None) is not None and w.status not in TERMINAL)
+
+            if phase["n"] == 0:
+                # wait for both g0/g1 to be admitted and running, then shrink the live cap to
+                # 1 -- the RAM-autoscale event the owner's report traced ("RAM-adjust 1..1
+                # tab(s)") -- WITHOUT touching either running worker.
+                if w0 is not None and w1 is not None \
+                        and w0.status == "waiting" and w1.status == "waiting":
+                    mc_box[0] = 1
+                    observed["shrunk"] = True
+                    phase["n"] = 1
+                return
+
+            if phase["n"] == 1:
+                # the tick right after the shrink: both tabs are still open, over the new cap.
+                observed["open_exceeded_cap_after_shrink"] = open_now > mc_box[0]
+                # the property under test: the 2 already-open tabs are NOT force-closed by the
+                # lower cap -- both must still be genuinely open, not merely uncounted.
+                check("shrink_keeps_both_running_workers_open",
+                      w0.status == "waiting" and w1.status == "waiting"
+                      and w0.page is not None and w1.page is not None)
+                if w2 is not None and getattr(w2, "page", None) is not None:
+                    observed["third_admitted_while_over_cap"] = True
+                state["control"]["w0"] = "done"     # drain one
+                phase["n"] = 2
+                return
+
+            if phase["n"] == 2:
+                # w0 has (or will next sweep have) closed; w1 must still be running solo, and
+                # the 3rd goal must not have snuck in while the fleet was over its new budget.
+                if w1 is not None and getattr(w1, "page", None) is not None \
+                        and w2 is not None and getattr(w2, "page", None) is not None:
+                    observed["third_admitted_while_over_cap"] = True
+                if w1 is not None and w1.status == "waiting":
+                    state["control"]["w1"] = "done"
+                    phase["n"] = 3
+                return
+
+            # phase 3+: unconditionally drain whatever is open (w2, once admitted under the
+            # active_open==0 bootstrap) so the run reaches completion.
+            for w in workers:
+                if getattr(w, "page", None) is not None and w.status == "waiting":
+                    state["control"][w.name] = "done"
+            # safety net: this loop is proven to terminate by construction (each phase only
+            # ever finishes MORE workers), but a future edit that breaks that invariant should
+            # fail loudly here rather than spin the CPU forever.
+            if phase["ticks"] > 200:
+                for w in workers:
+                    state["control"][w.name] = "done"
+
+        res = run_relay_fleet(FakeContext(), goals, "http://agent", max_concurrent=2,
+                              mc_box=mc_box, poll_s=0, on_tick=on_tick,
+                              notify=lambda *a, **k: None)
+        check("soft_shrink_all_goals_complete",
+              len(res) == 3 and all(r["outcome"] == "DONE" for r in res))
+        check("soft_shrink_actually_shrank", observed["shrunk"] is True)
+        check("soft_shrink_open_count_did_exceed_live_cap",
+              observed["open_exceeded_cap_after_shrink"] is True)
+        # the 3rd goal must NOT have been squeezed in while the fleet sat above its new,
+        # lower budget -- the shrink is soft on what's RUNNING, not a hole for NEW admission.
+        check("soft_shrink_no_new_admission_while_over_cap",
+              observed["third_admitted_while_over_cap"] is False)
+    finally:
+        _restore_worker(orig)
+
+
 def test_tab_budget_admission():
     # A worker that fans out to 3 tabs consumes the whole 3-tab budget, so a 2nd worker waits --
     # "3 open tabs == parallelism 3", reactive, no human cap. All goals still complete (continuous).
@@ -1177,6 +1286,7 @@ def main():
     for _fn in (test_disk_floor_predicate,
                 test_tab_load_accounting,
                 test_tab_budget_admission,
+                test_soft_shrink_does_not_close_running_tabs,
                 test_hysteresis_no_thrash,
                 test_continuous_admission_no_barrier,
                 test_verifying_counts_in_cap,
