@@ -100,6 +100,11 @@ EXEMPT = {
         "compiles ui/ChatSend.cs + ui/FleetCommands.cs with the test-only oracle and harness in "
         "ui/testdata/ into a throwaway console exe: it runs the chat's send path without WPF, "
         "which is the reason ChatSend.cs is its own file, not a build of the UI",
+    "ui/test_a_fleet_interrupt_survives_a_supervisor_restart.py":
+        "compiles the same ui/ChatSend.cs + ui/FleetCommands.cs with the test-only oracle and "
+        "harness in ui/testdata/ (identical SOURCES list to "
+        "ui/test_the_chat_window_sends_what_was_typed.py) into a throwaway console exe: it runs "
+        "the send path's restart-time interrupt decision without WPF, not a build of the UI",
     "ui/test_the_bridge_client_sends_the_token.py":
         "compiles ui/BridgeClient.cs with the test-only driver ui/testdata/BridgeClientHarness.cs "
         "into a throwaway console exe and runs it against a real bridge Handler on a free port: "
