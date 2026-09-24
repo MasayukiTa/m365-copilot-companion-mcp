@@ -164,6 +164,18 @@ def _driver(functions, root, body, script_dir=None, venv_py=None, bridge=None):
 
 def _ps(tmp_path, text, env=None, timeout=240):
     p = tmp_path / ("drv_%s.ps1" % uuid.uuid4().hex[:8])
+    # CI (windows-install-smoke, 2026-09-24), reproducible only there: a non-ASCII path
+    # survived Get-ServerAction's own UTF-8 stdin/stdout round trip (verified separately) but
+    # still came back as "tools/??.py". $OutputEncoding (set inside a test body, e.g.
+    # test_post_update_form_does_not_depend_on_the_hosts_pipe_encoding) governs the `|`
+    # pipeline operator to another PROGRAM; it does NOT govern the raw bytes THIS powershell.exe
+    # process itself writes to a REDIRECTED stdout pipe (subprocess.run's capture_output) --
+    # that is [Console]::OutputEncoding, which defaults to the runner's OS codepage. This
+    # machine's codepage is cp932 (Shift-JIS: represents 日本 fine); a non-Japanese-locale CI
+    # runner's cannot, and PowerShell substitutes '?' for each character it cannot encode
+    # BEFORE childproc.run ever sees a byte -- no decode-side fix can recover that. Forced to
+    # UTF-8 for every driver script this harness runs, not just the one test that first hit it.
+    text = '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n' + text
     p.write_text(text, encoding="utf-8-sig")
     r = childproc.run([_POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(p)],
                       env=env, timeout=timeout)
