@@ -178,37 +178,84 @@ def test_a_junction_nested_inside_a_clone_is_never_followed(tmp_path):
 
 def test_perf_sanity_hundreds_of_files_no_extra_stat_per_file(tmp_path, monkeypatch):
     """Lighter-weight CI-suitable version of the shape/scale test: a few thousand files across
-    several clones, asserting the walk is fast and does not call os.stat/os.path.getmtime per
-    file beyond what DirEntry.stat() (via scandir) already provides for free."""
+    several clones, asserting the walk costs O(directories) not O(files) -- via CALL COUNTS,
+    not wall-clock. A seconds-based bound is exactly the kind of assertion that goes red on a
+    loaded or shared CI runner for reasons that have nothing to do with a regression here (this
+    one already flaked once on this machine under unrelated background load); a count of
+    os.scandir()/os.stat() calls does not move with how busy the box is, only with how much
+    work the code under test actually did. The wall-clock line kept below is a generous
+    backstop against a genuine algorithmic regression (an accidental O(files) walk), not the
+    thing this test is really checking.
+    """
     now = time.time()
-    for c in range(5):
+    n_clones = 5
+    n_pkgs = 7
+    n_files_per_clone = 400
+    for c in range(n_clones):
         clone = str(tmp_path / "swe" / "work" / ("clone_%d" % c))
-        for i in range(400):
-            _touch(os.path.join(clone, "pkg%d" % (i % 7), "mod_%03d.py" % i),
+        for i in range(n_files_per_clone):
+            _touch(os.path.join(clone, "pkg%d" % (i % n_pkgs), "mod_%03d.py" % i),
                   age_days=90, now=now)
 
-    calls = []
+    stat_calls = []
+    getmtime_calls = []
     real_stat = os.stat
     real_getmtime = os.path.getmtime
 
     def spy_stat(*a, **k):
-        calls.append(("stat", a[0] if a else None))
+        stat_calls.append(a[0] if a else None)
         return real_stat(*a, **k)
 
     def spy_getmtime(*a, **k):
-        calls.append(("getmtime", a[0] if a else None))
+        getmtime_calls.append(a[0] if a else None)
         return real_getmtime(*a, **k)
 
     monkeypatch.setattr(os, "stat", spy_stat)
     monkeypatch.setattr(os.path, "getmtime", spy_getmtime)
+    scandir_calls = _record_scandir(monkeypatch)
 
+    # DRY RUN. This test's job is to bound the DISCOVERY walk -- _newest_mtime_and_size() and
+    # the scandir of swe/work itself -- which is the part this module's own code controls and
+    # the part f7571a1 was about. A real (non-dry) run additionally calls shutil.rmtree() on
+    # each removed clone, and rmtree does its OWN internal directory listing to delete a tree
+    # (confirmed by running this same scenario non-dry: the scandir count exactly doubles, one
+    # set from the walk here and one from rmtree walking the same directory again to remove
+    # it) -- a stdlib implementation detail this test has no business pinning down, and pinning
+    # it would make the test fail on a Python version whose rmtree walks differently despite
+    # this module's own code being unchanged. dry_run=True exercises the same discovery walk
+    # every real run also does, without shutil.rmtree in the picture.
     t0 = time.time()
-    freed, removed = R._clone_sweep_run_once(str(tmp_path), 14, _not_in_use, now)
+    freed, removed = R._clone_sweep_run_once(str(tmp_path), 14, _not_in_use, now, dry_run=True)
     elapsed = time.time() - t0
 
-    assert len(removed) == 5
-    assert elapsed < 5.0, "walk over 2000 files took %.2fs" % elapsed
-    assert len(calls) < 20, "%d os.stat/getmtime calls for 2000 files" % len(calls)
+    assert len(removed) == n_clones
+
+    # os.scandir() is called exactly once per DIRECTORY entered: once for swe/work itself (the
+    # leftover-.deleting- pass), once again for swe/work to list the clones, then once per
+    # clone directory and once per "pkgN" directory inside it -- (1 + n_pkgs) per clone. 2000
+    # files never enter this count at all; only the 1 + n_clones * (1 + n_pkgs) directories do.
+    expected_scandir_calls = 2 + n_clones * (1 + n_pkgs)
+    assert len(scandir_calls) == expected_scandir_calls, (
+        "%d scandir() calls, expected exactly %d (proportional to %d directories, not %d "
+        "files) -- got more than that means something is walking files, not directories" %
+        (len(scandir_calls), expected_scandir_calls, expected_scandir_calls,
+         n_clones * n_files_per_clone))
+
+    # DirEntry.stat(follow_symlinks=False), read from the scandir() listing itself, accounts
+    # for every mtime/size check; os.stat() and os.path.getmtime() are the PER-FILE (and
+    # per-directory) syscalls that cost the walk f7571a1 removed, and neither belongs anywhere
+    # in the walk over swe/work's contents. The one exception is os.path.isdir(work_root) at
+    # the very top -- checking swe/work itself exists, once, via CPython's os.path.isdir()
+    # (which calls os.stat() under the hood) -- so up to that ONE call is allowed; a second
+    # would mean something started stat()ing individual entries again.
+    assert len(stat_calls) <= 1, "%d bare os.stat() calls, expected at most 1: %r" % (
+        len(stat_calls), stat_calls)
+    assert getmtime_calls == [], (
+        "%d os.path.getmtime() calls, expected zero" % len(getmtime_calls))
+
+    # Generous backstop against an algorithmic regression, not the property under test above.
+    assert elapsed < 30.0, "walk over %d files took %.2fs" % (
+        n_clones * n_files_per_clone, elapsed)
 
 
 # ---------------------------------------------------------------------------
