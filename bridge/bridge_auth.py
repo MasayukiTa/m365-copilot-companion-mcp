@@ -147,6 +147,20 @@ def _restrict_to_owner(path: str) -> str:
             raise TokenFileError("%s is mode %o, not 600" % (path, mode))
         return "mode %o" % mode
     name, sid = _current_user()
+    # /reset FIRST: it replaces whatever DACL the file was created with -- on this owner's
+    # desktop that is purely inherited from the parent directory, but CI's Windows runner
+    # (measured 2026-09-24, windows-latest) hands a fresh temp file NT AUTHORITY\SYSTEM and
+    # BUILTIN\Administrators as EXPLICIT (non-inherited) ACEs, not inherited ones -- with
+    # entirely inherited ACEs from the parent directory, the same ones /inheritance:r below is
+    # about to strip. Skipping /reset left those two explicit ACEs behind: /inheritance:r only
+    # ever removes INHERITED entries, and /grant:r only replaces the named SID's own grant, so
+    # neither touches an explicit ACE for a different principal. Cheap and idempotent where the
+    # bug does not reproduce (this file's own desktop): /reset followed by /inheritance:r
+    # removes the same inherited ACEs either way.
+    r = _icacls([path, "/reset"])
+    if r.returncode != 0:
+        raise TokenFileError("icacls could not reset %s (rc=%s): %s%s"
+                             % (path, r.returncode, r.stdout, r.stderr))
     r = _icacls([path, "/inheritance:r", "/grant:r", "*%s:(F)" % sid])
     if r.returncode != 0:
         raise TokenFileError("icacls could not restrict %s (rc=%s): %s%s"

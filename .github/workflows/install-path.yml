@@ -200,7 +200,15 @@ jobs:
           $py = Join-Path $root '.venv\Scripts\python.exe'
           & $py (Join-Path $root 'scripts\bootstrap.py') --check-deps
           if ($LASTEXITCODE -ne 0) { 'fresh install reported stale'; exit 1 }
-          Add-Content -Path (Join-Path $root 'requirements.txt') -Value '# changed by CI'
+          # A COMMENT-ONLY EDIT IS NOT WHAT THIS CHECKS ANYMORE (2026-09-24): --check-deps now
+          # asks "does the .venv SATISFY requirements.txt" (installed metadata, offline) rather
+          # than only comparing the file's hash to a stamp -- a hash-changing edit that adds no
+          # new requirement is correctly judged still-satisfied, and the stamp is refreshed to
+          # match rather than reported stale. `# changed by CI` used to be enough to flip the
+          # hash and pass this; it no longer proves anything got noticed, since nothing became
+          # unsatisfied. Appending an actual (unsatisfiable) requirement line is what exercises
+          # the real probe.
+          Add-Content -Path (Join-Path $root 'requirements.txt') -Value 'ci-d5-staleness-probe-package-does-not-exist==0.0.1'
           & $py (Join-Path $root 'scripts\bootstrap.py') --check-deps
           if ($LASTEXITCODE -ne 3) { "a changed requirements.txt was not noticed (exit $LASTEXITCODE)"; exit 1 }
           # The expected, SUCCESSFUL outcome of the check just above is exit code 3 (stale
