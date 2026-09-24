@@ -9,6 +9,8 @@ Writes are intentionally NOT exposed.
 import sys
 from typing import Optional
 
+from .security import require_unlocked
+
 HIVE_NAMES = {
     "HKLM": "HKEY_LOCAL_MACHINE",
     "HKCU": "HKEY_CURRENT_USER",
@@ -38,10 +40,18 @@ def _open_key(full_path: str):
 def registry_read(key_path: str, value_name: Optional[str] = None) -> str:
     """Read a value (or all values + subkeys) from the Windows registry.
 
+    GATED: some registry locations hold credential-adjacent data in plain text
+    (e.g. HKLM\\...\\Winlogon's autologon password, product keys, saved
+    connection strings), so this requires the same per-IP unlock as a write.
+    Call unlock(password=...) first if refused.
+
     Args:
         key_path: Registry key, e.g. "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion".
         value_name: Specific value name to read. Omit to list all values and subkeys.
     """
+    locked = require_unlocked()
+    if locked:
+        return locked
     try:
         import winreg
 

@@ -111,6 +111,9 @@ def odbc_query(
     accepted. The connection is opened with readonly=True; DML/DDL is rejected
     at the driver layer for compliant drivers and at the query verb layer here.
 
+    GATED: returns real rows from a corporate database, so it requires the same
+    per-IP unlock as a write. Call unlock(password=...) first if refused.
+
     Args:
         connection: Either a named connection (from .env MCP_DB_<NAME>=...) or
             a full ODBC connection string (must contain '=' and ';').
@@ -119,6 +122,9 @@ def odbc_query(
         max_rows: Truncate result set to this many rows.
         timeout: Connection / login timeout in seconds.
     """
+    locked = require_unlocked()
+    if locked:
+        return locked
     try:
         if not _is_read_only(query):
             return "[odbc_query error: only SELECT/WITH/EXEC/SHOW/DESCRIBE allowed]"
@@ -150,11 +156,18 @@ def odbc_tables(
 ) -> str:
     """List tables and views available through an ODBC connection.
 
+    GATED: reveals a corporate database's schema (table/view names), so it
+    requires the same per-IP unlock as a write. Call unlock(password=...) first
+    if refused.
+
     Args:
         connection: Named connection or full connection string.
         schema: Optional schema name filter (e.g. 'dbo').
         catalog: Optional catalog/database name filter.
     """
+    locked = require_unlocked()
+    if locked:
+        return locked
     try:
         con = _connect(connection)
         try:
@@ -188,7 +201,14 @@ def odbc_columns(
     schema: Optional[str] = None,
     catalog: Optional[str] = None,
 ) -> str:
-    """Show column metadata for one table or view."""
+    """Show column metadata for one table or view.
+
+    GATED: reveals a corporate database's schema, so it requires the same
+    per-IP unlock as a write. Call unlock(password=...) first if refused.
+    """
+    locked = require_unlocked()
+    if locked:
+        return locked
     try:
         con = _connect(connection)
         try:
