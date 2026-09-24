@@ -286,8 +286,25 @@ def _block_driver(add_result_fn: str, check_fn: str, block: str, repo_dir) -> st
     # Add-Result and Check (defined elsewhere in the file) need supplying here.
     # Real Write-Host (not the -Json shadow) so failures are visible in the driver's own
     # stdout/stderr if something throws; only $script:results is asserted on.
+    #
+    # ORDER-DEPENDENT FAILURE, ROOT CAUSE (2026-09-24): the block's own network call --
+    # Invoke-RestMethod against http://127.0.0.1:8000/health, to read the LIVE server's
+    # server_pid and, from it, its process StartTime -- is "left in place and simply fails
+    # fast" per this file's own header comment, on the stated assumption that "nothing listens
+    # there in a test process". That assumption holds in CI, but not on a machine that is
+    # actually running this repo's own MCP server on port 8000 (the normal state of a dev/
+    # production box): there the call SUCCEEDS, $lsServerStart becomes that real server's real
+    # process start time, and Test-LastStartSummaryStale then compares a test-authored summary
+    # timestamp against it -- a value this test never controls and that changes with whenever
+    # the live server happened to last (re)start, hence "fails depending on the time of day".
+    # Shadowing Invoke-RestMethod for the isolated driver process is what actually delivers
+    # the "no live services" isolation this file already documents as its design: the block
+    # under test cannot tell the difference between a shadowed function and a genuinely empty
+    # port, so every caller now deterministically gets the "no live server" case this file's
+    # own tests were already written to assume.
+    health_shadow = "function Invoke-RestMethod { throw 'blocked in test: no live server' }\n"
     return (
-        add_result_fn + "\n\n" + check_fn + "\n\n" +
+        add_result_fn + "\n\n" + check_fn + "\n\n" + health_shadow + "\n" +
         "$script:results = @(); $script:ok = 0; $script:bad = 0; $script:warn = 0; $script:unknown = 0\n"
         "$repo = '%s'\n" % repo_dir +
         block + "\n" +
