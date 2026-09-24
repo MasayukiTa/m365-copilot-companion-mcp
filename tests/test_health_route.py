@@ -45,10 +45,6 @@ os.environ.setdefault("MCP_API_KEY", TEST_API_KEY)
 
 import main  # noqa: E402  (must follow the environment setup above)
 
-# The key `main` actually ended up with (its own value if something imported it first with a
-# different one already set; otherwise TEST_API_KEY from the line above).
-_ACTUAL_KEY = main.API_KEY
-
 
 def _make_request(peer_host: str, xff: str = "", authorization: str = "") -> MagicMock:
     """Minimal fake Starlette Request carrying only what main.health() reads:
@@ -105,19 +101,32 @@ def test_direct_remote_peer_with_no_bearer_gets_minimal_payload_only():
     assert body == {"status": "ok", "server_pid": os.getpid()}
 
 
-def test_forwarded_caller_with_correct_bearer_gets_full_payload():
+def test_forwarded_caller_with_correct_bearer_gets_full_payload(monkeypatch):
+    """Sets main.API_KEY explicitly for this test rather than trusting a key snapshotted at
+    collection time (`_ACTUAL_KEY` used to be captured once, at `import main` above, but
+    other test files in the same pytest session reload main.py under a synthetic
+    MCP_API_KEY and don't all restore it before this file's tests run -- CI, 2026-09-24: the
+    live main.API_KEY at call time had drifted from the collection-time snapshot, so the
+    correct bearer stopped matching. monkeypatch.setattr pins what main compares against AND
+    what this test sends to the same value, for the duration of this test only, so the
+    assertion no longer depends on suite order at all.)."""
+    monkeypatch.setattr(main, "API_KEY", TEST_API_KEY)
     body = _call_health(_make_request(
-        peer_host="127.0.0.1", xff="203.0.113.7", authorization=f"Bearer {_ACTUAL_KEY}"))
+        peer_host="127.0.0.1", xff="203.0.113.7", authorization=f"Bearer {TEST_API_KEY}"))
     for key in _FULL_ONLY_MARKERS:
         assert key in body
 
 
-def test_forwarded_caller_with_raw_unprefixed_key_gets_full_payload():
+def test_forwarded_caller_with_raw_unprefixed_key_gets_full_payload(monkeypatch):
     """Tolerates a raw (no "Bearer " scheme) Authorization value the same way
     main.py's _BearerPrefix does for /mcp -- an operator who pastes the raw API key should
-    not see a silently-downgraded /health response for missing a word."""
+    not see a silently-downgraded /health response for missing a word.
+
+    Same order-independence fix as the test above: main.API_KEY is set explicitly for this
+    test via monkeypatch rather than read from a collection-time snapshot."""
+    monkeypatch.setattr(main, "API_KEY", TEST_API_KEY)
     body = _call_health(_make_request(
-        peer_host="127.0.0.1", xff="203.0.113.7", authorization=_ACTUAL_KEY))
+        peer_host="127.0.0.1", xff="203.0.113.7", authorization=TEST_API_KEY))
     for key in _FULL_ONLY_MARKERS:
         assert key in body
 
