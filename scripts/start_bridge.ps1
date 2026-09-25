@@ -176,7 +176,28 @@ function Invoke-SignInHelper([string[]]$Extra) {
     } catch { return "" }
 }
 function Needs-SignIn {
-    return ((Invoke-SignInHelper @("--check-only")) -match 'VERDICT:\s*sign_in_needed')
+    # REQUIRE A POSITIVE "signed_in", NOT MERELY "not sign_in_needed".
+    #
+    # MEASURED 2026-09-25 (a fresh PC's bridge.log): the sign-in window opened, then closed
+    # itself and reopened roughly every 105-110 seconds, over and over, for 15+ cycles -- the
+    # person reported it kept popping back up "no matter how many times I close it, even after
+    # signing in". Demote-ToHeadless (below) declares the wall cleared once Needs-SignIn reads
+    # false for 3 consecutive 5s polls; the OLD check here only matched an EXACT
+    # "VERDICT: sign_in_needed" and treated everything else -- including "VERDICT: cannot_tell",
+    # which ensure_m365_signin.py prints for a page mid-redirect, still loading, or on an
+    # interstitial it does not recognise (an IdP's multi-hop bounce through
+    # login.microsoftonline.com, a "stay signed in?" prompt, a blank tab the instant the window
+    # was raised) -- as "not a wall". Three such polls in a row (15s -- far less time than a
+    # real password-plus-MFA sign-in takes) satisfied Demote-ToHeadless's clear condition, which
+    # HID THE WINDOW MID-AUTHENTICATION and rearmed the latch, so the very next redirect hop the
+    # bridge hit re-triggered a fresh "surface" -- the observed loop.
+    #
+    # "cannot_tell" must mean "keep waiting", not "done": only a confirmed "signed_in" verdict
+    # may count as clear. Everything else -- "sign_in_needed" AND "cannot_tell" alike -- keeps
+    # the wall considered present, so Demote-ToHeadless's clear-counter never advances on an
+    # ambiguous read and the window stays up until the checker can actually confirm the person
+    # finished.
+    return ((Invoke-SignInHelper @("--check-only")) -notmatch 'VERDICT:\s*signed_in')
 }
 
 # "Should the window come forward NOW?" -- asked of the checker, which also applies the rules:
