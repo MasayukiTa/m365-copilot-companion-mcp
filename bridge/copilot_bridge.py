@@ -7482,6 +7482,23 @@ def _page_main(cdp, fresh):
             _record_capture_baseline()
 
         print("copilot bridge: driving %s" % PAGE.url[-40:], flush=True)
+        # RECORD A STARTUP WALL BEFORE THE PAGE THAT SHOWS IT IS CLOSED.
+        #
+        # MEASURED 2026-09-25 (a fresh PC, bridge.log): startup opened the agent page, it
+        # landed on an IdP URL ("...login_hint=<email>"), and the code below closed that page
+        # and released it for a blank keep-alive tab a few lines later -- WITHOUT this call.
+        # _note_signin_wall's own docstring already explains why that is fatal ("the tab does
+        # not stay... this is the record that outlives the tab"), but the startup path that
+        # actually closes the page never called it, so /status's signin_wall stayed false and
+        # scripts/start_bridge.ps1's supervisor (which decides whether to surface the window
+        # purely from that field) never had anything to act on. No window ever appeared, and
+        # the person had no way to sign in. Mirrors the same check at the other two
+        # PAGE-closing/turn sites (_wait_composer above, and the socket-recapture site below).
+        try:
+            if _is_signin_wall(PAGE.url or ""):
+                _note_signin_wall(PAGE.url or "")
+        except Exception:
+            pass
         if BRIDGE_RELEASE_STARTUP_PAGE and BRIDGE_SOCKET and AGENT_URL:
             # Startup is finished and it needed a page; nothing after this does, until an
             # endpoint asks for the DOM.

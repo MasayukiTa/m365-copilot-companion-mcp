@@ -1357,41 +1357,41 @@ def _conversation_id_or_empty(resume_conv) -> str:
 
 
 def _initial_job_with_unlock(goal: str, plan_mode: bool = False):
-    """Build the first worker turn with a proactive unlock when local credentials exist.
+    """Build the first worker turn.
 
-    Waiting for a write/exec tool to fail is too late: the agent may give up before it has
-    discovered the usable tool set.  The unlock must still be called by the M365-side agent
-    because the gate is keyed to that remote client IP, so the password is injected only into
-    this transient first turn and never into persistent agent configuration.
+    CHANGED 2026-09-25: turn 1 (non-plan_mode -- the normal, always-on fleet mode) no longer
+    proactively injects UNLOCK_PREFIX/the literal password into the very first message sent to
+    the M365 Copilot agent. Production transcripts (.fleet/transcripts/r6ab5aa80_a0_w0.jsonl and
+    others, 07:41/07:55/07:58/08:05 on 2026-09-25) showed Microsoft 365 Copilot's own
+    safety/DLP filter refusing that exact message shape -- "call a tool with a password
+    argument" -- with a byte-identical boilerplate non-answer every single time. That is
+    deterministic, not transient, so the existing REFUSED-outcome auto-retry (which resends
+    byte-identical text) could never succeed; it just repeated the same doomed send forever.
+    That was the "fleet never makes progress" bug.
+    Turn 1 is now always the plain composed goal (opening_turn(goal, PROTOCOL) / PLAN_PROMPT +
+    goal under plan_mode). The reactive path -- _looks_locked() -> _inject_unlock(), called from
+    _decide_impl near line 4886, plus the ambiguous-lock-probe path -- is unaffected: it still
+    injects the password, but only once a genuine write/exec-tool refusal is actually observed
+    in a reply, which is a shape M365 Copilot does not blanket-refuse.
+    Original rationale for being proactive ("waiting for a write/exec tool to fail is too late:
+    the agent may give up before it has discovered the usable tool set") still matters -- that is
+    why the reactive path fires on the FIRST refusal rather than waiting for the retry budget to
+    run out -- but it no longer justifies putting the password in turn 1 itself.
+
+    plan_mode (operator-set, plan-then-WAIT) is a separate, deliberately different operator
+    mode and is UNCHANGED here: it still injects proactively, exactly as before.
     """
-    # plan_mode (operator-set, plan-then-WAIT) is unchanged. When it is off, which version
-    # of the planner component opens the turn is the evolvable choice -- see
-    # planner.PLANNER_VERSIONS for why an unattended plan-first arm is the comparable one.
-    if plan_mode:
-        original = PLAN_PROMPT + goal
-        opening = PLAN_PROMPT + goal
-    else:
-        original = goal
-        opening = opening_turn(goal, PROTOCOL)
-    pw = _unlock_password()
-    if not pw:
-        return opening, False
     if plan_mode:
         # Operator-set plan-then-wait: not a component, and not this function's to reinterpret.
-        return PROTOCOL + (UNLOCK_PREFIX % pw) + original, True
-    # THROUGH THE PLANNER, NOT AROUND IT.
-    #
-    # This composed the turn by hand whenever a password existed, which is the normal
-    # configuration -- so opening_turn, and with it the whole `planner` component, was reached
-    # only when unlock was NOT being injected. The effect was that planner/v1 and planner/v2
-    # produced byte-identical first turns in every ordinary run: an A/B whose two arms are the
-    # same program, which is precisely what PLANNER_VERSIONS was created to end. The comment
-    # above that table says so about its predecessor; the same hole was open one file over.
-    #
-    # The unlock text belongs where the protocol goes, before the goal, so passing it as part
-    # of the protocol reproduces the previous byte layout exactly under planner/v1 and lets
-    # planner/v2 differ where it is supposed to.
-    return opening_turn(original, PROTOCOL + (UNLOCK_PREFIX % pw)), True
+        opening = PLAN_PROMPT + goal
+        pw = _unlock_password()
+        if not pw:
+            return opening, False
+        return PROTOCOL + (UNLOCK_PREFIX % pw) + opening, True
+    # Non-plan_mode (normal fleet mode): always the plain goal, never the password, regardless
+    # of whether a local unlock password is configured. Which version of the planner component
+    # opens the turn is the evolvable choice -- see planner.PLANNER_VERSIONS.
+    return opening_turn(goal, PROTOCOL), False
 
 
 def _redact_unlock_password(text: str) -> str:
@@ -3679,17 +3679,28 @@ class RelayWorker:
         it -- and its comment, "the same initial payload as the original", had quietly stopped
         being true when the original grew memory and a procedure.
 
-        CARRIES THE UNLOCK for the same reason _recycle_job does, and it is the same class of
-        defect found at the same time: this is a BRAND NEW conversation, so it is a new MCP
-        session, so whatever token the agent held is gone with the old chat. Fixing only the
-        recycle would have left the identical hole one method down -- the two branches that
-        hand the agent a chat with no history are exactly the two that must re-unlock.
+        CHANGED 2026-09-25 (same fix, same day, as _initial_job_with_unlock): this used to
+        carry UNLOCK_PREFIX / the literal password into turn 1 of the replayed conversation,
+        reasoning that a brand-new conversation is a brand-new MCP session so whatever token
+        the agent held is gone. That reasoning about the session is still correct -- but the
+        production transcripts that forced _initial_job_with_unlock's fix apply here with equal
+        force: Microsoft 365 Copilot's safety/DLP filter blanket-refuses "turn 1 contains a
+        password argument" regardless of which conversation that turn 1 belongs to. Injecting
+        proactively into this reopened turn 1 would just relocate the same deterministic refusal
+        one conversation later instead of removing it. The reactive path (_looks_locked() ->
+        _inject_unlock(), from _decide_impl) still re-locks and re-unlocks this fresh
+        conversation exactly as it does the original one, the first time a write/exec tool is
+        actually refused -- that shape is not blanket-refused. Do not reintroduce the proactive
+        injection here without rereading that incident.
+
+        _unlock_attempts is RESET to 0, not left at whatever the prior conversation spent: this
+        is a fresh MCP session with its own reactive re-unlock budget (MAX_UNLOCK_ATTEMPTS bounds
+        looping WITHIN one conversation), and there is no longer a proactive attempt to count
+        against it. Same reasoning as _recycle_job's reset, below.
         """
-        pw = _unlock_password()
-        if pw:
-            self._unlock_attempts = 1
+        self._unlock_attempts = 0
         return (conversation_start_label(self.name + "-replay%d" % self.fresh_replay_count)
-                + PROTOCOL + ((UNLOCK_PREFIX % pw) if pw else "") + self._composed_goal)
+                + PROTOCOL + self._composed_goal)
 
     #: How much of the previous conversation may travel. The recycle exists BECAUSE the last
     #: conversation ran out of context, so an expensive handover would recreate the condition
@@ -3762,31 +3773,31 @@ class RelayWorker:
         so it travels again. It goes ABOVE the reset notice because RECYCLE_PREFIX ends with a
         "--- 元のゴール ---" heading, and what follows that heading should be the goal.
 
-        THE UNLOCK TRAVELS TOO, and its absence was the largest single source of refusals in
-        the system. _composed_prefix is taken from composed_goal, which is built BEFORE
-        _initial_job_with_unlock adds UNLOCK_PREFIX -- so every recycled conversation opened
-        with the memory, the skill and the contract, and no unlock. A fresh conversation is
-        also a fresh MCP session, and authorization is per session by design, so the token the
-        agent was holding died with the old chat and the new one was locked from its first
-        gated call.
-
-        Measured, run r6aa92e5a: 4 distinct MCP sessions in 34 minutes for ONE worker; the two
-        that were never authorized never called unlock at all, and all three refusals were the
-        "brand-new session" case rather than any session ageing out. The comment at
-        TOKEN_MISSING_REFUSAL records the scale -- 489 of 492 refusals over two days were this
-        one branch, "one already-unlocked identity that never presented a token". Waiting for
-        the refusal and then injecting was recovery from a certainty.
+        THE UNLOCK NO LONGER TRAVELS PROACTIVELY. This function used to carry UNLOCK_PREFIX /
+        the literal password into turn 1 of the recycled conversation, on the reasoning
+        recorded above (a fresh conversation is a fresh MCP session, so the token the agent was
+        holding died with the old chat and the new one starts locked). That reasoning about the
+        session boundary is still correct. CHANGED 2026-09-25: it no longer follows that the
+        password belongs in turn 1. The same production transcripts that forced
+        _initial_job_with_unlock's fix (see that function's docstring -- Microsoft 365
+        Copilot's safety/DLP filter blanket-refuses "turn 1 contains a password argument",
+        deterministically, regardless of which conversation that turn 1 opens) apply here
+        unchanged: proactively injecting into this reopened turn 1 does not avoid the refusal,
+        it just relocates it to the recycled conversation's first message instead of the
+        original's. The reactive path (_looks_locked() -> _inject_unlock(), from _decide_impl)
+        still re-locks and re-unlocks this fresh conversation the same as any other, the first
+        time a write/exec tool is actually refused -- that shape is not blanket-refused. Do not
+        reintroduce the proactive injection here without rereading that incident.
 
         The reactive budget is RESET rather than spent. MAX_UNLOCK_ATTEMPTS bounds a re-unlock
         loop WITHIN one conversation, where repeated failure means the password or the identity
         is wrong; this is a different conversation, and the outer loop is already bounded by
         _max_recycles. Charging recycles to that budget would make a long, healthy job go STUCK
-        for "unlock attempts exhausted" when nothing about the unlock had failed.
+        for "unlock attempts exhausted" when nothing about the unlock had failed. There is also
+        no longer a proactive attempt to count against it in the first place.
         """
-        pw = _unlock_password()
-        head = PROTOCOL + ((UNLOCK_PREFIX % pw) if pw else "")
-        if pw:
-            self._unlock_attempts = 1
+        self._unlock_attempts = 0
+        head = PROTOCOL
         # The compaction note goes AFTER the goal, not before it: RECYCLE_PREFIX ends with a
         # heading that introduces the goal, and the invariant that the composition ends with
         # the goal is what _composed_prefix's suffix slice depends on. Appending after it

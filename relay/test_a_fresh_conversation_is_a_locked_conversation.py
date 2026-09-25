@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""The two branches that open a chat with no history must carry the unlock.
+"""The two branches that open a chat with no history no longer inject the password proactively.
 
 WHAT THE LEDGER SAID, 2026-09-15. `.fleet/lock_refusals.jsonl`, 4,271 refusals since
 2026-08-22:
@@ -13,21 +13,23 @@ unlocked and holds tokens -- 128 of them for this identity -- but the call prese
 Of the ten most recent, every single one was a session that had never called unlock BEFORE
 being refused, and three never called it afterwards either.
 
-WHY. Authorization is per MCP session by design, and _composed_prefix is sliced off
-composed_goal, which is built BEFORE _initial_job_with_unlock prepends UNLOCK_PREFIX. So a
-recycled or replayed conversation was rebuilt with the memory, the skill and the contract --
-and no unlock. A fresh conversation is a fresh session, so the token the agent held died
-with the old chat, and the new one was locked from its first gated call.
+That ledger is why `_recycle_job`/`_replay_job` were originally made to carry UNLOCK_PREFIX
+proactively into the opening turn of a recycled or replayed conversation: authorization is
+per MCP session by design, so a fresh conversation starts locked, and waiting for the refusal
+before reacting meant the recovery mostly did not arrive (of 518 refusals whose session was
+recorded, 453 never saw a successful unlock in that session again).
 
-Measured on run r6aa92e5a: one worker, 34 minutes, 4 distinct MCP sessions. The two that
-were never authorized never called unlock at all, and all three of its refusals were the
-brand-new-session case rather than any session ageing out. The worker pressed the same key
-nine times, because three of those nine never reached the keyboard at all.
-
-Waiting for the refusal and then injecting was recovery from a certainty, and the ledger
-says the recovery mostly did not arrive: of 518 refusals whose session was recorded, 453
-never saw a successful unlock in that session again; the 65 that did took a median of 128
-seconds and 5 further tool calls.
+CHANGED 2026-09-25. That reasoning about the session boundary was correct, but the fix it
+produced repeated the exact defect `_initial_job_with_unlock` had at turn 1: production
+transcripts (.fleet/transcripts/r6ab5aa80_a0_w0.jsonl and others) showed Microsoft 365
+Copilot's own safety/DLP filter refusing "call a tool with a password argument" as an opening
+message, byte-identically, every time -- deterministic, not transient. Putting the password
+into the opening turn of a recycled or replayed conversation is the same shape turn 1 had; it
+does not avoid the refusal, it relocates it one conversation later. Both branches now send the
+plain re-anchored goal (protocol + procedure + goal, no password) as their opening turn, and
+rely on the same reactive path turn 1 now relies on: `_looks_locked()` -> `_inject_unlock()`,
+fired from `_decide_impl` the first time a write/exec tool is actually refused -- a shape
+Copilot does not blanket-refuse.
 
 These tests hold the property both branches now have, and they call the builders the code
 calls rather than reassembling the strings -- an assertion about my arithmetic would keep
@@ -66,19 +68,26 @@ def _unlock_text():
     return F.UNLOCK_PREFIX % PW
 
 
-def test_a_recycled_conversation_carries_the_unlock(with_password):
-    """The 99.7% branch. A recycle is a new session, so the old token is gone by definition."""
+def test_a_recycled_conversation_no_longer_carries_the_unlock(with_password):
+    """CHANGED 2026-09-25: a recycle's opening turn must NOT contain the password -- Copilot's
+    safety filter blanket-refuses that shape regardless of which conversation it opens. The
+    reactive path re-unlocks after a genuine refusal instead; see test_unlock_inject.py."""
     w = F.RelayWorker(GOAL, "w0")
     w._recycles = 1
-    assert _unlock_text() in w._recycle_job(), (
-        "a recycled conversation opens locked; this is the refusal that is 4,258 of 4,271")
+    job = w._recycle_job()
+    assert _unlock_text() not in job, (
+        "a recycled conversation's opening turn must stay password-free, same as turn 1")
+    assert "password=" not in job
 
 
-def test_a_replayed_conversation_carries_the_unlock(with_password):
-    """The same class of defect one method up. Fixing only the recycle leaves it open."""
+def test_a_replayed_conversation_no_longer_carries_the_unlock(with_password):
+    """Same class of fix one method up. Fixing only the recycle would have left the identical
+    hole open here."""
     w = F.RelayWorker(GOAL, "w0")
     w.fresh_replay_count = 1
-    assert _unlock_text() in w._replay_job()
+    job = w._replay_job()
+    assert _unlock_text() not in job
+    assert "password=" not in job
 
 
 def test_the_goal_is_intact_and_nothing_precedes_it_but_context(with_password):
@@ -101,19 +110,9 @@ def test_the_goal_is_intact_and_nothing_precedes_it_but_context(with_password):
     assert job.index(RECYCLE_PREFIX) < job.index(GOAL)
 
 
-def test_the_unlock_precedes_the_reset_notice(with_password):
-    """Ordering matters for the same reason it does at turn 1: the unlock belongs with the
-    protocol, above the notice whose heading introduces the goal."""
-    from relay.copilot_autopilot_relay import RECYCLE_PREFIX
-
-    w = F.RelayWorker(GOAL, "w0")
-    w._recycles = 1
-    job = w._recycle_job()
-    assert job.index(_unlock_text()) < job.index(RECYCLE_PREFIX)
-
-
 def test_the_procedure_still_travels(with_password):
-    """The property the previous test file holds. Adding the unlock must not displace it."""
+    """The property the previous test file holds. Removing the proactive unlock must not
+    displace it."""
     w = F.RelayWorker(GOAL, "w0")
     w._recycles = 1
     job = w._recycle_job()
@@ -121,7 +120,9 @@ def test_the_procedure_still_travels(with_password):
 
 
 def test_no_password_means_no_unlock_text_rather_than_a_crash(without_password):
-    """A machine with no MCP_UNLOCK_PASSWORD must still get a usable re-anchor."""
+    """A machine with no MCP_UNLOCK_PASSWORD must still get a usable re-anchor -- and, since
+    neither branch injects proactively any more, this now holds regardless of whether a
+    password is configured at all."""
     w = F.RelayWorker(GOAL, "w0")
     w._recycles = 1
     job = w._recycle_job()
@@ -131,36 +132,60 @@ def test_no_password_means_no_unlock_text_rather_than_a_crash(without_password):
     assert w._replay_job().endswith(GOAL)
 
 
-def test_a_recycle_resets_the_reactive_budget_instead_of_spending_it(with_password):
+def test_a_recycle_resets_the_reactive_budget_to_zero(with_password):
     """MAX_UNLOCK_ATTEMPTS bounds a re-unlock loop WITHIN one conversation, where repeated
     failure means the password or the identity is wrong. A recycle is a different
     conversation and is separately bounded by _max_recycles, so charging it here would make a
-    long healthy job go STUCK for "unlock attempts exhausted" with nothing having failed."""
+    long healthy job go STUCK for "unlock attempts exhausted" with nothing having failed.
+
+    CHANGED 2026-09-25: this used to reset to 1, counting the proactive injection this
+    function performed. There is no longer a proactive injection to count, so the reset is to
+    0 -- the reactive path's own budget, spent only if the recycled conversation is actually
+    refused."""
     w = F.RelayWorker(GOAL, "w0")
     w._unlock_attempts = F.MAX_UNLOCK_ATTEMPTS
     w._recycles = 1
     w._recycle_job()
-    assert w._unlock_attempts == 1
+    assert w._unlock_attempts == 0
     assert w._unlock_attempts < F.MAX_UNLOCK_ATTEMPTS, (
         "a recycled worker starts with no room to recover from a genuine re-lock")
 
 
-def test_the_unlock_text_is_the_same_text_turn_one_sends(with_password):
-    """So it inherits turn 1's handling rather than needing its own.
+def test_a_replay_resets_the_reactive_budget_to_zero(with_password):
+    """Same reasoning as the recycle test above, for the sibling branch."""
+    w = F.RelayWorker(GOAL, "w0")
+    w._unlock_attempts = F.MAX_UNLOCK_ATTEMPTS
+    w.fresh_replay_count = 1
+    w._replay_job()
+    assert w._unlock_attempts == 0
 
-    The first version of this test asserted the password was gone after
-    _redact_unlock_password, which was never true for a fake one: redact_secrets removes the
-    values it finds in the secret store, so a placeholder passes through untouched and the
-    test was measuring its own fixture. The property that actually matters is that both
-    fresh-conversation branches compose the unlock EXACTLY as the initial path does -- same
-    template, same source for the password -- so whatever redaction, logging and handling
-    turn 1 gets, these get too, with nothing to keep in step by hand.
-    """
+
+def test_the_reactive_path_still_composes_the_unlock_the_same_way(with_password):
+    """So a fresh conversation that DOES get refused inherits the reactive path's handling
+    rather than needing its own template.
+
+    CHANGED 2026-09-25: recycle/replay used to inject the unlock text into their own opening
+    turn, composed with the same template as the reactive path -- this test used to check that
+    the two compositions matched. Now neither branch injects proactively at all (same bug
+    shape turn 1 had, fixed the same way -- see the module docstring), so the property left to
+    check is narrower: the reactive path (`_inject_unlock`, the only place a fresh
+    conversation's turn 1 gets unlock text from now) still composes UNLOCK_PREFIX with the
+    real password, unaffected by this change."""
     expected = F.UNLOCK_PREFIX % F._unlock_password()
     w = F.RelayWorker(GOAL, "w0")
     w._recycles = 1
     w.fresh_replay_count = 1
-    assert expected in w._recycle_job()
-    assert expected in w._replay_job()
+    assert expected not in w._recycle_job()
+    assert expected not in w._replay_job()
+    w2 = F.RelayWorker(GOAL, "w1")
+    w2._inject_unlock()
+    assert expected in w2.job, "the reactive path no longer composes it this way"
+
+
+def test_turn_one_itself_no_longer_injects(with_password):
+    """CHANGED 2026-09-25: the very first turn of a fresh worker must NOT carry the password --
+    see test_unlock_inject.py and test_unlock_keeps_the_planner.py for the full contract."""
+    w = F.RelayWorker(GOAL, "w0")
     initial, injected = F._initial_job_with_unlock(w._composed_goal, False)
-    assert injected and expected in initial, "the initial path no longer composes it this way"
+    assert not injected
+    assert PW not in initial

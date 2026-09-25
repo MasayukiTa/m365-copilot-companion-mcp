@@ -114,9 +114,11 @@ def test_a_worker_past_the_unlock_attempts_raises_a_gate_naming_what_it_needs():
         w = _fresh_worker("w_unlock_gate")
         locked = ("[locked client IP: '203.0.113.9'] Call unlock(password='<password>') "
                   "first. The unlock is stored per client IP for 30 days.")
-        # The constructor already spends one attempt proactively (a local password exists),
-        # so MAX_UNLOCK_ATTEMPTS - 1 more reactive injections reach the cap exactly.
-        for _ in range(MAX_UNLOCK_ATTEMPTS - 1):
+        # CHANGED 2026-09-25 (turn-1 unlock-injection fix): the constructor no longer spends an
+        # attempt proactively -- turn 1 never carries the password now (see
+        # _initial_job_with_unlock's docstring) -- so the full MAX_UNLOCK_ATTEMPTS reactive
+        # injections are needed to reach the cap.
+        for _ in range(MAX_UNLOCK_ATTEMPTS):
             w._decide(locked)
         assert w._unlock_attempts == MAX_UNLOCK_ATTEMPTS
         w._decide(locked)                      # one past the cap
@@ -243,7 +245,9 @@ def test_unlock_exhaustion_is_cancelled_when_the_server_already_granted_it():
         w = _fresh_worker("w_recovered_gate")
         locked = ("[locked client IP: '203.0.113.11'] Call unlock(password='<password>') "
                   "first. The unlock is stored per client IP for 30 days.")
-        for _ in range(MAX_UNLOCK_ATTEMPTS - 1):
+        # CHANGED 2026-09-25: the constructor no longer spends a proactive attempt (see the
+        # sibling test above), so the full MAX_UNLOCK_ATTEMPTS reactive injections are needed.
+        for _ in range(MAX_UNLOCK_ATTEMPTS):
             w._decide(locked)
         assert w._unlock_attempts == MAX_UNLOCK_ATTEMPTS
 
@@ -279,7 +283,10 @@ def test_unlock_exhaustion_still_gates_when_no_grant_is_attributable():
         w = _fresh_worker("w_not_recovered_gate")
         locked = ("[locked client IP: '203.0.113.12'] Call unlock(password='<password>') "
                   "first. The unlock is stored per client IP for 30 days.")
-        for _ in range(MAX_UNLOCK_ATTEMPTS - 1):
+        # CHANGED 2026-09-25: no proactive attempt is spent by the constructor anymore, so
+        # MAX_UNLOCK_ATTEMPTS reactive injections are needed to reach the cap before the extra
+        # call below goes one past it.
+        for _ in range(MAX_UNLOCK_ATTEMPTS):
             w._decide(locked)
         w._decide(locked)                       # one past the cap, no grant recorded anywhere
         assert w.status == "awaiting_gate"
