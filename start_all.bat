@@ -56,5 +56,10 @@ echo   Windows Script Host is disabled, or wscript.exe could not run the hidden 
 echo   usual windowless start could not fire. Starting the stack directly via PowerShell instead
 echo   (still hidden and detached; ask IT to enable Windows Script Host to restore the normal
 echo   wscript path, or see scripts\start_all.ps1 to run it yourself).
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath 'powershell' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','%~dp0scripts\start_all.ps1') -WindowStyle Hidden -WorkingDirectory '%~dp0'"
+REM MCP_STARTALL_LAUNCH_PARENT_NAME (2026-09-25, scripts/test_start_all_ten_clicks.py): set on
+REM THIS process before Start-Process, so the started start_all.ps1 inherits it and skips its own
+REM WMI lookup for who its parent is -- see Get-LaunchLineage's own comment. No pid to hand down
+REM here (Start-Process creates the actual parent process after this line runs), only the name,
+REM which is fixed no matter which powershell.exe Start-Process ends up creating.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:MCP_STARTALL_LAUNCH_PARENT_NAME = 'powershell.exe'; Start-Process -FilePath 'powershell' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','%~dp0scripts\start_all.ps1') -WindowStyle Hidden -WorkingDirectory '%~dp0'"
 goto :eof

@@ -78,6 +78,38 @@ function Get-LaunchLineage([switch]$ParentOnly) {
     # -ParentOnly: this process and its parent, not the grandparent -- for a copy that leaves
     # because a startup is running (who clicked is the parent; one lookup fewer on its way out).
     $l = [ordered]@{ parent_pid = 0; parent_name = ""; parent_cmd = ""; grandparent_pid = 0; grandparent_name = "" }
+    if ($ParentOnly) {
+        # THE LAUNCHER ALREADY KNOWS ITS OWN PID -- ASK IT, DON'T QUERY THE OS (2026-09-25,
+        # CI leaver_max_s still crossing 3.0 s after the spool-file fix). Measured: the ONE WMI
+        # moniker lookup this function makes ([wmi]"Win32_Process.Handle=...", already the
+        # cheapest of everything tried -- Add-Type/P-Invoke to NtQueryInformationProcess,
+        # Get-Counter's PDH counters, a Reflection.Emit P-Invoke with no Add-Type/compiler at
+        # all, a budgeted async Runspace -- was EQUAL OR WORSE under the same contention, because
+        # every one of them does its own CPU-bound setup (a compiler process, a new runspace, a
+        # JIT) that competes for the same starved cores; there is no cheaper way to ask the OS
+        # "who is my parent" once the machine is genuinely CPU-saturated) still cost 0.25-2.3 s
+        # of a leaver's life as CPU contention rose in local repro (a 12-core box loaded to
+        # 91-100% with 20-46 competing processes), the same shape as CI's small (0.09-0.23 s)
+        # overshoot on its 2 vCPU runner. So skip the query entirely when the launcher told us
+        # who it is: start_all_hidden.vbs and start_all.bat's WSH-disabled fallback branch both
+        # set MCP_STARTALL_LAUNCH_PARENT_NAME (and _PID, when the launcher's own pid is free to
+        # read, e.g. $PID in a PowerShell launcher) on the child's environment before starting it
+        # -- inherited environment reads cost nothing. Only a launch this script does not
+        # control (a bare `powershell start_all.ps1`, the re-exec handoff) falls through to WMI
+        # below, same as before.
+        $envName = "$env:MCP_STARTALL_LAUNCH_PARENT_NAME"
+        $env:MCP_STARTALL_LAUNCH_PARENT_NAME = $null   # read once; never handed to what this run starts
+        $envPidRaw = "$env:MCP_STARTALL_LAUNCH_PARENT_PID"
+        $env:MCP_STARTALL_LAUNCH_PARENT_PID = $null
+        if ($envName) {
+            $l.parent_name = $envName
+            $l.parent_cmd = "(not read)"
+            $l.grandparent_name = "(not read)"
+            $envPid = 0
+            if ([int]::TryParse($envPidRaw, [ref]$envPid) -and $envPid -gt 0) { $l.parent_pid = $envPid }
+            return $l
+        }
+    }
     try {
         $me = Get-Win32ProcessByPid $PID
         if (-not $me) { return $l }
