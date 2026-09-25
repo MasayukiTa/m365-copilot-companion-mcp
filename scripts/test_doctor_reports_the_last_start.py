@@ -41,6 +41,7 @@ helpers elsewhere in the file), matching every other *.ps1 test in this director
 """
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import shutil
@@ -351,7 +352,12 @@ def test_block_reports_one_fail_per_recorded_failure_with_start_alls_own_text(
     repo_dir = tmp_path / "repo_failed"
     logs = repo_dir / ".setup" / "logs"
     logs.mkdir(parents=True)
-    when = "2026-09-24 06:00:00"  # recent -> not stale
+    # RELATIVE TO WALL-CLOCK NOW, NOT A FIXED CALENDAR DATE. Test-LastStartSummaryStale
+    # (doctor.ps1) compares this against the PowerShell block's own real Get-Date -- a
+    # literal like "2026-09-24 06:00:00" was "recent" only until the calendar caught up to
+    # it, then started reading >24h old and failing this test on the date alone (measured
+    # 2026-09-25, the day after it was written). One hour ago is recent on any day this runs.
+    when = (datetime.datetime.now() - datetime.timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
     text = (
         "failures=2\n"
         "when=%s\n"
@@ -378,8 +384,11 @@ def test_block_reports_ok_with_no_problems_when_the_last_start_was_clean(
     repo_dir = tmp_path / "repo_clean"
     logs = repo_dir / ".setup" / "logs"
     logs.mkdir(parents=True)
+    # Relative to wall-clock now -- see the sibling "recorded_failure" test's comment for why
+    # a fixed calendar date here eventually reads as stale on its own.
+    recent_when = (datetime.datetime.now() - datetime.timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
     (logs / "start_all_summary.txt").write_bytes(
-        b"failures=0\nwhen=2026-09-24 06:00:00\nmode=full\n")
+        ("failures=0\nwhen=%s\nmode=full\n" % recent_when).encode("utf-8"))
     results = _results(tmp_path, add_result_fn, check_fn, last_start_block, repo_dir)
     assert len(results) == 1
     assert results[0]["id"] == "last_start"
