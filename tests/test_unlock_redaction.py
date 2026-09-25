@@ -27,12 +27,33 @@ def _src(path):
 # ── 送る側：本物が入っていること ────────────────────────────────
 
 def test_fleet_first_turn_carries_the_real_password(monkeypatch):
+    """CHANGED 2026-09-25: the NORMAL (non-plan_mode) first turn no longer injects the
+    password proactively at all -- M365 Copilot's own safety filter refused that exact shape
+    deterministically (see relay/relay_fleet.py's _initial_job_with_unlock docstring). The
+    password is only injected reactively now, after a genuine lock refusal.
+
+    plan_mode (operator-set, plan-then-WAIT) is the one remaining path that still composes the
+    password into the initial job at construction time, so it is what this test -- whose whole
+    point is "the real password must reach the agent, not just survive redaction" -- now
+    exercises."""
+    import relay.relay_fleet as rf
+
+    monkeypatch.setattr(rf, "_unlock_password", lambda: PW)
+    body, did = rf._initial_job_with_unlock("ゴール", plan_mode=True)
+    assert did is True
+    assert PW in body, "送る文から消してしまうと解錠が通らない"
+    assert "ゴール" in body
+
+
+def test_fleet_first_turn_no_longer_proactively_injects(monkeypatch):
+    """The normal (non-plan_mode) path: even with a password configured, turn 1 is the plain
+    goal, and `did` (whether this call itself injected anything) is False."""
     import relay.relay_fleet as rf
 
     monkeypatch.setattr(rf, "_unlock_password", lambda: PW)
     body, did = rf._initial_job_with_unlock("ゴール")
-    assert did is True
-    assert PW in body, "送る文から消してしまうと解錠が通らない"
+    assert did is False
+    assert PW not in body
     assert "ゴール" in body
 
 

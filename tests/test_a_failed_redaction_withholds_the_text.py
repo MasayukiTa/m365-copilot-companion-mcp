@@ -141,13 +141,20 @@ def test_the_fleet_transcript_never_holds_the_canary(how, monkeypatch, tmp_path,
 
 def test_the_live_turn_still_carries_the_password_with_the_redactor_broken(monkeypatch):
     """Withholding the RECORD must not withhold the TURN: the unlock only works if the real
-    password reaches the agent."""
+    password reaches the agent.
+
+    CHANGED 2026-09-25: the normal (non-plan_mode) first turn no longer injects the password
+    proactively at all (see _initial_job_with_unlock's docstring -- M365 Copilot's safety
+    filter refused that shape deterministically). plan_mode is the one remaining path that
+    composes the password into the initial job at construction time, so it is what this test
+    -- whose point is specifically about that composition surviving a broken redactor --
+    exercises now."""
     import relay.relay_fleet as rf
     import tools.secret_store as ss
     monkeypatch.setattr(ss, "secret_values", _boom)
     monkeypatch.setattr(ss, "redact_secrets", _boom)
     monkeypatch.setattr(rf, "_unlock_password", lambda: CANARY)
-    body, did = rf._initial_job_with_unlock("the goal")
+    body, did = rf._initial_job_with_unlock("the goal", plan_mode=True)
     assert did is True and CANARY in body and "the goal" in body
 
 
