@@ -767,6 +767,9 @@ def test_the_planner_component_does_not_hijack_the_operators_plan_mode():
     from relay import relay_fleet as RF
     src = inspect.getsource(RF._initial_job_with_unlock)
     i = src.index("if plan_mode:")
-    j = src.index("else:", i)
+    # CHANGED 2026-09-25 (turn-1 unlock-injection fix): the non-plan_mode branch is no longer
+    # an "else:" -- the plan_mode branch now early-returns, so the split point is the first line
+    # after it, marked by this comment (see _initial_job_with_unlock's own docstring for why).
+    j = src.index("# Non-plan_mode", i)
     assert "opening_turn" not in src[i:j], "plan_mode 経路がコンポーネント版に乗っ取られている"
     assert "opening_turn" in src[j:], "plan_mode でない経路に本番の読み手が無い"

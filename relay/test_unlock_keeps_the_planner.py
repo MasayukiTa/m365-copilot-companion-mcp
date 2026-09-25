@@ -24,6 +24,15 @@ module before it runs anything, so an import-time env write is live for every ot
 the writing module's teardown, and two unrelated tests once failed in CI and passed locally on
 import order alone. `_unlock_password()` reads its value on each call, so a per-test patch is
 both sufficient and contained.
+
+CHANGED 2026-09-25: the non-plan_mode branch (the normal, always-on fleet configuration) no
+longer injects UNLOCK_PREFIX/the password into turn 1 at all -- M365 Copilot's own safety/DLP
+filter refused that exact message shape deterministically in production, so the proactive send
+could never succeed. Turn 1 is now always `opening_turn(goal, PROTOCOL)`, unconditionally --
+which, as a side effect, means the planner-routing fix this file was written to pin down (both
+arms reach `opening_turn`, so planner/v1 and planner/v2 differ) now holds unconditionally rather
+than only "when no password is set". plan_mode (operator-set plan-then-wait) is untouched and
+still injects proactively; see test_operator_plan_mode_is_not_reinterpreted below.
 """
 import os
 import sys
@@ -54,17 +63,21 @@ def planner(monkeypatch):
     return use
 
 
-def test_v1_is_byte_identical_to_what_it_produced_before(held, planner):
-    """The fix must not move a single character under the version that was already running,
-    or it is a behaviour change hiding inside a bug fix."""
+def test_v1_no_longer_injects_password_into_turn_one(held, planner):
+    """CHANGED 2026-09-25: turn 1 never carries UNLOCK_PREFIX/the password anymore, under either
+    planner version -- M365 Copilot's safety filter refused that exact shape deterministically,
+    so nothing is gained by putting it there and the send is no longer made."""
     planner("planner/v1")
     got, injected = F._initial_job_with_unlock(GOAL)
-    assert injected
-    assert got == F.PROTOCOL + (F.UNLOCK_PREFIX % PW) + GOAL
+    assert not injected
+    assert got == F.PROTOCOL + GOAL
+    assert PW not in got
 
 
 def test_v2_now_actually_differs(held, planner):
-    """THE POINT. Before this, the two arms returned the same string."""
+    """THE POINT, still true after the 2026-09-25 change: both arms now route through
+    `opening_turn` UNCONDITIONALLY (not only when no password is set), so planner/v1 and
+    planner/v2 still produce different first turns."""
     planner("planner/v1")
     v1, _ = F._initial_job_with_unlock(GOAL)
     planner("planner/v2")
@@ -73,11 +86,14 @@ def test_v2_now_actually_differs(held, planner):
     assert P.PLAN_PROMPT in v2 and P.PLAN_PROMPT not in v1
 
 
-def test_the_credential_still_reaches_the_agent(held, planner):
-    """It has to: unlock() proves knowledge rather than looking the value up."""
+def test_the_credential_no_longer_reaches_turn_one(held, planner):
+    """CHANGED 2026-09-25: the credential must NOT appear in turn 1 anymore. It still reaches
+    the agent, but only reactively (_inject_unlock), once a genuine write/exec lock refusal is
+    actually observed in a reply -- see test_unlock_inject.py."""
     planner("planner/v2")
     got, injected = F._initial_job_with_unlock(GOAL)
-    assert injected and PW in got
+    assert not injected
+    assert PW not in got
 
 
 def test_the_goal_still_survives_intact(held, planner):

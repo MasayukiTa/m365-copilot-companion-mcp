@@ -566,15 +566,19 @@ def sweep_unclaimed_refusals(workers, now=None, log=None, deliver=None):
 
 
 def apply_reunlock(target, workers, enqueue=None, log=None):
-    """THE FALLBACK BUTTON. Automatic recovery already exists: relay_fleet injects
-    `UNLOCK_PREFIX % password` into a worker's FIRST turn whenever a local password is
-    found (see `_initial_job_with_unlock`), and a heuristic elsewhere retries it when a
-    reply LOOKS like a lock refusal. Both can miss -- the heuristic is deliberately loose
-    and gated on a matching record, and neither runs at all for a refusal that arrives
-    after the first turn and never gets recognised as one. Measured twice in one day
-    (2026-09-15): a worker refused for lock, no recovery fired, and the run continued
-    regardless -- once producing a deliverable that claimed to have verified content it
-    had never been able to read. There was no button for the operator to press.
+    """THE FALLBACK BUTTON. Automatic recovery already exists: relay_fleet's
+    `_inject_unlock` injects `UNLOCK_PREFIX % password` REACTIVELY, once a reply LOOKS
+    like a lock refusal (see `_looks_locked`). (Before 2026-09-25, `_initial_job_with_unlock`
+    also injected it proactively into a fresh worker's FIRST turn whenever a local password
+    was found; that was removed because M365 Copilot's own safety/DLP filter refused that
+    exact "call unlock with this password" turn-1 shape deterministically, so the proactive
+    send could never succeed -- see `_initial_job_with_unlock`'s docstring.) The reactive
+    heuristic can still miss -- it is deliberately loose and gated on a matching record, and
+    it never runs at all for a refusal that arrives and never gets recognised as one.
+    Measured twice in one day (2026-09-15): a worker refused for lock, no recovery fired,
+    and the run continued regardless -- once producing a deliverable that claimed to have
+    verified content it had never been able to read. There was no button for the operator
+    to press.
 
     This is that button, and it is DELIBERATELY the same delivery path as a steer: the
     unlock instruction is a turn like any other, and `deliver_steers` already carries the

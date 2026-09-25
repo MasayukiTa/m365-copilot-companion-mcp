@@ -3,12 +3,14 @@
 regardless -- once producing a deliverable that claimed to have verified content it had never
 been able to read.
 
-AUTOMATIC RECOVERY ALREADY EXISTS. `relay.relay_fleet._initial_job_with_unlock` injects
-`UNLOCK_PREFIX % password` into a worker's very first turn whenever a local password is found,
-and a separate heuristic elsewhere retries it when a reply LOOKS like a lock refusal. Both can
-miss: the heuristic is deliberately loose and gated on a matching record, and neither runs at
-all for a refusal that arrives later and is never recognised as one. When that happens the
-operator could watch a run die on authorisation with no button to press.
+AUTOMATIC RECOVERY ALREADY EXISTS. `relay.relay_fleet._inject_unlock` injects
+`UNLOCK_PREFIX % password` REACTIVELY, once a reply LOOKS like a lock refusal (a heuristic
+that is deliberately loose and gated on a matching record). It never runs at all for a
+refusal that arrives and is never recognised as one. When that happens the operator could
+watch a run die on authorisation with no button to press. (Before 2026-09-25,
+`_initial_job_with_unlock` also injected proactively into a fresh worker's very first turn
+whenever a local password was found; that was removed because it made M365 Copilot's own
+safety/DLP filter refuse turn 1 deterministically -- see relay_fleet.py.)
 
 THIS IS THAT BUTTON. `{"reunlock": "w0"}` (a worker name, or "" / "*" for every live worker)
 written to the cockpit's command file re-delivers the unlock turn ON DEMAND, and
