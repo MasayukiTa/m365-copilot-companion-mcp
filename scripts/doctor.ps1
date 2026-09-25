@@ -877,17 +877,33 @@ Check "edge_bridge" "Bridge Edge running (:9223 -- the chat window's browser)" `
 #     bridge is alive -- probing / would have passed here and called a broken chat backend fine.
 Check "bridge_backend" "Chat backend serving (:8765 /conv)" `
     {
-        try {
-            $r = Invoke-WebRequest -Uri 'http://127.0.0.1:8765/conv' -TimeoutSec 6 -UseBasicParsing
-            [int]$r.StatusCode -lt 500
-        } catch {
-            # An HTTP error status still means something is serving; a dropped or refused
-            # connection does not.
-            if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode.value__ -lt 500 }
-            else { $false }
+        # RETRIED, NOT A SINGLE SHOT. A sign-in wall on the bridge Edge (see the m365_signin_*
+        # checks above) makes start_bridge.ps1's supervisor kill the bridge process, show the
+        # Edge window, wait for the person to actually finish signing in, and only THEN relaunch
+        # the bridge -- a real, expected window with the port legitimately down, not a hang.
+        # MEASURED 2026-09-25 (a fresh PC): the sign-in itself succeeded (m365_signin_9223 read
+        # OK) but a doctor run straight after start_all still caught the relaunch mid-flight and
+        # reported this row FAIL, because the previous single Invoke-WebRequest gave it one
+        # 6-second look. Three tries, 5s apart (16s total, matching start_all.ps1's own
+        # Get-BridgePollAttempts budget for the same reason), gives a restart that is already
+        # under way time to finish before this is reported as broken.
+        $bridgeOk = $false
+        for ($bAttempt = 0; $bAttempt -lt 3; $bAttempt++) {
+            if ($bAttempt -gt 0) { Start-Sleep -Seconds 5 }
+            try {
+                $r = Invoke-WebRequest -Uri 'http://127.0.0.1:8765/conv' -TimeoutSec 6 -UseBasicParsing
+                if ([int]$r.StatusCode -lt 500) { $bridgeOk = $true; break }
+            } catch {
+                # An HTTP error status still means something is serving; a dropped or refused
+                # connection does not.
+                if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode.value__ -lt 500) {
+                    $bridgeOk = $true; break
+                }
+            }
         }
+        $bridgeOk
     } `
-    "the chat backend is not answering on :8765. If a process holds the port but does not serve, it was probably started outside the venv (check the command line of the owner of :8765): stop it, then run start_all.bat, which relaunches the bridge with the venv interpreter."
+    "the chat backend is not answering on :8765. If a process holds the port but does not serve, it was probably started outside the venv (check the command line of the owner of :8765): stop it, then run start_all.bat, which relaunches the bridge with the venv interpreter. If a sign-in was just completed, this can also mean the bridge is still restarting -- wait a few seconds and run doctor.bat again."
 
 # 5b. UI apps (CopilotChat.exe / FleetCockpit.exe) -- gitignored, so a fresh clone has neither
 #     until the first build. Checked individually so the fix line names the missing one.
