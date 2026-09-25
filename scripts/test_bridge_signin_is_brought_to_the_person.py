@@ -390,6 +390,54 @@ def test_supervisor_brings_a_headless_bridge_edge_on_adfs_forward_once(tmp_path,
         "a completed sign-in must re-arm for the next expiry"
 
 
+def test_supervisor_does_not_hide_the_window_on_an_ambiguous_mid_auth_read(tmp_path, stub):
+    """MEASURED 2026-09-25 (a fresh PC's bridge.log): the sign-in window opened, then closed and
+    reopened every ~105-110s, 15+ times in a row, even after the person had signed in. Root
+    cause: Needs-SignIn (start_bridge.ps1) matched only an EXACT "VERDICT: sign_in_needed" and
+    treated everything else -- including "VERDICT: cannot_tell", which ensure_m365_signin.py
+    prints for a tab mid-redirect (e.g. the CsrToSSR bounce, or any hop the checker cannot yet
+    classify) -- as "not a wall". Demote-ToHeadless (start_bridge.ps1) declares the wall cleared
+    after 3 consecutive 5s polls read "not needed", so a few seconds of an unrecognised
+    in-between page was enough to hide the window mid-authentication -- and hiding it re-arms
+    the latch, so the very next hop that landed back on a real wall re-triggered a fresh
+    "surface", producing the observed loop.
+
+    This drives the real Demote-ToHeadless loop against a tab that stays on
+    "redirfrom=CsrToSSR&auth=2" -- state() reads this as ready=None ("mid-authentication", NOT
+    a wall and NOT signed in) -- for several poll cycles before finally landing on the app, and
+    asserts the window is NOT returned to headless while that ambiguous state persists."""
+    import concurrent.futures
+
+    BOUNCE = "https://m365.cloud.microsoft/chat?redirfrom=CsrToSSR&auth=2"
+    stub.tabs = [ADFS]
+    # Never let the stub's own signin_after counter auto-switch to APP; this test drives
+    # `stub.tabs` itself, on its own clock, from a separate thread.
+    stub.signin_after = 10_000
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        fut = pool.submit(_run_supervisor, tmp_path, stub, 120)
+        # Wait for the window to actually be surfaced (the visible relaunch), then park on the
+        # ambiguous bounce page for long enough to span several 5s Demote-ToHeadless polls.
+        deadline = time.time() + 30
+        while stub.visible_hits == 0 and time.time() < deadline:
+            time.sleep(0.2)
+        assert stub.visible_hits > 0, "the window was never surfaced at all"
+        stub.tabs = [BOUNCE]
+        time.sleep(18)   # >= 3 poll cycles at 5s each
+        assert not fut.done(), (
+            "the supervisor returned the Edge to headless while the tab was still on an "
+            "unresolved, ambiguous mid-authentication page -- it read that as 'signed in'")
+        # Now let it actually finish: land on the real app. Generous timeout, matching
+        # _run_supervisor's own subprocess.run(timeout=240) ceiling -- each poll spawns a real
+        # python.exe subprocess (Invoke-SignInHelper), and that overhead is exactly what this
+        # investigation exists to account for.
+        stub.tabs = [APP]
+        out, calls, pid, took = fut.result(timeout=200)
+
+    assert calls[-1].startswith("Ensure-Edge Hard=True Visible=False"), \
+        "the Edge was never returned to headless once actually signed in: %s" % calls
+
+
 def test_supervisor_does_not_surface_twice_for_one_need(tmp_path, stub):
     """Second bridge run on the same unresolved wall: already shown, so nothing."""
     stub.tabs = [ADFS]
