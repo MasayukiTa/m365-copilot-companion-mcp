@@ -631,7 +631,11 @@ def test_the_chat_backend_is_checked_not_just_the_browser_it_drives():
     block = block[:block.index("# 5b.")]
     assert "-Optional" not in block
     # an HTTP error still means something is serving; a dropped connection does not
-    assert "else { $false }" in block
+    assert "StatusCode.value__ -lt 500" in block and "$bridgeOk = $true" in block
+    # CHANGED 2026-09-25: retried rather than a single 6s shot -- a sign-in-triggered bridge
+    # restart (start_bridge.ps1's supervisor) legitimately holds :8765 down for a stretch
+    # doctor.bat can run straight into. See the Check block's own comment for the incident.
+    assert "for ($bAttempt = 0; $bAttempt -lt 3; $bAttempt++)" in block
 
 
 def test_a_held_but_dead_bridge_port_is_named_rather_than_relaunched_into():
