@@ -30,6 +30,7 @@ from dotenv import load_dotenv
 from .copilot_autopilot_relay import COPILOT_SELECTORS, CopilotWebDriver
 from relay import settle as _settle
 from tools.gate_ops import stop_check
+from tools import childproc
 
 load_dotenv()
 
@@ -177,6 +178,7 @@ def prompt_for_agent_url(env_key: str, reason: str = "") -> str:
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1,
              "-Only", env_key, "-Reason", (reason or "")],
             timeout=600, check=False,
+            creationflags=childproc.headless_creationflags(),
         )
     except Exception:
         return ""
