@@ -568,6 +568,28 @@ def test_the_goal_still_reaches_the_launch_alongside_the_floor_flag(state):
     assert "--state-dir" in cmd
 
 
+
+def test_the_pid_probe_is_windowless(monkeypatch):
+    """task_router runs unattended; its tasklist probe must not allocate a console window."""
+    import subprocess as sp
+    if os.name != "nt":
+        pytest.skip("console creation flags exist only on Windows")
+    seen = {}
+
+    class Result:
+        stdout = "12345 image.exe"
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = list(argv)
+        seen["kwargs"] = dict(kwargs)
+        return Result()
+
+    monkeypatch.setattr(TR.subprocess, "run", fake_run)
+    assert TR._pid_alive(12345) is True
+    flags = int(seen["kwargs"].get("creationflags", 0))
+    assert flags & sp.CREATE_NO_WINDOW, (
+        "the tasklist liveness probe can allocate a visible console: %r" % seen["kwargs"])
+
 def test_the_launch_asks_for_no_console_window():
     """A GOAL FROM A PHONE MUST NOT PUT A BLACK WINDOW ON THE DESKTOP.
 
