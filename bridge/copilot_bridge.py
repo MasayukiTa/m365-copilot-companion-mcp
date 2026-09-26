@@ -96,6 +96,7 @@ _PROCESS_STARTED = time.time()
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
+from tools import childproc
 
 DELETE_LOG = REPO / ".fleet" / "delete_log.jsonl"
 FLEET_CONVS_PATH = REPO / ".fleet" / "conversations.json"
@@ -4915,6 +4916,7 @@ class Handler(BaseHTTPRequestHandler):
             proc = subprocess.Popen(
                 argv, cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
+                creationflags=childproc.headless_creationflags(),
             )
 
             # Read the subprocess's stdout on a background thread so this thread can keep
@@ -4994,6 +4996,7 @@ class Handler(BaseHTTPRequestHandler):
         proc = subprocess.Popen(
             argv, cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace",
+            creationflags=childproc.headless_creationflags(),
         )
         line_q: "queue.Queue[str | None]" = queue.Queue()
 

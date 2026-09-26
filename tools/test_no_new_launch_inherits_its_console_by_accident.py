@@ -104,8 +104,6 @@ BASELINE = {
     "bench/swe_split.py::load_lite::subprocess.run": 1,
     "bench/swe_status.py::run::subprocess.run": 1,
     "bench/ui_deploy.py::<module>::subprocess.run": 3,
-    "bridge/copilot_bridge.py::_review_stream::subprocess.Popen": 1,
-    "bridge/copilot_bridge.py::_run_fix_subprocess::subprocess.Popen": 1,
     "relay/code_task.py::main::subprocess.call": 1,
     "relay/orphan_reaper.py::candidates::subprocess.run": 1,
     "relay/orphan_reaper.py::reap::subprocess.run": 1,
