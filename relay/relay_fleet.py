@@ -2940,6 +2940,12 @@ class RelayWorker:
         #: bytes go out again next sweep -- see _refute_fix_job for the measurement.
         self._refute_reason = ""
         self._refute_attempt = 0
+        # Preserve the last substantive DONE candidate while an independent reviewer asks for
+        # a correction. If that correction turn never answers, the truthful result is not
+        # STUCK-with-no-result: the candidate exists but its claim remains contradicted.
+        self._candidate_done_reply = ""
+        self._candidate_done_turn = 0
+        self._refute_fix_pending = False
         #: The last job text actually sent, so a re-send can be recognised as one.
         self._last_sent_job = ""
         # deep-research delegation (ported from the single-agent relay): a fleet worker can emit
@@ -4966,6 +4972,11 @@ class RelayWorker:
             # would duplicate those rows under the LATER (probe) turn number instead.
             self._decide(orig_resp, _resume=True)
             return
+        if self._refute_fix_pending and not _resume:
+            # The special preservation rule is ONLY for a correction turn that produced no
+            # assistant reply at all. Once the worker answers, ordinary execution owns the
+            # subsequent outcome again (CONTINUE, DONE, STUCK, etc.).
+            self._refute_fix_pending = False
         self.last_response = resp
         if not _resume:
             self._tx.assistant(self.turn, resp)    # persist the full Copilot reply for this turn
@@ -6038,6 +6049,8 @@ class RelayWorker:
         """
         self._continue_count = 0   # a DONE claim is real progress -> the continue streak resets
         self._done_reply = resp or ""
+        self._candidate_done_reply = self._done_reply or self.last_response or ""
+        self._candidate_done_turn = self.turn
         if not self.checks:
             # NOT self.verified = False. __init__'s own comment declares the contract:
             # "None=not checked, True/False after a gate ran" -- and no gate ran here, only
@@ -6236,7 +6249,7 @@ class RelayWorker:
         except Exception:
             pass
 
-    def _settle_done(self):
+    def _settle_done(self, outcome_override=None):
         """THE ONLY PLACE THIS WORKER BECOMES DONE.
 
         There were four separate sites assigning ("done", "DONE"). Adding the check at one of
@@ -6251,7 +6264,7 @@ class RelayWorker:
             self._record_tree_stability()
         except Exception:
             pass
-        self.outcome = self._claim_verdict()
+        self.outcome = outcome_override or self._claim_verdict()
 
     def _tree_hash_now(self) -> str:
         """supervisor_verify.tree_hash over this worker's cwd, or "" when there is nothing to
@@ -6532,6 +6545,7 @@ class RelayWorker:
             # to what this branch has always produced.
             self._refute_reason = reason or "(no reason)"
             self._refute_attempt = 1
+            self._refute_fix_pending = True
             self.job = _refute_fix_job(self._refute_reason, 1)
             self.status = "ready"
             return False
@@ -7118,6 +7132,25 @@ class RelayWorker:
                 # `socket_turn` origin belongs to the driver's own bound, which is enforced
                 # where SOCKET_TURN_TIMEOUT_S is passed to it -- not here.
                 _origin = "per_turn"
+                if (getattr(self, "_refute_fix_pending", False)
+                        and getattr(self, "_candidate_done_reply", "")):
+                    # MEASURED r6ab7d72e_a0: useful candidate DONE at turn 5, reviewer requested
+                    # a correction, then 8 x ~240s no-reply retries replaced the useful result
+                    # with STUCK. The reviewer has already contradicted the candidate, so keep
+                    # that evidence and stop: finished-but-contradicted is exactly what the
+                    # existing EVIDENCE_CONTRADICTED outcome means. Do not score it as a pass,
+                    # and do not resurrect it automatically on resume.
+                    self._note_timeout(_origin, _elapsed, "candidate-preserved", budget_s=_bound)
+                    self.last_response = self._candidate_done_reply
+                    self.retryable_override = False
+                    self._refute_fix_pending = False
+                    _rr = (self._refute_reason or "reviewer requested a correction").strip()
+                    self.reason = (
+                        "candidate DONE preserved; refuter correction produced no reply before "
+                        "the %.0fs turn timeout: %s" % (_bound, _rr)
+                    )[:500]
+                    self._settle_done(outcome_override="EVIDENCE_CONTRADICTED")
+                    return True
                 # a turn with NO reply is a transient stall -- retry before STUCK
                 if self._retry_transient():
                     self._note_timeout(_origin, _elapsed, "retry", budget_s=_bound)
