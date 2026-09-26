@@ -70,6 +70,16 @@ def test_the_streaming_paths_keep_their_ping():
         assert "self._ping()" in _body(name), "%s lost its disconnect detection" % name
 
 
+
+def test_review_subprocesses_do_not_allocate_console_windows():
+    """Bridge review helpers are unattended children of a background service."""
+    for name in ("_review_stream", "_run_fix_subprocess"):
+        body = _body(name)
+        assert "subprocess.Popen" in body
+        assert "creationflags=childproc.headless_creationflags()" in body, (
+            "%s can allocate a visible console window" % name)
+
+
 def test_every_drain_branch_either_delivers_or_puts_it_back():
     """THE SECOND DEFECT. Each way out of the per-item block must end in a delivery, a
     re-queue, or a written record -- never in a bare log line."""
