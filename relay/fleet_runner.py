@@ -1784,6 +1784,44 @@ def _write_goals_ledger(state_dir, goals, started):
         sys.stderr.write("[resume] WARN: could not write goals ledger: %s\n" % e)
 
 
+def _append_goals_ledger(state_dir, goals, started):
+    """Durably append live ``add_goal`` items to the current run ledger.
+
+    The original ledger was written only once at launch, which meant every task accepted
+    later through the live command channel vanished from ``--resume`` after a crash.  Keep
+    the existing stable-key semantics: repeated delivery of the same goal text is idempotent.
+    Returns the number of newly persisted entries. Best-effort, matching the run-start writer.
+    """
+    if not goals:
+        return 0
+    try:
+        existing_started, existing = _read_goals_ledger(state_dir)
+        out = list(existing or [])
+        seen = set()
+        for e in out:
+            if isinstance(e, dict):
+                seen.add(e.get("key") or _goal_key(e.get("text", "")))
+        added = 0
+        for goal in goals:
+            e = _normalize_goal_for_ledger(goal)
+            key = e.get("key")
+            if key in seen:
+                continue
+            out.append(e)
+            seen.add(key)
+            added += 1
+        if added:
+            payload = {"started": existing_started if existing_started is not None else started,
+                       "goals": out}
+            _write_atomic(os.path.join(state_dir, LAST_RUN_GOALS), payload)
+        return added
+    except Exception as e:
+        if not getattr(_append_goals_ledger, "_warned", False):
+            sys.stderr.write("[resume] WARN: could not append live goal to ledger: %s\n" % e)
+            _append_goals_ledger._warned = True
+        return 0
+
+
 def _read_goals_ledger(state_dir):
     """Read last_run_goals.json tolerantly. Returns (started, [ledger_entry,...]).
     Missing/corrupt/malformed -> (None, []) with no crash (utf-8-sig tolerates a BOM)."""
@@ -3197,8 +3235,11 @@ def main():
             if "reunlock" in cmd:
                 reunlock_box[0] = apply_reunlock(cmd.get("reunlock"), workers,
                                                  enqueue=add_box.append)
-            # native chat / cockpit queued a new goal into the running fleet
+            # native chat / cockpit queued a new goal into the running fleet. Persist the
+            # accepted goal BEFORE exposing it to the in-memory queue, so a crash after this
+            # sweep can resume every task the UI said it accepted, not only launch-time goals.
             for g in goals_from_command(cmd):
+                _append_goals_ledger(args.state_dir, [g], started)
                 add_box.append(g)
                 # THE ONE PLACE A `/goal ` SUBMISSION IS STILL VISIBLE. The command file is
                 # deleted the moment it is read, and after that this goal looks like any

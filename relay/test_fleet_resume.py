@@ -19,6 +19,7 @@ import sys
 import tempfile
 import types
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -143,6 +144,33 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(remainder, [])
         self.assertEqual(n_unfinished, 0)
         self.assertEqual(m_total, 0)
+
+
+    def test_live_added_goals_extend_the_durable_ledger(self):
+        fr._write_goals_ledger(self.state_dir, ["initial A"], started=10.0)
+        added = [
+            {"text": "live B", "checks": [{"kind": "b"}], "cwd": "C:/b", "priority": True},
+            {"text": "live C"},
+        ]
+        n = fr._append_goals_ledger(self.state_dir, added, started=10.0)
+        self.assertEqual(n, 2)
+        started, ledger = fr._read_goals_ledger(self.state_dir)
+        self.assertEqual(started, 10.0)
+        self.assertEqual([e["text"] for e in ledger], ["initial A", "live B", "live C"])
+        self.assertEqual(ledger[1]["cwd"], "C:/b")
+        self.assertTrue(ledger[1]["priority"])
+        # Re-delivery of the same command after a crash must not duplicate the durable item.
+        self.assertEqual(fr._append_goals_ledger(self.state_dir, ["live B"], started=10.0), 0)
+        self.assertEqual(len(fr._read_goals_ledger(self.state_dir)[1]), 3)
+
+    def test_live_add_goal_command_persists_before_queueing(self):
+        src = Path(fr.__file__).read_text(encoding="utf-8")
+        anchor = 'for g in goals_from_command(cmd):'
+        i = src.index(anchor)
+        block = src[i:i + 1200]
+        self.assertIn('_append_goals_ledger(', block)
+        self.assertLess(block.index('_append_goals_ledger('), block.index('add_box.append(g)'),
+                        'persist the accepted goal before the in-memory queue can run it')
 
     def test_missing_ledger_tolerated(self):
         # no ledger file at all -> nothing to resume
