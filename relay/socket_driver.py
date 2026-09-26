@@ -80,6 +80,12 @@ class CopilotSocketDriver:
 
         self._lock = threading.Lock()
         self._thread = None
+        # Last MEANINGFUL activity from the backend for the current turn. Socket pings do not
+        # count: a connection can stay alive forever after the model stopped making progress.
+        # The fleet uses this to distinguish a genuinely long turn from a wedged turn whose
+        # websocket is merely still breathing.
+        self._meaningful_activity_ts = 0.0
+        self._turn_started_ts = 0.0
         self._answers_done = 0
         self._partial = ""
         self._last = ""
@@ -112,6 +118,26 @@ class CopilotSocketDriver:
     def _is_generating(self) -> bool:
         t = self._thread
         return bool(t and t.is_alive())
+
+    def generation_idle_s(self) -> float:
+        """Seconds since meaningful output/progress on the running socket turn.
+
+        Pings deliberately do not refresh this clock. A live TCP/WebSocket connection is not
+        evidence that the agent is still doing work. Returns 0 when no turn is running.
+        """
+        if not self._is_generating():
+            return 0.0
+        with self._lock:
+            ts = self._meaningful_activity_ts or self._turn_started_ts
+        return max(0.0, time.time() - ts) if ts else 0.0
+
+    def fail_stalled_turn(self, reason: str) -> None:
+        """Mark a still-live turn unusable and close its socket so normal fallback can run."""
+        self.failed = str(reason or "socket turn stalled")[:240]
+        try:
+            self.conv.close()
+        except Exception:
+            pass
 
     def wait_for_idle(self, timeout_s=180.0, poll_s=0.25) -> bool:
         """Block until the running turn finishes. True if it finished, False on timeout.
@@ -149,6 +175,8 @@ class CopilotSocketDriver:
             raise ChatHubError("this socket route already failed: %s" % self.failed)
         with self._lock:
             self._partial = ""
+            self._turn_started_ts = time.time()
+            self._meaningful_activity_ts = self._turn_started_ts
             # THE PREVIOUS ANSWER IS RETIRED HERE, not left lying around. It used to survive
             # into the next turn: `send` cleared only the partial, so between this call and
             # the first token, "what is the answer" returned the LAST turn's answer -- and if
@@ -167,7 +195,10 @@ class CopilotSocketDriver:
     def _run_turn(self, text, annotations=None):
         def on_text(sofar):
             with self._lock:
+                changed = sofar != self._partial
                 self._partial = sofar
+                if changed:
+                    self._meaningful_activity_ts = time.time()
 
         # WHAT ELSE ARRIVED, so an empty answer can say what it was instead of only that it
         # was empty. The backend delivers tool authorisation and confirmation as their own
@@ -183,6 +214,10 @@ class CopilotSocketDriver:
                 tag = mt + (("/" + origin) if origin else "")
                 if tag and tag not in seen_types:
                     seen_types.append(tag)
+                # Progress frames are meaningful even when they carry no answer text (search,
+                # tool work, grounding, etc.). Refresh the idle clock for every such item.
+                with self._lock:
+                    self._meaningful_activity_ts = time.time()
             except Exception:
                 pass
 
