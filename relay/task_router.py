@@ -1043,15 +1043,14 @@ def _wants_fanout(goals) -> bool:
 
 
 def launch_creationflags() -> int:
-    """Windows creation flags for spawning a fleet. Split out so it can be tested.
+    """Windowless creation flags for an unattended fleet child.
 
-    The spawn itself cannot be exercised in a test -- autostart_fleet refuses to Popen under
-    pytest, deliberately, because reaching that line for real opens a browser. So the decision
-    lives here where it can be asserted without one, rather than in a source-text check that
-    would pass on a comment.
+    Keep this identical to the repository-wide policy. CREATE_NEW_PROCESS_GROUP used to be
+    ORed in here, but a CREATE_NO_WINDOW child has no shared console for Ctrl+C/CTRL_BREAK and
+    this repository does not use GenerateConsoleCtrlEvent as a shutdown channel.
     """
-    return (getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+    from tools.childproc import headless_creationflags
+    return headless_creationflags()
 
 
 def _autostart_path(state_dir) -> str:
@@ -1333,9 +1332,8 @@ def autostart_fleet(goals, state_dir=None, now=None, launcher=None) -> dict:
             #
             # CREATE_NO_WINDOW gives this process a console with no window, and descendants
             # INHERIT it rather than allocating their own -- which is what reaches the grandchild.
-            # CREATE_NEW_PROCESS_GROUP is kept so a Ctrl+C in the router's own console does not
-            # travel to the run. Detachment was never what kept the child alive: Windows does not
-            # kill children when a parent exits unless they share a job object, and these do not.
+            # No extra process-group flag: shutdown is file/taskkill based, and a windowless child
+            # cannot receive console control events from a console it does not share.
             kwargs = {"cwd": REPO}
             if os.name == "nt":
                 kwargs["creationflags"] = launch_creationflags()

@@ -610,9 +610,12 @@ def test_the_launch_asks_for_no_console_window():
     if os.name != "nt":
         pytest.skip("console creation flags exist only on Windows")
     flags = TR.launch_creationflags()
+    from tools import childproc
+    assert flags == childproc.headless_creationflags(), (
+        "fleet launch drifted from the repository-wide windowless policy: %r" % flags)
     assert flags & sp.CREATE_NO_WINDOW, (
         "the launch does not ask for a windowless console: %r" % flags)
     assert not (flags & sp.DETACHED_PROCESS), (
         "DETACHED_PROCESS is back; the grandchild will allocate its own console window")
-    assert flags & sp.CREATE_NEW_PROCESS_GROUP, (
-        "a Ctrl+C in the router's console would travel to the run")
+    assert not (flags & sp.CREATE_NEW_PROCESS_GROUP), (
+        "windowless fleet launch reintroduced an unused console-control process group")

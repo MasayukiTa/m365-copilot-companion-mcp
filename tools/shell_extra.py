@@ -18,6 +18,7 @@ import subprocess
 from typing import Optional
 
 from ._subproc import sanitized_child_env
+from .childproc import headless_creationflags
 from .file_ops import _validate_path
 from .security import require_unlocked
 
@@ -173,6 +174,7 @@ def pwsh_exec(
             env=sanitized_child_env(),
             timeout=timeout,
             cwd=cwd,
+            creationflags=headless_creationflags(),
         )
         return _format_result(args, r)
     except subprocess.TimeoutExpired:
@@ -269,6 +271,7 @@ def pwsh_exec_file(
             env=sanitized_child_env(),
             timeout=timeout,
             cwd=cwd,
+            creationflags=headless_creationflags(),
         )
         return _format_result(cmd, r)
     except subprocess.TimeoutExpired:
