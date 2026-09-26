@@ -8,6 +8,7 @@ The only semantic result channel is :mod:`relay.local_job_store`.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import secrets
@@ -26,6 +27,78 @@ from relay.local_job_store import (
 PAUSED_STATUSES = frozenset({
     "WAITING_USER", "WAITING_EXTERNAL", "NEEDS_ROUTING", "WAITING_AUTH", "WAITING_CONSENT",
 })
+
+def _new_companion_job_id(goal: str, now: float | None = None, nonce: str | None = None) -> str:
+    """Mint a safe, human-recognisable id for an ad-hoc durable companion task."""
+    text = str(goal or "").strip()
+    if not text:
+        raise ValueError("goal must not be empty")
+    now = time.time() if now is None else float(now)
+    stamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime(now))
+    scope = hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
+    suffix = str(nonce or secrets.token_hex(2)).lower()
+    suffix = "".join(ch for ch in suffix if ch.isalnum())[:12] or secrets.token_hex(2)
+    return f"companion_{stamp}_{scope}_{suffix}"
+
+
+def _job_from_goal(goal: str, *, job_id: str | None = None, cwd: str | None = None,
+                   max_turns: int = 1000, read_only: bool = False) -> dict:
+    """Build the smallest LOCAL_LOOP job contract from an ordinary natural-language goal.
+
+    The task remains intentionally open-ended: each committed turn supplies the next instruction.
+    A fixed ``turn_plan`` is only appropriate when a human or planner has actually authored one.
+    """
+    text = str(goal or "").strip()
+    if not text:
+        raise ValueError("goal must not be empty")
+    turns = int(max_turns)
+    if turns < 1:
+        raise ValueError("max_turns must be >= 1")
+    constraints = {
+        "max_turns": turns,
+        "read_only": bool(read_only),
+    }
+    if cwd:
+        constraints["allowed_base"] = str(Path(cwd).resolve())
+    return {
+        "job_id": str(job_id or _new_companion_job_id(text)),
+        "execution_profile": "LOCAL_LOOP",
+        # LOCAL_LOOP itself depends on the local MCP commit/heartbeat tools even when the
+        # business data being worked on lives in M365 rather than on disk.
+        "requires_local_tool": True,
+        "task": {"type": "companion_task", "instruction": text},
+        "constraints": constraints,
+        "acceptance_checks": [],
+    }
+
+
+def _execution_profiles_enabled() -> bool:
+    return os.environ.get("MCP_EXECUTION_PROFILES", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _read_goal_file(path: str | os.PathLike) -> str:
+    text = Path(path).read_text(encoding="utf-8").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        raise ValueError("goal file is empty")
+    return text
+
+
+def _project_job_snapshot(store: LocalJobStore, job_id: str, status_path: str | os.PathLike) -> dict:
+    """Write a one-job FleetCockpit snapshot from the durable SQLite authority."""
+    snapshot = store.console_snapshot()
+    status = store.get_job_status(job_id)["status"]
+    snapshot["workers"] = [
+        worker for worker in snapshot.get("workers", []) if worker.get("name") == job_id
+    ]
+    snapshot["total"] = len(snapshot["workers"])
+    snapshot["done_count"] = sum(
+        1 for worker in snapshot["workers"] if worker.get("outcome") == "DONE"
+    )
+    snapshot["running"] = status not in TERMINAL_JOB_STATUSES
+    snapshot["open_tabs"] = 0 if status in TERMINAL_JOB_STATUSES else 1
+    _write_atomic(status_path, snapshot)
+    return snapshot
+
 
 _AUTH_URL_MARKERS = (
     "login.microsoftonline.com", "/adfs/", "/oauth2/", "/signin", "/auth/",
@@ -217,21 +290,7 @@ class LocalLoopController:
     def _project(self):
         if not self.status_path:
             return
-        snapshot = self.store.console_snapshot()
-        status = self.store.get_job_status(self.job_id)["status"]
-        # The SQLite database is intentionally shared by campaigns and smoke jobs. A
-        # controller-owned status file must describe only this controller's job; projecting
-        # every historical/shared job makes one worker directory look like an entire fleet.
-        snapshot["workers"] = [
-            worker for worker in snapshot.get("workers", [])
-            if worker.get("name") == self.job_id
-        ]
-        snapshot["total"] = len(snapshot["workers"])
-        snapshot["done_count"] = sum(
-            1 for worker in snapshot["workers"] if worker.get("outcome") == "DONE"
-        )
-        snapshot["running"] = status not in TERMINAL_JOB_STATUSES
-        snapshot["open_tabs"] = 0 if status in TERMINAL_JOB_STATUSES else 1
+        snapshot = _project_job_snapshot(self.store, self.job_id, self.status_path)
         snapshot["local_loop_answer_content_reads"] = (
             int(getattr(self.driver, "answer_content_reads", 0)) - self._answer_reads_at_attach
         )
@@ -584,8 +643,13 @@ def main(argv=None):
 
     load_dotenv()
     ap = argparse.ArgumentParser(description="Response-content-independent M365 LOCAL_LOOP")
-    ap.add_argument("--job-id")
+    ap.add_argument("--job-id", help="resume this existing LOCAL_LOOP job, or override the id for --goal")
     ap.add_argument("--job-file", help="create/resume a LOCAL_LOOP job from this JSON file")
+    ap.add_argument("--goal", help="create a durable LOCAL_LOOP job from one natural-language task")
+    ap.add_argument("--goal-file", help="read the natural-language task from a UTF-8 text file")
+    ap.add_argument("--cwd", help="optional local workspace boundary for an ad-hoc goal job")
+    ap.add_argument("--max-turns", type=int, default=1000, help="maximum durable turns for --goal")
+    ap.add_argument("--read-only", action="store_true", help="mark an ad-hoc --goal job read-only")
     ap.add_argument("--db", default=os.environ.get("MCP_LOCAL_JOB_DB"))
     ap.add_argument("--cdp-url", default=os.environ.get("MCP_CDP_URL", "http://localhost:9222"))
     ap.add_argument("--agent-url", default=os.environ.get("MCP_FLEET_AGENT_URL") or
@@ -601,10 +665,28 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if not args.agent_url:
         ap.error("--agent-url or MCP_FLEET_AGENT_URL/MCP_IMPL_AGENT_URL is required")
+    if not _execution_profiles_enabled():
+        ap.error("durable LOCAL_LOOP requires MCP_EXECUTION_PROFILES=1; enable it and restart the MCP server")
+    goal_sources = sum(bool(value) for value in (args.job_file, args.goal, args.goal_file))
+    if goal_sources > 1:
+        ap.error("use exactly one of --job-file, --goal or --goal-file")
 
     store = LocalJobStore(args.db)
     job_id = args.job_id
-    if args.job_file:
+    job = None
+    goal_text = _read_goal_file(args.goal_file) if args.goal_file else args.goal
+    if goal_text:
+        job = _job_from_goal(
+            goal_text, job_id=job_id, cwd=args.cwd, max_turns=args.max_turns,
+            read_only=args.read_only,
+        )
+        job_id = job["job_id"]
+        try:
+            store.create_job(job)
+        except JobStoreError as exc:
+            if exc.code != "JOB_EXISTS":
+                raise
+    elif args.job_file:
         job = json.loads(Path(args.job_file).read_text(encoding="utf-8"))
         job_id = str(job.get("job_id") or job_id or "")
         try:
@@ -613,7 +695,11 @@ def main(argv=None):
             if exc.code != "JOB_EXISTS":
                 raise
     if not job_id:
-        ap.error("--job-id or --job-file is required")
+        ap.error("--job-id, --job-file, --goal or --goal-file is required")
+
+    # Surface the durable task immediately, before CDP/browser startup. If browser setup fails,
+    # the operator still sees which task exists in SQLite instead of a blank cockpit.
+    _project_job_snapshot(store, job_id, Path(args.state_dir) / "status.json")
 
     from playwright.sync_api import sync_playwright
     from relay.edge_recover import companion_edge_mb
