@@ -325,10 +325,10 @@ def _test_fix6_active_marker_roundtrip():
         check("fix6_marker_roundtrip_argv", m is not None and m.get("argv") == argv)
         check("fix6_marker_has_resume_argv", m is not None and "resume_argv" in m)
 
-        _clear_active_marker(tmp)
+        _clear_active_marker(tmp, owner_pid=4242)
         check("fix6_marker_cleared", _read_active_marker(tmp) is None)
         # clearing an already-absent marker must be a silent no-op, not an error.
-        _clear_active_marker(tmp)
+        _clear_active_marker(tmp, owner_pid=4242)
         check("fix6_clear_missing_marker_is_noop", _read_active_marker(tmp) is None)
 
 

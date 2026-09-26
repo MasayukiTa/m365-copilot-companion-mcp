@@ -1922,6 +1922,7 @@ def _resume_goals(state_dir):
 # relaunch it with --resume. Best-effort throughout: a marker read/write/remove failure
 # is logged (write) or silently tolerated (read/clear) and never takes down the run.
 ACTIVE_MARKER = "fleet_run_active.json"
+RUN_LOCK_FILE = "fleet_runner.lock"
 
 
 def _resume_argv(argv):
@@ -1978,15 +1979,103 @@ def _read_active_marker(state_dir):
         return None
 
 
-def _clear_active_marker(state_dir):
-    """Best-effort removal of the ACTIVE marker on clean completion / explicit user stop.
-    A missing file is fine (nothing to clear); never raises."""
+def _active_run_conflict_pid(state_dir, self_pid=None):
+    """Return the live pid that already owns this state dir, else 0.
+
+    This is the migration guard for runners started before the OS lock existed, and also makes
+    the refusal human-readable. Unknown pid state is treated as alive by `_pid_alive`, on purpose:
+    overwriting another coordinator's ledger/status is worse than refusing one launch.
+    """
+    marker = _read_active_marker(state_dir)
+    if not marker:
+        return 0
     try:
-        p = os.path.join(state_dir, ACTIVE_MARKER)
-        if os.path.isfile(p):
-            os.remove(p)
+        pid = int(marker.get("pid") or 0)
+        me = int(os.getpid() if self_pid is None else self_pid)
+    except Exception:
+        return 0
+    if pid <= 0 or pid == me:
+        return 0
+    return pid if _pid_alive(pid) else 0
+
+
+def _acquire_run_lock(state_dir):
+    """Non-blocking OS lock for one fleet coordinator per state directory.
+
+    A marker file is evidence, not exclusion: two launchers can both inspect a missing/stale
+    marker before either writes its own. The kernel byte-range lock closes that race and is
+    automatically released when a killed process dies, so it cannot become a stale lock.
+    Returns the open lock handle on success, None when another coordinator owns it.
+    """
+    os.makedirs(state_dir, exist_ok=True)
+    path = os.path.join(state_dir, RUN_LOCK_FILE)
+    fh = None
+    try:
+        fh = open(path, "a+b", buffering=0)
+        fh.seek(0, os.SEEK_END)
+        if fh.tell() == 0:
+            fh.write(b"\0")
+        fh.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fh
+    except (OSError, IOError):
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:
+                pass
+        return None
+
+
+def _release_run_lock(fh):
+    """Release a handle returned by `_acquire_run_lock`; safe on None/already-gone."""
+    if fh is None:
+        return
+    try:
+        fh.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
     except Exception:
         pass
+    try:
+        fh.close()
+    except Exception:
+        pass
+
+
+def _clear_active_marker(state_dir, owner_pid=None):
+    """Remove only THIS coordinator's ACTIVE marker.
+
+    The old implementation unconditionally removed the path. Measured 2026-09-26: runner A
+    finished cleanup after runner B had already written its fresh marker, so A deleted B's marker
+    and external resume paths started more coordinators on the same `.fleet`. Ownership is part
+    of the delete now. Missing/corrupt/mismatched marker is a safe no-op. Returns True iff deleted.
+    """
+    owner = int(os.getpid() if owner_pid is None else owner_pid)
+    marker = _read_active_marker(state_dir)
+    try:
+        marker_pid = int((marker or {}).get("pid") or 0)
+    except Exception:
+        return False
+    if marker_pid <= 0 or marker_pid != owner:
+        return False
+    try:
+        p = os.path.join(state_dir, ACTIVE_MARKER)
+        os.remove(p)
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
 
 
 def should_auto_resume(marker_exists, pid_alive, user_stopped=False):
@@ -2610,6 +2699,7 @@ def _print_table(workers, total=None):
 # this file (outside main()'s local scope) knows which state_dir's ACTIVE marker to
 # clear on an explicit Ctrl+C. None until a run actually starts.
 _ACTIVE_STATE_DIR = None
+_ACTIVE_RUN_LOCK = None
 
 
 
@@ -2659,6 +2749,7 @@ def report_duplicate_completions(state_dir, out=print, transcripts=None):
 
 
 def main():
+    global _ACTIVE_STATE_DIR, _ACTIVE_RUN_LOCK
     # cp932 console: goal/reason text can contain chars the legacy codepage cannot
     # encode (a worker once died printing U+26A0); degrade to '?' instead of crashing.
     for _s in (sys.stdout, sys.stderr):
@@ -2791,6 +2882,32 @@ def main():
                     help="where to write the live status.json the cockpit reads")
     args = ap.parse_args()
 
+    # FINAL EXCLUSION LAYER: one state dir may have exactly one coordinator. Do this before
+    # coordinator logs, queue receipts, retention, resume expansion, or any durable run-state
+    # rewrite. External launchers have guards too, but the process that owns the files is the
+    # only layer that can make the invariant unconditional.
+    os.makedirs(args.state_dir, exist_ok=True)
+    _ACTIVE_STATE_DIR = args.state_dir
+    _owner = _active_run_conflict_pid(args.state_dir)
+    if _owner:
+        print("REFUSING TO START: fleet state directory is already owned by live pid %d: %s"
+              % (_owner, args.state_dir), flush=True)
+        return 3
+    _ACTIVE_RUN_LOCK = _acquire_run_lock(args.state_dir)
+    if _ACTIVE_RUN_LOCK is None:
+        print("REFUSING TO START: another fleet coordinator holds the state-dir lock: %s"
+              % args.state_dir, flush=True)
+        return 3
+    # Close the marker-vs-lock race: another legacy runner may have written a marker after the
+    # first check but before this process took the new OS lock.
+    _owner = _active_run_conflict_pid(args.state_dir)
+    if _owner:
+        _release_run_lock(_ACTIVE_RUN_LOCK)
+        _ACTIVE_RUN_LOCK = None
+        print("REFUSING TO START: fleet state directory became owned by live pid %d: %s"
+              % (_owner, args.state_dir), flush=True)
+        return 3
+
     # Capture the coordinator's own stdout/stderr to a durable log under state_dir, from
     # here (right after argparse) so it covers argparse-error exits too, regardless of
     # which launcher started this process. Best-effort -- never crashes on failure.
@@ -2820,10 +2937,7 @@ def main():
     except Exception as _exc:                     # never let housekeeping stop a run
         print("fleet retention skipped: %s" % _exc, flush=True)
 
-    # let the KeyboardInterrupt handler at the bottom of this file clear the ACTIVE
-    # marker even though it runs outside main()'s local scope.
-    global _ACTIVE_STATE_DIR
-    _ACTIVE_STATE_DIR = args.state_dir
+    # KeyboardInterrupt already knows this state_dir from the early single-instance gate above.
 
     # ULTRA ACCURACY preset: maximise CLEAN correctness, ignore time. Wires the verified accuracy
     # levers -- the session's failure analysis pinned the bottleneck on edit PRECISION (right file,
@@ -2971,7 +3085,6 @@ def main():
     run_label = _first_line[:60]
     goal_count = len(gtexts)
 
-    os.makedirs(args.state_dir, exist_ok=True)
     status_path = os.path.join(args.state_dir, "status.json")
     started = time.time()
     # full-text conversation transcripts (one jsonl per worker, all turns untruncated).
@@ -3831,17 +3944,21 @@ def main():
     # the cockpit) cancelled everything and the loop above still exited normally. Either
     # way nothing is "interrupted" -- clear the ACTIVE marker so a supervisor never
     # mistakes a normal finish for a crash.
-    _clear_active_marker(args.state_dir)
+    _clear_active_marker(args.state_dir, owner_pid=os.getpid())
+    _release_run_lock(_ACTIVE_RUN_LOCK)
+    _ACTIVE_RUN_LOCK = None
 
 
 if __name__ == "__main__":
     try:
-        main()
+        raise SystemExit(main() or 0)
     except KeyboardInterrupt:
         # Explicit user stop (Ctrl+C). Clear the ACTIVE marker (if a run had started and
         # recorded one) so a supervisor never treats a deliberate interrupt as a crash to
         # auto-resume, then exit with the conventional SIGINT status.
         if _ACTIVE_STATE_DIR:
-            _clear_active_marker(_ACTIVE_STATE_DIR)
+            _clear_active_marker(_ACTIVE_STATE_DIR, owner_pid=os.getpid())
+        _release_run_lock(_ACTIVE_RUN_LOCK)
+        _ACTIVE_RUN_LOCK = None
         print("\n[fleet] interrupted by user -- ACTIVE marker cleared, not auto-resumable.")
         sys.exit(130)
