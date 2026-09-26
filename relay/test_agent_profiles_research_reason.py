@@ -12,6 +12,32 @@ import pytest
 from relay import agent_profiles as AP
 
 
+def test_agent_url_prompt_hides_only_the_powershell_console(monkeypatch):
+    """The URL fallback intentionally opens a GUI dialog, but its PowerShell host needs no console."""
+    from tools import childproc
+    seen = {}
+
+    class _Result:
+        returncode = 0
+
+    def _run(argv, **kwargs):
+        seen["argv"] = list(argv)
+        seen["kwargs"] = dict(kwargs)
+        return _Result()
+
+    monkeypatch.setenv("MCP_AGENT_URL_PROMPT", "1")
+    monkeypatch.setenv("MCP_TEST_AGENT_URL", "https://example.test/agent")
+    monkeypatch.setattr(AP.os.path, "isfile", lambda _p: True)
+    monkeypatch.setattr(AP.subprocess, "run", _run)
+    monkeypatch.setattr(AP, "load_dotenv", lambda *a, **k: True)
+
+    out = AP.prompt_for_agent_url("MCP_TEST_AGENT_URL", reason="test")
+    assert out == "https://example.test/agent"
+    assert seen["argv"][0].lower().startswith("powershell")
+    assert "creationflags" in seen["kwargs"]
+    assert seen["kwargs"]["creationflags"] == childproc.headless_creationflags()
+
+
 def _session():
     s = AP.ResearchSession.__new__(AP.ResearchSession)
     s._done = None
