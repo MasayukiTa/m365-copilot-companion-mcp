@@ -7098,7 +7098,17 @@ class RelayWorker:
             # already had. The defect in turn 3 is that the poll did not see a reply it had,
             # and why is NOT DETERMINED. Widening a clock to cover for that would hide it.
             _bound = self.per_turn_timeout_s
-            if time.time() - self._t_send > _bound:
+            # A REPLY THAT ALREADY EXISTS BEATS OUR OUTER CLOCK. This check must happen BEFORE
+            # timeout/retry. Measured twice now: r6aa597a8 turn 3 replied at +70s but was retried
+            # at +240s; r6ab7a384 w4 turn 12 replied at +16s but was retried at +240.6s. In both
+            # cases the transcript proves that retry duplicated work after an answer already existed.
+            # We do NOT accept the reply here: we only suppress the timeout and let the ordinary
+            # generating/stale/settle gates below decide when it is safe to consume.
+            try:
+                _has_new_answer = self.drv._answers().count() > self._count_before
+            except Exception:
+                _has_new_answer = False
+            if not _has_new_answer and time.time() - self._t_send > _bound:
                 # A MEASUREMENT, NOT A GUESS -- and recorded apart from the guesses.
                 # turn_outcome classifies THROTTLE/RECYCLE/TRANSIENT from what the upstream
                 # SAID; this is our own clock passing our own budget. A rate computed over
@@ -7108,7 +7118,7 @@ class RelayWorker:
                 # `socket_turn` origin belongs to the driver's own bound, which is enforced
                 # where SOCKET_TURN_TIMEOUT_S is passed to it -- not here.
                 _origin = "per_turn"
-                # a turn that never finished is a transient stall -- retry before STUCK
+                # a turn with NO reply is a transient stall -- retry before STUCK
                 if self._retry_transient():
                     self._note_timeout(_origin, _elapsed, "retry", budget_s=_bound)
                     self.reason = "turn timeout -> retry %d/%d" % (self.transient, self.max_transient)
@@ -7122,10 +7132,7 @@ class RelayWorker:
                 self.status, self.outcome, self.reason = "stuck", "STUCK", \
                     "turn timeout (after %d retries)" % self.transient
                 return True
-            try:
-                if self.drv._answers().count() <= self._count_before:
-                    return False
-            except Exception:
+            if not _has_new_answer:
                 return False
             # PRIMARY completion gate: never read/commit a turn while the agent is STILL
             # GENERATING (the live Stop/square button is showing). Reading mid-stream was
