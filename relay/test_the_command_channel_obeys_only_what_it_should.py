@@ -284,8 +284,10 @@ def test_apply_command_passes_the_gate_before_it_touches_anything():
     src = open(RUNNER, encoding="utf-8").read()
     body = src[src.index("    def _apply_command(cmd, workers):"):]
     body = body[:body.index("\n    def ", 10)]
-    gate = body.index("if not admit_command(cmd, args.state_dir, rejections_box):")
-    assert gate < body.index("by_name = {w.name: w for w in workers}")
+    gate = body.index("_errs = validate_command(cmd, args.state_dir)")
+    reject = body.index("record_command_rejection(rejections_box, cmd, _errs)")
+    first_effect = body.index("by_name = {w.name: w for w in workers}")
+    assert gate < reject < first_effect
     assert "command_rejections=rejections_box" in src
 
 

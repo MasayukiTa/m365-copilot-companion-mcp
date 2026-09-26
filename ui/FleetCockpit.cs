@@ -5674,21 +5674,62 @@ class CockpitWindow : Window
             item["priority"] = false;
             adds.Add(item);
         }
-        if (!SendCommand(Cmd1("add_goal", adds)))
+        var patch = Cmd1("add_goal", adds);
+        string ackId = "ui-live-" + Guid.NewGuid().ToString("N");
+        string ackPath = Path.Combine(_fleetDir, "acks", ackId + ".ack");
+        patch["ack"] = ackPath;
+        string commandPath;
+        if (!SendTrackedCommand(patch, out commandPath))
         {
             if (_startNote != null)
-                _startNote.Text = _lang == 0 ? "タスクをキューへ追加できませんでした。入力は残しています。"
+                _startNote.Text = _lang == 0 ? "タスクをキューへ追加できませんでした。入力は残っています。"
                                               : "Could not queue the task. Your input was kept.";
             return;
         }
 
         // Optimistic row first; the runner will replace it with a real worker on the next sweep.
         NoteSubmitted(goals);
+        WatchLiveAddHandoff(commandPath, ackPath);
         _goalInput.Text = "";
         if (_startNote != null)
             _startNote.Text = _lang == 0 ? (goals.Count + " 件を実行中のキューへ追加しました。")
                                           : ("Queued " + goals.Count + " task(s) into the active run.");
         _lastSig = "";
+    }
+
+    // A live add can race the final sweep: the UI saw running=true, wrote the command, then the
+    // coordinator finished before its next drain.  The command is durable now, so do not guess
+    // from status alone.  Receipt = applied/accepted.  No receipt + no live run = launch a
+    // rescuer that adopts THIS exact pending command after winning fleet_runner's state-dir lock.
+    void WatchLiveAddHandoff(string commandPath, string ackPath)
+    {
+        if (string.IsNullOrEmpty(commandPath) || string.IsNullOrEmpty(ackPath)) return;
+        var timer = new System.Windows.Threading.DispatcherTimer();
+        timer.Interval = TimeSpan.FromMilliseconds(300);
+        DateTime lastRescue = DateTime.MinValue;
+        timer.Tick += delegate
+        {
+            try
+            {
+                if (File.Exists(ackPath)) { timer.Stop(); return; }
+                if (RunIsLive()) return;
+                // Retry, rather than fire once: a dying old coordinator may still own the OS
+                // lock for a moment. A losing rescuer exits 3 before touching commandPath.
+                if ((DateTime.UtcNow - lastRescue).TotalSeconds < 2.0) return;
+                lastRescue = DateTime.UtcNow;
+                SpawnFleetAdoptCommand(commandPath);
+                if (_startNote != null)
+                    _startNote.Text = _lang == 0
+                        ? "実行終了と同時に追加されたタスクを、新しい実行へ引き継いでいます。"
+                        : "The run ended during submission; carrying the pending task into a new run.";
+            }
+            catch (Exception)
+            {
+                // Keep the durable command and retry on the next tick. Losing the watcher must
+                // never mean losing the task.
+            }
+        };
+        timer.Start();
     }
 
     // Paint the composer as task intake in both states; a live run changes Start -> Add.
@@ -5844,6 +5885,29 @@ class CockpitWindow : Window
             sb.Append("\n");
         }
         return sb.ToString();
+    }
+
+    // Rescue ONLY a command that was already durably written by the live composer. The runner
+    // itself arbitrates ownership: --adopt-command is processed only after the state-dir OS lock,
+    // so if another coordinator already started this process exits without touching the command.
+    bool SpawnFleetAdoptCommand(string commandPath)
+    {
+        string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+        string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
+        if (!File.Exists(py)) py = "python";
+        string stateDir = Path.GetDirectoryName(_statusPath);
+        var psi = new System.Diagnostics.ProcessStartInfo();
+        psi.FileName = py;
+        psi.Arguments = "-m relay.fleet_runner --adopt-command \"" + commandPath + "\""
+                        + " --state-dir \"" + stateDir + "\" --effort " + _effort
+                        + (_fanout ? " --fanout" : " --no-fanout");
+        if (_approval == "plan" || _approval == "auto") psi.Arguments += " --plan";
+        psi.WorkingDirectory = repo;
+        psi.UseShellExecute = false;
+        psi.CreateNoWindow = true;
+        try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
+        System.Diagnostics.Process.Start(psi);
+        return true;
     }
 
     // P2 RESUME: spawn a fresh fleet with --resume (re-queues the unfinished goals from the durable
@@ -14437,6 +14501,10 @@ class CockpitWindow : Window
     bool SendCommand(Dictionary<string, object> patch)
     {
         return FleetCommands.Write(_fleetDir, patch);
+    }
+    bool SendTrackedCommand(Dictionary<string, object> patch, out string path)
+    {
+        return FleetCommands.WriteTracked(_fleetDir, patch, out path);
     }
 
     // THE DEDUPE WENT WITH THE MERGE, DELIBERATELY. This used to read the pending `close` list

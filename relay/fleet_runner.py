@@ -1773,18 +1773,26 @@ def _ledger_to_goal(entry):
     return g
 
 
-def _write_goals_ledger(state_dir, goals, started):
-    """Write the durable goals ledger ONCE at run start. Best-effort: on any failure,
-    log once to stderr and return -- never raise (a sidecar must not take down the run)."""
+def _write_goals_ledger(state_dir, goals, started, raise_on_error=False):
+    """Write the durable goals ledger once at run start.
+
+    Normal launches keep the historical best-effort behaviour. ``raise_on_error=True`` is used
+    when adopting a pending command, because that command must not be committed away until the
+    ledger is known durable.
+    """
     try:
         payload = {"started": started,
                    "goals": [_normalize_goal_for_ledger(g) for g in goals]}
         _write_atomic(os.path.join(state_dir, LAST_RUN_GOALS), payload)
+        return True
     except Exception as e:
+        if raise_on_error:
+            raise
         sys.stderr.write("[resume] WARN: could not write goals ledger: %s\n" % e)
+        return False
 
 
-def _append_goals_ledger(state_dir, goals, started):
+def _append_goals_ledger(state_dir, goals, started, raise_on_error=False):
     """Durably append live ``add_goal`` items to the current run ledger.
 
     The original ledger was written only once at launch, which meant every task accepted
@@ -1816,6 +1824,8 @@ def _append_goals_ledger(state_dir, goals, started):
             _write_atomic(os.path.join(state_dir, LAST_RUN_GOALS), payload)
         return added
     except Exception as e:
+        if raise_on_error:
+            raise
         if not getattr(_append_goals_ledger, "_warned", False):
             sys.stderr.write("[resume] WARN: could not append live goal to ledger: %s\n" % e)
             _append_goals_ledger._warned = True
@@ -1926,8 +1936,8 @@ RUN_LOCK_FILE = "fleet_runner.lock"
 
 
 def _resume_argv(argv):
-    """Strip goal-specifying flags (-g/--goal VALUE, --goals-file VALUE) and any existing
-    --resume from an argv list, returning the remainder suitable for relaunching with a
+    """Strip goal-specifying flags (-g/--goal, --goals-file, --adopt-command) and any
+    existing --resume from an argv list, returning the remainder suitable for relaunching with a
     single --resume appended. --resume alone reconstructs the goal set from the durable
     ledger (last_run_goals.json); replaying the ORIGINAL -g/--goals-file on top would
     duplicate goals (both the already-finished and the unfinished ones get re-added
@@ -1939,10 +1949,10 @@ def _resume_argv(argv):
         if skip_next:
             skip_next = False
             continue
-        if a in ("-g", "--goal", "--goals-file"):
+        if a in ("-g", "--goal", "--goals-file", "--adopt-command"):
             skip_next = True
             continue
-        if a.startswith("--goal=") or a.startswith("--goals-file="):
+        if a.startswith("--goal=") or a.startswith("--goals-file=") or a.startswith("--adopt-command="):
             continue
         if a == "--resume":
             continue
@@ -2501,104 +2511,237 @@ def _write_receipt(state_dir, claimed, body) -> bool:
         return False
 
 
-def read_commands(state_dir) -> list:
-    """Every pending command for this run, oldest first, CONSUMED as it is read.
-
-    ONE FILE PER COMMAND, WHICH IS WHY THERE IS NO LOCK HERE. The single commands.json was a
-    read-modify-write on every writer: each read the whole file, added its own entry and wrote
-    it back, so whichever replaced second deleted the other's work -- and a lost goal looks
-    exactly like a goal that was never sent. A lock was added for the Python writers, but the
-    cockpit (ui/CopilotChat.cs) writes this file too and takes no lock, and this reader took
-    none either. A uniquely named file per command removes the read-modify-write entirely:
-    nothing merges, so nothing can clobber, and a writer needs no lock at all -- it only has to
-    land its own file atomically.
-
-    The legacy commands.json is still read, and must stay read: a shipped cockpit binary
-    predating the migration writes it, and those are built separately from this file.
-
-    THIS PARAGRAPH USED TO SAY THE LACK OF A LOCK STOPPED MATTERING BECAUSE "the cockpit is
-    its only writer -- one writer cannot race itself". THAT WAS FALSE, and write_command's own
-    docstring said so the whole time: the lock "could not fix it for ui/CopilotChat.cs, which
-    writes the same file from a separately built binary". Counted 2026-09-22: THREE hand-rolled
-    read-modify-writers across TWO processes -- ui/FleetCockpit.cs (ReadCommands/WriteCommands,
-    a dozen callers), ui/CopilotChat.cs AppendCommand, and ui/CopilotChat.cs EnqueueToFleet,
-    which also wrote a BOM where the other two did not. Two docstrings in one system
-    contradicted each other and the optimistic one was the wrong one.
-
-    What it cost, if it had not been found: a lost add_goal or steer, indistinguishable from
-    one never sent; an already-consumed command put back by a writer that read before the
-    os.remove below and wrote after it, which is a duplicate goal; and a torn File.WriteAllText
-    destroyed rather than preserved, because the legacy branch removes an unparseable file
-    instead of renaming it .bad the way the commands.d branch does.
-
-    The C# writers were migrated to commands.d/ on 2026-09-22, which is what actually removes
-    the race -- a lock was never available across those two binaries.
-
-    A file that will not parse is renamed .bad rather than deleted, so it stops being retried
-    forever without the instruction in it being destroyed. `.tmp` files are a writer mid-flight
-    and are skipped.
-    """
-    out = []
-    legacy = os.path.join(state_dir, "commands.json")
+def _claim_owner_pid(path):
+    """Owner pid encoded in ``...claim-<pid>``; 0 for anything else."""
+    name = os.path.basename(path)
+    tag = ".claim-"
+    if tag not in name:
+        return 0
+    tail = name.split(tag, 1)[1].split(".", 1)[0]
     try:
-        if os.path.isfile(legacy):
-            with open(legacy, encoding="utf-8-sig") as fh:   # tolerate a BOM from the C# cockpit
-                cmd = json.load(fh)
-            out.append(cmd)
-            os.remove(legacy)
+        return int(tail)
+    except Exception:
+        return 0
+
+
+def _recover_stale_command_claims(state_dir):
+    """Put dead coordinators' uncommitted command claims back on the input channel.
+
+    A claim is an OS-atomic rename of ``*.json`` to ``*.json.claim-PID``.  The kernel cannot
+    make a rename half-happen, and the new single-instance runner means a live owner must be
+    left alone.  ``*.applied`` is the commit tombstone: it is cleanup only and is NEVER replayed.
+    """
+    roots = [state_dir, os.path.join(state_dir, COMMANDS_DIR)]
+    recovered = 0
+    for root in roots:
+        try:
+            names = list(os.listdir(root))
+        except OSError:
+            continue
+        for name in names:
+            if ".claim-" not in name:
+                continue
+            path = os.path.join(root, name)
+            if name.endswith(".applied"):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                continue
+            owner = _claim_owner_pid(path)
+            if owner and _pid_alive(owner):
+                continue
+            original = path.split(".claim-", 1)[0]
+            if os.path.exists(original):
+                # Never overwrite a newer writer. Preserve the dead claim as evidence instead
+                # of turning an ambiguity into a duplicate delivery.
+                try:
+                    os.replace(path, path + ".orphan")
+                except OSError:
+                    pass
+                continue
+            try:
+                os.replace(path, original)
+                recovered += 1
+            except OSError:
+                pass
+    return recovered
+
+
+def _claim_one_command(path, display_name=None):
+    """Atomically take one command file for this process, or None if somebody else won."""
+    claimed = path + ".claim-%d" % os.getpid()
+    try:
+        os.replace(path, claimed)
+    except OSError:
+        return None
+    try:
+        with open(claimed, encoding="utf-8-sig") as fh:
+            cmd = json.load(fh)
     except Exception:
         try:
-            os.remove(legacy)
+            os.replace(claimed, path + ".bad")
         except OSError:
             pass
+        return None
+    return {"cmd": cmd, "original": path, "claimed": claimed,
+            "name": display_name or os.path.basename(path)}
+
+
+def claim_commands(state_dir) -> list:
+    """Claim every pending fleet command, oldest first, WITHOUT deleting it.
+
+    The live runner applies each returned claim and calls :func:`commit_command_claim` only after
+    the command's durable effects are in place.  If the process dies first, the next coordinator
+    recovers the dead pid's ``.claim-*`` file and retries it.  This closes the former
+    read/delete -> apply/ledger crash window.
+    """
+    _recover_stale_command_claims(state_dir)
+    out = []
+
+    # Shipped pre-commands.d cockpit binaries can still write this legacy file. Claim it too so
+    # compatibility does not re-introduce the durability hole.
+    legacy = os.path.join(state_dir, "commands.json")
+    if os.path.isfile(legacy):
+        c = _claim_one_command(legacy, "commands.json")
+        if c is not None:
+            out.append(c)
+
     d = os.path.join(state_dir, COMMANDS_DIR)
     try:
         names = sorted(n for n in os.listdir(d) if n.endswith(".json"))
     except OSError:
         return out
     for name in names:
-        path = os.path.join(d, name)
-        try:
-            with open(path, encoding="utf-8-sig") as fh:
-                cmd = json.load(fh)
-            out.append(cmd)
-        except Exception:
-            try:
-                os.replace(path, path + ".bad")
-            except OSError:
-                pass
-            continue
-        # LANDING MARK: prove the goal was actually READ here, not merely dispatched.
-        # The sender (relay/task_router.fleet_handoff) filed the goal "dispatched" the
-        # instant fleet_is_live() returned True -- but that check trusts a status.json up
-        # to FLEET_LIVE_MAX_AGE_S old, so a run that had already died still looked live for
-        # up to 30s. A goal handed over in that window was written here, consumed-on-read
-        # by no one, and lost, while its done/ record said "dispatched". Nothing on the
-        # receiving side ever recorded that a command was taken, so the sender's claim
-        # could never be checked. When a command carries an `ack` path, drop a small
-        # receipt there the moment before we delete the command: an audit can then tell a
-        # goal a live fleet really picked up from one that vanished into the stale window.
-        #
-        # THE RECEIPT'S LOCATION IS DERIVED, NOT OBEYED (SEC-08): see ack_receipt_path. An
-        # `ack` naming anywhere but this state dir's acks/ gets no receipt, and the command it
-        # rode on is refused by _apply_command's validation. A command that is refused for any
-        # other reason still gets its receipt -- it WAS read, which is all a receipt claims --
-        # and the receipt says it was rejected and why, so the sender is not left re-sending.
-        ack = (cmd or {}).get("ack") if isinstance(cmd, dict) else None
-        if isinstance(ack, str) and ack:
-            body = {"read": True, "ts": time.time(), "file": name}
-            errs = validate_command(cmd, state_dir)
-            if errs:
-                body.update({"rejected": True, "errors": errs[:10]})
-            if not _write_receipt(state_dir, ack, body):
-                print("[command] no landing receipt for %s: its ack names no file in this "
-                      "fleet's %s/, or the write failed" % (name, ACKS_DIR), flush=True)
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+        c = _claim_one_command(os.path.join(d, name), name)
+        if c is not None:
+            out.append(c)
     return out
 
+
+def restore_command_claim(claim) -> bool:
+    """Return an uncommitted claim to the input channel so the next sweep can retry it."""
+    try:
+        claimed = claim["claimed"]
+        original = claim["original"]
+    except Exception:
+        return False
+    if not os.path.isfile(claimed):
+        return False
+    if os.path.exists(original):
+        try:
+            os.replace(claimed, claimed + ".orphan")
+        except OSError:
+            pass
+        return False
+    try:
+        os.replace(claimed, original)
+        return True
+    except OSError:
+        return False
+
+
+def commit_command_claim(state_dir, claim, applied=None, rejected_errors=None) -> bool:
+    """Commit one claim and only then make it disappear.
+
+    The first rename to ``.applied`` is the commit point.  A crash after it can leave a tombstone
+    but can never replay the command; stale tombstones are housekeeping in
+    ``_recover_stale_command_claims``.  A landing receipt is written AFTER that commit point.
+    ``applied=None`` is used by the backwards-compatible :func:`read_commands` helper and keeps
+    its old 'read' semantics; the live drain passes True/False explicitly.
+    """
+    try:
+        claimed = claim["claimed"]
+        cmd = claim["cmd"]
+        name = claim.get("name") or os.path.basename(claim.get("original") or claimed)
+    except Exception:
+        return False
+    committed = claimed + ".applied"
+    until = time.time() + 2.0
+    while True:
+        try:
+            os.replace(claimed, committed)
+            break
+        except OSError:
+            if time.time() >= until:
+                return False
+            time.sleep(0.02)
+
+    ack = (cmd or {}).get("ack") if isinstance(cmd, dict) else None
+    if isinstance(ack, str) and ack:
+        body = {"read": True, "ts": time.time(), "file": name}
+        if applied is not None:
+            body["applied"] = bool(applied)
+        errs = list(rejected_errors or [])
+        if errs:
+            body.update({"rejected": True, "errors": errs[:10]})
+        if not _write_receipt(state_dir, ack, body):
+            print("[command] no landing receipt for %s: its ack names no file in this fleet's %s/, or the write failed"
+                  % (name, ACKS_DIR), flush=True)
+    try:
+        os.remove(committed)
+    except OSError:
+        pass                         # .applied is deliberately non-replayable
+    return True
+
+
+def claim_specific_command(state_dir, path):
+    """Claim exactly one pending commands.d JSON, but only from this state directory."""
+    if not path:
+        return None
+    command_dir = os.path.join(state_dir, COMMANDS_DIR)
+    full = os.path.abspath(path)
+    if not full.lower().endswith(".json"):
+        return None
+    if not _same_dir(os.path.dirname(full), command_dir):
+        return None
+    _recover_stale_command_claims(state_dir)
+    return _claim_one_command(full, os.path.basename(full))
+
+
+def claim_adopt_command(state_dir, path):
+    """Claim a pending add_goal command for a fresh runner to adopt as initial work.
+
+    Only ``add_goal`` plus its optional landing ``ack`` may be adopted. A control command
+    (stop/steer/settings/close) belongs to the run it addressed and must never become a new run.
+    Invalid commands are restored before returning so a diagnosis never destroys the request.
+    Returns ``(claim_or_none, goals, errors)``.
+    """
+    claim = claim_specific_command(state_dir, path)
+    if claim is None:
+        return None, [], ["adopt command is not a pending file in this fleet's commands.d"]
+    cmd = claim["cmd"]
+    errors = list(validate_command(cmd, state_dir))
+    if isinstance(cmd, dict):
+        extra = sorted(k for k in cmd if k not in ("add_goal", "ack"))
+        if extra:
+            errors.append("adopt command contains live-control key(s): %s" % extra[:8])
+        if "add_goal" not in cmd:
+            errors.append("adopt command has no add_goal")
+    goals = goals_from_command(cmd) if not errors else []
+    if not goals and not errors:
+        errors.append("adopt command contains no usable goals")
+    if errors:
+        restore_command_claim(claim)
+        return None, [], errors
+    return claim, goals, []
+
+
+def read_commands(state_dir) -> list:
+    """Compatibility consumer: return pending commands and commit them as READ.
+
+    Production fleet execution uses ``claim_commands`` directly and commits only AFTER apply.
+    Tests and small seam tools historically call ``read_commands`` as the receiver itself; keep
+    that API and its landing-receipt semantics without putting the live runner back on the old
+    read/delete-before-apply path.
+    """
+    out = []
+    for claim in claim_commands(state_dir):
+        cmd = claim["cmd"]
+        errs = validate_command(cmd, state_dir)
+        commit_command_claim(state_dir, claim, applied=None, rejected_errors=errs)
+        out.append(cmd)
+    return out
 
 def goals_from_command(cmd) -> list:
     """The `add_goal` entries in a fleet command file, as goals this run can queue.
@@ -2764,6 +2907,7 @@ def main():
                                             or os.environ.get("MCP_IMPL_AGENT_URL", "")))
     ap.add_argument("-g", "--goal", action="append", help="a goal (repeatable)")
     ap.add_argument("--goals-file", help="file with one goal per line (# comments ok)")
+    ap.add_argument("--adopt-command", help="rescue one pending commands.d add_goal as this run's initial work; used by the local cockpit when a live run ends during submission")
     ap.add_argument("--force", action="store_true",
                     help="start even when the launch gate's preconditions are unmet; the run still happens and its measurements carry whatever was wrong")
     ap.add_argument("--resume", action="store_true",
@@ -2908,6 +3052,24 @@ def main():
               % (_owner, args.state_dir), flush=True)
         return 3
 
+    _adopt_claim = None
+    _adopt_goals = []
+    if args.adopt_command:
+        _adopt_claim, _adopt_goals, _adopt_errors = claim_adopt_command(args.state_dir, args.adopt_command)
+        if _adopt_claim is None:
+            # If the exact pending file vanished after the UI launched this rescuer, another
+            # runner already claimed it. That is success-by-race, not an error; anything still
+            # present but invalid is a real refusal.
+            if not os.path.exists(args.adopt_command):
+                print("ADOPT: command is no longer pending; another runner already took it.", flush=True)
+                _release_run_lock(_ACTIVE_RUN_LOCK)
+                _ACTIVE_RUN_LOCK = None
+                return 0
+            print("ADOPT: refusing pending command: %s" % "; ".join(_adopt_errors), flush=True)
+            _release_run_lock(_ACTIVE_RUN_LOCK)
+            _ACTIVE_RUN_LOCK = None
+            return 4
+
     # Capture the coordinator's own stdout/stderr to a durable log under state_dir, from
     # here (right after argparse) so it covers argparse-error exits too, regardless of
     # which launcher started this process. Best-effort -- never crashes on failure.
@@ -2917,7 +3079,7 @@ def main():
     # goal given on the command line appeared nowhere until the run was already going, so a run
     # that died on a precondition left the operator unable to tell it from a command never
     # typed. Cleared at run start, where the goals ledger takes over.
-    _cli_queue_paths = _record_cli_submission(args.state_dir, _read_goals(args), sys.argv)
+    _cli_queue_paths = _record_cli_submission(args.state_dir, _adopt_goals + _read_goals(args), sys.argv)
 
     # RETENTION RUNS ONCE, HERE, AND NOT ON A TIMER -- the same reasoning as the session
     # store's pass: a sweep that can fire mid-run is a sweep that can delete the transcript
@@ -2997,7 +3159,7 @@ def main():
     print("[effort] %s  (refuter=%s lenses=%s refute<=%d research<=%d)"
           % (_eff, args.refuter, args._lenses, args.max_refute, args.max_research))
 
-    goals = _read_goals(args)
+    goals = _adopt_goals + _read_goals(args)
 
     # THE LENS IS CHOSEN BEFORE THE GOALS ARE READ, AND THE GOALS ARE THE EVIDENCE.
     #
@@ -3096,23 +3258,38 @@ def main():
     except Exception:
         pass
 
-    # RUN-RESUME: write the durable goals ledger ONCE, now, so a crash mid-run leaves a
-    # record `--resume` can relaunch from. Reset the done-map to empty for this run so a
-    # previous run's completions never mask this run's goals. Best-effort (never crashes).
-    _write_goals_ledger(args.state_dir, goals, started)
-    # The run is under way and its goals are in the ledger and about to be in status.json, so
-    # the queue entries written at startup have done their job.
-    _clear_cli_submission(_cli_queue_paths)
+    # RUN-RESUME: the ledger is the durable owner of every initial goal. For an adopted live
+    # command this write is REQUIRED, not best-effort: the command may not be committed away
+    # until another durable source can reconstruct it.
+    try:
+        _write_goals_ledger(args.state_dir, goals, started, raise_on_error=bool(_adopt_claim))
+    except Exception as e:
+        if _adopt_claim is not None:
+            restore_command_claim(_adopt_claim)
+        print("[resume] could not durably adopt pending command: %s" % e, flush=True)
+        _release_run_lock(_ACTIVE_RUN_LOCK)
+        _ACTIVE_RUN_LOCK = None
+        return 5
     try:
         _write_atomic(os.path.join(args.state_dir, LAST_RUN_DONE), {})
     except Exception as e:
         sys.stderr.write("[resume] WARN: could not reset done map: %s\n" % e)
 
-    # RUN-ACTIVE marker: written now that we know goals are actually going to run (the
-    # early --resume-with-nothing-to-do exit above already returned). Removed on clean
-    # completion / explicit stop below; its survival past this process's death is exactly
-    # what tells a boot-time supervisor the run was interrupted (see should_auto_resume()).
+    # Write interruption recovery BEFORE committing an adopted command. From the instant the
+    # command disappears, a crash must still leave both its goals ledger and an active marker
+    # that tells the supervisor to resume that ledger.
     _write_active_marker(args.state_dir, start_ts=started)
+    if _adopt_claim is not None:
+        if not commit_command_claim(args.state_dir, _adopt_claim, applied=True):
+            restore_command_claim(_adopt_claim)
+            _clear_active_marker(args.state_dir, owner_pid=os.getpid())
+            print("ADOPT: durable goal ledger exists but command commit failed; returned command to queue.", flush=True)
+            _release_run_lock(_ACTIVE_RUN_LOCK)
+            _ACTIVE_RUN_LOCK = None
+            return 5
+
+    # The run is now represented by ledger + active marker; optimistic startup queue rows can go.
+    _clear_cli_submission(_cli_queue_paths)
 
     # an EXPLICIT --max-concurrent (>=0) was given on the CLI (not the -1 "ask the cockpit"
     # sentinel). Used for the precedence rule below: CLI wins over settings.txt autoscale.
@@ -3300,19 +3477,25 @@ def main():
                                        # status.json as command_rejections (SEC-08)
 
     def _drain_commands(workers):
-        # cockpit -> fleet control channel. {"close":["w2"], "set_maxtabs":5}. Consume.
-        # EVERY pending command, oldest first -- see read_commands for why they are separate
-        # files now. One malformed command must not cost the ones behind it, so the body is
-        # per-command and its except is too.
-        for cmd in read_commands(args.state_dir):
-            _apply_command(cmd, workers)
+        # CLAIM -> APPLY -> COMMIT. A command remains a real file until its durable effects are
+        # in place; a crash before commit leaves a .claim-PID the next coordinator recovers.
+        for claim in claim_commands(args.state_dir):
+            ok, errs = _apply_command(claim["cmd"], workers)
+            if ok is True:
+                if not commit_command_claim(args.state_dir, claim, applied=True):
+                    print("[command] applied but could not commit claim %s" % claim.get("name", "?"), flush=True)
+            elif ok is False:        # schema refusal is a terminal, audited consumption
+                commit_command_claim(args.state_dir, claim, applied=False, rejected_errors=errs)
+            else:                    # application failed before a durable commit; retry later
+                restore_command_claim(claim)
 
     def _apply_command(cmd, workers):
-        # WHOLE OR NOT AT ALL (SEC-08). Checked before anything below touches a box, so a
-        # command with one bad field cannot half-apply; see validate_command for the schema
-        # and the settings-panel bounds it enforces.
-        if not admit_command(cmd, args.state_dir, rejections_box):
-            return
+        # WHOLE OR NOT AT ALL (SEC-08). Checked before anything below touches a box. Return an
+        # explicit outcome so _drain_commands knows whether it may commit the claimed file.
+        _errs = validate_command(cmd, args.state_dir)
+        if _errs:
+            record_command_rejection(rejections_box, cmd, _errs)
+            return False, _errs
         try:
             by_name = {w.name: w for w in workers}
             for nm in cmd.get("close", []):
@@ -3370,11 +3553,13 @@ def main():
             if "reunlock" in cmd:
                 reunlock_box[0] = apply_reunlock(cmd.get("reunlock"), workers,
                                                  enqueue=add_box.append)
-            # native chat / cockpit queued a new goal into the running fleet. Persist the
-            # accepted goal BEFORE exposing it to the in-memory queue, so a crash after this
-            # sweep can resume every task the UI said it accepted, not only launch-time goals.
-            for g in goals_from_command(cmd):
-                _append_goals_ledger(args.state_dir, [g], started)
+            # native chat / cockpit queued new goals into the running fleet. Persist the WHOLE
+            # command's goal batch atomically BEFORE exposing any item to memory. If that write
+            # fails, _apply_command fails and the claimed command is restored for a later sweep.
+            _cmd_goals = goals_from_command(cmd)
+            if _cmd_goals:
+                _append_goals_ledger(args.state_dir, _cmd_goals, started, raise_on_error=True)
+            for g in _cmd_goals:
                 add_box.append(g)
                 # THE ONE PLACE A `/goal ` SUBMISSION IS STILL VISIBLE. The command file is
                 # deleted the moment it is read, and after that this goal looks like any
@@ -3398,9 +3583,11 @@ def main():
             # graceful stop: {"stop": true} cancels every worker and ends the run.
             if cmd.get("stop"):
                 stop_box[0] = True
+            return True, []
         except Exception as exc:
             print("[command] applying a validated command failed part-way: %s"
                   % type(exc).__name__, flush=True)
+            return None, []
 
     convs_path = os.path.join(args.state_dir, "conversations.json")
 
