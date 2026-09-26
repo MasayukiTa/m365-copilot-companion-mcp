@@ -374,7 +374,9 @@ def _surface_with_a_way_back(cdp_url: str, agent_url: str,
                     "-Port", str(port), "-HardReset", "-Headless"]
             if profile:
                 argv += ["-Profile", profile]
-            subprocess.run(argv, capture_output=True, timeout=180)
+            from tools import childproc
+            subprocess.run(argv, capture_output=True, timeout=180,
+                           creationflags=childproc.headless_creationflags())
         except Exception:
             pass
 
