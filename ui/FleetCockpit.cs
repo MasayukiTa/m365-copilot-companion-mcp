@@ -10501,6 +10501,19 @@ class CockpitWindow : Window
     static double Dbl(Dictionary<string, object> d, string k)
     { try { if (d.ContainsKey(k) && d[k] != null) return Convert.ToDouble(d[k]); } catch (Exception) { } return 0; }
 
+    static Dictionary<string, object> Obj(Dictionary<string, object> d, string k)
+    {
+        if (d == null || !d.ContainsKey(k) || d[k] == null) return null;
+        return d[k] as Dictionary<string, object>;
+    }
+
+    static int ArrCount(Dictionary<string, object> d, string k)
+    {
+        if (d == null || !d.ContainsKey(k) || d[k] == null) return 0;
+        var a = d[k] as object[];
+        return a != null ? a.Length : 0;
+    }
+
     string Sig(Dictionary<string, object> root)
     {
         var sb = new StringBuilder();
@@ -10519,6 +10532,13 @@ class CockpitWindow : Window
                 // changes need to force a re-render. Collapsed cards stay put while their
                 // worker streams -- that's what keeps a 164-task fleet from thrashing.
                 if (_expanded.Contains(nm)) sb.Append('#').Append(StableShortHash(S(w, "last")));
+                var ex = Obj(w, "execution");
+                if (ex != null)
+                    sb.Append("|x").Append(S(ex, "state"))
+                      .Append(':').Append(S(ex, "current_step_index"))
+                      .Append(':').Append(S(ex, "completed_count"))
+                      .Append(':').Append(StableShortHash(S(ex, "last_progress")))
+                      .Append(':').Append(S(ex, "last_progress_at"));
                 sb.Append(';');
             }
         return sb.ToString();
@@ -11406,6 +11426,16 @@ class CockpitWindow : Window
                   .Append(':').Append(StableShortHash(S(w, "conv_title")));
                 // TASK 3 (Bucket C): track next_step + self_confidence so the collapsed row re-renders.
                 sb.Append('|').Append(S(w, "next_step").Length).Append(':').Append(S(w, "self_confidence"));
+                var ex = Obj(w, "execution");
+                if (ex != null)
+                    sb.Append("|exec:").Append(S(ex, "state"))
+                      .Append(':').Append(S(ex, "current_step_index"))
+                      .Append(':').Append(S(ex, "total_steps"))
+                      .Append(':').Append(S(ex, "completed_count"))
+                      .Append(':').Append(ArrCount(ex, "artifacts"))
+                      .Append(':').Append(StableShortHash(S(ex, "current_step")))
+                      .Append(':').Append(StableShortHash(S(ex, "last_progress")))
+                      .Append(':').Append(S(ex, "last_progress_at"));
                 // FIX B: _stopping dims non-terminal cards -- track it so a Stop click (or its
                 // resolution) re-templates this card instead of reusing the old realized element.
                 sb.Append('|').Append(_stopping ? "1" : "0");
@@ -12827,6 +12857,27 @@ class CockpitWindow : Window
             {
                 // ── Normal collapsed ledger row: line 2 + line 3 ────────────────────────────
                 // Line 2: latest human-readable progress. Precedence: display_result > last > fallback.
+                var execution = Obj(w, "execution");
+                if (execution != null)
+                {
+                    string currentStep = S(execution, "current_step");
+                    int currentIndex = I(execution, "current_step_index");
+                    int totalSteps = I(execution, "total_steps");
+                    if (!string.IsNullOrEmpty(currentStep))
+                    {
+                        string stepPrefix = totalSteps > 0
+                            ? ("▶ " + currentIndex + "/" + totalSteps + "  ")
+                            : ("▶ " + currentIndex + "  ");
+                        col.Children.Add(new TextBlock
+                        {
+                            Text = stepPrefix + OneLine(currentStep),
+                            Foreground = Fg, FontSize = 12.5, FontWeight = FontWeights.SemiBold,
+                            TextTrimming = TextTrimming.CharacterEllipsis, TextWrapping = TextWrapping.NoWrap,
+                            Margin = new Thickness(24, 4, 0, 0)
+                        });
+                    }
+                }
+
                 string collapsedDisplayResult = S(w, "display_result");
                 string resultText;
                 if (!string.IsNullOrEmpty(collapsedDisplayResult))
@@ -12890,6 +12941,23 @@ class CockpitWindow : Window
                 if (turn > 0) meta.Append(" · ").Append(T("turn")).Append(' ').Append(turn);
                 if (reviews > 0) meta.Append(" · ").Append(_lang == 0 ? ("確認 " + reviews + " 回") : ("reviewed " + reviews));
                 if (verifiedOk) meta.Append(" · ").Append(_lang == 0 ? "検証OK" : "verified");
+                if (execution != null)
+                {
+                    int completed = I(execution, "completed_count");
+                    int totalSteps = I(execution, "total_steps");
+                    int artifactCount = ArrCount(execution, "artifacts");
+                    meta.Append(" · ✓ ").Append(completed);
+                    if (totalSteps > 0) meta.Append('/').Append(totalSteps);
+                    if (artifactCount > 0)
+                        meta.Append(" · ").Append(artifactCount).Append(_lang == 0 ? " 成果物" : " artifacts");
+                    double progressTs = Dbl(execution, "last_progress_at");
+                    if (progressTs > 0)
+                    {
+                        double progressAge = Math.Max(0, NowUnix() - progressTs);
+                        meta.Append(" · ").Append(_lang == 0 ? "進捗 " : "progress ")
+                            .Append(Fmt(progressAge)).Append(_lang == 0 ? " 前" : " ago");
+                    }
+                }
                 var ml = new TextBlock
                 {
                     Text = meta.ToString(), Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 12,
@@ -13250,10 +13318,94 @@ class CockpitWindow : Window
         return t;
     }
 
+    UIElement ExecutionOverview(Dictionary<string, object> w)
+    {
+        var execution = Obj(w, "execution");
+        if (execution == null) return null;
+
+        var sp = new StackPanel();
+        string state = S(execution, "state");
+        string current = S(execution, "current_step");
+        int currentIndex = I(execution, "current_step_index");
+        int total = I(execution, "total_steps");
+        int completed = I(execution, "completed_count");
+        string lastProgress = S(execution, "last_progress");
+        string next = S(execution, "next_step");
+        string waiting = S(execution, "waiting_reason");
+
+        string head = (total > 0 ? (currentIndex + "/" + total) : currentIndex.ToString());
+        if (!string.IsNullOrEmpty(state)) head += " · " + state;
+        if (!string.IsNullOrEmpty(current)) head += " · " + current;
+        sp.Children.Add(new TextBlock { Text = "▶ " + head, Foreground = Fg, FontSize = 12.5,
+            FontWeight = FontWeights.SemiBold, TextWrapping = TextWrapping.Wrap });
+
+        if (!string.IsNullOrEmpty(lastProgress))
+            sp.Children.Add(new TextBlock { Text = (_lang == 0 ? "進捗: " : "Progress: ") + lastProgress,
+                Foreground = Muted, FontSize = 12.5, Margin = new Thickness(0, 3, 0, 0), TextWrapping = TextWrapping.Wrap });
+        if (!string.IsNullOrEmpty(waiting))
+            sp.Children.Add(new TextBlock { Text = (_lang == 0 ? "待機理由: " : "Waiting: ") + waiting,
+                Foreground = Muted, FontSize = 12.5, Margin = new Thickness(0, 3, 0, 0), TextWrapping = TextWrapping.Wrap });
+
+        object doneRaw;
+        if (execution.TryGetValue("completed_steps", out doneRaw) && doneRaw is object[])
+        {
+            var done = (object[])doneRaw;
+            if (done.Length > 0)
+            {
+                sp.Children.Add(new TextBlock { Text = (_lang == 0 ? "完了 " : "Completed ") + completed,
+                    Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 11.5, Margin = new Thickness(0, 5, 0, 1) });
+                foreach (object obj in done)
+                {
+                    var step = obj as Dictionary<string, object>;
+                    if (step == null) continue;
+                    string instruction = S(step, "instruction");
+                    string summary = S(step, "summary");
+                    string line = "✓ " + instruction;
+                    if (!string.IsNullOrEmpty(summary) && summary != instruction) line += " — " + summary;
+                    sp.Children.Add(new TextBlock { Text = line, Foreground = Muted, FontSize = 12,
+                        Margin = new Thickness(8, 1, 0, 1), TextWrapping = TextWrapping.Wrap });
+                }
+            }
+        }
+
+        if (!string.IsNullOrEmpty(next))
+            sp.Children.Add(new TextBlock { Text = (_lang == 0 ? "次: " : "Next: ") + next,
+                Foreground = Muted, FontSize = 12.5, Margin = new Thickness(0, 5, 0, 0), TextWrapping = TextWrapping.Wrap });
+
+        object artsRaw;
+        if (execution.TryGetValue("artifacts", out artsRaw) && artsRaw is object[])
+        {
+            var arts = (object[])artsRaw;
+            if (arts.Length > 0)
+            {
+                sp.Children.Add(new TextBlock { Text = _lang == 0 ? "成果物" : "Artifacts",
+                    Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 11.5, Margin = new Thickness(0, 5, 0, 1) });
+                foreach (object obj in arts)
+                {
+                    var artifact = obj as Dictionary<string, object>;
+                    if (artifact == null) continue;
+                    string label = S(artifact, "path");
+                    if (string.IsNullOrEmpty(label)) label = S(artifact, "name");
+                    if (string.IsNullOrEmpty(label)) label = S(artifact, "uri");
+                    if (string.IsNullOrEmpty(label)) label = _lang == 0 ? "成果物" : "artifact";
+                    sp.Children.Add(new TextBlock { Text = "• " + label, Foreground = Muted, FontSize = 12,
+                        Margin = new Thickness(8, 1, 0, 1), TextWrapping = TextWrapping.Wrap });
+                }
+            }
+        }
+        return sp;
+    }
+
     UIElement TabOverview(string goal, string last, string outcome, bool terminal, int reviews,
                           bool verifiedOk, string tpath, Dictionary<string, object> w)
     {
         var sp = new StackPanel();
+        UIElement execView = ExecutionOverview(w);
+        if (execView != null)
+        {
+            sp.Children.Add(SectLabel(_lang == 0 ? "実行" : "Execution"));
+            sp.Children.Add(execView);
+        }
         sp.Children.Add(SectLabel(_lang == 0 ? "結果" : "Result"));
         // Precedence: display_result (cleaned final answer from runner) > last > OutcomeLabel fallback.
         string displayResult = (w != null) ? S(w, "display_result") : "";
