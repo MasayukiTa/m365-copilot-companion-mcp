@@ -129,6 +129,7 @@ jobs:
             tools/test_a_tool_must_not_promise_a_model_can_see.py \
             scripts/test_the_dots_must_be_readable_without_a_screen.py \
             relay/test_the_harness_unlocks_without_being_asked.py \
+            relay/test_unlock_recovery_contract.py \
             relay/test_a_one_line_answer_is_still_an_answer.py \
             tests/test_a_question_nobody_can_fail_is_not_a_question.py \
             tools/test_fleet_intake.py \

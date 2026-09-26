@@ -485,14 +485,19 @@ def deliver_steers(items, workers, log=None, enqueue=None):
     return delivered
 
 
-#: How long a refusal has to sit unclaimed before the harness acts on it itself. Long enough
-#: that the worker's own recovery -- _looks_locked -> _inject_unlock, which fires when the
-#: REPLY comes back -- gets first refusal, and short enough that a run does not spend minutes
-#: producing work on top of a tool call that never happened.
+#: How long a refusal has to sit unclaimed before the harness MAY act on it. Age alone is not
+#: sufficient: while a candidate worker is still `waiting`, its reply has not landed yet and
+#: _looks_locked has had literally no chance to classify/recover it. The old sweep ignored that
+#: fact and raced normal recovery at 45s; measured 2026-09-26 unlock grants took median 68.3s
+#: and up to 172.4s, so healthy in-flight turns were routinely given duplicate re-unlock steers.
+#: We keep 45s as the post-settlement backstop, but NEVER intervene in an in-flight turn.
 UNCLAIMED_REFUSAL_GRACE_S = 45.0
 
-#: The newest refusal already acted on, so a sweep does not re-deliver for the same one.
-_LAST_UNCLAIMED_TS = [0.0]
+#: Refusals already acted on by the fallback sweep, keyed individually rather than by a single
+#: monotonic timestamp. A later worker's refusal must never watermark away an older refusal that
+#: was deliberately deferred while its own turn was still in flight. Pruned to the server's fresh
+#: refusal window on every sweep, so this cannot grow without bound.
+_HANDLED_UNCLAIMED = set()
 
 
 def sweep_unclaimed_refusals(workers, now=None, log=None, deliver=None):
@@ -510,8 +515,8 @@ def sweep_unclaimed_refusals(workers, now=None, log=None, deliver=None):
     produces a recognisable reply is invisible to it.
 
     WHAT THIS ASKS INSTEAD, using only records the server already writes: the server logs every
-    refusal; readers log every classification. A refusal with no classification after it, past
-    the grace period, was picked up by nobody. relay/turn_windows says which workers had a turn
+    refusal; readers log every classification. A refusal with no classification consuming that exact row and no later grant for its
+    session, past the grace period, was picked up by nobody. relay/turn_windows says which workers had a turn
     open at that instant, and those are the ones told to unlock.
 
     THE COST IS ASYMMETRIC AND THE BIAS FOLLOWS IT. Unlocking a worker that was not locked
@@ -530,31 +535,105 @@ def sweep_unclaimed_refusals(workers, now=None, log=None, deliver=None):
     try:
         from tools import lock_state as _ls
         from relay import turn_windows as _tw
-        from relay.relay_fleet import NO_CONTEXT_REFUSAL
+        from relay.relay_fleet import NO_CONTEXT_REFUSAL, is_recovery_payload as _is_recovery_payload
 
         since = t - float(getattr(_ls, "DEFAULT_FRESH_SEC", 180.0))
         claims = _ls.classifications(since, now=t)
+        grants = _ls.granted_records(since, now=t)
         refusals = [r for r in _ls.matching_records(since, now=t)
                     if not str(r.get("detail") or "").startswith(NO_CONTEXT_REFUSAL)]
-        live = {getattr(w, "name", "") for w in (workers or [])
-                if getattr(w, "status", "") not in ("done", "stuck", "cancelled")}
+
+        def _refusal_key(refusal):
+            """Stable identity for one refusal row within the fresh window."""
+            try:
+                ts = float((refusal or {}).get("ts") or 0.0)
+            except (TypeError, ValueError):
+                ts = 0.0
+            return (
+                ts,
+                str((refusal or {}).get("session") or ""),
+                str((refusal or {}).get("client_ip") or ""),
+                str((refusal or {}).get("site") or ""),
+                str((refusal or {}).get("detail") or "")[:160],
+            )
+
+        # Keep only keys that still exist in the same freshness window we are about to inspect.
+        # This bounds memory while preserving deferred older refusals independently of newer ones.
+        fresh_keys = {_refusal_key(r) for r in refusals}
+        _HANDLED_UNCLAIMED.intersection_update(fresh_keys)
+
+        live = {getattr(w, "name", ""): w for w in (workers or [])
+                if getattr(w, "status", "") not in ("done", "stuck", "cancelled",
+                                                      "content_refused", "maxturns", "error")}
+
+        def _claim_consumed_refusal(claim, refusal):
+            """True only when this classification names THIS refusal as its evidence.
+
+            A classification timestamp is not a global acknowledgement: under concurrency one
+            worker can classify its own refusal after a different worker's refusal. The ledger
+            already stores `consumed`; use the join it was written to provide.
+            """
+            consumed = (claim or {}).get("consumed") or {}
+            try:
+                cts = float(consumed.get("ts") or 0.0)
+                rts = float((refusal or {}).get("ts") or 0.0)
+            except (TypeError, ValueError):
+                return False
+            if cts <= 0.0 or rts <= 0.0 or abs(cts - rts) > 1e-6:
+                return False
+            cs = str(consumed.get("session") or "")
+            rs = str((refusal or {}).get("session") or "")
+            return not (cs and rs and cs != rs)
+
+        def _grant_resolved_refusal(grant, refusal):
+            """A successful unlock resolves only an earlier refusal from the same MCP session."""
+            rs = str((refusal or {}).get("session") or "")
+            gs = str((grant or {}).get("session") or "")
+            if not rs or gs != rs:
+                return False
+            try:
+                return float(grant.get("ts") or 0.0) >= float(refusal.get("ts") or 0.0)
+            except (TypeError, ValueError):
+                return False
+
         for rec in refusals:
             ts = float(rec.get("ts") or 0.0)
-            if ts <= _LAST_UNCLAIMED_TS[0] or (t - ts) < UNCLAIMED_REFUSAL_GRACE_S:
+            key = _refusal_key(rec)
+            if key in _HANDLED_UNCLAIMED or (t - ts) < UNCLAIMED_REFUSAL_GRACE_S:
                 continue
-            # CLAIMED means a reader wrote a classification AFTER this refusal landed. The
-            # note carries the record it consumed, but matching on that would fail whenever a
-            # reader consumed a different refusal from the same burst -- and a burst is the
-            # normal case. Ordering is the weaker claim and the true one.
-            if any(float(c.get("ts") or 0.0) >= ts for c in claims):
+            # A classification only claims the refusal row it actually consumed. The old
+            # timestamp-only rule let worker B's later classification hide worker A's unhandled
+            # refusal. Conversely, a later grant for this exact session means recovery already
+            # succeeded even if no classification row was written, so do not send another unlock.
+            if any(_claim_consumed_refusal(c, rec) for c in claims):
                 continue
-            cands = [n for n in _tw.candidates(ts) if n in live]
+            if any(_grant_resolved_refusal(g, rec) for g in grants):
+                continue
+            cands = []
+            for n in _tw.candidates(ts):
+                w = live.get(n)
+                if w is None:
+                    continue
+                # A refusal occurring inside an in-flight turn is expected to be unclassified:
+                # classification runs on the reply, and the reply does not exist yet. Queueing a
+                # steer here races the worker's own recovery and was the main source of duplicate
+                # unlock prompts in the 2026-09-25/26 logs. Wait for the turn to settle first.
+                if getattr(w, "status", "") == "waiting":
+                    continue
+                if _is_recovery_payload(getattr(w, "job", "")):
+                    continue
+                if any(_is_recovery_payload(x) for x in (getattr(w, "steer_msgs", []) or [])):
+                    continue
+                cands.append(n)
             if not cands:
                 # No worker had a turn open then: this refusal belongs to something else on
                 # this machine. Delivering to everyone on no evidence is how a recovery starts
                 # causing the noise it was built to quieten.
                 continue
-            _LAST_UNCLAIMED_TS[0] = max(_LAST_UNCLAIMED_TS[0], ts)
+            # Mark only THIS refusal handled. Do it before delivery, matching the old one-shot
+            # behaviour even if delivery itself reports a missing password or other terminal
+            # inability; retrying that every tick would be a new spam loop.
+            _HANDLED_UNCLAIMED.add(key)
             for name in cands:
                 say("[reunlock] nobody classified the refusal at %.0f; %s had a turn open "
                     "then -- sending unlock" % (ts, name))

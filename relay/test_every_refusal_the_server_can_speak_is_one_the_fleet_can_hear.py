@@ -79,12 +79,12 @@ def _static_prefix(literal: str) -> str:
     return literal if brace < 0 else literal[:brace]
 
 
-def test_the_source_sweep_finds_all_three_known_refusals():
-    """Pins the sweep itself: if this ever finds fewer than three, the regex broke, not the
-    server -- tools/security.py's three refusals are read directly in the assertions below."""
+def test_the_source_sweep_finds_all_known_refusal_variants():
+    """Pins the sweep itself. Session-auth and token-fallback now have separate token-missing
+    messages, so there are four source literals but still three refusal classes/prefixes."""
     literals = _locked_literals_in_security_py()
-    assert len(literals) == 3, (
-        "expected exactly 3 '[locked' literals in tools/security.py, found %d: %r -- "
+    assert len(literals) == 4, (
+        "expected exactly 4 '[locked' literals in tools/security.py, found %d: %r -- "
         "either a refusal was removed (update this count) or the sweep regex needs fixing"
         % (len(literals), literals))
     assert any(lit.startswith("[locked: no HTTP request context") for lit in literals)
