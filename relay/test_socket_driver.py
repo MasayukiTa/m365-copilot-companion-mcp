@@ -346,3 +346,25 @@ def test_the_first_failed_turn_has_nothing_to_offer_either():
     d = _drv(error=RuntimeError("boom"))
     d.send("q"); assert _settle(d)
     assert d.settled_text() == "" and d.partial_text() == ""
+
+def test_generation_idle_clock_moves_only_with_meaningful_activity():
+    drv = _drv(delay=0.12, deltas=("first", "second"), answer="second")
+    drv.send("q")
+    time.sleep(0.03)
+    before = drv.generation_idle_s()
+    assert before >= 0.0
+    # First delta arrives after ~0.12s and must refresh the meaningful-activity clock.
+    time.sleep(0.13)
+    after = drv.generation_idle_s()
+    assert after < before + 0.15
+    assert _settle(drv)
+    assert drv.generation_idle_s() == 0.0
+
+
+def test_fail_stalled_turn_marks_the_route_and_closes_the_socket():
+    conv = _FakeConv(delay=0.5)
+    drv = SD.CopilotSocketDriver(conv, connect=object())
+    drv.send("q")
+    drv.fail_stalled_turn("no meaningful progress")
+    assert "no meaningful progress" in drv.failed
+    assert conv.closed is True

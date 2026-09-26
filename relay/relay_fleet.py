@@ -2312,6 +2312,11 @@ SOCKET_REFRESH_MARGIN_S = float(os.environ.get("MCP_FLEET_SOCKET_MARGIN_S", "150
 # token about twice an hour, which is the other cost being traded here -- each refresh opens a
 # capture tab for ~40 seconds.
 SOCKET_TURN_TIMEOUT_S = float(os.environ.get("MCP_FLEET_SOCKET_TURN_S", "1200"))
+# A socket can remain technically alive on ping frames after useful work has stopped. Do not
+# confuse transport liveness with agent progress: after this much time with neither answer growth
+# nor a progress frame, fail the socket turn and let the existing reconnect/fallback policy act.
+# Long research is unaffected as long as it emits progress.
+SOCKET_MEANINGFUL_IDLE_S = float(os.environ.get("MCP_FLEET_SOCKET_IDLE_S", "90"))
 
 
 def free_disk_gb(path=None):
@@ -4244,6 +4249,20 @@ class RelayWorker:
         if getattr(self, "socket", False) and getattr(self.drv, "_is_generating", None):
             try:
                 if self.drv._is_generating():
+                    idle_fn = getattr(self.drv, "generation_idle_s", None)
+                    idle_s = float(idle_fn()) if callable(idle_fn) else 0.0
+                    if idle_s >= SOCKET_MEANINGFUL_IDLE_S:
+                        reason = ("socket turn made no meaningful progress for %.0fs "
+                                  "(limit %.0fs)" % (idle_s, SOCKET_MEANINGFUL_IDLE_S))
+                        fail_fn = getattr(self.drv, "fail_stalled_turn", None)
+                        if callable(fail_fn):
+                            fail_fn(reason)
+                        else:
+                            self.drv.failed = reason
+                        self.reason = reason + " -> reconnect/fallback"
+                        self._cooldown_until = now + 0.5
+                        self.status = "ready"
+                        return True
                     self.gen_waits += 1          # still counted, so the wait is observable
                     self._cooldown_until = now + 2.0
                     self.status = "ready"

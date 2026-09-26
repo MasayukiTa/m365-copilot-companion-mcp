@@ -979,12 +979,20 @@ def test_an_explicit_blank_is_off_and_an_absent_variable_is_on(monkeypatch):
 # 1つのターンに締め切りが2つあるのは1つ多い。
 
 class _GenDrv2(_FakeDrv):
-    def __init__(self, generating):
+    def __init__(self, generating, idle_s=0.0):
         super().__init__()
         self.generating = generating
+        self.idle_s = idle_s
+        self.failed = ""
 
     def _is_generating(self):
         return self.generating
+
+    def generation_idle_s(self):
+        return self.idle_s
+
+    def fail_stalled_turn(self, reason):
+        self.failed = reason
 
 
 def _deferring_worker(drv, socket=True):
@@ -1000,8 +1008,19 @@ def _deferring_worker(drv, socket=True):
 
 
 def test_a_working_socket_turn_is_not_killed_by_the_tab_era_budget():
-    w = _deferring_worker(_GenDrv2(generating=True))
+    w = _deferring_worker(_GenDrv2(generating=True, idle_s=1.0))
     assert w._defer_generation() is True, "健全な socket ターンを予算切れで殺している"
+    assert w.status == "ready"
+    assert not w.drv.failed
+
+
+def test_a_ping_only_socket_turn_does_not_get_twenty_minutes_of_patience(monkeypatch):
+    import relay.relay_fleet as rf
+    monkeypatch.setattr(rf, "SOCKET_MEANINGFUL_IDLE_S", 90.0)
+    w = _deferring_worker(_GenDrv2(generating=True, idle_s=91.0))
+    assert w._defer_generation() is True
+    assert "no meaningful progress" in w.drv.failed
+    assert "reconnect/fallback" in w.reason
     assert w.status == "ready"
 
 
