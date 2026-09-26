@@ -100,3 +100,32 @@ def test_a_recycled_pid_does_not_splice_a_younger_process_in_as_a_parent():
     t.add({"pid": 20, "ppid": 7, "name": "new.exe", "created": 70.0, "exe": "", "cmdline": "new"})
     names = [r["name"] for r in t.chain(30)]
     assert names[:2] == ["child.exe", "old.exe"]
+
+
+def test_fleet_launch_checkpoint_runs_powershell_without_a_console(monkeypatch):
+    """The pre-run checkpoint is called from a windowless fleet launcher.
+
+    A bare powershell.exe child of a console-less Python/WPF process gets a new visible console
+    on Windows. The checkpoint runs on every fleet launch, so its PowerShell helper must ask for
+    CREATE_NO_WINDOW explicitly rather than inherit whatever console policy its parent has.
+    """
+    from scripts.win import checkpoint as C
+    from tools import childproc
+
+    seen = {}
+    expected = 0x08000000
+
+    class Result:
+        stdout = "ok"
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = list(argv)
+        seen["kwargs"] = dict(kwargs)
+        return Result()
+
+    monkeypatch.setattr(childproc, "run", fake_run)
+    monkeypatch.setattr(childproc, "headless_creationflags", lambda: expected)
+
+    assert C._ps("Write-Output ok") == "ok"
+    assert seen["argv"][:2] == ["powershell", "-NoProfile"]
+    assert seen["kwargs"].get("creationflags") == expected

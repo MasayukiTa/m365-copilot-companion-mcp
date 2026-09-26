@@ -29,9 +29,15 @@ MANAGED = ("copilot-companion-edge", "copilot-bridge-edge", "copilot-eval-edge")
 def _ps(script, timeout=40):
     try:
         sys.path.insert(0, REPO)
-        from tools.childproc import run as _run_child
-        return _run_child(["powershell", "-NoProfile", "-Command", script],
-                          timeout=timeout).stdout
+        from tools import childproc
+        # This helper runs from the pre-launch gate, whose parent is commonly a windowless
+        # WPF/wscript/supervisor process. A bare console child in that situation is given a
+        # brand-new visible console by Windows -- the PowerShell flash seen when a fleet/Copilot
+        # agent starts. The query is fully unattended, so it must state the no-console policy
+        # instead of inheriting whatever console its parent happens to have.
+        return childproc.run(["powershell", "-NoProfile", "-Command", script],
+                             timeout=timeout,
+                             creationflags=childproc.headless_creationflags()).stdout
     except Exception:
         return ""
 
