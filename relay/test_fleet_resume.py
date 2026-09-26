@@ -190,12 +190,12 @@ class LedgerTests(unittest.TestCase):
 
     def test_live_add_goal_command_persists_before_queueing(self):
         src = Path(fr.__file__).read_text(encoding="utf-8")
-        anchor = 'for g in goals_from_command(cmd):'
+        anchor = '_cmd_goals = goals_from_command(cmd)'
         i = src.index(anchor)
-        block = src[i:i + 1200]
-        self.assertIn('_append_goals_ledger(', block)
+        block = src[i:i + 1400]
+        self.assertIn('_append_goals_ledger(args.state_dir, _cmd_goals, started, raise_on_error=True)', block)
         self.assertLess(block.index('_append_goals_ledger('), block.index('add_box.append(g)'),
-                        'persist the accepted goal before the in-memory queue can run it')
+                        'persist the whole accepted goal batch before the in-memory queue can run it')
 
     def test_missing_ledger_tolerated(self):
         # no ledger file at all -> nothing to resume
