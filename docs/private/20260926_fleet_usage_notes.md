@@ -49,3 +49,11 @@ The execution goal still keeps the full instruction text, but the Cockpit no lon
 The runner now emits a separate `goal_summary` per worker plus `directive_summary` / compact `run_label`. These reuse the existing deterministic `relay.conv_title` extractor: extractive only (no model call / no invented outcome), bounded, and display-redacted. Policy-only openings such as `READ-ONLY audit only; do not edit...` are skipped in favor of the next task-identifying sentence. The authoritative `goal` / `directive` remain byte-for-byte full text for execution, retry, resume, search, and the expanded Overview. Both history archive routes persist `goal_summary`, while old rows fall back to the previous CardTitle logic.
 
 Validation: 311 related pytest cases passed, the legacy fleet_runner fix harness passed 61/61, and both WPF binaries rebuilt/restarted successfully.
+
+## Long read-only audit repeatedly timed out inside one worker turn
+
+For the ShuttleScope E-1/E-2 ConfidenceBadge audit, the goal was submitted through the required GUI route (`submit_via_ui.ps1`, `goalInput`, Start/Send; no fleet CLI submission). The run was idle before submission and accepted exactly one read-only goal.
+
+During execution, `.fleet/status.json` repeatedly reported the same worker turn waiting on generation and then `turn timeout -> retry 2/10`; by turn 8 no requested report file had been produced yet. This is not a repository-search failure or a GUI-submission failure: the task was accepted, but a long model generation did not complete within the turn timeout and consumed retries.
+
+Operational consequence: for broad read-only audits, one very large goal can spend substantial wall-clock time retrying a single generation before producing any durable partial report. Prefer splitting independent audits into smaller GUI-submitted goals when no run is active, or make the worker persist partial findings between turns if the harness can support it. Supervising code should continue its own audit rather than assuming the delegated result will arrive promptly.
