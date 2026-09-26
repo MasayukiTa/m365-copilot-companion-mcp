@@ -4746,7 +4746,9 @@ class CockpitWindow : Window
                 pastTag.Margin = new Thickness(0, 0, 0, 2);
                 wrap.Children.Add(pastTag);
                 var titleTag = new TextBlock();
-                titleTag.Text = CardTitle(S(focusEntry, "conv_title"), S(focusEntry, "goal"));
+                string focusSummary = S(focusEntry, "goal_summary");
+                titleTag.Text = !string.IsNullOrEmpty(focusSummary)
+                    ? focusSummary : CardTitle(S(focusEntry, "conv_title"), S(focusEntry, "goal"));
                 titleTag.Foreground = Theme.Br(Theme.Muted(_dark)); titleTag.FontSize = 10;
                 titleTag.TextTrimming = TextTrimming.CharacterEllipsis;
                 titleTag.Margin = new Thickness(0, 0, 0, 2);
@@ -5406,7 +5408,7 @@ class CockpitWindow : Window
             if (e.Key == Key.Return && (Keyboard.Modifiers & ModifierKeys.Control) != 0)
             {
                 e.Handled = true;
-                // A2-2: Ctrl+Enter steers when a run is active; starts fleet otherwise.
+                // Ctrl+Enter adds tasks to the live run; starts a new fleet when idle.
                 //
                 // AND A SLASH SETTING IS A SETTING HERE TOO. The send button below already
                 // calls HandleSlashSetting first, with a note saying the bug was found by
@@ -5418,7 +5420,7 @@ class CockpitWindow : Window
                 // The same fault reached by two callers is one fault; fixing the caller you
                 // happened to be looking at leaves it live everywhere else.
                 if (HandleSlashSetting()) return;
-                if (_composerRunActive) TrySendSteer();
+                if (_composerRunActive) TryAddGoalsToLiveFleet();
                 else StartFleet();
             }
         };
@@ -5451,7 +5453,7 @@ class CockpitWindow : Window
         _startBtn.Cursor = Cursors.Hand; _startBtn.BorderThickness = new Thickness(0);
         _startBtn.Height = Theme.BtnH; _startBtn.MinWidth = 132; _startBtn.FontWeight = FontWeights.SemiBold;
         _startBtn.Margin = new Thickness(8, 0, 0, 0); _startBtn.Padding = new Thickness(16, 0, 16, 0);
-        // A2-2: when a run is active, the button sends a steer instead of starting a fleet.
+        // When a run is active, the primary button adds tasks to that run.
         _startBtn.Click += delegate
         {
             // A SETTING IS NEVER A MESSAGE. While a run is live this button steers the running
@@ -5462,7 +5464,7 @@ class CockpitWindow : Window
             // Found by typing `/fanout on` into the real window; settings.txt had no fanout key
             // afterwards, and the running worker had been handed the text.
             if (HandleSlashSetting()) return;
-            if (_composerRunActive) TrySendSteer();
+            if (_composerRunActive) TryAddGoalsToLiveFleet();
             else StartFleet();
         };
         btns.Children.Add(_startBtn);
@@ -5644,77 +5646,138 @@ class CockpitWindow : Window
         }
     }
 
-    // A2-2: Send a steer from the bottom composer. Parses "W2: ..." prefix to target a specific
-    // worker; otherwise broadcasts to the first running worker (or ALL via broadcast if no live
-    // specific worker is found -- the relay picks the right one). Reuses RequestSteer() exactly
-    // as the per-card SteerRow does: writes {"steer":[{worker,text},...]} as its own command file.
-    void TrySendSteer()
+    // The bottom composer is the task intake surface in BOTH idle and live-run states.
+    // During a live run, enqueue new work through the same lossless one-command-per-file channel
+    // used by retry. Worker-specific steering remains available on each worker card.
+    void TryAddGoalsToLiveFleet()
     {
-        string text = (_goalInput != null ? _goalInput.Text : "").Trim();
-        if (string.IsNullOrEmpty(text)) return;
+        if (_goalInput == null) return;
+        var goals = new List<string>();
+        foreach (string ln in (_goalInput.Text ?? "").Replace("\r", "").Split('\n'))
+        {
+            string goal = ln.Trim();
+            if (goal.Length > 0 && !goal.StartsWith("#")) goals.Add(goal);
+        }
+        if (goals.Count == 0) return;
+
+        // The UI can be one tick behind the coordinator. If the run ended between paint and click,
+        // preserve the user's intent by using the normal new-run path instead of dropping the text.
         if (!RunIsLive())
         {
-            if (_startNote != null) _startNote.Text = T("steer_dead");
+            StartFleet();
             return;
         }
 
-        // Parse optional "Wx: " / "W0: " / "W10: " prefix for targeted worker routing.
-        string targetWorker = "";
-        string steerText = text;
-        if (text.Length > 2 && (text[0] == 'W' || text[0] == 'w'))
+        var adds = new List<object>();
+        foreach (string goal in goals)
         {
-            int colonIdx = text.IndexOf(':');
-            if (colonIdx >= 2 && colonIdx <= 4)
-            {
-                string maybeWorker = text.Substring(0, colonIdx).Trim();
-                bool allDigits = true;
-                for (int ci = 1; ci < maybeWorker.Length; ci++)
-                    if (!char.IsDigit(maybeWorker[ci])) { allDigits = false; break; }
-                if (allDigits && maybeWorker.Length >= 2)
-                {
-                    targetWorker = maybeWorker;      // e.g. "W2"
-                    steerText = text.Substring(colonIdx + 1).Trim();
-                }
-            }
+            var item = new Dictionary<string, object>();
+            item["text"] = goal;
+            item["priority"] = false;
+            adds.Add(item);
+        }
+        var patch = Cmd1("add_goal", adds);
+        string ackId = "ui-live-" + Guid.NewGuid().ToString("N");
+        string ackPath = Path.Combine(_fleetDir, "acks", ackId + ".ack");
+        patch["ack"] = ackPath;
+        string commandPath;
+        if (!SendTrackedCommand(patch, out commandPath))
+        {
+            if (_startNote != null)
+                _startNote.Text = _lang == 0 ? "タスクをキューへ追加できませんでした。入力は残っています。"
+                                              : "Could not queue the task. Your input was kept.";
+            return;
         }
 
-        // If no explicit worker prefix, broadcast to the first non-terminal running worker.
-        if (string.IsNullOrEmpty(targetWorker))
-        {
-            var workers = _toolbarAll ?? new List<Dictionary<string, object>>();
-            foreach (Dictionary<string, object> tw in workers)
-            {
-                string st = S(tw, "status");
-                if (!IsTerminalWorker(tw) && st != "pending")
-                {
-                    targetWorker = S(tw, "name");
-                    break;
-                }
-            }
-            // Still empty: fall back to empty string (relay broadcasts to all workers).
-        }
-
-        RequestSteer(targetWorker, steerText);
-        if (_goalInput != null) _goalInput.Text = "";
-        // SAY WHICH WORKER, AND SAY IT TAKES A TURN. This used to read "queued for the
-        // next turn" whatever happened -- including when no live worker was found and an
-        // EMPTY name went out, which the relay then dropped because nothing there
-        // broadcast. The person believed they had redirected the work and watched it
-        // continue in the old direction. The relay broadcasts now, and the note says
-        // which case this was so a surprise is visible rather than inferred.
+        // Optimistic row first; the runner will replace it with a real worker on the next sweep.
+        NoteSubmitted(goals);
+        WatchLiveAddHandoff(commandPath, ackPath);
+        _goalInput.Text = "";
         if (_startNote != null)
-        {
-            bool ja = _lang == 0;
-            if (!string.IsNullOrEmpty(targetWorker))
-                _startNote.Text = ja ? (targetWorker + " の次のターンに送ります")
-                                     : ("Queued for " + targetWorker + "'s next turn");
-            else
-                _startNote.Text = ja ? "実行中の全ワーカーの次のターンに送ります"
-                                     : "Queued for every live worker's next turn";
-        }
+            _startNote.Text = _lang == 0 ? (goals.Count + " 件を実行中のキューへ追加しました。")
+                                          : ("Queued " + goals.Count + " task(s) into the active run.");
+        _lastSig = "";
     }
 
-    // A2-2: Paint the composer into either "idle/add-goals" or "active-run/steer" mode.
+    // 1 = the runner durably applied the command, 0 = receipt not ready/parseable yet,
+    // -1 = the runner explicitly rejected it. Mere file existence is NOT success: rejected
+    // commands also have receipts, and treating those as success silently lost a submitted task.
+    int LiveAddReceiptState(string ackPath, out string detail)
+    {
+        detail = "";
+        if (string.IsNullOrEmpty(ackPath) || !File.Exists(ackPath)) return 0;
+        try
+        {
+            var d = _js.DeserializeObject(File.ReadAllText(ackPath, Encoding.UTF8))
+                    as Dictionary<string, object>;
+            if (d == null) return 0;
+            bool rejected = d.ContainsKey("rejected") && Convert.ToBoolean(d["rejected"]);
+            if (rejected)
+            {
+                detail = _lang == 0 ? "タスク追加がrunnerに拒否されました。" : "The runner rejected the added task.";
+                return -1;
+            }
+            if (d.ContainsKey("applied"))
+            {
+                bool applied = Convert.ToBoolean(d["applied"]);
+                if (applied) return 1;
+                detail = _lang == 0 ? "タスク追加は適用されませんでした。" : "The added task was not applied.";
+                return -1;
+            }
+        }
+        catch (Exception)
+        {
+            // Atomic receipt writes should make parse failures rare; treat one as incomplete and
+            // retry instead of converting an ambiguous file into success or failure.
+        }
+        return 0;
+    }
+
+    // A live add can race the final sweep: the UI saw running=true, wrote the command, then the
+    // coordinator finished before its next drain.  The command is durable now, so do not guess
+    // from status alone.  Receipt = applied/accepted.  No receipt + no live run = launch a
+    // rescuer that adopts THIS exact pending command after winning fleet_runner's state-dir lock.
+    void WatchLiveAddHandoff(string commandPath, string ackPath)
+    {
+        if (string.IsNullOrEmpty(commandPath) || string.IsNullOrEmpty(ackPath)) return;
+        var timer = new System.Windows.Threading.DispatcherTimer();
+        timer.Interval = TimeSpan.FromMilliseconds(300);
+        DateTime lastRescue = DateTime.MinValue;
+        timer.Tick += delegate
+        {
+            try
+            {
+                string receiptError;
+                int receiptState = LiveAddReceiptState(ackPath, out receiptError);
+                if (receiptState > 0) { timer.Stop(); return; }
+                if (receiptState < 0)
+                {
+                    timer.Stop();
+                    if (_startNote != null) _startNote.Text = receiptError;
+                    _lastSig = "";
+                    return;
+                }
+                if (RunIsLive()) return;
+                // Retry, rather than fire once: a dying old coordinator may still own the OS
+                // lock for a moment. A losing rescuer exits 3 before touching commandPath.
+                if ((DateTime.UtcNow - lastRescue).TotalSeconds < 2.0) return;
+                lastRescue = DateTime.UtcNow;
+                SpawnFleetAdoptCommand(commandPath);
+                if (_startNote != null)
+                    _startNote.Text = _lang == 0
+                        ? "実行終了と同時に追加されたタスクを、新しい実行へ引き継いでいます。"
+                        : "The run ended during submission; carrying the pending task into a new run.";
+            }
+            catch (Exception)
+            {
+                // Keep the durable command and retry on the next tick. Losing the watcher must
+                // never mean losing the task.
+            }
+        };
+        timer.Start();
+    }
+
+    // Paint the composer as task intake in both states; a live run changes Start -> Add.
     // Only repaints when the mode actually changes (keyed off _composerRunActive).
     void PaintComposerMode(bool runActive)
     {
@@ -5724,35 +5787,33 @@ class CockpitWindow : Window
         bool ja = _lang == 0;
         if (runActive)
         {
-            // Active-run mode: steer / intervene surface
+            // Active-run mode: add new tasks to the existing queue.
             if (_composerWatermark != null)
-                _composerWatermark.Text = ja
-                    ? "ステア・割り込み...（例: W2: 修正案を確認して）"
-                    : "Steer or intervene... (e.g. W2: check the fix)";
+                _composerWatermark.Text = ja ? "タスクを追加..." : "Add tasks...";
             if (_composerHint != null)
                 _composerHint.Text = ja
-                    ? "アクティブな実行に送信 ·「/」でコマンド"
-                    : "sent to the active run · '/' for commands";
+                    ? "実行中のキューに追加 · 割り込みは各タスクカードから · / でコマンド"
+                    : "adds to the active run · steer from a task card · '/' for commands";
             if (_startBtn != null)
             {
-                _startBtn.Content = ja ? "送信" : "Send";
-                // Use accent color for primary action; same as the idle Start button.
+                _startBtn.Content = ja ? "追加" : "Add";
                 _startBtn.Background = AccentFill;
                 _startBtn.Foreground = AccentFg;
             }
             if (_folderBtn != null)
             {
-                // Folder button less prominent while steering
-                _folderBtn.Visibility = Visibility.Collapsed;
+                _folderBtn.Visibility = Visibility.Visible;
             }
         }
         else
         {
-            // Idle mode: add goals / start
+            // Idle mode: add goals / start.
             if (_composerWatermark != null)
-                _composerWatermark.Text = ja ? "タスクを入力..." : "Add tasks...";
+                _composerWatermark.Text = ja ? "タスクを追加..." : "Add tasks...";
             if (_composerHint != null)
-                _composerHint.Text = ja ? "1行に1ゴール（複数可） ·「/」でコマンド" : "One goal per line · \"/\" for commands";
+                _composerHint.Text = ja
+                    ? "1行に1ゴール（複数可） · / でコマンド"
+                    : "One goal per line · '/' for commands";
             if (_startBtn != null)
             {
                 _startBtn.Content = T("start");
@@ -5869,6 +5930,29 @@ class CockpitWindow : Window
             sb.Append("\n");
         }
         return sb.ToString();
+    }
+
+    // Rescue ONLY a command that was already durably written by the live composer. The runner
+    // itself arbitrates ownership: --adopt-command is processed only after the state-dir OS lock,
+    // so if another coordinator already started this process exits without touching the command.
+    bool SpawnFleetAdoptCommand(string commandPath)
+    {
+        string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+        string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
+        if (!File.Exists(py)) py = "python";
+        string stateDir = Path.GetDirectoryName(_statusPath);
+        var psi = new System.Diagnostics.ProcessStartInfo();
+        psi.FileName = py;
+        psi.Arguments = "-m relay.fleet_runner --adopt-command \"" + commandPath + "\""
+                        + " --state-dir \"" + stateDir + "\" --effort " + _effort
+                        + (_fanout ? " --fanout" : " --no-fanout");
+        if (_approval == "plan" || _approval == "auto") psi.Arguments += " --plan";
+        psi.WorkingDirectory = repo;
+        psi.UseShellExecute = false;
+        psi.CreateNoWindow = true;
+        try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
+        System.Diagnostics.Process.Start(psi);
+        return true;
     }
 
     // P2 RESUME: spawn a fresh fleet with --resume (re-queues the unfinished goals from the durable
@@ -11287,7 +11371,8 @@ class CockpitWindow : Window
             filtered = new List<Dictionary<string, object>>();
             foreach (Dictionary<string, object> e in visible)
             {
-                string hay = (CardTitle(S(e, "conv_title"), S(e, "goal")) + " "
+                string hay = ((string.IsNullOrEmpty(S(e, "goal_summary"))
+                    ? CardTitle(S(e, "conv_title"), S(e, "goal")) : S(e, "goal_summary")) + " "
                               + S(e, "goal") + " " + S(e, "display_result") + " "
                               + S(e, "last") + " " + S(e, "outcome")).ToLowerInvariant();
                 if (hay.IndexOf(ql, StringComparison.Ordinal) >= 0) filtered.Add(e);
@@ -11755,12 +11840,15 @@ class CockpitWindow : Window
         // Gather goal texts from the ON-BOARD workers (History-cleared lanes excluded, set in
         // BuildRows) to determine single vs multi-goal.
         var goalTexts = new List<string>();
+        var goalDisplays = new List<string>();
         var dbSrc = _directiveBandWorkers != null && _directiveBandWorkers.Count > 0 ? _directiveBandWorkers : _toolbarAll;
         foreach (Dictionary<string, object> tw in dbSrc)
         {
-            string g = S(tw, "goal");
-            if (!string.IsNullOrEmpty(g) && !goalTexts.Contains(g))
-                goalTexts.Add(g);
+            string fullGoal = S(tw, "goal");
+            if (string.IsNullOrEmpty(fullGoal) || goalTexts.Contains(fullGoal)) continue;
+            goalTexts.Add(fullGoal);
+            string displayGoal = S(tw, "goal_summary");
+            goalDisplays.Add(!string.IsNullOrEmpty(displayGoal) ? displayGoal : CardTitle("", fullGoal));
         }
 
         // Section label: "DIRECTIVE" / "指示" when a single goal; "Goals (N)" / "ゴール (N)" for multiple.
@@ -11777,7 +11865,7 @@ class CockpitWindow : Window
         //
         // The list was already complete here; only the rendering threw it away. Concurrent
         // lanes are concurrent: they belong side by side, not behind a number.
-        string goalDisplay = string.Join("\n", goalTexts.ToArray());
+        string goalDisplay = string.Join("\n", goalDisplays.ToArray());
 
         // Meta line: "started HH:MM · {elapsed} · {active}/{total} lanes active" [COMPUTED]
         string metaLine = _directiveBandMeta;
@@ -12384,7 +12472,9 @@ class CockpitWindow : Window
         // ellipsis-trimmed -- so History matches the live collapsed card instead of dumping the
         // full goal text. The long goal only appears when this row is explicitly expanded.
         var head = new TextBlock();
-        head.Text = CardTitle(S(e, "conv_title"), S(e, "goal"));
+        string histSummary = S(e, "goal_summary");
+        head.Text = !string.IsNullOrEmpty(histSummary)
+            ? histSummary : CardTitle(S(e, "conv_title"), S(e, "goal"));
         head.Foreground = Fg; head.FontSize = 13;
         head.VerticalAlignment = VerticalAlignment.Center;
         head.TextTrimming = TextTrimming.CharacterEllipsis;
@@ -12538,6 +12628,7 @@ class CockpitWindow : Window
     {
         string name = S(w, "name");
         string goal = S(w, "goal");
+        string goalSummary = S(w, "goal_summary");
         string rawStatus = S(w, "status");
         string status = rawStatus == "ready" ? "waiting" : rawStatus;   // canonical (runner emits fine states)
         string reason = S(w, "reason");
@@ -12676,7 +12767,8 @@ class CockpitWindow : Window
         // for the configured agent, WARNING-colored 既定Copilot badge for a plain /chat/ (default) url.
         var agentBadge = BuildAgentBadge(conv, convTitle);
         if (agentBadge != null) { DockPanel.SetDock(agentBadge, Dock.Left); left.Children.Add(agentBadge); }
-        string headline = CardTitle(convTitle, goal);
+        string headline = !string.IsNullOrEmpty(goalSummary)
+            ? goalSummary : CardTitle(convTitle, goal);
         var ht = new TextBlock {
             Text = headline, Foreground = Fg, FontSize = 13.5, FontWeight = FontWeights.SemiBold,
             VerticalAlignment = VerticalAlignment.Center,
@@ -14463,6 +14555,10 @@ class CockpitWindow : Window
     {
         return FleetCommands.Write(_fleetDir, patch);
     }
+    bool SendTrackedCommand(Dictionary<string, object> patch, out string path)
+    {
+        return FleetCommands.WriteTracked(_fleetDir, patch, out path);
+    }
 
     // THE DEDUPE WENT WITH THE MERGE, DELIBERATELY. This used to read the pending `close` list
     // and skip a name already in it. With one command per file there is no pending list to
@@ -14942,6 +15038,7 @@ class CockpitWindow : Window
             _archivedKeys.Add(key);
             var e = new Dictionary<string, object>();
             e["key"] = key; e["goal"] = S(w, "goal"); e["status"] = status;
+            e["goal_summary"] = S(w, "goal_summary");
             e["conv_title"] = S(w, "conv_title");
             e["outcome"] = S(w, "outcome"); e["conv_url"] = conv;
             // Carry the disk transcript path + worker name so a HISTORY row can still show the
@@ -15021,6 +15118,7 @@ class CockpitWindow : Window
             _archivedKeys.Add(key);
             var e = new Dictionary<string, object>();
             e["key"] = key; e["goal"] = S(w, "goal"); e["status"] = S(w, "status");
+            e["goal_summary"] = S(w, "goal_summary");
             e["conv_title"] = S(w, "conv_title"); e["outcome"] = S(w, "outcome");
             e["conv_url"] = S(w, "conv_url");
             // see _archiveTerminal: carry transcript path + name so the history row can show the

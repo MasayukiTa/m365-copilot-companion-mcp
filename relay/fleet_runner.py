@@ -33,6 +33,7 @@ MCP_IMPL_AGENT_URL / MCP_FLEET_AGENT_URL in .env (gitignored).
 from __future__ import annotations
 
 import argparse
+from functools import lru_cache
 import io
 import json
 import math as _math
@@ -1517,6 +1518,22 @@ def _close_idle_copilot_pages(context) -> int:
         return 0
 
 
+
+@lru_cache(maxsize=4096)
+def _goal_summary(goal):
+    """Compact, deterministic task identity for UI only; never replaces the execution goal."""
+    text = str(goal or "")
+    if not text.strip():
+        return ""
+    try:
+        from relay import conv_title as _ct
+        return _ct.make_title(text, key=text)
+    except Exception:
+        # Display metadata must never break a run. Keep the fallback extractive and bounded.
+        one = " ".join(text.split())
+        return one if len(one) <= 64 else one[:63].rstrip() + "…"
+
+
 def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paused=False,
               ram_floor_mb=0.0, directive="", run_label="", goal_count=0, queued=0,
               reunlock=None, command_rejections=None):
@@ -1578,13 +1595,15 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         # UI already handles multi-goal honestly and should NOT fabricate a summary). Only
         # populated when there is a genuinely single directive -- never fabricated for multi-goal.
         "directive": directive,
-        # FIX 3 (P2): human-readable run label (verbatim first line of first goal, <=60 chars)
-        # and total goal count for the UI header.  run_label is NEVER synthesised -- verbatim only.
+        "directive_summary": _goal_summary(directive) if directive else "",
+        # Human-readable, display-only task identity plus total goal count. ``run_label`` is
+        # extractive/redacted metadata; authoritative instructions remain in goal/directive.
         "run_label": run_label,
         "goal_count": goal_count,
         "workers": [{
             "name": w.name,
             "goal": w.goal,
+            "goal_summary": _goal_summary(w.goal),
             "status": w.status,
             "pill": STATUS_PILL.get(w.status, (w.status, "muted"))[0],
             "color": STATUS_PILL.get(w.status, (w.status, "muted"))[1],
@@ -1773,15 +1792,64 @@ def _ledger_to_goal(entry):
     return g
 
 
-def _write_goals_ledger(state_dir, goals, started):
-    """Write the durable goals ledger ONCE at run start. Best-effort: on any failure,
-    log once to stderr and return -- never raise (a sidecar must not take down the run)."""
+def _write_goals_ledger(state_dir, goals, started, raise_on_error=False):
+    """Write the durable goals ledger once at run start.
+
+    Normal launches keep the historical best-effort behaviour. ``raise_on_error=True`` is used
+    when adopting a pending command, because that command must not be committed away until the
+    ledger is known durable.
+    """
     try:
         payload = {"started": started,
                    "goals": [_normalize_goal_for_ledger(g) for g in goals]}
         _write_atomic(os.path.join(state_dir, LAST_RUN_GOALS), payload)
+        return True
     except Exception as e:
+        if raise_on_error:
+            raise
         sys.stderr.write("[resume] WARN: could not write goals ledger: %s\n" % e)
+        return False
+
+
+def _append_goals_ledger(state_dir, goals, started, raise_on_error=False, return_new=False):
+    """Durably append live ``add_goal`` items to the current run ledger.
+
+    The original ledger was written only once at launch, which meant every task accepted
+    later through the live command channel vanished from ``--resume`` after a crash.  Keep
+    the existing stable-key semantics: repeated delivery of the same goal text is idempotent.
+    Returns the number of newly persisted entries. Best-effort, matching the run-start writer.
+    """
+    if not goals:
+        return [] if return_new else 0
+    try:
+        existing_started, existing = _read_goals_ledger(state_dir)
+        if existing_started is None:
+            raise RuntimeError("goals ledger is missing or corrupt; refusing to replace unknown run state")
+        out = list(existing or [])
+        seen = set()
+        for e in out:
+            if isinstance(e, dict):
+                seen.add(e.get("key") or _goal_key(e.get("text", "")))
+        newly_admitted = []
+        for goal in goals:
+            e = _normalize_goal_for_ledger(goal)
+            key = e.get("key")
+            if key in seen:
+                continue
+            out.append(e)
+            seen.add(key)
+            newly_admitted.append(goal)
+        if newly_admitted:
+            payload = {"started": existing_started, "goals": out}
+            _write_atomic(os.path.join(state_dir, LAST_RUN_GOALS), payload)
+        return newly_admitted if return_new else len(newly_admitted)
+    except Exception as e:
+        if raise_on_error:
+            raise
+        if not getattr(_append_goals_ledger, "_warned", False):
+            sys.stderr.write("[resume] WARN: could not append live goal to ledger: %s\n" % e)
+            _append_goals_ledger._warned = True
+        return [] if return_new else 0
 
 
 def _read_goals_ledger(state_dir):
@@ -1816,13 +1884,13 @@ def _read_done_map(state_dir):
 
 
 def _update_done_map(state_dir, workers):
-    """Rewrite last_run_done.json from the live workers: map goal_key -> outcome for
-    every worker that reached a successful terminal outcome (DONE). Best-effort: a
+    """Merge live successful workers into last_run_done.json: goal_key -> outcome.
+    Existing success keys are monotonic across reconnect chunks. Best-effort: a
     failure logs once to stderr and is swallowed (never crashes the snapshot hook).
 
     Cheap: called on the snapshot tick, iterates the in-memory workers, atomic write."""
     try:
-        done = {}
+        done = _read_done_map(state_dir)
         for w in workers:
             outcome = getattr(w, "outcome", None)
             if outcome in _RESUME_SUCCESS_OUTCOMES:
@@ -1833,6 +1901,28 @@ def _update_done_map(state_dir, workers):
         if not getattr(_update_done_map, "_warned", False):
             sys.stderr.write("[resume] WARN: could not write done map: %s\n" % e)
             _update_done_map._warned = True
+
+
+def _merge_final_done_map(state_dir, results):
+    """Merge successful outcomes from one final chunk into the durable done-map.
+
+    ``run_relay_fleet`` may return only the workers from the last reconnect chunk, and a
+    graceful stop can return just the workers active at stop time. Replacing the file from
+    that partial ``results`` list erases DONE outcomes from earlier chunks and makes
+    ``--resume`` replay work that already succeeded. Existing DONE keys are therefore
+    monotonic for the life of the ledger.
+    """
+    done = _read_done_map(state_dir)
+    for r in results or []:
+        try:
+            outcome = r.get("outcome")
+            goal = r.get("goal") or ""
+        except Exception:
+            continue
+        if outcome in _RESUME_SUCCESS_OUTCOMES and goal:
+            done[_goal_key(goal)] = outcome
+    _write_atomic(os.path.join(state_dir, LAST_RUN_DONE), done)
+    return done
 
 
 def _resume_goals(state_dir):
@@ -1862,11 +1952,12 @@ def _resume_goals(state_dir):
 # relaunch it with --resume. Best-effort throughout: a marker read/write/remove failure
 # is logged (write) or silently tolerated (read/clear) and never takes down the run.
 ACTIVE_MARKER = "fleet_run_active.json"
+RUN_LOCK_FILE = "fleet_runner.lock"
 
 
 def _resume_argv(argv):
-    """Strip goal-specifying flags (-g/--goal VALUE, --goals-file VALUE) and any existing
-    --resume from an argv list, returning the remainder suitable for relaunching with a
+    """Strip goal-specifying flags (-g/--goal, --goals-file, --adopt-command) and any
+    existing --resume from an argv list, returning the remainder suitable for relaunching with a
     single --resume appended. --resume alone reconstructs the goal set from the durable
     ledger (last_run_goals.json); replaying the ORIGINAL -g/--goals-file on top would
     duplicate goals (both the already-finished and the unfinished ones get re-added
@@ -1878,10 +1969,10 @@ def _resume_argv(argv):
         if skip_next:
             skip_next = False
             continue
-        if a in ("-g", "--goal", "--goals-file"):
+        if a in ("-g", "--goal", "--goals-file", "--adopt-command"):
             skip_next = True
             continue
-        if a.startswith("--goal=") or a.startswith("--goals-file="):
+        if a.startswith("--goal=") or a.startswith("--goals-file=") or a.startswith("--adopt-command="):
             continue
         if a == "--resume":
             continue
@@ -1889,7 +1980,7 @@ def _resume_argv(argv):
     return out
 
 
-def _write_active_marker(state_dir, argv=None, pid=None, start_ts=None):
+def _write_active_marker(state_dir, argv=None, pid=None, start_ts=None, raise_on_error=False):
     """Best-effort: record this run as ACTIVE (pid, start_ts, argv, and a precomputed
     resume_argv) so a supervisor can detect an interrupted run later. Never raises -- a
     marker failure is logged once to stderr and the run continues untouched."""
@@ -1900,8 +1991,12 @@ def _write_active_marker(state_dir, argv=None, pid=None, start_ts=None):
                    "argv": raw_argv,
                    "resume_argv": _resume_argv(raw_argv)}
         _write_atomic(os.path.join(state_dir, ACTIVE_MARKER), payload)
+        return True
     except Exception as e:
+        if raise_on_error:
+            raise
         sys.stderr.write("[resume] WARN: could not write active-run marker: %s\n" % e)
+        return False
 
 
 def _read_active_marker(state_dir):
@@ -1918,15 +2013,108 @@ def _read_active_marker(state_dir):
         return None
 
 
-def _clear_active_marker(state_dir):
-    """Best-effort removal of the ACTIVE marker on clean completion / explicit user stop.
-    A missing file is fine (nothing to clear); never raises."""
+def _active_run_conflict_pid(state_dir, self_pid=None):
+    """Return the live pid that already owns this state dir, else 0.
+
+    This is the migration guard for runners started before the OS lock existed, and also makes
+    the refusal human-readable. Unknown pid state is treated as alive by `_pid_alive`, on purpose:
+    overwriting another coordinator's ledger/status is worse than refusing one launch.
+    """
+    marker_path = os.path.join(state_dir, ACTIVE_MARKER)
+    if not os.path.isfile(marker_path):
+        return 0
+    marker = _read_active_marker(state_dir)
+    if not marker:
+        return -1                 # fail closed: may belong to a pre-lock legacy coordinator
     try:
-        p = os.path.join(state_dir, ACTIVE_MARKER)
-        if os.path.isfile(p):
-            os.remove(p)
+        pid = int(marker.get("pid") or 0)
+        me = int(os.getpid() if self_pid is None else self_pid)
+    except Exception:
+        return -1
+    if pid <= 0:
+        return -1
+    if pid == me:
+        return 0
+    return pid if _pid_alive(pid) else 0
+
+
+def _acquire_run_lock(state_dir):
+    """Non-blocking OS lock for one fleet coordinator per state directory.
+
+    A marker file is evidence, not exclusion: two launchers can both inspect a missing/stale
+    marker before either writes its own. The kernel byte-range lock closes that race and is
+    automatically released when a killed process dies, so it cannot become a stale lock.
+    Returns the open lock handle on success, None when another coordinator owns it.
+    """
+    os.makedirs(state_dir, exist_ok=True)
+    path = os.path.join(state_dir, RUN_LOCK_FILE)
+    fh = None
+    try:
+        fh = open(path, "a+b", buffering=0)
+        fh.seek(0, os.SEEK_END)
+        if fh.tell() == 0:
+            fh.write(b"\0")
+        fh.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fh
+    except (OSError, IOError):
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:
+                pass
+        return None
+
+
+def _release_run_lock(fh):
+    """Release a handle returned by `_acquire_run_lock`; safe on None/already-gone."""
+    if fh is None:
+        return
+    try:
+        fh.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
     except Exception:
         pass
+    try:
+        fh.close()
+    except Exception:
+        pass
+
+
+def _clear_active_marker(state_dir, owner_pid=None):
+    """Remove only THIS coordinator's ACTIVE marker.
+
+    The old implementation unconditionally removed the path. Measured 2026-09-26: runner A
+    finished cleanup after runner B had already written its fresh marker, so A deleted B's marker
+    and external resume paths started more coordinators on the same `.fleet`. Ownership is part
+    of the delete now. Missing/corrupt/mismatched marker is a safe no-op. Returns True iff deleted.
+    """
+    owner = int(os.getpid() if owner_pid is None else owner_pid)
+    marker = _read_active_marker(state_dir)
+    try:
+        marker_pid = int((marker or {}).get("pid") or 0)
+    except Exception:
+        return False
+    if marker_pid <= 0 or marker_pid != owner:
+        return False
+    try:
+        p = os.path.join(state_dir, ACTIVE_MARKER)
+        os.remove(p)
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
 
 
 def should_auto_resume(marker_exists, pid_alive, user_stopped=False):
@@ -2178,6 +2366,10 @@ def _validate_command(cmd, state_dir):
     for k in cmd:
         if k not in _COMMAND_KEYS:
             errs.append("unknown key %r" % _CONTROL.sub("?", str(k))[:40])
+    if "add_goal" in cmd:
+        mixed = sorted(k for k in cmd if k not in ("add_goal", "ack"))
+        if mixed:
+            errs.append("add_goal cannot be combined with control key(s): %s" % mixed[:8])
 
     def _items(key, v):
         items = v if isinstance(v, list) else [v]
@@ -2352,104 +2544,334 @@ def _write_receipt(state_dir, claimed, body) -> bool:
         return False
 
 
-def read_commands(state_dir) -> list:
-    """Every pending command for this run, oldest first, CONSUMED as it is read.
+def _pid_birth_token(pid):
+    """Stable-enough process identity component in milliseconds since epoch.
 
-    ONE FILE PER COMMAND, WHICH IS WHY THERE IS NO LOCK HERE. The single commands.json was a
-    read-modify-write on every writer: each read the whole file, added its own entry and wrote
-    it back, so whichever replaced second deleted the other's work -- and a lost goal looks
-    exactly like a goal that was never sent. A lock was added for the Python writers, but the
-    cockpit (ui/CopilotChat.cs) writes this file too and takes no lock, and this reader took
-    none either. A uniquely named file per command removes the read-modify-write entirely:
-    nothing merges, so nothing can clobber, and a writer needs no lock at all -- it only has to
-    land its own file atomically.
-
-    The legacy commands.json is still read, and must stay read: a shipped cockpit binary
-    predating the migration writes it, and those are built separately from this file.
-
-    THIS PARAGRAPH USED TO SAY THE LACK OF A LOCK STOPPED MATTERING BECAUSE "the cockpit is
-    its only writer -- one writer cannot race itself". THAT WAS FALSE, and write_command's own
-    docstring said so the whole time: the lock "could not fix it for ui/CopilotChat.cs, which
-    writes the same file from a separately built binary". Counted 2026-09-22: THREE hand-rolled
-    read-modify-writers across TWO processes -- ui/FleetCockpit.cs (ReadCommands/WriteCommands,
-    a dozen callers), ui/CopilotChat.cs AppendCommand, and ui/CopilotChat.cs EnqueueToFleet,
-    which also wrote a BOM where the other two did not. Two docstrings in one system
-    contradicted each other and the optimistic one was the wrong one.
-
-    What it cost, if it had not been found: a lost add_goal or steer, indistinguishable from
-    one never sent; an already-consumed command put back by a writer that read before the
-    os.remove below and wrote after it, which is a duplicate goal; and a torn File.WriteAllText
-    destroyed rather than preserved, because the legacy branch removes an unparseable file
-    instead of renaming it .bad the way the commands.d branch does.
-
-    The C# writers were migrated to commands.d/ on 2026-09-22, which is what actually removes
-    the race -- a lock was never available across those two binaries.
-
-    A file that will not parse is renamed .bad rather than deleted, so it stops being retried
-    forever without the instruction in it being destroyed. `.tmp` files are a writer mid-flight
-    and are skipped.
+    Numeric pids are recyclable. ``create_time`` distinguishes a later unrelated process that
+    inherited the same pid from the coordinator that originally claimed a command. A failure to
+    read it returns 0 and callers fall back to the old conservative pid-only behaviour.
     """
-    out = []
-    legacy = os.path.join(state_dir, "commands.json")
     try:
-        if os.path.isfile(legacy):
-            with open(legacy, encoding="utf-8-sig") as fh:   # tolerate a BOM from the C# cockpit
-                cmd = json.load(fh)
-            out.append(cmd)
-            os.remove(legacy)
+        import psutil
+        return int(round(float(psutil.Process(int(pid)).create_time()) * 1000.0))
+    except Exception:
+        return 0
+
+
+def _claim_owner_identity(path):
+    """Return ``(pid, birth_token)`` from ``...claim-PID[-BIRTH]``.
+
+    ``birth_token == 0`` is the legacy pid-only claim format. Committed suffixes such as
+    ``.applied`` are ignored by parsing only the claim owner segment.
+    """
+    name = os.path.basename(path)
+    tag = ".claim-"
+    if tag not in name:
+        return 0, 0
+    owner = name.split(tag, 1)[1].split(".", 1)[0]
+    parts = owner.split("-", 1)
+    try:
+        pid = int(parts[0])
+    except Exception:
+        return 0, 0
+    birth = 0
+    if len(parts) > 1:
+        try:
+            birth = int(parts[1])
+        except Exception:
+            birth = 0
+    return pid, birth
+
+
+def _claim_owner_pid(path):
+    """Backward-compatible pid-only view of :func:`_claim_owner_identity`."""
+    return _claim_owner_identity(path)[0]
+
+
+def _claim_owner_is_live(path):
+    """True only when the claim still belongs to the same live process instance."""
+    pid, birth = _claim_owner_identity(path)
+    if pid <= 0 or not _pid_alive(pid):
+        return False
+    if birth <= 0:
+        return True                 # legacy claim: pid is all the evidence we have
+    now_birth = _pid_birth_token(pid)
+    if now_birth <= 0:
+        return True                 # cannot disprove ownership -> do not steal somebody's work
+    return now_birth == birth
+
+
+def _committed_claim_state(name):
+    """Receipt state encoded in a non-replayable claim tombstone suffix."""
+    if name.endswith(".applied"):
+        return True
+    if name.endswith(".rejected"):
+        return False
+    if name.endswith(".read"):
+        return None
+    return "not-committed"
+
+
+def _recover_committed_claim_receipt(state_dir, path, applied):
+    """Publish a missing receipt from a committed tombstone; delete only after publication.
+
+    The tombstone still contains the original command JSON.  That makes the commit point and
+    receipt publication crash-recoverable without making the command replayable.
+    """
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            cmd = json.load(fh)
+    except Exception:
+        return False                 # preserve evidence; never replay a committed unknown body
+    ack = cmd.get("ack") if isinstance(cmd, dict) else None
+    if isinstance(ack, str) and ack:
+        # Invalid ack paths can never be made durable and validation already rejects them; they
+        # must not pin an applied tombstone forever. A valid path that merely failed to write is
+        # retained and retried next sweep/start.
+        if ack_receipt_path(state_dir, ack) is None:
+            return True
+        name = os.path.basename(path).split(".claim-", 1)[0]
+        body = {"read": True, "ts": time.time(), "file": name}
+        if applied is not None:
+            body["applied"] = bool(applied)
+        if applied is False:
+            errs = validate_command(cmd, state_dir)
+            if errs:
+                body.update({"rejected": True, "errors": errs[:10]})
+        if not _write_receipt(state_dir, ack, body):
+            return False
+    return True
+
+
+def _recover_stale_command_claims(state_dir):
+    """Recover dead owners' claims and finish committed tombstones without replaying them."""
+    roots = [state_dir, os.path.join(state_dir, COMMANDS_DIR)]
+    recovered = 0
+    for root in roots:
+        try:
+            names = list(os.listdir(root))
+        except OSError:
+            continue
+        for name in names:
+            if ".claim-" not in name:
+                continue
+            path = os.path.join(root, name)
+            committed = _committed_claim_state(name)
+            if committed != "not-committed":
+                if _recover_committed_claim_receipt(state_dir, path, committed):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+                continue
+            if _claim_owner_is_live(path):
+                continue
+            original = path.split(".claim-", 1)[0]
+            if os.path.exists(original):
+                try:
+                    os.replace(path, path + ".orphan")
+                except OSError:
+                    pass
+                continue
+            try:
+                os.replace(path, original)
+                recovered += 1
+            except OSError:
+                pass
+    return recovered
+
+
+def _claim_one_command(path, display_name=None):
+    """Atomically take one command file for this process, or None if somebody else won."""
+    _me = os.getpid()
+    _birth = _pid_birth_token(_me)
+    claimed = path + (".claim-%d-%d" % (_me, _birth) if _birth > 0 else ".claim-%d" % _me)
+    try:
+        os.replace(path, claimed)
+    except OSError:
+        return None
+    try:
+        with open(claimed, encoding="utf-8-sig") as fh:
+            cmd = json.load(fh)
     except Exception:
         try:
-            os.remove(legacy)
+            os.replace(claimed, path + ".bad")
         except OSError:
             pass
+        return None
+    return {"cmd": cmd, "original": path, "claimed": claimed,
+            "name": display_name or os.path.basename(path)}
+
+
+def claim_commands(state_dir) -> list:
+    """Claim every pending fleet command, oldest first, WITHOUT deleting it.
+
+    The live runner applies each returned claim and calls :func:`commit_command_claim` only after
+    the command's durable effects are in place.  If the process dies first, the next coordinator
+    recovers the dead pid's ``.claim-*`` file and retries it.  This closes the former
+    read/delete -> apply/ledger crash window.
+    """
+    _recover_stale_command_claims(state_dir)
+    out = []
+
+    # Shipped pre-commands.d cockpit binaries can still write this legacy file. Claim it too so
+    # compatibility does not re-introduce the durability hole.
+    legacy = os.path.join(state_dir, "commands.json")
+    if os.path.isfile(legacy):
+        c = _claim_one_command(legacy, "commands.json")
+        if c is not None:
+            out.append(c)
+
     d = os.path.join(state_dir, COMMANDS_DIR)
     try:
         names = sorted(n for n in os.listdir(d) if n.endswith(".json"))
     except OSError:
         return out
     for name in names:
-        path = os.path.join(d, name)
-        try:
-            with open(path, encoding="utf-8-sig") as fh:
-                cmd = json.load(fh)
-            out.append(cmd)
-        except Exception:
-            try:
-                os.replace(path, path + ".bad")
-            except OSError:
-                pass
-            continue
-        # LANDING MARK: prove the goal was actually READ here, not merely dispatched.
-        # The sender (relay/task_router.fleet_handoff) filed the goal "dispatched" the
-        # instant fleet_is_live() returned True -- but that check trusts a status.json up
-        # to FLEET_LIVE_MAX_AGE_S old, so a run that had already died still looked live for
-        # up to 30s. A goal handed over in that window was written here, consumed-on-read
-        # by no one, and lost, while its done/ record said "dispatched". Nothing on the
-        # receiving side ever recorded that a command was taken, so the sender's claim
-        # could never be checked. When a command carries an `ack` path, drop a small
-        # receipt there the moment before we delete the command: an audit can then tell a
-        # goal a live fleet really picked up from one that vanished into the stale window.
-        #
-        # THE RECEIPT'S LOCATION IS DERIVED, NOT OBEYED (SEC-08): see ack_receipt_path. An
-        # `ack` naming anywhere but this state dir's acks/ gets no receipt, and the command it
-        # rode on is refused by _apply_command's validation. A command that is refused for any
-        # other reason still gets its receipt -- it WAS read, which is all a receipt claims --
-        # and the receipt says it was rejected and why, so the sender is not left re-sending.
-        ack = (cmd or {}).get("ack") if isinstance(cmd, dict) else None
-        if isinstance(ack, str) and ack:
-            body = {"read": True, "ts": time.time(), "file": name}
-            errs = validate_command(cmd, state_dir)
-            if errs:
-                body.update({"rejected": True, "errors": errs[:10]})
-            if not _write_receipt(state_dir, ack, body):
-                print("[command] no landing receipt for %s: its ack names no file in this "
-                      "fleet's %s/, or the write failed" % (name, ACKS_DIR), flush=True)
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+        c = _claim_one_command(os.path.join(d, name), name)
+        if c is not None:
+            out.append(c)
     return out
 
+
+def restore_command_claim(claim) -> bool:
+    """Return an uncommitted claim to the input channel so the next sweep can retry it."""
+    try:
+        claimed = claim["claimed"]
+        original = claim["original"]
+    except Exception:
+        return False
+    if not os.path.isfile(claimed):
+        return False
+    if os.path.exists(original):
+        try:
+            os.replace(claimed, claimed + ".orphan")
+        except OSError:
+            pass
+        return False
+    try:
+        os.replace(claimed, original)
+        return True
+    except OSError:
+        return False
+
+
+def commit_command_claim(state_dir, claim, applied=None, rejected_errors=None) -> bool:
+    """Durably commit one claim, then publish its receipt.
+
+    Rename is the non-replayable commit point.  Receipt publication is recoverable from the
+    committed JSON tombstone; a transient receipt failure therefore keeps the tombstone rather
+    than losing both the command and its acknowledgement.
+    """
+    try:
+        claimed = claim["claimed"]
+        cmd = claim["cmd"]
+        name = claim.get("name") or os.path.basename(claim.get("original") or claimed)
+    except Exception:
+        return False
+    suffix = ".applied" if applied is True else (".rejected" if applied is False else ".read")
+    committed = claimed + suffix
+    until = time.time() + 2.0
+    while True:
+        try:
+            os.replace(claimed, committed)
+            break
+        except OSError:
+            if time.time() >= until:
+                return False
+            time.sleep(0.02)
+
+    ack = (cmd or {}).get("ack") if isinstance(cmd, dict) else None
+    receipt_ok = True
+    if isinstance(ack, str) and ack:
+        body = {"read": True, "ts": time.time(), "file": name}
+        if applied is not None:
+            body["applied"] = bool(applied)
+        errs = list(rejected_errors or [])
+        if errs:
+            body.update({"rejected": True, "errors": errs[:10]})
+        if ack_receipt_path(state_dir, ack) is None:
+            receipt_ok = True       # impossible/invalid ack; validation owns this refusal
+        else:
+            receipt_ok = _write_receipt(state_dir, ack, body)
+            if not receipt_ok:
+                print("[command] committed %s; receipt write deferred to tombstone recovery"
+                      % name, flush=True)
+    if receipt_ok:
+        try:
+            os.remove(committed)
+        except OSError:
+            pass
+    return True
+
+
+def retry_pending_command_commits(state_dir, pending) -> int:
+    """Retry commit only, never command effects; mutate ``pending`` to the still-failed set."""
+    keep = []
+    for claim, applied, errors in list(pending or []):
+        if not commit_command_claim(state_dir, claim, applied=applied, rejected_errors=errors):
+            keep.append((claim, applied, errors))
+    pending[:] = keep
+    return len(keep)
+
+
+def claim_specific_command(state_dir, path):
+    """Claim exactly one pending commands.d JSON, but only from this state directory."""
+    if not path:
+        return None
+    command_dir = os.path.join(state_dir, COMMANDS_DIR)
+    full = os.path.abspath(path)
+    if not full.lower().endswith(".json"):
+        return None
+    if not _same_dir(os.path.dirname(full), command_dir):
+        return None
+    _recover_stale_command_claims(state_dir)
+    return _claim_one_command(full, os.path.basename(full))
+
+
+def claim_adopt_command(state_dir, path):
+    """Claim a pending add_goal command for a fresh runner to adopt as initial work.
+
+    Only ``add_goal`` plus its optional landing ``ack`` may be adopted. A control command
+    (stop/steer/settings/close) belongs to the run it addressed and must never become a new run.
+    Invalid commands are restored before returning so a diagnosis never destroys the request.
+    Returns ``(claim_or_none, goals, errors)``.
+    """
+    claim = claim_specific_command(state_dir, path)
+    if claim is None:
+        return None, [], ["adopt command is not a pending file in this fleet's commands.d"]
+    cmd = claim["cmd"]
+    errors = list(validate_command(cmd, state_dir))
+    if isinstance(cmd, dict):
+        extra = sorted(k for k in cmd if k not in ("add_goal", "ack"))
+        if extra:
+            errors.append("adopt command contains live-control key(s): %s" % extra[:8])
+        if "add_goal" not in cmd:
+            errors.append("adopt command has no add_goal")
+    goals = goals_from_command(cmd) if not errors else []
+    if not goals and not errors:
+        errors.append("adopt command contains no usable goals")
+    if errors:
+        restore_command_claim(claim)
+        return None, [], errors
+    return claim, goals, []
+
+
+def read_commands(state_dir) -> list:
+    """Compatibility consumer: return pending commands and commit them as READ.
+
+    Production fleet execution uses ``claim_commands`` directly and commits only AFTER apply.
+    Tests and small seam tools historically call ``read_commands`` as the receiver itself; keep
+    that API and its landing-receipt semantics without putting the live runner back on the old
+    read/delete-before-apply path.
+    """
+    out = []
+    for claim in claim_commands(state_dir):
+        cmd = claim["cmd"]
+        errs = validate_command(cmd, state_dir)
+        commit_command_claim(state_dir, claim, applied=None, rejected_errors=errs)
+        out.append(cmd)
+    return out
 
 def goals_from_command(cmd) -> list:
     """The `add_goal` entries in a fleet command file, as goals this run can queue.
@@ -2550,6 +2972,7 @@ def _print_table(workers, total=None):
 # this file (outside main()'s local scope) knows which state_dir's ACTIVE marker to
 # clear on an explicit Ctrl+C. None until a run actually starts.
 _ACTIVE_STATE_DIR = None
+_ACTIVE_RUN_LOCK = None
 
 
 
@@ -2599,6 +3022,7 @@ def report_duplicate_completions(state_dir, out=print, transcripts=None):
 
 
 def main():
+    global _ACTIVE_STATE_DIR, _ACTIVE_RUN_LOCK
     # cp932 console: goal/reason text can contain chars the legacy codepage cannot
     # encode (a worker once died printing U+26A0); degrade to '?' instead of crashing.
     for _s in (sys.stdout, sys.stderr):
@@ -2613,6 +3037,7 @@ def main():
                                             or os.environ.get("MCP_IMPL_AGENT_URL", "")))
     ap.add_argument("-g", "--goal", action="append", help="a goal (repeatable)")
     ap.add_argument("--goals-file", help="file with one goal per line (# comments ok)")
+    ap.add_argument("--adopt-command", help="rescue one pending commands.d add_goal as this run's initial work; used by the local cockpit when a live run ends during submission")
     ap.add_argument("--force", action="store_true",
                     help="start even when the launch gate's preconditions are unmet; the run still happens and its measurements carry whatever was wrong")
     ap.add_argument("--resume", action="store_true",
@@ -2731,6 +3156,58 @@ def main():
                     help="where to write the live status.json the cockpit reads")
     args = ap.parse_args()
 
+    # FINAL EXCLUSION LAYER: one state dir may have exactly one coordinator. Do this before
+    # coordinator logs, queue receipts, retention, resume expansion, or any durable run-state
+    # rewrite. External launchers have guards too, but the process that owns the files is the
+    # only layer that can make the invariant unconditional.
+    os.makedirs(args.state_dir, exist_ok=True)
+    _ACTIVE_STATE_DIR = args.state_dir
+    _owner = _active_run_conflict_pid(args.state_dir)
+    if _owner:
+        if _owner < 0:
+            print("REFUSING TO START: fleet state directory has an unreadable active-run marker: %s"
+                  % args.state_dir, flush=True)
+        else:
+            print("REFUSING TO START: fleet state directory is already owned by live pid %d: %s"
+                  % (_owner, args.state_dir), flush=True)
+        return 3
+    _ACTIVE_RUN_LOCK = _acquire_run_lock(args.state_dir)
+    if _ACTIVE_RUN_LOCK is None:
+        print("REFUSING TO START: another fleet coordinator holds the state-dir lock: %s"
+              % args.state_dir, flush=True)
+        return 3
+    # Close the marker-vs-lock race: another legacy runner may have written a marker after the
+    # first check but before this process took the new OS lock.
+    _owner = _active_run_conflict_pid(args.state_dir)
+    if _owner:
+        _release_run_lock(_ACTIVE_RUN_LOCK)
+        _ACTIVE_RUN_LOCK = None
+        if _owner < 0:
+            print("REFUSING TO START: fleet state directory gained an unreadable active-run marker: %s"
+                  % args.state_dir, flush=True)
+        else:
+            print("REFUSING TO START: fleet state directory became owned by live pid %d: %s"
+                  % (_owner, args.state_dir), flush=True)
+        return 3
+
+    _adopt_claim = None
+    _adopt_goals = []
+    if args.adopt_command:
+        _adopt_claim, _adopt_goals, _adopt_errors = claim_adopt_command(args.state_dir, args.adopt_command)
+        if _adopt_claim is None:
+            # If the exact pending file vanished after the UI launched this rescuer, another
+            # runner already claimed it. That is success-by-race, not an error; anything still
+            # present but invalid is a real refusal.
+            if not os.path.exists(args.adopt_command):
+                print("ADOPT: command is no longer pending; another runner already took it.", flush=True)
+                _release_run_lock(_ACTIVE_RUN_LOCK)
+                _ACTIVE_RUN_LOCK = None
+                return 0
+            print("ADOPT: refusing pending command: %s" % "; ".join(_adopt_errors), flush=True)
+            _release_run_lock(_ACTIVE_RUN_LOCK)
+            _ACTIVE_RUN_LOCK = None
+            return 4
+
     # Capture the coordinator's own stdout/stderr to a durable log under state_dir, from
     # here (right after argparse) so it covers argparse-error exits too, regardless of
     # which launcher started this process. Best-effort -- never crashes on failure.
@@ -2740,7 +3217,7 @@ def main():
     # goal given on the command line appeared nowhere until the run was already going, so a run
     # that died on a precondition left the operator unable to tell it from a command never
     # typed. Cleared at run start, where the goals ledger takes over.
-    _cli_queue_paths = _record_cli_submission(args.state_dir, _read_goals(args), sys.argv)
+    _cli_queue_paths = _record_cli_submission(args.state_dir, _adopt_goals + _read_goals(args), sys.argv)
 
     # RETENTION RUNS ONCE, HERE, AND NOT ON A TIMER -- the same reasoning as the session
     # store's pass: a sweep that can fire mid-run is a sweep that can delete the transcript
@@ -2760,10 +3237,7 @@ def main():
     except Exception as _exc:                     # never let housekeeping stop a run
         print("fleet retention skipped: %s" % _exc, flush=True)
 
-    # let the KeyboardInterrupt handler at the bottom of this file clear the ACTIVE
-    # marker even though it runs outside main()'s local scope.
-    global _ACTIVE_STATE_DIR
-    _ACTIVE_STATE_DIR = args.state_dir
+    # KeyboardInterrupt already knows this state_dir from the early single-instance gate above.
 
     # ULTRA ACCURACY preset: maximise CLEAN correctness, ignore time. Wires the verified accuracy
     # levers -- the session's failure analysis pinned the bottleneck on edit PRECISION (right file,
@@ -2823,7 +3297,7 @@ def main():
     print("[effort] %s  (refuter=%s lenses=%s refute<=%d research<=%d)"
           % (_eff, args.refuter, args._lenses, args.max_refute, args.max_research))
 
-    goals = _read_goals(args)
+    goals = _adopt_goals + _read_goals(args)
 
     # THE LENS IS CHOSEN BEFORE THE GOALS ARE READ, AND THE GOALS ARE THE EVIDENCE.
     #
@@ -2902,16 +3376,12 @@ def main():
     # directive, so we set it to "" -- the UI handles multi-goal runs honestly and we never
     # fabricate a summary. Only one goal -> directive = that goal's text.
     directive = gtexts[0] if len(gtexts) == 1 else ""
-    # FIX 3 (P2): run_label = verbatim first line of the first goal, truncated to 60 chars,
-    # with leading list markers / whitespace stripped.  NEVER synthesised.
-    import re as _re
-    _first_goal_text = gtexts[0] if gtexts else ""
-    _first_line = _first_goal_text.splitlines()[0] if _first_goal_text else ""
-    _first_line = _re.sub(r'^[\s\-*#\d.>]+', '', _first_line).strip()
-    run_label = _first_line[:60]
+    # Display-only task identity. The full execution goal remains in workers[].goal / directive.
+    # Reuse the same deterministic, redacting extractor as conversation titles instead of
+    # exposing the first 60 characters of a 2-4k operational prompt.
+    run_label = _goal_summary(gtexts[0]) if gtexts else ""
     goal_count = len(gtexts)
 
-    os.makedirs(args.state_dir, exist_ok=True)
     status_path = os.path.join(args.state_dir, "status.json")
     started = time.time()
     # full-text conversation transcripts (one jsonl per worker, all turns untruncated).
@@ -2923,23 +3393,47 @@ def main():
     except Exception:
         pass
 
-    # RUN-RESUME: write the durable goals ledger ONCE, now, so a crash mid-run leaves a
-    # record `--resume` can relaunch from. Reset the done-map to empty for this run so a
-    # previous run's completions never mask this run's goals. Best-effort (never crashes).
-    _write_goals_ledger(args.state_dir, goals, started)
-    # The run is under way and its goals are in the ledger and about to be in status.json, so
-    # the queue entries written at startup have done their job.
-    _clear_cli_submission(_cli_queue_paths)
+    # RUN-RESUME: the ledger is the durable owner of every initial goal. For an adopted live
+    # command this write is REQUIRED, not best-effort: the command may not be committed away
+    # until another durable source can reconstruct it.
+    try:
+        _write_goals_ledger(args.state_dir, goals, started, raise_on_error=True)
+    except Exception as e:
+        if _adopt_claim is not None:
+            restore_command_claim(_adopt_claim)
+        print("[resume] could not write the durable goals ledger: %s" % e, flush=True)
+        _release_run_lock(_ACTIVE_RUN_LOCK)
+        _ACTIVE_RUN_LOCK = None
+        return 5
     try:
         _write_atomic(os.path.join(args.state_dir, LAST_RUN_DONE), {})
     except Exception as e:
         sys.stderr.write("[resume] WARN: could not reset done map: %s\n" % e)
 
-    # RUN-ACTIVE marker: written now that we know goals are actually going to run (the
-    # early --resume-with-nothing-to-do exit above already returned). Removed on clean
-    # completion / explicit stop below; its survival past this process's death is exactly
-    # what tells a boot-time supervisor the run was interrupted (see should_auto_resume()).
-    _write_active_marker(args.state_dir, start_ts=started)
+    # Write interruption recovery BEFORE committing an adopted command. From the instant the
+    # command disappears, a crash must still leave both its goals ledger and an active marker
+    # that tells the supervisor to resume that ledger.
+    try:
+        _write_active_marker(args.state_dir, start_ts=started,
+                             raise_on_error=bool(_adopt_claim))
+    except Exception as e:
+        if _adopt_claim is not None:
+            restore_command_claim(_adopt_claim)
+        print("[resume] could not durably mark adopted work active: %s" % e, flush=True)
+        _release_run_lock(_ACTIVE_RUN_LOCK)
+        _ACTIVE_RUN_LOCK = None
+        return 5
+    if _adopt_claim is not None:
+        if not commit_command_claim(args.state_dir, _adopt_claim, applied=True):
+            restore_command_claim(_adopt_claim)
+            _clear_active_marker(args.state_dir, owner_pid=os.getpid())
+            print("ADOPT: durable goal ledger exists but command commit failed; returned command to queue.", flush=True)
+            _release_run_lock(_ACTIVE_RUN_LOCK)
+            _ACTIVE_RUN_LOCK = None
+            return 5
+
+    # The run is now represented by ledger + active marker; optimistic startup queue rows can go.
+    _clear_cli_submission(_cli_queue_paths)
 
     # an EXPLICIT --max-concurrent (>=0) was given on the CLI (not the -1 "ask the cockpit"
     # sentinel). Used for the precedence rule below: CLI wins over settings.txt autoscale.
@@ -2947,9 +3441,14 @@ def main():
     if args.max_concurrent > 0:
         max_conc = args.max_concurrent
     elif args.max_concurrent == 0:
-        max_conc = auto_concurrency(len(goals))           # 0 = auto from free RAM
+        # The run is a long-lived queue: add_goal can add work after launch.  Asking RAM how
+        # many of the *initial* goals fit permanently shrinks a one-goal run to one lane.
+        max_conc = auto_concurrency(AUTOSCALE_CEILING_DEFAULT)  # 0 = auto from free RAM
     else:
-        max_conc = min(settings_maxtabs(), len(goals))    # -1 = the cockpit's setting (default 3)
+        # Do not cap the live capacity by len(goals) at t=0.  The pending queue itself prevents
+        # over-admission when only one goal exists; keeping the configured capacity lets later
+        # add_goal submissions use the idle lanes immediately.
+        max_conc = settings_maxtabs()                    # -1 = cockpit setting (default 3)
 
     # ── autoscale: the user picks a DEFAULT (start) and a CEILING (上限). Start at the
     # default, shrink when RAM is tight, grow toward the ceiling when RAM is free.
@@ -2982,7 +3481,9 @@ def main():
         # the fixed cap exactly as before.
         asc_ceiling = AUTOSCALE_CEILING_DEFAULT if autoscale else max(asc_default,
                                                                       settings_maxtabs())
-    asc_ceiling = max(1, min(asc_ceiling, len(goals)))
+    # Same long-lived-queue rule as max_conc above.  The ceiling is machine/operator capacity,
+    # not the number of goals present at startup.  Keep the ordinary tab safety bound instead.
+    asc_ceiling = max(TABS_BOUNDS[0], min(int(asc_ceiling), TABS_BOUNDS[1]))
     asc_default = max(1, min(asc_default, asc_ceiling))      # default never exceeds the ceiling
     autoscale_max = asc_ceiling
     if autoscale:
@@ -3118,22 +3619,43 @@ def main():
                                        # the button worked rather than watching silence
     rejections_box = []                # commands refused by validate_command -- surfaced in
                                        # status.json as command_rejections (SEC-08)
+    _pending_command_commits = []      # effects already applied; retry COMMIT only, never apply
 
     def _drain_commands(workers):
-        # cockpit -> fleet control channel. {"close":["w2"], "set_maxtabs":5}. Consume.
-        # EVERY pending command, oldest first -- see read_commands for why they are separate
-        # files now. One malformed command must not cost the ones behind it, so the body is
-        # per-command and its except is too.
-        for cmd in read_commands(args.state_dir):
-            _apply_command(cmd, workers)
+        # CLAIM -> APPLY -> COMMIT. If the post-apply rename itself fails, keep the live claim
+        # in a commit-only retry list; re-running effects would be worse than backpressure.
+        if _pending_command_commits:
+            retry_pending_command_commits(args.state_dir, _pending_command_commits)
+            if _pending_command_commits:
+                return
+        for claim in claim_commands(args.state_dir):
+            ok, errs = _apply_command(claim["cmd"], workers)
+            if ok is True:
+                if not commit_command_claim(args.state_dir, claim, applied=True):
+                    _pending_command_commits.append((claim, True, []))
+                    print("[command] applied; commit will retry without reapplying %s"
+                          % claim.get("name", "?"), flush=True)
+                    return
+            elif ok is False:        # schema refusal is a terminal, audited consumption
+                if not commit_command_claim(args.state_dir, claim, applied=False, rejected_errors=errs):
+                    _pending_command_commits.append((claim, False, errs))
+                    return
+            else:                    # application failed before a durable effect; retry later
+                restore_command_claim(claim)
 
     def _apply_command(cmd, workers):
-        # WHOLE OR NOT AT ALL (SEC-08). Checked before anything below touches a box, so a
-        # command with one bad field cannot half-apply; see validate_command for the schema
-        # and the settings-panel bounds it enforces.
-        if not admit_command(cmd, args.state_dir, rejections_box):
-            return
+        # WHOLE OR NOT AT ALL (SEC-08). Checked before anything below touches a box. Return an
+        # explicit outcome so _drain_commands knows whether it may commit the claimed file.
+        _errs = validate_command(cmd, args.state_dir)
+        if _errs:
+            record_command_rejection(rejections_box, cmd, _errs)
+            return False, _errs
         try:
+            _cmd_goals = goals_from_command(cmd)
+            _new_cmd_goals = []
+            if _cmd_goals:
+                _new_cmd_goals = _append_goals_ledger(
+                    args.state_dir, _cmd_goals, started, raise_on_error=True, return_new=True)
             by_name = {w.name: w for w in workers}
             for nm in cmd.get("close", []):
                 w = by_name.get(nm)
@@ -3190,8 +3712,10 @@ def main():
             if "reunlock" in cmd:
                 reunlock_box[0] = apply_reunlock(cmd.get("reunlock"), workers,
                                                  enqueue=add_box.append)
-            # native chat / cockpit queued a new goal into the running fleet
-            for g in goals_from_command(cmd):
+            # Only goals that this command newly admitted to the durable ledger enter memory.
+            # A recovered command whose batch was persisted before a crash is therefore a no-op;
+            # --resume already reconstructed that work from the same ledger.
+            for g in _new_cmd_goals:
                 add_box.append(g)
                 # THE ONE PLACE A `/goal ` SUBMISSION IS STILL VISIBLE. The command file is
                 # deleted the moment it is read, and after that this goal looks like any
@@ -3215,9 +3739,11 @@ def main():
             # graceful stop: {"stop": true} cancels every worker and ends the run.
             if cmd.get("stop"):
                 stop_box[0] = True
+            return True, []
         except Exception as exc:
             print("[command] applying a validated command failed part-way: %s"
                   % type(exc).__name__, flush=True)
+            return None, []
 
     convs_path = os.path.join(args.state_dir, "conversations.json")
 
@@ -3676,6 +4202,7 @@ def main():
         cleaned = _clean_final_text(raw_last)
         return {
             "name": r["name"], "goal": r["goal"],
+            "goal_summary": _goal_summary(r["goal"]),
             "status": report_status(r["outcome"]),
             "outcome": r["outcome"], "turn": r["turns"],
             "max_turns": max_turns, "reason": r["reason"],
@@ -3731,22 +4258,21 @@ def main():
     final = {"started": started, "updated": time.time(), "total": len(results),
              "done_count": done_count, "running": False, "elapsed_s": elapsed,
              "directive": directive,
-             # FIX 3 (P2): also carry run_label / goal_count into the final snapshot.
+             "directive_summary": _goal_summary(directive) if directive else "",
+             # Carry the same compact display identity into the final frozen snapshot.
              "run_label": run_label, "goal_count": goal_count,
              "workers": [_final_worker_entry(r, args.max_turns) for r in results]}
     _ffv = fanout_family_view(final["workers"])
     for _fw in final["workers"]:
         _fw["fanout"] = _ffv.get(_fw["name"], {"kind": "solo", "campaign_id": _fw.get("campaign_id", ""), "label": ""})
     _write_atomic(status_path, final)
-    # RUN-RESUME: write the FINAL completion map from the true per-goal outcomes (the
-    # on_tick map may miss a worker that reached DONE on the very last sweep). A later
-    # --resume then re-queues exactly the goals that did NOT finish successfully.
+    # RUN-RESUME: merge this FINAL CHUNK into the durable completion map. ``results`` is not
+    # necessarily the whole run after reconnects / graceful stop, so replacement here would
+    # erase earlier DONE goals and replay them on --resume.
     try:
-        final_done = {_goal_key(r["goal"]): r["outcome"]
-                      for r in results if r["outcome"] in _RESUME_SUCCESS_OUTCOMES}
-        _write_atomic(os.path.join(args.state_dir, LAST_RUN_DONE), final_done)
+        _merge_final_done_map(args.state_dir, results)
     except Exception as e:
-        sys.stderr.write("[resume] WARN: could not write final done map: %s\n" % e)
+        sys.stderr.write("[resume] WARN: could not merge final done map: %s\n" % e)
     print("\n\n=== fleet complete in %ss ===" % elapsed)
     for r in results:
         print("  %-4s %-8s turns=%d  %s" % (r["name"], r["outcome"], r["turns"],
@@ -3763,17 +4289,21 @@ def main():
     # the cockpit) cancelled everything and the loop above still exited normally. Either
     # way nothing is "interrupted" -- clear the ACTIVE marker so a supervisor never
     # mistakes a normal finish for a crash.
-    _clear_active_marker(args.state_dir)
+    _clear_active_marker(args.state_dir, owner_pid=os.getpid())
+    _release_run_lock(_ACTIVE_RUN_LOCK)
+    _ACTIVE_RUN_LOCK = None
 
 
 if __name__ == "__main__":
     try:
-        main()
+        raise SystemExit(main() or 0)
     except KeyboardInterrupt:
         # Explicit user stop (Ctrl+C). Clear the ACTIVE marker (if a run had started and
         # recorded one) so a supervisor never treats a deliberate interrupt as a crash to
         # auto-resume, then exit with the conventional SIGINT status.
         if _ACTIVE_STATE_DIR:
-            _clear_active_marker(_ACTIVE_STATE_DIR)
+            _clear_active_marker(_ACTIVE_STATE_DIR, owner_pid=os.getpid())
+        _release_run_lock(_ACTIVE_RUN_LOCK)
+        _ACTIVE_RUN_LOCK = None
         print("\n[fleet] interrupted by user -- ACTIVE marker cleared, not auto-resumable.")
         sys.exit(130)

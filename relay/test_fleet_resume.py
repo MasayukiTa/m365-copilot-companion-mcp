@@ -19,6 +19,7 @@ import sys
 import tempfile
 import types
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -144,6 +145,59 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(n_unfinished, 0)
         self.assertEqual(m_total, 0)
 
+
+
+    def test_final_chunk_never_erases_done_from_earlier_chunks(self):
+        # A succeeded in an earlier reconnect chunk. The final chunk contains only B cancelled.
+        fr._write_atomic(self._done_path(), {fr._goal_key("goal A"): "DONE"})
+        fr._merge_final_done_map(self.state_dir, [
+            {"goal": "goal B", "outcome": "CANCELLED"},
+        ])
+        self.assertEqual(fr._read_done_map(self.state_dir), {fr._goal_key("goal A"): "DONE"})
+
+        # A later successful item is added without removing A.
+        fr._merge_final_done_map(self.state_dir, [
+            {"goal": "goal C", "outcome": "DONE"},
+        ])
+        self.assertEqual(fr._read_done_map(self.state_dir), {
+            fr._goal_key("goal A"): "DONE",
+            fr._goal_key("goal C"): "DONE",
+        })
+
+    def test_main_finalization_uses_merge_not_replacement(self):
+        src = Path(fr.__file__).read_text(encoding="utf-8")
+        i = src.index('# RUN-RESUME: merge this FINAL CHUNK into the durable completion map')
+        block = src[i:i + 1000]
+        self.assertIn('_merge_final_done_map(', block)
+        self.assertNotIn('final_done = {', block)
+
+    def test_live_added_goals_extend_the_durable_ledger(self):
+        fr._write_goals_ledger(self.state_dir, ["initial A"], started=10.0)
+        added = [
+            {"text": "live B", "checks": [{"kind": "b"}], "cwd": "C:/b", "priority": True},
+            {"text": "live C"},
+        ]
+        n = fr._append_goals_ledger(self.state_dir, added, started=10.0)
+        self.assertEqual(n, 2)
+        started, ledger = fr._read_goals_ledger(self.state_dir)
+        self.assertEqual(started, 10.0)
+        self.assertEqual([e["text"] for e in ledger], ["initial A", "live B", "live C"])
+        self.assertEqual(ledger[1]["cwd"], "C:/b")
+        self.assertTrue(ledger[1]["priority"])
+        # Re-delivery of the same command after a crash must not duplicate the durable item.
+        self.assertEqual(fr._append_goals_ledger(self.state_dir, ["live B"], started=10.0), 0)
+        self.assertEqual(len(fr._read_goals_ledger(self.state_dir)[1]), 3)
+
+    def test_live_add_goal_command_persists_before_queueing(self):
+        src = Path(fr.__file__).read_text(encoding="utf-8")
+        anchor = '_cmd_goals = goals_from_command(cmd)'
+        i = src.index(anchor)
+        block = src[i:i + 1400]
+        self.assertIn('_new_cmd_goals = _append_goals_ledger(', block)
+        self.assertIn('raise_on_error=True, return_new=True', block)
+        self.assertLess(block.index('_append_goals_ledger('), src[i:].index('add_box.append(g)'),
+                        'persist the whole accepted goal batch before the in-memory queue can run it')
+
     def test_missing_ledger_tolerated(self):
         # no ledger file at all -> nothing to resume
         remainder, n_unfinished, m_total = fr._resume_goals(self.state_dir)
@@ -162,3 +216,33 @@ class LedgerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+def test_live_append_refuses_to_replace_an_unknown_or_corrupt_ledger(tmp_path):
+    """PR47 #4111676490: a live add must not turn a corrupt launch ledger into add-only state."""
+    import pytest
+    p = tmp_path / fr.LAST_RUN_GOALS
+    p.write_text('{broken', encoding='utf-8')
+    with pytest.raises(Exception):
+        fr._append_goals_ledger(str(tmp_path), ['live-only'], started=10.0,
+                                raise_on_error=True)
+    assert p.read_text(encoding='utf-8') == '{broken'
+
+
+def test_periodic_done_update_is_monotonic_across_reconnect_chunks(tmp_path):
+    """PR47 #4111676604: current-chunk ticks may add DONE keys, never erase older ones."""
+    fr._write_atomic(str(tmp_path / fr.LAST_RUN_DONE), {'old-key': 'DONE'})
+    class W:
+        goal = 'new goal'
+        outcome = 'DONE'
+    fr._update_done_map(str(tmp_path), [W()])
+    got = fr._read_done_map(str(tmp_path))
+    assert got['old-key'] == 'DONE'
+    assert got[fr._goal_key('new goal')] == 'DONE'
+
+
+def test_main_requires_the_initial_goals_ledger_before_work_can_start():
+    """PR47 #4111676490: the launch ledger is part of admission, not optional telemetry."""
+    src = Path(fr.__file__).read_text(encoding='utf-8')
+    main = src[src.index('def main():'):]
+    assert '_write_goals_ledger(args.state_dir, goals, started, raise_on_error=True)' in main
