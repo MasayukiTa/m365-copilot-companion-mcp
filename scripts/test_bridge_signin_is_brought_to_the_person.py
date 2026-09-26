@@ -416,12 +416,21 @@ def test_supervisor_does_not_hide_the_window_on_an_ambiguous_mid_auth_read(tmp_p
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         fut = pool.submit(_run_supervisor, tmp_path, stub, 120)
-        # Wait for the window to actually be surfaced (the visible relaunch), then park on the
-        # ambiguous bounce page for long enough to span several 5s Demote-ToHeadless polls.
-        deadline = time.time() + 30
-        while stub.visible_hits == 0 and time.time() < deadline:
+        # Synchronise on the supervisor actually reaching our stub before timing the surface.
+        # CI can take tens of seconds merely to schedule/start PowerShell under the full suite;
+        # charging that unrelated process-start latency to the sign-in invariant made this test
+        # intermittently fail before the code under test had made its first /json read.
+        start_deadline = time.time() + 90
+        while stub.json_hits == 0 and not fut.done() and time.time() < start_deadline:
             time.sleep(0.2)
-        assert stub.visible_hits > 0, "the window was never surfaced at all"
+        assert stub.json_hits > 0, "the supervisor never reached the browser stub"
+
+        # Once the supervisor is observing the sign-in wall, surfacing it should be prompt.
+        # This is the behaviour the test owns; OS/runner process-start time is not.
+        surface_deadline = time.time() + 30
+        while stub.visible_hits == 0 and not fut.done() and time.time() < surface_deadline:
+            time.sleep(0.2)
+        assert stub.visible_hits > 0, "the observed sign-in wall was never surfaced"
         stub.tabs = [BOUNCE]
         time.sleep(18)   # >= 3 poll cycles at 5s each
         assert not fut.done(), (

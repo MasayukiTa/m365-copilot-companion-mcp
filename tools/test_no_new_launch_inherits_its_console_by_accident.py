@@ -145,8 +145,6 @@ BASELINE = {
     "tools/jobs.py::run_in_background::subprocess.Popen": 1,
     "tools/jobs.py::run_python_in_background::subprocess.Popen": 1,
     "tools/schedule_ops.py::_run::subprocess.run": 1,
-    "tools/shell_extra.py::pwsh_exec::subprocess.run": 1,
-    "tools/shell_extra.py::pwsh_exec_file::subprocess.run": 1,
     "tools/unreached.py::cross_language_text::subprocess.run": 1,
     "tools/unreached.py::tracked_files::subprocess.run": 1,
 }

@@ -19,6 +19,17 @@ from tools import shell_extra as SE
 from tools._subproc import sanitized_child_env
 
 
+# ---- unattended PowerShell must not allocate a desktop console ----------------------------
+
+def test_both_powershell_spawn_sites_are_explicitly_windowless():
+    """Both entry points are -NonInteractive and run under the MCP server, often from a GUI parent."""
+    import inspect
+    src = inspect.getsource(SE)
+    spawns = src.count("subprocess.run(")
+    assert spawns == 2
+    assert src.count("creationflags=headless_creationflags()") == spawns
+
+
 # ---- the child must not be handed the server's secrets ----------------------------------
 
 def test_the_sanitised_environment_withholds_the_two_keys(monkeypatch):
