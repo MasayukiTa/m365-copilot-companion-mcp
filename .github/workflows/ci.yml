@@ -194,6 +194,7 @@ jobs:
             relay/test_fleet_landing_reconcile.py \
             relay/test_adopt_pending_command.py \
             relay/test_command_claim_commit.py \
+            relay/test_done_candidate_survives_refute_timeout.py \
             relay/test_fleet_runner_single_instance.py \
             relay/test_goal_display_summary.py \
             relay/test_live_added_goals_keep_capacity.py \
