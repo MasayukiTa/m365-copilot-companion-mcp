@@ -29,7 +29,8 @@ from the local operator (the goals file / folder_coder / the cockpit), never fro
 Copilot oracle -- so a check is allowed to run shell commands. Never build a check spec
 from untrusted/oracle-produced text.
 
-stdlib only -- runs anywhere the repo's Python runs.
+No external dependency is required; `tools.childproc` supplies only this repository's
+Windows no-console creation policy for unattended checks.
 """
 from __future__ import annotations
 
@@ -41,6 +42,7 @@ import tempfile
 import time
 
 from relay.test_feedback import summarize_test_failure
+from tools import childproc
 
 # How much stdout/stderr to feed back to Copilot on failure. Enough to see the real
 # error (a traceback tail / a failing assertion) without flooding the next turn.
@@ -295,6 +297,7 @@ class Check:
                     target, cwd=self.cwd, shell=shell,
                     stdout=self._out, stderr=self._err,
                     stdin=subprocess.DEVNULL,
+                    creationflags=childproc.headless_creationflags(),
                 )
                 self._deadline = time.time() + self.timeout
             else:

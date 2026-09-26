@@ -146,6 +146,35 @@ def main():
             check("timeout_%r_refused" % (_bad,), True)
     check("timeout_good_kept", Check({"type": "shell", "cmd": "x", "timeout": 30}).timeout == 30.0)
 
+    # 14. Process-backed checks are unattended. A bare console child of the windowless
+    # fleet runner would allocate a visible console on Windows, so Check.start must state the
+    # no-console policy explicitly rather than inherit whatever its parent has.
+    import relay.acceptance as _acceptance
+    from tools import childproc as _childproc
+    _seen = {}
+
+    class _FakeProc:
+        pass
+
+    def _fake_popen(target, **kwargs):
+        _seen["target"] = target
+        _seen["kwargs"] = dict(kwargs)
+        return _FakeProc()
+
+    _real_popen = _acceptance.subprocess.Popen
+    try:
+        _acceptance.subprocess.Popen = _fake_popen
+        _c = Check({"type": "shell", "argv": [PY, "-c", "pass"]}).start()
+        _flags = _seen.get("kwargs", {}).get("creationflags")
+        check("acceptance_child_is_windowless",
+              _flags == _childproc.headless_creationflags() and "creationflags" in _seen.get("kwargs", {}))
+        try:
+            _c._out.close(); _c._err.close()
+        except Exception:
+            pass
+    finally:
+        _acceptance.subprocess.Popen = _real_popen
+
     print("\n=== %d/%d acceptance checks passed ===" % (sum(results), len(results)))
     return 0 if all(results) else 1
 

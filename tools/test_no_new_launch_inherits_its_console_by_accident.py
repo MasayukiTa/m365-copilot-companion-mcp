@@ -106,7 +106,6 @@ BASELINE = {
     "bench/ui_deploy.py::<module>::subprocess.run": 3,
     "bridge/copilot_bridge.py::_review_stream::subprocess.Popen": 1,
     "bridge/copilot_bridge.py::_run_fix_subprocess::subprocess.Popen": 1,
-    "relay/acceptance.py::start::subprocess.Popen": 1,
     "relay/agent_profiles.py::prompt_for_agent_url::subprocess.run": 1,
     "relay/code_task.py::main::subprocess.call": 1,
     "relay/edge_auth.py::_back_to_background::subprocess.run": 1,
