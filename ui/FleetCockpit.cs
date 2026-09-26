@@ -5699,6 +5699,40 @@ class CockpitWindow : Window
         _lastSig = "";
     }
 
+    // 1 = the runner durably applied the command, 0 = receipt not ready/parseable yet,
+    // -1 = the runner explicitly rejected it. Mere file existence is NOT success: rejected
+    // commands also have receipts, and treating those as success silently lost a submitted task.
+    int LiveAddReceiptState(string ackPath, out string detail)
+    {
+        detail = "";
+        if (string.IsNullOrEmpty(ackPath) || !File.Exists(ackPath)) return 0;
+        try
+        {
+            var d = _js.DeserializeObject(File.ReadAllText(ackPath, Encoding.UTF8))
+                    as Dictionary<string, object>;
+            if (d == null) return 0;
+            bool rejected = d.ContainsKey("rejected") && Convert.ToBoolean(d["rejected"]);
+            if (rejected)
+            {
+                detail = _lang == 0 ? "タスク追加がrunnerに拒否されました。" : "The runner rejected the added task.";
+                return -1;
+            }
+            if (d.ContainsKey("applied"))
+            {
+                bool applied = Convert.ToBoolean(d["applied"]);
+                if (applied) return 1;
+                detail = _lang == 0 ? "タスク追加は適用されませんでした。" : "The added task was not applied.";
+                return -1;
+            }
+        }
+        catch (Exception)
+        {
+            // Atomic receipt writes should make parse failures rare; treat one as incomplete and
+            // retry instead of converting an ambiguous file into success or failure.
+        }
+        return 0;
+    }
+
     // A live add can race the final sweep: the UI saw running=true, wrote the command, then the
     // coordinator finished before its next drain.  The command is durable now, so do not guess
     // from status alone.  Receipt = applied/accepted.  No receipt + no live run = launch a
@@ -5713,7 +5747,16 @@ class CockpitWindow : Window
         {
             try
             {
-                if (File.Exists(ackPath)) { timer.Stop(); return; }
+                string receiptError;
+                int receiptState = LiveAddReceiptState(ackPath, out receiptError);
+                if (receiptState > 0) { timer.Stop(); return; }
+                if (receiptState < 0)
+                {
+                    timer.Stop();
+                    if (_startNote != null) _startNote.Text = receiptError;
+                    _lastSig = "";
+                    return;
+                }
                 if (RunIsLive()) return;
                 // Retry, rather than fire once: a dying old coordinator may still own the OS
                 // lock for a moment. A losing rescuer exits 3 before touching commandPath.
