@@ -244,7 +244,8 @@ def _exec_shell(payload):
     if not cmd:
         return "error", None, "shell job missing 'cmd'"
     r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                       errors="replace", timeout=LOCAL_TIMEOUT_S, cwd=REPO)
+                       errors="replace", timeout=LOCAL_TIMEOUT_S, cwd=REPO,
+                       creationflags=childproc.headless_creationflags())
     out = (r.stdout or "") + (("\n[stderr]\n" + r.stderr) if r.stderr else "")
     return ("ok" if r.returncode == 0 else "error"), {"rc": r.returncode, "output": out[:20000]}, None
 
@@ -256,7 +257,8 @@ def _exec_python(payload):
     py = VENVPY if os.path.isfile(VENVPY) else sys.executable
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
     r = subprocess.run([py, "-c", code], capture_output=True, text=True,
-                       errors="replace", timeout=LOCAL_TIMEOUT_S, cwd=REPO, env=env)
+                       errors="replace", timeout=LOCAL_TIMEOUT_S, cwd=REPO, env=env,
+                       creationflags=childproc.headless_creationflags())
     out = (r.stdout or "") + (("\n[stderr]\n" + r.stderr) if r.stderr else "")
     return ("ok" if r.returncode == 0 else "error"), {"rc": r.returncode, "output": out[:20000]}, None
 
@@ -285,7 +287,8 @@ def _exec_screenshot(payload):
     elif payload.get("region") and len(payload["region"]) == 4:
         cmd += ["-Region", ",".join(str(int(x)) for x in payload["region"])]
     r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
-                       timeout=LOCAL_TIMEOUT_S)
+                       timeout=LOCAL_TIMEOUT_S,
+                       creationflags=childproc.headless_creationflags())
     if r.returncode == 0 and os.path.isfile(out):
         return "ok", {"path": out, "mode": (r.stdout or "").strip()[:80]}, None
     return "error", None, ((r.stderr or r.stdout or "screenshot failed")[:2000])

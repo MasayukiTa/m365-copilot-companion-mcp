@@ -74,6 +74,33 @@ def test_local_shell_and_python():
     check("missing cmd -> error", rec["status"] == "error" and rec["error"])
 
 
+
+def test_local_process_executors_are_windowless(monkeypatch, tmp_path):
+    """LOCAL jobs are unattended; shell/python/screenshot must not allocate console windows."""
+    from tools import childproc
+    seen = []
+
+    class _Result:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    def _run(argv, **kwargs):
+        seen.append((argv, dict(kwargs)))
+        return _Result()
+
+    monkeypatch.setattr(tr.subprocess, "run", _run)
+    tr._exec_shell({"cmd": "echo ok"})
+    tr._exec_python({"code": "print('ok')"})
+    tr._exec_screenshot({"id": "headless-test", "out": str(tmp_path / "shot.png")})
+
+    assert len(seen) == 3
+    want = childproc.headless_creationflags()
+    for _argv, kwargs in seen:
+        assert "creationflags" in kwargs, (_argv, kwargs)
+        assert kwargs["creationflags"] == want, (_argv, kwargs)
+
+
 def test_file_roundtrip():
     # tempdir d sits outside REPO -- the H3 hard floor (see test_h3_file_path_floor below)
     # would reject it by default, so these executor-correctness tests opt in explicitly.
