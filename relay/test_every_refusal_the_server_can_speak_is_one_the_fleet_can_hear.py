@@ -184,7 +184,7 @@ def test_still_rejects_long_prose_that_merely_discusses_unlock():
 
 
 if __name__ == "__main__":
-    test_the_source_sweep_finds_all_three_known_refusals()
+    test_the_source_sweep_finds_all_known_refusal_variants()
     test_every_locked_literal_in_security_py_is_covered_by_a_relay_marker()
     test_named_constants_match_their_source_literals_verbatim()
     test_recognises_the_token_missing_refusal_verbatim()
