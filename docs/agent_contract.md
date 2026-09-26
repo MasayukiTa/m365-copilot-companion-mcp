@@ -130,9 +130,13 @@ The short version, because the wrong choice here produced fabricated answers twi
 
 ## 4. Refusals, and the one that means what it says
 
-A refusal that names a missing `unlock_token` means exactly that: include the token, do not
-retry the same call unchanged and do not fall back to read-only tools and present the result as
-though the task were done.
+A refusal that names `unlock_token` is a second-factor refusal, not an instruction for the model
+to memorize a credential forever. Call `unlock(password=...)`. On the normal MCP transport a
+successful unlock authorizes the **same MCP session**, so retry the blocked call in the same
+conversation; you do not need to remember or re-attach the returned token on every call. The
+returned `unlock_token` is a **fallback** only when session auth is explicitly disabled or the
+transport has no usable session ID. In every case, do not fall back to read-only tools and
+present the result as though the blocked task were done.
 
 A refusal that names a **locked** state is recorded as a failure, not a success, whatever the
 transport reported — the ledger corrects `ok=True` to `ok=False` when the result text is a lock

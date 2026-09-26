@@ -22,6 +22,26 @@ def test_recovery_contract_uses_session_auth_not_model_memory():
     assert ".env" in text and "読まない" in text
 
 
+
+def test_public_and_agent_docs_are_session_first():
+    """Current operator/agent instructions must not resurrect the old per-call token contract."""
+    from pathlib import Path
+    repo = Path(__file__).resolve().parent.parent
+    readme = (repo / "README.md").read_text(encoding="utf-8")
+    contract = (repo / "docs" / "agent_contract.md").read_text(encoding="utf-8")
+
+    assert "MCP_REQUIRE_UNLOCK_TOKEN" in readme
+    assert "MCP_UNLOCK_SESSION_AUTH" in readme
+    assert "既定では無効" not in readme
+    assert "同じ MCP session" in readme
+
+    stale = "A refusal that names a missing `unlock_token` means exactly that: include the token"
+    assert stale not in contract
+    assert "same MCP session" in contract
+    assert "fallback" in contract.lower()
+    assert "do not need to remember or re-attach" in contract
+
+
 def test_a_grant_already_in_the_server_ledger_cancels_reunlock(monkeypatch):
     monkeypatch.setenv("MCP_UNLOCK_PASSWORD", "pw-for-test")
     monkeypatch.setattr(RF, "_worker_recently_granted", lambda _name, **_kw: True)
