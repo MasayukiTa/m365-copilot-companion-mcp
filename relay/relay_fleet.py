@@ -4487,6 +4487,9 @@ class RelayWorker:
             self._gate_token = None
             self._gate_question = ""
             self._gate_deadline = 0.0
+            # No answer from the human is a terminal dependency, not transient infrastructure.
+            # Re-queuing into a fresh conversation only asks the same unanswered question again.
+            self.retryable_override = False
             self.status, self.outcome = "stuck", "STUCK"
             self.reason = (
                 "human input requested but unanswered after %ds; the question was: %s"
@@ -4816,6 +4819,10 @@ class RelayWorker:
         if self._raise_stuck_gate(reason, "unlock exhausted after %d attempts"
                                   % self._unlock_attempts):
             return
+        # A fresh conversation cannot repair a missing/invalid unlock grant or a broken HITL
+        # surface. Without this override coarse STUCK autoretry re-queued the same goal into a
+        # new locked conversation and restarted the exact loop this exhaustion path just bounded.
+        self.retryable_override = False
         self.status, self.outcome = "stuck", "STUCK"
         self.reason = reason
 

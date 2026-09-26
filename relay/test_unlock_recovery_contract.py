@@ -239,3 +239,39 @@ def test_deterministic_stuck_marks_worker_nonretryable(monkeypatch):
     w._decide(reply)
     assert w.outcome == "STUCK"
     assert w.retryable_override is False
+
+
+def test_unlock_exhaustion_when_gate_cannot_be_raised_is_not_fresh_retried(monkeypatch):
+    """A broken HITL surface must not turn deterministic unlock exhaustion into a fresh-loop."""
+    monkeypatch.setattr(RF, "_unlock_password", lambda: "pw-for-test")
+    monkeypatch.setattr(RF, "_worker_recently_granted", lambda *_a, **_k: False)
+    monkeypatch.setattr(RF.RelayWorker, "_raise_stuck_gate", lambda *_a, **_k: False)
+    w = RF.RelayWorker("write the file", "w-no-gate")
+    w._unlock_attempts = RF.MAX_UNLOCK_ATTEMPTS
+
+    w._inject_unlock()
+
+    assert w.status == "stuck"
+    assert w.outcome == "STUCK"
+    assert w.retryable_override is False, (
+        "unlock exhaustion became coarse STUCK and can be requeued into a fresh locked conversation")
+
+
+def test_an_unanswered_human_gate_timeout_is_not_fresh_retried(monkeypatch):
+    """No human answer is not transient infrastructure; a new conversation cannot invent it."""
+    from tools import gate_ops
+    monkeypatch.setattr(gate_ops, "gate_get", lambda _token: None)
+    w = RF.RelayWorker("needs operator input", "w-gate-timeout")
+    w._gate_token = "gate-test"
+    w._gate_question = "Which external value should I use?"
+    w._gate_deadline = 1.0
+    w.status = "awaiting_gate"
+    monkeypatch.setattr(RF.time, "time", lambda: 2.0)
+
+    settled = w._poll_gate()
+
+    assert settled is True
+    assert w.status == "stuck"
+    assert w.outcome == "STUCK"
+    assert w.retryable_override is False, (
+        "an unanswered human question can be auto-requeued into a fresh conversation")
