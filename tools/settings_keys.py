@@ -185,6 +185,9 @@ KEYS = OrderedDict([
     _k("approval", UI_ONLY, "run", "ui/FleetCockpit.cs",
        "Restores the plan/auto/run selector. The choice reaches a run as a command-line "
        "flag; no Python reads this key."),
+    _k("runtime", UI_ONLY, "fleet", "ui/FleetCockpit.cs",
+       "Chooses the next cockpit launch path: fleet keeps the conversation-driven runner; "
+       "durable starts the SQLite-backed LOCAL_LOOP runtime. Existing work is unaffected."),
     _k("dark", UI_ONLY, 1, "ui/FleetCockpit.cs, ui/CopilotChat.cs", "Theme."),
     _k("lang", UI_ONLY, 0, "ui/FleetCockpit.cs, ui/CopilotChat.cs", "Interface language."),
     _k("ui_scale", UI_ONLY, "auto", "ui/FleetCockpit.cs, ui/CopilotChat.cs", "Zoom."),
