@@ -1811,7 +1811,7 @@ def _write_goals_ledger(state_dir, goals, started, raise_on_error=False):
         return False
 
 
-def _append_goals_ledger(state_dir, goals, started, raise_on_error=False):
+def _append_goals_ledger(state_dir, goals, started, raise_on_error=False, return_new=False):
     """Durably append live ``add_goal`` items to the current run ledger.
 
     The original ledger was written only once at launch, which meant every task accepted
@@ -1820,15 +1820,17 @@ def _append_goals_ledger(state_dir, goals, started, raise_on_error=False):
     Returns the number of newly persisted entries. Best-effort, matching the run-start writer.
     """
     if not goals:
-        return 0
+        return [] if return_new else 0
     try:
         existing_started, existing = _read_goals_ledger(state_dir)
+        if existing_started is None:
+            raise RuntimeError("goals ledger is missing or corrupt; refusing to replace unknown run state")
         out = list(existing or [])
         seen = set()
         for e in out:
             if isinstance(e, dict):
                 seen.add(e.get("key") or _goal_key(e.get("text", "")))
-        added = 0
+        newly_admitted = []
         for goal in goals:
             e = _normalize_goal_for_ledger(goal)
             key = e.get("key")
@@ -1836,19 +1838,18 @@ def _append_goals_ledger(state_dir, goals, started, raise_on_error=False):
                 continue
             out.append(e)
             seen.add(key)
-            added += 1
-        if added:
-            payload = {"started": existing_started if existing_started is not None else started,
-                       "goals": out}
+            newly_admitted.append(goal)
+        if newly_admitted:
+            payload = {"started": existing_started, "goals": out}
             _write_atomic(os.path.join(state_dir, LAST_RUN_GOALS), payload)
-        return added
+        return newly_admitted if return_new else len(newly_admitted)
     except Exception as e:
         if raise_on_error:
             raise
         if not getattr(_append_goals_ledger, "_warned", False):
             sys.stderr.write("[resume] WARN: could not append live goal to ledger: %s\n" % e)
             _append_goals_ledger._warned = True
-        return 0
+        return [] if return_new else 0
 
 
 def _read_goals_ledger(state_dir):
@@ -1883,13 +1884,13 @@ def _read_done_map(state_dir):
 
 
 def _update_done_map(state_dir, workers):
-    """Rewrite last_run_done.json from the live workers: map goal_key -> outcome for
-    every worker that reached a successful terminal outcome (DONE). Best-effort: a
+    """Merge live successful workers into last_run_done.json: goal_key -> outcome.
+    Existing success keys are monotonic across reconnect chunks. Best-effort: a
     failure logs once to stderr and is swallowed (never crashes the snapshot hook).
 
     Cheap: called on the snapshot tick, iterates the in-memory workers, atomic write."""
     try:
-        done = {}
+        done = _read_done_map(state_dir)
         for w in workers:
             outcome = getattr(w, "outcome", None)
             if outcome in _RESUME_SUCCESS_OUTCOMES:
@@ -1979,7 +1980,7 @@ def _resume_argv(argv):
     return out
 
 
-def _write_active_marker(state_dir, argv=None, pid=None, start_ts=None):
+def _write_active_marker(state_dir, argv=None, pid=None, start_ts=None, raise_on_error=False):
     """Best-effort: record this run as ACTIVE (pid, start_ts, argv, and a precomputed
     resume_argv) so a supervisor can detect an interrupted run later. Never raises -- a
     marker failure is logged once to stderr and the run continues untouched."""
@@ -1990,8 +1991,12 @@ def _write_active_marker(state_dir, argv=None, pid=None, start_ts=None):
                    "argv": raw_argv,
                    "resume_argv": _resume_argv(raw_argv)}
         _write_atomic(os.path.join(state_dir, ACTIVE_MARKER), payload)
+        return True
     except Exception as e:
+        if raise_on_error:
+            raise
         sys.stderr.write("[resume] WARN: could not write active-run marker: %s\n" % e)
+        return False
 
 
 def _read_active_marker(state_dir):
@@ -2015,15 +2020,20 @@ def _active_run_conflict_pid(state_dir, self_pid=None):
     the refusal human-readable. Unknown pid state is treated as alive by `_pid_alive`, on purpose:
     overwriting another coordinator's ledger/status is worse than refusing one launch.
     """
+    marker_path = os.path.join(state_dir, ACTIVE_MARKER)
+    if not os.path.isfile(marker_path):
+        return 0
     marker = _read_active_marker(state_dir)
     if not marker:
-        return 0
+        return -1                 # fail closed: may belong to a pre-lock legacy coordinator
     try:
         pid = int(marker.get("pid") or 0)
         me = int(os.getpid() if self_pid is None else self_pid)
     except Exception:
-        return 0
-    if pid <= 0 or pid == me:
+        return -1
+    if pid <= 0:
+        return -1
+    if pid == me:
         return 0
     return pid if _pid_alive(pid) else 0
 
@@ -2356,6 +2366,10 @@ def _validate_command(cmd, state_dir):
     for k in cmd:
         if k not in _COMMAND_KEYS:
             errs.append("unknown key %r" % _CONTROL.sub("?", str(k))[:40])
+    if "add_goal" in cmd:
+        mixed = sorted(k for k in cmd if k not in ("add_goal", "ack"))
+        if mixed:
+            errs.append("add_goal cannot be combined with control key(s): %s" % mixed[:8])
 
     def _items(key, v):
         items = v if isinstance(v, list) else [v]
@@ -2543,13 +2557,50 @@ def _claim_owner_pid(path):
         return 0
 
 
-def _recover_stale_command_claims(state_dir):
-    """Put dead coordinators' uncommitted command claims back on the input channel.
+def _committed_claim_state(name):
+    """Receipt state encoded in a non-replayable claim tombstone suffix."""
+    if name.endswith(".applied"):
+        return True
+    if name.endswith(".rejected"):
+        return False
+    if name.endswith(".read"):
+        return None
+    return "not-committed"
 
-    A claim is an OS-atomic rename of ``*.json`` to ``*.json.claim-PID``.  The kernel cannot
-    make a rename half-happen, and the new single-instance runner means a live owner must be
-    left alone.  ``*.applied`` is the commit tombstone: it is cleanup only and is NEVER replayed.
+
+def _recover_committed_claim_receipt(state_dir, path, applied):
+    """Publish a missing receipt from a committed tombstone; delete only after publication.
+
+    The tombstone still contains the original command JSON.  That makes the commit point and
+    receipt publication crash-recoverable without making the command replayable.
     """
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            cmd = json.load(fh)
+    except Exception:
+        return False                 # preserve evidence; never replay a committed unknown body
+    ack = cmd.get("ack") if isinstance(cmd, dict) else None
+    if isinstance(ack, str) and ack:
+        # Invalid ack paths can never be made durable and validation already rejects them; they
+        # must not pin an applied tombstone forever. A valid path that merely failed to write is
+        # retained and retried next sweep/start.
+        if ack_receipt_path(state_dir, ack) is None:
+            return True
+        name = os.path.basename(path).split(".claim-", 1)[0]
+        body = {"read": True, "ts": time.time(), "file": name}
+        if applied is not None:
+            body["applied"] = bool(applied)
+        if applied is False:
+            errs = validate_command(cmd, state_dir)
+            if errs:
+                body.update({"rejected": True, "errors": errs[:10]})
+        if not _write_receipt(state_dir, ack, body):
+            return False
+    return True
+
+
+def _recover_stale_command_claims(state_dir):
+    """Recover dead owners' claims and finish committed tombstones without replaying them."""
     roots = [state_dir, os.path.join(state_dir, COMMANDS_DIR)]
     recovered = 0
     for root in roots:
@@ -2561,19 +2612,19 @@ def _recover_stale_command_claims(state_dir):
             if ".claim-" not in name:
                 continue
             path = os.path.join(root, name)
-            if name.endswith(".applied"):
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
+            committed = _committed_claim_state(name)
+            if committed != "not-committed":
+                if _recover_committed_claim_receipt(state_dir, path, committed):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
                 continue
             owner = _claim_owner_pid(path)
             if owner and _pid_alive(owner):
                 continue
             original = path.split(".claim-", 1)[0]
             if os.path.exists(original):
-                # Never overwrite a newer writer. Preserve the dead claim as evidence instead
-                # of turning an ambiguity into a duplicate delivery.
                 try:
                     os.replace(path, path + ".orphan")
                 except OSError:
@@ -2661,13 +2712,11 @@ def restore_command_claim(claim) -> bool:
 
 
 def commit_command_claim(state_dir, claim, applied=None, rejected_errors=None) -> bool:
-    """Commit one claim and only then make it disappear.
+    """Durably commit one claim, then publish its receipt.
 
-    The first rename to ``.applied`` is the commit point.  A crash after it can leave a tombstone
-    but can never replay the command; stale tombstones are housekeeping in
-    ``_recover_stale_command_claims``.  A landing receipt is written AFTER that commit point.
-    ``applied=None`` is used by the backwards-compatible :func:`read_commands` helper and keeps
-    its old 'read' semantics; the live drain passes True/False explicitly.
+    Rename is the non-replayable commit point.  Receipt publication is recoverable from the
+    committed JSON tombstone; a transient receipt failure therefore keeps the tombstone rather
+    than losing both the command and its acknowledgement.
     """
     try:
         claimed = claim["claimed"]
@@ -2675,7 +2724,8 @@ def commit_command_claim(state_dir, claim, applied=None, rejected_errors=None) -
         name = claim.get("name") or os.path.basename(claim.get("original") or claimed)
     except Exception:
         return False
-    committed = claimed + ".applied"
+    suffix = ".applied" if applied is True else (".rejected" if applied is False else ".read")
+    committed = claimed + suffix
     until = time.time() + 2.0
     while True:
         try:
@@ -2687,6 +2737,7 @@ def commit_command_claim(state_dir, claim, applied=None, rejected_errors=None) -
             time.sleep(0.02)
 
     ack = (cmd or {}).get("ack") if isinstance(cmd, dict) else None
+    receipt_ok = True
     if isinstance(ack, str) and ack:
         body = {"read": True, "ts": time.time(), "file": name}
         if applied is not None:
@@ -2694,14 +2745,29 @@ def commit_command_claim(state_dir, claim, applied=None, rejected_errors=None) -
         errs = list(rejected_errors or [])
         if errs:
             body.update({"rejected": True, "errors": errs[:10]})
-        if not _write_receipt(state_dir, ack, body):
-            print("[command] no landing receipt for %s: its ack names no file in this fleet's %s/, or the write failed"
-                  % (name, ACKS_DIR), flush=True)
-    try:
-        os.remove(committed)
-    except OSError:
-        pass                         # .applied is deliberately non-replayable
+        if ack_receipt_path(state_dir, ack) is None:
+            receipt_ok = True       # impossible/invalid ack; validation owns this refusal
+        else:
+            receipt_ok = _write_receipt(state_dir, ack, body)
+            if not receipt_ok:
+                print("[command] committed %s; receipt write deferred to tombstone recovery"
+                      % name, flush=True)
+    if receipt_ok:
+        try:
+            os.remove(committed)
+        except OSError:
+            pass
     return True
+
+
+def retry_pending_command_commits(state_dir, pending) -> int:
+    """Retry commit only, never command effects; mutate ``pending`` to the still-failed set."""
+    keep = []
+    for claim, applied, errors in list(pending or []):
+        if not commit_command_claim(state_dir, claim, applied=applied, rejected_errors=errors):
+            keep.append((claim, applied, errors))
+    pending[:] = keep
+    return len(keep)
 
 
 def claim_specific_command(state_dir, path):
@@ -3053,8 +3119,12 @@ def main():
     _ACTIVE_STATE_DIR = args.state_dir
     _owner = _active_run_conflict_pid(args.state_dir)
     if _owner:
-        print("REFUSING TO START: fleet state directory is already owned by live pid %d: %s"
-              % (_owner, args.state_dir), flush=True)
+        if _owner < 0:
+            print("REFUSING TO START: fleet state directory has an unreadable active-run marker: %s"
+                  % args.state_dir, flush=True)
+        else:
+            print("REFUSING TO START: fleet state directory is already owned by live pid %d: %s"
+                  % (_owner, args.state_dir), flush=True)
         return 3
     _ACTIVE_RUN_LOCK = _acquire_run_lock(args.state_dir)
     if _ACTIVE_RUN_LOCK is None:
@@ -3067,8 +3137,12 @@ def main():
     if _owner:
         _release_run_lock(_ACTIVE_RUN_LOCK)
         _ACTIVE_RUN_LOCK = None
-        print("REFUSING TO START: fleet state directory became owned by live pid %d: %s"
-              % (_owner, args.state_dir), flush=True)
+        if _owner < 0:
+            print("REFUSING TO START: fleet state directory gained an unreadable active-run marker: %s"
+                  % args.state_dir, flush=True)
+        else:
+            print("REFUSING TO START: fleet state directory became owned by live pid %d: %s"
+                  % (_owner, args.state_dir), flush=True)
         return 3
 
     _adopt_claim = None
@@ -3278,11 +3352,11 @@ def main():
     # command this write is REQUIRED, not best-effort: the command may not be committed away
     # until another durable source can reconstruct it.
     try:
-        _write_goals_ledger(args.state_dir, goals, started, raise_on_error=bool(_adopt_claim))
+        _write_goals_ledger(args.state_dir, goals, started, raise_on_error=True)
     except Exception as e:
         if _adopt_claim is not None:
             restore_command_claim(_adopt_claim)
-        print("[resume] could not durably adopt pending command: %s" % e, flush=True)
+        print("[resume] could not write the durable goals ledger: %s" % e, flush=True)
         _release_run_lock(_ACTIVE_RUN_LOCK)
         _ACTIVE_RUN_LOCK = None
         return 5
@@ -3294,7 +3368,16 @@ def main():
     # Write interruption recovery BEFORE committing an adopted command. From the instant the
     # command disappears, a crash must still leave both its goals ledger and an active marker
     # that tells the supervisor to resume that ledger.
-    _write_active_marker(args.state_dir, start_ts=started)
+    try:
+        _write_active_marker(args.state_dir, start_ts=started,
+                             raise_on_error=bool(_adopt_claim))
+    except Exception as e:
+        if _adopt_claim is not None:
+            restore_command_claim(_adopt_claim)
+        print("[resume] could not durably mark adopted work active: %s" % e, flush=True)
+        _release_run_lock(_ACTIVE_RUN_LOCK)
+        _ACTIVE_RUN_LOCK = None
+        return 5
     if _adopt_claim is not None:
         if not commit_command_claim(args.state_dir, _adopt_claim, applied=True):
             restore_command_claim(_adopt_claim)
@@ -3491,18 +3574,28 @@ def main():
                                        # the button worked rather than watching silence
     rejections_box = []                # commands refused by validate_command -- surfaced in
                                        # status.json as command_rejections (SEC-08)
+    _pending_command_commits = []      # effects already applied; retry COMMIT only, never apply
 
     def _drain_commands(workers):
-        # CLAIM -> APPLY -> COMMIT. A command remains a real file until its durable effects are
-        # in place; a crash before commit leaves a .claim-PID the next coordinator recovers.
+        # CLAIM -> APPLY -> COMMIT. If the post-apply rename itself fails, keep the live claim
+        # in a commit-only retry list; re-running effects would be worse than backpressure.
+        if _pending_command_commits:
+            retry_pending_command_commits(args.state_dir, _pending_command_commits)
+            if _pending_command_commits:
+                return
         for claim in claim_commands(args.state_dir):
             ok, errs = _apply_command(claim["cmd"], workers)
             if ok is True:
                 if not commit_command_claim(args.state_dir, claim, applied=True):
-                    print("[command] applied but could not commit claim %s" % claim.get("name", "?"), flush=True)
+                    _pending_command_commits.append((claim, True, []))
+                    print("[command] applied; commit will retry without reapplying %s"
+                          % claim.get("name", "?"), flush=True)
+                    return
             elif ok is False:        # schema refusal is a terminal, audited consumption
-                commit_command_claim(args.state_dir, claim, applied=False, rejected_errors=errs)
-            else:                    # application failed before a durable commit; retry later
+                if not commit_command_claim(args.state_dir, claim, applied=False, rejected_errors=errs):
+                    _pending_command_commits.append((claim, False, errs))
+                    return
+            else:                    # application failed before a durable effect; retry later
                 restore_command_claim(claim)
 
     def _apply_command(cmd, workers):
@@ -3513,6 +3606,11 @@ def main():
             record_command_rejection(rejections_box, cmd, _errs)
             return False, _errs
         try:
+            _cmd_goals = goals_from_command(cmd)
+            _new_cmd_goals = []
+            if _cmd_goals:
+                _new_cmd_goals = _append_goals_ledger(
+                    args.state_dir, _cmd_goals, started, raise_on_error=True, return_new=True)
             by_name = {w.name: w for w in workers}
             for nm in cmd.get("close", []):
                 w = by_name.get(nm)
@@ -3569,13 +3667,10 @@ def main():
             if "reunlock" in cmd:
                 reunlock_box[0] = apply_reunlock(cmd.get("reunlock"), workers,
                                                  enqueue=add_box.append)
-            # native chat / cockpit queued new goals into the running fleet. Persist the WHOLE
-            # command's goal batch atomically BEFORE exposing any item to memory. If that write
-            # fails, _apply_command fails and the claimed command is restored for a later sweep.
-            _cmd_goals = goals_from_command(cmd)
-            if _cmd_goals:
-                _append_goals_ledger(args.state_dir, _cmd_goals, started, raise_on_error=True)
-            for g in _cmd_goals:
+            # Only goals that this command newly admitted to the durable ledger enter memory.
+            # A recovered command whose batch was persisted before a crash is therefore a no-op;
+            # --resume already reconstructed that work from the same ledger.
+            for g in _new_cmd_goals:
                 add_box.append(g)
                 # THE ONE PLACE A `/goal ` SUBMISSION IS STILL VISIBLE. The command file is
                 # deleted the moment it is read, and after that this goal looks like any
