@@ -309,6 +309,43 @@ def test_every_surface_schedules_a_return_to_background(monkeypatch):
     assert started["delay"] == 5.0
 
 
+
+def test_return_to_background_powershell_is_windowless(monkeypatch):
+    """The delayed headless relaunch is unattended and must never allocate a console."""
+    started = {}
+    import relay.edge_recover as _rec
+    monkeypatch.setattr(_rec, "surface", lambda port=None, open_url="": True)
+    monkeypatch.setattr(_rec, "rehide", lambda port=None: None)
+
+    class _Timer:
+        def __init__(self, delay, fn):
+            started["fn"] = fn
+            self.daemon = False
+        def start(self):
+            pass
+
+    import threading
+    import subprocess as _sp
+    from tools import childproc as _childproc
+    monkeypatch.setattr(threading, "Timer", _Timer)
+    seen = {}
+
+    class _Result:
+        returncode = 0
+
+    def _run(argv, **kwargs):
+        seen["argv"] = list(argv)
+        seen["kwargs"] = dict(kwargs)
+        return _Result()
+
+    monkeypatch.setattr(_sp, "run", _run)
+    assert _REAL_SURFACE_WITH_WAY_BACK("http://127.0.0.1:9222", "https://x", 5.0) is True
+    started["fn"]()
+    assert seen["argv"][0].lower().startswith("powershell")
+    assert "creationflags" in seen["kwargs"]
+    assert seen["kwargs"]["creationflags"] == _childproc.headless_creationflags()
+
+
 def test_the_navigation_url_actually_has_its_query_separator():
     """THE BUG EVERY OTHER TEST HERE MISSED.
 
