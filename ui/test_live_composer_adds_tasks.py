@@ -20,7 +20,9 @@ def test_live_task_add_uses_the_same_lossless_command_channel_and_immediate_ui_r
     block = SOURCE[SOURCE.index('void TryAddGoalsToLiveFleet()'):]
     block = block[:block.index('\n    void ', 10)]
     assert 'Cmd1("add_goal", adds)' in block
-    assert 'SendCommand(' in block
+    assert 'SendTrackedCommand(patch, out commandPath)' in block
+    assert 'patch["ack"] = ackPath' in block
+    assert 'WatchLiveAddHandoff(commandPath, ackPath)' in block
     assert 'NoteSubmitted(goals)' in block
     assert '_goalInput.Text = ""' in block
 
