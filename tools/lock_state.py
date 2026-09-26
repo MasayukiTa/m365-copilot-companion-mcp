@@ -608,8 +608,9 @@ def _cli() -> None:
     shells out to it to surface the most recently refused client without a human having to look
     the IP up by hand, and it is the default so that call keeps working unchanged.
 
-    `token-gap` answers whether MCP_REQUIRE_UNLOCK_TOKEN can be switched on and what it would
-    refuse. It is here rather than beside `python -m tools.security list` because security.py is
+    `token-gap` reports the legacy/explicit-enforcement-off compatibility path: whether
+    MCP_REQUIRE_UNLOCK_TOKEN could be switched back on and what identity-only traffic existed.
+    It is here rather than beside `python -m tools.security list` because security.py is
     in the frozen set, where a change means the operator re-signs the baseline with a reason --
     not a trade worth making for a report, and the counter it reads lives in this file anyway.
 
@@ -687,10 +688,11 @@ _TOKEN_GAP_FILE = _STATE_FILE.parent / "unlock_token_gap.json"
 def record_token_gap(client_ip: str = "", ts: Optional[float] = None) -> None:
     """Note a call allowed without a token, so enforcement can be switched on with evidence.
 
-    MCP_REQUIRE_UNLOCK_TOKEN defaults to off: turning it on before anyone has re-unlocked
-    would refuse every existing session at once, and an outage is how a security change gets
-    reverted wholesale instead of kept. This counter is what says when it is safe -- when it
-    stops growing, every live caller is presenting a token and the switch costs nothing.
+    MCP_REQUIRE_UNLOCK_TOKEN now defaults to ON. This counter remains for deployments that
+    explicitly set it to 0 (and for historical evidence from when OFF was the default): it records
+    identity-only passes so an operator can see what would break before turning enforcement back
+    on. Session-authorized calls do not count as gaps because they already satisfy the second
+    factor without asking the model to shuttle a token.
 
     Never raises: a counter that can fail a request is worse than a counter.
     """
@@ -749,7 +751,7 @@ def _token_gap_quiet_seconds() -> float:
 
 
 def token_gap_report() -> dict:
-    """Whether MCP_REQUIRE_UNLOCK_TOKEN can be switched on, and what it would break.
+    """For an explicitly enforcement-off deployment, whether it can be switched back on.
 
     record_token_gap() above has counted every call that passed the unlock gate on the strength
     of the identity alone since 2026-08-18, and its docstring says what the count is for -- "this

@@ -764,8 +764,8 @@ def edge_recover_surface(port=None, open_url=""):
 #   "[locked: no HTTP request context] Denied: this call ran in-process (test, CLI, or an internal hook), not through the MCP HTTP server. unlock() cannot help here -- it needs the same HTTP context and will fail the same way; do not retry it. Either route the call through the HTTP server, or use an internal *_local path that does not pass this gate (memory_save_local / runlog_append_local)."
 #   "[locked: no valid unlock token for 'x.x.x.x'] The identity in the forwarding header is
 #    not sufficient on its own. Call unlock(password='<password>') and pass the returned
-#    `unlock_token` with the call. ..." -- the IP is already unlocked but no per-call token
-#    (or a stale one) came with the request; MCP_REQUIRE_UNLOCK_TOKEN's second-factor branch.
+#    `unlock_token` with the call. ..." -- the IP is already unlocked but neither a matching
+#    fallback token nor an authorized current MCP session established the second factor.
 #   "[locked client IP: 'x.x.x.x'] Mutating and execution tools require an unlock. Call
 #    unlock(password='<password>') first. The unlock is stored per client IP for
 #    MCP_UNLOCK_TTL_DAYS days."
@@ -804,7 +804,8 @@ def edge_recover_surface(port=None, open_url=""):
 NO_CONTEXT_REFUSAL = "[locked: no HTTP request context]"
 
 #: The bracketed prefix tools/security.py writes when the caller's client IP is ALREADY
-#: unlocked but the call carried no unlock_token (or a stale/wrong one) -- require_unlocked()
+#: unlocked but neither the presented fallback token nor the current MCP session is authorized --
+#: require_unlocked()
 #: ~line 562, added 2026-08-18. Stops before "for {ip!r}", the varying part, same convention as
 #: NO_CONTEXT_REFUSAL above. This is not a rare edge: measured 2026-09-10 (see
 #: tests/test_security_xff.py), 489 of 492 lock refusals in two days were this branch, one
@@ -880,35 +881,27 @@ GATE_AFTER_STUCK_RETRIES = int(os.environ.get("MCP_FLEET_GATE_AFTER_RETRIES", "5
 #: parked for hours on a question nobody was ever going to see.
 GATE_ANSWER_TIMEOUT_S = float(os.environ.get("MCP_FLEET_GATE_TIMEOUT_S", "1800") or 1800)
 
-#: THE TOKEN IS THE SECOND FACTOR AND THIS TEXT USED TO DENY IT EXISTED. The old wording told
-#: the worker that once unlock succeeded the tools "使えるので" -- just work on that connection.
-#: That is only true while MCP_REQUIRE_UNLOCK_TOKEN is off. With it on, tools/security.py
-#: unlocks the IP and then refuses every mutating call that arrives without the token it just
-#: handed back, saying so in as many words: "Call unlock(password='<password>') and pass the
-#: returned `unlock_token` with the call." The worker followed this prefix, believed the
-#: connection was now open, never passed the token, and was refused until its attempts ran out
-#: -- at which point the stuck reason below blamed a rotating IP or a wrong password, neither of
-#: which was true. Two jobs lost seventeen and six turns to that on 2026-09-07 before the cause
-#: was found. The password alone was never the whole story; say what the server actually wants.
-# TRIMMED 2026-09-15 (first-turn budget push). Cut the parenthetical "拒否メッセージ自体に
-# もそう書かれています" aside and merged the two password-related sentences into one -- the
-# load-bearing content (unlock_token is required, the password is already here so do not
-# hunt for it, .env is refused, read-only needs no unlock) is unchanged and each required
-# phrase relay/test_unlock_inject.py checks for is still present verbatim.
+#: UNLOCK RECOVERY CONTRACT, ALIGNED WITH tools/security.py. Since 2026-09-09 a successful
+#: unlock() authorizes the current Mcp-Session-Id itself. The model therefore does NOT need to
+#: remember a random unlock_token and re-attach it forever; asking it to do so was the incident
+#: that session authorization was introduced to fix. The token remains a transport fallback
+#: when session auth is explicitly disabled or unavailable, but it is not the normal fleet
+#: contract. The load-bearing instructions are now: call unlock once in THIS conversation,
+#: observe success, retry the blocked operation in the SAME conversation, and do not go hunting
+#: through .env or other files for credentials already supplied in this transient recovery turn.
 UNLOCK_PREFIX = (
-    "【要解錠】書込/実行ツールはロック解除が必要です。まず call_tool で "
-    "'unlock' を引数 {\"password\": \"%s\"} で1回実行してください。"
-    "**戻り値の unlock_token を必ず保持し、以後の書込/実行系 call_tool すべてに "
-    "引数 unlock_token として渡してください。** IPの解錠だけでは足りず、トークン無しの呼び出しは拒否されます。"
-    "解錠できたら当初のゴールを続行し、password は二度と出力しないこと。"
-    "password はこの指示に既にあるので探しに行かないこと――"
-    "特に .env は読まないこと(サーバが必ず拒否し何度も通らない)。読み取り専用の作業に unlock は不要。"
+    "【要解錠】書込/実行ツールはロック解除が必要です。まず call_tool の 'unlock' を "
+    "引数 {\"password\": \"%s\"} で1回実行してください。"
+    "unlock が成功したら、同じ会話のまま直前に拒否された書込/実行ツールを再試行してください。"
+    "現行サーバは unlock 成功時にこの会話の MCP session 自体を認可するため、通常は "
+    "unlock_token をモデルが保持して毎回再添付する必要はありません。"
+    "返却 token は transport fallback であり、探したり保存したりしないでください。"
+    "password はこの指示に既にあるので探しに行かないこと。特に .env は読まないこと。"
+    "読み取り専用の作業に unlock は不要です。"
     "\n--- 元のゴール ---\n"
 )
 
-#: The distinctive marker at the front of UNLOCK_PREFIX -- used ONLY to recognise text this
-#: process itself generated (_inject_unlock composed it earlier and it is being redelivered
-#: through the steer/follow-up channel), never to detect anything about text from elsewhere.
+#: Distinctive marker for text generated by this process itself.
 _UNLOCK_MARKER = "【要解錠】"
 
 
@@ -974,21 +967,17 @@ def _tried_to_call_a_tool(resp: str) -> bool:
     return any(m in low for m in _INVOKE_MARKUP)
 
 
-def _exclusively_refused(worker: str, since: float) -> bool:
+def _exclusively_refused(worker: str, since: float, *, return_record: bool = False):
     """Did the SERVER refuse a call that could only have been this worker's?
 
-    The branch that needs no reply text. A refusal carries a timestamp; relay/turn_windows
-    knows which workers had a turn open then; if exactly one did and it is this worker, the
-    refusal is ATTRIBUTED rather than inferred.
-
-    Measured 2026-09-16 across 39 real runs, attributing a session to the worker whose turn
-    window contains all its calls: 100% of sessions resolve uniquely at 2 concurrent workers,
-    31% at 8, 15% at 15, 3% at 96 -- overall 45 of 470, 10%. So this answers often when the
-    fleet is small and rarely when it is large, and it says nothing rather than guessing in
-    between. Every rule below is unchanged and still carries the cases this one declines.
+    By default this keeps the historical boolean contract. `return_record=True` is used by the
+    classifier so the exact refusal row survives into `classified_locked.consumed` instead of
+    disappearing behind a boolean. That row carries the MCP session id, which is the only stable
+    join to a later grant when several workers overlap by the time unlock() succeeds.
     """
+    empty = None if return_record else False
     if not worker or since <= 0:
-        return False
+        return empty
     try:
         from tools import lock_state as _ls
         from relay import turn_windows as _tw
@@ -999,10 +988,10 @@ def _exclusively_refused(worker: str, since: float) -> bool:
                 continue
             ts = float(rec.get("ts") or 0)
             if ts and _tw.belongs_to(worker, ts):
-                return True
+                return rec if return_record else True
     except Exception:
-        return False
-    return False
+        return empty
+    return empty
 
 
 #: How far back _worker_recently_granted ASKS to look for a grant it can attribute to a
@@ -1017,33 +1006,22 @@ def _exclusively_refused(worker: str, since: float) -> bool:
 _RECENT_GRANT_LOOKBACK_S = 1200.0
 
 
-def _worker_recently_granted(worker: str, lookback_s: float = _RECENT_GRANT_LOOKBACK_S) -> bool:
-    """Did the SERVER record this identity becoming unlocked recently, even though the last
-    reply this worker sent still looked locked?
+def _worker_recently_granted(
+        worker: str, lookback_s: float = _RECENT_GRANT_LOOKBACK_S, *, since: float = 0.0) -> bool:
+    """Did the server grant the lock episode that this worker is recovering from?
 
-    THE INCIDENT THIS CLOSES, measured 2026-09-24 (.fleet/lock_refusals.jsonl, 20:46-21:06):
-    eight fleet workers exhausted MAX_UNLOCK_ATTEMPTS and raised a HITL gate reading "unlock
-    を4回投入したが解錠が続かない". Session 74a529deaa442b2b -- one of those eight -- was
-    refused three times over roughly five minutes (gaps of 176s and 82s between refusal and
-    the next auto-injected attempt), each refusal carrying an EMPTY presented_digest and
-    session_state "unrecognized-or-expired": the model's own turn was simply slow to act on
-    the injected unlock() instruction, not incapable of it. 29 seconds after the LAST of
-    those three refusals, the same session WAS granted (`{"event": "granted", ...,
-    "session": "74a529deaa442b2b", "via": "password"}`) -- inside the round-trip of one more
-    attempt, after the budget that triggers a human gate had already been spent counting
-    attempts rather than elapsed recovery time. The client IP never rotated (20.210.146.129
-    throughout every one of the eight incidents that day) and MCP_REQUIRE_UNLOCK_TOKEN /
-    MCP_UNLOCK_PASSWORD were both configured correctly -- so of the three causes
-    _inject_unlock's exhaustion message names, none was the actual cause for at least this
-    worker; it was still catching up.
+    `True` is deliberately a proof and `False` is only "not established". There are two proof
+    paths, strongest first:
 
-    Reuses _exclusively_refused's exact attribution (relay/turn_windows.belongs_to) against
-    'granted' events instead of 'refused' ones (tools/lock_state.granted_records). SAME
-    FALSE-NEGATIVE SHAPE: attribution resolves exclusively only ~10% of the time overall
-    (100% at 2 concurrent workers, 3% at 96 -- see _exclusively_refused's docstring), so a
-    False here means "not established", never "not granted". That asymmetry is why this may
-    only ever CANCEL a gate/STUCK that would otherwise fire, never suppress one that a
-    worker genuinely needs: on a False, _inject_unlock's existing behaviour is unchanged.
+    1. A `classified_locked` row owned *exclusively* by this worker names the exact refusal row
+       and therefore its MCP session. A later `granted` row for that same session is an exact
+       join even if the grant timestamp itself occurs while several workers are in flight.
+    2. Backward-compatible fallback: the grant timestamp itself is exclusively attributable to
+       this worker through relay.turn_windows.
+
+    `since` narrows both paths to the current turn/lock episode. This matters when a session id is
+    reused or an earlier authorization aged out: a grant older than the refusal must never cancel
+    recovery for a new refusal.
     """
     if not worker:
         return False
@@ -1051,8 +1029,49 @@ def _worker_recently_granted(worker: str, lookback_s: float = _RECENT_GRANT_LOOK
         from tools import lock_state as _ls
         from relay import turn_windows as _tw
 
-        since = time.time() - max(1.0, float(lookback_s))
-        for rec in _ls.granted_records(since):
+        lower = time.time() - max(1.0, float(lookback_s))
+        try:
+            requested = float(since or 0.0)
+        except (TypeError, ValueError):
+            requested = 0.0
+        if requested > 0.0:
+            lower = max(lower, requested)
+
+        grants = list(_ls.granted_records(lower))
+
+        # STRONG PATH: join the exact refusal session to a later grant. Only classifications
+        # whose refusal attribution was exclusive are allowed to establish this; using an
+        # ambiguous consumed row would turn another worker's success into ours.
+        try:
+            classes = list(_ls.classifications(lower))
+        except Exception:
+            classes = []
+        for cls in classes:
+            attr = cls.get("attribution") or {}
+            if str(attr.get("worker") or "") != str(worker) or not bool(attr.get("exclusive")):
+                continue
+            consumed = cls.get("consumed") or {}
+            session = str(consumed.get("session") or attr.get("session") or "")
+            if not session:
+                continue
+            try:
+                refusal_ts = float(consumed.get("ts") or 0.0)
+            except (TypeError, ValueError):
+                refusal_ts = 0.0
+            if refusal_ts <= 0.0 or refusal_ts < lower:
+                continue
+            for rec in grants:
+                if str(rec.get("session") or "") != session:
+                    continue
+                try:
+                    grant_ts = float(rec.get("ts") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if grant_ts >= refusal_ts:
+                    return True
+
+        # WEAKER BUT STILL PROVABLE FALLBACK: the grant instant itself had one exclusive owner.
+        for rec in grants:
             ts = float(rec.get("ts") or 0)
             if ts and _tw.belongs_to(worker, ts):
                 return True
@@ -1074,8 +1093,9 @@ def _looks_locked(resp: str, since: float = 0.0, worker: str = "") -> bool:
          entire (short) tool-call return value; a long analytical response merely mentioning
          unlock(password=...) is not.
     """
-    if _exclusively_refused(worker, since):
-        _note_locked("exclusive-attribution", resp, since, None)
+    exclusive = _exclusively_refused(worker, since, return_record=True)
+    if exclusive:
+        _note_locked("exclusive-attribution", resp, since, exclusive, worker)
         return True
     low = (resp or "").lower()
     if any(m in low for m in LOCKED_MARKERS):
@@ -2943,6 +2963,10 @@ class RelayWorker:
         self._signin_surfaced_ok = False  # TRUTHFUL result of that surface() call (see edge_recover.surface)
         self._headed_recovery_done = False  # forced a HEADED companion relaunch once (last resort)
         self._unlock_attempts = 0       # auto-injected unlock(password) turns (write/exec gate)
+        # None = use the outcome-wide retry policy; False/True = this worker has stronger
+        # evidence about THIS terminal event. Deterministic STUCK/content refusal must not be
+        # turned into a fresh conversation merely because another STUCK was transient once.
+        self.retryable_override = None
         # HITL GATE (operator E, wired in -- see GATE_AFTER_STUCK_RETRIES above): the token of
         # this worker's OWN standing gate, or None. ONE GATE PER WORKER AT A TIME -- a worker
         # that has already asked (token set) must not ask again while its question stands; see
@@ -4733,6 +4757,17 @@ class RelayWorker:
             self.reason = ("⚠ 書込/実行に unlock が必要だが MCP_UNLOCK_PASSWORD が未設定。"
                            ".env に設定して再投入してください。")
             return
+        # CHECK THE SERVER LEDGER BEFORE SENDING ANOTHER PASSWORD TURN. A Copilot turn can
+        # call unlock successfully near the end of the same response that still contains an
+        # earlier lock refusal. Until now we only checked this AFTER exhausting all attempts,
+        # so a grant that already happened could still be followed by another unlock prompt.
+        # False means "not established" under concurrency; True is safe to act on.
+        if _worker_recently_granted(self.name, since=getattr(self, "_turn_sent_at", 0.0)):
+            self._unlock_attempts = 0
+            self.job = self._task_anchor(RETRY_JOB)
+            self.reason = "unlock grant confirmed by server ledger -> retry blocked operation"
+            self.status = "ready"
+            return
         if self._unlock_attempts < MAX_UNLOCK_ATTEMPTS:
             self._unlock_attempts += 1
             self.job = PROTOCOL + (UNLOCK_PREFIX % pw) + self.goal
@@ -4753,27 +4788,27 @@ class RelayWorker:
         # attempt is counted. If the server's own ledger shows this worker's identity was
         # granted since, the run is not stuck at all; resume it instead of spending a human
         # gate on a question recovery already answered.
-        if _worker_recently_granted(self.name):
+        if _worker_recently_granted(self.name, since=getattr(self, "_turn_sent_at", 0.0)):
             self._unlock_attempts = 0
             self.job = self._task_anchor(CONTINUE_JOB)
             self.reason = "unlock 済みをサーバ記録で確認 -> 再開(人への確認は不要と判断)"
             self.status = "ready"
             return
-        # NAME THE CAUSE THAT ACTUALLY HAPPENS. This listed a rotating backend IP and a wrong
-        # password, and on 2026-09-07 it was neither: MCP_REQUIRE_UNLOCK_TOKEN was on, the
-        # unlock succeeded, and every following call was refused for arriving without the
-        # token. Whoever reads this line is trying to find out why, so the possibility that
-        # was true must be in it -- and it is the cheapest one to check.
-        reason = ("⚠ unlock を %d 回投入したが解錠が続かない。"
-                  "(1) MCP_REQUIRE_UNLOCK_TOKEN が有効で、unlock_token を後続の "
-                  "call_tool に渡せていない (lock_refusals.jsonl の site が "
-                  "security.py:324 ならこれ)、"
-                  "(2) M365バックエンドの送信元IPが毎回変わる(unlockはIP単位)、"
-                  "(3) MCP_UNLOCK_PASSWORD 不一致。のいずれか。"
-                  % self._unlock_attempts)
+        # DIAGNOSE THE STATE MACHINE WE ACTUALLY RUN NOW. Session authorization has been the
+        # normal path since 2026-09-09, so "the model forgot to re-attach unlock_token" is no
+        # longer the first explanation for a normal fleet worker. Exhaustion means we never
+        # established a usable grant for THIS conversation, or the transport identity changed.
+        reason = ("⚠ unlock を %d 回投入したが、この会話の解錠成功を確認できません。"
+                  "確認順序: (1) agent がこの会話で unlock() を実行していない/遅延している、"
+                  "(2) Mcp-Session-Id が途中で変わったか失効した、"
+                  "(3) MCP_UNLOCK_PASSWORD が一致していない。"
+                  "MCP_UNLOCK_SESSION_AUTH=0 を明示している場合に限り、返却 unlock_token の"
+                  "再添付も確認してください。" % self._unlock_attempts)
+
         # HITL GATE, NOT AN IMMEDIATE STUCK. Every one of the three causes named above is a
-        # question only a person can answer (flip MCP_REQUIRE_UNLOCK_TOKEN, chase the IP, or
-        # confirm the password) -- exactly operator E's case, and the trap the module-level
+        # question only a person can answer (did this conversation ever execute unlock, did its
+        # MCP session identity change/expire, or is the configured password wrong) -- exactly
+        # operator E's case, and the trap the module-level
         # comment above GATE_AFTER_STUCK_RETRIES documents: a worker cannot call gate_ask on
         # its own behalf here, being the one case that most needs it. Falls back to the old
         # immediate-STUCK behaviour if a gate already stands for this worker or raising one
@@ -5371,12 +5406,14 @@ class RelayWorker:
                 self.status = "stuck"
                 _proof = connector_proof_source()
                 if _proof == "run":
+                    self.retryable_override = False
                     self.outcome = "REFUSED"
                     self.reason = ("⚠ 定型の無回答が継続。ただし本走行の別ワーカーにはカスタム"
                                    "エージェントが応答しており、MCPコネクタは生きている。"
                                    "→ 接続の問題ではなく**この指示に対する拒否**。"
                                    "再ナビもヘッドフル復旧も効かない。指示の言い換えが要る。")
                 elif _proof == "probe":
+                    self.retryable_override = False
                     # SAME VERDICT, DIFFERENT EVIDENCE. Saying "a sibling answered" here would
                     # be false -- this run may have had no sibling at all.
                     self.outcome = "REFUSED"
@@ -5577,6 +5614,7 @@ class RelayWorker:
                 # settlement if a gate already stands or raising one fails outright.
                 if self._raise_stuck_gate(reason_text, "converged on consecutive STUCK replies"):
                     return
+                self.retryable_override = False
                 self.status, self.outcome = "stuck", "STUCK"
                 self.reason = ("worker reached the same conclusion on consecutive turns -> "
                                "settling on its own stated reason instead of nudging again: %s"
@@ -5631,6 +5669,7 @@ class RelayWorker:
                 return
             if self._salvage_via_checks():
                 return
+            self.retryable_override = False
             self.status, self.outcome, self.reason = "stuck", "STUCK", \
                 "agent reported STUCK (after %d retries): %s" % (self.transient, reason_text)
             return
@@ -8097,6 +8136,10 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     def _retry_allowed(outcome, worker):
         """Whether this outcome may be re-queued, saying so out loud when it is not KNOWN.
 
+        A worker may carry `retryable_override` when it has stronger evidence than the coarse
+        outcome name: e.g. a converged STUCK or a prompt-specific refusal is deterministic and
+        a fresh conversation only repeats it. None preserves the outcome-wide historical rule.
+
         `outcomes.is_retryable` refuses an outcome outside the closed set instead of answering
         "no" -- because "not retryable" and "not considered" were the same answer once, and the
         outcome that actually occurred (STUCK) was the one left out. The raw membership test
@@ -8109,6 +8152,9 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         not retryable -- exactly as before -- and PRINTED and RECORDED, which is the half that
         was missing.
         """
+        _override = getattr(worker, "retryable_override", None)
+        if _override is not None:
+            return bool(_override)
         if _retryable is None:                      # outcomes module unavailable: prior rule
             return outcome in RETRYABLE_OUTCOMES
         try:
@@ -8205,8 +8251,10 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                                triggered=_retry_allowed(_oc, _w),
                                not_triggered_reason=(
                                    "" if _retry_allowed(_oc, _w) else
-                                   "outcome %s is not retryable; the trigger reads the "
-                                   "worker's own report" % _oc),
+                                   ("worker marked this terminal result deterministic; fresh retry disabled"
+                                    if getattr(_w, "retryable_override", None) is False else
+                                    "outcome %s is not retryable; the trigger reads the "
+                                    "worker's own report" % _oc)),
                                self_report_outcome=str(_oc or ""))
                 except Exception:
                     pass

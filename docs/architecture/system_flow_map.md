@@ -206,7 +206,7 @@ flowchart TD
 
     requnlocked -->|"no HTTP request context"| refusenoctx["'[locked: no HTTP request context] ...'<br/>tools/security.py ~493<br/>lock_state.record_locked() logs it"]
     requnlocked -->|"local caller"| ok1["allowed, no unlock needed"]
-    requnlocked -->|"IP unlocked, no/stale unlock_token,<br/>MCP_REQUIRE_UNLOCK_TOKEN=1"| refusetoken["'[locked: no valid unlock token for ...] ...'<br/>tools/security.py ~562"]
+    requnlocked -->|"IP unlocked, token invalid/absent,<br/>session absent/unrecognized, enforcement ON"| refusetoken["'[locked: no valid unlock token for ...] ...'<br/>tools/security.py ~562"]
     requnlocked -->|"IP never unlocked"| refuseip["'[locked client IP: ...] ...'<br/>tools/security.py ~570"]
     requnlocked -->|"unlocked (IP, or IP+token,<br/>or IP+session fallback)"| ok2["allowed"]
 

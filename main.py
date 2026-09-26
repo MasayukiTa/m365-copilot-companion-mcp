@@ -297,16 +297,16 @@ mcp = FastMCP(
         "read_image and pptx_export_png; and install Python dependencies. Read-only "
         "tools work after token authentication; mutating or execution tools additionally "
         "require unlock(password), per client IP. "
-        # THE AGENT CANNOT COMPLY WITH A RULE IT WAS NEVER TOLD. The token was added to the
-        # gate, to unlock()'s reply and to call_tool's signature, and none of those is a place
-        # an agent reliably reads BEFORE its first refusal. It goes here, next to the unlock
-        # sentence it modifies, because "carry a value between calls" is only free if the
-        # instruction is in front of the model the whole time.
-        "RULE 8: unlock(password) replies with a line `unlock_token: <value>`. KEEP that "
-        "value for the rest of the conversation and pass it on every mutating or executing "
-        "call: call_tool(name='run_python', arguments={...}, unlock_token='<value>'). It is "
-        "shown once; if you lose it, call unlock again. A refusal mentioning a missing token "
-        "means only that -- add the token, do not retry the identical call. "
+        # UNLOCK IS SESSION-FIRST. A successful unlock records the current Mcp-Session-Id,
+        # which the transport carries automatically. The returned unlock_token is retained as a
+        # fallback for clients without session authorization; making a language model shuttle it
+        # on every call recreated the exact reliability problem session auth was added to remove.
+        "RULE 8: if a mutating/executing tool says this conversation is locked, call "
+        "unlock(password) ONCE in this same conversation, then retry the blocked tool here. "
+        "A successful unlock authorizes this MCP session automatically. Do NOT try to remember "
+        "or re-attach unlock_token on every call. The returned token is only a fallback: pass "
+        "it explicitly if the refusal says no authorized MCP session is available or session "
+        "authorization is disabled. "
         "Relative user-folder names (Desktop, Documents, Downloads, ...) resolve to the "
         "user's home profile, not the server's working directory. If a file or folder "
         "seems missing, use find_files (recursive name search) before concluding it is "
@@ -710,20 +710,22 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
         list_directory, find_files) run as-is; only mutating or executing tools need unlock.
 
         UNLOCKING, AND KEEPING THE TOKEN. `unlock(password="...")` replies with a line reading
-        `unlock_token: <value>`. KEEP THAT VALUE for the rest of the conversation and pass it
-        on every mutating or executing call:
+        `unlock_token: <value>`. In the normal MCP path, a successful unlock also authorizes
+        the current Mcp-Session-Id, so keep working in the SAME conversation and retry the
+        blocked tool; the model does not need to remember or re-attach the token on every call.
+
+        The token is a transport fallback. Pass it explicitly when session authorization is
+        unavailable/disabled, or when a refusal specifically says this call has no authorized
+        MCP session:
 
             call_tool(name="run_python", arguments={"code": "..."}, unlock_token="<value>")
-
-        It is shown once and cannot be retrieved afterwards; if it is lost, call unlock again.
-        A refusal that mentions a missing token means exactly this and nothing else -- the
-        remedy is to include it, not to retry the same call.
 
         Args:
             name: the tool's name (e.g. "odbc_query"). Empty or "?" lists every tool.
             arguments: dict of the target tool's keyword arguments.
-            unlock_token: the value from unlock()'s reply. Required for mutating and executing
-                tools once MCP_REQUIRE_UNLOCK_TOKEN is on; harmless to pass at any time.
+            unlock_token: fallback credential returned by unlock(). Usually optional after a
+                successful unlock in the same MCP conversation; required when no authorized
+                MCP session is available.
         """
         def _log_discovery(kind, detail, result):
             """Record a catalogue or signature lookup, which the ledger did not see.

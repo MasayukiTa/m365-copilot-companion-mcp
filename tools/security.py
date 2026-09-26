@@ -1053,11 +1053,18 @@ def require_unlocked() -> str | None:
         # WHAT TO DO, NOT WHAT IS WRONG. The measured case (2026-09-17..24) is a conversation
         # that never unlocked -- or unlocked in an earlier conversation -- and the old text sent
         # agents to look for the password in files. Say the one action that works.
-        msg = (
-            f"[locked: no valid unlock token for {ip!r}] This conversation is not unlocked. "
-            "Call unlock(password='<password>') again now, in this conversation, then retry "
-            "with the returned unlock_token. " + _HANDOFF_HINT
-        )
+        if sess and session_auth_enabled():
+            msg = (
+                f"[locked: no valid unlock token for {ip!r}] Session not unlocked. "
+                "Call unlock(password='<password>') again now, in this conversation, then retry "
+                "the blocked tool. Session auth makes unlock_token optional. " + _HANDOFF_HINT
+            )
+        else:
+            msg = (
+                f"[locked: no valid unlock token for {ip!r}] This call has no authorized MCP "
+                "session. Call unlock(password='<password>') now and retry with the returned "
+                "unlock_token. " + _HANDOFF_HINT
+            )
         lock_state.record_locked(ip, msg, presented_digest=presented_digest, tokens_held=held,
                                  session_state=session_state)
         return msg
@@ -1138,11 +1145,20 @@ def unlock(password: str) -> str:
     # The refusal that prompted this unlock is now history; drop it so a reader
     # checking "was a call just refused?" is not answered by a stale record.
     lock_state.clear()
+    if sess and session_auth_enabled():
+        return (
+            f"Unlocked IP {ip!r} for {ttl_days} days.\n"
+            "This MCP session is now authorized; retry the blocked mutating/execution tool in "
+            "this same conversation.\n"
+            f"unlock_token: {token}\n"
+            "The token is a fallback for clients that explicitly carry it; this session does "
+            "not require the model to re-attach it on every call."
+        )
     return (
         f"Unlocked IP {ip!r} for {ttl_days} days.\n"
         f"unlock_token: {token}\n"
-        "Pass this as `unlock_token` on call_tool for mutating and execution tools. "
-        "It is shown once and only its hash is kept."
+        "No MCP session authorization is available, so pass this as `unlock_token` on "
+        "mutating and execution calls. It is shown once and only its hash is kept."
     )
 
 
