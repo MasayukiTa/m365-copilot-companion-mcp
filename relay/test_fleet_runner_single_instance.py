@@ -46,3 +46,14 @@ def test_live_marker_conflict_is_detected_before_lock_race_fallback(tmp_path, mo
     monkeypatch.setattr(fr, '_pid_alive', lambda pid: int(pid) == 9876)
     assert fr._active_run_conflict_pid(str(tmp_path), self_pid=1234) == 9876
     assert fr._active_run_conflict_pid(str(tmp_path), self_pid=9876) == 0
+
+
+def test_unreadable_existing_active_marker_fails_closed(tmp_path):
+    """PR47 #4111676515: a legacy owner's unreadable marker is not evidence of no owner."""
+    (tmp_path / fr.ACTIVE_MARKER).write_text('{broken', encoding='utf-8')
+    assert fr._active_run_conflict_pid(str(tmp_path), self_pid=1234) != 0
+
+
+def test_noninteger_active_marker_pid_fails_closed(tmp_path):
+    fr._write_atomic(str(tmp_path / fr.ACTIVE_MARKER), {'pid': 'not-a-pid'})
+    assert fr._active_run_conflict_pid(str(tmp_path), self_pid=1234) != 0

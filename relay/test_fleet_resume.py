@@ -193,8 +193,9 @@ class LedgerTests(unittest.TestCase):
         anchor = '_cmd_goals = goals_from_command(cmd)'
         i = src.index(anchor)
         block = src[i:i + 1400]
-        self.assertIn('_append_goals_ledger(args.state_dir, _cmd_goals, started, raise_on_error=True)', block)
-        self.assertLess(block.index('_append_goals_ledger('), block.index('add_box.append(g)'),
+        self.assertIn('_new_cmd_goals = _append_goals_ledger(', block)
+        self.assertIn('raise_on_error=True, return_new=True', block)
+        self.assertLess(block.index('_append_goals_ledger('), src[i:].index('add_box.append(g)'),
                         'persist the whole accepted goal batch before the in-memory queue can run it')
 
     def test_missing_ledger_tolerated(self):
@@ -215,3 +216,33 @@ class LedgerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+def test_live_append_refuses_to_replace_an_unknown_or_corrupt_ledger(tmp_path):
+    """PR47 #4111676490: a live add must not turn a corrupt launch ledger into add-only state."""
+    import pytest
+    p = tmp_path / fr.LAST_RUN_GOALS
+    p.write_text('{broken', encoding='utf-8')
+    with pytest.raises(Exception):
+        fr._append_goals_ledger(str(tmp_path), ['live-only'], started=10.0,
+                                raise_on_error=True)
+    assert p.read_text(encoding='utf-8') == '{broken'
+
+
+def test_periodic_done_update_is_monotonic_across_reconnect_chunks(tmp_path):
+    """PR47 #4111676604: current-chunk ticks may add DONE keys, never erase older ones."""
+    fr._write_atomic(str(tmp_path / fr.LAST_RUN_DONE), {'old-key': 'DONE'})
+    class W:
+        goal = 'new goal'
+        outcome = 'DONE'
+    fr._update_done_map(str(tmp_path), [W()])
+    got = fr._read_done_map(str(tmp_path))
+    assert got['old-key'] == 'DONE'
+    assert got[fr._goal_key('new goal')] == 'DONE'
+
+
+def test_main_requires_the_initial_goals_ledger_before_work_can_start():
+    """PR47 #4111676490: the launch ledger is part of admission, not optional telemetry."""
+    src = Path(fr.__file__).read_text(encoding='utf-8')
+    main = src[src.index('def main():'):]
+    assert '_write_goals_ledger(args.state_dir, goals, started, raise_on_error=True)' in main

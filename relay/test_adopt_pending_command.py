@@ -68,3 +68,23 @@ def test_adopt_commit_happens_only_after_ledger_and_active_marker_exist():
     assert ledger < marker < commit
     assert "--adopt-command" in main
     assert "_adopt_goals + _read_goals(args)" in main
+
+
+def test_active_marker_can_be_required_before_an_adopted_command_is_committed(tmp_path, monkeypatch):
+    """PR47 #4111676544: adoption may not commit when interruption recovery cannot be written."""
+    def boom(*a, **k):
+        raise OSError('disk unavailable')
+    monkeypatch.setattr(fr, '_write_atomic', boom)
+    import pytest
+    with pytest.raises(OSError):
+        fr._write_active_marker(str(tmp_path), argv=['--adopt-command', 'x'],
+                                pid=123, start_ts=1.0, raise_on_error=True)
+
+
+def test_adopt_path_uses_a_required_active_marker():
+    src = Path(fr.__file__).read_text(encoding='utf-8')
+    main = src[src.index('def main():'):]
+    marker = main.index('_write_active_marker(args.state_dir, start_ts=started')
+    commit = main.index('commit_command_claim(args.state_dir, _adopt_claim')
+    assert 'raise_on_error=bool(_adopt_claim)' in main[marker:marker + 250]
+    assert marker < commit

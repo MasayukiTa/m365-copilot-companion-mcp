@@ -318,3 +318,16 @@ def test_the_rest_of_the_state_dir_is_not_caught(tmp_path):
             FO._validate_path(str(tmp_path / rel))
         except PermissionError as exc:
             assert "command channel" not in str(exc), rel
+
+
+def test_add_goal_cannot_share_one_command_with_live_control_effects(tmp_path):
+    """PR47 #4111676584: goal durability and external/control effects cannot share a retry unit."""
+    controls = [
+        {'steer': {'worker': 'w0', 'text': 'x'}}, {'close': ['w0']}, {'reunlock': 'w0'},
+        {'set_maxtabs': 2}, {'set_disk_floor_gb': 1}, {'set_ram_floor_mb': 1},
+        {'set_autoscale': {'on': 1}}, {'pause': True}, {'stop': True},
+    ]
+    for c in controls:
+        cmd = {'add_goal': [{'text': 'new goal'}], **c}
+        errs = FR.validate_command(cmd, str(tmp_path))
+        assert errs and any('add_goal' in e and 'control' in e for e in errs), (cmd, errs)
