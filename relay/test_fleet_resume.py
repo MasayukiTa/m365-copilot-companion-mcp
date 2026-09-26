@@ -146,6 +146,31 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(m_total, 0)
 
 
+
+    def test_final_chunk_never_erases_done_from_earlier_chunks(self):
+        # A succeeded in an earlier reconnect chunk. The final chunk contains only B cancelled.
+        fr._write_atomic(self._done_path(), {fr._goal_key("goal A"): "DONE"})
+        fr._merge_final_done_map(self.state_dir, [
+            {"goal": "goal B", "outcome": "CANCELLED"},
+        ])
+        self.assertEqual(fr._read_done_map(self.state_dir), {fr._goal_key("goal A"): "DONE"})
+
+        # A later successful item is added without removing A.
+        fr._merge_final_done_map(self.state_dir, [
+            {"goal": "goal C", "outcome": "DONE"},
+        ])
+        self.assertEqual(fr._read_done_map(self.state_dir), {
+            fr._goal_key("goal A"): "DONE",
+            fr._goal_key("goal C"): "DONE",
+        })
+
+    def test_main_finalization_uses_merge_not_replacement(self):
+        src = Path(fr.__file__).read_text(encoding="utf-8")
+        i = src.index('# RUN-RESUME: merge this FINAL CHUNK into the durable completion map')
+        block = src[i:i + 1000]
+        self.assertIn('_merge_final_done_map(', block)
+        self.assertNotIn('final_done = {', block)
+
     def test_live_added_goals_extend_the_durable_ledger(self):
         fr._write_goals_ledger(self.state_dir, ["initial A"], started=10.0)
         added = [

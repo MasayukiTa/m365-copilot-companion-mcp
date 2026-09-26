@@ -1873,6 +1873,28 @@ def _update_done_map(state_dir, workers):
             _update_done_map._warned = True
 
 
+def _merge_final_done_map(state_dir, results):
+    """Merge successful outcomes from one final chunk into the durable done-map.
+
+    ``run_relay_fleet`` may return only the workers from the last reconnect chunk, and a
+    graceful stop can return just the workers active at stop time. Replacing the file from
+    that partial ``results`` list erases DONE outcomes from earlier chunks and makes
+    ``--resume`` replay work that already succeeded. Existing DONE keys are therefore
+    monotonic for the life of the ledger.
+    """
+    done = _read_done_map(state_dir)
+    for r in results or []:
+        try:
+            outcome = r.get("outcome")
+            goal = r.get("goal") or ""
+        except Exception:
+            continue
+        if outcome in _RESUME_SUCCESS_OUTCOMES and goal:
+            done[_goal_key(goal)] = outcome
+    _write_atomic(os.path.join(state_dir, LAST_RUN_DONE), done)
+    return done
+
+
 def _resume_goals(state_dir):
     """Build the resume goal set from the sidecar ledger + done-map. Returns
     (remainder_goals, n_unfinished, m_total). A corrupt/absent ledger yields ([], 0, 0)
@@ -3786,15 +3808,13 @@ def main():
     for _fw in final["workers"]:
         _fw["fanout"] = _ffv.get(_fw["name"], {"kind": "solo", "campaign_id": _fw.get("campaign_id", ""), "label": ""})
     _write_atomic(status_path, final)
-    # RUN-RESUME: write the FINAL completion map from the true per-goal outcomes (the
-    # on_tick map may miss a worker that reached DONE on the very last sweep). A later
-    # --resume then re-queues exactly the goals that did NOT finish successfully.
+    # RUN-RESUME: merge this FINAL CHUNK into the durable completion map. ``results`` is not
+    # necessarily the whole run after reconnects / graceful stop, so replacement here would
+    # erase earlier DONE goals and replay them on --resume.
     try:
-        final_done = {_goal_key(r["goal"]): r["outcome"]
-                      for r in results if r["outcome"] in _RESUME_SUCCESS_OUTCOMES}
-        _write_atomic(os.path.join(args.state_dir, LAST_RUN_DONE), final_done)
+        _merge_final_done_map(args.state_dir, results)
     except Exception as e:
-        sys.stderr.write("[resume] WARN: could not write final done map: %s\n" % e)
+        sys.stderr.write("[resume] WARN: could not merge final done map: %s\n" % e)
     print("\n\n=== fleet complete in %ss ===" % elapsed)
     for r in results:
         print("  %-4s %-8s turns=%d  %s" % (r["name"], r["outcome"], r["turns"],
