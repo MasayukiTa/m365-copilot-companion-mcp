@@ -36,6 +36,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from tools import childproc
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -73,7 +75,8 @@ def hard_reset(port=9222, wait=True):
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1,
              "-HardReset", "-Port", str(port)],
             cwd=repo, timeout=120 if wait else 5,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=childproc.headless_creationflags())
         return True
     except Exception:
         return False
@@ -317,7 +320,8 @@ def surface(port=9222, poll_timeout_s=8.0, poll_interval_s=0.5, open_url=""):
         subprocess.run(
             _surface_launcher_argv(ps1, flag, port, open_url),
             cwd=repo, timeout=60 if flag == "-Foreground" else 15,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=childproc.headless_creationflags())
     except Exception:
         return False
     # Verify the REAL outcome rather than trusting subprocess.run's exit code. A -Foreground
@@ -466,7 +470,8 @@ def rehide(port=None, profile=""):
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
              _REHIDE_PS.replace("__PROFILE__", marker)],
             cwd=repo, timeout=20,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=childproc.headless_creationflags())
         return True
     except Exception:
         return False
