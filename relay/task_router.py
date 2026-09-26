@@ -146,6 +146,8 @@ if TASK_JOB_APPROVAL_MODE not in ("default", "auto", "bypass"):
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
+from tools import childproc
+
 # These helpers are reused, not reimplemented (see module docstring / design notes below).
 # Imports are defensive: the router must stay importable even if tools/relay siblings are
 # absent from a stripped-down deployment -- job_gate() then degrades to "never flags risk",
@@ -1137,7 +1139,8 @@ def _pid_alive(pid) -> bool:
     try:
         out = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid, "/NH"],
                              capture_output=True, text=True, encoding="utf-8",
-                             errors="replace", timeout=20)
+                             errors="replace", timeout=20,
+                             creationflags=childproc.headless_creationflags())
         return str(pid) in (out.stdout or "")
     except Exception:
         # UNKNOWN IS TREATED AS ALIVE, deliberately. The only thing this answer gates is

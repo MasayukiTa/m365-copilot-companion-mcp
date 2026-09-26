@@ -118,7 +118,6 @@ BASELINE = {
     "relay/task_router.py::_exec_python::subprocess.run": 1,
     "relay/task_router.py::_exec_screenshot::subprocess.run": 1,
     "relay/task_router.py::_exec_shell::subprocess.run": 1,
-    "relay/task_router.py::_pid_alive::subprocess.run": 1,
     "relay/task_router.py::autostart_fleet::subprocess.Popen": 1,
     "scripts/bootstrap.py::_provision_dev_tunnel::subprocess.Popen": 1,
     "scripts/bootstrap.py::_seed_pip::subprocess.call": 1,
