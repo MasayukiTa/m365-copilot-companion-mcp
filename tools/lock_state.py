@@ -692,7 +692,7 @@ def record_token_gap(client_ip: str = "", ts: Optional[float] = None) -> None:
     explicitly set it to 0 (and for historical evidence from when OFF was the default): it records
     identity-only passes so an operator can see what would break before turning enforcement back
     on. Session-authorized calls do not count as gaps because they already satisfy the second
-    factor without asking the model to shuttle a token.
+    factor without asking the model to carry a token.
 
     Never raises: a counter that can fail a request is worse than a counter.
     """

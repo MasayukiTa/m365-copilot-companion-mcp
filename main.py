@@ -299,7 +299,7 @@ mcp = FastMCP(
         "require unlock(password), per client IP. "
         # UNLOCK IS SESSION-FIRST. A successful unlock records the current Mcp-Session-Id,
         # which the transport carries automatically. The returned unlock_token is retained as a
-        # fallback for clients without session authorization; making a language model shuttle it
+        # fallback for clients without session authorization; making a language model carry it
         # on every call recreated the exact reliability problem session auth was added to remove.
         "RULE 8: if a mutating/executing tool says this conversation is locked, call "
         "unlock(password) ONCE in this same conversation, then retry the blocked tool here. "
