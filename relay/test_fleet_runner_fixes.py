@@ -16,9 +16,9 @@ FIX 2 (P0) -- _clean_final_text():
     (h) Output is capped at max_len.
     (i) Empty / None input returns "".
 
-FIX 3 (P2) -- run_label derivation (tested via the logic used in main(), extracted inline):
-    (j) run_label is the verbatim first line of the first goal, truncated to 60 chars.
-    (k) Leading list markers / whitespace are stripped from run_label.
+FIX 3 (P2) -- run_label derivation:
+    (j) run_label is the same compact extractive task identity used by goal_summary.
+    (k) Policy-only READ-ONLY prefixes do not hide the actual requested work.
     (l) goal_count equals the number of goals.
 
 FIX 5 -- coordinator output capture (_setup_coordinator_log / _Tee):
@@ -62,7 +62,6 @@ import json
 import os
 import sys
 import tempfile
-import re
 from argparse import Namespace
 from pathlib import Path
 
@@ -73,7 +72,7 @@ sys.path.insert(0, str(REPO))
 from relay.fleet_runner import (
     _pending_gates, _clean_final_text, _read_goals,
     _setup_coordinator_log, _write_active_marker, _read_active_marker,
-    _clear_active_marker, _resume_argv, should_auto_resume,
+    _clear_active_marker, _resume_argv, should_auto_resume, _goal_summary,
 )
 
 results: list[bool] = []
@@ -225,47 +224,37 @@ def _test_fix2_clean_final_text():
 # ---------------------------------------------------------------------------
 
 def _derive_run_label(gtexts):
-    """Mirror the run_label derivation logic from fleet_runner.main()."""
-    _first_goal_text = gtexts[0] if gtexts else ""
-    _first_line = _first_goal_text.splitlines()[0] if _first_goal_text else ""
-    _first_line = re.sub(r'^[\s\-*#\d.>]+', '', _first_line).strip()
-    return _first_line[:60]
+    """Mirror fleet_runner.main(): display metadata, never the authoritative goal."""
+    return _goal_summary(gtexts[0]) if gtexts else ""
 
 
 def _test_fix3_run_label():
-    """FIX 3: run_label and goal_count."""
+    """FIX 3: compact task identity + goal count."""
     goals = ["Fix the login bug in auth.py", "Update the README", "Add unit tests"]
 
-    # (j) run_label is verbatim first line of first goal, <=60 chars
     label = _derive_run_label(goals)
-    check("fix3_run_label_verbatim_first_line", label == "Fix the login bug in auth.py")
-    check("fix3_run_label_max_60", len(label) <= 60)
+    check("fix3_run_label_task_identity", label == "Fix the login bug in auth.py")
+    check("fix3_run_label_bounded", len(label) <= 65)
 
-    # (k) leading list markers stripped
-    label2 = _derive_run_label(["- Fix the login bug"])
-    check("fix3_leading_dash_stripped", label2 == "Fix the login bug")
-    label3 = _derive_run_label(["1. Fix the login bug"])
-    check("fix3_leading_number_stripped", label3 == "Fix the login bug")
-    label4 = _derive_run_label(["# Section header goal"])
-    check("fix3_leading_hash_stripped", label4 == "Section header goal")
+    policy = ("READ-ONLY audit only; do not edit, commit, push, reset, or mutate repository files. "
+              "Review commits abc123 and def456 plus the current main tree.")
+    label2 = _derive_run_label([policy])
+    check("fix3_policy_prefix_skipped", label2.startswith("Review commits"))
 
-    # (l) goal_count is the number of goals
+    # goal_count is independent of the display label and still reports every goal.
     goal_count = len(goals)
     check("fix3_goal_count_correct", goal_count == 3)
 
-    # multi-line goal: run_label is ONLY the first line
     multiline_goal = "Deploy new version\nThis includes all services\nand the database"
-    label5 = _derive_run_label([multiline_goal])
-    check("fix3_multiline_first_line_only", label5 == "Deploy new version")
+    label3 = _derive_run_label([multiline_goal])
+    check("fix3_multiline_task_identity", label3 == "Deploy new version")
 
-    # truncation at 60 chars
     long_goal = "A" * 80
-    label6 = _derive_run_label([long_goal])
-    check("fix3_truncated_to_60", len(label6) == 60)
+    label4 = _derive_run_label([long_goal])
+    check("fix3_display_title_bounded", len(label4) <= 65)
 
-    # empty goals list
-    label7 = _derive_run_label([])
-    check("fix3_empty_goals_gives_empty", label7 == "")
+    label5 = _derive_run_label([])
+    check("fix3_empty_goals_gives_empty", label5 == "")
 
 
 # ---------------------------------------------------------------------------

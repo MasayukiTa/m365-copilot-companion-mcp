@@ -4746,7 +4746,9 @@ class CockpitWindow : Window
                 pastTag.Margin = new Thickness(0, 0, 0, 2);
                 wrap.Children.Add(pastTag);
                 var titleTag = new TextBlock();
-                titleTag.Text = CardTitle(S(focusEntry, "conv_title"), S(focusEntry, "goal"));
+                string focusSummary = S(focusEntry, "goal_summary");
+                titleTag.Text = !string.IsNullOrEmpty(focusSummary)
+                    ? focusSummary : CardTitle(S(focusEntry, "conv_title"), S(focusEntry, "goal"));
                 titleTag.Foreground = Theme.Br(Theme.Muted(_dark)); titleTag.FontSize = 10;
                 titleTag.TextTrimming = TextTrimming.CharacterEllipsis;
                 titleTag.Margin = new Thickness(0, 0, 0, 2);
@@ -11326,7 +11328,8 @@ class CockpitWindow : Window
             filtered = new List<Dictionary<string, object>>();
             foreach (Dictionary<string, object> e in visible)
             {
-                string hay = (CardTitle(S(e, "conv_title"), S(e, "goal")) + " "
+                string hay = ((string.IsNullOrEmpty(S(e, "goal_summary"))
+                    ? CardTitle(S(e, "conv_title"), S(e, "goal")) : S(e, "goal_summary")) + " "
                               + S(e, "goal") + " " + S(e, "display_result") + " "
                               + S(e, "last") + " " + S(e, "outcome")).ToLowerInvariant();
                 if (hay.IndexOf(ql, StringComparison.Ordinal) >= 0) filtered.Add(e);
@@ -11794,12 +11797,15 @@ class CockpitWindow : Window
         // Gather goal texts from the ON-BOARD workers (History-cleared lanes excluded, set in
         // BuildRows) to determine single vs multi-goal.
         var goalTexts = new List<string>();
+        var goalDisplays = new List<string>();
         var dbSrc = _directiveBandWorkers != null && _directiveBandWorkers.Count > 0 ? _directiveBandWorkers : _toolbarAll;
         foreach (Dictionary<string, object> tw in dbSrc)
         {
-            string g = S(tw, "goal");
-            if (!string.IsNullOrEmpty(g) && !goalTexts.Contains(g))
-                goalTexts.Add(g);
+            string fullGoal = S(tw, "goal");
+            if (string.IsNullOrEmpty(fullGoal) || goalTexts.Contains(fullGoal)) continue;
+            goalTexts.Add(fullGoal);
+            string displayGoal = S(tw, "goal_summary");
+            goalDisplays.Add(!string.IsNullOrEmpty(displayGoal) ? displayGoal : CardTitle("", fullGoal));
         }
 
         // Section label: "DIRECTIVE" / "指示" when a single goal; "Goals (N)" / "ゴール (N)" for multiple.
@@ -11816,7 +11822,7 @@ class CockpitWindow : Window
         //
         // The list was already complete here; only the rendering threw it away. Concurrent
         // lanes are concurrent: they belong side by side, not behind a number.
-        string goalDisplay = string.Join("\n", goalTexts.ToArray());
+        string goalDisplay = string.Join("\n", goalDisplays.ToArray());
 
         // Meta line: "started HH:MM · {elapsed} · {active}/{total} lanes active" [COMPUTED]
         string metaLine = _directiveBandMeta;
@@ -12423,7 +12429,9 @@ class CockpitWindow : Window
         // ellipsis-trimmed -- so History matches the live collapsed card instead of dumping the
         // full goal text. The long goal only appears when this row is explicitly expanded.
         var head = new TextBlock();
-        head.Text = CardTitle(S(e, "conv_title"), S(e, "goal"));
+        string histSummary = S(e, "goal_summary");
+        head.Text = !string.IsNullOrEmpty(histSummary)
+            ? histSummary : CardTitle(S(e, "conv_title"), S(e, "goal"));
         head.Foreground = Fg; head.FontSize = 13;
         head.VerticalAlignment = VerticalAlignment.Center;
         head.TextTrimming = TextTrimming.CharacterEllipsis;
@@ -12577,6 +12585,7 @@ class CockpitWindow : Window
     {
         string name = S(w, "name");
         string goal = S(w, "goal");
+        string goalSummary = S(w, "goal_summary");
         string rawStatus = S(w, "status");
         string status = rawStatus == "ready" ? "waiting" : rawStatus;   // canonical (runner emits fine states)
         string reason = S(w, "reason");
@@ -12715,7 +12724,8 @@ class CockpitWindow : Window
         // for the configured agent, WARNING-colored 既定Copilot badge for a plain /chat/ (default) url.
         var agentBadge = BuildAgentBadge(conv, convTitle);
         if (agentBadge != null) { DockPanel.SetDock(agentBadge, Dock.Left); left.Children.Add(agentBadge); }
-        string headline = CardTitle(convTitle, goal);
+        string headline = !string.IsNullOrEmpty(goalSummary)
+            ? goalSummary : CardTitle(convTitle, goal);
         var ht = new TextBlock {
             Text = headline, Foreground = Fg, FontSize = 13.5, FontWeight = FontWeights.SemiBold,
             VerticalAlignment = VerticalAlignment.Center,
@@ -14985,6 +14995,7 @@ class CockpitWindow : Window
             _archivedKeys.Add(key);
             var e = new Dictionary<string, object>();
             e["key"] = key; e["goal"] = S(w, "goal"); e["status"] = status;
+            e["goal_summary"] = S(w, "goal_summary");
             e["conv_title"] = S(w, "conv_title");
             e["outcome"] = S(w, "outcome"); e["conv_url"] = conv;
             // Carry the disk transcript path + worker name so a HISTORY row can still show the
@@ -15064,6 +15075,7 @@ class CockpitWindow : Window
             _archivedKeys.Add(key);
             var e = new Dictionary<string, object>();
             e["key"] = key; e["goal"] = S(w, "goal"); e["status"] = S(w, "status");
+            e["goal_summary"] = S(w, "goal_summary");
             e["conv_title"] = S(w, "conv_title"); e["outcome"] = S(w, "outcome");
             e["conv_url"] = S(w, "conv_url");
             // see _archiveTerminal: carry transcript path + name so the history row can show the

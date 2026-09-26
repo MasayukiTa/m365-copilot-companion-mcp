@@ -42,8 +42,10 @@ The live Fleet path had several independent durability / ownership gaps. They co
 
 Validation performed: 201 related pytest cases passed; FleetCockpit and CopilotChat rebuilt with csc; isolated real-browser E2E completed `commands.d -> --adopt-command -> applied ack -> worker DONE -> done map -> active marker cleanup`, leaving zero pending command JSON files.
 
-## Follow-up: displayed goal text can become unusably long
+## Displayed goal text was unusably long -- fixed after reliability stabilization
 
-The execution goal needs the full instruction text, but the Cockpit currently exposes too much of that text as the visible goal/directive in places. Long operational prompts make it difficult to see what task a worker is actually trying to accomplish.
+The execution goal still keeps the full instruction text, but the Cockpit no longer uses that 2-4k-character operational prompt as its primary visible identity. The measured archive contained recent goals of 1,900-3,500+ characters, and the Directive band concatenated every full goal, making it hard to see what each lane was actually doing.
 
-Do not truncate or summarize the authoritative execution goal in storage. Add a separate display field (for example `goal_summary` / `display_title`) derived from the goal's task intent, keep the full goal available in details, and use the short field for cards / headers / directive summaries. This is deliberately deferred until the reliability work above is stable.
+The runner now emits a separate `goal_summary` per worker plus `directive_summary` / compact `run_label`. These reuse the existing deterministic `relay.conv_title` extractor: extractive only (no model call / no invented outcome), bounded, and display-redacted. Policy-only openings such as `READ-ONLY audit only; do not edit...` are skipped in favor of the next task-identifying sentence. The authoritative `goal` / `directive` remain byte-for-byte full text for execution, retry, resume, search, and the expanded Overview. Both history archive routes persist `goal_summary`, while old rows fall back to the previous CardTitle logic.
+
+Validation: 311 related pytest cases passed, the legacy fleet_runner fix harness passed 61/61, and both WPF binaries rebuilt/restarted successfully.

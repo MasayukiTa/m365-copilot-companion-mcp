@@ -33,6 +33,7 @@ MCP_IMPL_AGENT_URL / MCP_FLEET_AGENT_URL in .env (gitignored).
 from __future__ import annotations
 
 import argparse
+from functools import lru_cache
 import io
 import json
 import math as _math
@@ -1517,6 +1518,22 @@ def _close_idle_copilot_pages(context) -> int:
         return 0
 
 
+
+@lru_cache(maxsize=4096)
+def _goal_summary(goal):
+    """Compact, deterministic task identity for UI only; never replaces the execution goal."""
+    text = str(goal or "")
+    if not text.strip():
+        return ""
+    try:
+        from relay import conv_title as _ct
+        return _ct.make_title(text, key=text)
+    except Exception:
+        # Display metadata must never break a run. Keep the fallback extractive and bounded.
+        one = " ".join(text.split())
+        return one if len(one) <= 64 else one[:63].rstrip() + "…"
+
+
 def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paused=False,
               ram_floor_mb=0.0, directive="", run_label="", goal_count=0, queued=0,
               reunlock=None, command_rejections=None):
@@ -1578,13 +1595,15 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         # UI already handles multi-goal honestly and should NOT fabricate a summary). Only
         # populated when there is a genuinely single directive -- never fabricated for multi-goal.
         "directive": directive,
-        # FIX 3 (P2): human-readable run label (verbatim first line of first goal, <=60 chars)
-        # and total goal count for the UI header.  run_label is NEVER synthesised -- verbatim only.
+        "directive_summary": _goal_summary(directive) if directive else "",
+        # Human-readable, display-only task identity plus total goal count. ``run_label`` is
+        # extractive/redacted metadata; authoritative instructions remain in goal/directive.
         "run_label": run_label,
         "goal_count": goal_count,
         "workers": [{
             "name": w.name,
             "goal": w.goal,
+            "goal_summary": _goal_summary(w.goal),
             "status": w.status,
             "pill": STATUS_PILL.get(w.status, (w.status, "muted"))[0],
             "color": STATUS_PILL.get(w.status, (w.status, "muted"))[1],
@@ -3238,13 +3257,10 @@ def main():
     # directive, so we set it to "" -- the UI handles multi-goal runs honestly and we never
     # fabricate a summary. Only one goal -> directive = that goal's text.
     directive = gtexts[0] if len(gtexts) == 1 else ""
-    # FIX 3 (P2): run_label = verbatim first line of the first goal, truncated to 60 chars,
-    # with leading list markers / whitespace stripped.  NEVER synthesised.
-    import re as _re
-    _first_goal_text = gtexts[0] if gtexts else ""
-    _first_line = _first_goal_text.splitlines()[0] if _first_goal_text else ""
-    _first_line = _re.sub(r'^[\s\-*#\d.>]+', '', _first_line).strip()
-    run_label = _first_line[:60]
+    # Display-only task identity. The full execution goal remains in workers[].goal / directive.
+    # Reuse the same deterministic, redacting extractor as conversation titles instead of
+    # exposing the first 60 characters of a 2-4k operational prompt.
+    run_label = _goal_summary(gtexts[0]) if gtexts else ""
     goal_count = len(gtexts)
 
     status_path = os.path.join(args.state_dir, "status.json")
@@ -4046,6 +4062,7 @@ def main():
         cleaned = _clean_final_text(raw_last)
         return {
             "name": r["name"], "goal": r["goal"],
+            "goal_summary": _goal_summary(r["goal"]),
             "status": report_status(r["outcome"]),
             "outcome": r["outcome"], "turn": r["turns"],
             "max_turns": max_turns, "reason": r["reason"],
@@ -4101,7 +4118,8 @@ def main():
     final = {"started": started, "updated": time.time(), "total": len(results),
              "done_count": done_count, "running": False, "elapsed_s": elapsed,
              "directive": directive,
-             # FIX 3 (P2): also carry run_label / goal_count into the final snapshot.
+             "directive_summary": _goal_summary(directive) if directive else "",
+             # Carry the same compact display identity into the final frozen snapshot.
              "run_label": run_label, "goal_count": goal_count,
              "workers": [_final_worker_entry(r, args.max_turns) for r in results]}
     _ffv = fanout_family_view(final["workers"])
