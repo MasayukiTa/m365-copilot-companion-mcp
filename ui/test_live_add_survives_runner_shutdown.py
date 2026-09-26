@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+from tools.childproc import run as run_child
 
 REPO = Path(__file__).resolve().parents[1]
 UI = REPO / "ui"
@@ -36,12 +37,12 @@ def test_shared_writer_can_return_the_exact_file_it_atomically_landed(tmp_path):
     h = tmp_path / "H.cs"
     h.write_text(HARNESS, encoding="utf-8")
     exe = tmp_path / "H.exe"
-    r = subprocess.run([str(CSC), "/nologo", "/target:exe", "/out:" + str(exe),
-                        "/r:" + str(FW / "System.Web.Extensions.dll"),
-                        str(UI / "FleetCommands.cs"), str(h)], capture_output=True, text=True, timeout=120)
+    r = run_child([str(CSC), "/nologo", "/target:exe", "/out:" + str(exe),
+                   "/r:" + str(FW / "System.Web.Extensions.dll"),
+                   str(UI / "FleetCommands.cs"), str(h)], timeout=120)
     assert r.returncode == 0 and exe.is_file(), (r.stdout, r.stderr)
     state = tmp_path / "fleet"
-    q = subprocess.run([str(exe), str(state)], capture_output=True, text=True, timeout=30)
+    q = run_child([str(exe), str(state)], timeout=30)
     assert q.returncode == 0, (q.stdout, q.stderr)
     landed = Path(q.stdout.strip().splitlines()[-1])
     assert landed.is_file()

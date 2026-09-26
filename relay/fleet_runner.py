@@ -3646,10 +3646,10 @@ def main():
     def _apply_command(cmd, workers):
         # WHOLE OR NOT AT ALL (SEC-08). Checked before anything below touches a box. Return an
         # explicit outcome so _drain_commands knows whether it may commit the claimed file.
-        _errs = validate_command(cmd, args.state_dir)
-        if _errs:
-            record_command_rejection(rejections_box, cmd, _errs)
-            return False, _errs
+        if not admit_command(cmd, args.state_dir, rejections_box):
+            # The caller needs the errors for the rejected landing receipt. Validation is pure,
+            # so recomputing them here keeps admit_command as the single mutate/log gate.
+            return False, validate_command(cmd, args.state_dir)
         try:
             _cmd_goals = goals_from_command(cmd)
             _new_cmd_goals = []

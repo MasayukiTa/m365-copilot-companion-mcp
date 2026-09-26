@@ -7164,7 +7164,10 @@ class RelayWorker:
                         return False
                 except Exception:
                     pass
-            t = self.drv.read_last_response()
+            _read_last = getattr(self.drv, "read_last_response", None)
+            if not callable(_read_last):
+                return False
+            t = _read_last()
             if _settle.unified():
                 # THE ONE RULE, and for this site it is a real change rather than a move.
                 # This loop has no sample requirement at all -- only a dwell -- so the guard
