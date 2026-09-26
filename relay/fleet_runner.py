@@ -2947,9 +2947,14 @@ def main():
     if args.max_concurrent > 0:
         max_conc = args.max_concurrent
     elif args.max_concurrent == 0:
-        max_conc = auto_concurrency(len(goals))           # 0 = auto from free RAM
+        # The run is a long-lived queue: add_goal can add work after launch.  Asking RAM how
+        # many of the *initial* goals fit permanently shrinks a one-goal run to one lane.
+        max_conc = auto_concurrency(AUTOSCALE_CEILING_DEFAULT)  # 0 = auto from free RAM
     else:
-        max_conc = min(settings_maxtabs(), len(goals))    # -1 = the cockpit's setting (default 3)
+        # Do not cap the live capacity by len(goals) at t=0.  The pending queue itself prevents
+        # over-admission when only one goal exists; keeping the configured capacity lets later
+        # add_goal submissions use the idle lanes immediately.
+        max_conc = settings_maxtabs()                    # -1 = cockpit setting (default 3)
 
     # ── autoscale: the user picks a DEFAULT (start) and a CEILING (上限). Start at the
     # default, shrink when RAM is tight, grow toward the ceiling when RAM is free.
@@ -2982,7 +2987,9 @@ def main():
         # the fixed cap exactly as before.
         asc_ceiling = AUTOSCALE_CEILING_DEFAULT if autoscale else max(asc_default,
                                                                       settings_maxtabs())
-    asc_ceiling = max(1, min(asc_ceiling, len(goals)))
+    # Same long-lived-queue rule as max_conc above.  The ceiling is machine/operator capacity,
+    # not the number of goals present at startup.  Keep the ordinary tab safety bound instead.
+    asc_ceiling = max(TABS_BOUNDS[0], min(int(asc_ceiling), TABS_BOUNDS[1]))
     asc_default = max(1, min(asc_default, asc_ceiling))      # default never exceeds the ceiling
     autoscale_max = asc_ceiling
     if autoscale:

@@ -5406,7 +5406,7 @@ class CockpitWindow : Window
             if (e.Key == Key.Return && (Keyboard.Modifiers & ModifierKeys.Control) != 0)
             {
                 e.Handled = true;
-                // A2-2: Ctrl+Enter steers when a run is active; starts fleet otherwise.
+                // Ctrl+Enter adds tasks to the live run; starts a new fleet when idle.
                 //
                 // AND A SLASH SETTING IS A SETTING HERE TOO. The send button below already
                 // calls HandleSlashSetting first, with a note saying the bug was found by
@@ -5418,7 +5418,7 @@ class CockpitWindow : Window
                 // The same fault reached by two callers is one fault; fixing the caller you
                 // happened to be looking at leaves it live everywhere else.
                 if (HandleSlashSetting()) return;
-                if (_composerRunActive) TrySendSteer();
+                if (_composerRunActive) TryAddGoalsToLiveFleet();
                 else StartFleet();
             }
         };
@@ -5451,7 +5451,7 @@ class CockpitWindow : Window
         _startBtn.Cursor = Cursors.Hand; _startBtn.BorderThickness = new Thickness(0);
         _startBtn.Height = Theme.BtnH; _startBtn.MinWidth = 132; _startBtn.FontWeight = FontWeights.SemiBold;
         _startBtn.Margin = new Thickness(8, 0, 0, 0); _startBtn.Padding = new Thickness(16, 0, 16, 0);
-        // A2-2: when a run is active, the button sends a steer instead of starting a fleet.
+        // When a run is active, the primary button adds tasks to that run.
         _startBtn.Click += delegate
         {
             // A SETTING IS NEVER A MESSAGE. While a run is live this button steers the running
@@ -5462,7 +5462,7 @@ class CockpitWindow : Window
             // Found by typing `/fanout on` into the real window; settings.txt had no fanout key
             // afterwards, and the running worker had been handed the text.
             if (HandleSlashSetting()) return;
-            if (_composerRunActive) TrySendSteer();
+            if (_composerRunActive) TryAddGoalsToLiveFleet();
             else StartFleet();
         };
         btns.Children.Add(_startBtn);
@@ -5644,77 +5644,54 @@ class CockpitWindow : Window
         }
     }
 
-    // A2-2: Send a steer from the bottom composer. Parses "W2: ..." prefix to target a specific
-    // worker; otherwise broadcasts to the first running worker (or ALL via broadcast if no live
-    // specific worker is found -- the relay picks the right one). Reuses RequestSteer() exactly
-    // as the per-card SteerRow does: writes {"steer":[{worker,text},...]} as its own command file.
-    void TrySendSteer()
+    // The bottom composer is the task intake surface in BOTH idle and live-run states.
+    // During a live run, enqueue new work through the same lossless one-command-per-file channel
+    // used by retry. Worker-specific steering remains available on each worker card.
+    void TryAddGoalsToLiveFleet()
     {
-        string text = (_goalInput != null ? _goalInput.Text : "").Trim();
-        if (string.IsNullOrEmpty(text)) return;
+        if (_goalInput == null) return;
+        var goals = new List<string>();
+        foreach (string ln in (_goalInput.Text ?? "").Replace("\r", "").Split('\n'))
+        {
+            string goal = ln.Trim();
+            if (goal.Length > 0 && !goal.StartsWith("#")) goals.Add(goal);
+        }
+        if (goals.Count == 0) return;
+
+        // The UI can be one tick behind the coordinator. If the run ended between paint and click,
+        // preserve the user's intent by using the normal new-run path instead of dropping the text.
         if (!RunIsLive())
         {
-            if (_startNote != null) _startNote.Text = T("steer_dead");
+            StartFleet();
             return;
         }
 
-        // Parse optional "Wx: " / "W0: " / "W10: " prefix for targeted worker routing.
-        string targetWorker = "";
-        string steerText = text;
-        if (text.Length > 2 && (text[0] == 'W' || text[0] == 'w'))
+        var adds = new List<object>();
+        foreach (string goal in goals)
         {
-            int colonIdx = text.IndexOf(':');
-            if (colonIdx >= 2 && colonIdx <= 4)
-            {
-                string maybeWorker = text.Substring(0, colonIdx).Trim();
-                bool allDigits = true;
-                for (int ci = 1; ci < maybeWorker.Length; ci++)
-                    if (!char.IsDigit(maybeWorker[ci])) { allDigits = false; break; }
-                if (allDigits && maybeWorker.Length >= 2)
-                {
-                    targetWorker = maybeWorker;      // e.g. "W2"
-                    steerText = text.Substring(colonIdx + 1).Trim();
-                }
-            }
+            var item = new Dictionary<string, object>();
+            item["text"] = goal;
+            item["priority"] = false;
+            adds.Add(item);
+        }
+        if (!SendCommand(Cmd1("add_goal", adds)))
+        {
+            if (_startNote != null)
+                _startNote.Text = _lang == 0 ? "タスクをキューへ追加できませんでした。入力は残しています。"
+                                              : "Could not queue the task. Your input was kept.";
+            return;
         }
 
-        // If no explicit worker prefix, broadcast to the first non-terminal running worker.
-        if (string.IsNullOrEmpty(targetWorker))
-        {
-            var workers = _toolbarAll ?? new List<Dictionary<string, object>>();
-            foreach (Dictionary<string, object> tw in workers)
-            {
-                string st = S(tw, "status");
-                if (!IsTerminalWorker(tw) && st != "pending")
-                {
-                    targetWorker = S(tw, "name");
-                    break;
-                }
-            }
-            // Still empty: fall back to empty string (relay broadcasts to all workers).
-        }
-
-        RequestSteer(targetWorker, steerText);
-        if (_goalInput != null) _goalInput.Text = "";
-        // SAY WHICH WORKER, AND SAY IT TAKES A TURN. This used to read "queued for the
-        // next turn" whatever happened -- including when no live worker was found and an
-        // EMPTY name went out, which the relay then dropped because nothing there
-        // broadcast. The person believed they had redirected the work and watched it
-        // continue in the old direction. The relay broadcasts now, and the note says
-        // which case this was so a surprise is visible rather than inferred.
+        // Optimistic row first; the runner will replace it with a real worker on the next sweep.
+        NoteSubmitted(goals);
+        _goalInput.Text = "";
         if (_startNote != null)
-        {
-            bool ja = _lang == 0;
-            if (!string.IsNullOrEmpty(targetWorker))
-                _startNote.Text = ja ? (targetWorker + " の次のターンに送ります")
-                                     : ("Queued for " + targetWorker + "'s next turn");
-            else
-                _startNote.Text = ja ? "実行中の全ワーカーの次のターンに送ります"
-                                     : "Queued for every live worker's next turn";
-        }
+            _startNote.Text = _lang == 0 ? (goals.Count + " 件を実行中のキューへ追加しました。")
+                                          : ("Queued " + goals.Count + " task(s) into the active run.");
+        _lastSig = "";
     }
 
-    // A2-2: Paint the composer into either "idle/add-goals" or "active-run/steer" mode.
+    // Paint the composer as task intake in both states; a live run changes Start -> Add.
     // Only repaints when the mode actually changes (keyed off _composerRunActive).
     void PaintComposerMode(bool runActive)
     {
@@ -5724,35 +5701,33 @@ class CockpitWindow : Window
         bool ja = _lang == 0;
         if (runActive)
         {
-            // Active-run mode: steer / intervene surface
+            // Active-run mode: add new tasks to the existing queue.
             if (_composerWatermark != null)
-                _composerWatermark.Text = ja
-                    ? "ステア・割り込み...（例: W2: 修正案を確認して）"
-                    : "Steer or intervene... (e.g. W2: check the fix)";
+                _composerWatermark.Text = ja ? "タスクを追加..." : "Add tasks...";
             if (_composerHint != null)
                 _composerHint.Text = ja
-                    ? "アクティブな実行に送信 ·「/」でコマンド"
-                    : "sent to the active run · '/' for commands";
+                    ? "実行中のキューに追加 · 割り込みは各タスクカードから · / でコマンド"
+                    : "adds to the active run · steer from a task card · '/' for commands";
             if (_startBtn != null)
             {
-                _startBtn.Content = ja ? "送信" : "Send";
-                // Use accent color for primary action; same as the idle Start button.
+                _startBtn.Content = ja ? "追加" : "Add";
                 _startBtn.Background = AccentFill;
                 _startBtn.Foreground = AccentFg;
             }
             if (_folderBtn != null)
             {
-                // Folder button less prominent while steering
-                _folderBtn.Visibility = Visibility.Collapsed;
+                _folderBtn.Visibility = Visibility.Visible;
             }
         }
         else
         {
-            // Idle mode: add goals / start
+            // Idle mode: add goals / start.
             if (_composerWatermark != null)
-                _composerWatermark.Text = ja ? "タスクを入力..." : "Add tasks...";
+                _composerWatermark.Text = ja ? "タスクを追加..." : "Add tasks...";
             if (_composerHint != null)
-                _composerHint.Text = ja ? "1行に1ゴール（複数可） ·「/」でコマンド" : "One goal per line · \"/\" for commands";
+                _composerHint.Text = ja
+                    ? "1行に1ゴール（複数可） · / でコマンド"
+                    : "One goal per line · '/' for commands";
             if (_startBtn != null)
             {
                 _startBtn.Content = T("start");
