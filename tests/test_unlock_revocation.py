@@ -43,7 +43,8 @@ def _isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(lock_state, "_TOKEN_GAP_FILE", tmp_path / "gap.json")
     monkeypatch.setattr(S, "get_http_request", lambda: _Req())
     monkeypatch.setattr(S, "unlock_password_from_env", lambda: "pw")
-    monkeypatch.delenv("MCP_REQUIRE_UNLOCK_TOKEN", raising=False)   # THE DEFAULT
+    # Exercise the production defaults: unset means token enforcement ON and session auth ON.
+    monkeypatch.delenv("MCP_REQUIRE_UNLOCK_TOKEN", raising=False)
     monkeypatch.delenv("MCP_UNLOCK_SESSION_AUTH", raising=False)
     S.clear_presented_token()
     yield
