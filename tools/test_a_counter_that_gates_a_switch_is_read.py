@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
 """A counter kept for 26 days to decide a security switch, that nothing ever read.
 
-`tools/lock_state.py::record_token_gap` counts every call that passed the unlock gate on the
-strength of the identity alone. Its docstring says exactly what the count is for:
+`tools/lock_state.py::record_token_gap` counts calls that passed the unlock gate only because
+second-factor enforcement was explicitly OFF. Historically, before SEC-02 made
+`MCP_REQUIRE_UNLOCK_TOKEN` default to ON (2026-09-24), the counter answered whether enabling the
+switch would strand identity-only callers. It remains the compatibility/diagnostic reader for
+deployments that explicitly set the switch to 0. Session-authorized calls are not gaps: after a
+successful unlock the current MCP session satisfies the second factor without making the model
+re-attach a token on every call.
 
-    MCP_REQUIRE_UNLOCK_TOKEN defaults to off: turning it on before anyone has re-unlocked would
-    refuse every existing session at once ... This counter is what says when it is safe -- when
-    it stops growing, every live caller is presenting a token and the switch costs nothing.
-
-`token_gap()`, the reader, had no caller. MEASURED 2026-09-13 on the live file:
+`token_gap()`, the reader, had no caller. MEASURED 2026-09-13, while enforcement was still OFF,
+on the live file:
 
     count 154   first 2026-08-18 06:14   last 2026-09-13 11:05 (that morning)
     ips   one address: 146, + five others (the address itself is in the live file, not here)
@@ -51,7 +53,7 @@ def test_an_empty_counter_says_the_switch_is_free():
 
 
 def test_a_call_this_morning_says_it_is_not():
-    """THE LIVE CASE. 154 records, the newest hours old -- enforcement would refuse them."""
+    """Historical enforcement-OFF shape: a fresh gap means the compatibility path is still in use."""
     _gap("203.0.113.9")
     r = LS.token_gap_report()
     assert r["count"] == 1

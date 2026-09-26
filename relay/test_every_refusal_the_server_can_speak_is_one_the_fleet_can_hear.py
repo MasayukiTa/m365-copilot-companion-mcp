@@ -178,7 +178,7 @@ def test_still_rejects_long_prose_that_merely_discusses_unlock():
     # And the loose phrase alone, without the bracket, must never trip it regardless of length.
     passing_mention = (
         "unlock(password='<password>') is called once the identity is verified, and "
-        "no valid unlock token means the per-call token was missing or stale."
+        "no valid unlock token can mean neither a fallback token nor the current MCP session satisfied the second factor."
     )
     assert RF._looks_locked(passing_mention) is False
 
