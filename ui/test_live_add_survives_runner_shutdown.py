@@ -56,9 +56,18 @@ def test_live_composer_tracks_receipt_and_rescues_with_adopt_command():
     assert "SendTrackedCommand(patch, out commandPath)" in block
     assert "WatchLiveAddHandoff(commandPath, ackPath)" in block
 
+    assert "int LiveAddReceiptState(" in src
+    receipt = src[src.index("int LiveAddReceiptState("):]
+    receipt = receipt[:receipt.index("\n    void ", 40)]
+    assert 'd.ContainsKey("applied")' in receipt
+    assert 'bool applied = Convert.ToBoolean(d["applied"]);' in receipt
+    assert 'd.ContainsKey("rejected") && Convert.ToBoolean(d["rejected"])' in receipt
+
     watcher = src[src.index("void WatchLiveAddHandoff("):]
     watcher = watcher[:watcher.index("\n    void ", 20)]
-    assert "File.Exists(ackPath)" in watcher
+    assert "LiveAddReceiptState(ackPath, out receiptError)" in watcher
+    assert "if (receiptState > 0)" in watcher
+    assert "if (receiptState < 0)" in watcher
     assert "if (RunIsLive()) return;" in watcher
     assert "SpawnFleetAdoptCommand(commandPath)" in watcher
     assert "lastRescue" in watcher, "the watcher must retry a rescue that lost the state-dir race"
