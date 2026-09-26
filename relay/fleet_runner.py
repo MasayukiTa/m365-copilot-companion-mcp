@@ -2544,17 +2544,61 @@ def _write_receipt(state_dir, claimed, body) -> bool:
         return False
 
 
-def _claim_owner_pid(path):
-    """Owner pid encoded in ``...claim-<pid>``; 0 for anything else."""
+def _pid_birth_token(pid):
+    """Stable-enough process identity component in milliseconds since epoch.
+
+    Numeric pids are recyclable. ``create_time`` distinguishes a later unrelated process that
+    inherited the same pid from the coordinator that originally claimed a command. A failure to
+    read it returns 0 and callers fall back to the old conservative pid-only behaviour.
+    """
+    try:
+        import psutil
+        return int(round(float(psutil.Process(int(pid)).create_time()) * 1000.0))
+    except Exception:
+        return 0
+
+
+def _claim_owner_identity(path):
+    """Return ``(pid, birth_token)`` from ``...claim-PID[-BIRTH]``.
+
+    ``birth_token == 0`` is the legacy pid-only claim format. Committed suffixes such as
+    ``.applied`` are ignored by parsing only the claim owner segment.
+    """
     name = os.path.basename(path)
     tag = ".claim-"
     if tag not in name:
-        return 0
-    tail = name.split(tag, 1)[1].split(".", 1)[0]
+        return 0, 0
+    owner = name.split(tag, 1)[1].split(".", 1)[0]
+    parts = owner.split("-", 1)
     try:
-        return int(tail)
+        pid = int(parts[0])
     except Exception:
-        return 0
+        return 0, 0
+    birth = 0
+    if len(parts) > 1:
+        try:
+            birth = int(parts[1])
+        except Exception:
+            birth = 0
+    return pid, birth
+
+
+def _claim_owner_pid(path):
+    """Backward-compatible pid-only view of :func:`_claim_owner_identity`."""
+    return _claim_owner_identity(path)[0]
+
+
+def _claim_owner_is_live(path):
+    """True only when the claim still belongs to the same live process instance."""
+    pid, birth = _claim_owner_identity(path)
+    if pid <= 0 or not _pid_alive(pid):
+        return False
+    if birth <= 0:
+        return True                 # legacy claim: pid is all the evidence we have
+    now_birth = _pid_birth_token(pid)
+    if now_birth <= 0:
+        return True                 # cannot disprove ownership -> do not steal somebody's work
+    return now_birth == birth
 
 
 def _committed_claim_state(name):
@@ -2620,8 +2664,7 @@ def _recover_stale_command_claims(state_dir):
                     except OSError:
                         pass
                 continue
-            owner = _claim_owner_pid(path)
-            if owner and _pid_alive(owner):
+            if _claim_owner_is_live(path):
                 continue
             original = path.split(".claim-", 1)[0]
             if os.path.exists(original):
@@ -2640,7 +2683,9 @@ def _recover_stale_command_claims(state_dir):
 
 def _claim_one_command(path, display_name=None):
     """Atomically take one command file for this process, or None if somebody else won."""
-    claimed = path + ".claim-%d" % os.getpid()
+    _me = os.getpid()
+    _birth = _pid_birth_token(_me)
+    claimed = path + (".claim-%d-%d" % (_me, _birth) if _birth > 0 else ".claim-%d" % _me)
     try:
         os.replace(path, claimed)
     except OSError:

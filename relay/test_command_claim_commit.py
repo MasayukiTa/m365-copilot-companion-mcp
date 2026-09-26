@@ -185,3 +185,44 @@ def test_live_apply_enqueues_only_newly_durable_goals():
     assert "return_new=True" in block
     assert "for g in _new_cmd_goals:" in block
     assert "for g in _cmd_goals:" not in block
+
+def test_claim_owner_identity_includes_process_birth_token(tmp_path):
+    p = _write(tmp_path, text="birth token")
+    c = fr.claim_commands(str(tmp_path))[0]
+    pid, birth = fr._claim_owner_identity(c["claimed"])
+    assert pid == os.getpid()
+    assert birth > 0, c["claimed"]
+    fr.restore_command_claim(c)
+
+
+def test_pid_reuse_does_not_strand_a_dead_claim(tmp_path, monkeypatch):
+    """A different process reusing the same numeric pid is not the claim owner."""
+    cmd = _write(tmp_path, text="recover after pid reuse")
+    claimed = cmd + ".claim-4242-111000"
+    os.replace(cmd, claimed)
+    monkeypatch.setattr(fr, "_pid_alive", lambda pid: int(pid) == 4242)
+    monkeypatch.setattr(fr, "_pid_birth_token", lambda pid: 222000 if int(pid) == 4242 else 0)
+    got = fr.claim_commands(str(tmp_path))
+    assert len(got) == 1
+    assert got[0]["cmd"]["add_goal"][0]["text"] == "recover after pid reuse"
+    fr.restore_command_claim(got[0])
+
+
+def test_same_pid_and_birth_token_keeps_a_live_claim_owned(tmp_path, monkeypatch):
+    cmd = _write(tmp_path, text="still owned")
+    claimed = cmd + ".claim-4242-111000"
+    os.replace(cmd, claimed)
+    monkeypatch.setattr(fr, "_pid_alive", lambda pid: int(pid) == 4242)
+    monkeypatch.setattr(fr, "_pid_birth_token", lambda pid: 111000 if int(pid) == 4242 else 0)
+    assert fr.claim_commands(str(tmp_path)) == []
+    assert os.path.isfile(claimed)
+
+
+def test_legacy_pid_only_claim_remains_conservative(tmp_path, monkeypatch):
+    cmd = _write(tmp_path, text="legacy owner")
+    claimed = cmd + ".claim-4242"
+    os.replace(cmd, claimed)
+    monkeypatch.setattr(fr, "_pid_alive", lambda pid: int(pid) == 4242)
+    monkeypatch.setattr(fr, "_pid_birth_token", lambda pid: 999999)
+    assert fr.claim_commands(str(tmp_path)) == []
+    assert os.path.isfile(claimed)
