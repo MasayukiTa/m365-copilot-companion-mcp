@@ -2635,9 +2635,15 @@ def _recover_committed_claim_receipt(state_dir, path, applied):
         if applied is not None:
             body["applied"] = bool(applied)
         if applied is False:
-            errs = validate_command(cmd, state_dir)
-            if errs:
-                body.update({"rejected": True, "errors": errs[:10]})
+            # The .rejected tombstone is the durable admission decision. Recovery may happen
+            # after tenant/config/state changes, so re-validating the command now cannot be used
+            # to decide whether the historical receipt was a rejection. Preserve that fact
+            # unconditionally; current validation is only best-effort detail for the error list.
+            try:
+                errs = validate_command(cmd, state_dir)
+            except Exception:
+                errs = []
+            body.update({"rejected": True, "errors": list(errs or [])[:10]})
         if not _write_receipt(state_dir, ack, body):
             return False
     return True

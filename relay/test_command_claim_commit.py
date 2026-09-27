@@ -261,3 +261,23 @@ def test_live_drain_never_preclaims_later_commands_before_current_commit():
     assert "restore_command_claim(claim)" in block
     restore_i = block.index("restore_command_claim(claim)")
     assert "return" in block[restore_i:restore_i + 160]
+
+
+def test_rejected_tombstone_recovery_preserves_rejected_decision_after_state_changes(tmp_path, monkeypatch):
+    """The tombstone suffix is the durable decision; current validation state cannot rewrite history."""
+    ack = str(tmp_path / "acks" / "rejected-recover.ack")
+    path = tr.write_command(str(tmp_path), {"unknown": 1, "ack": ack})
+    c = fr.claim_commands(str(tmp_path))[0]
+    rejected = c["claimed"] + ".rejected"
+    os.replace(c["claimed"], rejected)
+
+    # Simulate tenant/config/state changing between the original refusal and crash recovery.
+    # Re-validating now says OK, but the already-committed .rejected decision must not become
+    # a successful/"dispatched" landing receipt.
+    monkeypatch.setattr(fr, "validate_command", lambda cmd, state_dir: [])
+    assert fr._recover_committed_claim_receipt(str(tmp_path), rejected, False) is True
+    body = json.loads(Path(ack).read_text(encoding="utf-8"))
+    assert body["read"] is True
+    assert body["applied"] is False
+    assert body["rejected"] is True
+    assert isinstance(body.get("errors"), list)
