@@ -430,11 +430,17 @@ def run_check_blocking(spec, cwd=None, poll_s=0.25):
     completion and return (passed, detail). The fleet uses the non-blocking Check
     directly so it never stalls the round-robin."""
     c = Check(spec, cwd=cwd).start()
-    while True:
-        r = c.poll()
-        if r is not None:
-            return r
-        time.sleep(poll_s)
+    try:
+        while True:
+            r = c.poll()
+            if r is not None:
+                return r
+            time.sleep(poll_s)
+    finally:
+        # Normal completion is idempotent (`cancel` returns the committed result). The reason
+        # this is a finally is the abnormal path: KeyboardInterrupt / caller exceptions used to
+        # unwind past a still-running shell/pytest tree and leave it consuming CPU indefinitely.
+        c.cancel()
 
 
 def run_all_blocking(specs, cwd=None):
