@@ -114,26 +114,61 @@ def _redact(text: str) -> str:
 
 _GENERIC_POLICY_ONLY = re.compile(
     r"^\s*READ[- ]?ONLY\s+(?:audit|investigation)\s+only\b", re.I)
+_NEGATIVE_GUARD = re.compile(r"^\s*(?:do not|don't|never)\b", re.I)
+_MUTATION_GUARD_VERBS = re.compile(
+    r"\b(?:edit|write|commit|push|reset|checkout|stash|kill|mutate|modify|delete|remove|change)\b",
+    re.I,
+)
+_TASK_ID_VERBS = re.compile(
+    r"\b(?:audit|review|investigate|inspect|analy[sz]e|check|verify|find|determine|compare|"
+    r"explain|report|summarize|assess|trace|reproduce|test)\b",
+    re.I,
+)
+_NO_MUTATION_GUARD = re.compile(
+    r"^\s*(?:no|without)\s+(?:edits?|writes?|changes?|modifications?|mutations?)\b", re.I)
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?\u3002\uff01\uff1f])\s+")
+
+
+def _policy_only_clause(text: str) -> bool:
+    """True only for a leading safety sentence that does not identify the requested work.
+
+    Not every negative instruction is boilerplate. For example, ``Do not assume passing CI
+    proves race-safety`` is part of the audit itself. The special case is a mutation-prohibition
+    sentence such as ``Do not edit, commit, push...`` with no positive review/investigation act.
+    """
+    clause = (text or "").strip()
+    if not clause:
+        return True
+    if _GENERIC_POLICY_ONLY.match(clause):
+        return True
+    if _NO_MUTATION_GUARD.match(clause):
+        return True
+    if (_NEGATIVE_GUARD.match(clause)
+            and _MUTATION_GUARD_VERBS.search(clause)
+            and not _TASK_ID_VERBS.search(clause)):
+        return True
+    return False
 
 
 def _task_clause(text: str) -> str:
-    """Extract the first clause that identifies the work rather than only its safety policy.
+    """Extract the first clause that identifies work rather than only its safety policy.
 
-    Real delegated goals sometimes begin with a whole sentence such as
-    ``READ-ONLY audit only; do not edit, commit, push...``.  That sentence is important to
-    execution but useless as a compact task identity.  When (and only when) the opening matches
-    that narrow policy-only shape, take the next sentence from the original goal.  Everything
-    remains extractive; no action or outcome is invented.
+    Delegated goals can carry more than one safety sentence before the real request, e.g.
+    ``READ-ONLY AUDIT ONLY. Do not edit, write, commit... Audit PR #47 ...``. Walk across the
+    consecutive policy-only prefix and return the first substantive clause. Everything remains
+    extractive; no action or outcome is invented.
     """
     raw = (text or "").strip()
-    if _GENERIC_POLICY_ONLY.match(raw):
-        parts = re.split(r"(?<=[.!?。！？])\s+", raw, maxsplit=1)
-        if len(parts) > 1:
-            nxt = _first_clause(parts[1])
-            if nxt:
-                return nxt
+    if not raw:
+        return ""
+    for part in _SENTENCE_SPLIT.split(raw):
+        candidate = _first_clause(part)
+        if not candidate:
+            continue
+        if _policy_only_clause(candidate):
+            continue
+        return candidate
     return _first_clause(raw)
-
 
 def _first_clause(text: str) -> str:
     """The first sentence-ish run of the remaining text."""
