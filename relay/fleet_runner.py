@@ -3664,7 +3664,7 @@ def main():
             if "set_maxtabs" in cmd:
                 # under autoscale this knob is the CEILING (上限); otherwise the fixed cap.
                 try:
-                    n = max(1, int(cmd["set_maxtabs"]))
+                    n = max(TABS_BOUNDS[0], min(int(cmd["set_maxtabs"]), TABS_BOUNDS[1]))
                     if asc_box[0]:
                         asc_box[1] = n
                     else:
