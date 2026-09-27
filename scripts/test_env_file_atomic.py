@@ -107,3 +107,41 @@ def test_key_classification():
     text = "A=1\n# B=2\n#C=3\n  D = 4\nnot a line\n"
     assert E.active_keys(text) == {"A", "D"}
     assert E.commented_keys(text) == {"B", "C"}
+
+
+def test_generic_writer_refuses_plaintext_secret_keys(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("A=1\n", encoding="utf-8")
+    for key in ("MCP_API_KEY", "MCP_UNLOCK_PASSWORD"):
+        with pytest.raises(ValueError, match="legacy plaintext secret key"):
+            E.set_key(env, key, "must-not-land")
+    assert "must-not-land" not in env.read_text(encoding="utf-8")
+
+
+def test_cli_refuses_plaintext_secret_persistence(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("A=1\n", encoding="utf-8")
+    script = str(HERE / "env_file.py")
+    r = childproc.run([sys.executable, script, "set", "MCP_API_KEY", "secret-value", "--env", str(env)])
+    assert r.returncode == 2
+    assert "MCP_API_KEY_PROTECTED" in r.stderr
+    assert "secret-value" not in env.read_text(encoding="utf-8")
+
+
+def test_rotation_backup_never_keeps_legacy_plaintext_auth_secrets(monkeypatch):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("rotate_secrets_for_test", HERE / "rotate_secrets.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(mod, "protect_secret", lambda v: "dpapi:protected-" + v)
+    got = mod.protect_legacy_secret_lines([
+        "MCP_API_KEY=api-plain",
+        "MCP_UNLOCK_PASSWORD=unlock-plain",
+        "OTHER=1",
+    ])
+    joined = "\n".join(got)
+    assert "MCP_API_KEY=api-plain" not in joined
+    assert "MCP_UNLOCK_PASSWORD=unlock-plain" not in joined
+    assert "MCP_API_KEY_PROTECTED=dpapi:protected-api-plain" in joined
+    assert "MCP_UNLOCK_PASSWORD_PROTECTED=dpapi:protected-unlock-plain" in joined
+    assert "OTHER=1" in joined

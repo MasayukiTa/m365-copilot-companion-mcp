@@ -121,14 +121,15 @@ REM D1: the protected-password line used to say "shown by setup when generated" 
 REM once that window had scrolled or closed. It now names the command that shows it again.
 if exist ".env" (
     for /f "usebackq tokens=1,* delims==" %%A in (".env") do (
-        if /i "%%A"=="MCP_API_KEY" echo   Bearer token  ^(MCP_API_KEY^)        : %%B
+        if /i "%%A"=="MCP_API_KEY" echo   Bearer token  ^(legacy MCP_API_KEY^) : %%B
+        if /i "%%A"=="MCP_API_KEY_PROTECTED" echo   Bearer token                      : ^<stored protected; double-click copilot_studio_values.bat to show it^>
         if /i "%%A"=="MCP_UNLOCK_PASSWORD" echo   Unlock password ^(MCP_UNLOCK_PASSWORD^): %%B
         if /i "%%A"=="MCP_UNLOCK_PASSWORD_PROTECTED" echo   Unlock password                  : ^<stored protected; double-click copilot_studio_values.bat to show it^>
     )
     echo.
     echo   The Bearer token authorizes read-only tools. The unlock password is
     echo   passed to unlock^(password^) to enable mutating/execution tools per IP.
-    echo   Keep both secret. They live in .env ^(gitignored^).
+    echo   Keep both secret. .env stores them DPAPI-protected ^(gitignored^).
 ) else (
     echo   .env not found - bootstrap may not have completed. Re-run quickstart.bat.
 )

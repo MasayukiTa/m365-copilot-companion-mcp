@@ -9,6 +9,8 @@ from ctypes import wintypes
 
 _log = logging.getLogger(__name__)
 
+API_KEY_VAR = "MCP_API_KEY"
+API_KEY_PROTECTED_VAR = "MCP_API_KEY_PROTECTED"
 UNLOCK_PASSWORD_VAR = "MCP_UNLOCK_PASSWORD"
 UNLOCK_PASSWORD_PROTECTED_VAR = "MCP_UNLOCK_PASSWORD_PROTECTED"
 _DPAPI_PREFIX = "dpapi:"
@@ -105,6 +107,33 @@ _LAST_PROBLEM = [""]
 #: Diagnostic codes. Callers should test these rather than match the prose.
 PROBLEM_UNSET = "unset"
 PROBLEM_UNDECRYPTABLE = "undecryptable"
+
+
+
+
+def api_key_from_env(environ=None) -> str:
+    """Read legacy plaintext or preferred DPAPI-protected bearer token."""
+    env = environ if environ is not None else os.environ
+    plain = (env.get(API_KEY_VAR) or "").strip()
+    if plain:
+        return plain
+    protected = (env.get(API_KEY_PROTECTED_VAR) or "").strip()
+    if not protected:
+        return ""
+    try:
+        return unprotect_secret(protected).strip()
+    except Exception as exc:
+        _log.warning("MCP_API_KEY_PROTECTED is set but cannot be decrypted by this Windows account (%s)", type(exc).__name__)
+        return ""
+
+
+def materialize_api_key(environ=None) -> str:
+    """Decrypt the bearer token into process memory only; never persist plaintext."""
+    env = environ if environ is not None else os.environ
+    value = api_key_from_env(env)
+    if value:
+        env[API_KEY_VAR] = value
+    return value
 
 
 def unlock_password_problem() -> str:

@@ -170,6 +170,8 @@ from tools.task_ops import todo_clear, todo_list, todo_write
 from tools.web_ops import github_file, render_page, web_fetch
 
 load_dotenv()
+from tools.secret_store import materialize_api_key
+materialize_api_key()
 
 EXECUTION_PROFILE_TOOLS = (
     claim_turn, heartbeat, commit_turn, abort_turn, read_job_context, get_job_status,

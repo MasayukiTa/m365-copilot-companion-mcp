@@ -34,6 +34,14 @@ ROOT = Path(__file__).resolve().parent.parent
 
 _KEY_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=")
 
+# Never let the generic atomic writer become a back door around protected-secret storage.
+# These aliases remain READABLE for legacy migration, but writes must use the DPAPI ciphertext
+# variables produced by bootstrap/setup/rotate_secrets.
+_PLAINTEXT_SECRET_KEYS = {
+    "MCP_API_KEY": "MCP_API_KEY_PROTECTED",
+    "MCP_UNLOCK_PASSWORD": "MCP_UNLOCK_PASSWORD_PROTECTED",
+}
+
 
 def read_text(path: Path) -> str:
     """The file as text. utf-8-sig: a BOM left by PowerShell 5.1's Set-Content must not fold
@@ -130,9 +138,15 @@ def append_lines(text: str, lines: list) -> str:
 
 
 def set_key(path: Path, key: str, value: str) -> None:
-    """KEY=VALUE, replacing the FIRST active assignment and dropping any later duplicates
-    (the readers here disagree on first-wins vs last-wins, so a duplicate is a value two
-    programs read differently). Appended when absent."""
+    """KEY=VALUE atomically, except plaintext secret aliases are never writable.
+
+    Legacy plaintext secret keys are read/migrated elsewhere, but accepting a new write here
+    would reopen the clear-text persistence path CodeQL #38 identified.
+    """
+    if key in _PLAINTEXT_SECRET_KEYS:
+        raise ValueError(
+            "%s is a legacy plaintext secret key; persist only %s via the protected-secret flow"
+            % (key, _PLAINTEXT_SECRET_KEYS[key]))
     text = read_text(path)
     nl = newline_of(text) if text else "\n"
     out, done = [], False
@@ -183,7 +197,11 @@ def main(argv=None) -> int:
         if a.value is None:
             print("env_file.py: 'set' needs a value", file=sys.stderr)
             return 2
-        set_key(env, a.key, a.value)
+        try:
+            set_key(env, a.key, a.value)
+        except ValueError as exc:
+            print("env_file.py: %s" % exc, file=sys.stderr)
+            return 2
         return 0
     removed = unset_key(env, a.key)
     print("removed" if removed else "absent")

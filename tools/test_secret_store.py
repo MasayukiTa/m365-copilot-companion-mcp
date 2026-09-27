@@ -84,3 +84,17 @@ def test_the_logged_variable_name_matches_the_constant():
     assert S.UNLOCK_PASSWORD_PROTECTED_VAR == "MCP_UNLOCK_PASSWORD_PROTECTED"
     assert S.UNLOCK_PASSWORD_PROTECTED_VAR in src, "the message no longer names the variable"
     assert "UNLOCK_PASSWORD_PROTECTED_VAR, type(exc)" not in src, "the constant flows again"
+
+
+def test_api_key_materializes_only_into_process_environment(monkeypatch):
+    from tools import secret_store as S
+    monkeypatch.setattr(S, "unprotect_secret", lambda v: "bearer-secret")
+    env = {S.API_KEY_PROTECTED_VAR: "dpapi:ciphertext"}
+    assert S.materialize_api_key(env) == "bearer-secret"
+    assert env[S.API_KEY_VAR] == "bearer-secret"
+    assert env[S.API_KEY_PROTECTED_VAR] == "dpapi:ciphertext"
+
+
+def test_legacy_plain_api_key_remains_readable_during_migration():
+    from tools import secret_store as S
+    assert S.api_key_from_env({S.API_KEY_VAR: "legacy-bearer"}) == "legacy-bearer"
