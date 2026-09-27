@@ -29,7 +29,9 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, REPO)
 
-from relay.fleet_runner import ACTIVE_MARKER, should_auto_resume   # noqa: E402
+from relay.fleet_runner import (  # noqa: E402
+    ACTIVE_MARKER, marker_owner_alive, should_auto_resume,
+)
 
 
 def read_marker(state_dir: str):
@@ -85,7 +87,7 @@ def main(argv=None) -> int:
         return 0
 
     pid = marker.get("pid")
-    alive = pid_alive(pid)
+    alive = marker_owner_alive(marker, pid_alive)
     if not should_auto_resume(True, alive):
         print("a run is live (pid %s) -- nothing to resume." % pid)
         return 0

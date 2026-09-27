@@ -2023,7 +2023,13 @@ def _write_active_marker(state_dir, argv=None, pid=None, start_ts=None, raise_on
     marker failure is logged once to stderr and the run continues untouched."""
     try:
         raw_argv = list(argv if argv is not None else sys.argv[1:])
-        payload = {"pid": int(pid if pid is not None else os.getpid()),
+        owner_pid = int(pid if pid is not None else os.getpid())
+        payload = {"pid": owner_pid,
+                   # Numeric pids are recyclable. Store the process creation-time token when
+                   # available so a later unrelated process that inherits this pid cannot keep
+                   # an interrupted Fleet permanently classified as live. Zero means legacy /
+                   # unavailable and is handled conservatively by marker_owner_alive().
+                   "pid_birth": int(_pid_birth_token(owner_pid) or 0),
                    "start_ts": float(start_ts if start_ts is not None else time.time()),
                    "argv": raw_argv,
                    "resume_argv": _resume_argv(raw_argv)}
@@ -2050,6 +2056,39 @@ def _read_active_marker(state_dir):
         return None
 
 
+def marker_owner_alive(marker, pid_alive_fn=None):
+    """Whether an active-run marker still names the SAME live process instance.
+
+    PID existence alone is insufficient on a long-lived Windows workstation because pids are
+    recycled. New markers carry ``pid_birth`` (process create-time ms). Old markers and hosts
+    where birth lookup is unavailable retain the historical fail-closed pid-only behaviour.
+    """
+    if not isinstance(marker, dict):
+        return False
+    try:
+        pid = int(marker.get("pid") or 0)
+    except Exception:
+        return False
+    if pid <= 0:
+        return False
+    alive = pid_alive_fn or _pid_alive
+    try:
+        if not bool(alive(pid)):
+            return False
+    except Exception:
+        return True                 # cannot disprove ownership -> do not start a rival runner
+    try:
+        recorded_birth = int(marker.get("pid_birth") or 0)
+    except Exception:
+        recorded_birth = 0
+    if recorded_birth <= 0:
+        return True                 # old marker: pid is all the evidence available
+    current_birth = _pid_birth_token(pid)
+    if current_birth <= 0:
+        return True                 # lookup unavailable -> preserve fail-closed semantics
+    return current_birth == recorded_birth
+
+
 def _active_run_conflict_pid(state_dir, self_pid=None):
     """Return the live pid that already owns this state dir, else 0.
 
@@ -2072,7 +2111,7 @@ def _active_run_conflict_pid(state_dir, self_pid=None):
         return -1
     if pid == me:
         return 0
-    return pid if _pid_alive(pid) else 0
+    return pid if marker_owner_alive(marker, _pid_alive) else 0
 
 
 def _acquire_run_lock(state_dir):
