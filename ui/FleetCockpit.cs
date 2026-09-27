@@ -5456,13 +5456,11 @@ class CockpitWindow : Window
         // When a run is active, the primary button adds tasks to that run.
         _startBtn.Click += delegate
         {
-            // A SETTING IS NEVER A MESSAGE. While a run is live this button steers the running
-            // worker, and the steer is simply whatever the composer holds -- so `/fanout on`,
-            // `/effort max` and `/approval plan` were being sent to Copilot as instructions
-            // instead of changing anything here. Nothing failed visibly: the composer cleared,
-            // the note read like a steer had gone out, and the setting was silently unchanged.
-            // Found by typing `/fanout on` into the real window; settings.txt had no fanout key
-            // afterwards, and the running worker had been handed the text.
+            // A SETTING IS NEVER A TASK. Slash settings are consumed locally before the primary
+            // action is chosen. With an active run, ordinary text is durably added to that run;
+            // when idle, ordinary text starts a new run. Worker-specific steering lives on each
+            // worker card, so `/fanout`, `/effort`, and `/approval` must never enter either task
+            // path as Copilot instructions.
             if (HandleSlashSetting()) return;
             if (_composerRunActive) TryAddGoalsToLiveFleet();
             else StartFleet();
