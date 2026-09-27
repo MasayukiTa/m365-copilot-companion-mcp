@@ -650,9 +650,21 @@ def looks_like_login(url):
         from relay.edge_auth import looks_like_signin_wall
         return looks_like_signin_wall(url)
     except Exception:
-        u = (url or "").lower()
-        return ("login.microsoftonline" in u or "login.live.com" in u
-                or "/signin" in u or "oauth2/authorize" in u)
+        from urllib.parse import urlparse
+        try:
+            parsed = urlparse(url or "")
+            host = (parsed.hostname or "").lower().rstrip(".")
+        except Exception:
+            return False
+        # Conservative fallback only. The normal path delegates to edge_auth's generic IdP
+        # classifier; if that module cannot import, do not treat an arbitrary URL containing
+        # an auth hostname in its path/query as a sign-in wall.
+        return host in {
+            "login.microsoftonline.com",
+            "login.microsoft.com",
+            "login.windows.net",
+            "login.live.com",
+        }
 
 
 def close_all_tabs(cdp_url="http://localhost:9222", connect_timeout_ms=8000,
