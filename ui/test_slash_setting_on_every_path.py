@@ -44,8 +44,8 @@ SOURCE = _executable(RAW)
 
 
 def _confirm_paths():
-    """コンポーザの入力を確定させる分岐。両方とも `TrySendSteer` / `StartFleet` へ分かれる。"""
-    return [m.start() for m in re.finditer(r"if \(_composerRunActive\) TrySendSteer\(\);", SOURCE)]
+    """コンポーザの入力を確定させる分岐。両方とも `TryAddGoalsToLiveFleet` / `StartFleet` へ分かれる。"""
+    return [m.start() for m in re.finditer(r"if \(_composerRunActive\) TryAddGoalsToLiveFleet\(\);", SOURCE)]
 
 
 def test_there_are_exactly_two_confirm_paths():
@@ -56,7 +56,7 @@ def test_there_are_exactly_two_confirm_paths():
 
 
 def test_every_confirm_path_handles_a_slash_setting_first():
-    """**両方**の経路が、steer/start より前に HandleSlashSetting を呼ぶこと。"""
+    """**両方**の経路が、add/start より前に HandleSlashSetting を呼ぶこと。"""
     for start in _confirm_paths():
         before = SOURCE[max(0, start - 600):start]
         assert "HandleSlashSetting()" in before, (
@@ -65,9 +65,26 @@ def test_every_confirm_path_handles_a_slash_setting_first():
 
 
 def test_the_slash_handler_short_circuits():
-    """設定として扱ったら、そこで止まること。続けて steer すると二重に効く。"""
+    """設定として扱ったら、そこで止まること。続けて add すると二重に効く。"""
     for start in _confirm_paths():
         before = SOURCE[max(0, start - 600):start]
         i = before.rindex("HandleSlashSetting()")
         assert "return" in before[i:i + 40], (
-            "HandleSlashSetting の後に return していない -- 設定が steer としても送られる")
+            "HandleSlashSetting の後に return していない -- 設定が add としても送られる")
+
+
+SUBMIT_UI = (Path(__file__).resolve().parents[1] / "scripts" / "win" / "submit_via_ui.ps1").read_text(encoding="utf-8-sig")
+
+
+def test_visible_gui_submitter_matches_the_live_composer_task_intake_contract():
+    assert '"追加", "Add"' in SUBMIT_UI
+    assert 'if ($running -and -not $Steer)' not in SUBMIT_UI
+    assert 'Submit ($Goal -join "`n")' in SUBMIT_UI
+    assert '-Steer is not supported by the current cockpit bottom composer' in SUBMIT_UI
+
+
+def test_visible_gui_submitter_never_silently_turns_steer_into_add_goal():
+    steer_guard = SUBMIT_UI.index('if ($Steer)')
+    submit = SUBMIT_UI.index('Submit ($Goal -join "`n")')
+    assert steer_guard < submit
+    assert 'throw "-Steer is not supported' in SUBMIT_UI[steer_guard:submit]

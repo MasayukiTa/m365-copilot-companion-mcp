@@ -133,17 +133,11 @@ BASELINE = {
     "scripts/run_script_style_tests.py::run_one::subprocess.run": 1,
     "scripts/run_transport_series.py::run_one::subprocess.run": 1,
     "scripts/status.py::processes::subprocess.run": 1,
-    "tools/auto/autoloop.py::_run::subprocess.Popen": 1,
-    "tools/auto/autoloop.py::_run::subprocess.run": 1,
     "tools/childproc.py::run::subprocess.run": 1,
-    "tools/code_exec.py::_kill_tree::subprocess.run": 1,
-    "tools/code_exec.py::_run_with_tree_timeout::subprocess.Popen": 1,
     "tools/code_exec.py::run_python::subprocess.run": 1,
     "tools/coding_ops.py::_git_raw::subprocess.run": 1,
     "tools/env_ops.py::_pip_version::subprocess.run": 1,
     "tools/env_ops.py::pip_install::subprocess.run": 1,
-    "tools/jobs.py::run_in_background::subprocess.Popen": 1,
-    "tools/jobs.py::run_python_in_background::subprocess.Popen": 1,
     "tools/schedule_ops.py::_run::subprocess.run": 1,
     "tools/unreached.py::cross_language_text::subprocess.run": 1,
     "tools/unreached.py::tracked_files::subprocess.run": 1,
@@ -236,3 +230,16 @@ def test_the_scanner_still_sees_the_call_shape_it_is_looking_for():
     hits = L.scan_file("tools/childproc.py", REPO)
     assert any(h["callee"] == "subprocess.run" for h in hits), \
         "the scanner can no longer see subprocess.run in the module that wraps it"
+
+
+def test_the_scanner_understands_the_shared_tree_policy_kwargs(tmp_path):
+    """A shared policy factory is a decision, just like an explicit creationflags=."""
+    (tmp_path / "m.py").write_text(
+        "import subprocess\n"
+        "from tools import childproc\n"
+        "subprocess.Popen(['x'], **childproc.tree_popen_kwargs(headless=True))\n",
+        encoding="utf-8")
+    hits = L.scan_file("m.py", str(tmp_path))
+    popen = [h for h in hits if h["callee"] == "subprocess.Popen"]
+    assert len(popen) == 1
+    assert popen[0]["decided"] is True

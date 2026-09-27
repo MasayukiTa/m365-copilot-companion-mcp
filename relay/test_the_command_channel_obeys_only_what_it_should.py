@@ -177,6 +177,15 @@ def test_values_the_settings_panel_can_produce_are_admitted(cmd, state):
     assert ok, box
 
 
+def test_maxtabs_apply_layer_reclamps_to_the_same_bound():
+    # Defense in depth: validate_command is the public gate, but the mutation site should never
+    # be able to manufacture a capacity larger than the established 1..100 operator bound.
+    src = open(FR.__file__, encoding="utf-8").read()
+    i = src.index('if "set_maxtabs" in cmd:', src.index('def _apply_command(cmd, workers):'))
+    block = src[i:i + 500]
+    assert 'n = max(TABS_BOUNDS[0], min(int(cmd["set_maxtabs"]), TABS_BOUNDS[1]))' in block
+
+
 @pytest.mark.parametrize("cmd", [
     {"set_disk_floor_gb": 100.1}, {"set_disk_floor_gb": -1}, {"set_disk_floor_gb": 1e9},
     {"set_disk_floor_gb": math.nan}, {"set_disk_floor_gb": math.inf},
@@ -285,7 +294,8 @@ def test_apply_command_passes_the_gate_before_it_touches_anything():
     body = src[src.index("    def _apply_command(cmd, workers):"):]
     body = body[:body.index("\n    def ", 10)]
     gate = body.index("if not admit_command(cmd, args.state_dir, rejections_box):")
-    assert gate < body.index("by_name = {w.name: w for w in workers}")
+    first_effect = body.index("by_name = {w.name: w for w in workers}")
+    assert gate < first_effect
     assert "command_rejections=rejections_box" in src
 
 
@@ -316,3 +326,16 @@ def test_the_rest_of_the_state_dir_is_not_caught(tmp_path):
             FO._validate_path(str(tmp_path / rel))
         except PermissionError as exc:
             assert "command channel" not in str(exc), rel
+
+
+def test_add_goal_cannot_share_one_command_with_live_control_effects(tmp_path):
+    """PR47 #4111676584: goal durability and external/control effects cannot share a retry unit."""
+    controls = [
+        {'steer': {'worker': 'w0', 'text': 'x'}}, {'close': ['w0']}, {'reunlock': 'w0'},
+        {'set_maxtabs': 2}, {'set_disk_floor_gb': 1}, {'set_ram_floor_mb': 1},
+        {'set_autoscale': {'on': 1}}, {'pause': True}, {'stop': True},
+    ]
+    for c in controls:
+        cmd = {'add_goal': [{'text': 'new goal'}], **c}
+        errs = FR.validate_command(cmd, str(tmp_path))
+        assert errs and any('add_goal' in e and 'control' in e for e in errs), (cmd, errs)

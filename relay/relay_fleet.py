@@ -2940,6 +2940,12 @@ class RelayWorker:
         #: bytes go out again next sweep -- see _refute_fix_job for the measurement.
         self._refute_reason = ""
         self._refute_attempt = 0
+        # Preserve the last substantive DONE candidate while an independent reviewer asks for
+        # a correction. If that correction turn never answers, the truthful result is not
+        # STUCK-with-no-result: the candidate exists but its claim remains contradicted.
+        self._candidate_done_reply = ""
+        self._candidate_done_turn = 0
+        self._refute_fix_pending = False
         #: The last job text actually sent, so a re-send can be recognised as one.
         self._last_sent_job = ""
         # deep-research delegation (ported from the single-agent relay): a fleet worker can emit
@@ -3518,7 +3524,14 @@ class RelayWorker:
             return False
 
     def close(self):
-        """Release the tab (frees ~0.3-0.6 GB). Idempotent; never raises."""
+        """Release this worker and every resource it owns. Idempotent; never raises."""
+        try:
+            if self._active_check is not None:
+                self._active_check.cancel()
+        except Exception:
+            pass
+        self._active_check = None
+        self._pending_checks = []
         if self.closed:
             return
         self.closed = True
@@ -4966,6 +4979,11 @@ class RelayWorker:
             # would duplicate those rows under the LATER (probe) turn number instead.
             self._decide(orig_resp, _resume=True)
             return
+        if self._refute_fix_pending and not _resume:
+            # The special preservation rule is ONLY for a correction turn that produced no
+            # assistant reply at all. Once the worker answers, ordinary execution owns the
+            # subsequent outcome again (CONTINUE, DONE, STUCK, etc.).
+            self._refute_fix_pending = False
         self.last_response = resp
         if not _resume:
             self._tx.assistant(self.turn, resp)    # persist the full Copilot reply for this turn
@@ -6038,6 +6056,8 @@ class RelayWorker:
         """
         self._continue_count = 0   # a DONE claim is real progress -> the continue streak resets
         self._done_reply = resp or ""
+        self._candidate_done_reply = self._done_reply or self.last_response or ""
+        self._candidate_done_turn = self.turn
         if not self.checks:
             # NOT self.verified = False. __init__'s own comment declares the contract:
             # "None=not checked, True/False after a gate ran" -- and no gate ran here, only
@@ -6236,7 +6256,7 @@ class RelayWorker:
         except Exception:
             pass
 
-    def _settle_done(self):
+    def _settle_done(self, outcome_override=None):
         """THE ONLY PLACE THIS WORKER BECOMES DONE.
 
         There were four separate sites assigning ("done", "DONE"). Adding the check at one of
@@ -6251,7 +6271,7 @@ class RelayWorker:
             self._record_tree_stability()
         except Exception:
             pass
-        self.outcome = self._claim_verdict()
+        self.outcome = outcome_override or self._claim_verdict()
 
     def _tree_hash_now(self) -> str:
         """supervisor_verify.tree_hash over this worker's cwd, or "" when there is nothing to
@@ -6532,6 +6552,7 @@ class RelayWorker:
             # to what this branch has always produced.
             self._refute_reason = reason or "(no reason)"
             self._refute_attempt = 1
+            self._refute_fix_pending = True
             self.job = _refute_fix_job(self._refute_reason, 1)
             self.status = "ready"
             return False
@@ -7098,7 +7119,17 @@ class RelayWorker:
             # already had. The defect in turn 3 is that the poll did not see a reply it had,
             # and why is NOT DETERMINED. Widening a clock to cover for that would hide it.
             _bound = self.per_turn_timeout_s
-            if time.time() - self._t_send > _bound:
+            # A REPLY THAT ALREADY EXISTS BEATS OUR OUTER CLOCK. This check must happen BEFORE
+            # timeout/retry. Measured twice now: r6aa597a8 turn 3 replied at +70s but was retried
+            # at +240s; r6ab7a384 w4 turn 12 replied at +16s but was retried at +240.6s. In both
+            # cases the transcript proves that retry duplicated work after an answer already existed.
+            # We do NOT accept the reply here: we only suppress the timeout and let the ordinary
+            # generating/stale/settle gates below decide when it is safe to consume.
+            try:
+                _has_new_answer = self.drv._answers().count() > self._count_before
+            except Exception:
+                _has_new_answer = False
+            if not _has_new_answer and time.time() - self._t_send > _bound:
                 # A MEASUREMENT, NOT A GUESS -- and recorded apart from the guesses.
                 # turn_outcome classifies THROTTLE/RECYCLE/TRANSIENT from what the upstream
                 # SAID; this is our own clock passing our own budget. A rate computed over
@@ -7108,7 +7139,26 @@ class RelayWorker:
                 # `socket_turn` origin belongs to the driver's own bound, which is enforced
                 # where SOCKET_TURN_TIMEOUT_S is passed to it -- not here.
                 _origin = "per_turn"
-                # a turn that never finished is a transient stall -- retry before STUCK
+                if (getattr(self, "_refute_fix_pending", False)
+                        and getattr(self, "_candidate_done_reply", "")):
+                    # MEASURED r6ab7d72e_a0: useful candidate DONE at turn 5, reviewer requested
+                    # a correction, then 8 x ~240s no-reply retries replaced the useful result
+                    # with STUCK. The reviewer has already contradicted the candidate, so keep
+                    # that evidence and stop: finished-but-contradicted is exactly what the
+                    # existing EVIDENCE_CONTRADICTED outcome means. Do not score it as a pass,
+                    # and do not resurrect it automatically on resume.
+                    self._note_timeout(_origin, _elapsed, "candidate-preserved", budget_s=_bound)
+                    self.last_response = self._candidate_done_reply
+                    self.retryable_override = False
+                    self._refute_fix_pending = False
+                    _rr = (self._refute_reason or "reviewer requested a correction").strip()
+                    self.reason = (
+                        "candidate DONE preserved; refuter correction produced no reply before "
+                        "the %.0fs turn timeout: %s" % (_bound, _rr)
+                    )[:500]
+                    self._settle_done(outcome_override="EVIDENCE_CONTRADICTED")
+                    return True
+                # a turn with NO reply is a transient stall -- retry before STUCK
                 if self._retry_transient():
                     self._note_timeout(_origin, _elapsed, "retry", budget_s=_bound)
                     self.reason = "turn timeout -> retry %d/%d" % (self.transient, self.max_transient)
@@ -7122,10 +7172,7 @@ class RelayWorker:
                 self.status, self.outcome, self.reason = "stuck", "STUCK", \
                     "turn timeout (after %d retries)" % self.transient
                 return True
-            try:
-                if self.drv._answers().count() <= self._count_before:
-                    return False
-            except Exception:
+            if not _has_new_answer:
                 return False
             # PRIMARY completion gate: never read/commit a turn while the agent is STILL
             # GENERATING (the live Stop/square button is showing). Reading mid-stream was
@@ -7157,7 +7204,10 @@ class RelayWorker:
                         return False
                 except Exception:
                     pass
-            t = self.drv.read_last_response()
+            _read_last = getattr(self.drv, "read_last_response", None)
+            if not callable(_read_last):
+                return False
+            t = _read_last()
             if _settle.unified():
                 # THE ONE RULE, and for this site it is a real change rather than a move.
                 # This loop has no sample requirement at all -- only a dwell -- so the guard
