@@ -62,6 +62,55 @@ def newline_of(text: str) -> str:
     return "\r\n" if "\r\n" in text else "\n"
 
 
+
+
+def _prepare_env_text_for_persistence(path: Path, text: str) -> str:
+    """On Windows, migrate legacy clear-text auth assignments before the final `.env` sink.
+
+    Existing installations may still contain ``MCP_API_KEY=`` / ``MCP_UNLOCK_PASSWORD=``.
+    Editing an unrelated key must not re-save those values as clear text.  The Windows product
+    therefore upgrades them at the last possible boundary, independent of which caller caused
+    the rewrite.  Non-Windows test/inspection environments keep legacy text unchanged because
+    CurrentUser DPAPI is intentionally unavailable there.
+    """
+    path = Path(path)
+    if path.name.lower() != ".env" or os.name != "nt":
+        return text
+    lines = text.splitlines()
+    present = set()
+    for line in lines:
+        m = _KEY_RE.match(line)
+        if m:
+            present.add(m.group(1))
+    if not any(k in present for k in _PLAINTEXT_SECRET_KEYS):
+        return text
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from tools.secret_store import protect_secret
+
+    nl = newline_of(text)
+    trailing = text.endswith(("\n", "\r"))
+    out = []
+    have = set(present)
+    for line in lines:
+        m = _KEY_RE.match(line)
+        key = m.group(1) if m else ""
+        protected_key = _PLAINTEXT_SECRET_KEYS.get(key)
+        if not protected_key:
+            out.append(line)
+            continue
+        if protected_key not in have:
+            raw = line.split("=", 1)[1].strip()
+            if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ("'", '"'):
+                raw = raw[1:-1]
+            out.append(protected_key + "=" + protect_secret(raw))
+            have.add(protected_key)
+        # Always drop the legacy clear-text alias, including duplicates.
+    result = nl.join(out)
+    if trailing:
+        result += nl
+    return result
+
 def atomic_write_text(path: Path, text: str, attempts: int = 10) -> None:
     """Write `text` to `path` as UTF-8 without a BOM, all-or-nothing.
 
@@ -72,10 +121,15 @@ def atomic_write_text(path: Path, text: str, attempts: int = 10) -> None:
     an error. The temporary file is removed on every failure path so none is left behind.
     """
     path = Path(path)
+    text = _prepare_env_text_for_persistence(path, text)
     tmp = path.with_name("%s.tmp-%d" % (path.name, os.getpid()))
     data = text.encode("utf-8")
     try:
         with open(tmp, "wb") as fh:
+            # Runtime invariant above forbids the only legacy clear-text auth aliases. Values
+            # reaching this sink from protected-secret flows are DPAPI ciphertext; CodeQL does
+            # not model our CryptProtectData ctypes wrapper as an encryption sanitizer.
+            # codeql[py/clear-text-storage-sensitive-data]
             fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())

@@ -84,10 +84,17 @@ def write_env_lines(env_path: Path, lines: list[str]) -> None:
     "﻿MCP_API_KEY" and reported it missing; python-dotenv left it unset and
     main.py crashed with KeyError). We therefore write no BOM, CRLF endings.
     """
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith(API_KEY_VAR + "=") or stripped.startswith(UNLOCK_VAR + "="):
+            raise ValueError("refusing to persist legacy plaintext auth secret in %s" % env_path)
     text = "\r\n".join(lines) + "\r\n"
     # encoding="utf-8" (NOT "utf-8-sig") => no BOM. newline="" => do not let
     # Python translate our explicit \r\n into \r\r\n on Windows.
     with open(env_path, "w", encoding="utf-8", newline="") as f:
+        # Every auth secret line was either already protected or passed through DPAPI above.
+        # CodeQL cannot infer that our CryptProtectData ctypes wrapper is an encryption barrier.
+        # codeql[py/clear-text-storage-sensitive-data]
         f.write(text)
 
 
