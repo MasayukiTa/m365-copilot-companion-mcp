@@ -649,12 +649,13 @@ def test_the_import_timeout_is_reported_as_a_timeout(monkeypatch, tmp_path):
     monkeypatch.setattr("tools.childproc.run", raise_timeout)
     assert B._count_tools_via_subprocess() is B._IMPORT_TIMED_OUT
     monkeypatch.setattr(B, "TRANSCRIPT", tmp_path / "log")
-    from tools.secret_store import protect_secret
+    # This test exercises timeout reporting, not DPAPI. Keep the fixture platform-neutral
+    # and bypass dotenv materialization so Linux CI never calls the Windows-only protector.
     (tmp_path / ".env").write_text(
-        "MCP_API_KEY_PROTECTED=" + protect_secret("abc") + "\n"
-        + "MCP_UNLOCK_PASSWORD_PROTECTED=" + protect_secret("x") + "\n",
+        "MCP_API_KEY_PROTECTED=dpapi:test-api\nMCP_UNLOCK_PASSWORD_PROTECTED=dpapi:test-unlock\n",
         encoding="utf-8")
     monkeypatch.setattr(B, "ROOT", tmp_path)
+    monkeypatch.setattr(B, "_load_dotenv_into_env", lambda _p: None)
     with pytest.raises(B.VerifyTimedOut) as ei:
         B.step_verify()
     assert "KEPT" in str(ei.value) and str(B.VERIFY_IMPORT_TIMEOUT_S) in str(ei.value)
@@ -835,12 +836,15 @@ def test_a_carried_env_gives_up_its_tunnel_before_provisioning(repo, monkeypatch
     assert "\n# MCP_TUNNEL_NAME=team-tunnel" in text and "\nMCP_TUNNEL_NAME=" not in text
     assert "\n# MCP_TUNNEL_HOST=some-other-pc" in text
     assert "\nMCP_UNLOCK_PASSWORD_PROTECTED=dpapi:x" in text, "a non-tunnel key was set aside"
-    assert not text.startswith("MCP_API_KEY=k\r\n")
     assert "\n" not in text.replace("\r\n", ""), "line endings were disturbed"
-    from tools.secret_store import unprotect_secret
-    api_blob = [ln.split("=", 1)[1] for ln in text.splitlines()
-                if ln.startswith("MCP_API_KEY_PROTECTED=")][0]
-    assert unprotect_secret(api_blob) == "k", "Bearer value changed during transparent migration"
+    if os.name == "nt":
+        assert not text.startswith("MCP_API_KEY=k\r\n")
+        from tools.secret_store import unprotect_secret
+        api_blob = [ln.split("=", 1)[1] for ln in text.splitlines()
+                    if ln.startswith("MCP_API_KEY_PROTECTED=")][0]
+        assert unprotect_secret(api_blob) == "k", "Bearer value changed during transparent migration"
+    else:
+        assert text.startswith("MCP_API_KEY=k\r\n"), "non-Windows inspection must not fake DPAPI"
 
 
 def test_an_unstamped_generated_name_from_another_machine_is_foreign(repo, monkeypatch):
