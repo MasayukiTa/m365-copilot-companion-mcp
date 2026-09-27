@@ -57,6 +57,12 @@ def test_live_composer_tracks_receipt_and_rescues_with_adopt_command():
     assert "SendTrackedCommand(patch, out commandPath)" in block
     assert "WatchLiveAddHandoff(commandPath, ackPath)" in block
 
+    # This method is entered only from the active composer. A transient unreadable/stale status
+    # must not divert the submission into StartFleet(), where the state-dir lock can reject it
+    # after the UI has already cleared the input. The tracked command + watcher owns that race.
+    assert "if (!RunIsLive())" not in block
+    assert "StartFleet();" not in block
+
     assert "int LiveAddReceiptState(" in src
     receipt = src[src.index("int LiveAddReceiptState("):]
     receipt = receipt[:receipt.index("\n    void ", 40)]
