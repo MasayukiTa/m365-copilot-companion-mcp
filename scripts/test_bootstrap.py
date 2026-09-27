@@ -420,7 +420,11 @@ class WriteTunnelPreservesUrlTests(unittest.TestCase):
         bootstrap._write_tunnel_to_env("m365-copilot-companion", None)
         text = env.read_text(encoding="utf-8-sig")
         self.assertIn("MCP_TUNNEL_URL=https://keep-me-8000.jpe1.devtunnels.ms/", text)
-        self.assertIn("MCP_API_KEY=abc", text)  # other keys preserved
+        self.assertNotIn("MCP_API_KEY=abc", text)
+        from tools.secret_store import unprotect_secret
+        api_blob = [ln.split("=", 1)[1] for ln in text.splitlines()
+                    if ln.startswith("MCP_API_KEY_PROTECTED=")][0]
+        self.assertEqual(unprotect_secret(api_blob), "abc")
 
     def test_new_url_overwrites_old(self):
         env = self.root / ".env"
