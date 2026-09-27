@@ -227,7 +227,6 @@ def repair_unlock_password(env_path: str, environ=None) -> dict:
     # unlock inside the fleet and bridge is unaffected either way; a person typing
     # unlock(password) by hand is not, and that is exactly who sets up a new machine.
     return {"acted": True, "reason": "re-established the unlock password for this machine",
-            "password": fresh,
             "backup": env_path + ".before-unlock-repair"}
 
 
