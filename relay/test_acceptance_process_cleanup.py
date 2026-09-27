@@ -6,6 +6,9 @@ import os
 import subprocess
 import sys
 import time
+
+import pytest
+import relay.acceptance as acceptance
 from pathlib import Path
 
 from relay.acceptance import Check
@@ -107,3 +110,22 @@ def test_worker_close_cancels_an_active_acceptance_check():
     assert check.calls == 1
     assert w._active_check is None
     assert w._pending_checks == []
+
+
+
+def test_blocking_check_kills_tree_on_keyboardinterrupt(tmp_path, monkeypatch):
+    real, grandchild = _started_check(tmp_path)
+
+    class InterruptingCheck:
+        def start(self):
+            return self
+        def poll(self):
+            raise KeyboardInterrupt("unit interrupt")
+        def cancel(self):
+            return real.cancel()
+
+    monkeypatch.setattr(acceptance, "Check", lambda *args, **kwargs: InterruptingCheck())
+    with pytest.raises(KeyboardInterrupt, match="unit interrupt"):
+        acceptance.run_check_blocking({"type": "shell", "argv": [sys.executable, "-c", "pass"]},
+                                      cwd=str(tmp_path), poll_s=0.01)
+    assert _wait_dead(grandchild), "blocking acceptance interrupt left its grandchild alive"
