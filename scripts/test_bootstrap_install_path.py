@@ -649,7 +649,11 @@ def test_the_import_timeout_is_reported_as_a_timeout(monkeypatch, tmp_path):
     monkeypatch.setattr("tools.childproc.run", raise_timeout)
     assert B._count_tools_via_subprocess() is B._IMPORT_TIMED_OUT
     monkeypatch.setattr(B, "TRANSCRIPT", tmp_path / "log")
-    (tmp_path / ".env").write_text("MCP_API_KEY=abc\nMCP_UNLOCK_PASSWORD=x\n", encoding="utf-8")
+    from tools.secret_store import protect_secret
+    (tmp_path / ".env").write_text(
+        "MCP_API_KEY_PROTECTED=" + protect_secret("abc") + "\n"
+        + "MCP_UNLOCK_PASSWORD_PROTECTED=" + protect_secret("x") + "\n",
+        encoding="utf-8")
     monkeypatch.setattr(B, "ROOT", tmp_path)
     with pytest.raises(B.VerifyTimedOut) as ei:
         B.step_verify()
@@ -725,8 +729,10 @@ def test_a_bearer_minted_into_an_existing_env_is_shown(repo, capsys):
     without a word."""
     (repo / ".env").write_text("MCP_UNLOCK_PASSWORD=keep\n", encoding="utf-8")
     B.step_gen_env()
-    api = [l.split("=", 1)[1] for l in (repo / ".env").read_text(encoding="utf-8").splitlines()
-           if l.startswith("MCP_API_KEY=")][0]
+    from tools.secret_store import unprotect_secret
+    api_blob = [l.split("=", 1)[1] for l in (repo / ".env").read_text(encoding="utf-8").splitlines()
+                if l.startswith("MCP_API_KEY_PROTECTED=")][0]
+    api = unprotect_secret(api_blob)
     assert api in capsys.readouterr().out
 
 

@@ -24,6 +24,9 @@ import urllib.request
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+from tools.secret_store import api_key_from_env
 PY_VENV = REPO / ".venv" / "Scripts" / "python.exe"
 RETRY_IDS = REPO / ".fleet" / "gaia" / "retry_ids.json"
 OUT_DIR = REPO / ".fleet" / "gaia"
@@ -31,13 +34,13 @@ ENDPOINT_LOG = OUT_DIR / "endpoint.log"
 
 
 def _api_key() -> str:
+    env = {}
     for line in (REPO / ".env").read_text(encoding="utf-8-sig").splitlines():
         line = line.strip()
         if line and not line.startswith("#") and "=" in line:
             k, v = line.split("=", 1)
-            if k.strip() == "MCP_API_KEY":
-                return v.strip()
-    return ""
+            env[k.strip()] = v.strip()
+    return api_key_from_env(env)
 
 
 def _looks_like_models_payload(body: bytes) -> bool:

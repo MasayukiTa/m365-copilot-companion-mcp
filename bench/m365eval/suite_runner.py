@@ -21,7 +21,7 @@ Arguments:
 Safety rules (hard-coded, not configurable):
   * NEVER calls outlook_send_mail or asks the agent to send email.
   * NEVER touches any artifact whose title differs from the exact marker.
-  * MCP_API_KEY is read from .env at runtime; never printed, logged, or committed.
+  * MCP_API_KEY is materialized in process memory from legacy/plain or DPAPI-protected .env storage; never persisted in clear text.
   * After the suite, verifies zero M365EVAL artifacts remain.
   * OneDrive tasks: if the independent read returns NOT_FOUND or a tool error,
     the task is marked 'unsupported' and excluded from the score denominator.
@@ -74,6 +74,8 @@ def _load_dotenv(path):
 
 
 _load_dotenv(REPO_ROOT / ".env")
+from tools.secret_store import materialize_api_key
+materialize_api_key()
 
 # Import runner helpers (avoid re-defining them)
 import importlib.util as _ilu
@@ -836,7 +838,7 @@ def main():
 
     api_key = os.environ.get("MCP_API_KEY", "")
     if not api_key:
-        print("BLOCKER: MCP_API_KEY not found in environment / .env")
+        print("BLOCKER: MCP_API_KEY could not be materialized from environment / protected .env storage")
         return 3
 
     # Preflight
