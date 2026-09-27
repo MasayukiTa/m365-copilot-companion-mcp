@@ -836,7 +836,6 @@ def test_a_carried_env_gives_up_its_tunnel_before_provisioning(repo, monkeypatch
 def test_an_unstamped_generated_name_from_another_machine_is_foreign(repo, monkeypatch):
     _dev_tunnel_env(repo, ["MCP_TUNNEL_NAME=m365-copilot-companion-deadbeef"])
     monkeypatch.setattr(B, "_machine_suffix", lambda: "0badf00d")
-    monkeypatch.setattr(B, "_legacy_machine_suffix", lambda: "abcdef")
     assert "generated on another machine" in B._foreign_env_reason(_env_text(repo))
     assert _run_dev_tunnel_step(monkeypatch, repo) == "m365-copilot-companion-0badf00d"
 
@@ -875,3 +874,12 @@ def test_a_pip_failure_behind_a_proxy_names_the_proxy(monkeypatch):
     msg = B._pip_failure_message()
     assert "proxy.example:8080" in msg and "407" in msg
     assert "certificate" not in msg.lower()
+
+
+def test_unstamped_legacy_six_hex_name_is_conservatively_kept_without_sha1(repo, monkeypatch):
+    _dev_tunnel_env(repo, ["MCP_TUNNEL_NAME=m365-copilot-companion-cafe01"])
+    monkeypatch.setattr(B, "_machine_suffix", lambda: "0badf00d")
+    assert B._foreign_env_reason(_env_text(repo)) == ""
+    src = Path(B.__file__).read_text(encoding="utf-8")
+    assert "hashlib.sha1(" not in src
+    assert "_legacy_machine_suffix" not in src

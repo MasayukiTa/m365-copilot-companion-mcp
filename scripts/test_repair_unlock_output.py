@@ -85,9 +85,9 @@ def test_nothing_derived_from_the_repair_reaches_stdout_unscrubbed():
                 continue
             if "_scrub" in ln or name in sanitized:
                 continue
-            # `exc` at the import-failure site is raised before .env is ever read, so there is
-            # no secret in scope to leak.
-            if "failed:import" in ln:
+            # Exception TYPE is structural metadata, not the exception message/value. Both the
+            # import failure and post-.env failure paths intentionally expose only the class name.
+            if name == "exc" and "type(exc).__name__" in ln:
                 continue
             raise AssertionError("unscrubbed %r reaches stdout: %s" % (name, ln))
 
@@ -108,3 +108,11 @@ def test_every_verdict_keeps_the_prefix_start_all_matches_on():
               '"password:', '"unset:', '"undecryptable:')
     for ln in printed:
         assert any(p in ln for p in shapes), ln
+
+
+def test_repair_stdout_has_no_cleartext_secret_channel():
+    import io
+    src = io.open(R.__file__, encoding="utf-8").read()
+    assert 'print("password:' not in src
+    assert '--current' in src and 'cleartext output was removed' in src
+    assert '_reveal_allowed' not in src

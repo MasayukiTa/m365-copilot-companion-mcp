@@ -10,6 +10,7 @@
   * ソケット経路が、ページと同じ意味を返すこと。とくに settled が走行中に空であること --
     ここが埋まると、ループは末尾を切り落として完了扱いにする。
 """
+from pathlib import Path
 import pytest
 
 from bridge import copilot_bridge as B
@@ -746,3 +747,8 @@ def test_the_two_reported_sites_are_covered():
     risky = _re.findall(r"logger\.(?:warning|info|error|debug)\([^\n]*?%s[^\n]*?,\s*"
                         r"(sid|url|conv_url)\s*[,)]", src)
     assert not risky, "request-derived values still logged raw: %s" % risky
+
+
+def test_bridge_refusal_detail_is_logsafe_at_the_sink():
+    src = Path(B.__file__).read_text(encoding="utf-8", errors="replace")
+    assert 'logger.warning("bridge refused %s %s: %s", method, logsafe(parsed.path),\n                               logsafe(refusal[2]))' in src
