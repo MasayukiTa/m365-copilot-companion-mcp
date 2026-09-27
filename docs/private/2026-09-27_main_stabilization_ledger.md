@@ -11,9 +11,9 @@ Authoritative working checklist for the current repository stabilization. Update
 - [x] Confirm only one patch-equivalent duplicate exists (`ed518f7` == `origin/main` `051661f`); all other feature commits are unique main work.
 - [x] Validate merged main in bounded chunks (avoid one oversized pytest invocation that leaves duplicate validation trees).
 - [x] Rebuild FleetCockpit/CopilotChat from merged main and verify deployed exe/source consistency.
-- [ ] Commit the merge on main.
-- [ ] Push main.
-- [ ] Confirm remote main SHA matches local main.
+- [x] Commit the merge on main (`a40002f`).
+- [x] Push main.
+- [x] Confirm remote main SHA matches local main (`a40002f`).
 
 ## Reliability fixes being promoted to main
 
