@@ -3524,7 +3524,14 @@ class RelayWorker:
             return False
 
     def close(self):
-        """Release the tab (frees ~0.3-0.6 GB). Idempotent; never raises."""
+        """Release this worker and every resource it owns. Idempotent; never raises."""
+        try:
+            if self._active_check is not None:
+                self._active_check.cancel()
+        except Exception:
+            pass
+        self._active_check = None
+        self._pending_checks = []
         if self.closed:
             return
         self.closed = True
