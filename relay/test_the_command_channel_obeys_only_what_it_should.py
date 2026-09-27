@@ -177,6 +177,15 @@ def test_values_the_settings_panel_can_produce_are_admitted(cmd, state):
     assert ok, box
 
 
+def test_maxtabs_apply_layer_reclamps_to_the_same_bound():
+    # Defense in depth: validate_command is the public gate, but the mutation site should never
+    # be able to manufacture a capacity larger than the established 1..100 operator bound.
+    src = open(FR.__file__, encoding="utf-8").read()
+    i = src.index('if "set_maxtabs" in cmd:', src.index('def _apply_command(cmd, workers):'))
+    block = src[i:i + 500]
+    assert 'n = max(TABS_BOUNDS[0], min(int(cmd["set_maxtabs"]), TABS_BOUNDS[1]))' in block
+
+
 @pytest.mark.parametrize("cmd", [
     {"set_disk_floor_gb": 100.1}, {"set_disk_floor_gb": -1}, {"set_disk_floor_gb": 1e9},
     {"set_disk_floor_gb": math.nan}, {"set_disk_floor_gb": math.inf},
