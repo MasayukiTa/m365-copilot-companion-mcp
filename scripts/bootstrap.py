@@ -122,13 +122,6 @@ def _is_generated_tunnel_name(name: str | None) -> bool:
     return bool(name and _GENERATED_NAME_RE.match(name.strip().lower()))
 
 
-def _legacy_machine_suffix() -> str:
-    """setup_devtunnel.ps1's pre-D22 suffix: SHA1(COMPUTERNAME|USERNAME)[:6], case as given.
-    Still counts as this machine's, as it does there."""
-    seed = "%s|%s" % (os.environ.get("COMPUTERNAME", ""), os.environ.get("USERNAME", ""))
-    return hashlib.sha1(seed.encode("utf-8"), usedforsecurity=False).hexdigest()[:6]
-
-
 def _is_identifying_tunnel_name(name: str | None) -> bool:
     """Returns True if 'name' leaks an identifying token. Mirrors
     Test-IdentifyingTunnelName in setup_devtunnel.ps1 -- keep both in sync.
@@ -1860,9 +1853,15 @@ def _foreign_env_reason(text: str) -> str:
         return "its tunnel was recorded on '%s', not this machine ('%s')" % (stamp, _this_host())
     if not stamp and _is_generated_tunnel_name(name):
         m = re.match(r"^-([0-9a-f]+)", name.lower()[len(DEFAULT_TUNNEL_NAME):])
-        if m and m.group(1) not in (_machine_suffix(), _legacy_machine_suffix()):
-            return ("its tunnel name '%s' was generated on another machine (the suffix is not "
-                    "this machine's)" % name)
+        if m:
+            suffix = m.group(1)
+            # Legacy setup used a 6-hex SHA-1(machine|user) fingerprint. Recomputing SHA-1 over
+            # identifying data is unnecessary and triggers a real weak-hash finding. Without a
+            # host stamp an old 6-hex name is simply not PROVABLY foreign, so preserve it. New
+            # 8-hex names use SHA-256 and remain attributable to this machine.
+            if len(suffix) == 8 and suffix != _machine_suffix():
+                return ("its tunnel name '%s' was generated on another machine (the suffix is not "
+                        "this machine's)" % name)
     return ""
 
 

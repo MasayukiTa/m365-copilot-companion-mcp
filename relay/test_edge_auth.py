@@ -372,3 +372,18 @@ def test_the_navigation_url_actually_has_its_query_separator():
     for url in seen:
         assert "/json/new?" in url, "the query separator is missing: %r" % url
         assert url.endswith("https://example.test/chat/?titleId=T_x"), url
+
+
+def test_edge_recover_fallback_does_not_accept_login_host_as_arbitrary_substring(monkeypatch):
+    import builtins
+    import relay.edge_recover as er
+    real_import = builtins.__import__
+    def fail_edge_auth(name, *a, **kw):
+        if name == "relay.edge_auth":
+            raise ImportError("forced fallback")
+        return real_import(name, *a, **kw)
+    monkeypatch.setattr(builtins, "__import__", fail_edge_auth)
+    assert er.looks_like_login("https://login.live.com/signin") is True
+    assert er.looks_like_login("https://login.microsoftonline.com/common/oauth2/authorize") is True
+    assert er.looks_like_login("https://evil.example/path/login.live.com/signin") is False
+    assert er.looks_like_login("https://login.live.com.evil.example/signin") is False
