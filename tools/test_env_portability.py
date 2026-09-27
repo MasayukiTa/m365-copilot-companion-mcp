@@ -136,6 +136,7 @@ def test_an_undecryptable_password_is_replaced_with_one_this_machine_can_use(tmp
     got = EP.repair_unlock_password(env_path, env)
 
     assert got["acted"] is True, got
+    assert "password" not in got, "fresh plaintext must not escape the repair function"
     text = open(env_path, encoding="utf-8").read()
     assert "dpapi:AAAAfromanotherpc==" not in text, "the unusable value was left in place"
     assert "MCP_API_KEY=keep-me" in text, "an unrelated secret was lost"

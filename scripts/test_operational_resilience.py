@@ -454,7 +454,11 @@ def test_the_new_unlock_password_reaches_the_operator_without_being_echoed():
     start_all = (ROOT / "scripts" / "start_all.ps1").read_text(encoding="utf-8")
     repair = (ROOT / "scripts" / "repair_unlock.py").read_text(encoding="utf-8")
 
-    assert '"password": fresh' in ep
+    # The repair helper must NOT return the freshly minted clear-text value. It persists only
+    # the protected value; the interactive PowerShell helper is the sole reveal path.
+    assert '"password": fresh' not in ep
+    assert 'env[UNLOCK_PASSWORD_PROTECTED_VAR] = protected' in ep
+    assert 'return {"acted": True' in ep
     assert (ROOT / "scripts" / "repair_unlock.py").exists()
     assert "repair_unlock.py" in start_all
     assert 'repair -like "repaired:*"' in start_all
