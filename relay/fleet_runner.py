@@ -2771,15 +2771,22 @@ def commit_command_claim(state_dir, claim, applied=None, rejected_errors=None) -
         return False
     suffix = ".applied" if applied is True else (".rejected" if applied is False else ".read")
     committed = claimed + suffix
-    until = time.time() + 2.0
-    while True:
-        try:
-            os.replace(claimed, committed)
-            break
-        except OSError:
-            if time.time() >= until:
-                return False
-            time.sleep(0.02)
+    # Idempotent commit-only retry. The first call may already have crossed the non-replayable
+    # rename boundary and then failed to publish its receipt. In that case ``claimed`` is gone
+    # by design; continue from the durable tombstone instead of reporting a rename failure or
+    # tempting the caller to re-apply command effects.
+    if not os.path.isfile(committed):
+        until = time.time() + 2.0
+        while True:
+            try:
+                os.replace(claimed, committed)
+                break
+            except OSError:
+                if os.path.isfile(committed):
+                    break
+                if time.time() >= until:
+                    return False
+                time.sleep(0.02)
 
     ack = (cmd or {}).get("ack") if isinstance(cmd, dict) else None
     receipt_ok = True
@@ -2802,7 +2809,11 @@ def commit_command_claim(state_dir, claim, applied=None, rejected_errors=None) -
             os.remove(committed)
         except OSError:
             pass
-    return True
+        return True
+    # Effects are durably committed but the handoff is not complete until the receipt is durable.
+    # False means "retry commit only" to the live drain; the .applied/.rejected tombstone is the
+    # crash-recovery source and must stay in place.
+    return False
 
 
 def retry_pending_command_commits(state_dir, pending) -> int:

@@ -162,18 +162,25 @@ def test_commit_only_retry_never_calls_command_application_again(tmp_path, monke
     assert len(calls) == 2 and all(c[1] is True for c in calls)
 
 
-def test_receipt_failure_keeps_committed_tombstone_until_recovery_succeeds(tmp_path, monkeypatch):
+def test_receipt_failure_is_a_pending_commit_and_retries_from_the_existing_tombstone(tmp_path, monkeypatch):
+    """PR47 #4115030177: effects are committed, but handoff is not complete until ack is durable."""
     ack = str(tmp_path / "acks" / "later.ack")
     _write(tmp_path, text="receipt later", ack=ack)
     c = fr.claim_commands(str(tmp_path))[0]
     real_write = fr._write_receipt
     monkeypatch.setattr(fr, "_write_receipt", lambda *a, **k: False)
-    assert fr.commit_command_claim(str(tmp_path), c, applied=True) is True
+    assert fr.commit_command_claim(str(tmp_path), c, applied=True) is False
     tomb = c["claimed"] + ".applied"
     assert os.path.isfile(tomb)
     assert not os.path.exists(ack)
+
+    # The retry is commit-only: the original .claim path is already gone, so this proves
+    # commit_command_claim can continue from the .applied tombstone instead of trying to rename
+    # or re-apply the command a second time.
+    pending = [(c, True, [])]
     monkeypatch.setattr(fr, "_write_receipt", real_write)
-    assert fr.claim_commands(str(tmp_path)) == []
+    assert fr.retry_pending_command_commits(str(tmp_path), pending) == 0
+    assert pending == []
     assert os.path.isfile(ack)
     assert not os.path.exists(tomb)
 

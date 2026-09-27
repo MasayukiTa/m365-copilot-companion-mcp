@@ -5627,7 +5627,7 @@ class CockpitWindow : Window
                 return;
             }
             // Slash settings are handled by the shared HandleSlashSetting(), which the
-            // send button also calls BEFORE deciding start-vs-steer -- see there for why.
+            // send button also calls before deciding whether to start or add to a live run.
             if (HandleSlashSetting()) return;
 
             bool planMode = _approval == "plan" || _approval == "auto";
@@ -5660,13 +5660,11 @@ class CockpitWindow : Window
         }
         if (goals.Count == 0) return;
 
-        // The UI can be one tick behind the coordinator. If the run ended between paint and click,
-        // preserve the user's intent by using the normal new-run path instead of dropping the text.
-        if (!RunIsLive())
-        {
-            StartFleet();
-            return;
-        }
+        // This method is entered from the ACTIVE composer. Do not re-decide ownership from one
+        // status read here: a transient unreadable/stale snapshot used to divert this submission
+        // into StartFleet(), where the state-dir lock correctly rejected the second coordinator
+        // after the UI had already cleared the input. Always land the tracked command; its applied
+        // receipt + WatchLiveAddHandoff resolve whether the old run consumes it or a new run adopts it.
 
         var adds = new List<object>();
         foreach (string goal in goals)
