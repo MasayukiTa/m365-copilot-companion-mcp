@@ -276,7 +276,7 @@ function Submit([string]$text) {
     # BY NAME, in both languages the cockpit ships. The name comes from T("start"), so these
     # two strings are the whole set -- matching on width instead would pick a different
     # button the moment the layout changes.
-    $wanted = @("並列実行を開始", "Start parallel run", "送信", "Send")
+    $wanted = @("並列実行を開始", "Start parallel run", "送信", "Send", "追加", "Add")
     for ($i = 0; $i -lt $btns.Count -and -not $startBtn; $i++) {
         $b = $btns.Item($i)
         if ($wanted -contains $b.Current.Name -and $b.Current.IsEnabled) { $startBtn = $b }
@@ -307,8 +307,8 @@ function Submit([string]$text) {
     Write-Output ("submitted: {0}" -f ($text.Substring(0, [Math]::Min(70, $text.Length))))
 }
 
-# IS A RUN ALREADY GOING? The cockpit does not say so through automation, so ask the record
-# the fleet keeps. Getting this wrong steers a running goal with the text of a new one.
+# IS A RUN ALREADY GOING? Keep this diagnostic visible because it is useful when a GUI submit
+# misbehaves. It no longer changes Goal semantics: the bottom composer adds tasks in a live run.
 $running = $false
 try {
     $statusPath = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) ".fleet/status.json"
@@ -322,15 +322,18 @@ Write-Output ("run in flight: {0}" -f $running)
 if ($Command) { Submit $Command }
 
 if ($Goal.Count -gt 0) {
-    if ($running -and -not $Steer) {
-        throw ("a run is in flight, and Ctrl+Enter steers rather than starts while one is. " +
-               "Wait for it, or pass -Steer if steering is what was meant.")
+    if ($Steer) {
+        # The bottom composer is task intake in BOTH idle and live states now. Invoking its
+        # button with -Steer would therefore ADD A TASK, not steer, which is worse than refusing.
+        # Steering remains a per-worker card action until this UIA helper grows a card-targeted
+        # path with an explicit worker identity.
+        throw "-Steer is not supported by the current cockpit bottom composer; steer from the target worker card instead"
     }
-    if ($Steer -and $Goal.Count -gt 1) { throw "steer one message at a time" }
     foreach ($g in $Goal) {
         if ($g -match "`n") { throw "a goal may not contain a newline; the cockpit splits on them" }
     }
-    # SEVERAL GOALS GO IN TOGETHER, one per line, and start as one fleet. Submitting them one
-    # at a time cannot work: the first starts a run, and every later one steers it.
+    # The same visible button is Start when idle and Add while a run is live. Multiple goals are
+    # placed in the composer together, one per line; Cockpit splits them into independent add_goal
+    # items and its durable handoff/ack path owns the run-ending race.
     Submit ($Goal -join "`n")
 }
