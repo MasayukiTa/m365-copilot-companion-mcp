@@ -297,7 +297,7 @@ class Check:
                     target, cwd=self.cwd, shell=shell,
                     stdout=self._out, stderr=self._err,
                     stdin=subprocess.DEVNULL,
-                    creationflags=childproc.headless_creationflags(),
+                    **childproc.tree_popen_kwargs(headless=True),
                 )
                 self._deadline = time.time() + self.timeout
             else:
@@ -315,18 +315,28 @@ class Check:
         rc = self._proc.poll()
         if rc is None:
             if time.time() > (self._deadline or 0):
-                try:
-                    self._proc.kill()
-                except Exception:
-                    pass
-                try:
-                    self._proc.wait(timeout=5)
-                except Exception:
-                    pass
+                childproc.kill_tree(self._proc, wait_s=5)
                 self._instant = self._finish(rc=None, timed_out=True)
                 return self._instant
             return None
         self._instant = self._finish(rc=rc)
+        return self._instant
+
+
+    def cancel(self):
+        """Cancel a running process-backed check and its descendants. Idempotent."""
+        if self._instant is not None:
+            return self._instant
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            childproc.kill_tree(proc, wait_s=5)
+        out = self._read(self._out) if self._out else ""
+        err = self._read(self._err) if self._err else ""
+        body = _tail(err or out)
+        detail = "[%s] CANCELLED" % self.describe()
+        if body:
+            detail += "\n" + body
+        self._instant = (False, detail)
         return self._instant
 
     # -- result assembly -----------------------------------------------------
@@ -420,11 +430,17 @@ def run_check_blocking(spec, cwd=None, poll_s=0.25):
     completion and return (passed, detail). The fleet uses the non-blocking Check
     directly so it never stalls the round-robin."""
     c = Check(spec, cwd=cwd).start()
-    while True:
-        r = c.poll()
-        if r is not None:
-            return r
-        time.sleep(poll_s)
+    try:
+        while True:
+            r = c.poll()
+            if r is not None:
+                return r
+            time.sleep(poll_s)
+    finally:
+        # Normal completion is idempotent (`cancel` returns the committed result). The reason
+        # this is a finally is the abnormal path: KeyboardInterrupt / caller exceptions used to
+        # unwind past a still-running shell/pytest tree and leave it consuming CPU indefinitely.
+        c.cancel()
 
 
 def run_all_blocking(specs, cwd=None):

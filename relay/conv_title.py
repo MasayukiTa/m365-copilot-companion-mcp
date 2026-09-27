@@ -112,6 +112,29 @@ def _redact(text: str) -> str:
     return text
 
 
+_GENERIC_POLICY_ONLY = re.compile(
+    r"^\s*READ[- ]?ONLY\s+(?:audit|investigation)\s+only\b", re.I)
+
+
+def _task_clause(text: str) -> str:
+    """Extract the first clause that identifies the work rather than only its safety policy.
+
+    Real delegated goals sometimes begin with a whole sentence such as
+    ``READ-ONLY audit only; do not edit, commit, push...``.  That sentence is important to
+    execution but useless as a compact task identity.  When (and only when) the opening matches
+    that narrow policy-only shape, take the next sentence from the original goal.  Everything
+    remains extractive; no action or outcome is invented.
+    """
+    raw = (text or "").strip()
+    if _GENERIC_POLICY_ONLY.match(raw):
+        parts = re.split(r"(?<=[.!?。！？])\s+", raw, maxsplit=1)
+        if len(parts) > 1:
+            nxt = _first_clause(parts[1])
+            if nxt:
+                return nxt
+    return _first_clause(raw)
+
+
 def _first_clause(text: str) -> str:
     """The first sentence-ish run of the remaining text."""
     for line in (text or "").splitlines():
@@ -247,7 +270,7 @@ def make_title(goal: str, existing: str = "", key: str = "", when: float = None)
     the original beside the derived one.
     """
     text = strip_boilerplate(goal or existing or "")
-    candidate = _swe_title(goal or "") or _first_clause(text)
+    candidate = _swe_title(goal or "") or _task_clause(text)
     candidate = _CONTROL.sub("", _redact(candidate)).strip()
     candidate = re.sub(r"\s+", " ", candidate)
     if len(candidate) > MAX_LEN:

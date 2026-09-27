@@ -21,8 +21,56 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RELAY = os.path.join(ROOT, "relay")
 
 
+def _returned_string_literals(tree, called, seen=None):
+    """Strings a local function/method can return, following simple composed expressions.
+
+    Outcome assignment was refactored from a literal/call into
+    ``outcome_override or self._claim_verdict()``.  A guard that only understands one AST node
+    shape becomes a refactor detector instead of an outcome-closure detector, so expressions are
+    walked recursively while call targets remain deliberately local to this module.
+    """
+    seen = set(seen or ())
+    if not called or called in seen:
+        return []
+    seen.add(called)
+    out = []
+    for other in ast.walk(tree):
+        if not (isinstance(other, (ast.FunctionDef, ast.AsyncFunctionDef)) and other.name == called):
+            continue
+        for r in ast.walk(other):
+            if isinstance(r, ast.Return):
+                out.extend(_strings_from_expr(tree, r.value, seen))
+    return out
+
+
+def _strings_from_expr(tree, expr, seen=None):
+    """Conservative string possibilities for an expression assigned to ``.outcome``."""
+    if expr is None:
+        return []
+    if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+        return [(expr.value, getattr(expr, "lineno", 0), "literal")]
+    if isinstance(expr, (ast.BoolOp, ast.Tuple, ast.List, ast.Set)):
+        values = getattr(expr, "values", None) or getattr(expr, "elts", ())
+        out = []
+        for item in values:
+            out.extend(_strings_from_expr(tree, item, seen))
+        return out
+    if isinstance(expr, ast.IfExp):
+        return (_strings_from_expr(tree, expr.body, seen)
+                + _strings_from_expr(tree, expr.orelse, seen))
+    if isinstance(expr, ast.Call):
+        fn = expr.func
+        called = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
+        return [(value, line, "returned by %s" % called)
+                for value, line, _kind in _returned_string_literals(tree, called, seen)]
+    # A Name such as ``outcome_override`` is intentionally not guessed from annotations/defaults.
+    # If it matters, another branch/call must emit the same concrete member; otherwise the reverse
+    # closure assertion will expose the gap rather than this walker inventing a value.
+    return []
+
+
 def _assigned_outcomes():
-    """Every string literal assigned to something named `outcome`, with where it came from."""
+    """Every concrete string that can feed an attribute named ``outcome``, with provenance."""
     found = {}
     for name in sorted(os.listdir(RELAY)):
         if not name.endswith(".py") or name.startswith("test_"):
@@ -35,7 +83,6 @@ def _assigned_outcomes():
         for node in ast.walk(tree):
             if not isinstance(node, ast.Assign):
                 continue
-            # self.outcome = "X"   and   self.status, self.outcome = "x", "X"
             targets, values = [], []
             for tgt in node.targets:
                 if isinstance(tgt, ast.Tuple):
@@ -48,29 +95,9 @@ def _assigned_outcomes():
             for tgt, val in zip(targets, values):
                 if not (isinstance(tgt, ast.Attribute) and tgt.attr == "outcome"):
                     continue
-                if isinstance(val, ast.Constant) and isinstance(val.value, str):
-                    found.setdefault(val.value, []).append("%s:%d" % (name, node.lineno))
-                elif isinstance(val, ast.Call):
-                    # ASSIGNED FROM A METHOD, WHICH THIS USED TO BE BLIND TO.
-                    #
-                    # `_settle_done` consolidated four separate ("done", "DONE") assignments
-                    # into ONE site -- exactly the right move, and it is why a gate now cannot
-                    # be walked around. But the literal moved from an assignment into a
-                    # `return`, so a walker that only reads Assign nodes stopped seeing DONE at
-                    # all and declared the most common outcome in the system unproduced.
-                    #
-                    # The guard has to follow the refactor: when outcome is assigned from
-                    # self.<method>(), harvest the strings that method returns.
-                    fn = val.func
-                    called = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
-                    for other in ast.walk(tree):
-                        if not (isinstance(other, ast.FunctionDef) and other.name == called):
-                            continue
-                        for r in ast.walk(other):
-                            if (isinstance(r, ast.Return) and isinstance(r.value, ast.Constant)
-                                    and isinstance(r.value.value, str)):
-                                found.setdefault(r.value.value, []).append(
-                                    "%s:%d (returned by %s)" % (name, r.lineno, called))
+                for value, line, kind in _strings_from_expr(tree, val):
+                    found.setdefault(value, []).append(
+                        "%s:%d (%s)" % (name, line or node.lineno, kind))
     return found
 
 

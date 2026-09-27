@@ -165,9 +165,10 @@ def main():
     try:
         _acceptance.subprocess.Popen = _fake_popen
         _c = Check({"type": "shell", "argv": [PY, "-c", "pass"]}).start()
-        _flags = _seen.get("kwargs", {}).get("creationflags")
+        _kw = _seen.get("kwargs", {})
+        _expected = _childproc.tree_popen_kwargs(headless=True)
         check("acceptance_child_is_windowless",
-              _flags == _childproc.headless_creationflags() and "creationflags" in _seen.get("kwargs", {}))
+              bool(_expected) and all(_kw.get(k) == v for k, v in _expected.items()))
         try:
             _c._out.close(); _c._err.close()
         except Exception:

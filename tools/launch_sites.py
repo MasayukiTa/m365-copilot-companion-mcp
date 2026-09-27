@@ -47,6 +47,10 @@ _OS_STARTERS = frozenset({
 #: Modules whose job IS to launch, so a call into them is a site that has already decided.
 _WRAPPERS = frozenset({"childproc"})
 
+#: Known **kwargs factories that decide Popen's process/console ownership policy. Keep this
+#: narrow: an arbitrary ``**kw`` is NOT evidence that the caller chose a policy.
+_POLICY_KW_WRAPPERS = frozenset({("childproc", "tree_popen_kwargs")})
+
 
 def tracked_python(repo=REPO, include_tests: bool = False) -> list:
     """Tracked .py paths, from git. NEVER a filesystem walk.
@@ -108,6 +112,23 @@ def _enclosing(tree: ast.AST) -> dict:
     return owner
 
 
+
+def _expanded_policy(node: ast.Call) -> bool:
+    """True when a ``**known_policy_factory(...)`` expansion decides this launch."""
+    for kw in node.keywords:
+        if kw.arg is not None:
+            continue
+        value = kw.value
+        if not isinstance(value, ast.Call):
+            continue
+        fn = value.func
+        if not isinstance(fn, ast.Attribute) or not isinstance(fn.value, ast.Name):
+            continue
+        if (fn.value.id, fn.attr) in _POLICY_KW_WRAPPERS:
+            return True
+    return False
+
+
 def scan_file(rel: str, repo=REPO) -> list:
     """Launch sites in one file, as dicts. Unparseable files yield nothing, not an error."""
     path = os.path.join(repo, rel)
@@ -132,7 +153,9 @@ def scan_file(rel: str, repo=REPO) -> list:
             "line": node.lineno,
             # A call into a launching wrapper has already made the decision somewhere the
             # wrapper owns, so it is never "inherits whatever it is given".
-            "decided": callee.split(".")[0] in _WRAPPERS or "creationflags" in kw,
+            "decided": (callee.split(".")[0] in _WRAPPERS
+                        or "creationflags" in kw
+                        or _expanded_policy(node)),
             "shell": any(k.arg == "shell" for k in node.keywords),
         })
     return found
