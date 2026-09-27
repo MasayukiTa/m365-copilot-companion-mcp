@@ -2703,6 +2703,34 @@ def _claim_one_command(path, display_name=None):
             "name": display_name or os.path.basename(path)}
 
 
+def claim_next_command(state_dir):
+    """Claim at most one pending fleet command, oldest-first.
+
+    Production draining uses this instead of pre-claiming the whole queue.  Therefore a commit
+    failure on the current command cannot strand later work as live ``.claim-<pid>`` files: later
+    commands have not been renamed yet and remain ordinary ``.json`` input.
+    """
+    _recover_stale_command_claims(state_dir)
+
+    # Legacy single-file command remains first for compatibility with already-shipped UI builds.
+    legacy = os.path.join(state_dir, "commands.json")
+    if os.path.isfile(legacy):
+        c = _claim_one_command(legacy, "commands.json")
+        if c is not None:
+            return c
+
+    d = os.path.join(state_dir, COMMANDS_DIR)
+    try:
+        names = sorted(n for n in os.listdir(d) if n.endswith(".json"))
+    except OSError:
+        return None
+    for name in names:
+        c = _claim_one_command(os.path.join(d, name), name)
+        if c is not None:
+            return c
+    return None
+
+
 def claim_commands(state_dir) -> list:
     """Claim every pending fleet command, oldest first, WITHOUT deleting it.
 
@@ -3633,13 +3661,17 @@ def main():
     _pending_command_commits = []      # effects already applied; retry COMMIT only, never apply
 
     def _drain_commands(workers):
-        # CLAIM -> APPLY -> COMMIT. If the post-apply rename itself fails, keep the live claim
-        # in a commit-only retry list; re-running effects would be worse than backpressure.
+        # ONE CLAIM -> APPLY -> COMMIT AT A TIME. Never pre-claim the whole queue: if the current
+        # post-apply commit stalls, every later command must remain an ordinary .json that no live
+        # pid owns. Effects already applied to the current claim still use commit-only retry.
         if _pending_command_commits:
             retry_pending_command_commits(args.state_dir, _pending_command_commits)
             if _pending_command_commits:
                 return
-        for claim in claim_commands(args.state_dir):
+        while True:
+            claim = claim_next_command(args.state_dir)
+            if claim is None:
+                return
             ok, errs = _apply_command(claim["cmd"], workers)
             if ok is True:
                 if not commit_command_claim(args.state_dir, claim, applied=True):
@@ -3651,8 +3683,9 @@ def main():
                 if not commit_command_claim(args.state_dir, claim, applied=False, rejected_errors=errs):
                     _pending_command_commits.append((claim, False, errs))
                     return
-            else:                    # application failed before a durable effect; retry later
+            else:                    # application failed before a durable effect; retry next sweep
                 restore_command_claim(claim)
+                return
 
     def _apply_command(cmd, workers):
         # WHOLE OR NOT AT ALL (SEC-08). Checked before anything below touches a box. Return an

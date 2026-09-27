@@ -105,11 +105,12 @@ def test_an_applied_leftover_is_never_replayed(tmp_path):
 def test_live_drain_uses_claim_apply_commit_not_read_then_delete():
     src = Path(fr.__file__).read_text(encoding="utf-8")
     i = src.index("def _drain_commands(workers):")
-    block = src[i:i + 1800]
-    assert "claim_commands(args.state_dir)" in block
+    block = src[i:i + 2200]
+    assert "claim = claim_next_command(args.state_dir)" in block
     assert "commit_command_claim(" in block
     assert "restore_command_claim(" in block
     assert "for cmd in read_commands(args.state_dir)" not in block
+    assert "for claim in claim_commands(args.state_dir)" not in block
 
 
 def test_applied_tombstone_recovers_missing_ack_instead_of_just_being_deleted(tmp_path):
@@ -233,3 +234,30 @@ def test_legacy_pid_only_claim_remains_conservative(tmp_path, monkeypatch):
     monkeypatch.setattr(fr, "_pid_birth_token", lambda pid: 999999)
     assert fr.claim_commands(str(tmp_path)) == []
     assert os.path.isfile(claimed)
+
+
+def test_production_claims_only_one_command_at_a_time(tmp_path):
+    _write(tmp_path, text="first")
+    _write(tmp_path, text="second")
+    c = fr.claim_next_command(str(tmp_path))
+    assert c is not None
+    assert os.path.isfile(c["claimed"])
+    command_dir = tmp_path / fr.COMMANDS_DIR
+    remaining = sorted(command_dir.glob("*.json"))
+    assert len(remaining) == 1, "later work must remain unclaimed while the first command is in-flight"
+    fr.restore_command_claim(c)
+    assert len(list(command_dir.glob("*.json"))) == 2
+
+
+def test_live_drain_never_preclaims_later_commands_before_current_commit():
+    src = Path(fr.__file__).read_text(encoding="utf-8")
+    i = src.index("def _drain_commands(workers):")
+    block = src[i:i + 2400]
+    assert "claim = claim_next_command(args.state_dir)" in block
+    assert "for claim in claim_commands(args.state_dir)" not in block
+    assert "while True:" in block
+    # A failed apply is restored then the sweep stops, otherwise the same restored file could
+    # be immediately reclaimed in a tight loop.
+    assert "restore_command_claim(claim)" in block
+    restore_i = block.index("restore_command_claim(claim)")
+    assert "return" in block[restore_i:restore_i + 160]
