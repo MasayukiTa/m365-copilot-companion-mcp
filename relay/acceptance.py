@@ -297,7 +297,7 @@ class Check:
                     target, cwd=self.cwd, shell=shell,
                     stdout=self._out, stderr=self._err,
                     stdin=subprocess.DEVNULL,
-                    creationflags=childproc.headless_creationflags(),
+                    **childproc.tree_popen_kwargs(headless=True),
                 )
                 self._deadline = time.time() + self.timeout
             else:
@@ -315,18 +315,28 @@ class Check:
         rc = self._proc.poll()
         if rc is None:
             if time.time() > (self._deadline or 0):
-                try:
-                    self._proc.kill()
-                except Exception:
-                    pass
-                try:
-                    self._proc.wait(timeout=5)
-                except Exception:
-                    pass
+                childproc.kill_tree(self._proc, wait_s=5)
                 self._instant = self._finish(rc=None, timed_out=True)
                 return self._instant
             return None
         self._instant = self._finish(rc=rc)
+        return self._instant
+
+
+    def cancel(self):
+        """Cancel a running process-backed check and its descendants. Idempotent."""
+        if self._instant is not None:
+            return self._instant
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            childproc.kill_tree(proc, wait_s=5)
+        out = self._read(self._out) if self._out else ""
+        err = self._read(self._err) if self._err else ""
+        body = _tail(err or out)
+        detail = "[%s] CANCELLED" % self.describe()
+        if body:
+            detail += "\n" + body
+        self._instant = (False, detail)
         return self._instant
 
     # -- result assembly -----------------------------------------------------
