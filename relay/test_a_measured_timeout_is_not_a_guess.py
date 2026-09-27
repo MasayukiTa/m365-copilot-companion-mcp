@@ -27,6 +27,7 @@ classifier that starts steering before its own numbers are known cannot be evalu
 """
 from __future__ import annotations
 
+import ast
 import os
 import re
 import sys
@@ -55,6 +56,30 @@ def _worker(socket=False, per_turn=240):
     w.per_turn_timeout_s = per_turn
     w.transient = 1
     return w
+
+
+def _waiting_arm_source():
+    """Return the complete ``if self.status == "waiting"`` arm from RelayWorker.poll().
+
+    Character windows were accidentally testing comment length: adding a legitimate guard pushed
+    the salvage/stuck branches past byte 2200 and CI failed although control flow was unchanged.
+    AST ``end_lineno`` makes the contract follow the branch itself.
+    """
+    path = os.path.join(REPO, "relay", "relay_fleet.py")
+    src = open(path, encoding="utf-8").read()
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        try:
+            rendered = ast.unparse(node.test)
+        except Exception:
+            continue
+        if rendered == "self.status == 'waiting'":
+            lines = src.splitlines()
+            segment = "\n".join(lines[node.lineno - 1:node.end_lineno])
+            return "\n".join(line.split("#", 1)[0] for line in segment.splitlines())
+    raise AssertionError('could not find if self.status == "waiting" arm')
 
 
 # ── the record itself ─────────────────────────────────────────────────────────────────────
@@ -133,15 +158,7 @@ def test_the_inferred_classifier_is_untouched():
 def test_the_call_sites_pass_the_treatment_they_took():
     """Read from source: the three branches of the timeout arm each report what they did.
     Comments are stripped first so this cannot match the explanation beside them."""
-    src = open(os.path.join(REPO, "relay", "relay_fleet.py"), encoding="utf-8").read()
-    body = "\n".join(l.split("#", 1)[0] for l in src.splitlines())
-    # ANCHORED ON THE ARM, NOT ON THE COMPARISON INSIDE IT. This indexed the line
-    # `if time.time() - self._t_send > self.per_turn_timeout_s:` -- which is not what
-    # either test is about, and which changed when a socket turn stopped being judged
-    # against the tab-era budget. Both tests then failed for a reason unrelated to the
-    # property they check. `status == "waiting"` is the arm's identity.
-    i = body.index('if self.status == "waiting":')
-    arm = body[i:i + 2200]
+    arm = _waiting_arm_source()
     for treatment in ('"retry"', '"salvaged"', '"stuck"'):
         # NO CLOSING PAREN: the branch now also passes the budget that expired, and
         # what this test is about is that each branch names the treatment it took.
@@ -152,15 +169,7 @@ def test_the_call_sites_pass_the_treatment_they_took():
 def test_the_timeout_arm_still_does_what_it_did():
     """OBSERVE, DO NOT STEER. The record was added to a failure path that already had a
     policy; if this change also altered the policy, neither could be evaluated afterwards."""
-    src = open(os.path.join(REPO, "relay", "relay_fleet.py"), encoding="utf-8").read()
-    body = "\n".join(l.split("#", 1)[0] for l in src.splitlines())
-    # ANCHORED ON THE ARM, NOT ON THE COMPARISON INSIDE IT. This indexed the line
-    # `if time.time() - self._t_send > self.per_turn_timeout_s:` -- which is not what
-    # either test is about, and which changed when a socket turn stopped being judged
-    # against the tab-era budget. Both tests then failed for a reason unrelated to the
-    # property they check. `status == "waiting"` is the arm's identity.
-    i = body.index('if self.status == "waiting":')
-    arm = body[i:i + 2200]
+    arm = _waiting_arm_source()
     assert "self._retry_transient()" in arm
     assert "self._salvage_via_checks()" in arm
     assert '"stuck", "STUCK"' in arm
