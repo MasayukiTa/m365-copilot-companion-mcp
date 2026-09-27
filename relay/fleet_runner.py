@@ -1759,11 +1759,30 @@ _RESUME_SUCCESS_OUTCOMES = ("DONE",)
 
 
 def _goal_key(text):
-    """Stable key for a goal from its NORMALIZED text. Same text -> same key across
-    process restarts (unlike Python's per-process hash()). Used to join the done-map
-    onto the goals ledger when resuming."""
+    """Stable TEXT key used by legacy / jid-less goals.
+
+    Admission-aware goals have a stronger identity (`jid`) and use `_goal_resume_key` instead.
+    Keep this hash unchanged for backwards compatibility with old ledgers/done maps and CLI goals.
+    """
     import hashlib
     return hashlib.sha1((text or "").strip().encode("utf-8")).hexdigest()[:16]
+
+
+def _goal_resume_key(goal):
+    """Durable identity for resume/done-map joins: jid first, text hash only as fallback.
+
+    `jid` names one admitted request. Two users may intentionally submit identical instructions,
+    so text equality cannot collapse two different jids without losing work after a crash. Goals
+    that predate admission identity (plain CLI / legacy records) retain the historical text key.
+    """
+    if isinstance(goal, dict):
+        jid = str(goal.get("jid") or "").strip()
+        if jid:
+            return "jid:" + jid
+        text = goal.get("text") or goal.get("goal") or ""
+    else:
+        text = str(goal or "")
+    return _goal_key(text)
 
 
 def _normalize_goal_for_ledger(goal):
@@ -1775,7 +1794,7 @@ def _normalize_goal_for_ledger(goal):
     if isinstance(goal, dict):
         out = dict(goal)
         out.update({"text": text, "checks": checks, "cwd": cwd,
-                    "priority": priority, "key": _goal_key(text)})
+                    "priority": priority, "key": _goal_resume_key(out)})
         return out
     return {"text": text, "checks": checks, "cwd": cwd,
             "priority": priority, "key": _goal_key(text)}
@@ -1815,8 +1834,9 @@ def _append_goals_ledger(state_dir, goals, started, raise_on_error=False, return
     """Durably append live ``add_goal`` items to the current run ledger.
 
     The original ledger was written only once at launch, which meant every task accepted
-    later through the live command channel vanished from ``--resume`` after a crash.  Keep
-    the existing stable-key semantics: repeated delivery of the same goal text is idempotent.
+    later through the live command channel vanished from ``--resume`` after a crash. Re-delivery
+    of the SAME admitted goal (same jid) is idempotent, while identical text under different jids
+    remains two tasks. Jid-less legacy/CLI goals retain text-key idempotency.
     Returns the number of newly persisted entries. Best-effort, matching the run-start writer.
     """
     if not goals:
@@ -1829,11 +1849,11 @@ def _append_goals_ledger(state_dir, goals, started, raise_on_error=False, return
         seen = set()
         for e in out:
             if isinstance(e, dict):
-                seen.add(e.get("key") or _goal_key(e.get("text", "")))
+                seen.add(_goal_resume_key(e))
         newly_admitted = []
         for goal in goals:
             e = _normalize_goal_for_ledger(goal)
-            key = e.get("key")
+            key = _goal_resume_key(e)
             if key in seen:
                 continue
             out.append(e)
@@ -1871,7 +1891,7 @@ def _read_goals_ledger(state_dir):
 
 
 def _read_done_map(state_dir):
-    """Read last_run_done.json tolerantly: {goal_key: outcome}. Missing/corrupt -> {}."""
+    """Read last_run_done.json tolerantly: {resume_key: outcome}. Missing/corrupt -> {}."""
     path = os.path.join(state_dir, LAST_RUN_DONE)
     try:
         if not os.path.isfile(path):
@@ -1884,7 +1904,7 @@ def _read_done_map(state_dir):
 
 
 def _update_done_map(state_dir, workers):
-    """Merge live successful workers into last_run_done.json: goal_key -> outcome.
+    """Merge live successful workers into last_run_done.json: resume_key -> outcome.
     Existing success keys are monotonic across reconnect chunks. Best-effort: a
     failure logs once to stderr and is swallowed (never crashes the snapshot hook).
 
@@ -1894,7 +1914,10 @@ def _update_done_map(state_dir, workers):
         for w in workers:
             outcome = getattr(w, "outcome", None)
             if outcome in _RESUME_SUCCESS_OUTCOMES:
-                done[_goal_key(getattr(w, "goal", "") or "")] = outcome
+                done[_goal_resume_key({
+                    "text": getattr(w, "goal", "") or "",
+                    "jid": getattr(w, "jid", None),
+                })] = outcome
         _write_atomic(os.path.join(state_dir, LAST_RUN_DONE), done)
     except Exception as e:
         # log ONCE per process (not once per tick) to avoid stderr spam every sweep.
@@ -1920,7 +1943,7 @@ def _merge_final_done_map(state_dir, results):
         except Exception:
             continue
         if outcome in _RESUME_SUCCESS_OUTCOMES and goal:
-            done[_goal_key(goal)] = outcome
+            done[_goal_resume_key({"text": goal, "jid": r.get("jid")})] = outcome
     _write_atomic(os.path.join(state_dir, LAST_RUN_DONE), done)
     return done
 
@@ -1933,11 +1956,25 @@ def _resume_goals(state_dir):
     if not ledger:
         return [], 0, 0
     done_map = _read_done_map(state_dir)
+
+    # Migration from the pre-jid resume ledger. Old entries may contain a jid but still store the
+    # text hash in `key`. That legacy DONE key is safe to reuse only when exactly one ledger row
+    # owns it. If two jids share the same old text key, the old map cannot tell which request
+    # finished; resume both rather than silently discard unfinished work.
+    legacy_key_counts = {}
+    for entry in ledger:
+        stored = entry.get("key") or _goal_key(entry.get("text", ""))
+        legacy_key_counts[stored] = legacy_key_counts.get(stored, 0) + 1
+
     remainder = []
     for entry in ledger:
-        key = entry.get("key") or _goal_key(entry.get("text", ""))
-        if done_map.get(key) in _RESUME_SUCCESS_OUTCOMES:
+        primary = _goal_resume_key(entry)
+        if done_map.get(primary) in _RESUME_SUCCESS_OUTCOMES:
             continue                       # already finished successfully -- skip
+        stored = entry.get("key") or _goal_key(entry.get("text", ""))
+        if (primary != stored and legacy_key_counts.get(stored) == 1
+                and done_map.get(stored) in _RESUME_SUCCESS_OUTCOMES):
+            continue                       # unambiguous pre-jid ledger migration
         remainder.append(_ledger_to_goal(entry))
     return remainder, len(remainder), len(ledger)
 
