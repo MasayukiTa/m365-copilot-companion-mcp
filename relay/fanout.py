@@ -607,7 +607,7 @@ def aggregation_goal(parent_goal, records, *, campaign_id="", parent_task_id="",
     ENDS the parent; merging is a separate piece of work that starts when there is something
     to merge.
     """
-    cid = campaign_id or campaign_id_for(parent_goal)
+    cid = campaign_id or campaign_id_for(parent_goal, parent_task_id=parent_task_id)
     item = {
         "text": aggregation_prompt(parent_goal, records, limit_each=limit_each,
                                    parent_partial=parent_partial),
