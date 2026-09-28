@@ -714,7 +714,8 @@ def test_merge_into_empty_existing():
     entry = {"url": "https://x/conversation/abc", "title": "t", "source": "chat",
               "transcript": "sessions/s1.jsonl", "name": "s1", "ts": 1.0}
     merged = B.merge_fleet_conversations([], [entry])
-    assert merged == [entry]
+    expected = dict(entry); expected["transcripts"] = [entry["transcript"]]
+    assert merged == [expected]
 
 
 def test_merge_dedup_by_url_updates_in_place():
@@ -723,7 +724,8 @@ def test_merge_dedup_by_url_updates_in_place():
     new = {"url": "https://x/conversation/abc", "title": "new", "source": "chat",
            "transcript": "sessions/s1.jsonl", "name": "s1", "ts": 2.0}
     merged = B.merge_fleet_conversations([old], [new])
-    assert merged == [new]
+    expected = dict(new); expected["transcripts"] = [new["transcript"]]
+    assert merged == [expected]
     assert len(merged) == 1
 
 
@@ -734,7 +736,8 @@ def test_merge_preserves_untouched_existing_entries():
                   "transcript": "sessions/s1.jsonl", "name": "s1", "ts": 2.0}
     merged = B.merge_fleet_conversations([fleet_entry], [chat_entry])
     assert fleet_entry in merged
-    assert chat_entry in merged
+    expected_chat = dict(chat_entry); expected_chat["transcripts"] = [chat_entry["transcript"]]
+    assert expected_chat in merged
     assert len(merged) == 2
 
 
@@ -747,7 +750,8 @@ def test_merge_empty_url_entries_dedup_by_source_and_name_not_url():
     new = {"url": "", "title": "new title", "source": "chat", "transcript": "sessions/s1.jsonl",
            "name": "s1", "ts": 2.0}
     merged = B.merge_fleet_conversations([old], [new])
-    assert merged == [new]
+    expected = dict(new); expected["transcripts"] = [new["transcript"]]
+    assert merged == [expected]
     assert len(merged) == 1
 
 
