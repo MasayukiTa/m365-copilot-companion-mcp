@@ -79,3 +79,8 @@ Next: Amend this note into the local checkpoint and push the branch.
 Action: Verified commit state after an apparently contradictory commit response.
 Result: Reflog proves commit 85a95ed was created at 10:26:54 with the collector, tests, and ledger. Remote branch does not yet exist; worktree was clean. The later 'nothing to commit' was only a duplicate commit attempt.
 Next: Amend this note into the local checkpoint and push the branch.
+
+## 2026-09-28 10:32:30 +09:00
+Action: Updated the remote diagnostic branch after local ledger amend.
+Result: force-with-lease succeeded against the verified remote hash; remote now points at local HEAD 7612204.
+Next: Check branch CI/main CI, then continue Edge-loop diagnosis using fresh post-fix evidence.
