@@ -822,6 +822,7 @@ class CockpitWindow : Window
     // that fits costs nothing; this only decides whether the question is ever asked.
     bool _fanout = true;       // -> settings.txt fanout=
     string _approval = "run";  // approval mode run|plan|auto -> settings.txt approval=
+    string _runtimeMode = "fleet"; // next launch: fleet | durable -> settings.txt runtime=
     bool _paused = false;      // local fleet pause/resume toggle state (NEW)
     // FIX B: optimistic "stopping" state set the instant Stop is clicked (dims non-terminal cards +
     // flips the Stop button's tooltip/icon) so the click never feels dead for the ~700ms sweep.
@@ -1772,6 +1773,11 @@ class CockpitWindow : Window
                 {
                     string fx = ln.Substring(7).Trim().ToLower();
                     _fanout = (fx == "on" || fx == "1" || fx == "true");
+                }
+                else if (ln.StartsWith("runtime="))
+                {
+                    string rt = ln.Substring(8).Trim().ToLower();
+                    if (rt == "fleet" || rt == "durable") _runtimeMode = rt;
                 }
             }
             _settingsMtime = File.GetLastWriteTimeUtc(SettingsFile).Ticks;
@@ -5574,6 +5580,20 @@ class CockpitWindow : Window
                 handled = true;
             }
         }
+        else if (g0.StartsWith("/runtime ", StringComparison.OrdinalIgnoreCase))
+        {
+            string v = g0.Substring(9).Trim().ToLower();
+            if (v == "fleet" || v == "durable")
+            {
+                _runtimeMode = v;
+                SaveKey("runtime", _runtimeMode);
+                if (_startNote != null)
+                    _startNote.Text = _lang == 0
+                        ? (_runtimeMode == "durable" ? "次のタスクは長時間実行モードで開始します。" : "次のタスクは従来Fleetで開始します。")
+                        : (_runtimeMode == "durable" ? "Next task will use the durable runtime." : "Next task will use classic Fleet.");
+                handled = true;
+            }
+        }
         else if (g0.StartsWith("/fanout", StringComparison.OrdinalIgnoreCase))
         {
             string v = g0.Length > 7 ? g0.Substring(7).Trim().ToLower() : "";
@@ -5627,6 +5647,34 @@ class CockpitWindow : Window
             // Slash settings are handled by the shared HandleSlashSetting(), which the
             // send button also calls before deciding whether to start or add to a live run.
             if (HandleSlashSetting()) return;
+
+            if (_runtimeMode == "durable")
+            {
+                if (goals.Count != 1)
+                {
+                    _startNote.Text = _lang == 0 ? "長時間実行モードは現在1タスクずつ開始します。1件にまとめてください。"
+                                                  : "Durable runtime currently starts one task at a time.";
+                    return;
+                }
+                if (_approval != "run")
+                {
+                    _startNote.Text = _lang == 0 ? "長時間実行モードのPhase 1は /approval run が必要です。"
+                                                  : "Durable Phase 1 requires /approval run.";
+                    return;
+                }
+                if (!DurableRuntimeEnabled())
+                {
+                    _startNote.Text = _lang == 0 ? "長時間実行は無効です。MCP_EXECUTION_PROFILES=1 を設定してMCPサーバを再起動してください。"
+                                                  : "Durable runtime is disabled. Set MCP_EXECUTION_PROFILES=1 and restart the MCP server.";
+                    return;
+                }
+                if (!SpawnDurableTask(goals[0])) return;
+                _goalInput.Text = "";
+                _startNote.Text = _lang == 0 ? "長時間タスクを開始しました。現在の工程と進捗をカードに表示します。"
+                                              : "Durable task started. Current step and progress will appear on the card.";
+                _lastSig = "";
+                return;
+            }
 
             bool planMode = _approval == "plan" || _approval == "auto";
             SpawnFleet(goals, "goals_input.txt", planMode);
@@ -5856,6 +5904,64 @@ class CockpitWindow : Window
             System.Diagnostics.Process.Start(psi);
         }
         catch (Exception) { }
+    }
+
+    bool DurableRuntimeEnabled()
+    {
+        string raw = Environment.GetEnvironmentVariable("MCP_EXECUTION_PROFILES") ?? "";
+        try
+        {
+            string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+            string envPath = Path.Combine(repo, ".env");
+            if (string.IsNullOrWhiteSpace(raw) && File.Exists(envPath))
+            {
+                foreach (string line in File.ReadAllLines(envPath))
+                {
+                    string trimmed = (line ?? "").Trim();
+                    if (trimmed.StartsWith("MCP_EXECUTION_PROFILES=", StringComparison.OrdinalIgnoreCase))
+                    {
+                        raw = trimmed.Substring(trimmed.IndexOf('=') + 1).Trim().Trim('"', (char)39);
+                        break;
+                    }
+                }
+            }
+        }
+        catch (Exception) { }
+        raw = (raw ?? "").Trim().ToLowerInvariant();
+        return raw == "1" || raw == "true" || raw == "yes" || raw == "on";
+    }
+
+    bool SpawnDurableTask(string goal)
+    {
+        try
+        {
+            string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+            string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
+            if (!File.Exists(py)) py = "python";
+            string stateDir = Path.GetDirectoryName(_statusPath);
+            string token = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString() + "_"
+                         + Guid.NewGuid().ToString("N").Substring(0, 8);
+            string goalFile = Path.Combine(stateDir, "durable_goal_" + token + ".txt");
+            File.WriteAllText(goalFile, goal ?? "", new UTF8Encoding(false));
+
+            var psi = new System.Diagnostics.ProcessStartInfo();
+            psi.FileName = py;
+            psi.Arguments = "-m relay.local_loop_controller --goal-file \"" + goalFile
+                          + "\" --state-dir \"" + stateDir + "\"";
+            psi.WorkingDirectory = repo;
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
+            System.Diagnostics.Process.Start(psi);
+            NoteSubmitted(new List<string> { goal });
+            return true;
+        }
+        catch (Exception ex)
+        {
+            if (_startNote != null)
+                _startNote.Text = (_lang == 0 ? "長時間実行の起動に失敗: " : "Durable start failed: ") + ex.Message;
+            return false;
+        }
     }
 
     bool SpawnFleet(List<string> goals, string goalsFileName, bool planMode = false)
@@ -6108,6 +6214,7 @@ class CockpitWindow : Window
         new[]{"/effort","推論モードを設定: min|max|ultra|auto"},
         new[]{"/approval","実行方式を設定: run|plan|auto（互換コマンド）"},
         new[]{"/fanout","分割実行: on|off（長い依頼を分けて並列実行し統合）"},
+        new[]{"/runtime","実行基盤: durable|fleet（長時間実行 / 従来Fleet）"},
     };
     static readonly string[][] _goalCommandsEn = {
         new[]{"/help","Show the command list"},
@@ -6121,6 +6228,7 @@ class CockpitWindow : Window
         new[]{"/effort","set reasoning mode: min|max|ultra|auto"},
         new[]{"/approval","set approval mode: run|plan|auto"},
         new[]{"/fanout","split a long goal, run the parts in parallel, merge: on|off"},
+        new[]{"/runtime","execution runtime: durable|fleet"},
     };
     // Localized at access time so the slash palette (and the template it inserts) follows the UI language.
     string[][] _goalCommands { get { return _lang == 0 ? _goalCommandsJa : _goalCommandsEn; } }
@@ -6195,7 +6303,7 @@ class CockpitWindow : Window
 
             // /effort and /approval: if the current line has an argument, apply it immediately
             // and clear the line. If no arg, insert the template (prompts for value) instead.
-            if (cmdName == "/effort" || cmdName == "/approval")
+            if (cmdName == "/effort" || cmdName == "/approval" || cmdName == "/runtime")
             {
                 int ls2; string line2; CurrentGoalLine(out ls2, out line2);
                 // line2 looks like "/effort" or "/effort max"
@@ -6215,7 +6323,7 @@ class CockpitWindow : Window
                             if (_startNote != null) _startNote.Text = (_lang == 0 ? "推論モード→ " : "Effort set to ") + _effort;
                         }
                     }
-                    else  // /approval
+                    else if (cmdName == "/approval")
                     {
                         if (argVal == "run" || argVal == "plan" || argVal == "auto")
                         {
@@ -6224,6 +6332,19 @@ class CockpitWindow : Window
                             PaintApproval();
                             applied = true;
                             if (_startNote != null) _startNote.Text = (_lang == 0 ? "実行方式→ " : "Run mode set to ") + _approval;
+                        }
+                    }
+                    else  // /runtime
+                    {
+                        if (argVal == "fleet" || argVal == "durable")
+                        {
+                            _runtimeMode = argVal;
+                            SaveKey("runtime", _runtimeMode);
+                            applied = true;
+                            if (_startNote != null)
+                                _startNote.Text = _lang == 0
+                                    ? (_runtimeMode == "durable" ? "次のタスクは長時間実行モードで開始します。" : "次のタスクは従来Fleetで開始します。")
+                                    : (_runtimeMode == "durable" ? "Next task will use the durable runtime." : "Next task will use classic Fleet.");
                         }
                     }
                     if (applied)
@@ -6279,6 +6400,7 @@ class CockpitWindow : Window
                 + "/doc <target> - write README / docs\n"
                 + "/review <target> - review and list issues\n"
                 + "/research <question> - deep research\n"
+                + "/runtime durable|fleet - choose long-running or classic runtime\n"
                 + "\nReasoning (top bar)\n"
                 + "min - fastest, least reasoning\n"
                 + "max - deepest reasoning\n"
@@ -10581,6 +10703,19 @@ class CockpitWindow : Window
     static double Dbl(Dictionary<string, object> d, string k)
     { try { if (d.ContainsKey(k) && d[k] != null) return Convert.ToDouble(d[k]); } catch (Exception) { } return 0; }
 
+    static Dictionary<string, object> Obj(Dictionary<string, object> d, string k)
+    {
+        if (d == null || !d.ContainsKey(k) || d[k] == null) return null;
+        return d[k] as Dictionary<string, object>;
+    }
+
+    static int ArrCount(Dictionary<string, object> d, string k)
+    {
+        if (d == null || !d.ContainsKey(k) || d[k] == null) return 0;
+        var a = d[k] as object[];
+        return a != null ? a.Length : 0;
+    }
+
     string Sig(Dictionary<string, object> root)
     {
         var sb = new StringBuilder();
@@ -10599,6 +10734,13 @@ class CockpitWindow : Window
                 // changes need to force a re-render. Collapsed cards stay put while their
                 // worker streams -- that's what keeps a 164-task fleet from thrashing.
                 if (_expanded.Contains(nm)) sb.Append('#').Append(StableShortHash(S(w, "last")));
+                var ex = Obj(w, "execution");
+                if (ex != null)
+                    sb.Append("|x").Append(S(ex, "state"))
+                      .Append(':').Append(S(ex, "current_step_index"))
+                      .Append(':').Append(S(ex, "completed_count"))
+                      .Append(':').Append(StableShortHash(S(ex, "last_progress")))
+                      .Append(':').Append(S(ex, "last_progress_at"));
                 sb.Append(';');
             }
         return sb.ToString();
@@ -11487,6 +11629,16 @@ class CockpitWindow : Window
                   .Append(':').Append(StableShortHash(S(w, "conv_title")));
                 // TASK 3 (Bucket C): track next_step + self_confidence so the collapsed row re-renders.
                 sb.Append('|').Append(S(w, "next_step").Length).Append(':').Append(S(w, "self_confidence"));
+                var ex = Obj(w, "execution");
+                if (ex != null)
+                    sb.Append("|exec:").Append(S(ex, "state"))
+                      .Append(':').Append(S(ex, "current_step_index"))
+                      .Append(':').Append(S(ex, "total_steps"))
+                      .Append(':').Append(S(ex, "completed_count"))
+                      .Append(':').Append(ArrCount(ex, "artifacts"))
+                      .Append(':').Append(StableShortHash(S(ex, "current_step")))
+                      .Append(':').Append(StableShortHash(S(ex, "last_progress")))
+                      .Append(':').Append(S(ex, "last_progress_at"));
                 // FIX B: _stopping dims non-terminal cards -- track it so a Stop click (or its
                 // resolution) re-templates this card instead of reusing the old realized element.
                 sb.Append('|').Append(_stopping ? "1" : "0");
@@ -12915,6 +13067,27 @@ class CockpitWindow : Window
             {
                 // ── Normal collapsed ledger row: line 2 + line 3 ────────────────────────────
                 // Line 2: latest human-readable progress. Precedence: display_result > last > fallback.
+                var execution = Obj(w, "execution");
+                if (execution != null)
+                {
+                    string currentStep = S(execution, "current_step");
+                    int currentIndex = I(execution, "current_step_index");
+                    int totalSteps = I(execution, "total_steps");
+                    if (!string.IsNullOrEmpty(currentStep))
+                    {
+                        string stepPrefix = totalSteps > 0
+                            ? ("▶ " + currentIndex + "/" + totalSteps + "  ")
+                            : ("▶ " + currentIndex + "  ");
+                        col.Children.Add(new TextBlock
+                        {
+                            Text = stepPrefix + OneLine(currentStep),
+                            Foreground = Fg, FontSize = 12.5, FontWeight = FontWeights.SemiBold,
+                            TextTrimming = TextTrimming.CharacterEllipsis, TextWrapping = TextWrapping.NoWrap,
+                            Margin = new Thickness(24, 4, 0, 0)
+                        });
+                    }
+                }
+
                 string collapsedDisplayResult = S(w, "display_result");
                 string resultText;
                 if (!string.IsNullOrEmpty(collapsedDisplayResult))
@@ -12978,6 +13151,23 @@ class CockpitWindow : Window
                 if (turn > 0) meta.Append(" · ").Append(T("turn")).Append(' ').Append(turn);
                 if (reviews > 0) meta.Append(" · ").Append(_lang == 0 ? ("確認 " + reviews + " 回") : ("reviewed " + reviews));
                 if (verifiedOk) meta.Append(" · ").Append(_lang == 0 ? "検証OK" : "verified");
+                if (execution != null)
+                {
+                    int completed = I(execution, "completed_count");
+                    int totalSteps = I(execution, "total_steps");
+                    int artifactCount = ArrCount(execution, "artifacts");
+                    meta.Append(" · ✓ ").Append(completed);
+                    if (totalSteps > 0) meta.Append('/').Append(totalSteps);
+                    if (artifactCount > 0)
+                        meta.Append(" · ").Append(artifactCount).Append(_lang == 0 ? " 成果物" : " artifacts");
+                    double progressTs = Dbl(execution, "last_progress_at");
+                    if (progressTs > 0)
+                    {
+                        double progressAge = Math.Max(0, NowUnix() - progressTs);
+                        meta.Append(" · ").Append(_lang == 0 ? "進捗 " : "progress ")
+                            .Append(Fmt(progressAge)).Append(_lang == 0 ? " 前" : " ago");
+                    }
+                }
                 var ml = new TextBlock
                 {
                     Text = meta.ToString(), Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 12,
@@ -13338,10 +13528,94 @@ class CockpitWindow : Window
         return t;
     }
 
+    UIElement ExecutionOverview(Dictionary<string, object> w)
+    {
+        var execution = Obj(w, "execution");
+        if (execution == null) return null;
+
+        var sp = new StackPanel();
+        string state = S(execution, "state");
+        string current = S(execution, "current_step");
+        int currentIndex = I(execution, "current_step_index");
+        int total = I(execution, "total_steps");
+        int completed = I(execution, "completed_count");
+        string lastProgress = S(execution, "last_progress");
+        string next = S(execution, "next_step");
+        string waiting = S(execution, "waiting_reason");
+
+        string head = (total > 0 ? (currentIndex + "/" + total) : currentIndex.ToString());
+        if (!string.IsNullOrEmpty(state)) head += " · " + state;
+        if (!string.IsNullOrEmpty(current)) head += " · " + current;
+        sp.Children.Add(new TextBlock { Text = "▶ " + head, Foreground = Fg, FontSize = 12.5,
+            FontWeight = FontWeights.SemiBold, TextWrapping = TextWrapping.Wrap });
+
+        if (!string.IsNullOrEmpty(lastProgress))
+            sp.Children.Add(new TextBlock { Text = (_lang == 0 ? "進捗: " : "Progress: ") + lastProgress,
+                Foreground = Muted, FontSize = 12.5, Margin = new Thickness(0, 3, 0, 0), TextWrapping = TextWrapping.Wrap });
+        if (!string.IsNullOrEmpty(waiting))
+            sp.Children.Add(new TextBlock { Text = (_lang == 0 ? "待機理由: " : "Waiting: ") + waiting,
+                Foreground = Muted, FontSize = 12.5, Margin = new Thickness(0, 3, 0, 0), TextWrapping = TextWrapping.Wrap });
+
+        object doneRaw;
+        if (execution.TryGetValue("completed_steps", out doneRaw) && doneRaw is object[])
+        {
+            var done = (object[])doneRaw;
+            if (done.Length > 0)
+            {
+                sp.Children.Add(new TextBlock { Text = (_lang == 0 ? "完了 " : "Completed ") + completed,
+                    Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 11.5, Margin = new Thickness(0, 5, 0, 1) });
+                foreach (object obj in done)
+                {
+                    var step = obj as Dictionary<string, object>;
+                    if (step == null) continue;
+                    string instruction = S(step, "instruction");
+                    string summary = S(step, "summary");
+                    string line = "✓ " + instruction;
+                    if (!string.IsNullOrEmpty(summary) && summary != instruction) line += " — " + summary;
+                    sp.Children.Add(new TextBlock { Text = line, Foreground = Muted, FontSize = 12,
+                        Margin = new Thickness(8, 1, 0, 1), TextWrapping = TextWrapping.Wrap });
+                }
+            }
+        }
+
+        if (!string.IsNullOrEmpty(next))
+            sp.Children.Add(new TextBlock { Text = (_lang == 0 ? "次: " : "Next: ") + next,
+                Foreground = Muted, FontSize = 12.5, Margin = new Thickness(0, 5, 0, 0), TextWrapping = TextWrapping.Wrap });
+
+        object artsRaw;
+        if (execution.TryGetValue("artifacts", out artsRaw) && artsRaw is object[])
+        {
+            var arts = (object[])artsRaw;
+            if (arts.Length > 0)
+            {
+                sp.Children.Add(new TextBlock { Text = _lang == 0 ? "成果物" : "Artifacts",
+                    Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 11.5, Margin = new Thickness(0, 5, 0, 1) });
+                foreach (object obj in arts)
+                {
+                    var artifact = obj as Dictionary<string, object>;
+                    if (artifact == null) continue;
+                    string label = S(artifact, "path");
+                    if (string.IsNullOrEmpty(label)) label = S(artifact, "name");
+                    if (string.IsNullOrEmpty(label)) label = S(artifact, "uri");
+                    if (string.IsNullOrEmpty(label)) label = _lang == 0 ? "成果物" : "artifact";
+                    sp.Children.Add(new TextBlock { Text = "• " + label, Foreground = Muted, FontSize = 12,
+                        Margin = new Thickness(8, 1, 0, 1), TextWrapping = TextWrapping.Wrap });
+                }
+            }
+        }
+        return sp;
+    }
+
     UIElement TabOverview(string goal, string last, string outcome, bool terminal, int reviews,
                           bool verifiedOk, string tpath, Dictionary<string, object> w)
     {
         var sp = new StackPanel();
+        UIElement execView = ExecutionOverview(w);
+        if (execView != null)
+        {
+            sp.Children.Add(SectLabel(_lang == 0 ? "実行" : "Execution"));
+            sp.Children.Add(execView);
+        }
         sp.Children.Add(SectLabel(_lang == 0 ? "結果" : "Result"));
         // Precedence: display_result (cleaned final answer from runner) > last > OutcomeLabel fallback.
         string displayResult = (w != null) ? S(w, "display_result") : "";

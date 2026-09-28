@@ -211,6 +211,7 @@ jobs:
             ui/test_history_is_not_destroyed_by_a_failed_load.py \
             ui/test_a_retry_budget_bounds_the_repair_it_pays_for.py \
             ui/test_every_lane_in_flight_is_on_screen.py \
+            ui/test_durable_execution_state_visible.py \
             ui/test_a_selection_survives_a_refresh_that_changed_nothing.py \
             ui/test_a_follow_up_is_not_a_wall_of_text.py \
             ui/test_a_card_is_not_a_reading_surface.py \

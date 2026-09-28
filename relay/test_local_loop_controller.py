@@ -6,6 +6,10 @@ from relay.local_loop_controller import (
     _AUTH_ACTION_SELECTOR,
     _CREDENTIAL_INPUT_SELECTOR,
     _close_driver_page,
+    _job_from_goal,
+    _new_companion_job_id,
+    _project_job_snapshot,
+    _read_goal_file,
     _write_atomic,
     probe_browser_interaction,
 )
@@ -441,3 +445,60 @@ def test_close_driver_page_closes_only_owned_page():
     _close_driver_page(driver)
     assert page.closed is True
     _close_driver_page(driver)  # idempotent
+
+
+def test_plain_goal_builds_a_durable_companion_job(tmp_path):
+    job = _job_from_goal(
+        "Research the supplier change and prepare the meeting pack",
+        job_id="companion_test_1", cwd=str(tmp_path), max_turns=37, read_only=True,
+    )
+    assert job["job_id"] == "companion_test_1"
+    assert job["execution_profile"] == "LOCAL_LOOP"
+    assert job["requires_local_tool"] is True
+    assert job["task"]["type"] == "companion_task"
+    assert job["task"]["instruction"] == "Research the supplier change and prepare the meeting pack"
+    assert job["constraints"]["max_turns"] == 37
+    assert job["constraints"]["read_only"] is True
+    assert job["constraints"]["allowed_base"] == str(tmp_path)
+    assert job["acceptance_checks"] == []
+
+
+def test_plain_goal_without_cwd_does_not_invent_a_workspace():
+    job = _job_from_goal("Summarize this quarter", job_id="companion_test_2")
+    assert "allowed_base" not in job["constraints"]
+
+
+def test_companion_job_id_is_safe_and_goal_scoped():
+    a = _new_companion_job_id("same goal", now=1234567890.0, nonce="abcd")
+    b = _new_companion_job_id("different goal", now=1234567890.0, nonce="abcd")
+    assert a != b
+    assert a.startswith("companion_20090213_233130_")
+    assert len(a) < 128
+    assert all(ch.isalnum() or ch in "_.-" for ch in a)
+
+
+def test_plain_goal_rejects_empty_instruction():
+    import pytest
+    with pytest.raises(ValueError, match="goal"):
+        _job_from_goal("  ", job_id="companion_test_3")
+
+
+def test_goal_file_preserves_multiline_task_text(tmp_path):
+    path = tmp_path / "goal.txt"
+    path.write_text("Make the pack\nUse the latest figures\nKeep citations", encoding="utf-8")
+    assert _read_goal_file(path) == "Make the pack\nUse the latest figures\nKeep citations"
+
+
+def test_job_projection_is_scoped_to_the_controller_job(tmp_path):
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    store.create_job(_job("job_1"), now=1)
+    store.create_job(_job("job_2"), now=2)
+    status_path = tmp_path / "status.json"
+
+    _project_job_snapshot(store, "job_2", status_path)
+
+    projected = json.loads(status_path.read_text(encoding="utf-8"))
+    assert projected["total"] == 1
+    assert [w["name"] for w in projected["workers"]] == ["job_2"]
+    assert projected["running"] is True
+    assert projected["execution_mode"] == "LOCAL_LOOP"
