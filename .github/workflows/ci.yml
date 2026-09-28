@@ -246,6 +246,7 @@ jobs:
             scripts/test_supervisor_reresolves_python.py \
             scripts/test_supervisor_port_owner.py \
             scripts/test_supervisor_fleet_resume_guard.py \
+            scripts/test_supervisor_local_loop_resume.py \
             scripts/test_a_submitted_job_is_picked_up_at_once.py \
             scripts/test_a_failing_entry_point_says_why.py \
             scripts/test_dialogs_use_japanese_font.py \
@@ -449,6 +450,7 @@ jobs:
             relay/test_fleet_resume.py \
             relay/test_local_job_store.py \
             relay/test_local_loop_controller.py \
+            relay/test_local_loop_autoresume.py \
             relay/test_a_drain_deletes_only_what_it_consumed.py \
             relay/test_network_recovery.py \
             relay/test_provenance.py \

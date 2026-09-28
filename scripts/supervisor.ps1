@@ -1247,11 +1247,11 @@ function Get-TunnelHostExitDetail {
 $FleetDir = Join-Path $Root ".fleet"
 $FleetMarkerPath = Join-Path $Root ".fleet\fleet_run_active.json"
 $ReviewMarkerPath = Join-Path $Root ".fleet\review_run_active.json"
+$LocalLoopMarkerDir = Join-Path $Root ".fleet\local_loop_active"
 $script:LastReviewResumeKey = ""
 $script:LastReviewResumeAttempt = [datetime]::MinValue
 
-# TRACKS AUTO-RESUME RUNNERS THIS SUPERVISOR ITSELF LAUNCHED (relay.fleet_runner /
-# bench.review_run below), so a LATER tick can read back their exit code instead of the
+# TRACKS AUTO-RESUME RUNNERS THIS SUPERVISOR ITSELF LAUNCHED (relay.fleet_runner / bench.review_run / relay.local_loop_controller below), so a LATER tick can read back their exit code instead of the
 # process vanishing the moment Start-Process returns -- the exact defect Get-ServerExitRecord
 # exists to fix for the MCP server, here applied one level up.
 #
@@ -1537,6 +1537,113 @@ function Invoke-ReviewAutoResume {
     }
 }
 
+
+function Test-LocalLoopAutoResumeEnabled {
+    $v = $env:MCP_LOCAL_LOOP_AUTORESUME
+    if ([string]::IsNullOrWhiteSpace($v)) { return $true }
+    return -not ($v -in @("0", "false", "False", "FALSE", "no", "No", "NO", "off", "Off", "OFF"))
+}
+
+function Test-LocalLoopMarkerProcessAlive {
+    param($Marker)
+    $procId = 0
+    $markerStarted = 0.0
+    try {
+        $procId = [int]$Marker.pid
+        $markerStarted = [double]$Marker.started
+    } catch { return $false }
+    if ($procId -le 0) { return $false }
+    $process = Get-Process -Id $procId -ErrorAction SilentlyContinue
+    if ($null -eq $process) { return $false }
+    try {
+        $processStarted = [DateTimeOffset]::new($process.StartTime).ToUnixTimeSeconds()
+        # Bind the marker to this process birth, not merely to a live/reused PID.  A different
+        # python that started long before OR after the marker must not suppress recovery forever.
+        if ($markerStarted -gt 0 -and [Math]::Abs($processStarted - $markerStarted) -gt 60) { return $false }
+        if ($process.ProcessName -notlike "python*") { return $false }
+    } catch { return $false }
+    return $true
+}
+
+function Write-LocalLoopMarkerAtomic {
+    param([string]$Path, $Marker)
+    try {
+        $dir = Split-Path -Parent $Path
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $tmp = $Path + ".tmp-" + $PID + "-" + [Guid]::NewGuid().ToString("N")
+        $json = $Marker | ConvertTo-Json -Depth 8 -Compress
+        [IO.File]::WriteAllText($tmp, $json, (New-Object Text.UTF8Encoding($false)))
+        Move-Item -Path $tmp -Destination $Path -Force
+        return $true
+    } catch {
+        try { if ($tmp -and (Test-Path $tmp)) { Remove-Item $tmp -Force } } catch { }
+        return $false
+    }
+}
+
+function Get-LocalLoopRetryDelaySeconds {
+    param([int]$RestartCount)
+    # Back off crash loops without making a previously-stable long job slow to recover.  The
+    # child preserves retry_after; if it survives past the deadline, a later crash resumes
+    # immediately because that deadline is already in the past.
+    $n = [Math]::Max(1, $RestartCount)
+    $exp = [Math]::Min(10, $n - 1)
+    $delay = [int](30 * [Math]::Pow(2, $exp))
+    return [int][Math]::Min(900, $delay)
+}
+
+
+function Invoke-LocalLoopAutoResume {
+    # Generic Cockpit LOCAL_LOOP jobs write one marker per job. Check EVERY cycle: the point of
+    # this runtime is multi-hour work, so waiting for a reboot to recover a dead coordinator is
+    # not acceptable. The controller itself also holds a per-job kernel lock; this supervisor is
+    # a relauncher, not the final exclusion layer.
+    if (-not (Test-LocalLoopAutoResumeEnabled)) { return $false }
+    if (-not (Test-Path $LocalLoopMarkerDir)) { return $false }
+    $did = $false
+    foreach ($file in @(Get-ChildItem -Path $LocalLoopMarkerDir -Filter "*.json" -File -ErrorAction SilentlyContinue)) {
+        $marker = $null
+        try { $marker = (Get-Content -Path $file.FullName -Raw -ErrorAction Stop) | ConvertFrom-Json -ErrorAction Stop }
+        catch { continue }
+        if ($null -eq $marker) { continue }
+        if (Test-LocalLoopMarkerProcessAlive $marker) { continue }
+        $nowEpoch = [DateTimeOffset]::Now.ToUnixTimeSeconds()
+        try { if ([double]$marker.retry_after -gt $nowEpoch) { continue } } catch { }
+        $resumeArgs = @($marker.resume_argv)
+        if ($resumeArgs.Count -eq 0) {
+            Write-Log "LOCAL_LOOP auto-resume skipped for $($file.Name): marker has no resume_argv"
+            continue
+        }
+        Update-PythonInterpreter "the LOCAL_LOOP auto-resume"
+        $jobId = [string]$marker.job_id
+        $shown = $resumeArgs -join " "
+        try { $restart = [int]$marker.restart_count + 1 } catch { $restart = 1 }
+        $retryDelay = Get-LocalLoopRetryDelaySeconds -RestartCount $restart
+        try {
+            $launchAt = Get-Date
+            $proc = Start-Process -FilePath $Py -ArgumentList (@("-m", "relay.local_loop_controller") + $resumeArgs) `
+                -WorkingDirectory $Root -WindowStyle Hidden -PassThru
+            # Close the spawn/next-tick window immediately. The healthy child preserves this deadline
+            # when it rewrites the marker with its own pid after acquiring the per-job kernel lock.
+            $marker | Add-Member -NotePropertyName pid -NotePropertyValue $proc.Id -Force
+            $marker | Add-Member -NotePropertyName started -NotePropertyValue ([DateTimeOffset]::new($launchAt).ToUnixTimeSeconds()) -Force
+            $marker | Add-Member -NotePropertyName restart_count -NotePropertyValue $restart -Force
+            $marker | Add-Member -NotePropertyName retry_after -NotePropertyValue ($nowEpoch + $retryDelay) -Force
+            [void](Write-LocalLoopMarkerAtomic -Path $file.FullName -Marker $marker)
+            Register-AutoResumeRunner -Proc $proc -LaunchTime $launchAt -Kind ("local-loop:" + $jobId) `
+                -CommandLine ('"' + $Py + '" -m relay.local_loop_controller ' + $shown)
+            Write-Log "LOCAL_LOOP job '$jobId' INTERRUPTED -> relaunched pid $($proc.Id) from $($file.Name)"
+            $did = $true
+        } catch {
+            $marker | Add-Member -NotePropertyName restart_count -NotePropertyValue $restart -Force
+            $marker | Add-Member -NotePropertyName retry_after -NotePropertyValue ($nowEpoch + $retryDelay) -Force
+            [void](Write-LocalLoopMarkerAtomic -Path $file.FullName -Marker $marker)
+            Write-Log "LOCAL_LOOP auto-resume FAILED for '$jobId' (retry in ${retryDelay}s): $($_.Exception.Message)"
+        }
+    }
+    return $did
+}
+
 # -- Queue delivery: the reaper + router pass, and the wait between ticks -----------------------
 # The two steps the tick has always run back to back, now callable from two places: the full
 # tick (unchanged position and order) and the express pass inside Wait-ForNextTick below.
@@ -1751,6 +1858,7 @@ Write-Log "supervisor up (tunnel=$TunnelName port=$Port interval=${IntervalSecon
 # Checked once, here, before the forever health-check loop starts.
 Invoke-FleetAutoResume -DryRun:$FleetResumeDryRun | Out-Null
 Invoke-ReviewAutoResume | Out-Null
+Invoke-LocalLoopAutoResume | Out-Null
 
 # THE DEBOUNCE IS FOR A SERVER THAT MIGHT COME BACK, NOT FOR ONE THAT WAS NEVER STARTED.
 # Starting at zero meant the FIRST launch waited out four consecutive failures. MEASURED on
@@ -1926,8 +2034,9 @@ while ($true) {
     foreach ($n in $shownToPass) { [void]$script:ExpressSeen.Add($n) }
 
     Invoke-ReviewAutoResume | Out-Null
+Invoke-LocalLoopAutoResume | Out-Null
 
-    # Report any tracked fleet/review auto-resume runner that has exited since the last tick.
+    # Report any tracked fleet/review/LOCAL_LOOP auto-resume runner that has exited since the last tick.
     # Every tick, not just after a relaunch, because the runner that needs reporting may still
     # be alive on the tick that launched it and only exit (quickly, if it never got past
     # argparse) on the very next one.
