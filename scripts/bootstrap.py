@@ -1207,7 +1207,7 @@ _FALLBACK_DEFAULTS = (
 
 #: Template keys that are SECRETS: never copied from the template (its values are
 #: placeholders); the secret branch below mints them instead.
-_SECRET_TEMPLATE_KEYS = ("MCP_API_KEY", "MCP_UNLOCK_PASSWORD")
+_SECRET_TEMPLATE_KEYS = ("MCP_API_KEY", "MCP_API_KEY_PROTECTED", "MCP_UNLOCK_PASSWORD", "MCP_UNLOCK_PASSWORD_PROTECTED")
 
 
 def missing_template_lines(current: str, example_text: str | None) -> tuple:
@@ -1301,6 +1301,55 @@ def step_gen_env() -> None:
         # and this file lacks. Append-only; never changes a value the user has.
         # Read with its own line endings kept, so the append below writes in the same ones.
         current = env_file.read_text(env_path)
+        # SECURITY MIGRATION: normalize BOTH legacy plaintext auth aliases in memory before
+        # the first persistence call.  Migrating API -> writing -> migrating unlock used to
+        # transiently re-save the still-plaintext unlock password.  The final env sink now
+        # fails closed on either legacy alias, so the conversion is deliberately one batch.
+        _lines = current.splitlines()
+        _had_trailing_nl = current.endswith(("\n", "\r"))
+        _nl = env_file.newline_of(current)
+        _has_protected_api = any(
+            line.lstrip().startswith("MCP_API_KEY_PROTECTED=") for line in _lines)
+        _has_protected_unlock = any(
+            line.lstrip().startswith(UNLOCK_PASSWORD_PROTECTED_VAR + "=") for line in _lines)
+        _legacy_api = None
+        _legacy_unlock = None
+        _kept = []
+        for _line in _lines:
+            _stripped = _line.lstrip()
+            if _stripped.startswith("MCP_API_KEY="):
+                if _legacy_api is None:
+                    _legacy_api = _line.split("=", 1)[1].strip()
+                continue
+            if _stripped.startswith("MCP_UNLOCK_PASSWORD="):
+                if _legacy_unlock is None:
+                    _legacy_unlock = _line.split("=", 1)[1].strip()
+                continue
+            _kept.append(_line)
+
+        def _legacy_env_value(raw):
+            if raw is None:
+                return None
+            if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ("'", '"'):
+                return raw[1:-1]
+            return raw
+
+        _migrated_keys = []
+        if _legacy_api is not None:
+            if not _has_protected_api:
+                _kept.append("MCP_API_KEY_PROTECTED="
+                             + protect_secret(_legacy_env_value(_legacy_api)))
+            _migrated_keys.append("MCP_API_KEY")
+        if _legacy_unlock is not None:
+            if not _has_protected_unlock:
+                _kept.append(UNLOCK_PASSWORD_PROTECTED_VAR + "="
+                             + protect_secret(_legacy_env_value(_legacy_unlock)))
+            _migrated_keys.append("MCP_UNLOCK_PASSWORD")
+        if _migrated_keys:
+            current = _nl.join(_kept) + (_nl if _had_trailing_nl else "")
+            env_file.atomic_write_text(env_path, current)
+            log("    OK: migrated legacy clear-text auth secret(s) to DPAPI-protected storage: "
+                + ", ".join(_migrated_keys))
         example_text = example.read_text(encoding="utf-8-sig") if example.exists() else None
         missing, left_commented = missing_template_lines(current, example_text)
         if left_commented:
@@ -1317,7 +1366,7 @@ def step_gen_env() -> None:
         # if the key is already present (even blank/placeholder -- that is the user's value to
         # keep or fix), it is NOT touched. We never overwrite an existing secret here.
         secret_lines = []
-        have_api = any(line.lstrip().startswith("MCP_API_KEY=") for line in current.splitlines())
+        have_api = any((line.lstrip().startswith("MCP_API_KEY=") or line.lstrip().startswith("MCP_API_KEY_PROTECTED=")) for line in current.splitlines())
         have_unlock = any(
             line.lstrip().startswith("MCP_UNLOCK_PASSWORD=")
             or line.lstrip().startswith(UNLOCK_PASSWORD_PROTECTED_VAR + "=")
@@ -1339,8 +1388,8 @@ def step_gen_env() -> None:
         minted_api = None
         if not have_api:
             minted_api = secrets.token_hex(20)
-            secret_lines.append("MCP_API_KEY=" + minted_api)
-            minted_keys.append("MCP_API_KEY")
+            secret_lines.append("MCP_API_KEY_PROTECTED=" + protect_secret(minted_api))
+            minted_keys.append("MCP_API_KEY_PROTECTED")
         if not have_unlock:
             minted_unlock = secrets.token_hex(8)
             secret_lines.append(UNLOCK_PASSWORD_PROTECTED_VAR + "=" + protect_secret(minted_unlock))
@@ -1382,8 +1431,8 @@ def step_gen_env() -> None:
         lines = example.read_text(encoding="utf-8-sig").splitlines()
     else:
         lines = [
-            "MCP_API_KEY=replace",
-            "MCP_UNLOCK_PASSWORD=replace",
+            "MCP_API_KEY_PROTECTED=dpapi:generated-by-setup",
+            "MCP_UNLOCK_PASSWORD_PROTECTED=dpapi:generated-by-setup",
             "MCP_UNLOCK_TTL_DAYS=30",
             "MCP_ALLOWED_BASE=~",
         ]
@@ -1391,9 +1440,9 @@ def step_gen_env() -> None:
     out_lines = []
     for line in lines:
         stripped = line.lstrip()
-        if stripped.startswith("MCP_API_KEY="):
-            out_lines.append("MCP_API_KEY=" + api_key)
-        elif stripped.startswith("MCP_UNLOCK_PASSWORD="):
+        if stripped.startswith("MCP_API_KEY=") or stripped.startswith("MCP_API_KEY_PROTECTED="):
+            out_lines.append("MCP_API_KEY_PROTECTED=" + protect_secret(api_key))
+        elif stripped.startswith("MCP_UNLOCK_PASSWORD=") or stripped.startswith(UNLOCK_PASSWORD_PROTECTED_VAR + "="):
             out_lines.append(UNLOCK_PASSWORD_PROTECTED_VAR + "=" + protected_unlock_code)
         else:
             # Keep MCP_ALLOWED_BASE=~ and leave the agent-URL vars commented as-is.
@@ -1982,7 +2031,7 @@ def step_gen_connector() -> None:
     step_header("Generating Copilot Studio connector helper (generated/copilot-connector.md)")
     GENERATED_DIR.mkdir(parents=True, exist_ok=True)
     out = GENERATED_DIR / "copilot-connector.md"
-    out.write_text(_connector_markdown("<your MCP_API_KEY from .env>"), encoding="utf-8")
+    out.write_text(_connector_markdown("<Bearer token shown by copilot_studio_values.bat>"), encoding="utf-8")
     log("    OK: wrote " + str(out))
 
 
@@ -1998,7 +2047,7 @@ sign-in. The bootstrap does NOT automate the Studio UI.
 - The server running locally:  `http://127.0.0.1:8000/mcp`  (start with `quickstart.bat` or `start_all.bat`)
 - A public HTTPS URL via Dev Tunnels:
   `https://<your-tunnel>-8000.<region>.devtunnels.ms/mcp`
-- Your Bearer key (from `.env`, `MCP_API_KEY`):
+- Your Bearer key (stored DPAPI-protected; reveal it with `copilot_studio_values.bat`):
 
       Authorization: Bearer {bearer_value}
 
@@ -2030,8 +2079,8 @@ sign-in. The bootstrap does NOT automate the Studio UI.
   no id).
 - If Microsoft changes the Studio UI, the field names may differ slightly but
   the three inputs are always: server URL, header name, header value.
-- Keep the Bearer key secret. Rotate it by editing `MCP_API_KEY` in `.env` and
-  restarting the server.
+- Keep the Bearer key secret. Rotate it with `rotate_secrets.bat --api-key`, then
+  restart the server and run `copilot_studio_values.bat` to copy the new value.
 """
 
 
@@ -2042,7 +2091,7 @@ def step_verify() -> None:
     step_header("Verifying environment")
 
     # 1. Required .env keys must be present and non-placeholder.
-    required = ["MCP_API_KEY"]
+    required = ["MCP_API_KEY_PROTECTED"]
     missing = []
     for k in required:
         v = _read_env_value(k)
@@ -2057,9 +2106,9 @@ def step_verify() -> None:
             ".env is missing or has placeholder values for: " + ", ".join(missing)
             + ". Re-run quickstart.bat (or setup.bat) (the gen_env step fills these)."
         )
-    log("    OK: .env has required keys (MCP_API_KEY and unlock password)")
+    log("    OK: .env has protected Bearer and unlock credentials")
 
-    # 2. Import main.py and report the tool count. main.py reads MCP_API_KEY from
+    # 2. Import main.py and report the tool count. main.py materializes MCP_API_KEY from
     #    the environment at import, so load .env into os.environ first.
     _load_dotenv_into_env(ROOT / ".env")
     count = _count_tools_via_subprocess()

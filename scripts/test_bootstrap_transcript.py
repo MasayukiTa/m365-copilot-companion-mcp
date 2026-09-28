@@ -140,8 +140,8 @@ def repo_with_env(tmp_path, monkeypatch, transcript):
 def test_the_minted_secrets_do_not_reach_the_transcript(repo_with_env, transcript, capsys):
     B.step_gen_env()
     written = repo_with_env.read_text(encoding="utf-8")
-    api = [l.split("=", 1)[1] for l in written.splitlines() if l.startswith("MCP_API_KEY=")]
-    assert api and len(api[0]) == 40, written          # it really did mint one
+    api = [l.split("=", 1)[1] for l in written.splitlines() if l.startswith("MCP_API_KEY_PROTECTED=")]
+    assert api and api[0].startswith("dpapi:"), written  # it really did persist only ciphertext
     recorded = io.open(str(transcript), encoding="utf-8").read()
     assert api[0] not in recorded, "the freshly minted Bearer token is in the transcript"
 

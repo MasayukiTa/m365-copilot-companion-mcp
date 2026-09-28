@@ -31,6 +31,8 @@ import os
 MACHINE_BOUND = {
     # DPAPI, CryptProtectData with no LOCAL_MACHINE flag -- see tools/secret_store.protect_secret.
     # Decryptable only by the Windows account that wrote it, on the machine that wrote it.
+    "MCP_API_KEY_PROTECTED":
+        "DPAPI value bound to the Windows account that created it",
     "MCP_UNLOCK_PASSWORD_PROTECTED":
         "DPAPI value bound to the Windows account that created it",
     # A dev tunnel belongs to the account that hosts it and cannot be renamed
