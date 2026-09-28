@@ -2994,7 +2994,7 @@ def read_commands(state_dir) -> list:
         out.append(cmd)
     return out
 
-def goals_from_command(cmd) -> list:
+def goals_from_command(cmd, submission_id=None) -> list:
     """The `add_goal` entries in a fleet command file, as goals this run can queue.
 
     MODULE LEVEL SO THE SEAM CAN BE TESTED. This was a closure inside main()'s _drain_commands,
@@ -3005,7 +3005,10 @@ def goals_from_command(cmd) -> list:
     `keep` while the policy read `kept`. Both sides passed their own tests throughout.
 
     Accepts a single entry or a list, a dict or a bare string. `checks` and `cwd` are carried
-    through so a RETRY re-runs WITH its acceptance gate rather than the bare prompt;
+    through so a RETRY re-runs WITH its acceptance gate rather than the bare prompt. When a
+    commands.d claim supplies ``submission_id``, jid-less items receive a deterministic 12-hex
+    jid derived from that command file + item index. Thus crash replay of the SAME command is
+    idempotent, while a NEW command intentionally retrying identical text is a new task.
     goal_fields reads them downstream. An entry without text contributes nothing rather than
     raising -- one malformed row must not cost the rest of the file.
     """
@@ -3014,7 +3017,12 @@ def goals_from_command(cmd) -> list:
         return []
     items = add if isinstance(add, list) else [add]
     out = []
-    for it in items:
+    _sid = str(submission_id or "").strip()
+    # Legacy commands.json is a fixed pathname reused for unrelated commands, so its filename
+    # is NOT an idempotency identity. Modern commands.d filenames are unique per submission.
+    if _sid.lower() == "commands.json":
+        _sid = ""
+    for _idx, it in enumerate(items):
         try:
             if isinstance(it, dict) and it.get("text"):
                 g = {"text": it["text"], "priority": bool(it.get("priority"))}
@@ -3028,6 +3036,9 @@ def goals_from_command(cmd) -> list:
                 # module docstring above already warns a writer/reader mismatch can happen.
                 if it.get("jid"):
                     g["jid"] = it["jid"]
+                elif _sid:
+                    import hashlib
+                    g["jid"] = hashlib.sha1(((_sid + "\0" + str(_idx))).encode("utf-8")).hexdigest()[:12]
                 # WHICH CONVERSATION TO CONTINUE, carried through for the same reason as the
                 # three above it. _follow_up builds this field and RelayWorker.__init__ reads
                 # it, but until now the only path between them ran inside one live run: a
@@ -3062,7 +3073,11 @@ def goals_from_command(cmd) -> list:
                     g["new_task"] = True
                 out.append(g)
             elif isinstance(it, str) and it:
-                out.append({"text": it, "priority": False})
+                g = {"text": it, "priority": False}
+                if _sid:
+                    import hashlib
+                    g["jid"] = hashlib.sha1(((_sid + "\0" + str(_idx))).encode("utf-8")).hexdigest()[:12]
+                out.append(g)
         except Exception:
             pass
     return out
@@ -3754,7 +3769,7 @@ def main():
             claim = claim_next_command(args.state_dir)
             if claim is None:
                 return
-            ok, errs = _apply_command(claim["cmd"], workers)
+            ok, errs = _apply_command(claim["cmd"], workers, submission_id=claim["name"])
             if ok is True:
                 if not commit_command_claim(args.state_dir, claim, applied=True):
                     _pending_command_commits.append((claim, True, []))
@@ -3769,7 +3784,7 @@ def main():
                 restore_command_claim(claim)
                 return
 
-    def _apply_command(cmd, workers):
+    def _apply_command(cmd, workers, submission_id=None):
         # WHOLE OR NOT AT ALL (SEC-08). Checked before anything below touches a box. Return an
         # explicit outcome so _drain_commands knows whether it may commit the claimed file.
         if not admit_command(cmd, args.state_dir, rejections_box):
@@ -3777,7 +3792,7 @@ def main():
             # so recomputing them here keeps admit_command as the single mutate/log gate.
             return False, validate_command(cmd, args.state_dir)
         try:
-            _cmd_goals = goals_from_command(cmd)
+            _cmd_goals = goals_from_command(cmd, submission_id=submission_id)
             _new_cmd_goals = []
             if _cmd_goals:
                 _new_cmd_goals = _append_goals_ledger(

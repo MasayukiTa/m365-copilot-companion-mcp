@@ -181,7 +181,7 @@ def test_maxtabs_apply_layer_reclamps_to_the_same_bound():
     # Defense in depth: validate_command is the public gate, but the mutation site should never
     # be able to manufacture a capacity larger than the established 1..100 operator bound.
     src = open(FR.__file__, encoding="utf-8").read()
-    i = src.index('if "set_maxtabs" in cmd:', src.index('def _apply_command(cmd, workers):'))
+    i = src.index('if "set_maxtabs" in cmd:', src.index('def _apply_command(cmd, workers, submission_id=None):'))
     block = src[i:i + 500]
     assert 'n = max(TABS_BOUNDS[0], min(int(cmd["set_maxtabs"]), TABS_BOUNDS[1]))' in block
 
@@ -291,7 +291,7 @@ def test_apply_command_passes_the_gate_before_it_touches_anything():
     """_apply_command is a closure inside main(), so the one thing a runtime test cannot reach
     is that it calls the gate first. Everything the gate DOES is tested above at runtime."""
     src = open(RUNNER, encoding="utf-8").read()
-    body = src[src.index("    def _apply_command(cmd, workers):"):]
+    body = src[src.index("    def _apply_command(cmd, workers, submission_id=None):"):]
     body = body[:body.index("\n    def ", 10)]
     gate = body.index("if not admit_command(cmd, args.state_dir, rejections_box):")
     first_effect = body.index("by_name = {w.name: w for w in workers}")
