@@ -44,8 +44,8 @@ SOURCE = _executable(RAW)
 
 
 def _confirm_paths():
-    """コンポーザの入力を確定させる分岐。両方とも `TryAddGoalsToLiveFleet` / `StartFleet` へ分かれる。"""
-    return [m.start() for m in re.finditer(r"if \(_composerRunActive\) TryAddGoalsToLiveFleet\(\);", SOURCE)]
+    """コンポーザの入力を確定させる分岐。両方とも `TryAddGoalsToActiveRun` / `StartFleet` へ分かれる。"""
+    return [m.start() for m in re.finditer(r"if \(_composerRunActive\) TryAddGoalsToActiveRun\(\);", SOURCE)]
 
 
 def test_there_are_exactly_two_confirm_paths():

@@ -5492,7 +5492,7 @@ class CockpitWindow : Window
                 // The same fault reached by two callers is one fault; fixing the caller you
                 // happened to be looking at leaves it live everywhere else.
                 if (HandleSlashSetting()) return;
-                if (_composerRunActive) TryAddGoalsToLiveFleet();
+                if (_composerRunActive) TryAddGoalsToActiveRun();
                 else StartFleet();
             }
         };
@@ -5534,7 +5534,7 @@ class CockpitWindow : Window
             // worker card, so `/fanout`, `/effort`, and `/approval` must never enter either task
             // path as Copilot instructions.
             if (HandleSlashSetting()) return;
-            if (_composerRunActive) TryAddGoalsToLiveFleet();
+            if (_composerRunActive) TryAddGoalsToActiveRun();
             else StartFleet();
         };
         btns.Children.Add(_startBtn);
@@ -5756,6 +5756,35 @@ class CockpitWindow : Window
         {
             _startNote.Text = (_lang == 0 ? "起動失敗: " : "Failed: ") + ex.Message;
         }
+    }
+
+    bool ActiveRunIsLocalLoop()
+    {
+        try
+        {
+            Dictionary<string, object> st = ReadStatus();
+            return st != null && string.Equals(
+                S(st, "execution_mode"), "LOCAL_LOOP", StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception) { return false; }
+    }
+
+    void TryAddGoalsToActiveRun()
+    {
+        // LOCAL_LOOP and classic Fleet intentionally have different command channels. Sending a
+        // durable task through FleetCommands while LOCAL_LOOP owns status.json leaves an orphaned
+        // commands.d item that can later resurrect as a classic Fleet task. Never cross that
+        // boundary. Phase 2 will wire this branch to the durable campaign queue; until then keep
+        // the operator's text intact instead of pretending it was accepted.
+        if (ActiveRunIsLocalLoop())
+        {
+            if (_startNote != null)
+                _startNote.Text = _lang == 0
+                    ? "長時間実行中の追加入力はまだキューへ送っていません。入力は残しています。"
+                    : "Live additions to the durable runtime are not queued yet. Your input was kept.";
+            return;
+        }
+        TryAddGoalsToLiveFleet();
     }
 
     // The bottom composer is the task intake surface in BOTH idle and live-run states.
