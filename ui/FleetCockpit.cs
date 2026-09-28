@@ -1310,17 +1310,50 @@ class CockpitWindow : Window
     // would re-enter the scan. The status.json read here is what a retry's goal is measured
     // against -- the worker being retried is already on the board with this very goal text,
     // and must not count as the new submission's worker (see SubmittedTasks.AddLocal).
-    void NoteSubmitted(IEnumerable<string> goals)
+    // Snapshot what existed BEFORE a submission leaves this process. A worker can appear in the
+    // few milliseconds between SendCommand/Process.Start and the optimistic UI row. If we sample
+    // after the handoff, that brand-new worker looks "preexisting" and the submitted row can
+    // remain `taken` forever even though the fleet already created its worker.
+    sealed class SubmissionBaseline
+    {
+        public string Started;
+        public List<Dictionary<string, object>> Workers;
+        public List<Dictionary<string, object>> History;
+        public double CapturedUnix;
+    }
+
+    SubmissionBaseline CaptureSubmissionBaseline()
     {
         try
         {
             Dictionary<string, object> root = ReadStatus();
-            string started = StartedOf(root);
-            List<Dictionary<string, object>> workers = WorkersOf(root);
-            List<Dictionary<string, object>> history = HistoryWorkers();
-            double now = NowUnix();
+            return new SubmissionBaseline {
+                Started = StartedOf(root),
+                Workers = WorkersOf(root),
+                History = HistoryWorkers(),
+                CapturedUnix = NowUnix() };
+        }
+        catch (Exception)
+        {
+            return new SubmissionBaseline {
+                Started = "", Workers = new List<Dictionary<string, object>>(),
+                History = new List<Dictionary<string, object>>(), CapturedUnix = NowUnix() };
+        }
+    }
+
+    void NoteSubmitted(IEnumerable<string> goals)
+    {
+        NoteSubmitted(goals, CaptureSubmissionBaseline());
+    }
+
+    void NoteSubmitted(IEnumerable<string> goals, SubmissionBaseline baseline)
+    {
+        try
+        {
+            SubmissionBaseline b = baseline ?? CaptureSubmissionBaseline();
             foreach (string g in goals)
-                _submitted.AddLocal(SubmittedTasks.GoalTextOf(g), now, started, workers, history);
+                _submitted.AddLocal(SubmittedTasks.GoalTextOf(g), b.CapturedUnix,
+                                    b.Started, b.Workers, b.History);
             Dispatcher.BeginInvoke(new Action(ForceRender));
         }
         catch (Exception) { }
@@ -5735,6 +5768,7 @@ class CockpitWindow : Window
             if (goal.Length > 0 && !goal.StartsWith("#")) goals.Add(goal);
         }
         if (goals.Count == 0) return;
+        SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
 
         // This method is entered from the ACTIVE composer. Do not re-decide ownership from one
         // status read here: a transient unreadable/stale snapshot used to divert this submission
@@ -5764,7 +5798,7 @@ class CockpitWindow : Window
         }
 
         // Optimistic row first; the runner will replace it with a real worker on the next sweep.
-        NoteSubmitted(goals);
+        NoteSubmitted(goals, submitBaseline);
         WatchLiveAddHandoff(commandPath, ackPath);
         _goalInput.Text = "";
         if (_startNote != null)
@@ -5963,6 +5997,7 @@ class CockpitWindow : Window
 
     bool SpawnDurableTask(string goal)
     {
+        SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
         try
         {
             string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
@@ -5983,7 +6018,7 @@ class CockpitWindow : Window
             psi.CreateNoWindow = true;
             try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
             System.Diagnostics.Process.Start(psi);
-            NoteSubmitted(new List<string> { goal });
+            NoteSubmitted(new List<string> { goal }, submitBaseline);
             return true;
         }
         catch (Exception ex)
@@ -5996,6 +6031,7 @@ class CockpitWindow : Window
 
     bool SpawnFleet(List<string> goals, string goalsFileName, bool planMode = false)
     {
+        SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
         string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
         string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
         if (!File.Exists(py)) py = "python";
@@ -6021,7 +6057,7 @@ class CockpitWindow : Window
         // On top of the list NOW, before the new run's first snapshot exists. Every spawn path
         // comes through here: the composer's StartFleet, a retry or bulk retry with no live run,
         // and the continue flows (whose lines are {"text":..} objects -- GoalTextOf reads them).
-        NoteSubmitted(goals);
+        NoteSubmitted(goals, submitBaseline);
         return true;
     }
 
@@ -14483,10 +14519,11 @@ class CockpitWindow : Window
     {
         if (RunIsLive())
         {
+            SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
             var adds = new List<object>();
             adds.Add(RetryEntry(w));
             SendCommand(Cmd1("add_goal", adds));
-            NoteSubmitted(new List<string> { S(w, "goal") });   // on top now, not when the run reads it
+            NoteSubmitted(new List<string> { S(w, "goal") }, submitBaseline);
             return;
         }
         string goal = S(w, "goal");
@@ -14538,8 +14575,9 @@ class CockpitWindow : Window
         if (n == 0) return 0;
         if (live)
         {
+            SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
             SendCommand(Cmd1("add_goal", adds));
-            NoteSubmitted(goalTexts);                 // on top now, not when the run reads it
+            NoteSubmitted(goalTexts, submitBaseline);
         }
         else if (goalTexts.Count > 0)
         {
