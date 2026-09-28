@@ -522,3 +522,43 @@ def test_controller_marker_preserves_supervisor_backoff_reservation(tmp_path):
     assert marker["restart_count"] == 7
     assert marker["retry_after"] == 12345.0
     assert _read_controller_marker(state, job_id) == marker
+
+
+def test_max_attempts_is_durable_across_controller_restart(tmp_path):
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    job = _job(max_turns=5)
+    job["constraints"]["max_attempts"] = 2
+    store.create_job(job)
+    # Simulate two RUN attempts made by an earlier controller process.
+    store.record_event("job_1", "UI_TRIGGER_ATTEMPT", {"seq": 1, "worker_id": "old-a"}, 1)
+    store.record_event("job_1", "UI_TRIGGER_ATTEMPT", {"seq": 1, "worker_id": "old-b"}, 1)
+
+    class MustNotSendDriver:
+        answer_content_reads = 0
+        sent = []
+        def send(self, *args, **kwargs):
+            raise AssertionError("a restarted controller reset the durable attempt budget")
+
+    driver = MustNotSendDriver()
+    controller = LocalLoopController(
+        store, "job_1", driver, rotate_after_turns=0, poll_seconds=.01,
+    )
+    assert controller.run() == "CANCELLED"
+    assert driver.sent == []
+    status = store.get_job_status("job_1", event_limit=30)
+    assert status["status"] == "CANCELLED"
+    assert "max_attempts=2 reached" in status["verification_detail"]
+
+
+def test_each_run_trigger_records_durable_attempt_before_send(tmp_path):
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    job = _job(max_turns=1)
+    job["constraints"]["max_attempts"] = 2
+    store.create_job(job)
+    driver = RetryAbortThenCommitDriver(store)
+    controller = LocalLoopController(
+        store, "job_1", driver, rotate_after_turns=0, poll_seconds=.01,
+        acceptance_runner=lambda current: (True, "verified"),
+    )
+    assert controller.run() == "DONE"
+    assert store.ui_trigger_attempt_count("job_1") == 2

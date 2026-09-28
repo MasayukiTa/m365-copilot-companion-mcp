@@ -616,7 +616,9 @@ class LocalLoopController:
         return self.store.verify_candidate(self.job_id, passed, detail)
 
     def run(self) -> str:
-        sent_attempts = 0
+        # Attempt budget is a durable job constraint, not a process-lifetime counter.  A crash /
+        # WAITING_RUNTIME auto-resume must not reset it and create an unbounded RUN loop.
+        sent_attempts = self.store.ui_trigger_attempt_count(self.job_id)
         while True:
             self._assert_no_answer_content_read()
             status = self.store.get_job_status(self.job_id)
@@ -668,6 +670,12 @@ class LocalLoopController:
             if bool(constraints.get("read_only")):
                 trigger += " mode=read-only"
             response_count_before = self._response_block_count()
+            # Commit the attempt BEFORE touching the browser. If the process dies during send,
+            # the next controller still sees that this attempt consumed budget.
+            self.store.record_event(self.job_id, "UI_TRIGGER_ATTEMPT", {
+                "seq": seq, "worker_id": self.worker_id,
+            }, seq)
+            sent_attempts += 1
             try:
                 self.driver.send(trigger, track_answer=False)
             except Exception as exc:
@@ -676,7 +684,6 @@ class LocalLoopController:
                     "seq": seq, "worker_id": self.worker_id, "reason": reason,
                 }, seq)
                 self.store.retry_uncommitted_turn(self.job_id, seq, reason)
-                sent_attempts += 1
                 if not self._rotate("send failed"):
                     self.store.mark_waiting_runtime(
                         self.job_id, "send failed; no replacement conversation",
@@ -687,7 +694,6 @@ class LocalLoopController:
             self.store.record_event(self.job_id, "UI_TRIGGER_SENT", {
                 "seq": seq, "worker_id": self.worker_id,
             }, seq)
-            sent_attempts += 1
             self.turns_in_conversation += 1
 
             commit = self._wait_for_commit(seq, retry_count_before, response_count_before)
