@@ -562,3 +562,105 @@ def test_each_run_trigger_records_durable_attempt_before_send(tmp_path):
     )
     assert controller.run() == "DONE"
     assert store.ui_trigger_attempt_count("job_1") == 2
+
+
+def test_projection_aggregates_marker_owned_jobs_in_same_state_dir(tmp_path):
+    from relay.local_loop_controller import _write_controller_marker
+
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    store.create_job(_job("job_1"), now=1)
+    store.create_job(_job("job_2"), now=2)
+    store.create_job(_job("unrelated_shared_db_job"), now=3)
+    _write_controller_marker(tmp_path, "job_1", ["--job-id", "job_1"], pid=101, started=1)
+    _write_controller_marker(tmp_path, "job_2", ["--job-id", "job_2"], pid=202, started=2)
+    status_path = tmp_path / "status.json"
+
+    _project_job_snapshot(store, "job_1", status_path, now=10)
+
+    projected = json.loads(status_path.read_text(encoding="utf-8"))
+    assert [w["name"] for w in projected["workers"]] == ["job_1", "job_2"]
+    assert projected["total"] == 2
+    assert projected["open_tabs"] == 2
+    assert projected["running"] is True
+    assert projected["started"] == 1
+    assert "unrelated_shared_db_job" not in {w["name"] for w in projected["workers"]}
+
+
+def test_projection_keeps_recent_terminal_job_visible_across_other_controller_refresh(tmp_path):
+    from relay.local_loop_controller import _write_controller_marker, _clear_controller_marker
+
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    store.create_job(_job("job_1"), now=1)
+    store.create_job(_job("job_2"), now=2)
+    _write_controller_marker(tmp_path, "job_1", ["--job-id", "job_1"], pid=101, started=1)
+    _write_controller_marker(tmp_path, "job_2", ["--job-id", "job_2"], pid=202, started=2)
+    status_path = tmp_path / "status.json"
+    _project_job_snapshot(store, "job_1", status_path, now=90)
+
+    store.cancel_job("job_1", "finished for projection test", now=100)
+    assert _clear_controller_marker(tmp_path, "job_1", owner_pid=101) is True
+
+    # job_2 refreshes the shared status after job_1 has cleared its recovery marker. The recent
+    # terminal row must remain visible long enough for Cockpit/history to observe completion.
+    _project_job_snapshot(store, "job_2", status_path, now=110)
+    recent = json.loads(status_path.read_text(encoding="utf-8"))
+    by_name = {w["name"]: w for w in recent["workers"]}
+    assert set(by_name) == {"job_1", "job_2"}
+    assert by_name["job_1"]["closed"] is True
+    assert by_name["job_1"]["outcome"] == "CANCELLED"
+    assert recent["open_tabs"] == 1
+
+    # The completion grace is display-only; old terminal jobs must eventually leave live status.
+    _project_job_snapshot(store, "job_2", status_path, now=1000)
+    later = json.loads(status_path.read_text(encoding="utf-8"))
+    assert [w["name"] for w in later["workers"]] == ["job_2"]
+
+
+def test_atomic_projection_writer_uses_unique_temp_files_under_concurrency(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from relay.local_loop_controller import _write_atomic
+
+    target = tmp_path / "status.json"
+
+    def writer(worker_id):
+        for seq in range(80):
+            _write_atomic(target, {"worker": worker_id, "seq": seq, "payload": "x" * 2000})
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(writer, i) for i in range(8)]
+        for future in futures:
+            future.result()
+
+    final = json.loads(target.read_text(encoding="utf-8"))
+    assert 0 <= final["worker"] < 8
+    assert 0 <= final["seq"] < 80
+    assert not list(tmp_path.glob(".status.json.*.tmp"))
+
+
+def test_concurrent_job_projections_keep_every_active_job_visible(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from relay.local_loop_controller import _write_controller_marker
+
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    store.create_job(_job("job_1"), now=1)
+    store.create_job(_job("job_2"), now=2)
+    _write_controller_marker(tmp_path, "job_1", ["--job-id", "job_1"], pid=101, started=1)
+    _write_controller_marker(tmp_path, "job_2", ["--job-id", "job_2"], pid=202, started=2)
+    status_path = tmp_path / "status.json"
+
+    def project(job_id, offset):
+        for seq in range(40):
+            _project_job_snapshot(store, job_id, status_path, now=100 + offset + seq / 1000.0)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        a = pool.submit(project, "job_1", 0.0)
+        b = pool.submit(project, "job_2", 0.5)
+        a.result()
+        b.result()
+
+    final = json.loads(status_path.read_text(encoding="utf-8"))
+    assert {w["name"] for w in final["workers"]} == {"job_1", "job_2"}
+    assert final["total"] == 2
+    assert final["open_tabs"] == 2
+    assert final["running"] is True
+    assert final["started"] == 1

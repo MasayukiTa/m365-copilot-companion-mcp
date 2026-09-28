@@ -419,3 +419,24 @@ def test_a_reserved_event_type_cannot_be_recorded_through_the_public_api():
 
     # observational events are unaffected
     store.record_event("reserved_probe", "BROWSER_METRICS", {"fps": 60})
+
+
+def test_console_projection_started_is_job_creation_not_last_update(tmp_path):
+    store = _store(tmp_path)
+    store.create_job(_job(), now=10)
+    claim = store.claim_turn("job_1", 1, "w", now=20)
+    store.heartbeat(
+        "job_1", 1, claim["lease_id"], claim["fencing_token"],
+        "working", "still progressing", now=30,
+    )
+
+    status = store.get_job_status("job_1")
+    snapshot = store.console_snapshot()
+    worker = snapshot["workers"][0]
+
+    assert status["created_at"] == 10
+    # A heartbeat advances the turn row, not the job row; the job was last updated by claim at 20.
+    assert status["updated_at"] == 20
+    assert worker["created_at"] == 10
+    assert worker["updated_at"] == 20
+    assert snapshot["started"] == 10

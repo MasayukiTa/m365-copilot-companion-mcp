@@ -687,6 +687,7 @@ class LocalJobStore:
                 "events": [{"seq": e["seq"], "event": e["event_type"],
                             "payload": json.loads(e["payload_json"]), "ts": e["created_at"]}
                            for e in reversed(events)],
+                "created_at": float(job["created_at"]),
                 "updated_at": float(job["updated_at"]),
             }
         finally:
@@ -1055,10 +1056,12 @@ class LocalJobStore:
                 "phase_events": item.get("events", []),
                 "next_step": execution.get("next_step", ""),
                 "execution": execution,
+                "created_at": float(item.get("created_at", item.get("updated_at", time.time()))),
+                "updated_at": float(item.get("updated_at", time.time())),
             })
         now = time.time()
         return {
-            "started": min((s["updated_at"] for s in statuses), default=now),
+            "started": min((s.get("created_at", s["updated_at"]) for s in statuses), default=now),
             "updated": now, "total": len(statuses), "done_count": done,
             "running": any(not w["closed"] for w in workers), "open_tabs": 0,
             "execution_mode": "LOCAL_LOOP", "workers": workers,
