@@ -1,4 +1,4 @@
-// FleetConvIdentityHarness.cs -- TEST-ONLY. Drives the SHIPPED ui/FleetConvIdentity.cs the same
+﻿// FleetConvIdentityHarness.cs -- TEST-ONLY. Drives the SHIPPED ui/FleetConvIdentity.cs the same
 // way ui/CopilotChat.cs's OpenFromFleet() and SyncRegistry() do, then feeds the resulting
 // Conversation into the SHIPPED ui/ChatSend.cs decision (LiveWorkerFor + DecideFleetSend) so the
 // test can see whether the merged identity actually keeps a fleet conversation answerable --
@@ -55,6 +55,21 @@ static class FleetConvIdentityHarness
         return Convert.ToString(v, CultureInfo.InvariantCulture);
     }
 
+    static List<string> StrList(Dictionary<string, object> d, string k)
+    {
+        var outp = new List<string>();
+        object v;
+        if (d == null || !d.TryGetValue(k, out v) || v == null) return outp;
+        var a = v as object[];
+        if (a == null) return outp;
+        foreach (object o in a)
+        {
+            string text = o == null ? "" : Convert.ToString(o, CultureInfo.InvariantCulture);
+            if (!string.IsNullOrEmpty(text)) outp.Add(text);
+        }
+        return outp;
+    }
+
     static int IntOr(Dictionary<string, object> d, string k, int dflt)
     {
         object v;
@@ -79,6 +94,7 @@ static class FleetConvIdentityHarness
                 conv.Source = Str(c, "existing_source");
                 conv.Name = Str(c, "existing_name");
                 conv.Transcript = Str(c, "existing_transcript");
+                conv.Transcripts = StrList(c, "existing_transcripts");
                 conv.Goal = Str(c, "existing_goal");
                 conv.ConvUrl = Str(c, "conv_url");
 
@@ -102,7 +118,10 @@ static class FleetConvIdentityHarness
                     string transcriptPath = Str(c, "transcript_path");
                     conv.Source = FleetConvIdentity.MergeBackfillOnly(conv.Source, "fleet");
                     conv.Name = FleetConvIdentity.MergeBackfillOnly(conv.Name, worker);
-                    conv.Transcript = FleetConvIdentity.MergeForward(conv.Transcript, transcriptPath);
+                    conv.Transcripts = FleetConvIdentity.MergeTranscriptLineage(
+                        conv.Transcripts, null, transcriptPath);
+                    conv.Transcript = FleetConvIdentity.LatestTranscript(
+                        conv.Transcripts, FleetConvIdentity.MergeForward(conv.Transcript, transcriptPath));
                     conv.Goal = FleetConvIdentity.MergeForward(conv.Goal, resolvedGoal);
                 }
                 else if (op == "registry_backfill")
@@ -114,7 +133,10 @@ static class FleetConvIdentityHarness
                     string regTranscript = Str(c, "reg_transcript");
                     resolvedGoal = regGoal;
                     conv.Goal = FleetConvIdentity.MergeBackfillOnly(conv.Goal, regGoal);
-                    conv.Transcript = FleetConvIdentity.MergeBackfillOnly(conv.Transcript, regTranscript);
+                    conv.Transcripts = FleetConvIdentity.MergeTranscriptLineage(
+                        conv.Transcripts, StrList(c, "reg_transcripts"), regTranscript);
+                    conv.Transcript = FleetConvIdentity.LatestTranscript(
+                        conv.Transcripts, FleetConvIdentity.MergeBackfillOnly(conv.Transcript, regTranscript));
                 }
                 else
                 {
@@ -130,6 +152,7 @@ static class FleetConvIdentityHarness
                 outp["resolved_goal"] = resolvedGoal;
                 outp["goal"] = conv.Goal;
                 outp["transcript"] = conv.Transcript;
+                outp["transcripts"] = conv.Transcripts;
                 outp["source"] = conv.Source;
                 outp["name"] = conv.Name;
                 outp["live"] = live;

@@ -74,7 +74,9 @@ pytestmark = pytest.mark.skipif(
     reason="the code under test is C# compiled by the .NET Framework csc, which exists only "
            "on Windows")
 
+OLD_TRANSCRIPT = r"C:\repo\.fleet\transcripts\1799980000_w0.jsonl"
 TRANSCRIPT = r"C:\repo\.fleet\transcripts\1799990000_w0.jsonl"
+THIRD_TRANSCRIPT = r"C:\repo\.fleet\transcripts\1800000000_w0.jsonl"
 META_GOAL = "investigate the copper-foil yield drop and report"
 LIVE_GOAL = "steer this: focus on the west-line sensors only"
 REG_GOAL = "audit the disk cleanup job for stray temp files"
@@ -116,6 +118,28 @@ CASES = [
         "reg_goal": REG_GOAL, "reg_transcript": TRANSCRIPT,
         "conv_url": "sess:99990000-1111-2222-3333-444455556666",
         "status_text": RESTART_STATUS, "text": INTERRUPT, "lang": 1,
+    },
+    {
+        "id": "lineage_advances",
+        "op": "registry_backfill",
+        "existing_source": "fleet", "existing_name": "w0",
+        "existing_transcript": TRANSCRIPT, "existing_transcripts": [OLD_TRANSCRIPT, TRANSCRIPT],
+        "existing_goal": META_GOAL,
+        "reg_goal": META_GOAL, "reg_transcript": THIRD_TRANSCRIPT,
+        "reg_transcripts": [OLD_TRANSCRIPT, TRANSCRIPT, THIRD_TRANSCRIPT],
+        "conv_url": "sess:lineage-advance", "status_text": RESTART_STATUS,
+        "text": INTERRUPT, "lang": 1,
+    },
+    {
+        "id": "lineage_stale_poll_cannot_rewind",
+        "op": "registry_backfill",
+        "existing_source": "fleet", "existing_name": "w0",
+        "existing_transcript": TRANSCRIPT, "existing_transcripts": [OLD_TRANSCRIPT, TRANSCRIPT],
+        "existing_goal": META_GOAL,
+        "reg_goal": META_GOAL, "reg_transcript": OLD_TRANSCRIPT,
+        "reg_transcripts": [OLD_TRANSCRIPT],
+        "conv_url": "sess:lineage-stale", "status_text": RESTART_STATUS,
+        "text": INTERRUPT, "lang": 1,
     },
     {
         "id": "never_overwrite",
@@ -229,3 +253,15 @@ def test_a_transient_miss_never_blanks_an_identity_the_row_already_had(results):
     fs = r["fleet_send"]
     assert fs["kind"] == "command" and fs["key"] == "add_goal", (
         "a blanked identity would have been refused fleet_no_goal here", fs)
+
+
+def test_transcript_lineage_advances_without_losing_older_segments(results):
+    r = results["lineage_advances"]
+    assert r["transcripts"] == [OLD_TRANSCRIPT, TRANSCRIPT, THIRD_TRANSCRIPT]
+    assert r["transcript"] == THIRD_TRANSCRIPT
+
+
+def test_stale_registry_poll_cannot_rewind_latest_transcript(results):
+    r = results["lineage_stale_poll_cannot_rewind"]
+    assert r["transcripts"] == [OLD_TRANSCRIPT, TRANSCRIPT]
+    assert r["transcript"] == TRANSCRIPT
