@@ -1,4 +1,4 @@
-﻿from pathlib import Path
+from pathlib import Path
 import re
 
 SOURCE = Path(__file__).with_name('FleetCockpit.cs').read_text(encoding='utf-8', errors='replace')
@@ -23,7 +23,7 @@ def test_live_task_add_uses_the_same_lossless_command_channel_and_immediate_ui_r
     assert 'SendTrackedCommand(patch, out commandPath)' in block
     assert 'patch["ack"] = ackPath' in block
     assert 'WatchLiveAddHandoff(commandPath, ackPath)' in block
-    assert 'NoteSubmitted(goals)' in block
+    assert 'NoteSubmitted(goals, submitBaseline)' in block
     assert '_goalInput.Text = ""' in block
 
 

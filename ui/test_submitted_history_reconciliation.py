@@ -64,8 +64,43 @@ def test_submitted_rows_reconcile_against_new_history_without_swallowing_retries
 def test_cockpit_passes_history_to_both_submission_merge_boundaries():
     src = (UI / "FleetCockpit.cs").read_text(encoding="utf-8-sig")
     refresh = src[src.index("void RefreshSubmitted("):src.index("static string StartedOf", src.index("void RefreshSubmitted("))]
-    note = src[src.index("void NoteSubmitted("):src.index("static string OneLine", src.index("void NoteSubmitted("))]
+    capture = src[src.index("SubmissionBaseline CaptureSubmissionBaseline()"):
+                  src.index("void NoteSubmitted(IEnumerable<string> goals)")]
+    note = src[src.index("void NoteSubmitted(IEnumerable<string> goals, SubmissionBaseline baseline)"):
+               src.index("static string OneLine", src.index("void NoteSubmitted(IEnumerable<string> goals, SubmissionBaseline baseline)"))]
     assert "HistoryWorkers()" in refresh
-    assert "HistoryWorkers()" in note
+    assert "HistoryWorkers()" in capture
+    assert "WorkersOf(root)" in capture
     assert "_submitted.Refresh(files, StartedOf(root)," in refresh
     assert "_submitted.AddLocal(" in note
+    assert "b.Started, b.Workers, b.History" in note
+
+
+def _method_block(src, name, next_marker):
+    i = src.index(name)
+    j = src.index(next_marker, i)
+    return src[i:j]
+
+
+def test_submission_baseline_is_captured_before_handoff_can_create_a_worker():
+    src = (UI / "FleetCockpit.cs").read_text(encoding="utf-8-sig")
+    assert "sealed class SubmissionBaseline" in src
+    assert "SubmissionBaseline CaptureSubmissionBaseline()" in src
+    assert "void NoteSubmitted(IEnumerable<string> goals, SubmissionBaseline baseline)" in src
+
+    live = _method_block(src, "void TryAddGoalsToLiveFleet()", "void WatchLiveAddHandoff(")
+    assert live.index("CaptureSubmissionBaseline()") < live.index("SendTrackedCommand(")
+    assert "NoteSubmitted(goals, submitBaseline)" in live
+
+    spawn = _method_block(src, "bool SpawnFleet(List<string> goals", "string GoalsToJsonl(")
+    assert spawn.index("CaptureSubmissionBaseline()") < spawn.index("Process.Start(psi)")
+    assert "NoteSubmitted(goals, submitBaseline)" in spawn
+
+    durable = _method_block(src, "bool SpawnDurableTask(string goal)", "bool SpawnFleet(List<string> goals")
+    assert durable.index("CaptureSubmissionBaseline()") < durable.index("Process.Start(psi)")
+    assert "NoteSubmitted(new List<string> { goal }, submitBaseline)" in durable
+
+    retry = _method_block(src, "void RetryGoal(Dictionary<string, object> w)", "Dictionary<string, object> Cmd1")
+    live_branch = retry[:retry.index("string goal = S(w, \"goal\")")]
+    assert live_branch.index("CaptureSubmissionBaseline()") < live_branch.index("SendCommand(")
+    assert "NoteSubmitted(new List<string> { S(w, \"goal\") }, submitBaseline)" in live_branch
