@@ -17,9 +17,9 @@
 # the exact follow-up actions (update the connector, re-unlock, restart).
 #
 # This script is stdlib-only and makes NO network calls. It NEVER writes the
-# secret values to any file or log -- it only writes them into .env (which
-# already holds secrets) and optionally echoes them to the console so you can
-# copy them.
+# clear-text secret values to a log or console. Only DPAPI-protected values are
+# persisted; use copilot_studio_values.bat for an explicit interactive reveal
+# when the operator actually needs to copy a rotated value.
 #
 # ASCII / ENGLISH ONLY (comments included) -- this repo's .bat/.ps1 mis-decode
 # non-ASCII; the Python files match that rule for consistency.
@@ -28,7 +28,7 @@
 #   python scripts/rotate_secrets.py            rotate BOTH secrets (default)
 #   python scripts/rotate_secrets.py --api-key  rotate only MCP_API_KEY
 #   python scripts/rotate_secrets.py --unlock   rotate only MCP_UNLOCK_PASSWORD
-#   python scripts/rotate_secrets.py --no-print  do not echo new values to console
+#   python scripts/rotate_secrets.py --no-print  compatibility flag; values are never printed
 # =============================================================================
 from __future__ import annotations
 
@@ -159,7 +159,7 @@ def main(argv=None) -> int:
     )
     parser.add_argument(
         "--no-print", action="store_true",
-        help="Do not echo the new secret value(s) to the console.",
+        help="Deprecated compatibility flag; rotated secret values are never printed.",
     )
     args = parser.parse_args(argv)
 
@@ -215,21 +215,16 @@ def main(argv=None) -> int:
     step = 1
     if rotate_api:
         print(f"{step}. Update the Copilot Studio MCP connector connection:")
-        if not args.no_print:
-            print(f"     Authorization header value -> `Bearer {new_api_key}`")
-        else:
-            print("     Authorization header value -> `Bearer <NEW_API_KEY>` "
-                  "(run copilot_studio_values.bat to reveal it interactively)")
+        print("     Authorization header value -> `Bearer <NEW_API_KEY>`")
+        print("     Run copilot_studio_values.bat to reveal it interactively when needed.")
         print("   The OLD Bearer token no longer authenticates once the server restarts.")
         step += 1
 
     if rotate_unlock:
         print(f"{step}. All existing per-IP unlocks are now invalid; agents must call")
         print("     unlock(<new password>) again to use write/exec tools.")
-        if not args.no_print:
-            print(f"     New unlock password: {new_unlock}")
-        else:
-            print("     (run copilot_studio_values.bat to reveal it interactively)")
+        print("     The new unlock password is not printed by this rotation command.")
+        print("     Run copilot_studio_values.bat to reveal it interactively when needed.")
         step += 1
 
     # 5. Restart instruction. Determined from main.py + supervisor.ps1:
