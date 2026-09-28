@@ -289,6 +289,29 @@ function Submit([string]$text) {
     if (-not $startBtn.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$ip)) {
         throw "the start button does not support Invoke"
     }
+
+    # FAIL CLOSED ON COMPOSER CORRUPTION. ValuePattern.SetValue() above is supposed to replace
+    # the whole text atomically, but an unattended machine can still receive an external edit
+    # between that write and this button invoke. Measured 2026-09-28: a 645-char READ-ONLY goal
+    # reached goals_input.txt as 646 chars with a leading "3". Re-read the SAME textbox at the
+    # last possible moment and require an ordinal exact match before creating any durable work.
+    $vpVerify = $null
+    if (-not $target.TryGetCurrentPattern(
+            [System.Windows.Automation.ValuePattern]::Pattern, [ref]$vpVerify)) {
+        throw "cannot re-read the composer immediately before submit"
+    }
+    $observed = [string]$vpVerify.Current.Value
+    if (-not [String]::Equals($observed, $text, [StringComparison]::Ordinal)) {
+        $common = [Math]::Min($observed.Length, $text.Length)
+        $at = 0
+        while ($at -lt $common -and $observed[$at] -eq $text[$at]) { $at++ }
+        $expectedCode = if ($at -lt $text.Length) { "U+{0:X4}" -f [int][char]$text[$at] } else { "<end>" }
+        $observedCode = if ($at -lt $observed.Length) { "U+{0:X4}" -f [int][char]$observed[$at] } else { "<end>" }
+        throw ("composer text changed before submit at index {0}: expected {1}, observed {2}; lengths {3}->{4}. " +
+               "Nothing was submitted and the current composer text was left untouched." -f
+               $at, $expectedCode, $observedCode, $text.Length, $observed.Length)
+    }
+
     [Console]::Error.WriteLine(("submit: invoking button '{0}'" -f $startBtn.Current.Name))
     $ip.Invoke()
 
