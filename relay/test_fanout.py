@@ -153,6 +153,27 @@ def test_children_share_one_campaign_and_name_their_parent():
     assert [k["subtask_index"] for k in kids] == [1, 2]
 
 
+
+
+def test_nested_campaign_id_is_scoped_by_the_splitting_task_identity():
+    root = fo.campaign_id_for("same text")
+    # Root compatibility: old persisted campaigns still resolve exactly as before.
+    assert root == fo.campaign_id_for("same text", parent_task_id="")
+    a = fo.campaign_id_for("same text", parent_task_id="outer-c1")
+    b = fo.campaign_id_for("same text", parent_task_id="outer-c2")
+    assert a != b != root
+    assert a == fo.campaign_id_for("same text", parent_task_id="outer-c1")
+
+
+def test_nested_children_get_a_family_unique_to_their_parent_task():
+    steps = ["slice A collect records", "slice B collect records"]
+    a = fo.child_goals("same nested goal", steps, parent_task_id="outer-c1")
+    b = fo.child_goals("same nested goal", steps, parent_task_id="outer-c2")
+    assert a and b
+    assert a[0]["campaign_id"] != b[0]["campaign_id"]
+    assert {k["parent_task_id"] for k in a} == {"outer-c1"}
+    assert {k["parent_task_id"] for k in b} == {"outer-c2"}
+
 def test_the_campaign_id_is_derived_from_the_goal_so_a_resume_rejoins_the_family():
     a = fo.child_goals("同じ目標", ["範囲A を取得する", "範囲B を取得する"])
     b = fo.child_goals("同じ目標", ["範囲A を取得する", "範囲B を取得する"])

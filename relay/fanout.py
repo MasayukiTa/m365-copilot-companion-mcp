@@ -156,15 +156,20 @@ def fanout_ready(resp) -> bool:
     return SUBTASKS_READY.upper() in (resp or "").upper()
 
 
-def campaign_id_for(parent_goal) -> str:
-    """A stable id for one parent and its children, derived from the goal itself.
+def campaign_id_for(parent_goal, parent_task_id="") -> str:
+    """Stable id for one split family. Root ids remain backward-compatible.
 
-    Derived rather than random because the fleet's scripts must not call Math.random's
-    equivalents for ids that appear in a resumable run: the same goal resumed must land in
-    the same campaign, or the children of the first attempt and the second become two
-    unrelated families in the same status file.
+    Root campaigns historically hash only the authoritative parent goal; keep that exact rule
+    so existing ``campaigns.jsonl`` and resumed top-level work still rejoin their old family.
+    Nested campaigns need one extra scope component: two different children can legitimately
+    carry identical instruction text, but their grandchildren must not become one family.
+    The splitting task id is stable across resume/retry and therefore scopes nested ids without
+    adding randomness.
     """
-    return "c" + hashlib.sha256((parent_goal or "").encode("utf-8")).hexdigest()[:12]
+    goal = parent_goal or ""
+    parent = str(parent_task_id or "")
+    seed = goal if not parent else (parent + "\0" + goal)
+    return "c" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:12]
 
 
 def _dedupe(steps):
@@ -381,7 +386,7 @@ def child_goals(parent_goal, steps, *, parent_task_id="", campaign_id="", depth=
     """
     if depth >= MAX_DEPTH:
         return []
-    cid = campaign_id or campaign_id_for(parent_goal)
+    cid = campaign_id or campaign_id_for(parent_goal, parent_task_id=parent_task_id)
     out = []
     for i, step in enumerate(steps, 1):
         # THE % BINDS TIGHTER THAN THE +, so the format has to be closed before the constant
