@@ -502,3 +502,23 @@ def test_job_projection_is_scoped_to_the_controller_job(tmp_path):
     assert [w["name"] for w in projected["workers"]] == ["job_2"]
     assert projected["running"] is True
     assert projected["execution_mode"] == "LOCAL_LOOP"
+
+
+def test_controller_marker_preserves_supervisor_backoff_reservation(tmp_path):
+    from relay.local_loop_controller import _write_controller_marker, _read_controller_marker
+
+    state = tmp_path / "state"
+    state.mkdir()
+    job_id = "backoff-preserve"
+    _write_controller_marker(
+        state, job_id, ["--job-id", job_id], pid=111, started=10.0,
+        restart_count=7, retry_after=12345.0,
+    )
+    marker = _write_controller_marker(
+        state, job_id, ["--job-id", job_id], pid=222, started=20.0,
+    )
+    assert marker["pid"] == 222
+    assert marker["started"] == 20.0
+    assert marker["restart_count"] == 7
+    assert marker["retry_after"] == 12345.0
+    assert _read_controller_marker(state, job_id) == marker
