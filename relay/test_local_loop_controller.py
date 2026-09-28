@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from relay.local_job_store import LocalJobStore
 from relay.local_loop_controller import (
@@ -8,6 +9,7 @@ from relay.local_loop_controller import (
     _close_driver_page,
     _job_from_goal,
     _new_companion_job_id,
+    _controller_resume_argv,
     _project_job_snapshot,
     _read_goal_file,
     _write_atomic,
@@ -714,3 +716,37 @@ def test_stale_campaign_manifest_is_ignored_by_an_unrelated_standalone_job(tmp_p
     projected = json.loads(status_path.read_text(encoding="utf-8"))
     assert [w["name"] for w in projected["workers"]] == ["standalone"]
     assert projected["open_tabs"] == 1
+
+
+def test_controller_resume_argv_preserves_an_explicit_commands_file(tmp_path):
+    from types import SimpleNamespace
+
+    commands = tmp_path / "child-commands.json"
+    args = SimpleNamespace(
+        state_dir=str(tmp_path), db=str(tmp_path / "jobs.sqlite3"),
+        cdp_url="http://localhost:9222", commands_file=str(commands),
+        poll_seconds=1.0, turn_timeout=1800.0, ui_idle_timeout=300.0,
+        rotate_after_turns=5, js_heap_limit_mb=0.0, dom_node_limit=0, edge_mb_limit=0.0,
+    )
+    argv = _controller_resume_argv(args, "job_1")
+    i = argv.index("--commands-file")
+    assert Path(argv[i + 1]) == commands.resolve()
+
+
+def test_controller_resume_argv_omits_commands_file_when_using_the_default(tmp_path):
+    from types import SimpleNamespace
+
+    args = SimpleNamespace(
+        state_dir=str(tmp_path), db=None, cdp_url="http://localhost:9222", commands_file=None,
+        poll_seconds=1.0, turn_timeout=1800.0, ui_idle_timeout=300.0,
+        rotate_after_turns=5, js_heap_limit_mb=0.0, dom_node_limit=0, edge_mb_limit=0.0,
+    )
+    argv = _controller_resume_argv(args, "job_1")
+    assert "--commands-file" not in argv
+
+
+def test_controller_cli_has_a_separate_child_command_channel_with_root_default():
+    source = Path(__file__).with_name("local_loop_controller.py").read_text(encoding="utf-8")
+    assert '"--commands-file"' in source
+    assert 'commands_path=(Path(args.commands_file) if args.commands_file else' in source
+    assert 'Path(args.state_dir) / "commands.json")' in source

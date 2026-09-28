@@ -416,6 +416,8 @@ def _controller_resume_argv(args, job_id: str) -> list[str]:
         out += ["--db", str(Path(args.db).resolve())]
     if getattr(args, "cdp_url", None):
         out += ["--cdp-url", str(args.cdp_url)]
+    if getattr(args, "commands_file", None):
+        out += ["--commands-file", str(Path(args.commands_file).resolve())]
     for flag, attr in (
         ("--poll-seconds", "poll_seconds"),
         ("--turn-timeout", "turn_timeout"),
@@ -901,6 +903,10 @@ def main(argv=None):
     ap.add_argument("--agent-url", default=os.environ.get("MCP_FLEET_AGENT_URL") or
                     os.environ.get("MCP_IMPL_AGENT_URL"))
     ap.add_argument("--state-dir", default=".fleet")
+    ap.add_argument(
+        "--commands-file",
+        help="optional controller-specific command file; defaults to <state-dir>/commands.json",
+    )
     ap.add_argument("--poll-seconds", type=float, default=1.0)
     ap.add_argument("--turn-timeout", type=float, default=1800)
     ap.add_argument("--ui-idle-timeout", type=float, default=300)
@@ -979,7 +985,8 @@ def main(argv=None):
             controller = LocalLoopController(
                 store, job_id, driver,
                 status_path=Path(args.state_dir) / "status.json",
-                commands_path=Path(args.state_dir) / "commands.json",
+                commands_path=(Path(args.commands_file) if args.commands_file else
+                               Path(args.state_dir) / "commands.json"),
                 poll_seconds=args.poll_seconds,
                 turn_timeout_seconds=args.turn_timeout,
                 ui_idle_timeout_seconds=args.ui_idle_timeout,
