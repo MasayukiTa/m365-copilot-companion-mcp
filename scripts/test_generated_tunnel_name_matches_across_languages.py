@@ -63,7 +63,7 @@ def _names_table() -> list[str]:
     """One shared table both implementations are run over. Order is not significant; each
     name is checked independently."""
     this_machine_suffix = bootstrap._machine_suffix()
-    legacy_suffix = bootstrap._legacy_machine_suffix()
+    legacy_suffix = "abcdef"  # representative legacy 6-hex shape; no SHA-1 recomputation
     default = bootstrap.DEFAULT_TUNNEL_NAME
     return [
         "",

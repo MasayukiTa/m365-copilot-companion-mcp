@@ -47,6 +47,18 @@ static class FleetCommands
     /// </summary>
     public static bool Write(string stateDir, Dictionary<string, object> patch)
     {
+        string ignored;
+        return WriteTracked(stateDir, patch, out ignored);
+    }
+
+    /// <summary>
+    /// Same atomic one-file write as Write(), but also returns the exact .json path that landed.
+    /// The cockpit uses this only for live add_goal so it can tell "runner claimed it" from
+    /// "runner ended and this exact durable command is still waiting".
+    /// </summary>
+    public static bool WriteTracked(string stateDir, Dictionary<string, object> patch, out string landedPath)
+    {
+        landedPath = null;
         try
         {
             if (string.IsNullOrEmpty(stateDir) || patch == null) return false;
@@ -83,7 +95,7 @@ static class FleetCommands
             DateTime until = DateTime.UtcNow.AddSeconds(2.0);
             while (true)
             {
-                try { File.Move(tmp, path); return true; }
+                try { File.Move(tmp, path); landedPath = path; return true; }
                 catch (IOException)
                 {
                     if (DateTime.UtcNow > until)

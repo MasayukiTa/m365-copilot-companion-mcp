@@ -32,7 +32,7 @@ import locale
 import os
 import subprocess
 
-__all__ = ["decode", "run", "headless_creationflags"]
+__all__ = ["decode", "run", "headless_creationflags", "tree_popen_kwargs", "kill_tree"]
 
 
 def decode(raw) -> str:
@@ -122,3 +122,57 @@ def headless_creationflags() -> int:
     if os.name != "nt":
         return 0
     return getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+
+def tree_popen_kwargs(headless: bool = False) -> dict:
+    """Popen kwargs that make the spawned process the root of a killable tree.
+
+    POSIX needs a fresh session so ``killpg(proc.pid, ...)`` cannot target the caller's own
+    process group. Windows ``taskkill /PID <root> /T`` already walks descendants while the root
+    is live; ``CREATE_NO_WINDOW`` is orthogonal and is added only when the caller is unattended.
+    """
+    if os.name == "nt":
+        return {"creationflags": headless_creationflags() if headless else 0}
+    return {"start_new_session": True}
+
+
+def kill_tree(proc, wait_s: float = 5.0) -> bool:
+    """Best-effort hard stop of ``proc`` and everything it started; never raises.
+
+    Every caller using this must have spawned with :func:`tree_popen_kwargs`. On Windows the
+    descendant walk must happen while the root PID is still attributable, so taskkill is tried
+    before the direct-child fallback. On POSIX the dedicated session makes proc.pid the pgid.
+    Returns True when the direct process is no longer running after cleanup.
+    """
+    if proc is None:
+        return True
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=max(1.0, float(wait_s)),
+                creationflags=headless_creationflags(),
+            )
+        else:
+            import signal
+            try:
+                os.killpg(int(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    except Exception:
+        pass
+    try:
+        if proc.poll() is None:
+            proc.kill()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=max(0.1, float(wait_s)))
+    except Exception:
+        pass
+    try:
+        return proc.poll() is not None
+    except Exception:
+        return False
