@@ -45,7 +45,24 @@ def test_local_loop_restart_backoff_grows_and_is_capped():
     assert '$nowEpoch + 30' not in resume
 
 
-def test_child_marker_backoff_is_not_cleared_by_supervisor_contract():
+def test_child_marker_backoff_is_reserved_without_supervisor_ownership_write():
     resume = SRC[SRC.index('function Invoke-LocalLoopAutoResume'):SRC.index('# -- Queue delivery:')]
     assert 'restart_count' in resume and 'retry_after' in resume
-    assert 'healthy child preserves this deadline' in resume
+    assert '$marker | Add-Member -NotePropertyName restart_count' in resume
+    assert '$marker | Add-Member -NotePropertyName retry_after' in resume
+    assert 'Add-Member -NotePropertyName pid' not in resume
+    assert 'Add-Member -NotePropertyName started' not in resume
+
+
+def test_supervisor_never_steals_local_loop_marker_ownership_from_controller():
+    resume = SRC[SRC.index('function Invoke-LocalLoopAutoResume'):SRC.index('# -- Queue delivery:')]
+    # Only the controller that won the per-job kernel lock may write pid/started ownership.
+    assert 'Add-Member -NotePropertyName pid' not in resume
+    assert 'Add-Member -NotePropertyName started' not in resume
+    assert 'supervisor never rewrites pid/started ownership' in resume
+
+def test_backoff_marker_is_persisted_before_child_spawn():
+    resume = SRC[SRC.index('function Invoke-LocalLoopAutoResume'):SRC.index('# -- Queue delivery:')]
+    write_i = resume.index('if (-not (Write-LocalLoopMarkerAtomic')
+    spawn_i = resume.index('$proc = Start-Process')
+    assert write_i < spawn_i

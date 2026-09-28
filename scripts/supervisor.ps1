@@ -1619,25 +1619,33 @@ function Invoke-LocalLoopAutoResume {
         $shown = $resumeArgs -join " "
         try { $restart = [int]$marker.restart_count + 1 } catch { $restart = 1 }
         $retryDelay = Get-LocalLoopRetryDelaySeconds -RestartCount $restart
+
+        # Reserve this retry BEFORE spawning, but do not claim controller ownership here.
+        # The supervisor never rewrites pid/started ownership: only a controller that actually
+        # wins the per-job kernel lock may publish its process identity. This avoids both the
+        # fast-child race (child writes a newer marker before Start-Process returns) and the
+        # false-death race (a duplicate child loses the lock but would otherwise steal marker
+        # ownership from the still-live controller).
+        $marker | Add-Member -NotePropertyName restart_count -NotePropertyValue $restart -Force
+        $marker | Add-Member -NotePropertyName retry_after -NotePropertyValue ($nowEpoch + $retryDelay) -Force
+        if (-not (Write-LocalLoopMarkerAtomic -Path $file.FullName -Marker $marker)) {
+            Write-Log "LOCAL_LOOP auto-resume skipped for '$jobId': could not persist retry/backoff marker"
+            continue
+        }
+
         try {
             $launchAt = Get-Date
             $proc = Start-Process -FilePath $Py -ArgumentList (@("-m", "relay.local_loop_controller") + $resumeArgs) `
                 -WorkingDirectory $Root -WindowStyle Hidden -PassThru
-            # Close the spawn/next-tick window immediately. The healthy child preserves this deadline
-            # when it rewrites the marker with its own pid after acquiring the per-job kernel lock.
-            $marker | Add-Member -NotePropertyName pid -NotePropertyValue $proc.Id -Force
-            $marker | Add-Member -NotePropertyName started -NotePropertyValue ([DateTimeOffset]::new($launchAt).ToUnixTimeSeconds()) -Force
-            $marker | Add-Member -NotePropertyName restart_count -NotePropertyValue $restart -Force
-            $marker | Add-Member -NotePropertyName retry_after -NotePropertyValue ($nowEpoch + $retryDelay) -Force
-            [void](Write-LocalLoopMarkerAtomic -Path $file.FullName -Marker $marker)
+            # A healthy child takes the per-job lock and then rewrites pid/started itself while
+            # preserving the restart_count/retry_after deadline reserved above.
             Register-AutoResumeRunner -Proc $proc -LaunchTime $launchAt -Kind ("local-loop:" + $jobId) `
                 -CommandLine ('"' + $Py + '" -m relay.local_loop_controller ' + $shown)
             Write-Log "LOCAL_LOOP job '$jobId' INTERRUPTED -> relaunched pid $($proc.Id) from $($file.Name)"
             $did = $true
         } catch {
-            $marker | Add-Member -NotePropertyName restart_count -NotePropertyValue $restart -Force
-            $marker | Add-Member -NotePropertyName retry_after -NotePropertyValue ($nowEpoch + $retryDelay) -Force
-            [void](Write-LocalLoopMarkerAtomic -Path $file.FullName -Marker $marker)
+            # The backoff reservation is already durable. Do not alter pid/started here: the
+            # old dead owner remains evidence until a future lock-winning controller replaces it.
             Write-Log "LOCAL_LOOP auto-resume FAILED for '$jobId' (retry in ${retryDelay}s): $($_.Exception.Message)"
         }
     }
