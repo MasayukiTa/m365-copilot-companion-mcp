@@ -829,6 +829,20 @@ class LocalJobStore:
                 _bounded_text(event_type, 128, "event_type"), dict(payload or {}), now,
             )
 
+    def ui_trigger_attempt_count(self, job_id: str) -> int:
+        """Durable count of RUN trigger attempts across controller process restarts."""
+        job_id = self._validate_job_id(job_id)
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM events WHERE job_id=? AND event_type='UI_TRIGGER_ATTEMPT'",
+                (job_id,),
+            ).fetchone()
+            return int(row[0] if row else 0)
+        finally:
+            conn.close()
+
+
     def mark_waiting_runtime(self, job_id: str, reason: str,
                              now: float | None = None) -> dict:
         job_id = self._validate_job_id(job_id)
