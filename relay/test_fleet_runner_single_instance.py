@@ -57,3 +57,35 @@ def test_unreadable_existing_active_marker_fails_closed(tmp_path):
 def test_noninteger_active_marker_pid_fails_closed(tmp_path):
     fr._write_atomic(str(tmp_path / fr.ACTIVE_MARKER), {'pid': 'not-a-pid'})
     assert fr._active_run_conflict_pid(str(tmp_path), self_pid=1234) != 0
+
+
+def test_reused_pid_with_different_birth_is_not_a_live_marker_owner(tmp_path, monkeypatch):
+    fr._write_atomic(str(tmp_path / fr.ACTIVE_MARKER), {
+        "pid": 9876, "pid_birth": 111000, "start_ts": 1.0, "resume_argv": ["--resume"],
+    })
+    monkeypatch.setattr(fr, "_pid_alive", lambda pid: int(pid) == 9876)
+    monkeypatch.setattr(fr, "_pid_birth_token", lambda pid: 222000 if int(pid) == 9876 else 0)
+    assert fr._active_run_conflict_pid(str(tmp_path), self_pid=1234) == 0
+
+
+def test_same_process_birth_keeps_the_active_marker_live(tmp_path, monkeypatch):
+    fr._write_atomic(str(tmp_path / fr.ACTIVE_MARKER), {
+        "pid": 9876, "pid_birth": 111000, "start_ts": 1.0, "resume_argv": ["--resume"],
+    })
+    monkeypatch.setattr(fr, "_pid_alive", lambda pid: int(pid) == 9876)
+    monkeypatch.setattr(fr, "_pid_birth_token", lambda pid: 111000 if int(pid) == 9876 else 0)
+    assert fr._active_run_conflict_pid(str(tmp_path), self_pid=1234) == 9876
+
+
+def test_legacy_active_marker_without_birth_remains_conservative(tmp_path, monkeypatch):
+    fr._write_atomic(str(tmp_path / fr.ACTIVE_MARKER), {
+        "pid": 9876, "start_ts": 1.0, "resume_argv": ["--resume"],
+    })
+    monkeypatch.setattr(fr, "_pid_alive", lambda pid: int(pid) == 9876)
+    monkeypatch.setattr(fr, "_pid_birth_token", lambda pid: 222000)
+    assert fr._active_run_conflict_pid(str(tmp_path), self_pid=1234) == 9876
+
+
+def test_boot_resumer_uses_the_same_process_instance_identity():
+    src = (Path(__file__).resolve().parents[1] / "scripts" / "win" / "resume_interrupted_fleet.py").read_text(encoding="utf-8")
+    assert "marker_owner_alive(marker, pid_alive)" in src
