@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 from relay.acceptance import Check, normalize_checks
+from relay.execution_profiles import ExecutionProfile
 from relay.local_job_store import (
     INTERACTION_WAIT_STATUSES,
     JobStoreError,
@@ -83,19 +84,69 @@ def _read_goal_file(path: str | os.PathLike) -> str:
     return text
 
 
-def _project_job_snapshot(store: LocalJobStore, job_id: str, status_path: str | os.PathLike) -> dict:
-    """Write a one-job FleetCockpit snapshot from the durable SQLite authority."""
+def _project_job_snapshot(store: LocalJobStore, job_id: str, status_path: str | os.PathLike,
+                          *, now: float | None = None, terminal_grace_seconds: float = 120.0) -> dict:
+    """Project every LOCAL_LOOP job visible in this state dir without leaking shared-DB jobs.
+
+    Controllers are locked per *job*, so several durable jobs may legitimately run at once and
+    all of them write the same FleetCockpit status file.  Projection membership therefore comes
+    from this state dir's active marker files plus LOCAL_LOOP rows already visible in the previous
+    status, never from every row in a potentially shared SQLite database.  Recently terminal rows
+    get a short display grace so another controller cannot erase completion before Cockpit/history
+    observes it.
+    """
+    now = time.time() if now is None else float(now)
+    terminal_grace_seconds = max(0.0, float(terminal_grace_seconds))
+    status_path = Path(status_path)
+    state_dir = status_path.parent
     snapshot = store.console_snapshot()
-    status = store.get_job_status(job_id)["status"]
-    snapshot["workers"] = [
-        worker for worker in snapshot.get("workers", []) if worker.get("name") == job_id
-    ]
-    snapshot["total"] = len(snapshot["workers"])
-    snapshot["done_count"] = sum(
-        1 for worker in snapshot["workers"] if worker.get("outcome") == "DONE"
+
+    marker_ids = set()
+    marker_dir = state_dir / LOCAL_LOOP_MARKER_DIR
+    try:
+        for marker in marker_dir.glob("*.json"):
+            try:
+                marker_ids.add(LocalJobStore._validate_job_id(marker.stem))
+            except JobStoreError:
+                continue
+    except OSError:
+        pass
+
+    previous_ids = set()
+    try:
+        previous = json.loads(status_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, TypeError):
+        previous = {}
+    for worker in previous.get("workers", []):
+        if worker.get("execution_profile") != ExecutionProfile.LOCAL_LOOP.value:
+            continue
+        try:
+            previous_ids.add(LocalJobStore._validate_job_id(worker.get("name")))
+        except JobStoreError:
+            continue
+
+    candidate_ids = marker_ids | previous_ids | {LocalJobStore._validate_job_id(job_id)}
+    workers = []
+    for worker in snapshot.get("workers", []):
+        name = worker.get("name")
+        if name not in candidate_ids:
+            continue
+        if worker.get("closed") and name != job_id and name not in marker_ids:
+            updated = float(worker.get("updated_at") or 0.0)
+            if name not in previous_ids or now - updated > terminal_grace_seconds:
+                continue
+        workers.append(worker)
+
+    snapshot["workers"] = workers
+    snapshot["total"] = len(workers)
+    snapshot["done_count"] = sum(1 for worker in workers if worker.get("outcome") == "DONE")
+    snapshot["running"] = any(not bool(worker.get("closed")) for worker in workers)
+    snapshot["open_tabs"] = sum(1 for worker in workers if not bool(worker.get("closed")))
+    snapshot["started"] = min(
+        (float(worker.get("created_at") or worker.get("updated_at") or now) for worker in workers),
+        default=now,
     )
-    snapshot["running"] = status not in TERMINAL_JOB_STATUSES
-    snapshot["open_tabs"] = 0 if status in TERMINAL_JOB_STATUSES else 1
+    snapshot["updated"] = now
     _write_atomic(status_path, snapshot)
     return snapshot
 
@@ -184,9 +235,29 @@ def probe_browser_interaction(driver) -> str:
 def _write_atomic(path: str | os.PathLike, payload: dict) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(target.name + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, target)
+    # Multiple LOCAL_LOOP controllers legitimately project the same status.json concurrently.
+    # A shared ``status.json.tmp`` lets one controller replace/delete another controller's temp
+    # file. Give each write its own same-directory temp so only the final os.replace is shared.
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        # Windows can transiently reject two concurrent replaces of the same destination with
+        # WinError 5/32 even though each source temp is independent. Retry only that sharing
+        # contention; the payload itself stays private to this writer until replace succeeds.
+        deadline = time.monotonic() + 1.0
+        while True:
+            try:
+                os.replace(tmp, target)
+                break
+            except PermissionError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.005)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 LOCAL_LOOP_MARKER_DIR = "local_loop_active"
