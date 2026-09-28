@@ -68,6 +68,16 @@ sealed class SubmittedView
     public bool Dismissable;       // stale with no file behind it: the person may clear it
 }
 
+/// Aggregate health of the submitted-but-not-yet-worker group. Kept out of WPF so tests and
+/// health publication use the exact same definition of stale work.
+sealed class SubmittedHealth
+{
+    public int Total;
+    public int StaleCount;
+    public int TakenStaleCount;
+    public double OldestAgeS;
+}
+
 /// A worker or a submitted entry, in display order.
 sealed class SubmittedDisplayItem
 {
@@ -90,6 +100,22 @@ sealed class SubmittedTasks
     /// treated as old. Three minutes: long enough to be seen after a submission, short enough
     /// that a worker stuck behind the gate stops crowding the live ones.
     public const double FRESH_PENDING_S = 180.0;
+
+    public static SubmittedHealth SummarizeHealth(IList<SubmittedView> views)
+    {
+        var h = new SubmittedHealth();
+        if (views == null) return h;
+        h.Total = views.Count;
+        foreach (SubmittedView v in views)
+        {
+            if (v == null) continue;
+            if (v.AgeS > h.OldestAgeS) h.OldestAgeS = v.AgeS;
+            if (!v.Stale) continue;
+            h.StaleCount++;
+            if (string.Equals(v.Source, "taken", StringComparison.Ordinal)) h.TakenStaleCount++;
+        }
+        return h;
+    }
 
     /// Files bigger than this are not commands or queue entries anyone wrote on purpose; they
     /// are skipped rather than parsed on a 700 ms tick.

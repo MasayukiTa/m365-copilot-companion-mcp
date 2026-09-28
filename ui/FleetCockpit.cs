@@ -1454,6 +1454,7 @@ class CockpitWindow : Window
         if (k == "hs_fix") return ja ? "直す" : "Fix";
         if (k == "hs_fixing_button") return ja ? "修復中…" : "Fixing…";
         if (k == "hs_fix_hint") return ja ? "検出された不具合を直す" : "Fix the detected problem";
+        if (k == "hs_queue_stale") return ja ? "未着手の投入済みタスクが {0} 件、最長 {1} 続いています" : "{0} submitted task(s) still unstarted; oldest {1}";
         if (k == "hs_ok") return ja ? "正常" : "OK";
         if (k == "hs_down") return ja ? "応答なし" : "down";
         if (k == "hs_unknown") return ja ? "未設定/不明" : "unknown";
@@ -2549,13 +2550,24 @@ class CockpitWindow : Window
             _fixBtn.IsEnabled = !_fixRunning;
             _fixBtn.Content = BuildFixPillContent(_fixRunning);
         }
-        // Clear the stale hint text once everything the strip knows about is healthy again (not
-        // mid-fix): RunFix's note() writes _fixNote.Text once and nothing else used to clear it,
-        // so "run start_all.bat"-style residue could persist forever after the stack recovered.
-        // This runs on the UI thread already (ApplyHealthToUi's documented contract), so no
-        // Dispatcher marshal is needed here (mirrors the rest of this method).
-        if (!anyBad && !_fixRunning && _fixNote != null && _fixNote.Text.Length > 0)
-            _fixNote.Text = "";
+        // Queue starvation is a SEPARATE operational fact, not a seventh infra dot. If a
+        // submitted item survives the worker-pickup budget after current/history reconciliation,
+        // surface it here so the operator does not have to discover it by scrolling.
+        SubmittedHealth queueHealth = SubmittedTasks.SummarizeHealth(ReadQueuedJobs());
+        if (!anyBad && !_fixRunning && _fixNote != null)
+        {
+            if (queueHealth.StaleCount > 0)
+            {
+                _fixNote.Text = string.Format(T("hs_queue_stale"), queueHealth.StaleCount,
+                    SubmittedTasks.Age(queueHealth.OldestAgeS, _lang == 0));
+                _fixNote.Foreground = Theme.Br(Theme.Warning(_dark));
+            }
+            else if (_fixNote.Text.Length > 0)
+            {
+                _fixNote.Text = "";
+                _fixNote.Foreground = Muted;
+            }
+        }
     }
     static readonly string[] _healthKeys = { "hs_server", "hs_tunnel", "hs_edge", "hs_signin", "hs_agent", "hs_tool" };
 
@@ -2915,11 +2927,15 @@ class CockpitWindow : Window
             // the same files. That distinction is the whole value: a reader comparing this
             // against .fleet/tasks/pending can see the display and the truth disagree.
             var qj = ReadQueuedJobs();
+            SubmittedHealth qh = SubmittedTasks.SummarizeHealth(qj);
             // WHERE IT LOOKED. A panel that reports "nothing queued" without saying where
             // it looked cannot be checked against the queue on disk -- which is the one
             // comparison this publication exists to make possible.
             sb.Append(",\"queue_dir\":\"").Append(JsonEscape(TasksDir())).Append('"');
             sb.Append(",\"queued_count\":").Append(qj.Count.ToString(inv));
+            sb.Append(",\"queued_stale_count\":").Append(qh.StaleCount.ToString(inv));
+            sb.Append(",\"queued_taken_stale_count\":").Append(qh.TakenStaleCount.ToString(inv));
+            sb.Append(",\"queued_oldest_age_s\":").Append(qh.OldestAgeS.ToString("F1", inv));
             sb.Append(",\"queued\":[");
             for (int qi = 0; qi < qj.Count && qi < 20; qi++)
             {
