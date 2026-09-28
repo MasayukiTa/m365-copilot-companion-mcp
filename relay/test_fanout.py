@@ -315,6 +315,24 @@ def test_the_merge_joins_the_campaign_it_merges():
     assert g["task_id"].endswith("-merge")
 
 
+def test_nested_merge_fallback_uses_the_same_parent_scoped_campaign_as_children():
+    steps = ["slice A collect records", "slice B collect records"]
+    kids = fo.child_goals("same nested goal", steps, parent_task_id="outer-c1")
+    merge = fo.aggregation_goal("same nested goal", [_r(1, "DONE", "a")],
+                                parent_task_id="outer-c1")
+    assert kids
+    assert merge["campaign_id"] == kids[0]["campaign_id"]
+    assert merge["parent_task_id"] == "outer-c1"
+
+
+def test_nested_merge_fallback_changes_with_parent_task_identity():
+    a = fo.aggregation_goal("same nested goal", [_r(1, "DONE", "a")],
+                            parent_task_id="outer-c1")
+    b = fo.aggregation_goal("same nested goal", [_r(1, "DONE", "a")],
+                            parent_task_id="outer-c2")
+    assert a["campaign_id"] != b["campaign_id"]
+
+
 # ---- a slice that was retried ---------------------------------------------------------------
 
 def test_a_retried_slice_reports_the_attempt_that_worked():
