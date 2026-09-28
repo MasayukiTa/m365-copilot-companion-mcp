@@ -36,11 +36,13 @@ import re
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 COCKPIT = os.path.join(REPO, "ui", "FleetCockpit.cs")
+COCKPIT_HEALTH = os.path.join(REPO, "ui", "FleetCockpit.Health.cs")
 SELFIMPROVE_DASHBOARD = os.path.join(REPO, "ui", "SelfImproveDashboard.cs")
 
 
 def _src():
-    return io.open(COCKPIT, encoding="utf-8").read()
+    return (io.open(COCKPIT, encoding="utf-8-sig").read() + "\n"
+            + io.open(COCKPIT_HEALTH, encoding="utf-8-sig").read())
 
 
 def _dashboard_src():

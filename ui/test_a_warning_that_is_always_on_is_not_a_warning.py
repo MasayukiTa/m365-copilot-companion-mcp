@@ -36,6 +36,7 @@ import re
 
 UI = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(UI, "FleetCockpit.cs")
+HEALTH = os.path.join(UI, "FleetCockpit.Health.cs")
 
 
 def _executable(cs: str) -> str:
@@ -55,8 +56,11 @@ def _executable(cs: str) -> str:
 
 
 def _src() -> str:
-    with open(SRC, encoding="utf-8") as fh:
-        return fh.read()
+    with open(SRC, encoding="utf-8-sig") as fh:
+        main = fh.read()
+    with open(HEALTH, encoding="utf-8-sig") as fh:
+        health = fh.read()
+    return main + "\n" + health
 
 
 SOURCE = _executable(_src())

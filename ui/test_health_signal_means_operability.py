@@ -8,7 +8,8 @@ color is reserved for impaired/uncertain operation that changes what the operato
 from pathlib import Path
 import re
 
-SRC = Path(__file__).with_name('FleetCockpit.cs').read_text(encoding='utf-8-sig')
+SRC = (Path(__file__).with_name('FleetCockpit.cs').read_text(encoding='utf-8-sig')
+       + '\n' + Path(__file__).with_name('FleetCockpit.Health.cs').read_text(encoding='utf-8-sig'))
 
 
 def _between(start, end):

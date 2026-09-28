@@ -398,6 +398,7 @@ jobs:
             ui/test_no_coloured_left_rails.py \
             ui/test_no_emoji_in_chrome.py \
             ui/test_health_signal_means_operability.py \
+            ui/test_fleetcockpit_is_split_by_responsibility.py \
             ui/test_spacing_scale.py \
             ui/test_retention_settings.py \
             bridge/test_skills_bridge.py \

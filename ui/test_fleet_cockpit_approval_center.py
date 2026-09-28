@@ -1,7 +1,8 @@
 from pathlib import Path
 
 
-SOURCE = Path(__file__).with_name("FleetCockpit.cs").read_text(encoding="utf-8")
+SOURCE = (Path(__file__).with_name("FleetCockpit.cs").read_text(encoding="utf-8-sig")
+          + "\n" + Path(__file__).with_name("FleetCockpit.Health.cs").read_text(encoding="utf-8-sig"))
 
 
 def test_run_mode_is_not_mislabeled_as_operation_approval():

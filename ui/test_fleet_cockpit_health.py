@@ -20,7 +20,8 @@
 """
 from pathlib import Path
 
-RAW = (Path(__file__).with_name("FleetCockpit.cs")).read_text(encoding="utf-8")
+RAW = ((Path(__file__).with_name("FleetCockpit.cs")).read_text(encoding="utf-8-sig")
+       + "\n" + (Path(__file__).with_name("FleetCockpit.Health.cs")).read_text(encoding="utf-8-sig"))
 
 
 def _executable(cs):
