@@ -1267,7 +1267,7 @@ class CockpitWindow : Window
                 Path.Combine(tasks, "pending"),
                 Path.Combine(tasks, "for_fleet"));
             List<SubmittedView> views = _submitted.Refresh(files, StartedOf(root),
-                                                           WorkersOf(root), NowUnix());
+                                                           WorkersOf(root), HistoryWorkers(), NowUnix());
             _submittedNow = views;
             _submittedSig = SubmittedTasks.Signature(views, _lang == 0);
         }
@@ -1292,6 +1292,18 @@ class CockpitWindow : Window
         return l;
     }
 
+    List<Dictionary<string, object>> HistoryWorkers()
+    {
+        var l = new List<Dictionary<string, object>>();
+        if (_history == null) return l;
+        foreach (object o in _history)
+        {
+            var d = o as Dictionary<string, object>;
+            if (d != null) l.Add(d);
+        }
+        return l;
+    }
+
     // THE INSTANT THIS WINDOW SUBMITS: put each goal in the "submitted" group before any file
     // is read back, then re-render on the next dispatcher turn. BeginInvoke, not a direct
     // ForceRender: AutoRetryScan calls RetryGoal from inside OnTick, and a nested OnTick there
@@ -1305,9 +1317,10 @@ class CockpitWindow : Window
             Dictionary<string, object> root = ReadStatus();
             string started = StartedOf(root);
             List<Dictionary<string, object>> workers = WorkersOf(root);
+            List<Dictionary<string, object>> history = HistoryWorkers();
             double now = NowUnix();
             foreach (string g in goals)
-                _submitted.AddLocal(SubmittedTasks.GoalTextOf(g), now, started, workers);
+                _submitted.AddLocal(SubmittedTasks.GoalTextOf(g), now, started, workers, history);
             Dispatcher.BeginInvoke(new Action(ForceRender));
         }
         catch (Exception) { }
