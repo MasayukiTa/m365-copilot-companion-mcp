@@ -1301,41 +1301,55 @@ def step_gen_env() -> None:
         # and this file lacks. Append-only; never changes a value the user has.
         # Read with its own line endings kept, so the append below writes in the same ones.
         current = env_file.read_text(env_path)
-        # SECURITY MIGRATION: legacy installs stored MCP_API_KEY in clear text. Keep the SAME
-        # bearer token (Copilot Studio must not be desynchronised), but replace the plaintext
-        # assignment with a user-bound DPAPI ciphertext before any other .env repair.
+        # SECURITY MIGRATION: normalize BOTH legacy plaintext auth aliases in memory before
+        # the first persistence call.  Migrating API -> writing -> migrating unlock used to
+        # transiently re-save the still-plaintext unlock password.  The final env sink now
+        # fails closed on either legacy alias, so the conversion is deliberately one batch.
+        _lines = current.splitlines()
+        _had_trailing_nl = current.endswith(("\n", "\r"))
+        _nl = env_file.newline_of(current)
+        _has_protected_api = any(
+            line.lstrip().startswith("MCP_API_KEY_PROTECTED=") for line in _lines)
+        _has_protected_unlock = any(
+            line.lstrip().startswith(UNLOCK_PASSWORD_PROTECTED_VAR + "=") for line in _lines)
         _legacy_api = None
-        _lines = current.splitlines()
-        for _line in _lines:
-            if _line.lstrip().startswith("MCP_API_KEY="):
-                _legacy_api = _line.split("=", 1)[1].strip()
-                break
-        _has_protected_api = any(_line.lstrip().startswith("MCP_API_KEY_PROTECTED=") for _line in _lines)
-        if _legacy_api and not _has_protected_api:
-            _nl = env_file.newline_of(current)
-            _out = []
-            for _line in _lines:
-                if _line.lstrip().startswith("MCP_API_KEY="):
-                    continue
-                _out.append(_line)
-            _out.append("MCP_API_KEY_PROTECTED=" + protect_secret(_legacy_api))
-            current = _nl.join(_out) + _nl
-            env_file.atomic_write_text(env_path, current)
-            log("    OK: migrated legacy clear-text MCP_API_KEY to DPAPI-protected storage")
         _legacy_unlock = None
-        _lines = current.splitlines()
+        _kept = []
         for _line in _lines:
-            if _line.lstrip().startswith("MCP_UNLOCK_PASSWORD="):
-                _legacy_unlock = _line.split("=", 1)[1].strip()
-                break
-        _has_protected_unlock = any(_line.lstrip().startswith(UNLOCK_PASSWORD_PROTECTED_VAR + "=") for _line in _lines)
-        if _legacy_unlock and not _has_protected_unlock:
-            _nl = env_file.newline_of(current)
-            _out = [ln for ln in _lines if not ln.lstrip().startswith("MCP_UNLOCK_PASSWORD=")]
-            _out.append(UNLOCK_PASSWORD_PROTECTED_VAR + "=" + protect_secret(_legacy_unlock))
-            current = _nl.join(_out) + _nl
+            _stripped = _line.lstrip()
+            if _stripped.startswith("MCP_API_KEY="):
+                if _legacy_api is None:
+                    _legacy_api = _line.split("=", 1)[1].strip()
+                continue
+            if _stripped.startswith("MCP_UNLOCK_PASSWORD="):
+                if _legacy_unlock is None:
+                    _legacy_unlock = _line.split("=", 1)[1].strip()
+                continue
+            _kept.append(_line)
+
+        def _legacy_env_value(raw):
+            if raw is None:
+                return None
+            if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ("'", '"'):
+                return raw[1:-1]
+            return raw
+
+        _migrated_keys = []
+        if _legacy_api is not None:
+            if not _has_protected_api:
+                _kept.append("MCP_API_KEY_PROTECTED="
+                             + protect_secret(_legacy_env_value(_legacy_api)))
+            _migrated_keys.append("MCP_API_KEY")
+        if _legacy_unlock is not None:
+            if not _has_protected_unlock:
+                _kept.append(UNLOCK_PASSWORD_PROTECTED_VAR + "="
+                             + protect_secret(_legacy_env_value(_legacy_unlock)))
+            _migrated_keys.append("MCP_UNLOCK_PASSWORD")
+        if _migrated_keys:
+            current = _nl.join(_kept) + (_nl if _had_trailing_nl else "")
             env_file.atomic_write_text(env_path, current)
-            log("    OK: migrated legacy clear-text MCP_UNLOCK_PASSWORD to DPAPI-protected storage")
+            log("    OK: migrated legacy clear-text auth secret(s) to DPAPI-protected storage: "
+                + ", ".join(_migrated_keys))
         example_text = example.read_text(encoding="utf-8-sig") if example.exists() else None
         missing, left_commented = missing_template_lines(current, example_text)
         if left_commented:

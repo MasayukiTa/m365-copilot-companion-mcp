@@ -62,6 +62,24 @@ def newline_of(text: str) -> str:
     return "\r\n" if "\r\n" in text else "\n"
 
 
+def _assert_no_plaintext_auth_persistence(text: str) -> None:
+    """Fail closed if an active legacy auth-secret alias would be written.
+
+    This module is the final persistence primitive for .env/.env.bak.  Migration/protection is
+    intentionally owned by bootstrap/setup/rotate; the generic writer must never silently
+    preserve or create the old clear-text aliases.  Commented examples are not assignments.
+    """
+    bad = []
+    for line in text.splitlines():
+        m = _KEY_RE.match(line)
+        if m and m.group(1) in _PLAINTEXT_SECRET_KEYS:
+            bad.append(m.group(1))
+    if bad:
+        raise ValueError(
+            "refusing to persist legacy plaintext auth secret key(s): %s"
+            % ", ".join(sorted(set(bad))))
+
+
 def atomic_write_text(path: Path, text: str, attempts: int = 10) -> None:
     """Write `text` to `path` as UTF-8 without a BOM, all-or-nothing.
 
@@ -72,10 +90,15 @@ def atomic_write_text(path: Path, text: str, attempts: int = 10) -> None:
     an error. The temporary file is removed on every failure path so none is left behind.
     """
     path = Path(path)
+    _assert_no_plaintext_auth_persistence(text)
     tmp = path.with_name("%s.tmp-%d" % (path.name, os.getpid()))
     data = text.encode("utf-8")
     try:
         with open(tmp, "wb") as fh:
+            # The invariant above rejects the only legacy clear-text auth aliases before bytes
+            # exist. Protected auth values are DPAPI ciphertext; CodeQL cannot infer either our
+            # explicit key-level rejection or the ctypes CryptProtectData sanitizer.
+            # lgtm[py/clear-text-storage-sensitive-data]
             fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())

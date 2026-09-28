@@ -827,7 +827,7 @@ def _run_dev_tunnel_step(monkeypatch, repo):
 def test_a_carried_env_gives_up_its_tunnel_before_provisioning(repo, monkeypatch):
     """D7: the recorded name used to be re-provisioned and stamped as this machine's, so the
     same account hosted ONE tunnel from two PCs."""
-    _dev_tunnel_env(repo, ["MCP_API_KEY=k", "MCP_TUNNEL_NAME=team-tunnel",
+    _dev_tunnel_env(repo, ["MCP_API_KEY_PROTECTED=dpapi:opaque", "MCP_TUNNEL_NAME=team-tunnel",
                            "MCP_TUNNEL_URL=https://team-tunnel-8000.jpe1.devtunnels.ms/",
                            "MCP_TUNNEL_HOST=some-other-pc", "MCP_UNLOCK_PASSWORD_PROTECTED=dpapi:x"])
     tunnel = _run_dev_tunnel_step(monkeypatch, repo)
@@ -836,7 +836,7 @@ def test_a_carried_env_gives_up_its_tunnel_before_provisioning(repo, monkeypatch
     assert "\n# MCP_TUNNEL_NAME=team-tunnel" in text and "\nMCP_TUNNEL_NAME=" not in text
     assert "\n# MCP_TUNNEL_HOST=some-other-pc" in text
     assert "\nMCP_UNLOCK_PASSWORD_PROTECTED=dpapi:x" in text, "a non-tunnel key was set aside"
-    assert text.startswith("MCP_API_KEY=k\r\n"), "an unrelated tunnel edit changed another key"
+    assert text.startswith("MCP_API_KEY_PROTECTED=dpapi:opaque\r\n"), "an unrelated tunnel edit changed another key"
     assert "\n" not in text.replace("\r\n", ""), "line endings were disturbed"
 
 
