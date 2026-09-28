@@ -954,3 +954,27 @@ def test_the_launcher_does_not_surface_a_browser_when_it_cannot_tell():
             "the surfacing helper must sit directly under a check for exit 1, so 2 (cannot "
             "tell) never opens a window; found %r above line %d" % (prev, i + 1)
         )
+
+
+def test_edge_respawn_diagnostic_collector_is_read_only_and_complete():
+    src = (ROOT / "scripts" / "collect_edge_respawn_diagnostics.ps1").read_text(encoding="utf-8")
+    # Evidence needed to distinguish stale new-PC deployment from a remaining runtime defect.
+    for needle in (
+        "git rev-parse HEAD", "61409d7", "8765,9222,9223",
+        "bridge.log", "start_all_runs.jsonl", "signin_surfaced_9223.json",
+        "page_counts.jsonl", "m365-companion-supervisor.log", "Compress-Archive",
+    ):
+        assert needle in src
+    # Collection must never perturb the thing being diagnosed.
+    for forbidden in ("Stop-Process", "taskkill", "Start-Process", "Remove-Item $fleet", "Get-ChildItem Env:"):
+        assert forbidden not in src
+    # Timing envs are allow-listed individually; never copy .env wholesale into the bundle.
+    assert "Copy-IfPresent (Join-Path $root '.env')" not in src
+
+
+def test_edge_respawn_collector_names_the_known_loop_fix_and_managed_profiles():
+    src = (ROOT / "scripts" / "collect_edge_respawn_diagnostics.ps1").read_text(encoding="utf-8")
+    assert "contains_signin_loop_fix_61409d7" in src
+    assert "copilot-bridge-edge" in src
+    assert "copilot-companion-edge" in src
+    assert "copilot-eval-edge" in src
