@@ -58,6 +58,27 @@ $ErrorActionPreference = "SilentlyContinue"
 # (which this hosts) all live there.
 $Root = Split-Path -Parent $PSScriptRoot
 
+
+function Get-EnvBridgePort {
+    # start_bridge.ps1 supports MCP_BRIDGE_PORT; the lifecycle supervisor must ask the same port.
+    # Task Scheduler does not necessarily inherit the user's shell environment, so .env is the
+    # authoritative fallback just as it is for MCP_TUNNEL_NAME below.
+    $raw = [string]$env:MCP_BRIDGE_PORT
+    if (-not $raw) {
+        try {
+            $envp = Join-Path $Root ".env"
+            if (Test-Path $envp) {
+                $m = (Get-Content $envp | Where-Object { $_ -match '^\s*MCP_BRIDGE_PORT\s*=' } | Select-Object -First 1)
+                if ($m) { $raw = ($m -replace '^\s*MCP_BRIDGE_PORT\s*=\s*', '').Trim() }
+            }
+        } catch { }
+    }
+    $p = 0
+    if ($raw -and [int]::TryParse($raw, [ref]$p) -and $p -ge 1 -and $p -le 65535) { return $p }
+    return 8765
+}
+$BridgePort = Get-EnvBridgePort
+
 # Shared PURE helpers (Get-BareTunnelName / Test-SupervisorTunnelDrift) used below to
 # self-correct if .env's MCP_TUNNEL_NAME changes while this supervisor is already
 # running -- see tunnel_name_util.ps1's header comment. No top-level side effects, so
@@ -436,6 +457,51 @@ function Test-ServerUp {
 }
 
 
+function Test-IsThisCheckoutBridgeCommandLine {
+    # PURE. The process which owns the bridge HTTP port is ours only when its command line names
+    # THIS checkout's bridge/copilot_bridge.py. A random local http.server on the reserved port is
+    # not a broken bridge and must not be allowed to hold an unrelated stale MCP server hostage.
+    param([string]$CommandLine, [string]$RootDir)
+    if (-not $CommandLine -or -not $RootDir) { return $false }
+    $bridge = Join-Path $RootDir "bridge\copilot_bridge.py"
+    $pat = "*" + [System.Management.Automation.WildcardPattern]::Escape($bridge) + "*"
+    return ($CommandLine -like $pat)
+}
+
+function Get-BridgePortVerdict {
+    # PURE-ISH observation: @{ Kind = ours|foreign|none|unknown; Desc }. `foreign` is PROOF that
+    # the real bridge cannot be serving this port, so no bridge turn can be in flight there.
+    # `unknown` stays fail-closed/busy.
+    param([int]$BridgePort)
+    $listeners = @()
+    try {
+        $listeners = @(Get-NetTCPConnection -LocalPort $BridgePort -State Listen -ErrorAction Stop)
+    } catch {
+        if ($_.CategoryInfo.Category -eq 'ObjectNotFound') {
+            return @{ Kind = "none"; Desc = ":$BridgePort has no listener" }
+        }
+        return @{ Kind = "unknown"; Desc = ":$BridgePort listener could not be inspected: $($_.Exception.Message)" }
+    }
+    if ($listeners.Count -eq 0) { return @{ Kind = "none"; Desc = ":$BridgePort has no listener" } }
+
+    $foreign = New-Object System.Collections.Generic.List[string]
+    $unknown = New-Object System.Collections.Generic.List[string]
+    foreach ($pid0 in @($listeners | Select-Object -ExpandProperty OwningProcess -Unique)) {
+        try { $p = Get-CimInstance Win32_Process -Filter ("ProcessId=" + [int]$pid0) -ErrorAction Stop }
+        catch { $unknown.Add("pid $pid0 (unreadable)"); continue }
+        if (-not $p -or -not $p.CommandLine) { $unknown.Add("pid $pid0 (no command line)"); continue }
+        $cl = [string]$p.CommandLine
+        if (Test-IsThisCheckoutBridgeCommandLine $cl $Root) {
+            return @{ Kind = "ours"; Desc = "pid ${pid0} (this checkout's bridge)" }
+        }
+        $foreign.Add("pid ${pid0} ($($p.Name))")
+    }
+    if ($unknown.Count -gt 0) {
+        return @{ Kind = "unknown"; Desc = ((@($foreign) + @($unknown)) -join " | ") }
+    }
+    return @{ Kind = "foreign"; Desc = ($foreign -join " | ") }
+}
+
 # A SERVER RUNNING CODE THE CHECKOUT HAS MOVED PAST, restarted by the thing that owns its
 # lifecycle instead of by whoever happens to look at the panel.
 #
@@ -474,15 +540,32 @@ function Invoke-StaleServerCycle {
         if (Test-Path $statusPath) {
             $fleetRunning = ((Get-Content $statusPath -Raw) -match '"running"\s*:\s*true')
         }
-        $breq = [System.Net.WebRequest]::Create("http://127.0.0.1:8765/status")
+        $breq = [System.Net.WebRequest]::Create("http://127.0.0.1:$BridgePort/status")
         $breq.Method = "GET"; $breq.Timeout = 5000; $breq.ReadWriteTimeout = 5000
         $bresp = $breq.GetResponse()
         $bbody = (New-Object System.IO.StreamReader($bresp.GetResponseStream())).ReadToEnd()
         $bresp.Close()
-        $bridgeBusy = ($bbody -match '"turn_running"\s*:\s*true') -or ($bbody -match '"busy"\s*:\s*true')
+        try { $bj = $bbody | ConvertFrom-Json -ErrorAction Stop } catch { $bj = $null }
+        if (-not $bj -or $bj.ok -ne $true) { throw "bridge /status did not return bridge JSON" }
+        $bridgeBusy = ($bj.turn_running -eq $true) -or ($bj.busy -eq $true)
         $busy = $fleetRunning -or $bridgeBusy
     } catch {
-        $busy = $true          # unreadable is busy, deliberately
+        # Unreadable remains busy UNLESS the port itself proves the bridge is absent. This exact
+        # distinction mattered 2026-09-28: an unrelated `python -m http.server 8765` returned
+        # 404 on /status, the old catch forced busy=true forever, and a server 5.5h stale could
+        # never cycle. `foreign` / `none` mean no bridge turn can exist on this port; `ours` /
+        # `unknown` stay fail-closed so a damaged live bridge never loses a tool server mid-turn.
+        $bv = Get-BridgePortVerdict $BridgePort
+        if ($bv.Kind -eq "foreign" -or $bv.Kind -eq "none") {
+            $bridgeBusy = $false
+            $busy = $fleetRunning
+            if ($bv.Kind -eq "foreign") {
+                Write-Log ("bridge status is unavailable because :$BridgePort is held by a foreign process; " +
+                           "treating the bridge as absent for stale-server safety: " + $bv.Desc)
+            }
+        } else {
+            $busy = $true
+        }
     }
     if ($busy) { $script:StaleStreak = 0; return }
 
