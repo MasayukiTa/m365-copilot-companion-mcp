@@ -46,9 +46,11 @@ def test_queue_health_summary_counts_real_stale_and_taken_stale(tmp_path):
     exe = tmp_path / "H.exe"
     r = subprocess.run([str(CSC), "/nologo", "/target:exe", "/out:" + str(exe),
                         "/r:" + str(FW / "System.Web.Extensions.dll"),
-                        str(UI / "SubmittedTasks.cs"), str(h)], capture_output=True, text=True, timeout=120)
+                        str(UI / "SubmittedTasks.cs"), str(h)], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=120)
     assert r.returncode == 0 and exe.is_file(), (r.stdout, r.stderr)
-    q = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
+    q = subprocess.run([str(exe)], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=30)
     assert q.returncode == 0, (q.returncode, q.stdout, q.stderr)
 
 
