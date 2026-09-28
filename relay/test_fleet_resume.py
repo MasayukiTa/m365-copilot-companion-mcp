@@ -264,7 +264,7 @@ class LedgerTests(unittest.TestCase):
 
     def test_live_add_goal_command_persists_before_queueing(self):
         src = Path(fr.__file__).read_text(encoding="utf-8")
-        anchor = '_cmd_goals = goals_from_command(cmd)'
+        anchor = '_cmd_goals = goals_from_command(cmd, submission_id=submission_id)'
         i = src.index(anchor)
         block = src[i:i + 1400]
         self.assertIn('_new_cmd_goals = _append_goals_ledger(', block)
