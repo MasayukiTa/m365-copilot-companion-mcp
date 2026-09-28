@@ -60,3 +60,25 @@ def test_run_label_is_the_task_summary_not_a_verbatim_prefix():
     main = src[src.index("def main():"):]
     assert "run_label = _goal_summary(gtexts[0]) if gtexts else \"\"" in main
     assert "_first_line[:60]" not in main
+
+
+def test_multiple_consecutive_policy_sentences_are_skipped():
+    goal = (
+        "READ-ONLY AUDIT ONLY. "
+        "Do not edit, write, commit, push, reset, checkout, stash, kill processes, or mutate repository/runtime state. "
+        "Audit PR #47 / branch fix/fleet-live-admission-and-submit at its current remote head for remaining correctness defects. "
+        "Focus deeply on crash durability."
+    )
+    title = ct.make_title(goal)
+    assert title.startswith("Audit PR #47"), title
+    assert "Do not edit" not in title
+
+
+def test_policy_skip_does_not_hide_a_real_negative_instruction():
+    goal = (
+        "Do not assume passing CI proves race-safety. "
+        "Check invariants across process death at every durable boundary."
+    )
+    # This is not a generic no-mutation safety preamble; it is part of the actual review task.
+    title = ct.make_title(goal)
+    assert title.startswith("Do not assume passing CI"), title

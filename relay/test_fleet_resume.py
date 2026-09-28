@@ -28,9 +28,10 @@ from relay import fleet_runner as fr  # noqa: E402
 
 class _FakeWorker:
     """Minimal stand-in for RelayWorker: only the attrs _update_done_map reads."""
-    def __init__(self, goal, outcome):
+    def __init__(self, goal, outcome, jid=None):
         self.goal = goal
         self.outcome = outcome
+        self.jid = jid
 
 
 class LedgerTests(unittest.TestCase):
@@ -187,6 +188,79 @@ class LedgerTests(unittest.TestCase):
         # Re-delivery of the same command after a crash must not duplicate the durable item.
         self.assertEqual(fr._append_goals_ledger(self.state_dir, ["live B"], started=10.0), 0)
         self.assertEqual(len(fr._read_goals_ledger(self.state_dir)[1]), 3)
+
+    def test_same_text_different_jid_are_distinct_durable_goals(self):
+        a = {"text": "same instruction", "jid": "job-a"}
+        b = {"text": "same instruction", "jid": "job-b"}
+        fr._write_goals_ledger(self.state_dir, [a], started=10.0)
+        added = fr._append_goals_ledger(
+            self.state_dir, [b], started=10.0, raise_on_error=True, return_new=True)
+        self.assertEqual([g["jid"] for g in added], ["job-b"])
+        _started, ledger = fr._read_goals_ledger(self.state_dir)
+        self.assertEqual([e["jid"] for e in ledger], ["job-a", "job-b"])
+        self.assertEqual([e["key"] for e in ledger], ["jid:job-a", "jid:job-b"])
+
+    def test_done_map_and_resume_join_on_jid_when_available(self):
+        goals = [
+            {"text": "same instruction", "jid": "job-a"},
+            {"text": "same instruction", "jid": "job-b"},
+        ]
+        fr._write_goals_ledger(self.state_dir, goals, started=11.0)
+        fr._update_done_map(self.state_dir, [
+            _FakeWorker("same instruction", "DONE", jid="job-a"),
+        ])
+        done = fr._read_done_map(self.state_dir)
+        self.assertEqual(done, {"jid:job-a": "DONE"})
+        remainder, n, total = fr._resume_goals(self.state_dir)
+        self.assertEqual((n, total), (1, 2))
+        self.assertEqual([g.get("jid") for g in remainder], ["job-b"])
+
+    def test_final_done_merge_uses_jid_not_only_goal_text(self):
+        goals = [
+            {"text": "same instruction", "jid": "job-a"},
+            {"text": "same instruction", "jid": "job-b"},
+        ]
+        fr._write_goals_ledger(self.state_dir, goals, started=12.0)
+        fr._merge_final_done_map(self.state_dir, [
+            {"goal": "same instruction", "jid": "job-a", "outcome": "DONE"},
+        ])
+        self.assertEqual(fr._read_done_map(self.state_dir), {"jid:job-a": "DONE"})
+        remainder, n, total = fr._resume_goals(self.state_dir)
+        self.assertEqual((n, total), (1, 2))
+        self.assertEqual([g.get("jid") for g in remainder], ["job-b"])
+
+    def test_legacy_text_done_key_migrates_only_when_unambiguous(self):
+        text = "same instruction"
+        old_key = fr._goal_key(text)
+        # Old PR47 ledgers can carry jid but still store the text hash in `key`. If that text
+        # appears once, its old done-map record can be joined safely.
+        fr._write_atomic(self._goals_path(), {
+            "started": 13.0,
+            "goals": [{"text": text, "jid": "job-a", "key": old_key}],
+        })
+        fr._write_atomic(self._done_path(), {old_key: "DONE"})
+        self.assertEqual(fr._resume_goals(self.state_dir), ([], 0, 1))
+
+        # If two different admitted goals share the text, the old key cannot say which one was
+        # done. Never erase both: conservatively resume both after the upgrade.
+        fr._write_atomic(self._goals_path(), {
+            "started": 13.0,
+            "goals": [
+                {"text": text, "jid": "job-a", "key": old_key},
+                {"text": text, "jid": "job-b", "key": old_key},
+            ],
+        })
+        remainder, n, total = fr._resume_goals(self.state_dir)
+        self.assertEqual((n, total), (2, 2))
+        self.assertEqual([g.get("jid") for g in remainder], ["job-a", "job-b"])
+
+    def test_no_jid_keeps_text_hash_idempotency(self):
+        fr._write_goals_ledger(self.state_dir, ["repeat me"], started=14.0)
+        self.assertEqual(fr._append_goals_ledger(
+            self.state_dir, ["repeat me"], started=14.0), 0)
+        _started, ledger = fr._read_goals_ledger(self.state_dir)
+        self.assertEqual(len(ledger), 1)
+        self.assertEqual(ledger[0]["key"], fr._goal_key("repeat me"))
 
     def test_live_add_goal_command_persists_before_queueing(self):
         src = Path(fr.__file__).read_text(encoding="utf-8")
