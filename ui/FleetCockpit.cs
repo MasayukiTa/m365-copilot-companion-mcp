@@ -824,6 +824,7 @@ class CockpitWindow : Window
     string _approval = "run";  // approval mode run|plan|auto -> settings.txt approval=
     string _runtimeMode = "fleet"; // next launch: fleet | durable -> settings.txt runtime=
     bool _durableEnqueuePending = false; // one durable campaign intake process at a time
+    bool _durableStartPending = false; // initial durable launch awaits LOCAL_LOOP status acceptance
     bool _fleetLaunchPending = false; // fresh Start waits for a closing prior coordinator
     bool _paused = false;      // local fleet pause/resume toggle state (NEW)
     // FIX B: optimistic "stopping" state set the instant Stop is clicked (dims non-terminal cards +
@@ -5686,6 +5687,13 @@ class CockpitWindow : Window
     {
         try
         {
+            if (_durableStartPending)
+            {
+                _startNote.Text = _lang == 0
+                    ? "長時間タスクの開始確認中です。入力は保持されています。"
+                    : "Waiting for the durable task to be accepted; your input is kept.";
+                return;
+            }
             if (_fleetLaunchPending)
             {
                 _startNote.Text = _lang == 0
@@ -5743,10 +5751,11 @@ class CockpitWindow : Window
                                                   : "Durable runtime is disabled. Set MCP_EXECUTION_PROFILES=1 and restart the MCP server.";
                     return;
                 }
-                if (!SpawnDurableTask(goals[0])) return;
-                _goalInput.Text = "";
-                _startNote.Text = _lang == 0 ? "長時間タスクを開始しました。現在の工程と進捗をカードに表示します。"
-                                              : "Durable task started. Current step and progress will appear on the card.";
+                string durableSubmittedText = _goalInput.Text ?? "";
+                if (!SpawnDurableTask(goals[0], durableSubmittedText)) return;
+                _startNote.Text = _lang == 0
+                    ? "長時間タスクの開始を確認中です。入力は保持されています。"
+                    : "Starting durable task; your input is kept until LOCAL_LOOP accepts it.";
                 _lastSig = "";
                 return;
             }
@@ -5768,14 +5777,19 @@ class CockpitWindow : Window
         }
     }
 
-    bool ActiveRunIsLocalLoop()
+    bool ActiveRunIsLocalLoop(Dictionary<string, object> st)
     {
         try
         {
-            Dictionary<string, object> st = ReadStatus();
             return st != null && string.Equals(
                 S(st, "execution_mode"), "LOCAL_LOOP", StringComparison.OrdinalIgnoreCase);
         }
+        catch (Exception) { return false; }
+    }
+
+    bool ActiveRunIsLocalLoop()
+    {
+        try { return ActiveRunIsLocalLoop(ReadStatus()); }
         catch (Exception) { return false; }
     }
 
@@ -6138,9 +6152,11 @@ class CockpitWindow : Window
         return raw == "1" || raw == "true" || raw == "yes" || raw == "on";
     }
 
-    bool SpawnDurableTask(string goal)
+    bool SpawnDurableTask(string goal, string submittedText)
     {
         SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
+        string goalFile = null;
+        System.Diagnostics.Process proc = null;
         try
         {
             string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
@@ -6149,7 +6165,7 @@ class CockpitWindow : Window
             string stateDir = Path.GetDirectoryName(_statusPath);
             string token = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString() + "_"
                          + Guid.NewGuid().ToString("N").Substring(0, 8);
-            string goalFile = Path.Combine(stateDir, "durable_goal_" + token + ".txt");
+            goalFile = Path.Combine(stateDir, "durable_goal_" + token + ".txt");
             File.WriteAllText(goalFile, goal ?? "", new UTF8Encoding(false));
 
             var psi = new System.Diagnostics.ProcessStartInfo();
@@ -6160,16 +6176,91 @@ class CockpitWindow : Window
             psi.UseShellExecute = false;
             psi.CreateNoWindow = true;
             try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
-            System.Diagnostics.Process.Start(psi);
+            proc = System.Diagnostics.Process.Start(psi);
+            if (proc == null) throw new InvalidOperationException("durable controller process did not start");
+            _durableStartPending = true;
             NoteSubmitted(new List<string> { goal }, submitBaseline);
+            WatchDurableStart(proc, submitBaseline, goalFile, submittedText ?? "", goal);
             return true;
         }
         catch (Exception ex)
         {
+            _durableStartPending = false;
+            try { if (!string.IsNullOrEmpty(goalFile) && File.Exists(goalFile)) File.Delete(goalFile); }
+            catch (Exception) { }
             if (_startNote != null)
                 _startNote.Text = (_lang == 0 ? "長時間実行の起動に失敗: " : "Durable start failed: ") + ex.Message;
+            try { if (proc != null) proc.Dispose(); } catch (Exception) { }
             return false;
         }
+    }
+
+    void WatchDurableStart(System.Diagnostics.Process proc, SubmissionBaseline baseline,
+                           string goalFile, string submittedText, string goal)
+    {
+        var timer = new System.Windows.Threading.DispatcherTimer();
+        timer.Interval = TimeSpan.FromMilliseconds(200);
+        DateTime exitSeenAt = DateTime.MinValue;
+        timer.Tick += delegate
+        {
+            try
+            {
+                Dictionary<string, object> root = ReadStatus();
+                string started = StartedOf(root);
+                bool accepted = ActiveRunIsLocalLoop(root)
+                                && !string.IsNullOrEmpty(started)
+                                && !string.Equals(started, baseline == null ? "" : baseline.Started,
+                                                  StringComparison.Ordinal)
+                                && FreshRunContainsGoals(root, new List<string> { goal });
+                if (accepted)
+                {
+                    timer.Stop();
+                    _durableStartPending = false;
+                    if (_goalInput.Text == submittedText) _goalInput.Text = "";
+                    try { if (!string.IsNullOrEmpty(goalFile) && File.Exists(goalFile)) File.Delete(goalFile); }
+                    catch (Exception) { }
+                    if (_startNote != null)
+                        _startNote.Text = _lang == 0
+                            ? "長時間タスクを開始しました。現在の工程と進捗をカードに表示します。"
+                            : "Durable task started. Current step and progress will appear on the card.";
+                    _lastSig = "";
+                    try { proc.Dispose(); } catch (Exception) { }
+                    return;
+                }
+
+                proc.Refresh();
+                if (!proc.HasExited) return;
+                if (exitSeenAt == DateTime.MinValue)
+                {
+                    exitSeenAt = DateTime.UtcNow;
+                    return;
+                }
+                if ((DateTime.UtcNow - exitSeenAt).TotalSeconds < 2.0) return;
+
+                timer.Stop();
+                _durableStartPending = false;
+                int code = -1;
+                try { code = proc.ExitCode; } catch (Exception) { }
+                try { if (!string.IsNullOrEmpty(goalFile) && File.Exists(goalFile)) File.Delete(goalFile); }
+                catch (Exception) { }
+                if (_startNote != null)
+                    _startNote.Text = (_lang == 0
+                        ? "長時間タスクを開始できませんでした。入力は残しています。終了コード "
+                        : "Could not start durable task; input was kept. Exit code ") + code;
+                try { proc.Dispose(); } catch (Exception) { }
+            }
+            catch (Exception ex)
+            {
+                timer.Stop();
+                _durableStartPending = false;
+                if (_startNote != null)
+                    _startNote.Text = (_lang == 0
+                        ? "長時間タスクの開始確認に失敗しました。入力は残しています。 "
+                        : "Could not confirm durable task start; input was kept. ") + ex.Message;
+                try { proc.Dispose(); } catch (Exception) { }
+            }
+        };
+        timer.Start();
     }
 
     bool SpawnFleet(List<string> goals, string goalsFileName, bool planMode = false,

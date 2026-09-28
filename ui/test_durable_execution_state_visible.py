@@ -37,7 +37,7 @@ def test_durable_runtime_is_an_explicit_opt_in_launch_path():
     assert 'string _runtimeMode = "fleet"' in SOURCE
     assert 'SaveKey("runtime", _runtimeMode)' in SOURCE
     assert 'if (_runtimeMode == "durable")' in SOURCE
-    assert 'bool SpawnDurableTask(string goal)' in SOURCE
+    assert 'bool SpawnDurableTask(string goal, string submittedText)' in SOURCE
     assert '-m relay.local_loop_controller --goal-file' in SOURCE
     assert 'psi.CreateNoWindow = true;' in SOURCE
     assert 'MCP_EXECUTION_PROFILES=1' in SOURCE
@@ -48,3 +48,31 @@ def test_runtime_slash_command_is_discoverable_and_persistent():
     assert 'new[]{"/runtime"' in SOURCE
     assert 'ln.StartsWith("runtime=")' in SOURCE
     assert 'cmdName == "/runtime"' in SOURCE
+
+
+def test_initial_durable_start_keeps_input_until_status_accepts_the_job():
+    start = SOURCE[SOURCE.index("void StartFleet()"):SOURCE.index("bool ActiveRunIsLocalLoop()") ]
+    durable = start[start.index('if (_runtimeMode == "durable")'):]
+    assert '_durableStartPending' in SOURCE
+    assert 'SpawnDurableTask(goals[0], durableSubmittedText)' in durable
+    assert '_goalInput.Text = "";' not in durable
+    assert 'Durable task started.' not in durable
+
+    spawn = SOURCE[SOURCE.index("bool SpawnDurableTask(string goal, string submittedText)"):SOURCE.index("bool SpawnFleet(List<string> goals") ]
+    assert 'proc = System.Diagnostics.Process.Start(psi);' in spawn
+    assert 'if (proc == null)' in spawn
+    assert 'WatchDurableStart(proc, submitBaseline, goalFile, submittedText ?? "", goal);' in spawn
+    assert '_durableStartPending = true;' in spawn
+
+    watch = SOURCE[SOURCE.index("void WatchDurableStart("):SOURCE.index("bool SpawnFleet(List<string> goals") ]
+    assert 'ActiveRunIsLocalLoop(root)' in watch
+    assert 'FreshRunContainsGoals(root, new List<string> { goal })' in watch
+    assert 'StartedOf(root)' in watch and 'baseline.Started' in watch
+    assert 'if (_goalInput.Text == submittedText) _goalInput.Text = "";' in watch
+    assert 'proc.HasExited' in watch
+    assert 'input was kept' in watch.lower()
+
+
+def test_durable_start_pending_blocks_duplicate_launch_clicks():
+    start = SOURCE[SOURCE.index("void StartFleet()"):SOURCE.index("bool ActiveRunIsLocalLoop()") ]
+    assert 'if (_durableStartPending)' in start

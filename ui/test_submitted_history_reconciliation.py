@@ -96,7 +96,7 @@ def test_submission_baseline_is_captured_before_handoff_can_create_a_worker():
     assert spawn.index("CaptureSubmissionBaseline()") < spawn.index("Process.Start(psi)")
     assert "NoteSubmitted(goals, submitBaseline)" in spawn
 
-    durable = _method_block(src, "bool SpawnDurableTask(string goal)", "bool SpawnFleet(List<string> goals")
+    durable = _method_block(src, "bool SpawnDurableTask(string goal, string submittedText)", "bool SpawnFleet(List<string> goals")
     assert durable.index("CaptureSubmissionBaseline()") < durable.index("Process.Start(psi)")
     assert "NoteSubmitted(new List<string> { goal }, submitBaseline)" in durable
 
