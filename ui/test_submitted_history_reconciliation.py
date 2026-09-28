@@ -104,3 +104,35 @@ def test_submission_baseline_is_captured_before_handoff_can_create_a_worker():
     live_branch = retry[:retry.index("string goal = S(w, \"goal\")")]
     assert live_branch.index("CaptureSubmissionBaseline()") < live_branch.index("SendCommand(")
     assert "NoteSubmitted(new List<string> { S(w, \"goal\") }, submitBaseline)" in live_branch
+
+
+def test_fresh_start_waits_for_closing_coordinator_before_clearing_input():
+    src = (UI / "FleetCockpit.cs").read_text(encoding="utf-8-sig")
+    start = _method_block(src, "void StartFleet()", "bool ActiveRunIsLocalLoop()")
+    assert '_fleetLaunchPending' in start
+    assert 'waitForClosingRun: true' in start
+    assert '_goalInput.Text = "";' not in start[start.index('bool planMode ='):], (
+        'fresh Start must keep the operator text until a new run is actually accepted')
+
+    spawn = _method_block(src, "bool SpawnFleet(List<string> goals", "string GoalsToJsonl(")
+    assert 'bool waitForClosingRun = false' in spawn
+    assert '--wait-for-state-dir-seconds 60' in spawn
+    assert 'WatchFreshFleetLaunch(' in spawn
+    assert 'System.Diagnostics.Process proc = System.Diagnostics.Process.Start(psi);' in spawn
+
+    watch = _method_block(src, "void WatchFreshFleetLaunch(", "string GoalsToJsonl(")
+    assert 'StartedOf(root)' in watch
+    assert 'baseline.Started' in watch
+    assert 'FreshRunContainsGoals(root, goals)' in watch
+    assert 'FreshRunContainsGoals(root, goals)' in watch
+    assert 'if (_goalInput.Text == submittedText) _goalInput.Text = "";' in watch
+    assert 'proc.HasExited' in watch
+    assert '_fleetLaunchPending = false;' in watch
+
+
+def test_fresh_start_uses_unique_goal_file_while_other_spawn_paths_keep_defaults():
+    src = (UI / "FleetCockpit.cs").read_text(encoding="utf-8-sig")
+    start = _method_block(src, "void StartFleet()", "bool ActiveRunIsLocalLoop()")
+    assert 'fresh_start_' in start
+    assert 'Guid.NewGuid().ToString("N")' in start
+    assert src.count('waitForClosingRun: true') == 1
