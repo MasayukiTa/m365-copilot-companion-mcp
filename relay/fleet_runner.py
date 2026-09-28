@@ -2006,10 +2006,13 @@ def _resume_argv(argv):
         if skip_next:
             skip_next = False
             continue
-        if a in ("-g", "--goal", "--goals-file", "--adopt-command"):
+        if a in ("-g", "--goal", "--goals-file", "--adopt-command",
+                  "--wait-for-state-dir-seconds"):
             skip_next = True
             continue
-        if a.startswith("--goal=") or a.startswith("--goals-file=") or a.startswith("--adopt-command="):
+        if (a.startswith("--goal=") or a.startswith("--goals-file=")
+                or a.startswith("--adopt-command=")
+                or a.startswith("--wait-for-state-dir-seconds=")):
             continue
         if a == "--resume":
             continue
@@ -2165,6 +2168,39 @@ def _release_run_lock(fh):
         fh.close()
     except Exception:
         pass
+
+
+def _acquire_run_slot(state_dir, *, wait_seconds=0.0, poll_seconds=0.10):
+    """Acquire this Fleet state directory, optionally waiting for a closing prior owner.
+
+    Default wait_seconds=0 preserves strict fail-fast behavior. The Cockpit fresh-Start path
+    opts into a bounded wait because status.json can reach running:false before the old
+    coordinator has completed final persistence and released its OS lock.
+    """
+    wait_seconds = max(0.0, float(wait_seconds or 0.0))
+    poll_seconds = max(0.0, float(poll_seconds or 0.0))
+    deadline = time.monotonic() + wait_seconds
+    last_conflict = 0
+    while True:
+        owner = _active_run_conflict_pid(state_dir)
+        if owner:
+            last_conflict = owner
+        else:
+            lock = _acquire_run_lock(state_dir)
+            if lock is not None:
+                owner = _active_run_conflict_pid(state_dir)
+                if not owner:
+                    return lock, 0
+                last_conflict = owner
+                _release_run_lock(lock)
+            else:
+                last_conflict = 0
+
+        now = time.monotonic()
+        if wait_seconds <= 0.0 or now >= deadline:
+            return None, last_conflict
+        remaining = max(0.0, deadline - now)
+        time.sleep(min(poll_seconds, remaining) if poll_seconds > 0.0 else 0.0)
 
 
 def _clear_active_marker(state_dir, owner_pid=None):
@@ -3288,6 +3324,9 @@ def main():
                          "correctness refuter; accept if upheld (cheap, no over-engineering), "
                          "escalate to research+panel only when it refutes. Beats a uniform ultra "
                          "by not over-engineering the easy tasks (ultra's observed failure mode).")
+    ap.add_argument("--wait-for-state-dir-seconds", type=float, default=0.0,
+                    help="opt-in fresh-start handoff: wait this many seconds for a closing "
+                         "coordinator to release the same state dir (default 0 = fail fast)")
     ap.add_argument("--state-dir", default=os.path.join(_repo_root(), ".fleet"),
                     help="where to write the live status.json the cockpit reads")
     args = ap.parse_args()
@@ -3298,32 +3337,20 @@ def main():
     # only layer that can make the invariant unconditional.
     os.makedirs(args.state_dir, exist_ok=True)
     _ACTIVE_STATE_DIR = args.state_dir
-    _owner = _active_run_conflict_pid(args.state_dir)
-    if _owner:
-        if _owner < 0:
-            print("REFUSING TO START: fleet state directory has an unreadable active-run marker: %s"
-                  % args.state_dir, flush=True)
-        else:
-            print("REFUSING TO START: fleet state directory is already owned by live pid %d: %s"
-                  % (_owner, args.state_dir), flush=True)
-        return 3
-    _ACTIVE_RUN_LOCK = _acquire_run_lock(args.state_dir)
+    _ACTIVE_RUN_LOCK, _owner = _acquire_run_slot(
+        args.state_dir, wait_seconds=args.wait_for_state_dir_seconds)
     if _ACTIVE_RUN_LOCK is None:
-        print("REFUSING TO START: another fleet coordinator holds the state-dir lock: %s"
-              % args.state_dir, flush=True)
-        return 3
-    # Close the marker-vs-lock race: another legacy runner may have written a marker after the
-    # first check but before this process took the new OS lock.
-    _owner = _active_run_conflict_pid(args.state_dir)
-    if _owner:
-        _release_run_lock(_ACTIVE_RUN_LOCK)
-        _ACTIVE_RUN_LOCK = None
+        waited = max(0.0, float(args.wait_for_state_dir_seconds or 0.0))
+        prefix = ("TIMED OUT WAITING TO START" if waited > 0.0 else "REFUSING TO START")
         if _owner < 0:
-            print("REFUSING TO START: fleet state directory gained an unreadable active-run marker: %s"
-                  % args.state_dir, flush=True)
+            print("%s: fleet state directory has an unreadable active-run marker: %s"
+                  % (prefix, args.state_dir), flush=True)
+        elif _owner > 0:
+            print("%s: fleet state directory is still owned by live pid %d: %s"
+                  % (prefix, _owner, args.state_dir), flush=True)
         else:
-            print("REFUSING TO START: fleet state directory became owned by live pid %d: %s"
-                  % (_owner, args.state_dir), flush=True)
+            print("%s: another fleet coordinator holds the state-dir lock: %s"
+                  % (prefix, args.state_dir), flush=True)
         return 3
 
     _adopt_claim = None

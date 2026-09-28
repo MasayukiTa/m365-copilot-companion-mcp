@@ -824,6 +824,7 @@ class CockpitWindow : Window
     string _approval = "run";  // approval mode run|plan|auto -> settings.txt approval=
     string _runtimeMode = "fleet"; // next launch: fleet | durable -> settings.txt runtime=
     bool _durableEnqueuePending = false; // one durable campaign intake process at a time
+    bool _fleetLaunchPending = false; // fresh Start waits for a closing prior coordinator
     bool _paused = false;      // local fleet pause/resume toggle state (NEW)
     // FIX B: optimistic "stopping" state set the instant Stop is clicked (dims non-terminal cards +
     // flips the Stop button's tooltip/icon) so the click never feels dead for the ~700ms sweep.
@@ -5685,6 +5686,13 @@ class CockpitWindow : Window
     {
         try
         {
+            if (_fleetLaunchPending)
+            {
+                _startNote.Text = _lang == 0
+                    ? "前の実行終了を待って新しいタスクを開始中です。"
+                    : "Waiting for the previous run to finish closing before starting this task.";
+                return;
+            }
             // refuse if a fleet is already running (both would write the same status.json)
             Dictionary<string, object> st = ReadStatus();
             if (st != null && st.ContainsKey("running") && Convert.ToBoolean(st["running"])
@@ -5744,14 +5752,15 @@ class CockpitWindow : Window
             }
 
             bool planMode = _approval == "plan" || _approval == "auto";
-            SpawnFleet(goals, "goals_input.txt", planMode);
-            _goalInput.Text = "";
-            _startNote.Text = (_lang == 0 ? "開始しました（" : "Started (") + goals.Count
-                              + (_lang == 0 ? " 件）" : " goals)")
-                              + (planMode
-                                  ? (_lang == 0 ? "。承認待ちの計画を各カードに出します。" : ". Each card will wait at plan approval.")
-                                  : "");
-            _lastSig = "";   // force a re-render once status.json starts updating
+            string submittedText = _goalInput.Text ?? "";
+            string freshFile = "fresh_start_" + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString()
+                             + "_" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".jsonl";
+            if (!SpawnFleet(goals, freshFile, planMode, waitForClosingRun: true,
+                            submittedText: submittedText)) return;
+            _startNote.Text = _lang == 0
+                ? "前の実行終了を待って開始します。タスクは保持されています。"
+                : "Waiting for the previous run to close; the task is kept until the new run starts.";
+            _lastSig = "";
         }
         catch (Exception ex)
         {
@@ -6163,7 +6172,8 @@ class CockpitWindow : Window
         }
     }
 
-    bool SpawnFleet(List<string> goals, string goalsFileName, bool planMode = false)
+    bool SpawnFleet(List<string> goals, string goalsFileName, bool planMode = false,
+                    bool waitForClosingRun = false, string submittedText = null)
     {
         SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
         string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
@@ -6178,6 +6188,7 @@ class CockpitWindow : Window
         psi.Arguments = "-m relay.fleet_runner --goals-file \"" + goalsFile + "\""
                         + " --state-dir \"" + stateDir + "\" --effort " + _effort;
         if (planMode) psi.Arguments += " --plan";
+        if (waitForClosingRun) psi.Arguments += " --wait-for-state-dir-seconds 60";
         // BOTH VALUES ARE SAID OUT LOUD. This used to append "--fanout" when on and nothing
         // when off -- and once the runner's default became true, saying nothing meant ON, so
         // a person who typed /fanout off got fan-out anyway while the cockpit reported OFF.
@@ -6187,12 +6198,114 @@ class CockpitWindow : Window
         psi.UseShellExecute = false;
         psi.CreateNoWindow = true;
         try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
-        System.Diagnostics.Process.Start(psi);
+        System.Diagnostics.Process proc = System.Diagnostics.Process.Start(psi);
+        if (proc == null) return false;
         // On top of the list NOW, before the new run's first snapshot exists. Every spawn path
         // comes through here: the composer's StartFleet, a retry or bulk retry with no live run,
         // and the continue flows (whose lines are {"text":..} objects -- GoalTextOf reads them).
         NoteSubmitted(goals, submitBaseline);
+        if (waitForClosingRun)
+        {
+            _fleetLaunchPending = true;
+            WatchFreshFleetLaunch(proc, submitBaseline, goalsFile, submittedText ?? "",
+                                  goals, planMode);
+        }
+        else
+        {
+            try { proc.Dispose(); } catch (Exception) { }
+        }
         return true;
+    }
+
+    static bool FreshRunContainsGoals(Dictionary<string, object> root, List<string> goals)
+    {
+        if (root == null || goals == null || goals.Count == 0) return false;
+        List<Dictionary<string, object>> workers = WorkersOf(root);
+        foreach (string raw in goals)
+        {
+            string wanted = SubmittedTasks.GoalTextOf(raw).Trim();
+            bool found = false;
+            foreach (Dictionary<string, object> w in workers)
+            {
+                if (string.Equals(S(w, "goal").Trim(), wanted, StringComparison.Ordinal))
+                {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return false;
+        }
+        return true;
+    }
+
+    void WatchFreshFleetLaunch(System.Diagnostics.Process proc, SubmissionBaseline baseline,
+                               string goalsFile, string submittedText, List<string> goals, bool planMode)
+    {
+        var timer = new System.Windows.Threading.DispatcherTimer();
+        timer.Interval = TimeSpan.FromMilliseconds(200);
+        DateTime exitSeenAt = DateTime.MinValue;
+        timer.Tick += delegate
+        {
+            try
+            {
+                Dictionary<string, object> root = ReadStatus();
+                string started = StartedOf(root);
+                bool accepted = !string.IsNullOrEmpty(started)
+                                && !string.Equals(started, baseline == null ? "" : baseline.Started,
+                                                  StringComparison.Ordinal)
+                                && FreshRunContainsGoals(root, goals);
+                if (accepted)
+                {
+                    timer.Stop();
+                    _fleetLaunchPending = false;
+                    if (_goalInput.Text == submittedText) _goalInput.Text = "";
+                    try { if (File.Exists(goalsFile)) File.Delete(goalsFile); } catch (Exception) { }
+                    if (_startNote != null)
+                        _startNote.Text = (_lang == 0 ? "開始しました（" : "Started (") + goals.Count
+                                          + (_lang == 0 ? " 件）" : " goals)")
+                                          + (planMode
+                                              ? (_lang == 0 ? "。承認待ちの計画が各カードに出ます。"
+                                                            : ". Each card will wait at plan approval.")
+                                              : "");
+                    _lastSig = "";
+                    try { proc.Dispose(); } catch (Exception) { }
+                    return;
+                }
+
+                proc.Refresh();
+                if (!proc.HasExited) return;
+                if (exitSeenAt == DateTime.MinValue)
+                {
+                    exitSeenAt = DateTime.UtcNow;
+                    return;
+                }
+                if ((DateTime.UtcNow - exitSeenAt).TotalSeconds < 2.0) return;
+
+                timer.Stop();
+                _fleetLaunchPending = false;
+                int code = -1;
+                try { code = proc.ExitCode; } catch (Exception) { }
+                try { if (File.Exists(goalsFile)) File.Delete(goalsFile); } catch (Exception) { }
+                if (_startNote != null)
+                    _startNote.Text = (_lang == 0
+                        ? "新しい実行を開始できませんでした。入力は残しています。終了コード "
+                        : "Could not start the new run; your input was kept. Exit code ")
+                        + code;
+                try { proc.Dispose(); } catch (Exception) { }
+            }
+            catch (Exception ex)
+            {
+                timer.Stop();
+                _fleetLaunchPending = false;
+                if (_startNote != null)
+                    _startNote.Text = (_lang == 0
+                        ? "新しい実行の開始確認に失敗しました。入力は残しています。 "
+                        : "Could not confirm the new run start; your input was kept. ")
+                        + ex.Message;
+                try { proc.Dispose(); } catch (Exception) { }
+            }
+        };
+        timer.Start();
     }
 
     // Render a goals list as the JSONL text SpawnFleet writes to its goals-file: one JSON object
