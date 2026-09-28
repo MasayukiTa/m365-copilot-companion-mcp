@@ -127,3 +127,14 @@ def test_doctor_sends_the_marker_on_its_negative_probe_only():
     with_key = [l for l in auth.splitlines() if "$withKey = Mcp-Status" in l]
     assert with_key and "X-MCP-Self-Test" not in with_key[0], \
         "the probe WITH the key must look like a real client"
+
+
+def test_doctor_materializes_the_dpapi_protected_bearer_before_auth_checks():
+    doctor = (REPO / "scripts" / "doctor.ps1").read_text(encoding="utf-8-sig")
+    load = doctor[:doctor.index('$script:ok = 0')]
+    assert "function Get-DoctorLocalSecret" in load
+    assert "'MCP_API_KEY_PROTECTED'" in load
+    assert "$doctorApiKey = Get-DoctorLocalSecret" in load
+    assert "$envv['MCP_API_KEY'] = $doctorApiKey" in load
+    auth = doctor[doctor.index('Check "auth_bearer"'):]
+    assert "$key = $envv['MCP_API_KEY']" in auth

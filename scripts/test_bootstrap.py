@@ -411,7 +411,7 @@ class WriteTunnelPreservesUrlTests(unittest.TestCase):
     def test_none_url_preserves_existing_url(self):
         env = self.root / ".env"
         env.write_text(
-            "MCP_API_KEY=abc\r\n"
+            "MCP_API_KEY_PROTECTED=dpapi:opaque\r\n"
             "MCP_TUNNEL_NAME=old-name\r\n"
             "MCP_TUNNEL_URL=https://keep-me-8000.jpe1.devtunnels.ms/\r\n",
             encoding="utf-8", newline="",
@@ -420,7 +420,7 @@ class WriteTunnelPreservesUrlTests(unittest.TestCase):
         bootstrap._write_tunnel_to_env("m365-copilot-companion", None)
         text = env.read_text(encoding="utf-8-sig")
         self.assertIn("MCP_TUNNEL_URL=https://keep-me-8000.jpe1.devtunnels.ms/", text)
-        self.assertIn("MCP_API_KEY=abc", text)  # other keys preserved
+        self.assertIn("MCP_API_KEY_PROTECTED=dpapi:opaque", text)  # unrelated key preserved
 
     def test_new_url_overwrites_old(self):
         env = self.root / ".env"
@@ -595,9 +595,9 @@ class GenEnvBackfillsMissingSecretsTests(unittest.TestCase):
         bootstrap.step_gen_env()
         text = env.read_text(encoding="utf-8-sig")
         # Both secrets now present and non-placeholder.
-        api = bootstrap._read_env_value("MCP_API_KEY")
-        self.assertTrue(api and not api.startswith("replace"),
-                        "MCP_API_KEY was not generated into an existing .env")
+        api = bootstrap._read_env_value("MCP_API_KEY_PROTECTED")
+        self.assertTrue(api and api.startswith("dpapi:"),
+                        "protected MCP_API_KEY was not generated into an existing .env")
         prot = bootstrap._read_env_value(bootstrap.UNLOCK_PASSWORD_PROTECTED_VAR)
         self.assertTrue(prot, "protected unlock password was not generated")
         # The pre-existing line is preserved.
@@ -612,13 +612,14 @@ class GenEnvBackfillsMissingSecretsTests(unittest.TestCase):
         )
         bootstrap.step_gen_env()
         text = env.read_text(encoding="utf-8-sig")
-        # The user's values survive verbatim, and no duplicate key is appended.
-        self.assertEqual(bootstrap._read_env_value("MCP_API_KEY"), "keepme")
-        self.assertEqual(bootstrap._read_env_value("MCP_UNLOCK_PASSWORD"), "keepme_too")
-        self.assertEqual(text.count("MCP_API_KEY="), 1)
-        self.assertEqual(text.count("MCP_UNLOCK_PASSWORD="), 1)
-        # The protected form must NOT be added when a plain unlock password already exists.
-        self.assertNotIn(bootstrap.UNLOCK_PASSWORD_PROTECTED_VAR + "=", text)
+        # The user's values survive semantically, but plaintext storage is migrated away.
+        from tools.secret_store import unprotect_secret
+        api_blob = bootstrap._read_env_value("MCP_API_KEY_PROTECTED")
+        unlock_blob = bootstrap._read_env_value(bootstrap.UNLOCK_PASSWORD_PROTECTED_VAR)
+        self.assertEqual(unprotect_secret(api_blob), "keepme")
+        self.assertEqual(unprotect_secret(unlock_blob), "keepme_too")
+        self.assertNotIn("MCP_API_KEY=", text)
+        self.assertNotIn("MCP_UNLOCK_PASSWORD=", text)
 
     def test_only_api_key_missing_generates_only_api_key(self):
         env = self.root / ".env"
@@ -628,8 +629,8 @@ class GenEnvBackfillsMissingSecretsTests(unittest.TestCase):
             encoding="utf-8",
         )
         bootstrap.step_gen_env()
-        api = bootstrap._read_env_value("MCP_API_KEY")
-        self.assertTrue(api and not api.startswith("replace"))
+        api = bootstrap._read_env_value("MCP_API_KEY_PROTECTED")
+        self.assertTrue(api and api.startswith("dpapi:"))
         # The existing protected unlock value is untouched, and no plain unlock line is minted.
         self.assertEqual(bootstrap._read_env_value(bootstrap.UNLOCK_PASSWORD_PROTECTED_VAR), "abc123")
 
@@ -667,8 +668,8 @@ class GenEnvFreshStillWritesSecretsTests(unittest.TestCase):
         bootstrap.step_gen_env()
         env = self.root / ".env"
         self.assertTrue(env.exists())
-        api = bootstrap._read_env_value("MCP_API_KEY")
-        self.assertTrue(api and not api.startswith("replace"))
+        api = bootstrap._read_env_value("MCP_API_KEY_PROTECTED")
+        self.assertTrue(api and api.startswith("dpapi:"))
         self.assertTrue(bootstrap._read_env_value(bootstrap.UNLOCK_PASSWORD_PROTECTED_VAR))
 
 
