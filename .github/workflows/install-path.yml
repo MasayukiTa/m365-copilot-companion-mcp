@@ -220,7 +220,7 @@ jobs:
 
       - name: Upload the setup transcript
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: setup-transcript-${{ matrix.name }}
           path: ${{ runner.temp }}/${{ matrix.dir }}/.setup/bootstrap.log
