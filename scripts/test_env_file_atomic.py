@@ -147,11 +147,30 @@ def test_rotation_backup_never_keeps_legacy_plaintext_auth_secrets(monkeypatch):
     assert "OTHER=1" in joined
 
 
-def test_unrelated_atomic_edit_does_not_secretly_require_dpapi(tmp_path):
+def test_generic_atomic_sink_refuses_legacy_plaintext_auth(tmp_path):
     env = tmp_path / ".env"
-    env.write_bytes(b"MCP_API_KEY=legacy\r\nMCP_TUNNEL_ALLOW_ANONYMOUS=1\r\nOTHER=1\r\n")
-    assert E.unset_key(env, "MCP_TUNNEL_ALLOW_ANONYMOUS") is True
-    assert env.read_bytes() == b"MCP_API_KEY=legacy\r\nOTHER=1\r\n"
+    old = b"MCP_API_KEY=legacy\r\nMCP_TUNNEL_ALLOW_ANONYMOUS=1\r\nOTHER=1\r\n"
+    env.write_bytes(old)
+    with pytest.raises(ValueError, match="plaintext auth secret"):
+        E.atomic_write_text(env, "MCP_API_KEY=legacy\r\nOTHER=1\r\n")
+    assert env.read_bytes() == old, "a rejected secret-bearing rewrite must leave the old file intact"
+
+
+def test_unrelated_edit_fails_closed_until_bootstrap_migrates_legacy_auth(tmp_path):
+    env = tmp_path / ".env"
+    old = b"MCP_UNLOCK_PASSWORD=legacy-password\r\nMCP_TUNNEL_ALLOW_ANONYMOUS=1\r\nOTHER=1\r\n"
+    env.write_bytes(old)
+    with pytest.raises(ValueError, match="plaintext auth secret"):
+        E.unset_key(env, "MCP_TUNNEL_ALLOW_ANONYMOUS")
+    assert env.read_bytes() == old
+
+
+def test_protected_auth_lines_are_allowed_at_the_final_sink(tmp_path):
+    env = tmp_path / ".env"
+    E.atomic_write_text(env, "MCP_API_KEY_PROTECTED=dpapi:opaque\nMCP_UNLOCK_PASSWORD_PROTECTED=dpapi:opaque2\n")
+    got = env.read_text(encoding="utf-8")
+    assert "MCP_API_KEY_PROTECTED=dpapi:opaque" in got
+    assert "MCP_UNLOCK_PASSWORD_PROTECTED=dpapi:opaque2" in got
 
 def test_rotate_writer_refuses_plaintext_auth_at_its_final_sink(tmp_path):
     import importlib.util
@@ -166,3 +185,13 @@ def test_rotate_writer_refuses_plaintext_auth_at_its_final_sink(tmp_path):
     text = env.read_text(encoding="utf-8")
     assert "MCP_API_KEY=must-not-land" not in text
     assert "MCP_API_KEY_PROTECTED=dpapi:opaque" in text
+
+
+def test_codeql_suppression_is_tied_to_the_sink_guard():
+    src = (HERE / "env_file.py").read_text(encoding="utf-8")
+    assert "_assert_no_plaintext_auth_persistence(text)" in src
+    lines = src.splitlines()
+    i = next(i for i, line in enumerate(lines) if "fh.write(data)" in line)
+    assert lines[i - 1].strip() == "# lgtm[py/clear-text-storage-sensitive-data]"
+    guard_i = next(i for i, line in enumerate(lines) if "_assert_no_plaintext_auth_persistence(text)" in line and not line.lstrip().startswith("def "))
+    assert guard_i < i

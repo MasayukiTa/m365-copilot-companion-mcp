@@ -411,7 +411,7 @@ class WriteTunnelPreservesUrlTests(unittest.TestCase):
     def test_none_url_preserves_existing_url(self):
         env = self.root / ".env"
         env.write_text(
-            "MCP_API_KEY=abc\r\n"
+            "MCP_API_KEY_PROTECTED=dpapi:opaque\r\n"
             "MCP_TUNNEL_NAME=old-name\r\n"
             "MCP_TUNNEL_URL=https://keep-me-8000.jpe1.devtunnels.ms/\r\n",
             encoding="utf-8", newline="",
@@ -420,7 +420,7 @@ class WriteTunnelPreservesUrlTests(unittest.TestCase):
         bootstrap._write_tunnel_to_env("m365-copilot-companion", None)
         text = env.read_text(encoding="utf-8-sig")
         self.assertIn("MCP_TUNNEL_URL=https://keep-me-8000.jpe1.devtunnels.ms/", text)
-        self.assertIn("MCP_API_KEY=abc", text)  # unrelated key is preserved
+        self.assertIn("MCP_API_KEY_PROTECTED=dpapi:opaque", text)  # unrelated key preserved
 
     def test_new_url_overwrites_old(self):
         env = self.root / ".env"
