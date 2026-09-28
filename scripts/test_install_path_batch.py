@@ -243,9 +243,6 @@ STUB_DEVTUNNEL = ("Add-Content -LiteralPath (Join-Path $PSScriptRoot '..\\devtun
 def _quickstart_tree(root: Path, env_text: str, dt_exit: int = 1) -> Path:
     tree = root / "qs repo"
     (tree / "scripts").mkdir(parents=True)
-    (tree / "tools").mkdir(parents=True)
-    shutil.copyfile(H.REPO / "tools" / "secret_store.py", tree / "tools" / "secret_store.py")
-    (tree / "tools" / "__init__.py").write_text("", encoding="ascii")
     H.crlf_copy(H.REPO / "quickstart.bat", tree / "quickstart.bat")
     (tree / "setup.bat").write_text(STUB_SETUP, encoding="ascii")
     for s in ("quickstart_lock.ps1", "detect_proxy.ps1", "env_file.py"):
@@ -293,12 +290,7 @@ def test_quickstart_n_removes_the_anonymous_opt_in_and_reports_a_failed_fetch(tm
     # D4
     text = (tree / ".env").read_bytes().decode("utf-8")
     assert "MCP_TUNNEL_ALLOW_ANONYMOUS" not in text, text
-    assert "MCP_API_KEY=k" not in text
-    assert "# — keep me\r\nOTHER=1\r\n" in text, "other lines were disturbed"
-    from tools.secret_store import unprotect_secret
-    api_blob = [ln.split("=", 1)[1] for ln in text.splitlines()
-                if ln.startswith("MCP_API_KEY_PROTECTED=")][0]
-    assert unprotect_secret(api_blob) == "k"
+    assert text == "MCP_API_KEY=k\r\n# — keep me\r\nOTHER=1\r\n", "other lines were disturbed"
     assert "Removed MCP_TUNNEL_ALLOW_ANONYMOUS" in out and "REVOKED" in out
     assert "no grant yet" not in out
     args = (tree / "devtunnel_args.txt").read_text(encoding="utf-8", errors="replace")

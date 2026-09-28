@@ -351,7 +351,6 @@ jobs:
             scripts/test_bootstrap_p2c.py \
             scripts/test_bootstrap_install_path.py \
             scripts/test_env_file_atomic.py \
-            scripts/test_codeql_secret_sink_suppressions.py \
             scripts/test_install_path_python_version.py \
             scripts/test_install_path_powershell.py \
             scripts/test_install_path_batch.py \

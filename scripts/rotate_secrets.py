@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import argparse
 import secrets
-import shutil
 import sys
 from pathlib import Path
 
@@ -45,6 +44,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from tools.secret_store import API_KEY_PROTECTED_VAR, UNLOCK_PASSWORD_PROTECTED_VAR, protect_secret
+from scripts import env_file
 ENV_PATH = ROOT / ".env"
 ENV_BAK_PATH = ROOT / ".env.bak"
 
@@ -89,13 +89,9 @@ def write_env_lines(env_path: Path, lines: list[str]) -> None:
         if stripped.startswith(API_KEY_VAR + "=") or stripped.startswith(UNLOCK_VAR + "="):
             raise ValueError("refusing to persist legacy plaintext auth secret in %s" % env_path)
     text = "\r\n".join(lines) + "\r\n"
-    # encoding="utf-8" (NOT "utf-8-sig") => no BOM. newline="" => do not let
-    # Python translate our explicit \r\n into \r\r\n on Windows.
-    with open(env_path, "w", encoding="utf-8", newline="") as f:
-        # Every auth secret line was either already protected or passed through DPAPI above.
-        # CodeQL cannot infer that our CryptProtectData ctypes wrapper is an encryption barrier.
-        # lgtm[py/clear-text-storage-sensitive-data]
-        f.write(text)
+    # One persistence primitive for .env and .env.bak. The auth-line validation above is this
+    # function's security boundary; env_file.atomic_write_text supplies the crash-safe swap.
+    env_file.atomic_write_text(env_path, text)
 
 
 def protect_legacy_secret_lines(lines: list[str]) -> list[str]:
