@@ -406,6 +406,14 @@ def test_supervisor_does_not_hide_the_window_on_an_ambiguous_mid_auth_read(tmp_p
     "redirfrom=CsrToSSR&auth=2" -- state() reads this as ready=None ("mid-authentication", NOT
     a wall and NOT signed in) -- for several poll cycles before finally landing on the app, and
     asserts the window is NOT returned to headless while that ambiguous state persists."""
+    # IMPORTANT: _run_supervisor() is submitted to a worker thread below. pytest.skip() raised
+    # inside that worker becomes Future.exception() and does NOT mark this owning test skipped.
+    # On Linux that made fut.done() true immediately and the test failed on json_hits=0. Decide
+    # platform eligibility on pytest's main thread before creating/submitting the worker.
+    import shutil
+    if os.name != "nt" or not shutil.which("powershell"):
+        pytest.skip("the supervisor is Windows PowerShell")
+
     import concurrent.futures
 
     BOUNCE = "https://m365.cloud.microsoft/chat?redirfrom=CsrToSSR&auth=2"

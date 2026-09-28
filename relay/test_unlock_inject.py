@@ -106,7 +106,13 @@ def main():
     check("inject_not_terminal", w.outcome is None and w.status != "stuck")
     check("reason_no_password_leak", PW not in (w.reason or ""))
     check("inject_job_names_the_token", "unlock_token" in (w.job or ""))
-    check("inject_job_says_to_pass_it", "渡して" in (w.job or ""))
+    # SESSION AUTH IS THE NORMAL CONTRACT NOW. The token is still named because it is a
+    # transport fallback, but telling the model to re-attach it every call is the OLD protocol
+    # and caused pointless token-hunting loops. The recovery turn must explicitly say the
+    # opposite: same conversation/session is authorized after unlock; token is fallback only.
+    check("inject_job_says_session_auth_is_normal",
+          "MCP session" in (w.job or "") and "再添付する必要はありません" in (w.job or ""))
+    check("inject_job_says_token_is_fallback", "fallback" in (w.job or ""))
     # THE PASSWORD IS ALREADY IN THIS PROMPT -- DO NOT HUNT FOR IT. Workers read .env (and
     # .env.example / .env.defaults.json / .unlock_state.json) looking for a password that the
     # prefix already embeds via %s. The server refuses .env every time, so the hunt never ends:
@@ -127,17 +133,29 @@ def main():
     # MAX_UNLOCK_ATTEMPTS attempts are now spent by MAX_UNLOCK_ATTEMPTS reactive locked
     # replies (previously MAX_UNLOCK_ATTEMPTS - 1, since the preflight itself spent the 1st).
     w2 = RelayWorker("g", "u1")
+    # This script-style suite tests the UNLOCK state machine, not the filesystem/UI mechanics
+    # of the HITL gate. Those have a dedicated integration test. Leaving the real gate here made
+    # this test OS-dependent: Linux CI could create the temp gate while a local standalone run
+    # could fall back to STUCK, so different assertions failed on each machine. Pin the seam and
+    # preserve the exact exhaustion reason for deterministic assertions below.
+    def _unit_gate(reason, _context):
+        w2._gate_token = "unit-test-gate"
+        w2.status = "awaiting_gate"
+        w2.reason = reason
+        return True
+    w2._raise_stuck_gate = _unit_gate
     for _ in range(MAX_UNLOCK_ATTEMPTS):
         w2._decide(LOCKED)
     check("cap_attempts_reached", w2._unlock_attempts == MAX_UNLOCK_ATTEMPTS)
     w2._decide(LOCKED)                                  # one past the cap
     check("cap_asks_a_human", w2.status == "awaiting_gate" and bool(w2._gate_token))
     check("cap_reason_actionable", "unlock" in (w2.reason or "") and PW not in (w2.reason or ""))
-    # THE REASON MUST LIST THE CAUSE THAT HAPPENS. It named a rotating backend IP and a wrong
-    # password; on 2026-09-07 it was neither, and the two jobs that hit this spent 17 and 6
-    # turns before anyone looked past the reason it printed. Whoever reads it is trying to find
-    # out why, so the token-enforcement case belongs in it -- and it is the cheapest to check.
-    check("cap_reason_names_token_enforcement", "unlock_token" in (w2.reason or ""))
+    # Exhaustion now diagnoses the session-auth state machine we actually run. Token re-attach
+    # is only relevant when session auth was explicitly disabled, and the reason must say that
+    # rather than implying token propagation is the default recovery path.
+    check("cap_reason_names_session_identity", "Mcp-Session-Id" in (w2.reason or ""))
+    check("cap_reason_scopes_token_fallback",
+          "MCP_UNLOCK_SESSION_AUTH=0" in (w2.reason or "") and "unlock_token" in (w2.reason or ""))
 
     # 3. missing password -> STUCK with a clear 'not configured' reason (patch the local reader)
     orig = rf._unlock_password

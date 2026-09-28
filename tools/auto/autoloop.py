@@ -30,6 +30,7 @@ import re
 import subprocess
 
 from tools.coding_ops import multi_edit_local, python_check
+from tools import childproc
 from tools.gate_ops import stop_check
 from tools.runlog_ops import runlog_append_local
 
@@ -71,19 +72,16 @@ def _run(cmd, cwd, timeout_s):
     killed and everything it had started was not.
     """
     shell = isinstance(cmd, str)
-    proc = subprocess.Popen(cmd, cwd=cwd, shell=shell, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT)
+    proc = subprocess.Popen(
+        cmd, cwd=cwd, shell=shell, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL, **childproc.tree_popen_kwargs(headless=True))
     try:
         out, _ = proc.communicate(timeout=timeout_s)
         return proc.returncode, (out or b"").decode("utf-8", "replace")
     except subprocess.TimeoutExpired:
+        childproc.kill_tree(proc, wait_s=5)
         try:
-            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
-        except Exception:
-            proc.kill()
-        try:
-            out, _ = proc.communicate(timeout=30)
+            out, _ = proc.communicate(timeout=5)
         except Exception:
             out = b""
         return None, (out or b"").decode("utf-8", "replace")

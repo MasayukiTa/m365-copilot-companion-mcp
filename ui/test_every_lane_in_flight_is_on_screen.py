@@ -37,11 +37,12 @@ def _band():
 
 
 def test_every_collected_goal_reaches_the_screen():
-    """THE DEFECT, in one assertion: the band renders the whole list, not its first element."""
+    """Every distinct authoritative goal contributes one display identity; none is collapsed."""
     band = _band()
-    assert "string.Join(\"\\n\", goalTexts.ToArray())" in band, (
-        "the directive band is rendering something other than the full goal list; with more "
-        "than one lane in flight it will show one of them and the operator will watch it swap")
+    assert 'goalDisplays.Add(' in band
+    assert "string.Join(\"\\n\", goalDisplays.ToArray())" in band, (
+        "the directive band is not rendering the complete display list; with more than one "
+        "lane in flight it could hide a task or fall back to the old first-item flicker")
 
 
 def test_the_lane_count_no_longer_stands_in_for_the_lanes():

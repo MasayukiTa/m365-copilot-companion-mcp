@@ -3925,7 +3925,7 @@ class Handler(BaseHTTPRequestHandler):
         if refusal is not None:
             if refusal[0] in (401, 403, 503):
                 logger.warning("bridge refused %s %s: %s", method, logsafe(parsed.path),
-                               refusal[2])
+                               logsafe(refusal[2]))
             if refusal[0] == 405 and method == "GET" and parsed.path in ("/stream", "/goal"):
                 self._refuse_as_stream()
                 return

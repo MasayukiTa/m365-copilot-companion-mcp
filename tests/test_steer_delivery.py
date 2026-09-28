@@ -172,15 +172,22 @@ def test_the_runner_calls_it_rather_than_reimplementing_it():
 
 
 def test_the_cockpit_no_longer_claims_success_unconditionally():
-    """It said 'queued for the next turn' whatever happened, including when it had found no
-    worker and sent an empty name."""
+    """The one steer-send path refuses when the run is not live and only queues on success."""
     import os
     src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                             "ui", "FleetCockpit.cs"), encoding="utf-8").read()
-    i = src.index("RequestSteer(targetWorker, steerText);")
-    seg = src[i:i + 1400]
-    assert "every live worker" in seg or "全ワーカー" in seg
-    assert "targetWorker +" in seg, "the note does not name the worker it went to"
+    i = src.index("bool TrySteerSend(string name, string text, out string failReason)")
+    seg = src[i:i + 900]
+    assert 'if (!RunIsLive()) { failReason = T("steer_dead"); return false; }' in seg
+    assert "RequestSteer(name, t);" in seg
+    assert "return true;" in seg
+
+    # The expanded composer only prints its queued-success note after TrySteerSend returned true.
+    caller = src[src.index("Func<bool> trySteer = delegate"):][:900]
+    assert "if (!TrySteerSend(nm, tb.Text, out failReason))" in caller
+    fail_i = caller.index("if (!TrySteerSend(nm, tb.Text, out failReason))")
+    ack_i = caller.index("Queued for the next turn")
+    assert fail_i < ack_i
 
 
 # ---- a message that was queued and never used ---------------------------------------------
