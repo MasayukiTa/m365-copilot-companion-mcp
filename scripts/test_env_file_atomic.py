@@ -147,19 +147,11 @@ def test_rotation_backup_never_keeps_legacy_plaintext_auth_secrets(monkeypatch):
     assert "OTHER=1" in joined
 
 
-@pytest.mark.skipif(os.name != "nt", reason="CurrentUser DPAPI migration is Windows-only")
-def test_atomic_sink_migrates_plaintext_auth_assignments(tmp_path):
-    from tools.secret_store import unprotect_secret
+def test_unrelated_atomic_edit_does_not_secretly_require_dpapi(tmp_path):
     env = tmp_path / ".env"
-    E.atomic_write_text(env, "MCP_API_KEY=api-plain\nMCP_UNLOCK_PASSWORD='unlock-plain'\nOTHER=1\n")
-    text = env.read_text(encoding="utf-8")
-    assert "MCP_API_KEY=api-plain" not in text
-    assert "MCP_UNLOCK_PASSWORD=" not in text.replace("MCP_UNLOCK_PASSWORD_PROTECTED=", "")
-    vals = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
-    assert unprotect_secret(vals["MCP_API_KEY_PROTECTED"]) == "api-plain"
-    assert unprotect_secret(vals["MCP_UNLOCK_PASSWORD_PROTECTED"]) == "unlock-plain"
-    assert vals["OTHER"] == "1"
-
+    env.write_bytes(b"MCP_API_KEY=legacy\r\nMCP_TUNNEL_ALLOW_ANONYMOUS=1\r\nOTHER=1\r\n")
+    assert E.unset_key(env, "MCP_TUNNEL_ALLOW_ANONYMOUS") is True
+    assert env.read_bytes() == b"MCP_API_KEY=legacy\r\nOTHER=1\r\n"
 
 def test_rotate_writer_refuses_plaintext_auth_at_its_final_sink(tmp_path):
     import importlib.util

@@ -836,15 +836,8 @@ def test_a_carried_env_gives_up_its_tunnel_before_provisioning(repo, monkeypatch
     assert "\n# MCP_TUNNEL_NAME=team-tunnel" in text and "\nMCP_TUNNEL_NAME=" not in text
     assert "\n# MCP_TUNNEL_HOST=some-other-pc" in text
     assert "\nMCP_UNLOCK_PASSWORD_PROTECTED=dpapi:x" in text, "a non-tunnel key was set aside"
+    assert text.startswith("MCP_API_KEY=k\r\n"), "an unrelated tunnel edit changed another key"
     assert "\n" not in text.replace("\r\n", ""), "line endings were disturbed"
-    if os.name == "nt":
-        assert not text.startswith("MCP_API_KEY=k\r\n")
-        from tools.secret_store import unprotect_secret
-        api_blob = [ln.split("=", 1)[1] for ln in text.splitlines()
-                    if ln.startswith("MCP_API_KEY_PROTECTED=")][0]
-        assert unprotect_secret(api_blob) == "k", "Bearer value changed during transparent migration"
-    else:
-        assert text.startswith("MCP_API_KEY=k\r\n"), "non-Windows inspection must not fake DPAPI"
 
 
 def test_an_unstamped_generated_name_from_another_machine_is_foreign(repo, monkeypatch):
