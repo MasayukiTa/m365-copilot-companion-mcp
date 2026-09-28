@@ -692,13 +692,13 @@ class LocalJobStore:
         finally:
             conn.close()
 
-    def list_job_statuses(self) -> list[dict]:
+    def list_job_statuses(self, event_limit: int = 8) -> list[dict]:
         conn = self._connect()
         try:
             ids = [row[0] for row in conn.execute("SELECT job_id FROM jobs ORDER BY created_at")]
         finally:
             conn.close()
-        return [self.get_job_status(job_id) for job_id in ids]
+        return [self.get_job_status(job_id, event_limit=event_limit) for job_id in ids]
 
     def cancel_job(self, job_id: str, reason: str = "operator stop",
                    now: float | None = None) -> dict:
@@ -908,9 +908,118 @@ class LocalJobStore:
             self._event(conn, job_id, int(turn["seq"]), "RUNTIME_RESUMED", {}, now)
         return {"ok": True, "idempotent": False, "status": "READY"}
 
+    def execution_snapshot(self, job_id: str, status: dict | None = None,
+                           max_completed_steps: int = 64) -> dict:
+        """Return the durable, UI-facing execution state for one LOCAL_LOOP job.
+
+        This deliberately derives from SQLite rows/events, not the browser transcript.  It is the
+        bridge between the durable execution authority and FleetCockpit: goal progress remains
+        reconstructible after a browser/session/process restart.
+        """
+        job_id = self._validate_job_id(job_id)
+        status = dict(status or self.get_job_status(job_id, event_limit=50))
+        job = self.get_job(job_id)
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT seq,instruction,commit_json,updated_at FROM turns "
+                "WHERE job_id=? ORDER BY seq", (job_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        turn_plan = job.get("turn_plan") if isinstance(job.get("turn_plan"), list) else []
+        initial_seq = int(job.get("initial_seq", 1))
+        current_seq = int(status.get("current_seq", initial_seq))
+        current_row = next((row for row in rows if int(row["seq"]) == current_seq), None)
+        current_step = str(current_row["instruction"] if current_row else "")
+
+        completed = []
+        artifacts = []
+        artifact_keys = set()
+        for row in rows:
+            raw = row["commit_json"]
+            if not raw:
+                continue
+            try:
+                commit = json.loads(raw)
+            except Exception:
+                continue
+            seq = int(row["seq"] )
+            completed.append({
+                "seq": seq,
+                "step_index": max(1, seq - initial_seq + 1),
+                "instruction": str(row["instruction"] or ""),
+                "summary": str(commit.get("summary") or ""),
+                "status": str(commit.get("status") or ""),
+                "committed_at": float(commit.get("committed_at") or row["updated_at"] or 0),
+            })
+            for artifact in commit.get("artifacts") or []:
+                if not isinstance(artifact, dict):
+                    continue
+                key = _json(artifact)
+                if key in artifact_keys:
+                    continue
+                artifact_keys.add(key)
+                artifacts.append(dict(artifact))
+
+        total_steps = len(turn_plan) if turn_plan else None
+        current_step_index = max(1, current_seq - initial_seq + 1)
+        next_step = ""
+        if turn_plan and current_step_index < len(turn_plan):
+            nxt = turn_plan[current_step_index]
+            if isinstance(nxt, dict):
+                next_step = str(nxt.get("instruction") or "")
+
+        last_progress = ""
+        last_progress_at = 0.0
+        for event in reversed(status.get("events") or []):
+            payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+            event_type = str(event.get("event") or "")
+            text = ""
+            if event_type == "HEARTBEAT":
+                phase = str(payload.get("phase") or "").strip()
+                detail = str(payload.get("detail") or "").strip()
+                text = (phase + ": " + detail) if phase and detail else (detail or phase)
+            elif event_type == "TURN_COMMITTED":
+                text = str(payload.get("summary") or "").strip()
+            else:
+                text = str(payload.get("detail") or payload.get("reason") or "").strip()
+            if text:
+                last_progress = text
+                last_progress_at = float(event.get("ts") or 0)
+                break
+        commit = status.get("commit") if isinstance(status.get("commit"), dict) else {}
+        if not last_progress:
+            last_progress = str(commit.get("summary") or current_step).strip()
+            last_progress_at = float(commit.get("committed_at") or status.get("updated_at") or 0)
+
+        state = str(status.get("status") or "")
+        waiting_reason = ""
+        if state.startswith("WAITING_") or state == "NEEDS_ROUTING":
+            waiting_reason = str(status.get("verification_detail") or commit.get("summary") or "").strip()
+
+        max_completed_steps = max(1, min(int(max_completed_steps), 256))
+        return {
+            "state": state,
+            "current_step": current_step,
+            "current_step_index": current_step_index,
+            "total_steps": total_steps,
+            "completed_count": len(completed),
+            "completed_steps": completed[-max_completed_steps:],
+            "completed_steps_truncated": len(completed) > max_completed_steps,
+            "next_step": next_step,
+            "last_progress": last_progress,
+            "last_progress_at": last_progress_at,
+            "waiting_reason": waiting_reason,
+            "artifacts": artifacts,
+            "retry_count": int(status.get("retry_count") or 0),
+        }
+
+
     def console_snapshot(self) -> dict:
         """Project SQLite state into the FleetCockpit-compatible status shape."""
-        statuses = self.list_job_statuses()
+        statuses = self.list_job_statuses(event_limit=50)
         workers = []
         done = 0
         for item in statuses:
@@ -918,13 +1027,20 @@ class LocalJobStore:
             terminal = item["status"] in TERMINAL_JOB_STATUSES
             if item["status"] == "DONE":
                 done += 1
+            job = self.get_job(item["job_id"])
+            execution = self.execution_snapshot(item["job_id"], item)
             workers.append({
-                "name": item["job_id"], "goal": self.get_job(item["job_id"]).get("task", {}).get("instruction", ""),
+                "name": item["job_id"], "goal": job.get("task", {}).get("instruction", ""),
                 "status": item["status"].lower(), "outcome": item["status"] if terminal else None,
-                "turn": item["current_seq"], "reason": item.get("verification_detail", ""),
-                "last": commit.get("summary", ""), "transcript": "", "closed": terminal,
+                "turn": item["current_seq"],
+                "reason": execution.get("waiting_reason") or item.get("verification_detail", ""),
+                "last": execution.get("last_progress") or commit.get("summary", ""),
+                "transcript": "", "closed": terminal,
                 "execution_profile": item["execution_profile"],
-                "artifacts": commit.get("artifacts", []), "phase_events": item.get("events", []),
+                "artifacts": execution.get("artifacts", []),
+                "phase_events": item.get("events", []),
+                "next_step": execution.get("next_step", ""),
+                "execution": execution,
             })
         now = time.time()
         return {
