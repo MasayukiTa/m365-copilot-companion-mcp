@@ -70,7 +70,7 @@ def test_open_from_fleet_resolves_a_goal_from_the_live_worker_or_the_transcript(
     worker dict first (survives a finished worker whose slot has not been reused), the
     transcript's own first-line "goal" as the fallback (survives a restarted fleet). The
     priority itself is FleetConvIdentity.ResolveGoal's job (see
-    ui/test_a_fleet_conversation_identity_merge_runs.py) -- this only checks the call site
+    ui/test_a_fleet_interrupt_survives_a_supervisor_restart.py) -- this only checks the call site
     passes it the right two values."""
     code = _code()
     body = _block(code, "void OpenFromFleet(string url, string worker, string transcriptHint)", 6500)
