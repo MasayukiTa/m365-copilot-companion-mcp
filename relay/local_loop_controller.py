@@ -189,6 +189,139 @@ def _write_atomic(path: str | os.PathLike, payload: dict) -> None:
     os.replace(tmp, target)
 
 
+LOCAL_LOOP_MARKER_DIR = "local_loop_active"
+LOCAL_LOOP_LOCK_DIR = "local_loop_locks"
+
+
+def _controller_marker_path(state_dir: str | os.PathLike, job_id: str) -> Path:
+    return Path(state_dir) / LOCAL_LOOP_MARKER_DIR / (str(job_id) + ".json")
+
+
+def _controller_lock_path(state_dir: str | os.PathLike, job_id: str) -> Path:
+    return Path(state_dir) / LOCAL_LOOP_LOCK_DIR / (str(job_id) + ".lock")
+
+
+def _read_controller_marker(state_dir: str | os.PathLike, job_id: str) -> dict | None:
+    path = _controller_marker_path(state_dir, job_id)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _write_controller_marker(state_dir: str | os.PathLike, job_id: str, resume_argv: list[str],
+                             *, pid: int | None = None, started: float | None = None,
+                             restart_count: int | None = None, retry_after: float | None = None) -> dict:
+    existing = _read_controller_marker(state_dir, job_id) or {}
+    if restart_count is None:
+        try:
+            restart_count = int(existing.get("restart_count", 0))
+        except Exception:
+            restart_count = 0
+    if retry_after is None:
+        try:
+            retry_after = float(existing.get("retry_after", 0.0))
+        except Exception:
+            retry_after = 0.0
+    payload = {
+        "version": 1,
+        "job_id": str(job_id),
+        "pid": int(os.getpid() if pid is None else pid),
+        "started": float(time.time() if started is None else started),
+        "resume_argv": [str(v) for v in resume_argv],
+        "restart_count": max(0, int(restart_count)),
+        "retry_after": max(0.0, float(retry_after)),
+    }
+    _write_atomic(_controller_marker_path(state_dir, job_id), payload)
+    return payload
+
+
+def _clear_controller_marker(state_dir: str | os.PathLike, job_id: str,
+                             *, owner_pid: int | None = None) -> bool:
+    owner = int(os.getpid() if owner_pid is None else owner_pid)
+    marker = _read_controller_marker(state_dir, job_id)
+    try:
+        marker_pid = int((marker or {}).get("pid") or 0)
+    except Exception:
+        return False
+    if marker_pid != owner:
+        return False
+    try:
+        _controller_marker_path(state_dir, job_id).unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
+
+
+def _acquire_job_lock(state_dir: str | os.PathLike, job_id: str):
+    """Take a non-blocking kernel lock for one controller per durable LOCAL_LOOP job."""
+    path = _controller_lock_path(state_dir, job_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = None
+    try:
+        fh = open(path, "a+b", buffering=0)
+        fh.seek(0, os.SEEK_END)
+        if fh.tell() == 0:
+            fh.write(b"\0")
+        fh.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fh
+    except (OSError, IOError):
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:
+                pass
+        return None
+
+
+def _release_job_lock(fh) -> None:
+    if fh is None:
+        return
+    try:
+        fh.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        fh.close()
+    except Exception:
+        pass
+
+
+def _controller_resume_argv(args, job_id: str) -> list[str]:
+    """Canonical crash-resume command line containing no task text or agent URL secrets."""
+    out = ["--job-id", str(job_id), "--state-dir", str(Path(args.state_dir).resolve())]
+    if getattr(args, "db", None):
+        out += ["--db", str(Path(args.db).resolve())]
+    if getattr(args, "cdp_url", None):
+        out += ["--cdp-url", str(args.cdp_url)]
+    for flag, attr in (
+        ("--poll-seconds", "poll_seconds"),
+        ("--turn-timeout", "turn_timeout"),
+        ("--ui-idle-timeout", "ui_idle_timeout"),
+        ("--rotate-after-turns", "rotate_after_turns"),
+        ("--js-heap-limit-mb", "js_heap_limit_mb"),
+        ("--dom-node-limit", "dom_node_limit"),
+        ("--edge-mb-limit", "edge_mb_limit"),
+    ):
+        out += [flag, str(getattr(args, attr))]
+    return out
+
+
 def run_acceptance_checks(job: dict) -> tuple[bool, str]:
     checks = normalize_checks(job.get("acceptance_checks"))
     if not checks:
@@ -697,66 +830,87 @@ def main(argv=None):
     if not job_id:
         ap.error("--job-id, --job-file, --goal or --goal-file is required")
 
-    # Surface the durable task immediately, before CDP/browser startup. If browser setup fails,
-    # the operator still sees which task exists in SQLite instead of a blank cockpit.
-    _project_job_snapshot(store, job_id, Path(args.state_dir) / "status.json")
+    job_lock = _acquire_job_lock(args.state_dir, job_id)
+    if job_lock is None:
+        print(f"LOCAL_LOOP {job_id}: another controller already owns this job", flush=True)
+        return 3
+    marker_written = False
+    completed_normally = False
+    keep_marker_for_runtime = False
+    try:
+        resume_argv = _controller_resume_argv(args, job_id)
+        _write_controller_marker(args.state_dir, job_id, resume_argv)
+        marker_written = True
+        # Surface the durable task immediately, before CDP/browser startup. If browser setup fails,
+        # the operator still sees which task exists in SQLite instead of a blank cockpit.
+        _project_job_snapshot(store, job_id, Path(args.state_dir) / "status.json")
 
-    from playwright.sync_api import sync_playwright
-    from relay.edge_recover import companion_edge_mb
+        from playwright.sync_api import sync_playwright
+        from relay.edge_recover import companion_edge_mb
 
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.connect_over_cdp(args.cdp_url, timeout=20000)
-        context = browser.contexts[0] if browser.contexts else browser.new_context()
-        driver = _open_driver(context, args.agent_url)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.connect_over_cdp(args.cdp_url, timeout=20000)
+            context = browser.contexts[0] if browser.contexts else browser.new_context()
+            driver = _open_driver(context, args.agent_url)
 
-        def rotate(old, reason):
-            old_page = getattr(old, "page", None)
-            replacement = _open_driver(context, args.agent_url)
+            def rotate(old, reason):
+                old_page = getattr(old, "page", None)
+                replacement = _open_driver(context, args.agent_url)
+                try:
+                    if old_page is not None and not old_page.is_closed():
+                        old_page.close()
+                except Exception:
+                    pass
+                return replacement
+
+            controller = LocalLoopController(
+                store, job_id, driver,
+                status_path=Path(args.state_dir) / "status.json",
+                commands_path=Path(args.state_dir) / "commands.json",
+                poll_seconds=args.poll_seconds,
+                turn_timeout_seconds=args.turn_timeout,
+                ui_idle_timeout_seconds=args.ui_idle_timeout,
+                rotate_after_turns=args.rotate_after_turns,
+                js_heap_limit_mb=args.js_heap_limit_mb,
+                dom_node_limit=args.dom_node_limit,
+                edge_mb_limit=args.edge_mb_limit,
+                rotate_driver=rotate,
+                consent_probe=probe_browser_interaction,
+                metrics_probe=lambda drv: collect_browser_metrics(drv.page, companion_edge_mb),
+            )
             try:
-                if old_page is not None and not old_page.is_closed():
-                    old_page.close()
-            except Exception:
-                pass
-            return replacement
-
-        controller = LocalLoopController(
-            store, job_id, driver,
-            status_path=Path(args.state_dir) / "status.json",
-            commands_path=Path(args.state_dir) / "commands.json",
-            poll_seconds=args.poll_seconds,
-            turn_timeout_seconds=args.turn_timeout,
-            ui_idle_timeout_seconds=args.ui_idle_timeout,
-            rotate_after_turns=args.rotate_after_turns,
-            js_heap_limit_mb=args.js_heap_limit_mb,
-            dom_node_limit=args.dom_node_limit,
-            edge_mb_limit=args.edge_mb_limit,
-            rotate_driver=rotate,
-            consent_probe=probe_browser_interaction,
-            metrics_probe=lambda drv: collect_browser_metrics(drv.page, companion_edge_mb),
-        )
-        try:
-            result = controller.run()
-            print(f"LOCAL_LOOP {job_id}: {result}")
-            # Record the run per theme. Everything needed is already in the job spec, so
-            # this costs one write and gives the next job on the same theme its history.
-            # Frame-side and best-effort -- and deliberately AFTER the result is printed,
-            # so a memory failure can never change what the CLI reports or returns.
-            try:
-                from relay.project_memory import record_task, theme_from_goal
-                task = (job or {}).get("task") or {}
-                instruction = task.get("instruction") or task.get("type") or job_id
-                record_task(theme_from_goal(instruction), instruction, result,
-                            note="job=%s base=%s" % (
-                                job_id,
-                                ((job or {}).get("constraints") or {}).get("allowed_base", "")))
-            except Exception:
-                pass
-            return 0 if result == "DONE" else 2
-        finally:
-            # connect_over_cdp disconnect does not close pages created in the persistent
-            # companion Edge. Leaving one page per completed job steadily recreates the
-            # memory problem LOCAL_LOOP is meant to solve.
-            _close_driver_page(controller.driver)
+                result = controller.run()
+                completed_normally = True
+                keep_marker_for_runtime = (result == "WAITING_RUNTIME")
+                print(f"LOCAL_LOOP {job_id}: {result}")
+                # Record the run per theme. Everything needed is already in the job spec, so
+                # this costs one write and gives the next job on the same theme its history.
+                # Frame-side and best-effort -- and deliberately AFTER the result is printed,
+                # so a memory failure can never change what the CLI reports or returns.
+                try:
+                    from relay.project_memory import record_task, theme_from_goal
+                    task = (job or {}).get("task") or {}
+                    instruction = task.get("instruction") or task.get("type") or job_id
+                    record_task(theme_from_goal(instruction), instruction, result,
+                                note="job=%s base=%s" % (
+                                    job_id,
+                                    ((job or {}).get("constraints") or {}).get("allowed_base", "")))
+                except Exception:
+                    pass
+                return 0 if result == "DONE" else 2
+            finally:
+                # connect_over_cdp disconnect does not close pages created in the persistent
+                # companion Edge. Leaving one page per completed job steadily recreates the
+                # memory problem LOCAL_LOOP is meant to solve.
+                _close_driver_page(controller.driver)
+    finally:
+        # Terminal and human/consent/routing waits are intentional ordinary returns and must not
+        # auto-relaunch. WAITING_RUNTIME is different: the store is explicitly resumable on the
+        # next controller start, so keep its marker and let the supervisor retry with backoff.
+        # An unexpected exception also leaves the marker behind while releasing the kernel lock.
+        if marker_written and completed_normally and not keep_marker_for_runtime:
+            _clear_controller_marker(args.state_dir, job_id, owner_pid=os.getpid())
+        _release_job_lock(job_lock)
 
 
 if __name__ == "__main__":
