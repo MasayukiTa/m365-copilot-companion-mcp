@@ -66,6 +66,61 @@ def test_a_repeated_step_is_not_run_twice():
     assert len(fo.subtasks_from(body)) == 2
 
 
+def test_trailing_dependent_merge_is_not_launched_as_a_parallel_child():
+    body = (
+        "1. Review slides 1-5 and save partial_1.md\n"
+        "2. Review slides 6-10 and save partial_2.md\n"
+        "3. Review slides 11-15 and save partial_3.md\n"
+        "4. Review slides 16-20 and save partial_4.md\n"
+        "5. Read the outputs from subtasks 1-4 and merge them into final.md\n"
+        + READY
+    )
+    assert fo.subtasks_from(body) == [
+        "Review slides 1-5 and save partial_1.md",
+        "Review slides 6-10 and save partial_2.md",
+        "Review slides 11-15 and save partial_3.md",
+        "Review slides 16-20 and save partial_4.md",
+    ]
+
+
+def test_observed_japanese_tail_aggregator_is_removed():
+    body = (
+        "1. S1〜S5をレビューし _partial_S01-05.md に保存\n"
+        "2. S6〜S10をレビューし _partial_S06-10.md に保存\n"
+        "3. S11〜S15をレビューし _partial_S11-15.md に保存\n"
+        "4. S16〜S20をレビューし _partial_S16-20.md に保存\n"
+        "5. サブタスク1〜4が生成した4ファイルを読み込み、S1〜S20を統合して最終ファイルに保存\n"
+        + READY
+    )
+    got = fo.subtasks_from(body)
+    assert len(got) == 4
+    assert all("統合" not in step for step in got)
+    assert got[-1].startswith("S16〜S20")
+
+
+def test_a_dependency_in_the_middle_refuses_the_whole_split():
+    body = (
+        "1. Collect January records\n"
+        "2. Read subtask 1 results and validate them\n"
+        "3. Collect March records\n"
+        + READY
+    )
+    assert fo.subtasks_from(body) == []
+
+
+def test_self_reference_does_not_count_as_a_cross_subtask_dependency():
+    body = (
+        "1. Subtask 1: collect January records\n"
+        "2. Subtask 2: collect February records\n"
+        + READY
+    )
+    assert len(fo.subtasks_from(body)) == 2
+
+
+def test_split_prompt_forbids_a_parallel_merge_child():
+    assert "Do not add a merge/aggregation subtask" in fo.SPLIT_JOB
+
+
 def test_prose_with_no_list_yields_nothing():
     assert fo.subtasks_from("分割は不要です。このまま進めます。%s" % READY) == []
 
