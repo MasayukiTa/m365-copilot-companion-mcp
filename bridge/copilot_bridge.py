@@ -217,6 +217,9 @@ def _log_delete(guid, title, ok, reason):
 # and must tolerate the file being briefly absent, non-list, or corrupt mid-rewrite by the other
 # writer -- never raise out of a chat turn over this.
 
+from relay.conversation_lineage import merge_transcript_chains, with_transcript_lineage
+
+
 def merge_fleet_conversations(existing, new_entries):
     """PURE merge/dedup function: list-in/list-out, no file I/O (fully unit-testable).
 
@@ -249,18 +252,34 @@ def merge_fleet_conversations(existing, new_entries):
             continue
         u = entry.get("url") or ""
         if u and u in by_url:
-            clean[by_url[u]] = entry
+            idx = by_url[u]
+            prior = clean[idx]
+            merged = dict(entry)
+            chain = merge_transcript_chains(prior, entry)
+            if chain:
+                merged["transcripts"] = chain
+            if not (entry.get("transcript") or "") and prior.get("transcript"):
+                merged["transcript"] = prior.get("transcript")
+            clean[idx] = merged
             continue
         if not u:
             key = (entry.get("source"), entry.get("name"))
             if key in by_source_name:
-                clean[by_source_name[key]] = entry
+                idx = by_source_name[key]
+                prior = clean[idx]
+                merged = dict(entry)
+                chain = merge_transcript_chains(prior, entry)
+                if chain:
+                    merged["transcripts"] = chain
+                if not (entry.get("transcript") or "") and prior.get("transcript"):
+                    merged["transcript"] = prior.get("transcript")
+                clean[idx] = merged
                 continue
             by_source_name[key] = len(clean)
-            clean.append(entry)
+            clean.append(with_transcript_lineage(entry))
             continue
         by_url[u] = len(clean)
-        clean.append(entry)
+        clean.append(with_transcript_lineage(entry))
     return clean
 
 
