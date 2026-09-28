@@ -25,11 +25,11 @@ from tools import childproc  # noqa: E402
 
 def test_an_interrupted_write_leaves_the_old_file_whole(tmp_path):
     env = tmp_path / ".env"
-    env.write_bytes(b"MCP_API_KEY=old\r\nOTHER=1\r\n")
+    env.write_bytes(b"A=old\r\nOTHER=1\r\n")
     with mock.patch.object(E.os, "replace", side_effect=OSError("power cut")):
         with pytest.raises(OSError):
-            E.atomic_write_text(env, "MCP_API_KEY=new\r\n")
-    assert env.read_bytes() == b"MCP_API_KEY=old\r\nOTHER=1\r\n"
+            E.atomic_write_text(env, "A=new\r\n")
+    assert env.read_bytes() == b"A=old\r\nOTHER=1\r\n"
     assert [p.name for p in tmp_path.iterdir()] == [".env"], "a temporary file was left behind"
 
 
@@ -89,7 +89,7 @@ def test_unset_removes_every_active_line_and_leaves_comments(tmp_path):
 
 def test_the_cli_as_quickstart_calls_it(tmp_path):
     env = tmp_path / ".env"
-    env.write_text("MCP_API_KEY=keep\nMCP_TUNNEL_ALLOW_ANONYMOUS=1\n", encoding="utf-8")
+    env.write_text("MCP_API_KEY_PROTECTED=dpapi:opaque\nMCP_TUNNEL_ALLOW_ANONYMOUS=1\n", encoding="utf-8")
     script = str(HERE / "env_file.py")
     r = childproc.run([sys.executable, script, "unset", "MCP_TUNNEL_ALLOW_ANONYMOUS", "--env", str(env)])
     assert r.returncode == 0 and r.stdout.strip() == "removed"
@@ -98,7 +98,7 @@ def test_the_cli_as_quickstart_calls_it(tmp_path):
     url = "https://m365.cloud.microsoft/chat/agent/T_x.y?a=1&b='q'"
     r = childproc.run([sys.executable, script, "set", "MCP_IMPL_AGENT_URL", url, "--env", str(env)])
     assert r.returncode == 0, r.stderr
-    assert env.read_text(encoding="utf-8") == "MCP_API_KEY=keep\nMCP_IMPL_AGENT_URL=" + url + "\n"
+    assert env.read_text(encoding="utf-8") == "MCP_API_KEY_PROTECTED=dpapi:opaque\nMCP_IMPL_AGENT_URL=" + url + "\n"
     r = childproc.run([sys.executable, script, "set", "BAD KEY", "x", "--env", str(env)])
     assert r.returncode == 2
 
@@ -107,3 +107,91 @@ def test_key_classification():
     text = "A=1\n# B=2\n#C=3\n  D = 4\nnot a line\n"
     assert E.active_keys(text) == {"A", "D"}
     assert E.commented_keys(text) == {"B", "C"}
+
+
+def test_generic_writer_refuses_plaintext_secret_keys(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("A=1\n", encoding="utf-8")
+    for key in ("MCP_API_KEY", "MCP_UNLOCK_PASSWORD"):
+        with pytest.raises(ValueError, match="legacy plaintext secret key"):
+            E.set_key(env, key, "must-not-land")
+    assert "must-not-land" not in env.read_text(encoding="utf-8")
+
+
+def test_cli_refuses_plaintext_secret_persistence(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("A=1\n", encoding="utf-8")
+    script = str(HERE / "env_file.py")
+    r = childproc.run([sys.executable, script, "set", "MCP_API_KEY", "secret-value", "--env", str(env)])
+    assert r.returncode == 2
+    assert "MCP_API_KEY_PROTECTED" in r.stderr
+    assert "secret-value" not in env.read_text(encoding="utf-8")
+
+
+def test_rotation_backup_never_keeps_legacy_plaintext_auth_secrets(monkeypatch):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("rotate_secrets_for_test", HERE / "rotate_secrets.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(mod, "protect_secret", lambda v: "dpapi:protected-" + v)
+    got = mod.protect_legacy_secret_lines([
+        "MCP_API_KEY=api-plain",
+        "MCP_UNLOCK_PASSWORD=unlock-plain",
+        "OTHER=1",
+    ])
+    joined = "\n".join(got)
+    assert "MCP_API_KEY=api-plain" not in joined
+    assert "MCP_UNLOCK_PASSWORD=unlock-plain" not in joined
+    assert "MCP_API_KEY_PROTECTED=dpapi:protected-api-plain" in joined
+    assert "MCP_UNLOCK_PASSWORD_PROTECTED=dpapi:protected-unlock-plain" in joined
+    assert "OTHER=1" in joined
+
+
+def test_generic_atomic_sink_refuses_legacy_plaintext_auth(tmp_path):
+    env = tmp_path / ".env"
+    old = b"MCP_API_KEY=legacy\r\nMCP_TUNNEL_ALLOW_ANONYMOUS=1\r\nOTHER=1\r\n"
+    env.write_bytes(old)
+    with pytest.raises(ValueError, match="plaintext auth secret"):
+        E.atomic_write_text(env, "MCP_API_KEY=legacy\r\nOTHER=1\r\n")
+    assert env.read_bytes() == old, "a rejected secret-bearing rewrite must leave the old file intact"
+
+
+def test_unrelated_edit_fails_closed_until_bootstrap_migrates_legacy_auth(tmp_path):
+    env = tmp_path / ".env"
+    old = b"MCP_UNLOCK_PASSWORD=legacy-password\r\nMCP_TUNNEL_ALLOW_ANONYMOUS=1\r\nOTHER=1\r\n"
+    env.write_bytes(old)
+    with pytest.raises(ValueError, match="plaintext auth secret"):
+        E.unset_key(env, "MCP_TUNNEL_ALLOW_ANONYMOUS")
+    assert env.read_bytes() == old
+
+
+def test_protected_auth_lines_are_allowed_at_the_final_sink(tmp_path):
+    env = tmp_path / ".env"
+    E.atomic_write_text(env, "MCP_API_KEY_PROTECTED=dpapi:opaque\nMCP_UNLOCK_PASSWORD_PROTECTED=dpapi:opaque2\n")
+    got = env.read_text(encoding="utf-8")
+    assert "MCP_API_KEY_PROTECTED=dpapi:opaque" in got
+    assert "MCP_UNLOCK_PASSWORD_PROTECTED=dpapi:opaque2" in got
+
+def test_rotate_writer_refuses_plaintext_auth_at_its_final_sink(tmp_path):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("rotate_secrets_sink_test", HERE / "rotate_secrets.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    env = tmp_path / ".env"
+    with pytest.raises(ValueError, match="legacy plaintext auth secret"):
+        mod.write_env_lines(env, ["MCP_API_KEY=must-not-land", "OTHER=1"])
+    assert not env.exists()
+    mod.write_env_lines(env, ["MCP_API_KEY_PROTECTED=dpapi:opaque", "OTHER=1"])
+    text = env.read_text(encoding="utf-8")
+    assert "MCP_API_KEY=must-not-land" not in text
+    assert "MCP_API_KEY_PROTECTED=dpapi:opaque" in text
+
+
+def test_codeql_suppression_is_tied_to_the_sink_guard():
+    src = (HERE / "env_file.py").read_text(encoding="utf-8")
+    assert "_assert_no_plaintext_auth_persistence(text)" in src
+    lines = src.splitlines()
+    i = next(i for i, line in enumerate(lines) if "fh.write(data)" in line)
+    assert lines[i - 1].strip() == "# codeql[py/clear-text-storage-sensitive-data]"
+    guard_i = next(i for i, line in enumerate(lines) if "_assert_no_plaintext_auth_persistence(text)" in line and not line.lstrip().startswith("def "))
+    assert guard_i < i

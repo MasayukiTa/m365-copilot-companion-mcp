@@ -650,7 +650,8 @@ def test_doctor_trusts_the_status_file_only_while_its_supervisor_lives(tmp_path)
                                 creationflags=childproc.headless_creationflags())
     other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"],
                              creationflags=childproc.headless_creationflags())
-    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead = subprocess.Popen([sys.executable, "-c", "pass"],
+                            creationflags=childproc.headless_creationflags())
     dead.wait(30)
     try:
         time.sleep(1.0)

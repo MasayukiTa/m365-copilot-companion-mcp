@@ -71,6 +71,8 @@ def _load_dotenv(path: Path) -> None:
 
 
 _load_dotenv(REPO_ROOT / ".env")
+from tools.secret_store import materialize_api_key
+materialize_api_key()
 
 # ---------------------------------------------------------------------------
 # Official scorer import
@@ -503,7 +505,7 @@ def main() -> None:
     # Check API key
     api_key = os.environ.get("MCP_API_KEY", "")
     if not api_key:
-        print("ERROR: MCP_API_KEY not set in .env or environment.", file=sys.stderr)
+        print("ERROR: MCP_API_KEY could not be materialized from environment / protected .env storage.", file=sys.stderr)
         sys.exit(1)
 
     # Preflight check

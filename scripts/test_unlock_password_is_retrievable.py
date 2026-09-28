@@ -70,3 +70,17 @@ def test_repair_source_has_no_cleartext_password_print_path():
     assert 'print("password:' not in src
     assert "_reveal_allowed" not in src
     assert "_show_current" not in src
+
+
+@pytest.mark.skipif(not _POWERSHELL, reason="needs Windows PowerShell")
+def test_copilot_studio_values_prints_the_bearer_from_dpapi(tmp_path):
+    root = tmp_path / "repo"
+    (root / "scripts").mkdir(parents=True)
+    shutil.copy(os.path.join(REPO, "scripts", "copilot_studio_values.ps1"), root / "scripts" / "copilot_studio_values.ps1")
+    (root / ".env").write_text(
+        "MCP_API_KEY_PROTECTED=%s\nMCP_UNLOCK_PASSWORD_PROTECTED=%s\n"
+        % (_protect("visible-bearer-1234"), _protect("visible-pw-5678")), encoding="utf-8")
+    proc = childproc.run([_POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                          str(root / "scripts" / "copilot_studio_values.ps1")], timeout=120)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Bearer visible-bearer-1234" in proc.stdout  # gitleaks:allow -- test fixture only

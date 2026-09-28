@@ -34,13 +34,17 @@ from __future__ import annotations
 
 import argparse
 import secrets
-import shutil
 import sys
 from pathlib import Path
+
 
 # Repo root = parent of this scripts/ dir, so the script behaves identically
 # regardless of the caller's working directory.
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from tools.secret_store import API_KEY_PROTECTED_VAR, UNLOCK_PASSWORD_PROTECTED_VAR, protect_secret
+from scripts import env_file
 ENV_PATH = ROOT / ".env"
 ENV_BAK_PATH = ROOT / ".env.bak"
 
@@ -80,11 +84,35 @@ def write_env_lines(env_path: Path, lines: list[str]) -> None:
     "﻿MCP_API_KEY" and reported it missing; python-dotenv left it unset and
     main.py crashed with KeyError). We therefore write no BOM, CRLF endings.
     """
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith(API_KEY_VAR + "=") or stripped.startswith(UNLOCK_VAR + "="):
+            raise ValueError("refusing to persist legacy plaintext auth secret in %s" % env_path)
     text = "\r\n".join(lines) + "\r\n"
-    # encoding="utf-8" (NOT "utf-8-sig") => no BOM. newline="" => do not let
-    # Python translate our explicit \r\n into \r\r\n on Windows.
-    with open(env_path, "w", encoding="utf-8", newline="") as f:
-        f.write(text)
+    # One persistence primitive for .env and .env.bak. The auth-line validation above is this
+    # function's security boundary; env_file.atomic_write_text supplies the crash-safe swap.
+    env_file.atomic_write_text(env_path, text)
+
+
+def protect_legacy_secret_lines(lines: list[str]) -> list[str]:
+    """Return a backup-safe copy: legacy plaintext auth secrets become DPAPI ciphertext."""
+    out = []
+    has_api_protected = any(ln.lstrip().startswith(API_KEY_PROTECTED_VAR + "=") for ln in lines)
+    has_unlock_protected = any(ln.lstrip().startswith(UNLOCK_PASSWORD_PROTECTED_VAR + "=") for ln in lines)
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith(API_KEY_VAR + "="):
+            if not has_api_protected:
+                out.append(f"{API_KEY_PROTECTED_VAR}={protect_secret(line.split('=', 1)[1].strip())}")
+                has_api_protected = True
+            continue
+        if stripped.startswith(UNLOCK_VAR + "="):
+            if not has_unlock_protected:
+                out.append(f"{UNLOCK_PASSWORD_PROTECTED_VAR}={protect_secret(line.split('=', 1)[1].strip())}")
+                has_unlock_protected = True
+            continue
+        out.append(line)
+    return out
 
 
 def rotate_in_lines(lines: list[str], updates: dict[str, str]) -> tuple[list[str], set[str]]:
@@ -144,9 +172,11 @@ def main(argv=None) -> int:
         print("Run setup first (setup.bat) so a .env exists before rotating.", file=sys.stderr)
         return 1
 
-    # 1. Back up the current .env first (overwrite-safe: always replaces .env.bak).
-    shutil.copy2(ENV_PATH, ENV_BAK_PATH)
-    print(f"Backed up current .env -> {ENV_BAK_PATH.name}")
+    # 1. Back up the current .env, but NEVER preserve legacy plaintext credentials in the
+    # backup. A rollback copy is still local persistence and must obey the same DPAPI rule.
+    original_lines = read_env_lines(ENV_PATH)
+    write_env_lines(ENV_BAK_PATH, protect_legacy_secret_lines(original_lines))
+    print(f"Backed up current .env -> {ENV_BAK_PATH.name} (auth secrets protected)")
 
     # 2. Generate the chosen new secret(s).
     new_api_key = gen_api_key() if rotate_api else None
@@ -154,12 +184,16 @@ def main(argv=None) -> int:
 
     updates: dict[str, str] = {}
     if new_api_key is not None:
-        updates[API_KEY_VAR] = new_api_key
+        updates[API_KEY_PROTECTED_VAR] = protect_secret(new_api_key)
     if new_unlock is not None:
-        updates[UNLOCK_VAR] = new_unlock
+        updates[UNLOCK_PASSWORD_PROTECTED_VAR] = protect_secret(new_unlock)
 
     # 3. Update .env IN PLACE, preserving all other keys/lines/order.
-    lines = read_env_lines(ENV_PATH)
+    lines = original_lines
+    if rotate_api:
+        lines = [ln for ln in lines if not ln.lstrip().startswith(API_KEY_VAR + "=")]
+    if rotate_unlock:
+        lines = [ln for ln in lines if not ln.lstrip().startswith(UNLOCK_VAR + "=")]
     new_lines, found = rotate_in_lines(lines, updates)
 
     # If a target key was not present at all, append it so rotation still works
@@ -185,7 +219,7 @@ def main(argv=None) -> int:
             print(f"     Authorization header value -> `Bearer {new_api_key}`")
         else:
             print("     Authorization header value -> `Bearer <NEW_API_KEY>` "
-                  "(read it from .env)")
+                  "(run copilot_studio_values.bat to reveal it interactively)")
         print("   The OLD Bearer token no longer authenticates once the server restarts.")
         step += 1
 
@@ -195,7 +229,7 @@ def main(argv=None) -> int:
         if not args.no_print:
             print(f"     New unlock password: {new_unlock}")
         else:
-            print("     (read the new unlock password from .env)")
+            print("     (run copilot_studio_values.bat to reveal it interactively)")
         step += 1
 
     # 5. Restart instruction. Determined from main.py + supervisor.ps1:

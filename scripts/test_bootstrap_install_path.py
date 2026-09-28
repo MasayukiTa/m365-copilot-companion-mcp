@@ -649,8 +649,13 @@ def test_the_import_timeout_is_reported_as_a_timeout(monkeypatch, tmp_path):
     monkeypatch.setattr("tools.childproc.run", raise_timeout)
     assert B._count_tools_via_subprocess() is B._IMPORT_TIMED_OUT
     monkeypatch.setattr(B, "TRANSCRIPT", tmp_path / "log")
-    (tmp_path / ".env").write_text("MCP_API_KEY=abc\nMCP_UNLOCK_PASSWORD=x\n", encoding="utf-8")
+    # This test exercises timeout reporting, not DPAPI. Keep the fixture platform-neutral
+    # and bypass dotenv materialization so Linux CI never calls the Windows-only protector.
+    (tmp_path / ".env").write_text(
+        "MCP_API_KEY_PROTECTED=dpapi:test-api\nMCP_UNLOCK_PASSWORD_PROTECTED=dpapi:test-unlock\n",
+        encoding="utf-8")
     monkeypatch.setattr(B, "ROOT", tmp_path)
+    monkeypatch.setattr(B, "_load_dotenv_into_env", lambda _p: None)
     with pytest.raises(B.VerifyTimedOut) as ei:
         B.step_verify()
     assert "KEPT" in str(ei.value) and str(B.VERIFY_IMPORT_TIMEOUT_S) in str(ei.value)
@@ -725,8 +730,10 @@ def test_a_bearer_minted_into_an_existing_env_is_shown(repo, capsys):
     without a word."""
     (repo / ".env").write_text("MCP_UNLOCK_PASSWORD=keep\n", encoding="utf-8")
     B.step_gen_env()
-    api = [l.split("=", 1)[1] for l in (repo / ".env").read_text(encoding="utf-8").splitlines()
-           if l.startswith("MCP_API_KEY=")][0]
+    from tools.secret_store import unprotect_secret
+    api_blob = [l.split("=", 1)[1] for l in (repo / ".env").read_text(encoding="utf-8").splitlines()
+                if l.startswith("MCP_API_KEY_PROTECTED=")][0]
+    api = unprotect_secret(api_blob)
     assert api in capsys.readouterr().out
 
 
@@ -820,7 +827,7 @@ def _run_dev_tunnel_step(monkeypatch, repo):
 def test_a_carried_env_gives_up_its_tunnel_before_provisioning(repo, monkeypatch):
     """D7: the recorded name used to be re-provisioned and stamped as this machine's, so the
     same account hosted ONE tunnel from two PCs."""
-    _dev_tunnel_env(repo, ["MCP_API_KEY=k", "MCP_TUNNEL_NAME=team-tunnel",
+    _dev_tunnel_env(repo, ["MCP_API_KEY_PROTECTED=dpapi:opaque", "MCP_TUNNEL_NAME=team-tunnel",
                            "MCP_TUNNEL_URL=https://team-tunnel-8000.jpe1.devtunnels.ms/",
                            "MCP_TUNNEL_HOST=some-other-pc", "MCP_UNLOCK_PASSWORD_PROTECTED=dpapi:x"])
     tunnel = _run_dev_tunnel_step(monkeypatch, repo)
@@ -829,8 +836,8 @@ def test_a_carried_env_gives_up_its_tunnel_before_provisioning(repo, monkeypatch
     assert "\n# MCP_TUNNEL_NAME=team-tunnel" in text and "\nMCP_TUNNEL_NAME=" not in text
     assert "\n# MCP_TUNNEL_HOST=some-other-pc" in text
     assert "\nMCP_UNLOCK_PASSWORD_PROTECTED=dpapi:x" in text, "a non-tunnel key was set aside"
-    assert text.startswith("MCP_API_KEY=k\r\n") and "\n" not in text.replace("\r\n", ""), \
-        "line endings or other lines were disturbed"
+    assert text.startswith("MCP_API_KEY_PROTECTED=dpapi:opaque\r\n"), "an unrelated tunnel edit changed another key"
+    assert "\n" not in text.replace("\r\n", ""), "line endings were disturbed"
 
 
 def test_an_unstamped_generated_name_from_another_machine_is_foreign(repo, monkeypatch):

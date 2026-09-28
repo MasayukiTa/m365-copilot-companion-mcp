@@ -25,7 +25,30 @@ $turl = $envv['MCP_TUNNEL_URL']
 $serverUrl = $null
 if ($turl) { $serverUrl = ($turl.TrimEnd('/')) + '/mcp' }
 
-if ($envv['MCP_API_KEY']) { $bearer = 'Bearer ' + $envv['MCP_API_KEY'] }
+function Get-LocalSecret([hashtable]$envMap, [string]$plainName, [string]$protectedName) {
+    $plain = [string]$envMap[$plainName]
+    if (-not [string]::IsNullOrWhiteSpace($plain)) { return @{ State = 'value'; Value = $plain } }
+    $protected = [string]$envMap[$protectedName]
+    if ([string]::IsNullOrWhiteSpace($protected)) { return @{ State = 'unset'; Value = $null } }
+    if (-not $protected.StartsWith('dpapi:', [System.StringComparison]::OrdinalIgnoreCase)) {
+        return @{ State = 'undecryptable'; Value = $null }
+    }
+    try {
+        Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue
+        $cipher = [Convert]::FromBase64String($protected.Substring('dpapi:'.Length))
+        $plainBytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
+            $cipher, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+        $value = [Text.Encoding]::UTF8.GetString($plainBytes)
+        if ([string]::IsNullOrWhiteSpace($value)) { return @{ State = 'undecryptable'; Value = $null } }
+        return @{ State = 'value'; Value = $value }
+    } catch {
+        return @{ State = 'undecryptable'; Value = $null }
+    }
+}
+
+$a = Get-LocalSecret $envv 'MCP_API_KEY' 'MCP_API_KEY_PROTECTED'
+if ($a.State -eq 'value') { $bearer = 'Bearer ' + $a.Value }
+elseif ($a.State -eq 'undecryptable') { $bearer = '<Bearer exists but cannot be decrypted on this Windows account>' }
 else { $bearer = '<no Bearer yet -- run quickstart.bat first>' }
 
 Write-Host ""
@@ -58,30 +81,9 @@ Write-Host ""
 # longer has any cleartext-output mode. Read the same .env keys here: legacy plain first, then
 # the user-bound DPAPI blob produced by tools.secret_store.protect_secret.
 function Get-UnlockPasswordLocal([hashtable]$envMap) {
-    $plain = [string]$envMap['MCP_UNLOCK_PASSWORD']
-    if (-not [string]::IsNullOrWhiteSpace($plain)) {
-        return @{ State = 'password'; Value = $plain }
-    }
-    $protected = [string]$envMap['MCP_UNLOCK_PASSWORD_PROTECTED']
-    if ([string]::IsNullOrWhiteSpace($protected)) {
-        return @{ State = 'unset'; Value = $null }
-    }
-    if (-not $protected.StartsWith('dpapi:', [System.StringComparison]::OrdinalIgnoreCase)) {
-        return @{ State = 'undecryptable'; Value = $null }
-    }
-    try {
-        Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue
-        $cipher = [Convert]::FromBase64String($protected.Substring('dpapi:'.Length))
-        $plainBytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
-            $cipher, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
-        $value = [Text.Encoding]::UTF8.GetString($plainBytes)
-        if ([string]::IsNullOrWhiteSpace($value)) {
-            return @{ State = 'undecryptable'; Value = $null }
-        }
-        return @{ State = 'password'; Value = $value }
-    } catch {
-        return @{ State = 'undecryptable'; Value = $null }
-    }
+    $r = Get-LocalSecret $envMap 'MCP_UNLOCK_PASSWORD' 'MCP_UNLOCK_PASSWORD_PROTECTED'
+    if ($r.State -eq 'value') { return @{ State = 'password'; Value = $r.Value } }
+    return @{ State = $r.State; Value = $null }
 }
 
 Write-Host "For mutating tools (write_file, run_python, shell) you also need, in chat:" -ForegroundColor Cyan
