@@ -84,6 +84,26 @@ def _read_goal_file(path: str | os.PathLike) -> str:
     return text
 
 
+def _campaign_job_ids(state_dir: str | os.PathLike) -> set[str]:
+    path = Path(state_dir) / LOCAL_LOOP_CAMPAIGN_MANIFEST
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, TypeError):
+        return set()
+    rows = manifest.get("entries") if isinstance(manifest, dict) else None
+    if not isinstance(rows, list):
+        return set()
+    ids = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            ids.add(LocalJobStore._validate_job_id(row.get("job_id")))
+        except JobStoreError:
+            continue
+    return ids
+
+
 def _project_job_snapshot(store: LocalJobStore, job_id: str, status_path: str | os.PathLike,
                           *, now: float | None = None, terminal_grace_seconds: float = 120.0) -> dict:
     """Project every LOCAL_LOOP job visible in this state dir without leaking shared-DB jobs.
@@ -112,6 +132,13 @@ def _project_job_snapshot(store: LocalJobStore, job_id: str, status_path: str | 
     except OSError:
         pass
 
+    campaign_ids = _campaign_job_ids(state_dir)
+    # A completed campaign manifest may remain on disk for audit/resume. A standalone job that is
+    # unrelated to it must not resurrect those old rows. Treat the manifest as live membership
+    # only when this controller belongs to it or another active marker does.
+    if campaign_ids and job_id not in campaign_ids and not (marker_ids & campaign_ids):
+        campaign_ids = set()
+
     previous_ids = set()
     try:
         previous = json.loads(status_path.read_text(encoding="utf-8-sig"))
@@ -125,13 +152,14 @@ def _project_job_snapshot(store: LocalJobStore, job_id: str, status_path: str | 
         except JobStoreError:
             continue
 
-    candidate_ids = marker_ids | previous_ids | {LocalJobStore._validate_job_id(job_id)}
+    candidate_ids = marker_ids | campaign_ids | previous_ids | {LocalJobStore._validate_job_id(job_id)}
     workers = []
     for worker in snapshot.get("workers", []):
         name = worker.get("name")
         if name not in candidate_ids:
             continue
-        if worker.get("closed") and name != job_id and name not in marker_ids:
+        if (worker.get("closed") and name != job_id and name not in marker_ids
+                and name not in campaign_ids):
             updated = float(worker.get("updated_at") or 0.0)
             if name not in previous_ids or now - updated > terminal_grace_seconds:
                 continue
@@ -141,7 +169,10 @@ def _project_job_snapshot(store: LocalJobStore, job_id: str, status_path: str | 
     snapshot["total"] = len(workers)
     snapshot["done_count"] = sum(1 for worker in workers if worker.get("outcome") == "DONE")
     snapshot["running"] = any(not bool(worker.get("closed")) for worker in workers)
-    snapshot["open_tabs"] = sum(1 for worker in workers if not bool(worker.get("closed")))
+    snapshot["open_tabs"] = sum(
+        1 for worker in workers
+        if worker.get("name") in marker_ids and not bool(worker.get("closed"))
+    )
     snapshot["started"] = min(
         (float(worker.get("created_at") or worker.get("updated_at") or now) for worker in workers),
         default=now,
@@ -262,6 +293,7 @@ def _write_atomic(path: str | os.PathLike, payload: dict) -> None:
 
 LOCAL_LOOP_MARKER_DIR = "local_loop_active"
 LOCAL_LOOP_LOCK_DIR = "local_loop_locks"
+LOCAL_LOOP_CAMPAIGN_MANIFEST = "local_loop_campaign.json"
 
 
 def _controller_marker_path(state_dir: str | os.PathLike, job_id: str) -> Path:

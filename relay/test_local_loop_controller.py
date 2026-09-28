@@ -664,3 +664,53 @@ def test_concurrent_job_projections_keep_every_active_job_visible(tmp_path):
     assert final["open_tabs"] == 2
     assert final["running"] is True
     assert final["started"] == 1
+
+
+def test_campaign_manifest_projects_queued_jobs_without_counting_them_as_open_tabs(tmp_path):
+    from relay.local_loop_controller import (
+        LOCAL_LOOP_CAMPAIGN_MANIFEST, _write_controller_marker,
+    )
+
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    store.create_job(_job("job_1"), now=1)
+    store.create_job(_job("job_2"), now=2)
+    store.create_job(_job("unrelated"), now=3)
+    (tmp_path / LOCAL_LOOP_CAMPAIGN_MANIFEST).write_text(json.dumps({
+        "version": 1,
+        "started": 1,
+        "entries": [{"job_id": "job_1"}, {"job_id": "job_2"}],
+    }), encoding="utf-8")
+    _write_controller_marker(tmp_path, "job_1", ["--job-id", "job_1"], pid=101, started=1)
+    status_path = tmp_path / "status.json"
+
+    _project_job_snapshot(store, "job_1", status_path, now=10)
+
+    projected = json.loads(status_path.read_text(encoding="utf-8"))
+    by_name = {w["name"]: w for w in projected["workers"]}
+    assert set(by_name) == {"job_1", "job_2"}
+    assert by_name["job_2"]["status"] == "ready"
+    assert projected["total"] == 2
+    assert projected["open_tabs"] == 1
+    assert projected["running"] is True
+    assert "unrelated" not in by_name
+
+
+def test_stale_campaign_manifest_is_ignored_by_an_unrelated_standalone_job(tmp_path):
+    from relay.local_loop_controller import (
+        LOCAL_LOOP_CAMPAIGN_MANIFEST, _write_controller_marker,
+    )
+
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    store.create_job(_job("old_campaign_job"), now=1)
+    store.create_job(_job("standalone"), now=2)
+    (tmp_path / LOCAL_LOOP_CAMPAIGN_MANIFEST).write_text(json.dumps({
+        "version": 1, "entries": [{"job_id": "old_campaign_job"}],
+    }), encoding="utf-8")
+    _write_controller_marker(tmp_path, "standalone", ["--job-id", "standalone"], pid=202, started=2)
+    status_path = tmp_path / "status.json"
+
+    _project_job_snapshot(store, "standalone", status_path, now=10)
+
+    projected = json.loads(status_path.read_text(encoding="utf-8"))
+    assert [w["name"] for w in projected["workers"]] == ["standalone"]
+    assert projected["open_tabs"] == 1
