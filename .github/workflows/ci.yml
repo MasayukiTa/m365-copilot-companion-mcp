@@ -214,6 +214,7 @@ jobs:
             ui/test_a_retry_budget_bounds_the_repair_it_pays_for.py \
             ui/test_every_lane_in_flight_is_on_screen.py \
             ui/test_durable_execution_state_visible.py \
+            ui/test_durable_live_campaign_enqueue.py \
             ui/test_a_selection_survives_a_refresh_that_changed_nothing.py \
             ui/test_a_follow_up_is_not_a_wall_of_text.py \
             ui/test_a_card_is_not_a_reading_surface.py \
@@ -248,6 +249,7 @@ jobs:
             scripts/test_supervisor_port_owner.py \
             scripts/test_supervisor_fleet_resume_guard.py \
             scripts/test_supervisor_local_loop_resume.py \
+            scripts/test_supervisor_local_loop_campaign.py \
             scripts/test_a_submitted_job_is_picked_up_at_once.py \
             scripts/test_a_failing_entry_point_says_why.py \
             scripts/test_dialogs_use_japanese_font.py \
@@ -452,6 +454,7 @@ jobs:
             relay/test_local_job_store.py \
             relay/test_local_loop_controller.py \
             relay/test_local_loop_autoresume.py \
+            relay/test_local_loop_campaign_queue.py \
             relay/test_a_drain_deletes_only_what_it_consumed.py \
             relay/test_network_recovery.py \
             relay/test_provenance.py \

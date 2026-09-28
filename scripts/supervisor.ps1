@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Keeps the MCP server and the Dev Tunnel host alive.
 
@@ -1248,6 +1248,7 @@ $FleetDir = Join-Path $Root ".fleet"
 $FleetMarkerPath = Join-Path $Root ".fleet\fleet_run_active.json"
 $ReviewMarkerPath = Join-Path $Root ".fleet\review_run_active.json"
 $LocalLoopMarkerDir = Join-Path $Root ".fleet\local_loop_active"
+$LocalLoopCampaignPath = Join-Path $FleetDir "local_loop_campaign.json"
 $script:LastReviewResumeKey = ""
 $script:LastReviewResumeAttempt = [datetime]::MinValue
 
@@ -1652,6 +1653,46 @@ function Invoke-LocalLoopAutoResume {
     return $did
 }
 
+function Invoke-LocalLoopCampaignDrain {
+    # Campaign intake is durable before a controller exists.  A short enqueue process normally
+    # launches its children immediately, but if it dies in that gap the active manifest remains.
+    # This pass makes the supervisor the recovery owner for those marker-less READY jobs.
+    # Do not duplicate Python's .env parser here. The controller owns the feature flag and loads
+    # .env; this supervisor only avoids spawning a drain when no active campaign exists.
+    if (-not (Test-Path $LocalLoopCampaignPath)) { return $false }
+    Update-PythonInterpreter "the LOCAL_LOOP campaign drain"
+    $out = ""
+    $code = 0
+    try {
+        Push-Location $Root
+        try {
+            $out = (& $Py -W ignore -m relay.local_loop_controller --drain-campaign --state-dir $FleetDir) -join ""
+            $code = $LASTEXITCODE
+        } finally {
+            Pop-Location
+        }
+    } catch {
+        Write-Log "LOCAL_LOOP campaign drain FAILED: $($_.Exception.Message)"
+        return $false
+    }
+    if ($code -ne 0) {
+        Write-Log "LOCAL_LOOP campaign drain exit $code"
+        return $false
+    }
+    if (-not [string]::IsNullOrWhiteSpace($out)) {
+        try {
+            $result = $out | ConvertFrom-Json -ErrorAction Stop
+            $launched = @($result.launched)
+            if ($launched.Count -gt 0) {
+                Write-Log ("LOCAL_LOOP campaign launched " + $launched.Count + " queued job(s): " + ($launched -join ", "))
+            }
+        } catch {
+            Write-Log "LOCAL_LOOP campaign drain returned unreadable output: $out"
+        }
+    }
+    return $true
+}
+
 # -- Queue delivery: the reaper + router pass, and the wait between ticks -----------------------
 # The two steps the tick has always run back to back, now callable from two places: the full
 # tick (unchanged position and order) and the express pass inside Wait-ForNextTick below.
@@ -1867,6 +1908,7 @@ Write-Log "supervisor up (tunnel=$TunnelName port=$Port interval=${IntervalSecon
 Invoke-FleetAutoResume -DryRun:$FleetResumeDryRun | Out-Null
 Invoke-ReviewAutoResume | Out-Null
 Invoke-LocalLoopAutoResume | Out-Null
+Invoke-LocalLoopCampaignDrain | Out-Null
 
 # THE DEBOUNCE IS FOR A SERVER THAT MIGHT COME BACK, NOT FOR ONE THAT WAS NEVER STARTED.
 # Starting at zero meant the FIRST launch waited out four consecutive failures. MEASURED on
@@ -2042,7 +2084,8 @@ while ($true) {
     foreach ($n in $shownToPass) { [void]$script:ExpressSeen.Add($n) }
 
     Invoke-ReviewAutoResume | Out-Null
-Invoke-LocalLoopAutoResume | Out-Null
+    Invoke-LocalLoopAutoResume | Out-Null
+    Invoke-LocalLoopCampaignDrain | Out-Null
 
     # Report any tracked fleet/review/LOCAL_LOOP auto-resume runner that has exited since the last tick.
     # Every tick, not just after a relaunch, because the runner that needs reporting may still
