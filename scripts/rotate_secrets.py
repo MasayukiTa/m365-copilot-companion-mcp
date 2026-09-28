@@ -94,7 +94,7 @@ def write_env_lines(env_path: Path, lines: list[str]) -> None:
     with open(env_path, "w", encoding="utf-8", newline="") as f:
         # Every auth secret line was either already protected or passed through DPAPI above.
         # CodeQL cannot infer that our CryptProtectData ctypes wrapper is an encryption barrier.
-        # codeql[py/clear-text-storage-sensitive-data]
+        # lgtm[py/clear-text-storage-sensitive-data]
         f.write(text)
 
 
