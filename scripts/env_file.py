@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import os
 import re
 import sys
@@ -62,21 +63,46 @@ def newline_of(text: str) -> str:
     return "\r\n" if "\r\n" in text else "\n"
 
 
-def _assert_no_plaintext_auth_persistence(text: str) -> None:
-    """Fail closed if an active legacy auth-secret alias would be written.
+def _plaintext_auth_assignments(text: str):
+    """Return active legacy secret assignments as key -> Counter(value-text).
 
-    This module is the final persistence primitive for .env/.env.bak.  Migration/protection is
-    intentionally owned by bootstrap/setup/rotate; the generic writer must never silently
-    preserve or create the old clear-text aliases.  Commented examples are not assignments.
+    Values are never logged or surfaced; the counters exist only to decide whether a proposed
+    rewrite would persist MORE plaintext secret material than is already on disk.
     """
-    bad = []
+    out = {key: Counter() for key in _PLAINTEXT_SECRET_KEYS}
     for line in text.splitlines():
         m = _KEY_RE.match(line)
-        if m and m.group(1) in _PLAINTEXT_SECRET_KEYS:
-            bad.append(m.group(1))
+        if not m:
+            continue
+        key = m.group(1)
+        if key in out:
+            out[key][line[m.end():]] += 1
+    return out
+
+
+def _assert_no_plaintext_auth_escalation(path: Path, text: str) -> None:
+    """Reject only NEW/CHANGED/DUPLICATED legacy plaintext auth assignments.
+
+    New-PC migration left some installations with readable legacy MCP_API_KEY / unlock lines.
+    Blocking EVERY unrelated .env edit while those lines existed made quickstart unable to
+    change an unrelated flag, even though it did not touch the secret at all.  That is not a
+    security boundary; it is a migration deadlock.
+
+    The generic writer still may not create or mutate a legacy plaintext secret.  A proposed
+    file may retain at most the exact legacy value occurrences already present in the old file.
+    Removing some/all legacy assignments is allowed and is the direction migration should move.
+    """
+    old = _plaintext_auth_assignments(read_text(Path(path)))
+    new = _plaintext_auth_assignments(text)
+    bad = []
+    for key in _PLAINTEXT_SECRET_KEYS:
+        for value, count in new[key].items():
+            if count > old[key][value]:
+                bad.append(key)
+                break
     if bad:
         raise ValueError(
-            "refusing to persist legacy plaintext auth secret key(s): %s"
+            "refusing to persist new or changed legacy plaintext auth secret key(s): %s"
             % ", ".join(sorted(set(bad))))
 
 
@@ -90,7 +116,7 @@ def atomic_write_text(path: Path, text: str, attempts: int = 10) -> None:
     an error. The temporary file is removed on every failure path so none is left behind.
     """
     path = Path(path)
-    _assert_no_plaintext_auth_persistence(text)
+    _assert_no_plaintext_auth_escalation(path, text)
     tmp = path.with_name("%s.tmp-%d" % (path.name, os.getpid()))
     data = text.encode("utf-8")
     try:

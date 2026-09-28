@@ -2658,9 +2658,6 @@ class CockpitWindow : Window
         else if (authStorm)
             SetDot(0, HealthState.Yellow,
                    T("hs_srv_detail_auth") + " (" + authFails + ")", now);
-        else if (codeState == "stale" && StaleLongEnoughToMatter(srvBody))
-            SetDot(0, HealthState.Yellow,
-                   T("hs_srv_detail_stale") + " (" + HealthField(srvBody, "server_head") + ")", now);
         else if (codeState == "stale")
             // GREEN, AND IT SAYS WHY. A commit that touches a watched package makes the running
             // server genuinely stale, so on a machine where an agent improves the code all day
@@ -3873,18 +3870,22 @@ class CockpitWindow : Window
             bool fleetWorking = fleetTool == "true";
             bool fleetFailing = fleetTool == "false";
 
-            if (ok && fleetFailing)
+            if (fleetWorking)
+            {
+                // CURRENT OPERABILITY WINS THE COLOUR. The Fleet is the path this cockpit is
+                // supervising. If real Fleet calls are succeeding, Tool is green. A degraded
+                // bridge/chat probe remains visible in the detail, but must not turn the Fleet
+                // traffic light amber while the work path is demonstrably healthy.
+                string detail = ok
+                    ? (ageTxt + " " + T("hs_tool_detail_ok"))
+                    : (ageTxt + " " + T("hs_tool_detail_bridge_only_down"));
+                if (ok && probing) detail += " / " + T("hs_tool_detail_checking");
+                SetDot(5, HealthState.Green, detail, now);
+            }
+            else if (ok && fleetFailing)
                 // The bridge can call tools and the fleet cannot. Green here would hide the
                 // failure of the path that does the work.
                 SetDot(5, HealthState.Yellow, ageTxt + " " + T("hs_tool_detail_fleet_down"), now);
-            else if (!ok && fleetWorking && ageMin < 20.0)
-                // The case that prompted all this. Amber and say which half is down, rather
-                // than red for "tools", which is read as all of them.
-                SetDot(5, HealthState.Yellow, ageTxt + " " + T("hs_tool_detail_bridge_only_down"), now);
-            else if (ageMin >= 20.0 && fleetWorking)
-                // A stale bridge probe while the fleet is demonstrably calling tools is not a
-                // tool outage; it is a probe nobody has run.
-                SetDot(5, HealthState.Yellow, ageTxt + " " + T("hs_tool_detail_bridge_only_down"), now);
             else if (ageMin >= 20.0)
                 SetDot(5, HealthState.Red, ageTxt + " " + T("hs_tool_detail_stale"), now);
             else if (kind == "checking" || kind == "starting")
@@ -13076,15 +13077,19 @@ class CockpitWindow : Window
                     if (!string.IsNullOrEmpty(currentStep))
                     {
                         string stepPrefix = totalSteps > 0
-                            ? ("▶ " + currentIndex + "/" + totalSteps + "  ")
-                            : ("▶ " + currentIndex + "  ");
-                        col.Children.Add(new TextBlock
+                            ? (currentIndex + "/" + totalSteps + "  ")
+                            : (currentIndex + "  ");
+                        var stepLine = new StackPanel { Orientation = Orientation.Horizontal,
+                            Margin = new Thickness(24, 4, 0, 0) };
+                        stepLine.Children.Add(MakeIcon("play_arrow", 13, Fg));
+                        stepLine.Children.Add(new TextBlock
                         {
                             Text = stepPrefix + OneLine(currentStep),
                             Foreground = Fg, FontSize = 12.5, FontWeight = FontWeights.SemiBold,
                             TextTrimming = TextTrimming.CharacterEllipsis, TextWrapping = TextWrapping.NoWrap,
-                            Margin = new Thickness(24, 4, 0, 0)
+                            Margin = new Thickness(4, 0, 0, 0)
                         });
+                        col.Children.Add(stepLine);
                     }
                 }
 
@@ -13137,7 +13142,7 @@ class CockpitWindow : Window
                     col.Children.Add(rl);
                 }
 
-                // Line 3: meta — worker name · turn N · alive {freshness} ago · ✓verified [COMPUTED].
+                // Line 3: meta — worker name · turn N · alive {freshness} ago · verified [COMPUTED].
                 var meta = new StringBuilder();
                 string transcriptPath = S(w, "transcript");
                 double startTs = ReadTranscriptStartTs(transcriptPath);
@@ -13156,7 +13161,7 @@ class CockpitWindow : Window
                     int completed = I(execution, "completed_count");
                     int totalSteps = I(execution, "total_steps");
                     int artifactCount = ArrCount(execution, "artifacts");
-                    meta.Append(" · ✓ ").Append(completed);
+                    meta.Append(" · ").Append(_lang == 0 ? "完了 " : "done ").Append(completed);
                     if (totalSteps > 0) meta.Append('/').Append(totalSteps);
                     if (artifactCount > 0)
                         meta.Append(" · ").Append(artifactCount).Append(_lang == 0 ? " 成果物" : " artifacts");
@@ -13546,8 +13551,12 @@ class CockpitWindow : Window
         string head = (total > 0 ? (currentIndex + "/" + total) : currentIndex.ToString());
         if (!string.IsNullOrEmpty(state)) head += " · " + state;
         if (!string.IsNullOrEmpty(current)) head += " · " + current;
-        sp.Children.Add(new TextBlock { Text = "▶ " + head, Foreground = Fg, FontSize = 12.5,
-            FontWeight = FontWeights.SemiBold, TextWrapping = TextWrapping.Wrap });
+        var headLine = new StackPanel { Orientation = Orientation.Horizontal };
+        headLine.Children.Add(MakeIcon("play_arrow", 13, Fg));
+        headLine.Children.Add(new TextBlock { Text = head, Foreground = Fg, FontSize = 12.5,
+            FontWeight = FontWeights.SemiBold, TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(4, 0, 0, 0) });
+        sp.Children.Add(headLine);
 
         if (!string.IsNullOrEmpty(lastProgress))
             sp.Children.Add(new TextBlock { Text = (_lang == 0 ? "進捗: " : "Progress: ") + lastProgress,
@@ -13570,10 +13579,14 @@ class CockpitWindow : Window
                     if (step == null) continue;
                     string instruction = S(step, "instruction");
                     string summary = S(step, "summary");
-                    string line = "✓ " + instruction;
+                    string line = instruction;
                     if (!string.IsNullOrEmpty(summary) && summary != instruction) line += " — " + summary;
-                    sp.Children.Add(new TextBlock { Text = line, Foreground = Muted, FontSize = 12,
-                        Margin = new Thickness(8, 1, 0, 1), TextWrapping = TextWrapping.Wrap });
+                    var doneLine = new StackPanel { Orientation = Orientation.Horizontal,
+                        Margin = new Thickness(8, 1, 0, 1) };
+                    doneLine.Children.Add(MakeIcon("check", 12, Muted));
+                    doneLine.Children.Add(new TextBlock { Text = line, Foreground = Muted, FontSize = 12,
+                        Margin = new Thickness(4, 0, 0, 0), TextWrapping = TextWrapping.Wrap });
+                    sp.Children.Add(doneLine);
                 }
             }
         }
