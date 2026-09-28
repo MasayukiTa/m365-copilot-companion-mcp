@@ -188,7 +188,7 @@ def test_receipt_failure_is_a_pending_commit_and_retries_from_the_existing_tombs
 
 def test_live_apply_enqueues_only_newly_durable_goals():
     src = Path(fr.__file__).read_text(encoding="utf-8")
-    i = src.index("def _apply_command(cmd, workers):")
+    i = src.index("def _apply_command(cmd, workers, submission_id=None):")
     block = src[i:i + 5000]
     assert "return_new=True" in block
     assert "for g in _new_cmd_goals:" in block
@@ -281,3 +281,55 @@ def test_rejected_tombstone_recovery_preserves_rejected_decision_after_state_cha
     assert body["applied"] is False
     assert body["rejected"] is True
     assert isinstance(body.get("errors"), list)
+
+
+def test_command_submission_identity_distinguishes_intentional_same_text_retries(tmp_path):
+    fr._write_goals_ledger(str(tmp_path), [], started=1.0, raise_on_error=True)
+
+    p1 = _write(tmp_path, text="same retry text")
+    c1 = fr.claim_next_command(str(tmp_path))
+    assert c1 is not None
+    g1 = fr.goals_from_command(c1["cmd"], submission_id=c1["name"])
+    assert len(g1) == 1 and g1[0].get("jid")
+    n1 = fr._append_goals_ledger(str(tmp_path), g1, started=1.0, raise_on_error=True, return_new=True)
+    assert len(n1) == 1
+    fr.restore_command_claim(c1)
+
+    # Re-reading THE SAME durable command after a crash must be idempotent.
+    c1b = fr.claim_next_command(str(tmp_path))
+    g1b = fr.goals_from_command(c1b["cmd"], submission_id=c1b["name"])
+    assert g1b[0]["jid"] == g1[0]["jid"]
+    assert fr._append_goals_ledger(str(tmp_path), g1b, started=1.0, raise_on_error=True, return_new=True) == []
+    assert fr.commit_command_claim(str(tmp_path), c1b, applied=True)
+
+    # A NEW command with the SAME text is an intentional retry and must get a new identity.
+    p2 = _write(tmp_path, text="same retry text")
+    assert p2 != p1
+    c2 = fr.claim_next_command(str(tmp_path))
+    g2 = fr.goals_from_command(c2["cmd"], submission_id=c2["name"])
+    assert g2[0]["jid"] != g1[0]["jid"]
+    n2 = fr._append_goals_ledger(str(tmp_path), g2, started=1.0, raise_on_error=True, return_new=True)
+    assert len(n2) == 1, "a deliberate same-text retry must become a new durable task"
+    fr.restore_command_claim(c2)
+
+
+def test_command_submission_identity_preserves_explicit_jid():
+    cmd = {"add_goal": [{"text": "x", "jid": "callerjid123"}]}
+    got = fr.goals_from_command(cmd, submission_id="some-command.json")
+    assert got[0]["jid"] == "callerjid123"
+
+
+def test_multi_goal_command_gets_stable_distinct_per_item_jids():
+    cmd = {"add_goal": [{"text": "x"}, {"text": "x"}]}
+    a = fr.goals_from_command(cmd, submission_id="cmd-abc.json")
+    b = fr.goals_from_command(cmd, submission_id="cmd-abc.json")
+    assert a[0]["jid"] != a[1]["jid"]
+    assert [g["jid"] for g in a] == [g["jid"] for g in b]
+
+
+def test_live_drain_passes_claim_identity_into_goal_admission():
+    src = Path(fr.__file__).read_text(encoding="utf-8")
+    i = src.index("def _drain_commands(workers):")
+    block = src[i:i + 3500]
+    assert '_apply_command(claim["cmd"], workers, submission_id=claim["name"])' in block
+    assert "goals_from_command(cmd, submission_id=submission_id)" in block
