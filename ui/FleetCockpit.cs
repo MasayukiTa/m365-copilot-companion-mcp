@@ -823,6 +823,7 @@ class CockpitWindow : Window
     bool _fanout = true;       // -> settings.txt fanout=
     string _approval = "run";  // approval mode run|plan|auto -> settings.txt approval=
     string _runtimeMode = "fleet"; // next launch: fleet | durable -> settings.txt runtime=
+    bool _durableEnqueuePending = false; // one durable campaign intake process at a time
     bool _paused = false;      // local fleet pause/resume toggle state (NEW)
     // FIX B: optimistic "stopping" state set the instant Stop is clicked (dims non-terminal cards +
     // flips the Stop button's tooltip/icon) so the click never feels dead for the ~700ms sweep.
@@ -5771,20 +5772,121 @@ class CockpitWindow : Window
 
     void TryAddGoalsToActiveRun()
     {
-        // LOCAL_LOOP and classic Fleet intentionally have different command channels. Sending a
-        // durable task through FleetCommands while LOCAL_LOOP owns status.json leaves an orphaned
-        // commands.d item that can later resurrect as a classic Fleet task. Never cross that
-        // boundary. Phase 2 will wire this branch to the durable campaign queue; until then keep
-        // the operator's text intact instead of pretending it was accepted.
+        // LOCAL_LOOP and classic Fleet intentionally have different durable command channels.
+        // LOCAL_LOOP additions become campaign jobs in SQLite/manifest; classic Fleet additions
+        // keep using the one-command-per-file channel. Never let either side consume the other.
         if (ActiveRunIsLocalLoop())
         {
-            if (_startNote != null)
-                _startNote.Text = _lang == 0
-                    ? "長時間実行中の追加入力はまだキューへ送っていません。入力は残しています。"
-                    : "Live additions to the durable runtime are not queued yet. Your input was kept.";
+            TryAddGoalsToDurableRun();
             return;
         }
         TryAddGoalsToLiveFleet();
+    }
+
+    void TryAddGoalsToDurableRun()
+    {
+        if (_goalInput == null) return;
+        if (_durableEnqueuePending)
+        {
+            if (_startNote != null)
+                _startNote.Text = _lang == 0 ? "前の長時間タスクをキューへ登録中です。"
+                                              : "The previous durable task submission is still being queued.";
+            return;
+        }
+        var goals = new List<string>();
+        foreach (string ln in (_goalInput.Text ?? "").Replace("\r", "").Split('\n'))
+        {
+            string goal = ln.Trim();
+            if (goal.Length > 0 && !goal.StartsWith("#")) goals.Add(goal);
+        }
+        if (goals.Count == 0) return;
+
+        SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
+        string submittedText = _goalInput.Text ?? "";
+        string goalsFile = null;
+        System.Diagnostics.Process proc = null;
+        try
+        {
+            string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+            string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
+            if (!File.Exists(py)) py = "python";
+            string stateDir = Path.GetDirectoryName(_statusPath);
+            string token = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString() + "_"
+                         + Guid.NewGuid().ToString("N").Substring(0, 8);
+            goalsFile = Path.Combine(stateDir, "durable_enqueue_" + token + ".json");
+            File.WriteAllText(goalsFile, _js.Serialize(goals), new UTF8Encoding(false));
+
+            var psi = new System.Diagnostics.ProcessStartInfo();
+            psi.FileName = py;
+            psi.Arguments = "-m relay.local_loop_controller --enqueue-goals-file \"" + goalsFile
+                          + "\" --state-dir \"" + stateDir + "\"";
+            psi.WorkingDirectory = repo;
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
+            proc = System.Diagnostics.Process.Start(psi);
+            if (proc == null) throw new InvalidOperationException("durable enqueue process did not start");
+            _durableEnqueuePending = true;
+            if (_startNote != null)
+                _startNote.Text = _lang == 0 ? "長時間タスクをdurable queueへ登録中..."
+                                              : "Queueing durable task(s)...";
+
+            var timer = new System.Windows.Threading.DispatcherTimer();
+            timer.Interval = TimeSpan.FromMilliseconds(200);
+            timer.Tick += delegate
+            {
+                try
+                {
+                    proc.Refresh();
+                    if (!proc.HasExited) return;
+                    timer.Stop();
+                    string stderr = "";
+                    try { stderr = proc.StandardError.ReadToEnd(); } catch (Exception) { }
+                    _durableEnqueuePending = false;
+                    try { if (!string.IsNullOrEmpty(goalsFile) && File.Exists(goalsFile)) File.Delete(goalsFile); }
+                    catch (Exception) { }
+                    if (proc.ExitCode == 0)
+                    {
+                        NoteSubmitted(goals, submitBaseline);
+                        if (_goalInput.Text == submittedText) _goalInput.Text = "";
+                        if (_startNote != null)
+                            _startNote.Text = _lang == 0 ? (goals.Count + " 件を長時間実行キューへ追加しました。")
+                                                          : ("Queued " + goals.Count + " durable task(s)." );
+                        _lastSig = "";
+                    }
+                    else
+                    {
+                        if (_startNote != null)
+                            _startNote.Text = (_lang == 0 ? "長時間タスクのキュー登録に失敗。入力は残しています。 "
+                                                          : "Durable queue submission failed; input was kept. ")
+                                            + (stderr ?? "").Trim();
+                    }
+                    try { proc.Dispose(); } catch (Exception) { }
+                }
+                catch (Exception ex)
+                {
+                    timer.Stop();
+                    _durableEnqueuePending = false;
+                    if (_startNote != null)
+                        _startNote.Text = (_lang == 0 ? "長時間タスクのキュー確認に失敗。入力は残しています。 "
+                                                      : "Could not confirm durable queue submission; input was kept. ")
+                                        + ex.Message;
+                }
+            };
+            timer.Start();
+        }
+        catch (Exception ex)
+        {
+            _durableEnqueuePending = false;
+            try { if (!string.IsNullOrEmpty(goalsFile) && File.Exists(goalsFile)) File.Delete(goalsFile); }
+            catch (Exception) { }
+            if (_startNote != null)
+                _startNote.Text = (_lang == 0 ? "長時間タスクのキュー起動に失敗。入力は残しています。 "
+                                              : "Could not start durable queue submission; input was kept. ")
+                                + ex.Message;
+        }
     }
 
     // The bottom composer is the task intake surface in BOTH idle and live-run states.

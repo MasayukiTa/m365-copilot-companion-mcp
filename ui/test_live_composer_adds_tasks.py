@@ -41,7 +41,9 @@ def test_durable_live_composer_never_crosses_into_fleet_command_channel():
     assert 'return;' in block
     assert 'TryAddGoalsToLiveFleet();' in block
     assert block.index('return;') < block.index('TryAddGoalsToLiveFleet();')
-    assert '_goalInput.Text = ""' not in block
+    durable = block[block.index('void TryAddGoalsToDurableRun()'):]
+    assert 'if (proc.ExitCode == 0)' in durable
+    assert durable.index('if (proc.ExitCode == 0)') < durable.index('_goalInput.Text = "";')
 
 
 def test_classic_live_add_keeps_the_lossless_fleet_channel():

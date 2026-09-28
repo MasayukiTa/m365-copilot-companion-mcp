@@ -12,6 +12,8 @@ import hashlib
 import json
 import os
 import secrets
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -23,6 +25,7 @@ from relay.local_job_store import (
     LocalJobStore,
     TERMINAL_JOB_STATUSES,
 )
+from tools import childproc
 
 
 PAUSED_STATUSES = frozenset({
@@ -84,15 +87,310 @@ def _read_goal_file(path: str | os.PathLike) -> str:
     return text
 
 
-def _campaign_job_ids(state_dir: str | os.PathLike) -> set[str]:
-    path = Path(state_dir) / LOCAL_LOOP_CAMPAIGN_MANIFEST
+def _read_enqueue_goals_file(path: str | os.PathLike) -> list[str]:
+    """Read the Cockpit's enqueue payload without teaching the UI the durable job schema."""
+    raw = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    if not isinstance(raw, list):
+        raise ValueError("enqueue goals file must contain a JSON array")
+    goals = [str(v or "").strip() for v in raw]
+    goals = [v for v in goals if v]
+    if not goals:
+        raise ValueError("enqueue goals file is empty")
+    return goals
+
+
+def _campaign_manifest_path(state_dir: str | os.PathLike) -> Path:
+    return Path(state_dir) / LOCAL_LOOP_CAMPAIGN_MANIFEST
+
+
+def _campaign_lock_path(state_dir: str | os.PathLike) -> Path:
+    return Path(state_dir) / LOCAL_LOOP_LOCK_DIR / LOCAL_LOOP_CAMPAIGN_LOCK
+
+
+def _active_marker_job_ids(state_dir: str | os.PathLike) -> set[str]:
+    ids = set()
+    marker_dir = Path(state_dir) / LOCAL_LOOP_MARKER_DIR
     try:
-        manifest = json.loads(path.read_text(encoding="utf-8-sig"))
+        for marker in marker_dir.glob("*.json"):
+            try:
+                ids.add(LocalJobStore._validate_job_id(marker.stem))
+            except JobStoreError:
+                continue
+    except OSError:
+        pass
+    return ids
+
+
+def _read_campaign_manifest(state_dir: str | os.PathLike) -> dict:
+    path = _campaign_manifest_path(state_dir)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, TypeError):
-        return set()
-    rows = manifest.get("entries") if isinstance(manifest, dict) else None
+        value = {}
+    if not isinstance(value, dict):
+        value = {}
+    rows = value.get("entries")
     if not isinstance(rows, list):
-        return set()
+        rows = []
+    return {
+        "version": 1,
+        "started": float(value.get("started") or 0.0),
+        "updated": float(value.get("updated") or 0.0),
+        "entries": [dict(row) for row in rows if isinstance(row, dict)],
+    }
+
+
+def _archive_campaign_manifest(state_dir: str | os.PathLike, manifest: dict,
+                               *, now: float | None = None) -> Path:
+    """Move a completed active manifest out of the supervisor's hot path but keep it for audit."""
+    now = time.time() if now is None else float(now)
+    payload = dict(manifest or {})
+    payload["version"] = 1
+    payload["updated"] = now
+    payload["closed"] = now
+    active = _campaign_manifest_path(state_dir)
+    _write_atomic(active, payload)
+    history = Path(state_dir) / LOCAL_LOOP_CAMPAIGN_HISTORY_DIR
+    history.mkdir(parents=True, exist_ok=True)
+    started = int(float(payload.get("started") or now))
+    closed = int(now)
+    target = history / f"campaign_{started}_{closed}_{secrets.token_hex(4)}.json"
+    os.replace(active, target)
+    return target
+
+
+def _acquire_campaign_lock(state_dir: str | os.PathLike, timeout_seconds: float = 2.0):
+    """Serialize manifest read-modify-write; bounded so UI enqueue can never hang indefinitely."""
+    path = _campaign_lock_path(state_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    while True:
+        fh = None
+        try:
+            fh = open(path, "a+b", buffering=0)
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                fh.write(b"\0")
+            fh.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh
+        except (OSError, IOError):
+            if fh is not None:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.02)
+
+
+def _campaign_has_live_work(store: LocalJobStore, manifest: dict,
+                            marker_ids: set[str]) -> bool:
+    for row in manifest.get("entries", []):
+        try:
+            job_id = LocalJobStore._validate_job_id(row.get("job_id"))
+        except JobStoreError:
+            continue
+        if job_id in marker_ids:
+            return True
+        try:
+            status = store.get_job_status(job_id).get("status")
+        except JobStoreError as exc:
+            if exc.code == "JOB_NOT_FOUND" and isinstance(row.get("job"), dict):
+                return True                 # manifest can still materialize this queued job
+            continue
+        if status not in TERMINAL_JOB_STATUSES:
+            return True
+    return False
+
+
+def _materialize_campaign_entry(store: LocalJobStore, row: dict) -> bool:
+    try:
+        job_id = LocalJobStore._validate_job_id(row.get("job_id"))
+    except JobStoreError:
+        return False
+    try:
+        store.get_job_status(job_id)
+        return True
+    except JobStoreError as exc:
+        if exc.code != "JOB_NOT_FOUND":
+            raise
+    job = row.get("job")
+    if not isinstance(job, dict):
+        return False
+    try:
+        store.create_job(job)
+    except JobStoreError as exc:
+        if exc.code != "JOB_EXISTS":
+            raise
+    return True
+
+
+def _enqueue_campaign_goals(store: LocalJobStore, state_dir: str | os.PathLike,
+                            goals: list[str], *, cwd: str | None = None,
+                            max_turns: int = 1000, read_only: bool = False,
+                            now: float | None = None) -> dict:
+    """Durably enqueue LOCAL_LOOP jobs before any controller process is required to exist."""
+    now = time.time() if now is None else float(now)
+    clean = [str(goal or "").strip() for goal in goals]
+    clean = [goal for goal in clean if goal]
+    if not clean:
+        raise ValueError("campaign enqueue requires at least one goal")
+    jobs = [
+        _job_from_goal(goal, cwd=cwd, max_turns=max_turns, read_only=read_only)
+        for goal in clean
+    ]
+    marker_ids = _active_marker_job_ids(state_dir)
+    lock = _acquire_campaign_lock(state_dir)
+    if lock is None:
+        raise RuntimeError("LOCAL_LOOP campaign queue is busy")
+    try:
+        manifest = _read_campaign_manifest(state_dir)
+        if not _campaign_has_live_work(store, manifest, marker_ids):
+            if manifest.get("entries") and _campaign_manifest_path(state_dir).is_file():
+                _archive_campaign_manifest(state_dir, manifest, now=now)
+            manifest = {"version": 1, "started": now, "updated": now, "entries": []}
+        if not manifest.get("started"):
+            manifest["started"] = now
+        entries = list(manifest.get("entries", []))
+        known = {str(row.get("job_id")) for row in entries if row.get("job_id")}
+        # A standalone controller becomes the campaign root the moment live work is added.
+        # Root entries need no job copy: SQLite already owns them and their marker proves scope.
+        for job_id in sorted(marker_ids):
+            if job_id not in known:
+                entries.append({"job_id": job_id, "joined_at": now})
+                known.add(job_id)
+        for job in jobs:
+            job_id = job["job_id"]
+            entries.append({
+                "job_id": job_id,
+                "job": job,
+                "enqueued_at": now,
+                "launch_attempts": 0,
+                "retry_after": 0.0,
+            })
+            known.add(job_id)
+        manifest.update({"version": 1, "updated": now, "entries": entries})
+        _write_atomic(_campaign_manifest_path(state_dir), manifest)
+    finally:
+        _release_job_lock(lock)
+
+    # The manifest is the intake source of truth. Materialise SQLite afterwards so a crash in
+    # this gap is repairable by campaign drain rather than turning an accepted task into an orphan.
+    for row in manifest["entries"]:
+        if row.get("job_id") in {job["job_id"] for job in jobs}:
+            _materialize_campaign_entry(store, row)
+    if jobs:
+        _project_job_snapshot(store, jobs[0]["job_id"], Path(state_dir) / "status.json", now=now)
+    return {"ok": True, "job_ids": [job["job_id"] for job in jobs]}
+
+
+def _campaign_commands_path(state_dir: str | os.PathLike, job_id: str) -> Path:
+    safe = LocalJobStore._validate_job_id(job_id)
+    return Path(state_dir) / "local_loop_commands" / (safe + ".json")
+
+
+def _campaign_child_argv(args, job_id: str) -> list[str]:
+    values = dict(vars(args))
+    values["commands_file"] = str(_campaign_commands_path(args.state_dir, job_id))
+    return _controller_resume_argv(argparse.Namespace(**values), job_id)
+
+
+def _default_campaign_launcher(argv: list[str]) -> int:
+    repo = Path(__file__).resolve().parent.parent
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "relay.local_loop_controller"] + list(argv),
+        cwd=str(repo), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, **childproc.tree_popen_kwargs(headless=True),
+    )
+    return int(proc.pid)
+
+
+def _drain_campaign(store: LocalJobStore, state_dir: str | os.PathLike, args, *,
+                    now: float | None = None, launcher=None) -> dict:
+    """Materialise and launch queued campaign jobs; reservations make repeated drains harmless."""
+    now = time.time() if now is None else float(now)
+    launcher = launcher or _default_campaign_launcher
+    lock = _acquire_campaign_lock(state_dir)
+    if lock is None:
+        return {"ok": False, "launched": [], "closed": False, "reason": "campaign queue busy"}
+    selected = []
+    manifest = None
+    closed = False
+    try:
+        manifest = _read_campaign_manifest(state_dir)
+        entries = manifest.get("entries", [])
+        changed = False
+        active = False
+        for row in entries:
+            try:
+                job_id = LocalJobStore._validate_job_id(row.get("job_id"))
+            except JobStoreError:
+                continue
+            # Marker ownership is stronger evidence than this store instance.  A campaign root
+            # may have been created with an explicit DB, and an interrupted child may temporarily
+            # be between durable store reads. Never archive or duplicate-launch while its marker
+            # exists; the controller/supervisor recovery path owns it.
+            if _controller_marker_path(state_dir, job_id).is_file():
+                active = True
+                continue
+            if not _materialize_campaign_entry(store, row):
+                continue
+            try:
+                status = str(store.get_job_status(job_id).get("status") or "")
+            except JobStoreError:
+                continue
+            if status in TERMINAL_JOB_STATUSES:
+                continue
+            active = True
+            if status in INTERACTION_WAIT_STATUSES:
+                continue
+            try:
+                retry_after = float(row.get("retry_after") or 0.0)
+            except Exception:
+                retry_after = 0.0
+            if retry_after > now:
+                continue
+            attempts = max(0, int(row.get("launch_attempts") or 0)) + 1
+            # The child writes its marker before browser work, but Python import + SQLite/lock setup
+            # can still take seconds on a busy Windows host.  Reserve 30s first, then exponential
+            # backoff; the per-job kernel lock remains the final duplicate-execution barrier.
+            delay = min(900.0, 30.0 * float(2 ** min(attempts - 1, 5)))
+            row["launch_attempts"] = attempts
+            row["retry_after"] = now + delay
+            row["last_launch_at"] = now
+            selected.append(job_id)
+            changed = True
+        if entries and not active:
+            _archive_campaign_manifest(state_dir, manifest, now=now)
+            closed = True
+        elif changed:
+            manifest["updated"] = now
+            _write_atomic(_campaign_manifest_path(state_dir), manifest)
+    finally:
+        _release_job_lock(lock)
+
+    launched = []
+    pids = {}
+    if not closed:
+        for job_id in selected:
+            try:
+                pid = int(launcher(_campaign_child_argv(args, job_id)))
+            except Exception:
+                continue
+            launched.append(job_id)
+            pids[job_id] = pid
+    return {"ok": True, "launched": launched, "pids": pids, "closed": closed}
+
+
+def _campaign_job_ids(state_dir: str | os.PathLike) -> set[str]:
+    rows = _read_campaign_manifest(state_dir).get("entries", [])
     ids = set()
     for row in rows:
         if not isinstance(row, dict):
@@ -121,16 +419,7 @@ def _project_job_snapshot(store: LocalJobStore, job_id: str, status_path: str | 
     state_dir = status_path.parent
     snapshot = store.console_snapshot()
 
-    marker_ids = set()
-    marker_dir = state_dir / LOCAL_LOOP_MARKER_DIR
-    try:
-        for marker in marker_dir.glob("*.json"):
-            try:
-                marker_ids.add(LocalJobStore._validate_job_id(marker.stem))
-            except JobStoreError:
-                continue
-    except OSError:
-        pass
+    marker_ids = _active_marker_job_ids(state_dir)
 
     campaign_ids = _campaign_job_ids(state_dir)
     # A completed campaign manifest may remain on disk for audit/resume. A standalone job that is
@@ -294,6 +583,8 @@ def _write_atomic(path: str | os.PathLike, payload: dict) -> None:
 LOCAL_LOOP_MARKER_DIR = "local_loop_active"
 LOCAL_LOOP_LOCK_DIR = "local_loop_locks"
 LOCAL_LOOP_CAMPAIGN_MANIFEST = "local_loop_campaign.json"
+LOCAL_LOOP_CAMPAIGN_HISTORY_DIR = "local_loop_campaign_history"
+LOCAL_LOOP_CAMPAIGN_LOCK = "campaign.lock"
 
 
 def _controller_marker_path(state_dir: str | os.PathLike, job_id: str) -> Path:
@@ -895,6 +1186,8 @@ def main(argv=None):
     ap.add_argument("--job-file", help="create/resume a LOCAL_LOOP job from this JSON file")
     ap.add_argument("--goal", help="create a durable LOCAL_LOOP job from one natural-language task")
     ap.add_argument("--goal-file", help="read the natural-language task from a UTF-8 text file")
+    ap.add_argument("--enqueue-goals-file", help="durably enqueue a JSON array of live LOCAL_LOOP goals")
+    ap.add_argument("--drain-campaign", action="store_true", help="materialize and launch queued campaign jobs, then exit")
     ap.add_argument("--cwd", help="optional local workspace boundary for an ad-hoc goal job")
     ap.add_argument("--max-turns", type=int, default=1000, help="maximum durable turns for --goal")
     ap.add_argument("--read-only", action="store_true", help="mark an ad-hoc --goal job read-only")
@@ -915,15 +1208,35 @@ def main(argv=None):
     ap.add_argument("--dom-node-limit", type=int, default=0)
     ap.add_argument("--edge-mb-limit", type=float, default=0)
     args = ap.parse_args(argv)
-    if not args.agent_url:
-        ap.error("--agent-url or MCP_FLEET_AGENT_URL/MCP_IMPL_AGENT_URL is required")
     if not _execution_profiles_enabled():
         ap.error("durable LOCAL_LOOP requires MCP_EXECUTION_PROFILES=1; enable it and restart the MCP server")
     goal_sources = sum(bool(value) for value in (args.job_file, args.goal, args.goal_file))
     if goal_sources > 1:
         ap.error("use exactly one of --job-file, --goal or --goal-file")
+    special_modes = int(bool(args.enqueue_goals_file)) + int(bool(args.drain_campaign))
+    if special_modes > 1 or (special_modes and (goal_sources or args.job_id)):
+        ap.error("campaign enqueue/drain modes cannot be combined with a controller job")
 
     store = LocalJobStore(args.db)
+    if args.enqueue_goals_file:
+        goals = _read_enqueue_goals_file(args.enqueue_goals_file)
+        queued = _enqueue_campaign_goals(
+            store, args.state_dir, goals, cwd=args.cwd, max_turns=args.max_turns,
+            read_only=args.read_only,
+        )
+        launched = _drain_campaign(store, args.state_dir, args) if args.agent_url else {"launched": []}
+        queued["launched"] = launched.get("launched", [])
+        print(json.dumps(queued, ensure_ascii=False), flush=True)
+        return 0
+    if args.drain_campaign:
+        if not args.agent_url:
+            print(json.dumps({"ok": False, "launched": [], "reason": "agent URL unavailable"}), flush=True)
+            return 2
+        result = _drain_campaign(store, args.state_dir, args)
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+        return 0 if result.get("ok") else 2
+    if not args.agent_url:
+        ap.error("--agent-url or MCP_FLEET_AGENT_URL/MCP_IMPL_AGENT_URL is required")
     job_id = args.job_id
     job = None
     goal_text = _read_goal_file(args.goal_file) if args.goal_file else args.goal
