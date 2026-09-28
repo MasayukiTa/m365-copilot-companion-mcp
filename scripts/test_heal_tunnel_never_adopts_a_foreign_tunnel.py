@@ -167,7 +167,8 @@ def test_an_owned_name_this_machine_is_hosting_is_kept(rig):
     before = rig.env_text()
     # A process on THIS machine whose command line is `devtunnel host <c>` (it only sleeps).
     dummy = subprocess.Popen(["cmd", "/c", "ping -n 60 127.0.0.1 >nul & rem devtunnel host %s" % c],
-                             stdout=subprocess.DEVNULL)
+                             stdout=subprocess.DEVNULL,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     try:
         out = rig.heal()
     finally:

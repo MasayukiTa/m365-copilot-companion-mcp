@@ -836,6 +836,7 @@ function Hide-Secrets([string]$text) {
     $t = $text
     $t = [regex]::Replace($t, '(?i)(bearer\s+)[A-Za-z0-9._\-]{8,}', '$1<redacted>')
     $t = [regex]::Replace($t, '(?i)(MCP_API_KEY\s*=\s*)\S+', '$1<redacted>')
+    $t = [regex]::Replace($t, '(?i)(MCP_API_KEY_PROTECTED\s*=\s*)\S+', '$1<redacted>')
     $t = [regex]::Replace($t, '(?i)(MCP_UNLOCK_PASSWORD[A-Z_]*\s*=\s*)\S+', '$1<redacted>')
     $t = [regex]::Replace($t, '(?i)(password|passwd|secret|token)(["'':\s=]+)\S+', '$1$2<redacted>')
     $t = [regex]::Replace($t, 'https://[A-Za-z0-9\-]+\.devtunnels\.ms\S*', 'https://<tunnel>.devtunnels.ms/...')

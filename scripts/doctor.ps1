@@ -52,6 +52,23 @@ if (Test-Path $envPath) {
     }
 }
 
+function Get-DoctorLocalSecret([hashtable]$map, [string]$plainName, [string]$protectedName) {
+    $plain = [string]$map[$plainName]
+    if (-not [string]::IsNullOrWhiteSpace($plain)) { return $plain }
+    $protected = [string]$map[$protectedName]
+    if ([string]::IsNullOrWhiteSpace($protected)) { return $null }
+    if (-not $protected.StartsWith('dpapi:', [System.StringComparison]::OrdinalIgnoreCase)) { return $null }
+    try {
+        Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue
+        $cipher = [Convert]::FromBase64String($protected.Substring('dpapi:'.Length))
+        $plainBytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
+            $cipher, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+        return [Text.Encoding]::UTF8.GetString($plainBytes)
+    } catch { return $null }
+}
+$doctorApiKey = Get-DoctorLocalSecret $envv 'MCP_API_KEY' 'MCP_API_KEY_PROTECTED'
+if ($doctorApiKey) { $envv['MCP_API_KEY'] = $doctorApiKey }
+
 $script:ok = 0; $script:bad = 0; $script:warn = 0
 # COUNTED APART FROM $warn, which also holds optional components being absent -- a complete
 # setup. This is required checks that could not be determined, which is not one.
@@ -142,7 +159,7 @@ Write-Host "m365-copilot-companion-mcp  --  setup doctor" -ForegroundColor Cyan
 Write-Host "============================================="
 
 # 1. secrets / .env
-Check "env_api_key" ".env present with a Bearer token (MCP_API_KEY)" `
+Check "env_api_key" ".env has a readable Bearer token (legacy or DPAPI-protected)" `
     { $envv.ContainsKey('MCP_API_KEY') -and $envv['MCP_API_KEY'] } `
     "run quickstart.bat -- it creates .env with a fresh Bearer + unlock password"
 
@@ -1062,7 +1079,7 @@ Check "auth_bearer" "Auth OK end-to-end (Bearer accepted on /mcp)" `
             -and ($withKey -ne 401) -and ($withKey -ne 403) -and ($withKey -ne 404) `
             -and (($noKey -eq 401) -or ($noKey -eq 403))
     } `
-    "the /mcp endpoint did not behave like an authenticated one. 0 = the server is down (start_all.bat); 401/403 with the key = the 'Bearer <MCP_API_KEY>' in Copilot Studio does not match .env; 404 = the server is answering but /mcp is not there; anything else without the key NOT being refused means authentication is not being enforced."
+    "the /mcp endpoint did not behave like an authenticated one. 0 = the server is down (start_all.bat); 401/403 with the key = the Bearer configured in Copilot Studio does not match this machine's protected/local token; 404 = the server is answering but /mcp is not there; anything else without the key NOT being refused means authentication is not being enforced."
 
 # 7. Last background start (.setup\logs\start_all_summary.txt). The daily launchers
 # (start_all.bat, the Desktop icon, the Startup .lnk/Task) run start_all.ps1 through

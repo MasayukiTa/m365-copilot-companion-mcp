@@ -29,7 +29,10 @@ def test_existing_env_gets_default_off_once(tmp_path, monkeypatch):
     assert text.count("MCP_LOCAL_REVIEW_MAX_CONCURRENT=2") == 1
     assert text.count("MCP_LOCAL_ROTATE_AFTER_TURNS=3") == 1
     assert text.count("MCP_LOCAL_EDGE_MB_LIMIT=1400") == 1
-    assert "MCP_API_KEY=secret" in text
+    from tools.secret_store import unprotect_secret
+    blob = [ln.split("=", 1)[1] for ln in text.splitlines() if ln.startswith("MCP_API_KEY_PROTECTED=")][0]
+    assert unprotect_secret(blob) == "secret"
+    assert "MCP_API_KEY=secret" not in text
 
 
 def test_existing_explicit_on_is_never_overwritten(tmp_path, monkeypatch):

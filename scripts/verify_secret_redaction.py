@@ -16,13 +16,18 @@ import json
 import os
 import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+from tools.secret_store import api_key_from_env, unlock_password_from_env
 env = {}
 for ln in io.open(os.path.join(ROOT, ".env"), encoding="utf-8-sig"):
     ln = ln.strip()
     if "=" in ln and not ln.startswith("#"):
         k, v = ln.split("=", 1)
         env[k.strip()] = v.strip()
-PW, KEY = env["MCP_UNLOCK_PASSWORD"], env["MCP_API_KEY"]
+PW, KEY = unlock_password_from_env(env), api_key_from_env(env)
+if not PW or not KEY:
+    raise SystemExit("protected/local secrets could not be materialized on this Windows account")
 LED = os.path.join(ROOT, ".fleet", "tool_events.jsonl")
 
 def leaked():
