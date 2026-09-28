@@ -129,7 +129,7 @@ def atomic_write_text(path: Path, text: str, attempts: int = 10) -> None:
             # Runtime invariant above forbids the only legacy clear-text auth aliases. Values
             # reaching this sink from protected-secret flows are DPAPI ciphertext; CodeQL does
             # not model our CryptProtectData ctypes wrapper as an encryption sanitizer.
-            # codeql[py/clear-text-storage-sensitive-data]
+            # lgtm[py/clear-text-storage-sensitive-data]
             fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
