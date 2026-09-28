@@ -1,4 +1,4 @@
-// SubmittedTasks.cs -- what the cockpit shows at the TOP of its list the instant a task is
+﻿// SubmittedTasks.cs -- what the cockpit shows at the TOP of its list the instant a task is
 // submitted, before any worker exists for it. No WPF here: FleetCockpit.cs renders the rows,
 // this file decides WHICH rows, in WHAT order, with WHAT label.
 //
@@ -20,7 +20,7 @@
 //       .fleet/tasks/for_fleet/<id>.txt (relay/task_router._write_for_fleet; plain text, or
 //       {"text":..,"priority":true} -- the same two shapes task_router.read_for_fleet reads).
 //
-// AN ENTRY LEAVES ONLY WHEN A WORKER FOR IT EXISTS: a status.json worker with the same goal
+// AN ENTRY LEAVES ONLY WHEN A WORKER FOR IT EXISTS: a status.json OR history worker with the same goal
 // that was NOT already there when the entry was first seen. The exclusion is what makes a
 // RETRY work -- a retry re-submits the goal text of a worker that is still on the board
 // (finished, failed), and matching that old worker would drop the new entry the instant it
@@ -68,6 +68,16 @@ sealed class SubmittedView
     public bool Dismissable;       // stale with no file behind it: the person may clear it
 }
 
+/// Aggregate health of the submitted-but-not-yet-worker group. Kept out of WPF so tests and
+/// health publication use the exact same definition of stale work.
+sealed class SubmittedHealth
+{
+    public int Total;
+    public int StaleCount;
+    public int TakenStaleCount;
+    public double OldestAgeS;
+}
+
 /// A worker or a submitted entry, in display order.
 sealed class SubmittedDisplayItem
 {
@@ -90,6 +100,22 @@ sealed class SubmittedTasks
     /// treated as old. Three minutes: long enough to be seen after a submission, short enough
     /// that a worker stuck behind the gate stops crowding the live ones.
     public const double FRESH_PENDING_S = 180.0;
+
+    public static SubmittedHealth SummarizeHealth(IList<SubmittedView> views)
+    {
+        var h = new SubmittedHealth();
+        if (views == null) return h;
+        h.Total = views.Count;
+        foreach (SubmittedView v in views)
+        {
+            if (v == null) continue;
+            if (v.AgeS > h.OldestAgeS) h.OldestAgeS = v.AgeS;
+            if (!v.Stale) continue;
+            h.StaleCount++;
+            if (string.Equals(v.Source, "taken", StringComparison.Ordinal)) h.TakenStaleCount++;
+        }
+        return h;
+    }
 
     /// Files bigger than this are not commands or queue entries anyone wrote on purpose; they
     /// are skipped rather than parsed on a 700 ms tick.
@@ -326,20 +352,44 @@ sealed class SubmittedTasks
 
     // ── the merge ──────────────────────────────────────────────────────────────────────────
 
-    static Dictionary<string, List<string>> WorkerKeysByGoal(string started,
-                                                              IList<Dictionary<string, object>> workers)
+    static string WorkerIdentity(string started, Dictionary<string, object> w)
     {
-        var map = new Dictionary<string, List<string>>(StringComparer.Ordinal);
-        if (workers == null) return map;
-        foreach (Dictionary<string, object> w in workers)
+        if (w == null) return "";
+        // History rows already persist the cockpit worker key (run-start#worker). Use that exact
+        // identity so a later run can prove that a submitted goal DID have a worker even after
+        // status.json has been replaced. Current status workers do not carry `key`, so they keep
+        // using this run's started value + worker name.
+        string explicitKey = Str(w, "key");
+        if (!string.IsNullOrEmpty(explicitKey)) return explicitKey;
+        string runId = Str(w, "run_id");
+        if (!string.IsNullOrEmpty(runId)) return runId + "#" + Str(w, "name");
+        return (started ?? "") + "#" + Str(w, "name");
+    }
+
+    static void AddWorkerKeys(Dictionary<string, List<string>> map, string started,
+                              IList<Dictionary<string, object>> rows)
+    {
+        if (rows == null) return;
+        foreach (Dictionary<string, object> w in rows)
         {
             if (w == null) continue;
             string k = Normalize(Str(w, "goal"));
             if (k.Length == 0) continue;
+            string wk = WorkerIdentity(started, w);
+            if (wk.Length == 0) continue;
             List<string> l;
             if (!map.TryGetValue(k, out l)) { l = new List<string>(); map[k] = l; }
-            l.Add((started ?? "") + "#" + Str(w, "name"));
+            if (!l.Contains(wk)) l.Add(wk);
         }
+    }
+
+    static Dictionary<string, List<string>> WorkerKeysByGoal(string started,
+                                                              IList<Dictionary<string, object>> workers,
+                                                              IList<Dictionary<string, object>> history)
+    {
+        var map = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        AddWorkerKeys(map, started, workers);
+        AddWorkerKeys(map, "", history);
         return map;
     }
 
@@ -369,18 +419,33 @@ sealed class SubmittedTasks
     public bool AddLocal(string goal, double nowUnix, string started,
                          IList<Dictionary<string, object>> workers)
     {
+        return AddLocal(goal, nowUnix, started, workers, null);
+    }
+
+    public bool AddLocal(string goal, double nowUnix, string started,
+                         IList<Dictionary<string, object>> workers,
+                         IList<Dictionary<string, object>> history)
+    {
         string key = Normalize(goal);
         if (key.Length == 0) return false;
         if (Find(key) != null) return true;          // already on screen
-        NewEntry(key, goal, "local", "", nowUnix, nowUnix, WorkerKeysByGoal(started, workers));
+        NewEntry(key, goal, "local", "", nowUnix, nowUnix,
+                 WorkerKeysByGoal(started, workers, history));
         return true;
     }
 
-    /// Merge what is on disk and what status.json says into the rows to show, newest first.
+    /// Merge what is on disk and what status/history say into the rows to show, newest first.
     public List<SubmittedView> Refresh(List<SubmittedFile> files, string started,
                                        IList<Dictionary<string, object>> workers, double nowUnix)
     {
-        var byGoal = WorkerKeysByGoal(started, workers);
+        return Refresh(files, started, workers, null, nowUnix);
+    }
+
+    public List<SubmittedView> Refresh(List<SubmittedFile> files, string started,
+                                       IList<Dictionary<string, object>> workers,
+                                       IList<Dictionary<string, object>> history, double nowUnix)
+    {
+        var byGoal = WorkerKeysByGoal(started, workers, history);
         foreach (Entry e in _entries) e.Backed = false;
 
         if (files != null)

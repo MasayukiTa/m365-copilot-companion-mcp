@@ -16,7 +16,8 @@ def test_collapsed_card_reads_the_durable_execution_contract():
     ):
         assert token in SOURCE
     assert 'Text = stepPrefix + OneLine(currentStep)' in SOURCE
-    assert 'meta.Append(" · ✓ ").Append(completed)' in SOURCE
+    assert 'stepLine.Children.Add(MakeIcon("play_arrow", 13, Fg));' in SOURCE
+    assert 'meta.Append(" · ").Append(_lang == 0 ? "完了 " : "done ").Append(completed);' in SOURCE
 
 
 def test_expanded_overview_shows_steps_waiting_and_artifacts():

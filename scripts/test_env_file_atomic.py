@@ -147,23 +147,37 @@ def test_rotation_backup_never_keeps_legacy_plaintext_auth_secrets(monkeypatch):
     assert "OTHER=1" in joined
 
 
-def test_generic_atomic_sink_refuses_legacy_plaintext_auth(tmp_path):
+def test_unrelated_atomic_edit_may_preserve_existing_legacy_plaintext_auth(tmp_path):
     env = tmp_path / ".env"
-    old = b"MCP_API_KEY=legacy\r\nMCP_TUNNEL_ALLOW_ANONYMOUS=1\r\nOTHER=1\r\n"
-    env.write_bytes(old)
-    with pytest.raises(ValueError, match="plaintext auth secret"):
-        E.atomic_write_text(env, "MCP_API_KEY=legacy\r\nOTHER=1\r\n")
-    assert env.read_bytes() == old, "a rejected secret-bearing rewrite must leave the old file intact"
+    env.write_bytes(b"MCP_API_KEY=legacy\r\nMCP_TUNNEL_ALLOW_ANONYMOUS=1\r\nOTHER=1\r\n")
+    E.atomic_write_text(env, "MCP_API_KEY=legacy\r\nOTHER=1\r\n")
+    assert env.read_bytes() == b"MCP_API_KEY=legacy\r\nOTHER=1\r\n"
 
-
-def test_unrelated_edit_fails_closed_until_bootstrap_migrates_legacy_auth(tmp_path):
+def test_quickstart_can_remove_unrelated_setting_while_legacy_auth_is_unchanged(tmp_path):
     env = tmp_path / ".env"
-    old = b"MCP_UNLOCK_PASSWORD=legacy-password\r\nMCP_TUNNEL_ALLOW_ANONYMOUS=1\r\nOTHER=1\r\n"
-    env.write_bytes(old)
-    with pytest.raises(ValueError, match="plaintext auth secret"):
-        E.unset_key(env, "MCP_TUNNEL_ALLOW_ANONYMOUS")
-    assert env.read_bytes() == old
+    env.write_bytes(b"MCP_UNLOCK_PASSWORD=legacy-password\r\nMCP_TUNNEL_ALLOW_ANONYMOUS=1\r\nOTHER=1\r\n")
+    assert E.unset_key(env, "MCP_TUNNEL_ALLOW_ANONYMOUS") is True
+    assert env.read_bytes() == b"MCP_UNLOCK_PASSWORD=legacy-password\r\nOTHER=1\r\n"
 
+
+def test_atomic_sink_rejects_new_changed_or_duplicated_legacy_plaintext_auth(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("MCP_API_KEY=legacy\nOTHER=1\n", encoding="utf-8")
+    for candidate in (
+        "MCP_API_KEY=changed\nOTHER=1\n",
+        "MCP_API_KEY=legacy\nMCP_API_KEY=legacy\nOTHER=1\n",
+        "MCP_API_KEY=legacy\nMCP_UNLOCK_PASSWORD=new-plain\nOTHER=1\n",
+    ):
+        with pytest.raises(ValueError, match="plaintext auth secret"):
+            E.atomic_write_text(env, candidate)
+    assert env.read_text(encoding="utf-8") == "MCP_API_KEY=legacy\nOTHER=1\n"
+
+
+def test_removing_a_legacy_plaintext_secret_is_allowed(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("MCP_API_KEY=legacy\nOTHER=1\n", encoding="utf-8")
+    E.atomic_write_text(env, "OTHER=1\n")
+    assert env.read_text(encoding="utf-8") == "OTHER=1\n"
 
 def test_protected_auth_lines_are_allowed_at_the_final_sink(tmp_path):
     env = tmp_path / ".env"
@@ -189,9 +203,9 @@ def test_rotate_writer_refuses_plaintext_auth_at_its_final_sink(tmp_path):
 
 def test_codeql_suppression_is_tied_to_the_sink_guard():
     src = (HERE / "env_file.py").read_text(encoding="utf-8")
-    assert "_assert_no_plaintext_auth_persistence(text)" in src
+    assert "_assert_no_plaintext_auth_escalation(path, text)" in src
     lines = src.splitlines()
     i = next(i for i, line in enumerate(lines) if "fh.write(data)" in line)
     assert lines[i - 1].strip() == "# codeql[py/clear-text-storage-sensitive-data]"
-    guard_i = next(i for i, line in enumerate(lines) if "_assert_no_plaintext_auth_persistence(text)" in line and not line.lstrip().startswith("def "))
+    guard_i = next(i for i, line in enumerate(lines) if "_assert_no_plaintext_auth_escalation(path, text)" in line and not line.lstrip().startswith("def "))
     assert guard_i < i

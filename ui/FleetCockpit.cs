@@ -1267,7 +1267,7 @@ class CockpitWindow : Window
                 Path.Combine(tasks, "pending"),
                 Path.Combine(tasks, "for_fleet"));
             List<SubmittedView> views = _submitted.Refresh(files, StartedOf(root),
-                                                           WorkersOf(root), NowUnix());
+                                                           WorkersOf(root), HistoryWorkers(), NowUnix());
             _submittedNow = views;
             _submittedSig = SubmittedTasks.Signature(views, _lang == 0);
         }
@@ -1292,22 +1292,68 @@ class CockpitWindow : Window
         return l;
     }
 
+    List<Dictionary<string, object>> HistoryWorkers()
+    {
+        var l = new List<Dictionary<string, object>>();
+        if (_history == null) return l;
+        foreach (object o in _history)
+        {
+            var d = o as Dictionary<string, object>;
+            if (d != null) l.Add(d);
+        }
+        return l;
+    }
+
     // THE INSTANT THIS WINDOW SUBMITS: put each goal in the "submitted" group before any file
     // is read back, then re-render on the next dispatcher turn. BeginInvoke, not a direct
     // ForceRender: AutoRetryScan calls RetryGoal from inside OnTick, and a nested OnTick there
     // would re-enter the scan. The status.json read here is what a retry's goal is measured
     // against -- the worker being retried is already on the board with this very goal text,
     // and must not count as the new submission's worker (see SubmittedTasks.AddLocal).
-    void NoteSubmitted(IEnumerable<string> goals)
+    // Snapshot what existed BEFORE a submission leaves this process. A worker can appear in the
+    // few milliseconds between SendCommand/Process.Start and the optimistic UI row. If we sample
+    // after the handoff, that brand-new worker looks "preexisting" and the submitted row can
+    // remain `taken` forever even though the fleet already created its worker.
+    sealed class SubmissionBaseline
+    {
+        public string Started;
+        public List<Dictionary<string, object>> Workers;
+        public List<Dictionary<string, object>> History;
+        public double CapturedUnix;
+    }
+
+    SubmissionBaseline CaptureSubmissionBaseline()
     {
         try
         {
             Dictionary<string, object> root = ReadStatus();
-            string started = StartedOf(root);
-            List<Dictionary<string, object>> workers = WorkersOf(root);
-            double now = NowUnix();
+            return new SubmissionBaseline {
+                Started = StartedOf(root),
+                Workers = WorkersOf(root),
+                History = HistoryWorkers(),
+                CapturedUnix = NowUnix() };
+        }
+        catch (Exception)
+        {
+            return new SubmissionBaseline {
+                Started = "", Workers = new List<Dictionary<string, object>>(),
+                History = new List<Dictionary<string, object>>(), CapturedUnix = NowUnix() };
+        }
+    }
+
+    void NoteSubmitted(IEnumerable<string> goals)
+    {
+        NoteSubmitted(goals, CaptureSubmissionBaseline());
+    }
+
+    void NoteSubmitted(IEnumerable<string> goals, SubmissionBaseline baseline)
+    {
+        try
+        {
+            SubmissionBaseline b = baseline ?? CaptureSubmissionBaseline();
             foreach (string g in goals)
-                _submitted.AddLocal(SubmittedTasks.GoalTextOf(g), now, started, workers);
+                _submitted.AddLocal(SubmittedTasks.GoalTextOf(g), b.CapturedUnix,
+                                    b.Started, b.Workers, b.History);
             Dispatcher.BeginInvoke(new Action(ForceRender));
         }
         catch (Exception) { }
@@ -1441,6 +1487,7 @@ class CockpitWindow : Window
         if (k == "hs_fix") return ja ? "直す" : "Fix";
         if (k == "hs_fixing_button") return ja ? "修復中…" : "Fixing…";
         if (k == "hs_fix_hint") return ja ? "検出された不具合を直す" : "Fix the detected problem";
+        if (k == "hs_queue_stale") return ja ? "未着手の投入済みタスクが {0} 件、最長 {1} 続いています" : "{0} submitted task(s) still unstarted; oldest {1}";
         if (k == "hs_ok") return ja ? "正常" : "OK";
         if (k == "hs_down") return ja ? "応答なし" : "down";
         if (k == "hs_unknown") return ja ? "未設定/不明" : "unknown";
@@ -2536,13 +2583,24 @@ class CockpitWindow : Window
             _fixBtn.IsEnabled = !_fixRunning;
             _fixBtn.Content = BuildFixPillContent(_fixRunning);
         }
-        // Clear the stale hint text once everything the strip knows about is healthy again (not
-        // mid-fix): RunFix's note() writes _fixNote.Text once and nothing else used to clear it,
-        // so "run start_all.bat"-style residue could persist forever after the stack recovered.
-        // This runs on the UI thread already (ApplyHealthToUi's documented contract), so no
-        // Dispatcher marshal is needed here (mirrors the rest of this method).
-        if (!anyBad && !_fixRunning && _fixNote != null && _fixNote.Text.Length > 0)
-            _fixNote.Text = "";
+        // Queue starvation is a SEPARATE operational fact, not a seventh infra dot. If a
+        // submitted item survives the worker-pickup budget after current/history reconciliation,
+        // surface it here so the operator does not have to discover it by scrolling.
+        SubmittedHealth queueHealth = SubmittedTasks.SummarizeHealth(ReadQueuedJobs());
+        if (!anyBad && !_fixRunning && _fixNote != null)
+        {
+            if (queueHealth.StaleCount > 0)
+            {
+                _fixNote.Text = string.Format(T("hs_queue_stale"), queueHealth.StaleCount,
+                    SubmittedTasks.Age(queueHealth.OldestAgeS, _lang == 0));
+                _fixNote.Foreground = Theme.Br(Theme.Warning(_dark));
+            }
+            else if (_fixNote.Text.Length > 0)
+            {
+                _fixNote.Text = "";
+                _fixNote.Foreground = Muted;
+            }
+        }
     }
     static readonly string[] _healthKeys = { "hs_server", "hs_tunnel", "hs_edge", "hs_signin", "hs_agent", "hs_tool" };
 
@@ -2658,9 +2716,6 @@ class CockpitWindow : Window
         else if (authStorm)
             SetDot(0, HealthState.Yellow,
                    T("hs_srv_detail_auth") + " (" + authFails + ")", now);
-        else if (codeState == "stale" && StaleLongEnoughToMatter(srvBody))
-            SetDot(0, HealthState.Yellow,
-                   T("hs_srv_detail_stale") + " (" + HealthField(srvBody, "server_head") + ")", now);
         else if (codeState == "stale")
             // GREEN, AND IT SAYS WHY. A commit that touches a watched package makes the running
             // server genuinely stale, so on a machine where an agent improves the code all day
@@ -2905,11 +2960,15 @@ class CockpitWindow : Window
             // the same files. That distinction is the whole value: a reader comparing this
             // against .fleet/tasks/pending can see the display and the truth disagree.
             var qj = ReadQueuedJobs();
+            SubmittedHealth qh = SubmittedTasks.SummarizeHealth(qj);
             // WHERE IT LOOKED. A panel that reports "nothing queued" without saying where
             // it looked cannot be checked against the queue on disk -- which is the one
             // comparison this publication exists to make possible.
             sb.Append(",\"queue_dir\":\"").Append(JsonEscape(TasksDir())).Append('"');
             sb.Append(",\"queued_count\":").Append(qj.Count.ToString(inv));
+            sb.Append(",\"queued_stale_count\":").Append(qh.StaleCount.ToString(inv));
+            sb.Append(",\"queued_taken_stale_count\":").Append(qh.TakenStaleCount.ToString(inv));
+            sb.Append(",\"queued_oldest_age_s\":").Append(qh.OldestAgeS.ToString("F1", inv));
             sb.Append(",\"queued\":[");
             for (int qi = 0; qi < qj.Count && qi < 20; qi++)
             {
@@ -3873,18 +3932,22 @@ class CockpitWindow : Window
             bool fleetWorking = fleetTool == "true";
             bool fleetFailing = fleetTool == "false";
 
-            if (ok && fleetFailing)
+            if (fleetWorking)
+            {
+                // CURRENT OPERABILITY WINS THE COLOUR. The Fleet is the path this cockpit is
+                // supervising. If real Fleet calls are succeeding, Tool is green. A degraded
+                // bridge/chat probe remains visible in the detail, but must not turn the Fleet
+                // traffic light amber while the work path is demonstrably healthy.
+                string detail = ok
+                    ? (ageTxt + " " + T("hs_tool_detail_ok"))
+                    : (ageTxt + " " + T("hs_tool_detail_bridge_only_down"));
+                if (ok && probing) detail += " / " + T("hs_tool_detail_checking");
+                SetDot(5, HealthState.Green, detail, now);
+            }
+            else if (ok && fleetFailing)
                 // The bridge can call tools and the fleet cannot. Green here would hide the
                 // failure of the path that does the work.
                 SetDot(5, HealthState.Yellow, ageTxt + " " + T("hs_tool_detail_fleet_down"), now);
-            else if (!ok && fleetWorking && ageMin < 20.0)
-                // The case that prompted all this. Amber and say which half is down, rather
-                // than red for "tools", which is read as all of them.
-                SetDot(5, HealthState.Yellow, ageTxt + " " + T("hs_tool_detail_bridge_only_down"), now);
-            else if (ageMin >= 20.0 && fleetWorking)
-                // A stale bridge probe while the fleet is demonstrably calling tools is not a
-                // tool outage; it is a probe nobody has run.
-                SetDot(5, HealthState.Yellow, ageTxt + " " + T("hs_tool_detail_bridge_only_down"), now);
             else if (ageMin >= 20.0)
                 SetDot(5, HealthState.Red, ageTxt + " " + T("hs_tool_detail_stale"), now);
             else if (kind == "checking" || kind == "starting")
@@ -5705,6 +5768,7 @@ class CockpitWindow : Window
             if (goal.Length > 0 && !goal.StartsWith("#")) goals.Add(goal);
         }
         if (goals.Count == 0) return;
+        SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
 
         // This method is entered from the ACTIVE composer. Do not re-decide ownership from one
         // status read here: a transient unreadable/stale snapshot used to divert this submission
@@ -5734,7 +5798,7 @@ class CockpitWindow : Window
         }
 
         // Optimistic row first; the runner will replace it with a real worker on the next sweep.
-        NoteSubmitted(goals);
+        NoteSubmitted(goals, submitBaseline);
         WatchLiveAddHandoff(commandPath, ackPath);
         _goalInput.Text = "";
         if (_startNote != null)
@@ -5933,6 +5997,7 @@ class CockpitWindow : Window
 
     bool SpawnDurableTask(string goal)
     {
+        SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
         try
         {
             string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
@@ -5953,7 +6018,7 @@ class CockpitWindow : Window
             psi.CreateNoWindow = true;
             try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
             System.Diagnostics.Process.Start(psi);
-            NoteSubmitted(new List<string> { goal });
+            NoteSubmitted(new List<string> { goal }, submitBaseline);
             return true;
         }
         catch (Exception ex)
@@ -5966,6 +6031,7 @@ class CockpitWindow : Window
 
     bool SpawnFleet(List<string> goals, string goalsFileName, bool planMode = false)
     {
+        SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
         string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
         string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
         if (!File.Exists(py)) py = "python";
@@ -5991,7 +6057,7 @@ class CockpitWindow : Window
         // On top of the list NOW, before the new run's first snapshot exists. Every spawn path
         // comes through here: the composer's StartFleet, a retry or bulk retry with no live run,
         // and the continue flows (whose lines are {"text":..} objects -- GoalTextOf reads them).
-        NoteSubmitted(goals);
+        NoteSubmitted(goals, submitBaseline);
         return true;
     }
 
@@ -13076,15 +13142,19 @@ class CockpitWindow : Window
                     if (!string.IsNullOrEmpty(currentStep))
                     {
                         string stepPrefix = totalSteps > 0
-                            ? ("▶ " + currentIndex + "/" + totalSteps + "  ")
-                            : ("▶ " + currentIndex + "  ");
-                        col.Children.Add(new TextBlock
+                            ? (currentIndex + "/" + totalSteps + "  ")
+                            : (currentIndex + "  ");
+                        var stepLine = new StackPanel { Orientation = Orientation.Horizontal,
+                            Margin = new Thickness(24, 4, 0, 0) };
+                        stepLine.Children.Add(MakeIcon("play_arrow", 13, Fg));
+                        stepLine.Children.Add(new TextBlock
                         {
                             Text = stepPrefix + OneLine(currentStep),
                             Foreground = Fg, FontSize = 12.5, FontWeight = FontWeights.SemiBold,
                             TextTrimming = TextTrimming.CharacterEllipsis, TextWrapping = TextWrapping.NoWrap,
-                            Margin = new Thickness(24, 4, 0, 0)
+                            Margin = new Thickness(4, 0, 0, 0)
                         });
+                        col.Children.Add(stepLine);
                     }
                 }
 
@@ -13137,7 +13207,7 @@ class CockpitWindow : Window
                     col.Children.Add(rl);
                 }
 
-                // Line 3: meta — worker name · turn N · alive {freshness} ago · ✓verified [COMPUTED].
+                // Line 3: meta — worker name · turn N · alive {freshness} ago · verified [COMPUTED].
                 var meta = new StringBuilder();
                 string transcriptPath = S(w, "transcript");
                 double startTs = ReadTranscriptStartTs(transcriptPath);
@@ -13156,7 +13226,7 @@ class CockpitWindow : Window
                     int completed = I(execution, "completed_count");
                     int totalSteps = I(execution, "total_steps");
                     int artifactCount = ArrCount(execution, "artifacts");
-                    meta.Append(" · ✓ ").Append(completed);
+                    meta.Append(" · ").Append(_lang == 0 ? "完了 " : "done ").Append(completed);
                     if (totalSteps > 0) meta.Append('/').Append(totalSteps);
                     if (artifactCount > 0)
                         meta.Append(" · ").Append(artifactCount).Append(_lang == 0 ? " 成果物" : " artifacts");
@@ -13546,8 +13616,12 @@ class CockpitWindow : Window
         string head = (total > 0 ? (currentIndex + "/" + total) : currentIndex.ToString());
         if (!string.IsNullOrEmpty(state)) head += " · " + state;
         if (!string.IsNullOrEmpty(current)) head += " · " + current;
-        sp.Children.Add(new TextBlock { Text = "▶ " + head, Foreground = Fg, FontSize = 12.5,
-            FontWeight = FontWeights.SemiBold, TextWrapping = TextWrapping.Wrap });
+        var headLine = new StackPanel { Orientation = Orientation.Horizontal };
+        headLine.Children.Add(MakeIcon("play_arrow", 13, Fg));
+        headLine.Children.Add(new TextBlock { Text = head, Foreground = Fg, FontSize = 12.5,
+            FontWeight = FontWeights.SemiBold, TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(4, 0, 0, 0) });
+        sp.Children.Add(headLine);
 
         if (!string.IsNullOrEmpty(lastProgress))
             sp.Children.Add(new TextBlock { Text = (_lang == 0 ? "進捗: " : "Progress: ") + lastProgress,
@@ -13570,10 +13644,14 @@ class CockpitWindow : Window
                     if (step == null) continue;
                     string instruction = S(step, "instruction");
                     string summary = S(step, "summary");
-                    string line = "✓ " + instruction;
+                    string line = instruction;
                     if (!string.IsNullOrEmpty(summary) && summary != instruction) line += " — " + summary;
-                    sp.Children.Add(new TextBlock { Text = line, Foreground = Muted, FontSize = 12,
-                        Margin = new Thickness(8, 1, 0, 1), TextWrapping = TextWrapping.Wrap });
+                    var doneLine = new StackPanel { Orientation = Orientation.Horizontal,
+                        Margin = new Thickness(8, 1, 0, 1) };
+                    doneLine.Children.Add(MakeIcon("check", 12, Muted));
+                    doneLine.Children.Add(new TextBlock { Text = line, Foreground = Muted, FontSize = 12,
+                        Margin = new Thickness(4, 0, 0, 0), TextWrapping = TextWrapping.Wrap });
+                    sp.Children.Add(doneLine);
                 }
             }
         }
@@ -14441,10 +14519,11 @@ class CockpitWindow : Window
     {
         if (RunIsLive())
         {
+            SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
             var adds = new List<object>();
             adds.Add(RetryEntry(w));
             SendCommand(Cmd1("add_goal", adds));
-            NoteSubmitted(new List<string> { S(w, "goal") });   // on top now, not when the run reads it
+            NoteSubmitted(new List<string> { S(w, "goal") }, submitBaseline);
             return;
         }
         string goal = S(w, "goal");
@@ -14496,8 +14575,9 @@ class CockpitWindow : Window
         if (n == 0) return 0;
         if (live)
         {
+            SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
             SendCommand(Cmd1("add_goal", adds));
-            NoteSubmitted(goalTexts);                 // on top now, not when the run reads it
+            NoteSubmitted(goalTexts, submitBaseline);
         }
         else if (goalTexts.Count > 0)
         {
