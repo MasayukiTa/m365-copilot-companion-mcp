@@ -181,3 +181,35 @@ def test_main_crash_waiting_runtime_and_done_have_distinct_marker_semantics(tmp_
     FakeController.result = "DONE"
     assert ll.main(argv("job_done")) == 0
     assert ll._read_controller_marker(state, "job_done") is None
+
+
+def test_marker_and_lock_paths_reject_unsafe_job_ids(tmp_path):
+    import pytest
+    from relay.local_job_store import JobStoreError
+
+    for bad in ("../escape", "..\\escape", "a/b", "a\\b", "", "x" * 129):
+        with pytest.raises(JobStoreError) as exc:
+            ll._controller_marker_path(tmp_path, bad)
+        assert exc.value.code == "INVALID_JOB_ID"
+        with pytest.raises(JobStoreError) as exc:
+            ll._controller_lock_path(tmp_path, bad)
+        assert exc.value.code == "INVALID_JOB_ID"
+
+
+def test_resume_job_id_is_rejected_before_any_lock_or_marker_path_escape(tmp_path, monkeypatch):
+    import pytest
+    from relay.local_job_store import JobStoreError
+
+    monkeypatch.setenv("MCP_EXECUTION_PROFILES", "1")
+    monkeypatch.setenv("MCP_FLEET_AGENT_URL", "http://127.0.0.1/fake-agent")
+    state = tmp_path / "state"
+    db = tmp_path / "jobs.sqlite3"
+    with pytest.raises(JobStoreError) as exc:
+        ll.main([
+            "--job-id", "../outside",
+            "--state-dir", str(state),
+            "--db", str(db),
+        ])
+    assert exc.value.code == "INVALID_JOB_ID"
+    assert not (tmp_path / "outside.json").exists()
+    assert not (tmp_path / "outside.lock").exists()

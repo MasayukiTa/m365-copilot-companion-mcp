@@ -194,11 +194,15 @@ LOCAL_LOOP_LOCK_DIR = "local_loop_locks"
 
 
 def _controller_marker_path(state_dir: str | os.PathLike, job_id: str) -> Path:
-    return Path(state_dir) / LOCAL_LOOP_MARKER_DIR / (str(job_id) + ".json")
+    # Marker/lock filenames are security boundaries too. Resume-by-id reaches these helpers
+    # before any browser work, so validate here rather than relying on a later SQLite lookup.
+    safe_id = LocalJobStore._validate_job_id(job_id)
+    return Path(state_dir) / LOCAL_LOOP_MARKER_DIR / (safe_id + ".json")
 
 
 def _controller_lock_path(state_dir: str | os.PathLike, job_id: str) -> Path:
-    return Path(state_dir) / LOCAL_LOOP_LOCK_DIR / (str(job_id) + ".lock")
+    safe_id = LocalJobStore._validate_job_id(job_id)
+    return Path(state_dir) / LOCAL_LOOP_LOCK_DIR / (safe_id + ".lock")
 
 
 def _read_controller_marker(state_dir: str | os.PathLike, job_id: str) -> dict | None:
