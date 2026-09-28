@@ -17,14 +17,24 @@ def _between(start, end):
     return SRC[i:j]
 
 
-def test_reachable_server_stale_code_is_green_with_detail_not_yellow():
+def test_recent_stale_is_green_but_stale_past_the_self_heal_window_can_warn():
     block = SRC[SRC.index('string codeState = HealthField(srvBody, "server_code")'):]
     block = block[:block.index('// 1) Tunnel:')]
-    assert 'codeState == "stale"' in block
-    # Staleness is deploy freshness, not service failure. Auth storm may still be amber.
-    stale_tail = block[block.index('codeState == "stale"'):]
-    assert 'SetDot(0, HealthState.Yellow' not in stale_tail
-    assert 'SetDot(0, HealthState.Green' in stale_tail
+
+    # Staleness itself is deploy freshness, not service failure. The actionable case is that it
+    # stayed stale longer than the supervisor should need to cycle the server.
+    prolonged = 'codeState == "stale" && StaleLongEnoughToMatter(srvBody)'
+    assert prolonged in block
+    i = block.index(prolonged)
+    j = block.index('else if (codeState == "stale")', i)
+    assert 'SetDot(0, HealthState.Yellow' in block[i:j]
+
+    # A normal just-changed server remains green while the automatic cycle has time to run.
+    k = block.index('else', j + 1)
+    recent = block[j:k]
+    assert 'SetDot(0, HealthState.Green' in recent
+    assert 'SetDot(0, HealthState.Yellow' not in recent
+    assert 'hs_srv_detail_stale_recent' in recent
 
 
 def test_real_fleet_tool_success_dominates_bridge_probe_color():

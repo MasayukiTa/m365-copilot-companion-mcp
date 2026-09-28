@@ -2716,6 +2716,9 @@ class CockpitWindow : Window
         else if (authStorm)
             SetDot(0, HealthState.Yellow,
                    T("hs_srv_detail_auth") + " (" + authFails + ")", now);
+        else if (codeState == "stale" && StaleLongEnoughToMatter(srvBody))
+            SetDot(0, HealthState.Yellow,
+                   T("hs_srv_detail_stale") + " (" + HealthField(srvBody, "server_head") + ")", now);
         else if (codeState == "stale")
             // GREEN, AND IT SAYS WHY. A commit that touches a watched package makes the running
             // server genuinely stale, so on a machine where an agent improves the code all day
