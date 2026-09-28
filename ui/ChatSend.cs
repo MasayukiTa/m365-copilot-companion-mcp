@@ -1,4 +1,4 @@
-// ChatSend.cs -- what the chat window DOES with a line that was typed, as code a test can run.
+﻿// ChatSend.cs -- what the chat window DOES with a line that was typed, as code a test can run.
 //
 // WHY THIS IS ITS OWN FILE. Until 2026-09-24 the whole send path -- the capacity reroute, the
 // "!" priority prefix, the research router, the page-pinning doors, the fleet steer / follow-up
@@ -37,7 +37,8 @@ class Conversation
     public string ConvUrl = "";
     public string Source = "";
     public double Ts = 0;
-    public string Transcript = "";   // disk jsonl path (fleet convs) -> open from disk, no scrape
+    public string Transcript = "";   // latest disk jsonl path; send/live-worker compatibility pointer
+    public List<string> Transcripts = new List<string>(); // ordered old -> new display lineage
     public string Name = "";         // worker name (fallback to resolve the transcript by name)
     public string Goal = "";         // fleet: the FULL goal text -- what identifies this
                                      // conversation to socket_route.conversation_for_goal,

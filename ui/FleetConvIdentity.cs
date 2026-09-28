@@ -1,4 +1,4 @@
-// FleetConvIdentity.cs -- the identity-merge DECISION for a fleet conversation's Goal /
+﻿// FleetConvIdentity.cs -- the identity-merge DECISION for a fleet conversation's Goal /
 // Transcript / Source / Name fields, extracted out of ui/CopilotChat.cs (commit 3c93b59) so it
 // can be run by a test instead of only read as text.
 //
@@ -40,6 +40,7 @@
 // expression-bodied members, NO nameof. No WPF types in this file -- that is what lets a test
 // compile it standalone.
 using System;
+using System.Collections.Generic;
 
 static class FleetConvIdentity
 {
@@ -65,6 +66,39 @@ static class FleetConvIdentity
     {
         if (string.IsNullOrEmpty(existing) && !string.IsNullOrEmpty(freshValue)) return freshValue;
         return existing ?? "";
+    }
+
+    /// Stable ordered union for one conversation's transcript segments. Existing order wins,
+    /// then newly observed lineage entries, then the latest pointer if it was not listed yet.
+    /// A stale registry poll carrying an older pointer therefore cannot move the conversation
+    /// backwards: an already-known newer segment stays at the tail.
+    public static List<string> MergeTranscriptLineage(IEnumerable<string> existing,
+                                                      IEnumerable<string> fresh,
+                                                      string latest)
+    {
+        var outp = new List<string>();
+        AddTranscriptPaths(outp, existing);
+        AddTranscriptPaths(outp, fresh);
+        if (!string.IsNullOrEmpty(latest) && !outp.Contains(latest)) outp.Add(latest);
+        return outp;
+    }
+
+    static void AddTranscriptPaths(List<string> dst, IEnumerable<string> src)
+    {
+        if (src == null) return;
+        foreach (string raw in src)
+        {
+            string value = (raw ?? "").Trim();
+            if (value.Length > 0 && !dst.Contains(value)) dst.Add(value);
+        }
+    }
+
+    /// Latest display/send pointer for a lineage. Falls back to the pre-lineage pointer for old
+    /// rows or a transient empty registry read.
+    public static string LatestTranscript(IList<string> lineage, string fallback)
+    {
+        if (lineage != null && lineage.Count > 0) return lineage[lineage.Count - 1];
+        return fallback ?? "";
     }
 
     /// OpenFromFleet's goal resolution: the live status.json worker dict's own "goal" field
