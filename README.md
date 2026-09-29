@@ -380,8 +380,13 @@ This is the only manual step. Go to `https://copilotstudio.microsoft.com` and fo
 6. Click **"Create"**. If the connection succeeds, the tools list loads (`list_my_tools`, `read_file`, and so on).
 7. Edit the agent's **Instructions**. Keep the existing text and append the complete contents of
    [`docs/examples/local_loop_agent_instructions.txt`](docs/examples/local_loop_agent_instructions.txt),
-   then save. This is required for SQLite-backed LOCAL_LOOP and the Deep Review commands; it is
-   activated only by the explicit `RUN <job_id> ...` protocol and does not replace normal chat rules.
+   then save. This remains the normal/fast path for SQLite-backed LOCAL_LOOP and the Deep Review
+   commands; it is activated only by the explicit `RUN <job_id> ...` protocol and does not replace
+   normal chat rules. If the agent answers a `RUN` without making the required SQLite commit, the
+   local controller fails closed after that one response: it fences the uncommitted turn and stops
+   in `WAITING_RUNTIME` with an actionable instruction to update/publish these Agent Instructions.
+   It deliberately does not teach/retry the protocol in-band, because a misconfigured agent can
+   route control text into ordinary tools and create duplicate work.
 8. Click **"Publish"** → set visibility to **"Just me" only**. Never select organization-wide.
 
 Once registered, open the agent's chat and paste the URL from the browser's address bar into the STEP 6 dialog.

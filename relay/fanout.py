@@ -79,6 +79,8 @@ SPLIT_JOB = (
     "  3. 何を対象にするかが具体的に書かれている（期間・対象・出力先を明示。"
     "「残りを続ける」のような相対的な指示は不可 — 実行する側は今の会話を見ていません）\n"
     "  4. サブタスク同士で重複も抜けも無いこと\n"
+    "  5. Do not add a merge/aggregation subtask that reads other subtasks; the system "
+    "automatically performs the merge after all children finish.\n"
     "%d〜%d 個に分割し、番号付きの箇条書きで列挙してください。"
     "最後の行に %s と書いてください。\n"
     "ただし、**分割すべきでないと判断したら分割しないでください。** 1つの調査を無理に割ると、"
@@ -154,15 +156,20 @@ def fanout_ready(resp) -> bool:
     return SUBTASKS_READY.upper() in (resp or "").upper()
 
 
-def campaign_id_for(parent_goal) -> str:
-    """A stable id for one parent and its children, derived from the goal itself.
+def campaign_id_for(parent_goal, parent_task_id="") -> str:
+    """Stable id for one split family. Root ids remain backward-compatible.
 
-    Derived rather than random because the fleet's scripts must not call Math.random's
-    equivalents for ids that appear in a resumable run: the same goal resumed must land in
-    the same campaign, or the children of the first attempt and the second become two
-    unrelated families in the same status file.
+    Root campaigns historically hash only the authoritative parent goal; keep that exact rule
+    so existing ``campaigns.jsonl`` and resumed top-level work still rejoin their old family.
+    Nested campaigns need one extra scope component: two different children can legitimately
+    carry identical instruction text, but their grandchildren must not become one family.
+    The splitting task id is stable across resume/retry and therefore scopes nested ids without
+    adding randomness.
     """
-    return "c" + hashlib.sha256((parent_goal or "").encode("utf-8")).hexdigest()[:12]
+    goal = parent_goal or ""
+    parent = str(parent_task_id or "")
+    seed = goal if not parent else (parent + "\0" + goal)
+    return "c" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:12]
 
 
 def _dedupe(steps):
@@ -225,6 +232,106 @@ def last_numbered_run(resp):
     return runs[-1] if runs else []
 
 
+# A split is parallel work, not a dependency graph. The fleet already has a separate
+# `aggregation_goal()` that runs after every child finishes, so a planner-produced "child 5:
+# read children 1-4 and merge them" is both impossible to run in parallel and a duplicate
+# aggregator. The prompt says this, but model output is untrusted input and needs a parser-side
+# invariant too.
+_SUBTASK_REF = re.compile(
+    r"(?:\bsubtasks?\b|サブタスク)\s*"
+    r"([0-9０-９]+(?:\s*(?:[-–—~〜]|to|through|から)\s*[0-9０-９]+)?"
+    r"(?:\s*(?:,|、|and|&|と)\s*[0-9０-９]+)*)",
+    re.IGNORECASE,
+)
+_DEPENDENCY_WORDS = (
+    "read", "use", "consume", "merge", "aggregate", "combine", "integrate", "validate",
+    "compare", "summarize", "summary", "result", "output", "artifact", "file", "after",
+    "wait for", "based on",
+    "読む", "読み", "利用", "用い", "統合", "集約", "まとめ", "結合", "検証", "比較",
+    "結果", "成果", "出力", "ファイル", "生成した", "完了後", "待つ", "待って",
+)
+_MERGE_WORDS = (
+    "merge", "aggregate", "combine", "integrate", "summarize", "summary", "final",
+    "統合", "集約", "まとめ", "結合", "総評", "最終",
+)
+_GENERIC_CROSS_REFS = (
+    "other subtasks", "previous subtasks", "all subtasks", "subtask results", "subtask outputs",
+    "他のサブタスク", "前のサブタスク", "各サブタスク", "全サブタスク",
+)
+
+
+def _ascii_digits(text):
+    return (text or "").translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+
+
+def _mentioned_subtask_indices(step):
+    """Explicit subtask numbers/ranges named by one proposed child."""
+    out = set()
+    for m in _SUBTASK_REF.finditer(_ascii_digits(step)):
+        raw = m.group(1)
+        nums = [int(x) for x in re.findall(r"\d+", raw)]
+        if not nums:
+            continue
+        # A single range (1-4 / 1〜4 / 1 to 4) names every member, not just its endpoints.
+        if len(nums) == 2 and re.search(r"[-–—~〜]|\bto\b|\bthrough\b|から", raw, re.I):
+            lo, hi = sorted(nums)
+            if hi - lo <= MAX_CHILDREN + 2:
+                out.update(range(lo, hi + 1))
+            else:
+                out.update(nums)
+        else:
+            out.update(nums)
+    return out
+
+
+def _cross_subtask_dependency(step, own_index):
+    """True only when the step appears to CONSUME another child's work.
+
+    Merely labelling itself "Subtask 1: ..." is not a dependency. We require dependency/action
+    wording as well as either an explicit other index or a generic "other/all subtask results"
+    reference. This intentionally errs toward refusing a dubious split rather than launching a
+    dependency graph as if it were parallel work.
+    """
+    low = _ascii_digits(step).lower()
+    if not any(word.lower() in low for word in _DEPENDENCY_WORDS):
+        return False
+    refs = _mentioned_subtask_indices(step)
+    if any(i != own_index for i in refs):
+        return True
+    return any(ref.lower() in low for ref in _GENERIC_CROSS_REFS)
+
+
+def _merge_like(step):
+    low = _ascii_digits(step).lower()
+    return any(word.lower() in low for word in _MERGE_WORDS)
+
+
+def _drop_trailing_system_merge(steps):
+    """Strip planner-invented tail aggregators; reject any other dependency.
+
+    A dependent suffix can be safely dropped only when every removed step is clearly merge-like,
+    because `aggregation_goal()` will perform that exact phase after the children finish. A
+    dependency in the middle (or a non-merge dependent tail) describes a DAG we do not schedule;
+    fail closed instead of silently changing the requested workflow.
+    """
+    kept = list(steps)
+    while kept:
+        i = len(kept)
+        if _cross_subtask_dependency(kept[-1], i) and _merge_like(kept[-1]):
+            kept.pop()
+            continue
+        break
+    for i, step in enumerate(kept, 1):
+        if _cross_subtask_dependency(step, i):
+            return []
+    # If a dependent tail remained but was not merge-like, it is not something the built-in
+    # aggregator can substitute for.
+    for i, step in enumerate(steps[len(kept):], len(kept) + 1):
+        if _cross_subtask_dependency(step, i) and not _merge_like(step):
+            return []
+    return kept
+
+
 def subtasks_from(resp):
     """The sub-task list in an agent's split reply, or [] if it is not usable as one.
 
@@ -246,6 +353,9 @@ def subtasks_from(resp):
     # this covers the fallback, where the line is not numbered and so is not skipped there.
     steps = [s for s in steps if SUBTASKS_READY.upper() not in s.upper()]
     steps = _dedupe([s for s in steps if len(s) >= MIN_STEP_CHARS])
+    if len(steps) < MIN_CHILDREN or len(steps) > MAX_CHILDREN:
+        return []
+    steps = _drop_trailing_system_merge(steps)
     if len(steps) < MIN_CHILDREN or len(steps) > MAX_CHILDREN:
         return []
     return steps
@@ -276,7 +386,7 @@ def child_goals(parent_goal, steps, *, parent_task_id="", campaign_id="", depth=
     """
     if depth >= MAX_DEPTH:
         return []
-    cid = campaign_id or campaign_id_for(parent_goal)
+    cid = campaign_id or campaign_id_for(parent_goal, parent_task_id=parent_task_id)
     out = []
     for i, step in enumerate(steps, 1):
         # THE % BINDS TIGHTER THAN THE +, so the format has to be closed before the constant
@@ -497,7 +607,7 @@ def aggregation_goal(parent_goal, records, *, campaign_id="", parent_task_id="",
     ENDS the parent; merging is a separate piece of work that starts when there is something
     to merge.
     """
-    cid = campaign_id or campaign_id_for(parent_goal)
+    cid = campaign_id or campaign_id_for(parent_goal, parent_task_id=parent_task_id)
     item = {
         "text": aggregation_prompt(parent_goal, records, limit_each=limit_each,
                                    parent_partial=parent_partial),

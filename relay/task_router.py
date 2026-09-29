@@ -117,6 +117,7 @@ DESTINATION = {
 }
 DEFAULT_DESTINATION = "claude"
 
+
 # A job may force its destination with payload {"escalate": true} -> CLAUDE, regardless of type.
 LOCAL_TIMEOUT_S = int(os.environ.get("TASK_LOCAL_TIMEOUT_S", "120"))
 
@@ -145,6 +146,8 @@ if TASK_JOB_APPROVAL_MODE not in ("default", "auto", "bypass"):
 # launched (`python relay/task_router.py` puts relay/ on sys.path[0], not REPO).
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
+
+from relay.control_envelopes import is_local_loop_control_submission
 
 from tools import childproc
 
@@ -1243,6 +1246,9 @@ def autostart_fleet(goals, state_dir=None, now=None, launcher=None) -> dict:
     goals = [g for g in (goals or []) if (g or {}).get("text")]
     if not goals:
         return {"ok": False, "detail": "no goals to start a fleet for"}
+    if any(is_local_loop_control_submission((g or {}).get("text")) for g in goals):
+        return {"ok": False, "refused": True,
+                "detail": "LOCAL_LOOP control envelope is not Fleet work"}
     url = _agent_url()
     if not url:
         return {"ok": False, "detail": "no agent URL (MCP_FLEET_AGENT_URL / MCP_IMPL_AGENT_URL)"}
@@ -1619,6 +1625,9 @@ def fleet_handoff(goal: str, jid: str, state_dir=None, priority: bool = False):
     """
     if not (goal or "").strip():
         return "error", {"handoff": "for_fleet/%s.txt" % jid, "detail": "empty goal"}
+    if is_local_loop_control_submission(goal):
+        return "refused", {"handoff": "for_fleet/%s.txt" % jid, "refused": True,
+                           "detail": "LOCAL_LOOP control envelope is not Fleet work"}
     if fleet_is_live(state_dir):
         # Clear any stale receipt for this id before queueing, so a confirmation seen later
         # belongs to THIS handoff and not a previous run's leftover file.
@@ -2195,6 +2204,19 @@ def run_job(job, now_ts=None):
                     rec["result"] = {"gate_token": token, "class_key": key}
                     rec["error"] = reason
         elif dest == "fleet":
+            payload = job.get("payload") or {}
+            goal = payload.get("goal") or payload.get("text", "")
+            source = ((job.get("origin") or {}).get("source")
+                      if isinstance(job.get("origin"), dict) else "")
+            if is_local_loop_control_submission(goal, source):
+                rec["status"] = "refused"
+                rec["error"] = (
+                    "LOCAL_LOOP control envelope is not executable Fleet work; repair the "
+                    "Copilot Studio LOCAL_LOOP Agent Instructions instead of routing RUN/control "
+                    "messages into fleet_submit"
+                )
+                rec["result"] = {"refused": True, "reason": "LOCAL_LOOP control feedback"}
+                return rec
             # A HANDOFF NOBODY COLLECTED. This branch wrote for_fleet/<id>.txt, marked the job
             # "dispatched" and stopped -- and no file in relay/, bridge/, tools/, ui/ or
             # scripts/ ever read that directory. Every fleet-bound job this router has ever
@@ -2210,8 +2232,6 @@ def run_job(job, now_ts=None):
             # that was delivered leaves no file, because its done/ record already says
             # "dispatched" and names how; a goal that was not leaves one, and every drain pass
             # tries the waiting ones again while a fleet is live.
-            payload = job.get("payload") or {}
-            goal = payload.get("goal") or payload.get("text", "")
             prio = bool(payload.get("priority"))
             rec["status"], rec["result"] = fleet_handoff(goal, jid, priority=prio)
             if rec["status"] != "dispatched":
@@ -2371,6 +2391,23 @@ def _deliver_waiting_goals(now_ts=None, state_dir=None):
                 os.remove(path)
             except OSError:
                 pass
+            continue
+        if is_local_loop_control_submission(goal):
+            rec = {"id": jid, "type": "fleet_goal", "destination": "fleet", "ts_done": now_ts,
+                   "status": "refused",
+                   "result": {"refused": True,
+                              "reason": "LOCAL_LOOP control envelope is not Fleet work",
+                              "stale_waiting_residue": True},
+                   "error": "LOCAL_LOOP control envelope is not Fleet work"}
+            try:
+                with open(_p("done", "%s.delivered.json" % jid), "w", encoding="utf-8") as fh:
+                    json.dump(rec, fh, ensure_ascii=False, indent=2)
+                os.remove(path)
+            except OSError:
+                # Fail closed: if the audit write/removal cannot complete, leave the source in
+                # place for inspection rather than pretending it was consumed.
+                continue
+            out.append(rec)
             continue
         if not live:
             if offered_cold:

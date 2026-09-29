@@ -156,6 +156,7 @@ jobs:
             scripts/test_start_all_install_path.py \
             scripts/test_the_identity_guard_speaks_before_the_push.py \
             scripts/test_run_script_style_tests.py \
+            scripts/test_submit_via_ui_roundtrip.py \
             tests/test_scroll_transcript.py \
             tests/test_golden.py \
             tests/test_listing_counts.py \
@@ -195,6 +196,7 @@ jobs:
             relay/test_fleet_landing_reconcile.py \
             relay/test_adopt_pending_command.py \
             relay/test_command_claim_commit.py \
+            relay/test_control_envelope_boundaries.py \
             relay/test_done_candidate_survives_refute_timeout.py \
             relay/test_fleet_runner_single_instance.py \
             relay/test_goal_display_summary.py \
@@ -213,6 +215,7 @@ jobs:
             ui/test_a_retry_budget_bounds_the_repair_it_pays_for.py \
             ui/test_every_lane_in_flight_is_on_screen.py \
             ui/test_durable_execution_state_visible.py \
+            ui/test_durable_live_campaign_enqueue.py \
             ui/test_a_selection_survives_a_refresh_that_changed_nothing.py \
             ui/test_a_follow_up_is_not_a_wall_of_text.py \
             ui/test_a_card_is_not_a_reading_surface.py \
@@ -235,6 +238,8 @@ jobs:
             ui/test_submitted_history_reconciliation.py \
             ui/test_stale_submitted_tasks_are_observable.py \
             ui/test_goal_summary_display.py \
+            ui/test_fleet_status_colors_preserved.py \
+            ui/test_timeline_semantics_localized.py \
             ui/test_live_add_survives_runner_shutdown.py \
             ui/test_live_composer_adds_tasks.py \
             ui/test_one_list_says_what_the_ui_compiles.py \
@@ -246,6 +251,8 @@ jobs:
             scripts/test_supervisor_reresolves_python.py \
             scripts/test_supervisor_port_owner.py \
             scripts/test_supervisor_fleet_resume_guard.py \
+            scripts/test_supervisor_local_loop_resume.py \
+            scripts/test_supervisor_local_loop_campaign.py \
             scripts/test_a_submitted_job_is_picked_up_at_once.py \
             scripts/test_a_failing_entry_point_says_why.py \
             scripts/test_dialogs_use_japanese_font.py \
@@ -355,6 +362,7 @@ jobs:
             scripts/test_bootstrap_p2c.py \
             scripts/test_bootstrap_install_path.py \
             scripts/test_env_file_atomic.py \
+            scripts/test_rotate_secrets_never_prints_values.py \
             scripts/test_install_path_python_version.py \
             scripts/test_install_path_powershell.py \
             scripts/test_install_path_batch.py \
@@ -449,6 +457,8 @@ jobs:
             relay/test_fleet_resume.py \
             relay/test_local_job_store.py \
             relay/test_local_loop_controller.py \
+            relay/test_local_loop_autoresume.py \
+            relay/test_local_loop_campaign_queue.py \
             relay/test_a_drain_deletes_only_what_it_consumed.py \
             relay/test_network_recovery.py \
             relay/test_provenance.py \
@@ -650,6 +660,7 @@ jobs:
             relay/selfimprove/test_reliability.py \
             relay/test_claim_verdict.py \
             relay/test_conv_registry_points_at_this_run.py \
+            relay/test_conversation_transcript_lineage.py \
             relay/test_conv_title.py \
             relay/test_edge_cache_trim.py \
             relay/test_edge_disk_cap.py \

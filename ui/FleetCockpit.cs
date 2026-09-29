@@ -823,6 +823,9 @@ class CockpitWindow : Window
     bool _fanout = true;       // -> settings.txt fanout=
     string _approval = "run";  // approval mode run|plan|auto -> settings.txt approval=
     string _runtimeMode = "fleet"; // next launch: fleet | durable -> settings.txt runtime=
+    bool _durableEnqueuePending = false; // one durable campaign intake process at a time
+    bool _durableStartPending = false; // initial durable launch awaits LOCAL_LOOP status acceptance
+    bool _fleetLaunchPending = false; // fresh Start waits for a closing prior coordinator
     bool _paused = false;      // local fleet pause/resume toggle state (NEW)
     // FIX B: optimistic "stopping" state set the instant Stop is clicked (dims non-terminal cards +
     // flips the Stop button's tooltip/icon) so the click never feels dead for the ~700ms sweep.
@@ -5030,17 +5033,16 @@ class CockpitWindow : Window
                         object peLabelRaw;
                         if (pe.TryGetValue("label", out peLabelRaw) && peLabelRaw != null)
                             peFallbackLabel = peLabelRaw.ToString();
-                        // Localized label via Theme.StatusLabel; fall back to stored English label
-                        string localLabel = Theme.StatusLabel(peEvent, _lang);
+                        // Localized timeline-event label; fall back to stored label for unknown events
+                        string localLabel = Theme.TimelineLabel(peEvent, _lang);
                         if (string.IsNullOrEmpty(localLabel) || localLabel == peEvent)
                         {
-                            // Theme.StatusLabel returns the key itself when unrecognized; use stored fallback
-                            string knownKey = Theme.StatusLabel(peEvent, _lang);
+                            // TimelineLabel returns the key itself when unrecognized; use stored fallback
+                            string knownKey = Theme.TimelineLabel(peEvent, _lang);
                             localLabel = (knownKey == peEvent && !string.IsNullOrEmpty(peFallbackLabel))
                                 ? peFallbackLabel : knownKey;
                         }
-                        string kind = Theme.StatusKind(peEvent);
-                        string colorHex = Theme.KindColor(kind, _dark);
+                        string colorHex = Theme.TimelineColor(peEvent, _dark);
                         string timeStr = "";
                         if (peTs > 0)
                         {
@@ -5212,11 +5214,11 @@ class CockpitWindow : Window
         // [COMPUTED] Honest markers only: queued/received, started (first turn), now/phase, ended.
         var events = new List<Tuple<string, string, string>>();
         // Each tuple: (label, time-string, railColor-hex)
-        string graphite = Theme.Muted(_dark);
+        string graphite = Theme.Text(_dark);
         string live = Theme.Info(_dark);
         string attn = Theme.Warning(_dark);
         string ended = Theme.Success(_dark);
-        string danger = Theme.Danger(_dark);
+        string danger = Theme.Warning(_dark);
 
         // Marker 1: Queued / directive received
         string qLabel = ja ? "投入" : "Queued";
@@ -5492,7 +5494,7 @@ class CockpitWindow : Window
                 // The same fault reached by two callers is one fault; fixing the caller you
                 // happened to be looking at leaves it live everywhere else.
                 if (HandleSlashSetting()) return;
-                if (_composerRunActive) TryAddGoalsToLiveFleet();
+                if (_composerRunActive) TryAddGoalsToActiveRun();
                 else StartFleet();
             }
         };
@@ -5534,7 +5536,7 @@ class CockpitWindow : Window
             // worker card, so `/fanout`, `/effort`, and `/approval` must never enter either task
             // path as Copilot instructions.
             if (HandleSlashSetting()) return;
-            if (_composerRunActive) TryAddGoalsToLiveFleet();
+            if (_composerRunActive) TryAddGoalsToActiveRun();
             else StartFleet();
         };
         btns.Children.Add(_startBtn);
@@ -5684,6 +5686,20 @@ class CockpitWindow : Window
     {
         try
         {
+            if (_durableStartPending)
+            {
+                _startNote.Text = _lang == 0
+                    ? "長時間タスクの開始確認中です。入力は保持されています。"
+                    : "Waiting for the durable task to be accepted; your input is kept.";
+                return;
+            }
+            if (_fleetLaunchPending)
+            {
+                _startNote.Text = _lang == 0
+                    ? "前の実行終了を待って新しいタスクを開始中です。"
+                    : "Waiting for the previous run to finish closing before starting this task.";
+                return;
+            }
             // refuse if a fleet is already running (both would write the same status.json)
             Dictionary<string, object> st = ReadStatus();
             if (st != null && st.ContainsKey("running") && Convert.ToBoolean(st["running"])
@@ -5701,6 +5717,14 @@ class CockpitWindow : Window
             if (goals.Count == 0)
             {
                 _startNote.Text = _lang == 0 ? "ゴールを入力してください。" : "Enter goals (one per line).";
+                return;
+            }
+            foreach (string goal in goals)
+            {
+                if (!IsLocalLoopControlGoal(goal)) continue;
+                if (_startNote != null) _startNote.Text = _lang == 0
+                    ? "LOCAL_LOOP の内部制御文は通常タスクとして再実行できません。耐久タスクのカードから再開してください。"
+                    : "LOCAL_LOOP control text cannot run as ordinary Fleet work. Resume the durable task card instead.";
                 return;
             }
             if (goals.Count == 1 && goals[0].Equals("/help", StringComparison.OrdinalIgnoreCase))
@@ -5734,27 +5758,164 @@ class CockpitWindow : Window
                                                   : "Durable runtime is disabled. Set MCP_EXECUTION_PROFILES=1 and restart the MCP server.";
                     return;
                 }
-                if (!SpawnDurableTask(goals[0])) return;
-                _goalInput.Text = "";
-                _startNote.Text = _lang == 0 ? "長時間タスクを開始しました。現在の工程と進捗をカードに表示します。"
-                                              : "Durable task started. Current step and progress will appear on the card.";
+                string durableSubmittedText = _goalInput.Text ?? "";
+                if (!SpawnDurableTask(goals[0], durableSubmittedText)) return;
+                _startNote.Text = _lang == 0
+                    ? "長時間タスクの開始を確認中です。入力は保持されています。"
+                    : "Starting durable task; your input is kept until LOCAL_LOOP accepts it.";
                 _lastSig = "";
                 return;
             }
 
             bool planMode = _approval == "plan" || _approval == "auto";
-            SpawnFleet(goals, "goals_input.txt", planMode);
-            _goalInput.Text = "";
-            _startNote.Text = (_lang == 0 ? "開始しました（" : "Started (") + goals.Count
-                              + (_lang == 0 ? " 件）" : " goals)")
-                              + (planMode
-                                  ? (_lang == 0 ? "。承認待ちの計画を各カードに出します。" : ". Each card will wait at plan approval.")
-                                  : "");
-            _lastSig = "";   // force a re-render once status.json starts updating
+            string submittedText = _goalInput.Text ?? "";
+            string freshFile = "fresh_start_" + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString()
+                             + "_" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".jsonl";
+            if (!SpawnFleet(goals, freshFile, planMode, waitForClosingRun: true,
+                            submittedText: submittedText)) return;
+            _startNote.Text = _lang == 0
+                ? "前の実行終了を待って開始します。タスクは保持されています。"
+                : "Waiting for the previous run to close; the task is kept until the new run starts.";
+            _lastSig = "";
         }
         catch (Exception ex)
         {
             _startNote.Text = (_lang == 0 ? "起動失敗: " : "Failed: ") + ex.Message;
+        }
+    }
+
+    bool ActiveRunIsLocalLoop(Dictionary<string, object> st)
+    {
+        try
+        {
+            return st != null && string.Equals(
+                S(st, "execution_mode"), "LOCAL_LOOP", StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception) { return false; }
+    }
+
+    bool ActiveRunIsLocalLoop()
+    {
+        try { return ActiveRunIsLocalLoop(ReadStatus()); }
+        catch (Exception) { return false; }
+    }
+
+    void TryAddGoalsToActiveRun()
+    {
+        // LOCAL_LOOP and classic Fleet intentionally have different durable command channels.
+        // LOCAL_LOOP additions become campaign jobs in SQLite/manifest; classic Fleet additions
+        // keep using the one-command-per-file channel. Never let either side consume the other.
+        if (ActiveRunIsLocalLoop())
+        {
+            TryAddGoalsToDurableRun();
+            return;
+        }
+        TryAddGoalsToLiveFleet();
+    }
+
+    void TryAddGoalsToDurableRun()
+    {
+        if (_goalInput == null) return;
+        if (_durableEnqueuePending)
+        {
+            if (_startNote != null)
+                _startNote.Text = _lang == 0 ? "前の長時間タスクをキューへ登録中です。"
+                                              : "The previous durable task submission is still being queued.";
+            return;
+        }
+        var goals = new List<string>();
+        foreach (string ln in (_goalInput.Text ?? "").Replace("\r", "").Split('\n'))
+        {
+            string goal = ln.Trim();
+            if (goal.Length > 0 && !goal.StartsWith("#")) goals.Add(goal);
+        }
+        if (goals.Count == 0) return;
+
+        SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
+        string submittedText = _goalInput.Text ?? "";
+        string goalsFile = null;
+        System.Diagnostics.Process proc = null;
+        try
+        {
+            string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+            string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
+            if (!File.Exists(py)) py = "python";
+            string stateDir = Path.GetDirectoryName(_statusPath);
+            string token = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString() + "_"
+                         + Guid.NewGuid().ToString("N").Substring(0, 8);
+            goalsFile = Path.Combine(stateDir, "durable_enqueue_" + token + ".json");
+            File.WriteAllText(goalsFile, _js.Serialize(goals), new UTF8Encoding(false));
+
+            var psi = new System.Diagnostics.ProcessStartInfo();
+            psi.FileName = py;
+            psi.Arguments = "-m relay.local_loop_controller --enqueue-goals-file \"" + goalsFile
+                          + "\" --state-dir \"" + stateDir + "\"";
+            psi.WorkingDirectory = repo;
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
+            proc = System.Diagnostics.Process.Start(psi);
+            if (proc == null) throw new InvalidOperationException("durable enqueue process did not start");
+            _durableEnqueuePending = true;
+            if (_startNote != null)
+                _startNote.Text = _lang == 0 ? "長時間タスクをdurable queueへ登録中..."
+                                              : "Queueing durable task(s)...";
+
+            var timer = new System.Windows.Threading.DispatcherTimer();
+            timer.Interval = TimeSpan.FromMilliseconds(200);
+            timer.Tick += delegate
+            {
+                try
+                {
+                    proc.Refresh();
+                    if (!proc.HasExited) return;
+                    timer.Stop();
+                    string stderr = "";
+                    try { stderr = proc.StandardError.ReadToEnd(); } catch (Exception) { }
+                    _durableEnqueuePending = false;
+                    try { if (!string.IsNullOrEmpty(goalsFile) && File.Exists(goalsFile)) File.Delete(goalsFile); }
+                    catch (Exception) { }
+                    if (proc.ExitCode == 0)
+                    {
+                        NoteSubmitted(goals, submitBaseline);
+                        if (_goalInput.Text == submittedText) _goalInput.Text = "";
+                        if (_startNote != null)
+                            _startNote.Text = _lang == 0 ? (goals.Count + " 件を長時間実行キューへ追加しました。")
+                                                          : ("Queued " + goals.Count + " durable task(s)." );
+                        _lastSig = "";
+                    }
+                    else
+                    {
+                        if (_startNote != null)
+                            _startNote.Text = (_lang == 0 ? "長時間タスクのキュー登録に失敗。入力は残しています。 "
+                                                          : "Durable queue submission failed; input was kept. ")
+                                            + (stderr ?? "").Trim();
+                    }
+                    try { proc.Dispose(); } catch (Exception) { }
+                }
+                catch (Exception ex)
+                {
+                    timer.Stop();
+                    _durableEnqueuePending = false;
+                    if (_startNote != null)
+                        _startNote.Text = (_lang == 0 ? "長時間タスクのキュー確認に失敗。入力は残しています。 "
+                                                      : "Could not confirm durable queue submission; input was kept. ")
+                                        + ex.Message;
+                }
+            };
+            timer.Start();
+        }
+        catch (Exception ex)
+        {
+            _durableEnqueuePending = false;
+            try { if (!string.IsNullOrEmpty(goalsFile) && File.Exists(goalsFile)) File.Delete(goalsFile); }
+            catch (Exception) { }
+            if (_startNote != null)
+                _startNote.Text = (_lang == 0 ? "長時間タスクのキュー起動に失敗。入力は残しています。 "
+                                              : "Could not start durable queue submission; input was kept. ")
+                                + ex.Message;
         }
     }
 
@@ -5771,6 +5932,14 @@ class CockpitWindow : Window
             if (goal.Length > 0 && !goal.StartsWith("#")) goals.Add(goal);
         }
         if (goals.Count == 0) return;
+        foreach (string goal in goals)
+        {
+            if (!IsLocalLoopControlGoal(goal)) continue;
+            if (_startNote != null) _startNote.Text = _lang == 0
+                ? "LOCAL_LOOP の内部制御文は通常Fleetへ追加できません。耐久タスクのカードから再開してください。"
+                : "LOCAL_LOOP control text cannot be added to ordinary Fleet. Resume the durable task card instead.";
+            return;
+        }
         SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
 
         // This method is entered from the ACTIVE composer. Do not re-decide ownership from one
@@ -5998,9 +6167,58 @@ class CockpitWindow : Window
         return raw == "1" || raw == "true" || raw == "yes" || raw == "on";
     }
 
-    bool SpawnDurableTask(string goal)
+    bool ResumeLocalLoopRuntime(Dictionary<string, object> w)
+    {
+        try
+        {
+            if (w == null) return false;
+            string jobId = S(w, "name").Replace("\"", "");
+            string db = S(w, "local_job_db").Replace("\"", "");
+            if (string.IsNullOrWhiteSpace(jobId)) return false;
+            if (!DurableRuntimeEnabled())
+            {
+                if (_startNote != null)
+                    _startNote.Text = _lang == 0
+                        ? "長時間実行は無効です。MCP_EXECUTION_PROFILES=1 を設定してください。"
+                        : "Durable runtime is disabled. Set MCP_EXECUTION_PROFILES=1 first.";
+                return false;
+            }
+
+            string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+            string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
+            if (!File.Exists(py)) py = "python";
+            string stateDir = Path.GetDirectoryName(_statusPath);
+            var psi = new System.Diagnostics.ProcessStartInfo();
+            psi.FileName = py;
+            psi.Arguments = "-m relay.local_loop_controller --job-id \"" + jobId
+                          + "\" --resume-runtime --state-dir \"" + stateDir + "\"";
+            if (!string.IsNullOrWhiteSpace(db)) psi.Arguments += " --db \"" + db + "\"";
+            psi.WorkingDirectory = repo;
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
+            var proc = System.Diagnostics.Process.Start(psi);
+            if (proc == null) throw new InvalidOperationException("LOCAL_LOOP resume process did not start");
+            if (_startNote != null)
+                _startNote.Text = _lang == 0
+                    ? "実行環境の修復後として、同じ長時間タスクを再開しています。"
+                    : "Resuming the same durable task after runtime repair.";
+            _lastSig = "";
+            return true;
+        }
+        catch (Exception ex)
+        {
+            if (_startNote != null)
+                _startNote.Text = (_lang == 0 ? "長時間タスクの再開に失敗: " : "Durable resume failed: ") + ex.Message;
+            return false;
+        }
+    }
+
+    bool SpawnDurableTask(string goal, string submittedText)
     {
         SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
+        string goalFile = null;
+        System.Diagnostics.Process proc = null;
         try
         {
             string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
@@ -6009,7 +6227,7 @@ class CockpitWindow : Window
             string stateDir = Path.GetDirectoryName(_statusPath);
             string token = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString() + "_"
                          + Guid.NewGuid().ToString("N").Substring(0, 8);
-            string goalFile = Path.Combine(stateDir, "durable_goal_" + token + ".txt");
+            goalFile = Path.Combine(stateDir, "durable_goal_" + token + ".txt");
             File.WriteAllText(goalFile, goal ?? "", new UTF8Encoding(false));
 
             var psi = new System.Diagnostics.ProcessStartInfo();
@@ -6020,20 +6238,104 @@ class CockpitWindow : Window
             psi.UseShellExecute = false;
             psi.CreateNoWindow = true;
             try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
-            System.Diagnostics.Process.Start(psi);
+            proc = System.Diagnostics.Process.Start(psi);
+            if (proc == null) throw new InvalidOperationException("durable controller process did not start");
+            _durableStartPending = true;
             NoteSubmitted(new List<string> { goal }, submitBaseline);
+            WatchDurableStart(proc, submitBaseline, goalFile, submittedText ?? "", goal);
             return true;
         }
         catch (Exception ex)
         {
+            _durableStartPending = false;
+            try { if (!string.IsNullOrEmpty(goalFile) && File.Exists(goalFile)) File.Delete(goalFile); }
+            catch (Exception) { }
             if (_startNote != null)
                 _startNote.Text = (_lang == 0 ? "長時間実行の起動に失敗: " : "Durable start failed: ") + ex.Message;
+            try { if (proc != null) proc.Dispose(); } catch (Exception) { }
             return false;
         }
     }
 
-    bool SpawnFleet(List<string> goals, string goalsFileName, bool planMode = false)
+    void WatchDurableStart(System.Diagnostics.Process proc, SubmissionBaseline baseline,
+                           string goalFile, string submittedText, string goal)
     {
+        var timer = new System.Windows.Threading.DispatcherTimer();
+        timer.Interval = TimeSpan.FromMilliseconds(200);
+        DateTime exitSeenAt = DateTime.MinValue;
+        timer.Tick += delegate
+        {
+            try
+            {
+                Dictionary<string, object> root = ReadStatus();
+                string started = StartedOf(root);
+                bool accepted = ActiveRunIsLocalLoop(root)
+                                && !string.IsNullOrEmpty(started)
+                                && !string.Equals(started, baseline == null ? "" : baseline.Started,
+                                                  StringComparison.Ordinal)
+                                && FreshRunContainsGoals(root, new List<string> { goal });
+                if (accepted)
+                {
+                    timer.Stop();
+                    _durableStartPending = false;
+                    if (_goalInput.Text == submittedText) _goalInput.Text = "";
+                    try { if (!string.IsNullOrEmpty(goalFile) && File.Exists(goalFile)) File.Delete(goalFile); }
+                    catch (Exception) { }
+                    if (_startNote != null)
+                        _startNote.Text = _lang == 0
+                            ? "長時間タスクを開始しました。現在の工程と進捗をカードに表示します。"
+                            : "Durable task started. Current step and progress will appear on the card.";
+                    _lastSig = "";
+                    try { proc.Dispose(); } catch (Exception) { }
+                    return;
+                }
+
+                proc.Refresh();
+                if (!proc.HasExited) return;
+                if (exitSeenAt == DateTime.MinValue)
+                {
+                    exitSeenAt = DateTime.UtcNow;
+                    return;
+                }
+                if ((DateTime.UtcNow - exitSeenAt).TotalSeconds < 2.0) return;
+
+                timer.Stop();
+                _durableStartPending = false;
+                int code = -1;
+                try { code = proc.ExitCode; } catch (Exception) { }
+                try { if (!string.IsNullOrEmpty(goalFile) && File.Exists(goalFile)) File.Delete(goalFile); }
+                catch (Exception) { }
+                if (_startNote != null)
+                    _startNote.Text = (_lang == 0
+                        ? "長時間タスクを開始できませんでした。入力は残しています。終了コード "
+                        : "Could not start durable task; input was kept. Exit code ") + code;
+                try { proc.Dispose(); } catch (Exception) { }
+            }
+            catch (Exception ex)
+            {
+                timer.Stop();
+                _durableStartPending = false;
+                if (_startNote != null)
+                    _startNote.Text = (_lang == 0
+                        ? "長時間タスクの開始確認に失敗しました。入力は残しています。 "
+                        : "Could not confirm durable task start; input was kept. ") + ex.Message;
+                try { proc.Dispose(); } catch (Exception) { }
+            }
+        };
+        timer.Start();
+    }
+
+    bool SpawnFleet(List<string> goals, string goalsFileName, bool planMode = false,
+                    bool waitForClosingRun = false, string submittedText = null)
+    {
+        foreach (string rawGoal in (goals ?? new List<string>()))
+        {
+            if (!IsLocalLoopControlGoal(SubmittedTasks.GoalTextOf(rawGoal))) continue;
+            if (_startNote != null) _startNote.Text = _lang == 0
+                ? "LOCAL_LOOP の内部制御文は通常Fleetとして起動できません。耐久タスクのカードから再開してください。"
+                : "LOCAL_LOOP control text cannot start ordinary Fleet work. Resume the durable task card instead.";
+            return false;
+        }
         SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
         string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
         string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
@@ -6047,6 +6349,7 @@ class CockpitWindow : Window
         psi.Arguments = "-m relay.fleet_runner --goals-file \"" + goalsFile + "\""
                         + " --state-dir \"" + stateDir + "\" --effort " + _effort;
         if (planMode) psi.Arguments += " --plan";
+        if (waitForClosingRun) psi.Arguments += " --wait-for-state-dir-seconds 60";
         // BOTH VALUES ARE SAID OUT LOUD. This used to append "--fanout" when on and nothing
         // when off -- and once the runner's default became true, saying nothing meant ON, so
         // a person who typed /fanout off got fan-out anyway while the cockpit reported OFF.
@@ -6056,12 +6359,114 @@ class CockpitWindow : Window
         psi.UseShellExecute = false;
         psi.CreateNoWindow = true;
         try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
-        System.Diagnostics.Process.Start(psi);
+        System.Diagnostics.Process proc = System.Diagnostics.Process.Start(psi);
+        if (proc == null) return false;
         // On top of the list NOW, before the new run's first snapshot exists. Every spawn path
         // comes through here: the composer's StartFleet, a retry or bulk retry with no live run,
         // and the continue flows (whose lines are {"text":..} objects -- GoalTextOf reads them).
         NoteSubmitted(goals, submitBaseline);
+        if (waitForClosingRun)
+        {
+            _fleetLaunchPending = true;
+            WatchFreshFleetLaunch(proc, submitBaseline, goalsFile, submittedText ?? "",
+                                  goals, planMode);
+        }
+        else
+        {
+            try { proc.Dispose(); } catch (Exception) { }
+        }
         return true;
+    }
+
+    static bool FreshRunContainsGoals(Dictionary<string, object> root, List<string> goals)
+    {
+        if (root == null || goals == null || goals.Count == 0) return false;
+        List<Dictionary<string, object>> workers = WorkersOf(root);
+        foreach (string raw in goals)
+        {
+            string wanted = SubmittedTasks.GoalTextOf(raw).Trim();
+            bool found = false;
+            foreach (Dictionary<string, object> w in workers)
+            {
+                if (string.Equals(S(w, "goal").Trim(), wanted, StringComparison.Ordinal))
+                {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return false;
+        }
+        return true;
+    }
+
+    void WatchFreshFleetLaunch(System.Diagnostics.Process proc, SubmissionBaseline baseline,
+                               string goalsFile, string submittedText, List<string> goals, bool planMode)
+    {
+        var timer = new System.Windows.Threading.DispatcherTimer();
+        timer.Interval = TimeSpan.FromMilliseconds(200);
+        DateTime exitSeenAt = DateTime.MinValue;
+        timer.Tick += delegate
+        {
+            try
+            {
+                Dictionary<string, object> root = ReadStatus();
+                string started = StartedOf(root);
+                bool accepted = !string.IsNullOrEmpty(started)
+                                && !string.Equals(started, baseline == null ? "" : baseline.Started,
+                                                  StringComparison.Ordinal)
+                                && FreshRunContainsGoals(root, goals);
+                if (accepted)
+                {
+                    timer.Stop();
+                    _fleetLaunchPending = false;
+                    if (_goalInput.Text == submittedText) _goalInput.Text = "";
+                    try { if (File.Exists(goalsFile)) File.Delete(goalsFile); } catch (Exception) { }
+                    if (_startNote != null)
+                        _startNote.Text = (_lang == 0 ? "開始しました（" : "Started (") + goals.Count
+                                          + (_lang == 0 ? " 件）" : " goals)")
+                                          + (planMode
+                                              ? (_lang == 0 ? "。承認待ちの計画が各カードに出ます。"
+                                                            : ". Each card will wait at plan approval.")
+                                              : "");
+                    _lastSig = "";
+                    try { proc.Dispose(); } catch (Exception) { }
+                    return;
+                }
+
+                proc.Refresh();
+                if (!proc.HasExited) return;
+                if (exitSeenAt == DateTime.MinValue)
+                {
+                    exitSeenAt = DateTime.UtcNow;
+                    return;
+                }
+                if ((DateTime.UtcNow - exitSeenAt).TotalSeconds < 2.0) return;
+
+                timer.Stop();
+                _fleetLaunchPending = false;
+                int code = -1;
+                try { code = proc.ExitCode; } catch (Exception) { }
+                try { if (File.Exists(goalsFile)) File.Delete(goalsFile); } catch (Exception) { }
+                if (_startNote != null)
+                    _startNote.Text = (_lang == 0
+                        ? "新しい実行を開始できませんでした。入力は残しています。終了コード "
+                        : "Could not start the new run; your input was kept. Exit code ")
+                        + code;
+                try { proc.Dispose(); } catch (Exception) { }
+            }
+            catch (Exception ex)
+            {
+                timer.Stop();
+                _fleetLaunchPending = false;
+                if (_startNote != null)
+                    _startNote.Text = (_lang == 0
+                        ? "新しい実行の開始確認に失敗しました。入力は残しています。 "
+                        : "Could not confirm the new run start; your input was kept. ")
+                        + ex.Message;
+                try { proc.Dispose(); } catch (Exception) { }
+            }
+        };
+        timer.Start();
     }
 
     // Render a goals list as the JSONL text SpawnFleet writes to its goals-file: one JSON object
@@ -10695,7 +11100,7 @@ class CockpitWindow : Window
             //
             // So the fan-out was not broken. It ran, it split, it merged, and then this
             // line threw the answer away.
-            if (!IsRetryableOutcome(S(w, "outcome"))) continue;
+            if (!IsRetryableWorker(w)) continue;
             string goal = S(w, "goal");
             if (string.IsNullOrEmpty(goal)) continue;
             int n = 0;
@@ -10863,8 +11268,7 @@ class CockpitWindow : Window
                     var ww2 = ow2 as Dictionary<string, object>;
                     if (ww2 == null) continue;
                     if (!IsTerminalWorker(ww2)) { allTerminal = false; }
-                    string wst2 = S(ww2, "status");
-                    if (wst2 == "stuck" || wst2 == "maxturns" || wst2 == "error") cntAttn++;
+                    if (IsOperatorAttention(ww2)) cntAttn++;
                 }
             }
         }
@@ -12211,7 +12615,7 @@ class CockpitWindow : Window
         foreach (Dictionary<string, object> rw in shown)
         {
             if (!IsTerminalWorker(rw)) continue;
-            if (!IsRetryableOutcome(S(rw, "outcome"))) continue;
+            if (!IsRetryableWorker(rw)) continue;
             retryTargets++;
         }
         if (retryTargets > 0)
@@ -12649,6 +13053,7 @@ class CockpitWindow : Window
     Border HistoryRow(Dictionary<string, object> e)
     {
         string status = S(e, "status");
+        bool internalControl = IsLocalLoopControlGoal(S(e, "goal"));
         string ck = ColorKey(status);
         string conv = S(e, "conv_url");
         // Default COLLAPSED, exactly like a live card: a terminal worker that scrolls down into
@@ -12674,7 +13079,9 @@ class CockpitWindow : Window
             dp.Children.Add(chev);
         }
         string hcanon = status == "ready" ? "waiting" : status;
-        var pill = Pill(Theme.StatusLabel(hcanon, _lang), Theme.StatusKind(hcanon));
+        var pill = internalControl
+            ? Pill(_lang == 0 ? "内部制御" : "Internal control", "neutral")
+            : Pill(Theme.StatusLabel(hcanon, _lang), Theme.StatusKind(hcanon));
         pill.Margin = new Thickness(0, 0, 5, 0);
         DockPanel.SetDock(pill, Dock.Left);
         dp.Children.Add(pill);
@@ -12759,7 +13166,7 @@ class CockpitWindow : Window
                         : "Started a continuation of the prior task (it re-reads the saved outputs, then runs the follow-up).";
                 }
             };
-            col.Children.Add(contBtn);
+            if (!internalControl) col.Children.Add(contBtn);
         }
 
         row.Child = col;
@@ -12782,6 +13189,39 @@ class CockpitWindow : Window
     static bool IsAttentionStatus(string status)
     {
         return status == "stuck" || status == "maxturns" || status == "error";
+    }
+
+    static bool IsAgentSetupRuntimeWait(string reason)
+    {
+        if (string.IsNullOrWhiteSpace(reason)) return false;
+        return reason.IndexOf("Agent Instructions are missing or stale", StringComparison.OrdinalIgnoreCase) >= 0
+            && reason.IndexOf("browser answered RUN without a SQLite commit", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    static bool IsLocalLoopControlGoal(string goal)
+    {
+        string norm = (goal ?? "").Replace("\r", " ").Replace("\n", " ").Replace("\t", " ").Trim().ToLowerInvariant();
+        while (norm.Contains("  ")) norm = norm.Replace("  ", " ");
+        return norm.StartsWith("local_loop run ")
+            || norm.StartsWith("local_loop bootstrap ")
+            || norm.StartsWith("local_loop protocol ")
+            || norm.StartsWith("execute local_loop job ")
+            || norm.StartsWith("run local_loop job ");
+    }
+
+    static bool IsOperatorAttention(Dictionary<string, object> w)
+    {
+        return w != null
+            && !IsLocalLoopControlGoal(S(w, "goal"))
+            && !IsInfraStuck(w)
+            && IsAttentionStatus(S(w, "status"));
+    }
+
+    static bool IsRetryableWorker(Dictionary<string, object> w)
+    {
+        return w != null
+            && !IsLocalLoopControlGoal(S(w, "goal"))
+            && IsRetryableOutcome(S(w, "outcome"));
     }
 
     // P0: an INFRA_STUCK worker is NOT a task failure — the engine parked it because the infra
@@ -12859,13 +13299,19 @@ class CockpitWindow : Window
         bool terminal = status == "done" || status == "stuck" || status == "maxturns"
                         || status == "error" || status == "cancelled";
         bool isOpen = _expanded.Contains(name);
+        bool internalControl = IsLocalLoopControlGoal(goal);
         // P0: INFRA_STUCK is an infra pause (Edge/sign-in/connector broke), NOT a task failure. It
         // gets the distinct ORANGE インフラ待ち treatment: a warning rail/pill, its actionable reason
         // shown as-is, and a 再投入 re-queue action — NOT the red stuck/error recovery surface.
-        bool isInfra = !closed && IsInfraStuck(w);
+        bool isInfra = !closed && !internalControl && IsInfraStuck(w);
+        bool isLocalRuntimeWait = !closed
+            && status == "waiting_runtime"
+            && string.Equals(S(w, "execution_profile"), "LOCAL_LOOP", StringComparison.OrdinalIgnoreCase)
+            && string.Equals(S(w, "runtime_resume_allowed"), "True", StringComparison.OrdinalIgnoreCase);
+        bool isAgentSetupWait = isLocalRuntimeWait && IsAgentSetupRuntimeWait(reason);
         // Attention lane: stuck/maxturns/error and NOT yet expanded -- gets recovery surface treatment.
         // INFRA_STUCK is carved out of the red attention lane (handled by its own infra branch).
-        bool isAttention = !closed && !isInfra && IsAttentionStatus(status);
+        bool isAttention = !closed && IsOperatorAttention(w);
 
         // The chip carries the status. There used to be a 3px coloured rail down the left edge of
         // every row as well, and removing it cost nothing measurable: the chip sits at a nearly
@@ -12873,7 +13319,8 @@ class CockpitWindow : Window
         // chip, not the rail thirty pixels to its left. The rail restated what the chip already
         // said, in the one shape the operator has objected to for months.
         bool isDone = status == "done" || string.Equals(S(w, "outcome"), "DONE", StringComparison.OrdinalIgnoreCase);
-        string chipKind = isDone ? "success" : (isInfra ? "warning" : Theme.StatusKind(status));
+        string chipKind = internalControl ? "neutral"
+            : (isDone ? "success" : (isInfra ? "warning" : Theme.StatusKind(status)));
 
         // Pass A2-1 TASK 1: demote the collapsed row to a LEDGER ROW.
         // - No rounded corners, no card background fill, no full border.
@@ -12918,7 +13365,21 @@ class CockpitWindow : Window
             openLink.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e) { e.Handled = true; FlashOpen(card); OpenWorker(onm, ourl); };
             right.Children.Add(openLink);
         }
-        if (closed || terminal)
+        if (isLocalRuntimeWait)
+        {
+            var runtimeResume = AttentionBtn(_lang == 0 ? "再開" : "Resume");
+            runtimeResume.ToolTip = _lang == 0
+                ? "実行環境を修復した後、同じ永続タスクを再開します"
+                : "Resume the same durable task after repairing the runtime";
+            Dictionary<string, object> runtimeWaitWorker = w;
+            runtimeResume.Click += delegate (object s2, RoutedEventArgs e2)
+            {
+                e2.Handled = true;
+                ResumeLocalLoopRuntime(runtimeWaitWorker);
+            };
+            right.Children.Add(runtimeResume);
+        }
+        else if (closed || terminal)
         {
             // Completed/released Fleet card menu: keep the kebab available after its agent tab is
             // released. The result and artifacts remain useful, and the same goal can be run again.
@@ -12942,8 +13403,11 @@ class CockpitWindow : Window
                 });
             }
 
-            menuLabels.Add(T("rerun_same"));
-            menuActions.Add(delegate { RetryGoal(wt2); ShowScaleToast(T("rerun_started")); });
+            if (!IsLocalLoopControlGoal(goal))
+            {
+                menuLabels.Add(T("rerun_same"));
+                menuActions.Add(delegate { RetryGoal(wt2); ShowScaleToast(T("rerun_started")); });
+            }
 
             menuLabels.Add(null);
             menuActions.Add(null);
@@ -12977,7 +13441,10 @@ class CockpitWindow : Window
         var left = new DockPanel { LastChildFill = true };
         var chev = ChevronToggle(name, isOpen); DockPanel.SetDock(chev, Dock.Left); left.Children.Add(chev);
         // INFRA_STUCK -> distinct ORANGE インフラ待ち pill; otherwise the normal status label.
-        var chip = Pill(isInfra ? T("infra_wait") : Theme.StatusLabel(status, _lang), chipKind);
+        var chip = Pill(internalControl
+            ? (_lang == 0 ? "内部制御" : "Internal control")
+            : (isAgentSetupWait ? (_lang == 0 ? "エージェント設定待ち" : "Agent setup required")
+                : (isInfra ? T("infra_wait") : Theme.StatusLabel(status, _lang))), chipKind);
         chip.Margin = new Thickness(2, 0, 5, 0);
         DockPanel.SetDock(chip, Dock.Left); left.Children.Add(chip);
         // AGENT BADGE (P0 feature 4): which agent this conversation is bound to. Green subtle badge
@@ -12998,7 +13465,23 @@ class CockpitWindow : Window
         if (!isOpen)
         {
             // ── COLLAPSED ROW body (ledger row, not expanded drawer) ──────────────────────────
-            if (isInfra)
+            if (isLocalRuntimeWait)
+            {
+                if (!string.IsNullOrEmpty(reason))
+                {
+                    var runtimeReason = new TextBlock
+                    {
+                        Text = (isAgentSetupWait ? (_lang == 0 ? "エージェント設定待ち: " : "Agent setup required: ")
+                            : (_lang == 0 ? "実行環境待ち: " : "Runtime paused: ")) + OneLine(reason),
+                        Foreground = Muted, FontSize = 12.5,
+                        TextTrimming = TextTrimming.CharacterEllipsis,
+                        TextWrapping = TextWrapping.NoWrap,
+                        Margin = new Thickness(24, 4, 0, 0)
+                    };
+                    col.Children.Add(runtimeReason);
+                }
+            }
+            else if (isInfra)
             {
                 // P0 INFRA_STUCK collapsed row: the reason text is actionable (e.g. "sign-in
                 // required" / "default-Copilot fallback"), so render it verbatim, then offer a
@@ -13142,7 +13625,13 @@ class CockpitWindow : Window
                     string currentStep = S(execution, "current_step");
                     int currentIndex = I(execution, "current_step_index");
                     int totalSteps = I(execution, "total_steps");
-                    if (!string.IsNullOrEmpty(currentStep))
+                    // Open-ended LOCAL_LOOP has no turn_plan, so current_step is initially the
+                    // authoritative goal itself. The headline already shows its compact task
+                    // identity; repeating the full (often English, multi-kilobyte) goal here makes
+                    // the collapsed card look like progress when it is only the original request.
+                    bool currentStepRepeatsGoal = string.Equals(
+                        (currentStep ?? "").Trim(), (goal ?? "").Trim(), StringComparison.Ordinal);
+                    if (!string.IsNullOrEmpty(currentStep) && !currentStepRepeatsGoal)
                     {
                         string stepPrefix = totalSteps > 0
                             ? (currentIndex + "/" + totalSteps + "  ")
@@ -13312,7 +13801,7 @@ class CockpitWindow : Window
             col.Children.Add(BuildCardTabs(w, name, goal, last, reason, terminal));
             // Actions live BELOW the tabs (not inside one) so steer/retry are always reachable.
             if (!terminal) col.Children.Add(SteerRow(name));
-            else if (S(w, "outcome") != "DONE") col.Children.Add(RetryRow(w));
+            else if (IsRetryableWorker(w)) col.Children.Add(RetryRow(w));
             else col.Children.Add(ContinueRow(name, goal, S(w, "conv_url")));
         }
 
@@ -13735,9 +14224,9 @@ class CockpitWindow : Window
         // Prefer phase_events (same source as Evidence Spine) when available; fall back to transcript.
         sp.Children.Add(SectLabel(_lang == 0 ? "タイムライン" : "Timeline"));
         var tsEvents = BuildTimelineEvents(tpath, outcome, terminal, reviews, w);
-        foreach (string ev in tsEvents)
+        foreach (var ev in tsEvents)
             sp.Children.Add(new TextBlock {
-                Text = "・" + ev, Foreground = Muted, FontSize = 12,
+                Text = "・" + ev.Item1, Foreground = Theme.Br(ev.Item2), FontSize = 12,
                 Margin = new Thickness(0, 1, 0, 1), TextWrapping = TextWrapping.Wrap });
 
         sp.Children.Add(SectLabel(_lang == 0 ? "指示" : "Goal"));
@@ -13748,7 +14237,7 @@ class CockpitWindow : Window
     // Build the ordered event list for the Timeline section.
     // Prefers phase_events from the worker dict (same source as Evidence Spine) when present.
     // Falls back to transcript-derived timestamps when phase_events is absent.
-    List<string> BuildTimelineEvents(string tpath, string outcome, bool terminal, int reviews,
+    List<Tuple<string, string>> BuildTimelineEvents(string tpath, string outcome, bool terminal, int reviews,
                                      Dictionary<string, object> w)
     {
         bool ja = _lang == 0;
@@ -13772,7 +14261,7 @@ class CockpitWindow : Window
                 object[] peArr = (object[])peRaw;
                 if (peArr.Length > 0)
                 {
-                    var evs2 = new List<string>();
+                    var evs2 = new List<Tuple<string, string>>();
                     foreach (object peObj in peArr)
                     {
                         var pe = peObj as Dictionary<string, object>;
@@ -13785,8 +14274,8 @@ class CockpitWindow : Window
                         object peEvRaw;
                         if (pe.TryGetValue("event", out peEvRaw) && peEvRaw != null)
                             peEvent = peEvRaw.ToString();
-                        // Use same label vocab as the Spine (Theme.StatusLabel)
-                        string localLabel = Theme.StatusLabel(peEvent, _lang);
+                        // Use the same event-history vocabulary as the Spine (Theme.TimelineLabel)
+                        string localLabel = Theme.TimelineLabel(peEvent, _lang);
                         if (string.IsNullOrEmpty(localLabel) || localLabel == peEvent)
                         {
                             object peLblRaw;
@@ -13796,7 +14285,7 @@ class CockpitWindow : Window
                         }
                         if (string.IsNullOrEmpty(localLabel)) localLabel = peEvent;
                         string timePrefix = peTs > 0 ? fmtTs(peTs) : "";
-                        evs2.Add(timePrefix + localLabel);
+                        evs2.Add(new Tuple<string, string>(timePrefix + localLabel, Theme.TimelineColor(peEvent, _dark)));
                     }
                     if (evs2.Count > 0) return evs2;
                 }
@@ -13837,27 +14326,30 @@ class CockpitWindow : Window
         }
         catch { }
 
-        var evs = new List<string>();
+        var evs = new List<Tuple<string, string>>();
         string queuedTs = hasTs ? fmtTs(metaTs) : "";
-        evs.Add(queuedTs + (ja ? "投入" : "Queued"));
+        evs.Add(new Tuple<string, string>(queuedTs + (ja ? "投入" : "Queued"), Theme.TimelineColor("pending", _dark)));
         string startTs = (firstTurnTs > 0) ? fmtTs(firstTurnTs) : "";
-        evs.Add(startTs + (ja ? "開始" : "Started"));
+        evs.Add(new Tuple<string, string>(startTs + (ja ? "開始" : "Started"), Theme.TimelineColor("ready", _dark)));
         if (reviews > 0)
-            evs.Add(ja ? ("レビュー (" + reviews + "x)") : ("Reviewed (" + reviews + "x)"));
+            evs.Add(new Tuple<string, string>(
+                ja ? ("レビュー (" + reviews + "x)") : ("Reviewed (" + reviews + "x)"),
+                Theme.TimelineColor("refuting", _dark)));
         if (terminal)
         {
             string outcomeEv;
+            string outcomeKey;
             switch (outcome)
             {
-                case "DONE":      outcomeEv = ja ? "完了" : "Completed"; break;
-                case "MAXTURNS":  outcomeEv = ja ? "ターン上限" : "Max turns reached"; break;
-                case "STUCK":     outcomeEv = ja ? "停滞" : "Stuck"; break;
-                case "ERROR":     outcomeEv = ja ? "エラー" : "Error"; break;
-                case "CANCELLED": outcomeEv = ja ? "停止" : "Cancelled"; break;
-                case "EVIDENCE_CONTRADICTED": outcomeEv = ja ? "記録と矛盾" : "Contradicted"; break;
-                default:          outcomeEv = string.IsNullOrEmpty(outcome) ? (ja ? "終了" : "Ended") : outcome; break;
+                case "DONE":      outcomeEv = ja ? "完了" : "Completed"; outcomeKey = "done"; break;
+                case "MAXTURNS":  outcomeEv = ja ? "ターン上限" : "Max turns reached"; outcomeKey = "maxturns"; break;
+                case "STUCK":     outcomeEv = ja ? "停滞" : "Stuck"; outcomeKey = "stuck"; break;
+                case "ERROR":     outcomeEv = ja ? "エラー" : "Error"; outcomeKey = "error"; break;
+                case "CANCELLED": outcomeEv = ja ? "停止" : "Cancelled"; outcomeKey = "cancelled"; break;
+                case "EVIDENCE_CONTRADICTED": outcomeEv = ja ? "記録と矛盾" : "Contradicted"; outcomeKey = "stuck"; break;
+                default:           outcomeEv = string.IsNullOrEmpty(outcome) ? (ja ? "終了" : "Ended") : outcome; outcomeKey = "cancelled"; break;
             }
-            evs.Add(outcomeEv);
+            evs.Add(new Tuple<string, string>(outcomeEv, Theme.TimelineColor(outcomeKey, _dark)));
         }
         return evs;
     }
@@ -14520,6 +15012,15 @@ class CockpitWindow : Window
     // The auto-retry scanner only calls this while live, so its add_goal path is unchanged.
     void RetryGoal(Dictionary<string, object> w)
     {
+        string goal = S(w, "goal");
+        if (string.IsNullOrEmpty(goal)) return;
+        if (IsLocalLoopControlGoal(goal))
+        {
+            if (_startNote != null) _startNote.Text = _lang == 0
+                ? "これはLOCAL_LOOPの内部制御記録です。通常Fleetとして再実行せず、耐久タスクのカードから再開してください。"
+                : "This is a LOCAL_LOOP control record. Do not rerun it as Fleet work; resume the durable task card instead.";
+            return;
+        }
         if (RunIsLive())
         {
             SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
@@ -14529,8 +15030,6 @@ class CockpitWindow : Window
             NoteSubmitted(new List<string> { S(w, "goal") }, submitBaseline);
             return;
         }
-        string goal = S(w, "goal");
-        if (string.IsNullOrEmpty(goal)) return;
         try { SpawnFleet(new List<string> { goal }, "retry_input.txt"); _lastSig = ""; } catch (Exception) { }
     }
 
@@ -14560,7 +15059,7 @@ class CockpitWindow : Window
             // Same closed set as AutoRetryScan and as relay/outcomes.py. "Retry all" used to
             // mean "everything that is not DONE", which swept up fan-out parents and threw
             // away the merged answers they carried.
-            if (!IsRetryableOutcome(S(w, "outcome"))) continue;
+            if (!IsRetryableWorker(w)) continue;
             string g = S(w, "goal");
             // Same counter, same key (goal text), same ceiling as AutoRetryScan, so the auto
             // and manual paths cannot each spend a full allowance on the same goal.

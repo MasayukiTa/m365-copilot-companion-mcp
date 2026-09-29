@@ -1,11 +1,12 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import os
-import subprocess
 from pathlib import Path
 
 import pytest
+
+from tools import childproc
 
 REPO = Path(__file__).resolve().parents[1]
 UI = REPO / "ui"
@@ -53,11 +54,11 @@ def test_submitted_rows_reconcile_against_new_history_without_swallowing_retries
     h = tmp_path / "H.cs"
     h.write_text(HARNESS, encoding="utf-8")
     exe = tmp_path / "H.exe"
-    r = subprocess.run([str(CSC), "/nologo", "/target:exe", "/out:" + str(exe),
-                        "/r:" + str(FW / "System.Web.Extensions.dll"),
-                        str(UI / "SubmittedTasks.cs"), str(h)], capture_output=True, text=True, timeout=120)
+    r = childproc.run([str(CSC), "/nologo", "/target:exe", "/out:" + str(exe),
+                      "/r:" + str(FW / "System.Web.Extensions.dll"),
+                      str(UI / "SubmittedTasks.cs"), str(h)], timeout=120)
     assert r.returncode == 0 and exe.is_file(), (r.stdout, r.stderr)
-    q = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
+    q = childproc.run([str(exe)], timeout=30)
     assert q.returncode == 0, (q.returncode, q.stdout, q.stderr)
 
 
@@ -96,11 +97,45 @@ def test_submission_baseline_is_captured_before_handoff_can_create_a_worker():
     assert spawn.index("CaptureSubmissionBaseline()") < spawn.index("Process.Start(psi)")
     assert "NoteSubmitted(goals, submitBaseline)" in spawn
 
-    durable = _method_block(src, "bool SpawnDurableTask(string goal)", "bool SpawnFleet(List<string> goals")
+    durable = _method_block(src, "bool SpawnDurableTask(string goal, string submittedText)", "bool SpawnFleet(List<string> goals")
     assert durable.index("CaptureSubmissionBaseline()") < durable.index("Process.Start(psi)")
     assert "NoteSubmitted(new List<string> { goal }, submitBaseline)" in durable
 
     retry = _method_block(src, "void RetryGoal(Dictionary<string, object> w)", "Dictionary<string, object> Cmd1")
-    live_branch = retry[:retry.index("string goal = S(w, \"goal\")")]
+    # A fail-closed LOCAL_LOOP-control guard now precedes the live branch. The ordering we care
+    # about is still baseline-before-delivery once RetryGoal has decided this is real Fleet work.
+    live_branch = retry[retry.index("if (RunIsLive())"):retry.index('try { SpawnFleet(')]
     assert live_branch.index("CaptureSubmissionBaseline()") < live_branch.index("SendCommand(")
-    assert "NoteSubmitted(new List<string> { S(w, \"goal\") }, submitBaseline)" in live_branch
+    assert 'NoteSubmitted(new List<string> { S(w, "goal") }, submitBaseline)' in live_branch
+
+
+def test_fresh_start_waits_for_closing_coordinator_before_clearing_input():
+    src = (UI / "FleetCockpit.cs").read_text(encoding="utf-8-sig")
+    start = _method_block(src, "void StartFleet()", "bool ActiveRunIsLocalLoop()")
+    assert '_fleetLaunchPending' in start
+    assert 'waitForClosingRun: true' in start
+    assert '_goalInput.Text = "";' not in start[start.index('bool planMode ='):], (
+        'fresh Start must keep the operator text until a new run is actually accepted')
+
+    spawn = _method_block(src, "bool SpawnFleet(List<string> goals", "string GoalsToJsonl(")
+    assert 'bool waitForClosingRun = false' in spawn
+    assert '--wait-for-state-dir-seconds 60' in spawn
+    assert 'WatchFreshFleetLaunch(' in spawn
+    assert 'System.Diagnostics.Process proc = System.Diagnostics.Process.Start(psi);' in spawn
+
+    watch = _method_block(src, "void WatchFreshFleetLaunch(", "string GoalsToJsonl(")
+    assert 'StartedOf(root)' in watch
+    assert 'baseline.Started' in watch
+    assert 'FreshRunContainsGoals(root, goals)' in watch
+    assert 'FreshRunContainsGoals(root, goals)' in watch
+    assert 'if (_goalInput.Text == submittedText) _goalInput.Text = "";' in watch
+    assert 'proc.HasExited' in watch
+    assert '_fleetLaunchPending = false;' in watch
+
+
+def test_fresh_start_uses_unique_goal_file_while_other_spawn_paths_keep_defaults():
+    src = (UI / "FleetCockpit.cs").read_text(encoding="utf-8-sig")
+    start = _method_block(src, "void StartFleet()", "bool ActiveRunIsLocalLoop()")
+    assert 'fresh_start_' in start
+    assert 'Guid.NewGuid().ToString("N")' in start
+    assert src.count('waitForClosingRun: true') == 1

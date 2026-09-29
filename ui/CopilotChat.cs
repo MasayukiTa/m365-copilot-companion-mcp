@@ -1006,6 +1006,54 @@ class ChatWindow : Window, IChatSendEffects
 
     static string SS(Dictionary<string, object> d, string k) { return ChatSend.SS(d, k); }
 
+    static List<string> TranscriptListField(Dictionary<string, object> d, string key)
+    {
+        var outp = new List<string>();
+        if (d == null || !d.ContainsKey(key) || d[key] == null) return outp;
+        var arr = d[key] as object[];
+        if (arr == null) return outp;
+        foreach (object o in arr)
+        {
+            string text = o == null ? "" : o.ToString().Trim();
+            if (text.Length > 0) outp.Add(text);
+        }
+        return outp;
+    }
+
+    List<string> RegistryTranscriptLineage(Dictionary<string, object> d)
+    {
+        return FleetConvIdentity.MergeTranscriptLineage(
+            null, TranscriptListField(d, "transcripts"), SS(d, "transcript"));
+    }
+
+    // Resolve one shared-conversation lineage from the registry. Real/sess URLs are the primary
+    // identity. For legacy rows without a URL, mirror the registry writer's (source,name) key.
+    // A latest hint is appended only when the registry has not seen it yet.
+    List<string> RegistryTranscriptLineageFor(string url, string worker, string latestHint)
+    {
+        try
+        {
+            foreach (object o in ReadConvsRegistry())
+            {
+                var d = o as Dictionary<string, object>;
+                if (d == null) continue;
+                string du = SS(d, "url");
+                string dn = SS(d, "name");
+                string ds = SS(d, "source");
+                string dt = SS(d, "transcript");
+                bool hit = false;
+                if (!string.IsNullOrEmpty(url)) hit = (du == url);
+                else if (!string.IsNullOrEmpty(worker)) hit = (du.Length == 0 && ds == "fleet" && dn == worker);
+                if (!hit && !string.IsNullOrEmpty(latestHint)) hit = (dt == latestHint);
+                if (!hit) continue;
+                return FleetConvIdentity.MergeTranscriptLineage(
+                    RegistryTranscriptLineage(d), null, latestHint);
+            }
+        }
+        catch { }
+        return FleetConvIdentity.MergeTranscriptLineage(null, null, latestHint);
+    }
+
     // status.json lives next to conversations.json (.fleet/). Read the worker dict whose
     // "conv_url" matches 'url' (the cockpit cards render exactly this live per-worker state).
     // Returns null when status.json is missing/unreadable or no worker matches.
@@ -1181,6 +1229,23 @@ class ChatWindow : Window, IChatSendEffects
             }
         }
         catch { }
+        return msgs;
+    }
+
+    List<Msg> ReadTranscriptLineage(IEnumerable<string> paths)
+    {
+        var msgs = new List<Msg>();
+        var seen = new List<string>();
+        if (paths == null) return msgs;
+        foreach (string raw in paths)
+        {
+            string path = (raw ?? "").Trim();
+            if (path.Length == 0 || seen.Contains(path)) continue;
+            seen.Add(path);
+            var part = ReadTranscript(path);
+            if (part.Count > 0) msgs.AddRange(part);
+            AppendSubAgentTranscripts(msgs, path);
+        }
         return msgs;
     }
 
@@ -1401,6 +1466,9 @@ class ChatWindow : Window, IChatSendEffects
                 if (d == null) continue;
                 string url = SS(d, "url");
                 string transcript = SS(d, "transcript");
+                string regSource = SS(d, "source");
+                string regName = SS(d, "name");
+                var regLineage = RegistryTranscriptLineage(d);
                 // A socket-driven fleet worker never gets a conv_url: relay_fleet.py's
                 // _capture_url only ever fires when the worker holds a browser `page`, and a
                 // socket worker's page is None by construction (MCP_FLEET_SOCKET has defaulted
@@ -1413,7 +1481,7 @@ class ChatWindow : Window, IChatSendEffects
                 // haven't loaded yet" branch below), so a transcript-only row is not degraded,
                 // just openable a different way. A row with neither is still skipped -- there
                 // is nothing to show or open for it either way.
-                if (string.IsNullOrEmpty(url) && string.IsNullOrEmpty(transcript)) continue;
+                if (string.IsNullOrEmpty(url) && string.IsNullOrEmpty(transcript) && regLineage.Count == 0) continue;
                 // THE FULL GOAL TEXT (relay/fleet_runner.py::_register_convs, added alongside
                 // this read). NOT "title": make_title() truncates that for display, and
                 // DecideFleetSend (ChatSend.cs) addresses a fleet conversation by the goal, not
@@ -1426,6 +1494,8 @@ class ChatWindow : Window, IChatSendEffects
                 foreach (var c in _all)
                 {
                     if (!string.IsNullOrEmpty(url) && c.ConvUrl == url) { existingC = c; break; }
+                    if (string.IsNullOrEmpty(url) && regSource == c.Source && regName == c.Name
+                        && !string.IsNullOrEmpty(regName)) { existingC = c; break; }
                     if (string.IsNullOrEmpty(url) && !string.IsNullOrEmpty(transcript)
                         && c.Transcript == transcript) { existingC = c; break; }
                 }
@@ -1438,16 +1508,26 @@ class ChatWindow : Window, IChatSendEffects
                     // FleetConvIdentity.MergeBackfillOnly (see ui/FleetConvIdentity.cs) so a
                     // test can run it directly instead of only reading this call site as text.
                     existingC.Goal = FleetConvIdentity.MergeBackfillOnly(existingC.Goal, regGoal);
-                    existingC.Transcript = FleetConvIdentity.MergeBackfillOnly(existingC.Transcript, transcript);
+                    existingC.Source = FleetConvIdentity.MergeBackfillOnly(existingC.Source, regSource);
+                    existingC.Name = FleetConvIdentity.MergeBackfillOnly(existingC.Name, regName);
+                    // Seed a legacy row's single latest pointer into the lineage BEFORE applying
+                    // the fresh registry chain, so a stale poll can never rewind a newer pointer.
+                    var priorLineage = FleetConvIdentity.MergeTranscriptLineage(
+                        existingC.Transcripts, null, existingC.Transcript);
+                    existingC.Transcripts = FleetConvIdentity.MergeTranscriptLineage(
+                        priorLineage, regLineage, transcript);
+                    existingC.Transcript = FleetConvIdentity.LatestTranscript(
+                        existingC.Transcripts, FleetConvIdentity.MergeBackfillOnly(existingC.Transcript, transcript));
                     continue;
                 }
                 {
                     var c = new Conversation();
                     c.ConvUrl = url;
                     c.Title = SS(d, "title");
-                    c.Source = SS(d, "source");
-                    c.Transcript = transcript;   // disk jsonl -> open from disk, no scrape
-                    c.Name = SS(d, "name");
+                    c.Source = regSource;
+                    c.Transcripts = regLineage;
+                    c.Transcript = FleetConvIdentity.LatestTranscript(c.Transcripts, transcript);
+                    c.Name = regName;
                     c.Goal = regGoal;
                     try { c.Ts = (d.ContainsKey("ts") && d["ts"] != null) ? Convert.ToDouble(d["ts"]) : 0; }
                     catch { c.Ts = 0; }
@@ -1667,17 +1747,19 @@ class ChatWindow : Window, IChatSendEffects
         // Resolve the live worker dict (by conv_url when we have a real URL, else by name).
         var wkr = ReadFleetWorker(key);
         bool running = FleetRunningFresh();
-        string transcriptPath = wkr != null ? SS(wkr, "transcript") : "";
-        // A history click carries the EXACT transcript path -- prefer it (correct even when several
-        // runs share a worker name, which the name-newest fallback below could otherwise confuse).
-        if (string.IsNullOrEmpty(transcriptPath) && !string.IsNullOrEmpty(transcriptHint))
-            transcriptPath = transcriptHint;
-        // FALLBACK by worker name: if no live worker dict resolved (finished/restarted run, a
-        // history click, or a transient status.json read) the transcript field is unavailable even
-        // though the .jsonl is on disk -- so locate it by name. This is what was dropping users to
-        // the "transcript not available" placeholder so often; the full conversation was right there.
-        if (string.IsNullOrEmpty(transcriptPath) && !string.IsNullOrEmpty(worker))
-            transcriptPath = NewestTranscriptForWorker(worker);
+        string liveTranscriptPath = wkr != null ? SS(wkr, "transcript") : "";
+        if (string.IsNullOrEmpty(liveTranscriptPath) && !string.IsNullOrEmpty(worker))
+            liveTranscriptPath = NewestTranscriptForWorker(worker);
+
+        // Registry lineage is the conversation identity (old -> new). A cockpit history click's
+        // transcriptHint is DISPLAY LOCATION only: it must never rewind the Conversation.Transcript
+        // pointer that ChatSend later uses for live-worker/follow-up routing.
+        var transcriptLineage = RegistryTranscriptLineageFor(url, worker, liveTranscriptPath);
+        string identityTranscriptPath = FleetConvIdentity.LatestTranscript(transcriptLineage, liveTranscriptPath);
+        bool exactTranscriptView = !string.IsNullOrEmpty(transcriptHint);
+        string displayTranscriptPath = exactTranscriptView ? transcriptHint : identityTranscriptPath;
+        if (transcriptLineage.Count == 0 && !string.IsNullOrEmpty(identityTranscriptPath))
+            transcriptLineage = FleetConvIdentity.MergeTranscriptLineage(null, null, identityTranscriptPath);
 
         // THE GOAL TEXT THAT IDENTIFIES THIS CONVERSATION TO THE FLEET (ChatSend.cs's
         // DecideFleetSend addresses a follow-up / a live steer by c.Goal and c.Transcript, not
@@ -1690,7 +1772,9 @@ class ChatWindow : Window, IChatSendEffects
         string liveGoal = wkr != null ? SS(wkr, "goal") : "";
         // Decision itself (which source wins) lives in FleetConvIdentity.ResolveGoal so a test
         // can run it without WPF; see ui/FleetConvIdentity.cs.
-        string bestGoal = FleetConvIdentity.ResolveGoal(liveGoal, TranscriptMetaGoal(transcriptPath));
+        string goalTranscriptPath = !string.IsNullOrEmpty(identityTranscriptPath)
+            ? identityTranscriptPath : displayTranscriptPath;
+        string bestGoal = FleetConvIdentity.ResolveGoal(liveGoal, TranscriptMetaGoal(goalTranscriptPath));
 
         // SOURCE PRIORITY:
         //  1. Persisted full-text transcript (jsonl) -- ALWAYS preferred when present. It is the
@@ -1700,8 +1784,9 @@ class ChatWindow : Window, IChatSendEffects
         //     fully separate from the fleet's :9222, so it is safe even mid-run (it no longer
         //     PAGE.goto's the shared companion Edge). Only used when there is no disk transcript.
         //  3. status.json snapshot fragment -- fallback for older workers with no transcript.
-        var msgs = ReadTranscript(transcriptPath);
-        AppendSubAgentTranscripts(msgs, transcriptPath);   // show captured research sub-conversations
+        var msgs = exactTranscriptView
+            ? ReadTranscriptLineage(FleetConvIdentity.MergeTranscriptLineage(null, null, displayTranscriptPath))
+            : ReadTranscriptLineage(transcriptLineage);
         bool fromTranscript = msgs.Count > 0;
         bool historyScraped = false;   // true only when the /history call below actually ran and succeeded
         if (!fromTranscript && !string.IsNullOrEmpty(url))   // scrape via the separate bridge Edge, mid-run safe
@@ -1755,7 +1840,11 @@ class ChatWindow : Window, IChatSendEffects
             // directly instead of only reading this call site as text.
             c.Source = FleetConvIdentity.MergeBackfillOnly(c.Source, "fleet");
             c.Name = FleetConvIdentity.MergeBackfillOnly(c.Name, worker);
-            c.Transcript = FleetConvIdentity.MergeForward(c.Transcript, transcriptPath);
+            var priorLineage = FleetConvIdentity.MergeTranscriptLineage(c.Transcripts, null, c.Transcript);
+            c.Transcripts = FleetConvIdentity.MergeTranscriptLineage(
+                priorLineage, transcriptLineage, identityTranscriptPath);
+            c.Transcript = FleetConvIdentity.LatestTranscript(
+                c.Transcripts, FleetConvIdentity.MergeForward(c.Transcript, identityTranscriptPath));
             c.Goal = FleetConvIdentity.MergeForward(c.Goal, bestGoal);
             c.Messages.Clear();
             foreach (var m in loaded) c.Messages.Add(m);
@@ -1810,7 +1899,7 @@ class ChatWindow : Window, IChatSendEffects
             // Follow this transcript's tail live from here on -- appends land as they are
             // written, no re-open needed to see them. No-ops (and stops any previous follow)
             // when this worker is no longer live-tracked or its transcript is already archived.
-            MaybeFollowConversation(c, transcriptPath);
+            MaybeFollowConversation(c, identityTranscriptPath);
             RefreshConvList();
             RefreshSteerVisual();   // tint the input border if this is a live steerable worker
             StickToEnd();
@@ -1866,7 +1955,10 @@ class ChatWindow : Window, IChatSendEffects
         //
         // The signature is the RENDERED CONTENT -- the transcript lines and the status tail --
         // and not the worker dict, which carries per-second fields that would defeat the point.
-        var txPre = ReadTranscript(SS(w, "transcript"));
+        string latestTranscript = SS(w, "transcript");
+        _conv.Transcripts = FleetConvIdentity.MergeTranscriptLineage(_conv.Transcripts, null, latestTranscript);
+        _conv.Transcript = FleetConvIdentity.LatestTranscript(_conv.Transcripts, latestTranscript);
+        var txPre = ReadTranscriptLineage(_conv.Transcripts);
         string tailPre = BuildFleetStatusTail(w, includeLast: txPre.Count == 0);
 
         // THE BAND IS UPDATED FIRST AND UNCONDITIONALLY, because it is the part that moves. It
@@ -3728,8 +3820,9 @@ class ChatWindow : Window, IChatSendEffects
                         : (!string.IsNullOrEmpty(c.Name) ? NewestTranscriptForWorker(c.Name) : "");
             if (!string.IsNullOrEmpty(tp))
             {
-                var tm = ReadTranscript(tp);
-                AppendSubAgentTranscripts(tm, tp);
+                c.Transcripts = FleetConvIdentity.MergeTranscriptLineage(c.Transcripts, null, tp);
+                c.Transcript = FleetConvIdentity.LatestTranscript(c.Transcripts, tp);
+                var tm = ReadTranscriptLineage(c.Transcripts);
                 foreach (var mm in tm) c.Messages.Add(mm);
             }
         }
@@ -5160,7 +5253,13 @@ class ChatWindow : Window, IChatSendEffects
                 if (budget-- <= 0) break;
                 if (f.IndexOf("__sub_", StringComparison.Ordinal) >= 0) continue;   // research children
                 bool exists = false;
-                foreach (var c in _all) if (StripGz(c.Transcript) == StripGz(f)) { exists = true; break; }
+                foreach (var c in _all)
+                {
+                    if (StripGz(c.Transcript) == StripGz(f)) { exists = true; break; }
+                    foreach (string tx in c.Transcripts)
+                        if (StripGz(tx) == StripGz(f)) { exists = true; break; }
+                    if (exists) break;
+                }
                 if (exists) continue;
                 string goal = "", name = "", guid = "";
                 try
@@ -5195,13 +5294,15 @@ class ChatWindow : Window, IChatSendEffects
                 double ts = 0;
                 try { ts = (File.GetLastWriteTimeUtc(f) - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds; }
                 catch { }
-                _all.Add(new Conversation { Transcript = f, Name = name, Title = title, Source = "fleet",
+                var discovered = new Conversation { Transcript = f, Name = name, Title = title, Source = "fleet",
                                             Ts = ts, Goal = goal,
                                             // "sess:<guid>" -- the bridge's own shape for a
                                             // conversation with no navigable URL. NOT a url:
                                             // calling it one is how a resume silently becomes
                                             // a fresh chat.
-                                            ConvUrl = guid.Length > 0 ? "sess:" + guid : "" });
+                                            ConvUrl = guid.Length > 0 ? "sess:" + guid : "" };
+                discovered.Transcripts.Add(f);
+                _all.Add(discovered);
             }
         }
         catch { }

@@ -687,6 +687,7 @@ class LocalJobStore:
                 "events": [{"seq": e["seq"], "event": e["event_type"],
                             "payload": json.loads(e["payload_json"]), "ts": e["created_at"]}
                            for e in reversed(events)],
+                "created_at": float(job["created_at"]),
                 "updated_at": float(job["updated_at"]),
             }
         finally:
@@ -829,11 +830,28 @@ class LocalJobStore:
                 _bounded_text(event_type, 128, "event_type"), dict(payload or {}), now,
             )
 
+    def ui_trigger_attempt_count(self, job_id: str) -> int:
+        """Durable count of RUN trigger attempts across controller process restarts."""
+        job_id = self._validate_job_id(job_id)
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM events WHERE job_id=? AND event_type='UI_TRIGGER_ATTEMPT'",
+                (job_id,),
+            ).fetchone()
+            return int(row[0] if row else 0)
+        finally:
+            conn.close()
+
+
     def mark_waiting_runtime(self, job_id: str, reason: str,
-                             now: float | None = None) -> dict:
+                             now: float | None = None, scope: str = "job") -> dict:
         job_id = self._validate_job_id(job_id)
         now = time.time() if now is None else float(now)
         reason = _bounded_text(reason, 2048, "runtime reason")
+        scope = str(scope or "job").strip().lower()
+        if scope not in {"job", "campaign"}:
+            raise JobStoreError("INVALID_RUNTIME_SCOPE", f"unsupported runtime scope {scope!r}")
         with self._transaction() as conn:
             job, turn = self._job_and_turn(conn, job_id)
             if job["status"] in TERMINAL_JOB_STATUSES:
@@ -842,8 +860,10 @@ class LocalJobStore:
                 "UPDATE jobs SET status='WAITING_RUNTIME',verification_detail=?,updated_at=? "
                 "WHERE job_id=?", (reason, now, job_id),
             )
-            self._event(conn, job_id, int(turn["seq"]), "WAITING_RUNTIME", {"reason": reason}, now)
-        return {"ok": True, "status": "WAITING_RUNTIME"}
+            self._event(conn, job_id, int(turn["seq"]), "WAITING_RUNTIME", {
+                "reason": reason, "scope": scope,
+            }, now)
+        return {"ok": True, "status": "WAITING_RUNTIME", "scope": scope}
 
     def mark_waiting_interaction(self, job_id: str, status: str, reason: str,
                                  now: float | None = None) -> dict:
@@ -1037,14 +1057,18 @@ class LocalJobStore:
                 "last": execution.get("last_progress") or commit.get("summary", ""),
                 "transcript": "", "closed": terminal,
                 "execution_profile": item["execution_profile"],
+                "runtime_resume_allowed": item["status"] == "WAITING_RUNTIME",
+                "local_job_db": str(self.path),
                 "artifacts": execution.get("artifacts", []),
                 "phase_events": item.get("events", []),
                 "next_step": execution.get("next_step", ""),
                 "execution": execution,
+                "created_at": float(item.get("created_at", item.get("updated_at", time.time()))),
+                "updated_at": float(item.get("updated_at", time.time())),
             })
         now = time.time()
         return {
-            "started": min((s["updated_at"] for s in statuses), default=now),
+            "started": min((s.get("created_at", s["updated_at"]) for s in statuses), default=now),
             "updated": now, "total": len(statuses), "done_count": done,
             "running": any(not w["closed"] for w in workers), "open_tabs": 0,
             "execution_mode": "LOCAL_LOOP", "workers": workers,

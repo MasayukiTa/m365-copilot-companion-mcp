@@ -91,6 +91,34 @@ def test_an_empty_goal_is_refused(empty):
     assert _jobs() == []
 
 
+@pytest.mark.parametrize("source", [
+    "LOCAL_LOOP RUN companion_20260929_012240_0dcf12d3_30f0 seq=1",
+    "LOCAL_LOOP bootstrap companion_20260929_012240_0dcf12d3_30f0",
+])
+def test_local_loop_control_provenance_is_refused_before_queueing(source):
+    out = FI.fleet_submit("do harmless work", source=source)
+    assert "refused" in out and "LOCAL_LOOP control" in out
+    assert _jobs() == []
+
+
+@pytest.mark.parametrize("goal", [
+    "Execute LOCAL_LOOP job companion_20260929_012240_0dcf12d3_30f0 (seq=1, worker=local_x).",
+    "Run LOCAL_LOOP job companion_20260929_012240_0dcf12d3_30f0 (seq=1, worker=local_x).",
+    "LOCAL_LOOP RUN companion_20260929_012240_0dcf12d3_30f0 seq=1 worker=local_x",
+    "LOCAL_LOOP bootstrap companion_20260929_012240_0dcf12d3_30f0",
+])
+def test_local_loop_control_goal_shape_is_refused_even_without_source(goal):
+    out = FI.fleet_submit(goal, source="agent")
+    assert "refused" in out and "LOCAL_LOOP control" in out
+    assert _jobs() == []
+
+
+def test_an_ordinary_task_about_local_loop_is_not_mistaken_for_control():
+    out = FI.fleet_submit("Inspect the LOCAL_LOOP implementation and report races", source="agent")
+    assert "queued" in out
+    assert len(_jobs()) == 1
+
+
 def test_a_pasted_document_is_refused_rather_than_queued():
     out = FI.fleet_submit("x" * (FI.MAX_GOAL_CHARS + 1))
     assert "refused" in out and "characters" in out

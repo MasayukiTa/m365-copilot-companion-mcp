@@ -29,6 +29,10 @@ import json
 import os
 import shutil
 import socket
+import subprocess
+import time
+import http.server
+import threading
 import sys
 import tempfile
 
@@ -454,3 +458,126 @@ def test_the_main_loop_keeps_the_same_identity_rule_for_a_booting_server(src):
     booting = loop[loop.index("$booting = $false"):loop.index("if ($booting)")]
     assert "Test-IsThisCheckoutServerCommandLine" in booting
     assert "$script:ServerProc" in booting
+
+# -- stale-server bridge-port ownership ------------------------------------------------------
+
+class _LoopbackBodyServer:
+    def __init__(self, body: bytes, status: int = 200):
+        outer = self
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+            def log_message(self, *a):
+                pass
+        self.srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+    def close(self):
+        self.srv.shutdown()
+
+
+def _wait_tcp(port: int, seconds: float = 10.0) -> None:
+    until = time.time() + seconds
+    while time.time() < until:
+        s = socket.socket()
+        try:
+            s.settimeout(0.2)
+            s.connect(("127.0.0.1", port))
+            return
+        except OSError:
+            time.sleep(0.05)
+        finally:
+            s.close()
+    raise AssertionError("port %d did not open" % port)
+
+
+def _stale_cycle_driver(src: str, root, server_port: int, bridge_port: int, out):
+    funcs = "\n\n".join(_extract_braced_block(src, m) for m in (
+        "function Test-IsThisCheckoutBridgeCommandLine",
+        "function Get-BridgePortVerdict",
+        "function Invoke-StaleServerCycle",
+    ))
+    driver = root / "stale-cycle.ps1"
+    body = r'''param([string]$RootDir,[int]$ServerPort,[int]$BridgePortArg,[string]$OutFile)
+$ErrorActionPreference = "SilentlyContinue"
+$Root = $RootDir
+$Port = $ServerPort
+$BridgePort = $BridgePortArg
+$script:StaleStreak = 0
+$script:Calls = 0
+$script:Logs = New-Object System.Collections.Generic.List[string]
+function Write-Log($m) { $script:Logs.Add([string]$m) }
+function Start-Server { $script:Calls++ }
+%s
+Invoke-StaleServerCycle
+Invoke-StaleServerCycle
+[ordered]@{calls=$script:Calls; logs=@($script:Logs)} | ConvertTo-Json -Depth 5 | Set-Content -Path $OutFile -Encoding UTF8
+''' % funcs
+    driver.write_text(body, encoding="utf-8")
+    return driver
+
+
+def test_foreign_bridge_port_cannot_hold_a_stale_server_hostage(src, tmp_path):
+    """Measured 2026-09-28: python -m http.server on the bridge port returned 404 forever."""
+    root = tmp_path / "repo"
+    (root / ".fleet").mkdir(parents=True)
+    (root / ".fleet" / "status.json").write_text('{"running": false}', encoding="utf-8")
+    stale = _LoopbackBodyServer(b'{"server_code":"stale"}')
+    foreign = _LoopbackBodyServer(b'<html>not the bridge</html>', status=404)
+    out = tmp_path / "foreign.json"
+    try:
+        driver = _stale_cycle_driver(src, root, stale.srv.server_address[1], foreign.srv.server_address[1], out)
+        r = childproc.run([_POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                           str(driver), "-RootDir", str(root), "-ServerPort", str(stale.srv.server_address[1]),
+                           "-BridgePortArg", str(foreign.srv.server_address[1]), "-OutFile", str(out)],
+                          timeout=60, creationflags=childproc.headless_creationflags())
+    finally:
+        stale.close(); foreign.close()
+    assert r.returncode == 0, r.stderr[-1200:]
+    body = json.loads(out.read_text(encoding="utf-8-sig"))
+    assert body["calls"] == 1, body
+    assert any("foreign process" in x for x in body["logs"]), body
+
+
+def test_our_broken_bridge_remains_fail_closed_busy(src, tmp_path):
+    root = tmp_path / "repo"
+    (root / ".fleet").mkdir(parents=True)
+    (root / ".fleet" / "status.json").write_text('{"running": false}', encoding="utf-8")
+    bridge_dir = root / "bridge"
+    bridge_dir.mkdir()
+    bridge_py = bridge_dir / "copilot_bridge.py"
+    bridge_py.write_text('''import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b"not-json")
+    def log_message(self,*a): pass
+HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+''', encoding="utf-8")
+    bridge_port = _free_port()
+    proc = subprocess.Popen([sys.executable, str(bridge_py), str(bridge_port)], stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, creationflags=childproc.headless_creationflags())
+    stale = _LoopbackBodyServer(b'{"server_code":"stale"}')
+    out = tmp_path / "ours.json"
+    try:
+        _wait_tcp(bridge_port)
+        driver = _stale_cycle_driver(src, root, stale.srv.server_address[1], bridge_port, out)
+        r = childproc.run([_POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                           str(driver), "-RootDir", str(root), "-ServerPort", str(stale.srv.server_address[1]),
+                           "-BridgePortArg", str(bridge_port), "-OutFile", str(out)], timeout=60,
+                          creationflags=childproc.headless_creationflags())
+    finally:
+        stale.close(); proc.kill(); proc.wait(timeout=10)
+    assert r.returncode == 0, r.stderr[-1200:]
+    body = json.loads(out.read_text(encoding="utf-8-sig"))
+    assert body["calls"] == 0, body
+
+
+def test_supervisor_bridge_port_follows_env_file(src):
+    assert "function Get-EnvBridgePort" in src
+    assert 'MCP_BRIDGE_PORT' in _extract_braced_block(src, "function Get-EnvBridgePort")
+    stale = _extract_braced_block(src, "function Invoke-StaleServerCycle")
+    assert 'http://127.0.0.1:$BridgePort/status' in stale
+    assert '127.0.0.1:8765/status' not in stale

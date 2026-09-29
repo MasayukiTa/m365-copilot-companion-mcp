@@ -419,3 +419,56 @@ def test_a_reserved_event_type_cannot_be_recorded_through_the_public_api():
 
     # observational events are unaffected
     store.record_event("reserved_probe", "BROWSER_METRICS", {"fps": 60})
+
+
+def test_console_projection_started_is_job_creation_not_last_update(tmp_path):
+    store = _store(tmp_path)
+    store.create_job(_job(), now=10)
+    claim = store.claim_turn("job_1", 1, "w", now=20)
+    store.heartbeat(
+        "job_1", 1, claim["lease_id"], claim["fencing_token"],
+        "working", "still progressing", now=30,
+    )
+
+    status = store.get_job_status("job_1")
+    snapshot = store.console_snapshot()
+    worker = snapshot["workers"][0]
+
+    assert status["created_at"] == 10
+    # A heartbeat advances the turn row, not the job row; the job was last updated by claim at 20.
+    assert status["updated_at"] == 20
+    assert worker["created_at"] == 10
+    assert worker["updated_at"] == 20
+    assert snapshot["started"] == 10
+
+
+def test_waiting_runtime_records_scope_without_schema_change(tmp_path):
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    store.create_job(_job())
+    result = store.mark_waiting_runtime("job_1", "shared agent config", scope="campaign")
+    assert result["scope"] == "campaign"
+    status = store.get_job_status("job_1", event_limit=20)
+    evt = [e for e in status["events"] if e["event"] == "WAITING_RUNTIME"][-1]
+    assert evt["payload"]["scope"] == "campaign"
+    assert evt["payload"]["reason"] == "shared agent config"
+
+
+def test_waiting_runtime_rejects_unknown_scope(tmp_path):
+    import pytest
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    store.create_job(_job())
+    with pytest.raises(JobStoreError) as exc:
+        store.mark_waiting_runtime("job_1", "bad", scope="fleet-wide")
+    assert exc.value.code == "INVALID_RUNTIME_SCOPE"
+
+
+def test_console_snapshot_exposes_runtime_resume_metadata(tmp_path):
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    store.create_job(_job())
+    store.mark_waiting_runtime("job_1", "repair runtime first")
+    snap = store.console_snapshot()
+    worker = next(w for w in snap["workers"] if w["name"] == "job_1")
+    assert worker["status"] == "waiting_runtime"
+    assert worker["execution_profile"] == "LOCAL_LOOP"
+    assert worker["runtime_resume_allowed"] is True
+    assert worker["local_job_db"] == str(store.path)

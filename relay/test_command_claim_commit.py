@@ -333,3 +333,41 @@ def test_live_drain_passes_claim_identity_into_goal_admission():
     block = src[i:i + 3500]
     assert '_apply_command(claim["cmd"], workers, submission_id=claim["name"])' in block
     assert "goals_from_command(cmd, submission_id=submission_id)" in block
+
+
+def test_live_command_admission_refuses_local_loop_control_envelopes():
+    for text in (
+        "Execute LOCAL_LOOP job companion_abc (seq=1, worker=local_x).",
+        "Run LOCAL_LOOP job companion_abc (seq=1, worker=local_x).",
+        "LOCAL_LOOP RUN companion_abc seq=1 worker=local_x",
+        "LOCAL_LOOP bootstrap companion_abc",
+        "LOCAL_LOOP protocol companion_abc",
+        "RUN companion_20260929_x seq=1 worker=local_abc",
+        "RUN job_1 seq=2 worker=local_xyz",
+        "LOCAL_LOOP job companion_20260929_x seq=1 worker=local_abc: claim and execute the operator-authored turn under the standard agent contract",
+        "LOCAL_LOOP job companion_20260929_x seq=1 worker=local_abc を、標準エージェント契約の下で claim_turn して実行する",
+        "Claim and execute LOCAL_LOOP job companion_20260929_x seq=1 worker=local_abc under the standard agent contract",
+        "Claim and execute LOCAL_LOOP job companion_20260929_x seq=1 worker=local_abc: claim_turn(expected_seq=1) then execute the operator-authored turn",
+    ):
+        errors = fr.validate_command({"add_goal": [{"text": text}]})
+        assert errors and any("LOCAL_LOOP control" in e for e in errors), (text, errors)
+
+
+def test_cli_goal_boundary_rejects_local_loop_control_envelopes_before_start():
+    good = [
+        {"text": "Inspect the LOCAL_LOOP implementation and report races"},
+        {"text": "Run companion analysis and summarize the result"},
+        {"text": "LOCAL_LOOP job scheduling is too slow; investigate it"},
+    ]
+    assert fr.reject_local_loop_control_goals(good) == []
+    bad = [{"text": "Run LOCAL_LOOP job companion_abc (seq=1, worker=local_x)."}]
+    errors = fr.reject_local_loop_control_goals(bad)
+    assert errors and "LOCAL_LOOP control" in errors[0]
+
+
+def test_resume_expansion_is_rechecked_for_old_control_envelopes():
+    src = Path(fr.__file__).read_text(encoding="utf-8")
+    resume = src[src.index("if args.resume:"):src.index("if not args.agent_url:")]
+    assert "goals = resume_goals + goals" in resume
+    assert resume.index("goals = resume_goals + goals") < resume.index("reject_local_loop_control_goals(goals)")
+    assert "return 4" in resume

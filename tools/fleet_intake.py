@@ -331,6 +331,12 @@ def fleet_submit(goal: str, note: str = "", source: str = "",
     if len(text) > MAX_GOAL_CHARS:
         return ("[fleet_submit: refused -- the goal is %d characters, over the %d limit. "
                 "Send the instruction, not the document.]" % (len(text), MAX_GOAL_CHARS))
+    if TR.is_local_loop_control_submission(text, source):
+        return (
+            "[fleet_submit: refused -- LOCAL_LOOP control messages are not Fleet goals. "
+            "Repair/publish the LOCAL_LOOP Agent Instructions instead of routing RUN/control "
+            "messages back into Fleet.]"
+        )
     dup = _duplicate_of(text)
     if dup is not None:
         dup_jid, sim = dup

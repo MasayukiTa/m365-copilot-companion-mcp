@@ -77,6 +77,7 @@ from relay.copilot_autopilot_relay import default_notify  # noqa: E402
 from relay.refuter import PANEL_LENSES  # noqa: E402
 from relay.fanout import fanout_family_view  # noqa: E402
 from relay.control_markers import CLOSING_INSTRUCTION  # noqa: E402
+from relay.control_envelopes import is_local_loop_control_submission  # noqa: E402
 
 
 # ── COORDINATOR OUTPUT CAPTURE (TEE) ────────────────────────────────────────────
@@ -124,6 +125,8 @@ class _Tee:
     def __getattr__(self, name):
         return getattr(self._real, name)
 
+
+from relay.conversation_lineage import merge_transcript_chains, with_transcript_lineage
 
 def _setup_coordinator_log(state_dir):
     """TEE sys.stdout/sys.stderr to a timestamped log under state_dir so a future
@@ -256,6 +259,9 @@ def merge_conv_rows(existing, entries, now=None):
         if hit is not None:
             row = rows[hit]
             fresh = {}
+            _chain = merge_transcript_chains(row, entry)
+            if _chain and row.get("transcripts") != _chain:
+                fresh["transcripts"] = _chain
             if tr and row.get("transcript") != tr:
                 fresh["transcript"] = tr
             nm = entry.get("name") or ""
@@ -278,7 +284,7 @@ def merge_conv_rows(existing, entries, now=None):
                     by_url[u] = hit
                 changed = True
             continue
-        row = dict(entry)
+        row = with_transcript_lineage(entry)
         row.setdefault("ts", time.time() if now is None else now)
         rows.append(row)
         if u:
@@ -1287,6 +1293,16 @@ def _read_goals(args):
     return goals
 
 
+def reject_local_loop_control_goals(goals):
+    """Return launch-admission errors for internal LOCAL_LOOP envelopes in ordinary Fleet goals."""
+    errors = []
+    for i, item in enumerate(goals or []):
+        text = item.get("text", "") if isinstance(item, dict) else str(item or "")
+        if is_local_loop_control_submission(text):
+            errors.append("goal %d: LOCAL_LOOP control envelope is not Fleet work" % (i + 1))
+    return errors
+
+
 def _pending_gates(started=0.0):
     """Scan .companion_gates/ for unanswered HITL gates and return a list of dicts.
 
@@ -2006,10 +2022,13 @@ def _resume_argv(argv):
         if skip_next:
             skip_next = False
             continue
-        if a in ("-g", "--goal", "--goals-file", "--adopt-command"):
+        if a in ("-g", "--goal", "--goals-file", "--adopt-command",
+                  "--wait-for-state-dir-seconds"):
             skip_next = True
             continue
-        if a.startswith("--goal=") or a.startswith("--goals-file=") or a.startswith("--adopt-command="):
+        if (a.startswith("--goal=") or a.startswith("--goals-file=")
+                or a.startswith("--adopt-command=")
+                or a.startswith("--wait-for-state-dir-seconds=")):
             continue
         if a == "--resume":
             continue
@@ -2165,6 +2184,39 @@ def _release_run_lock(fh):
         fh.close()
     except Exception:
         pass
+
+
+def _acquire_run_slot(state_dir, *, wait_seconds=0.0, poll_seconds=0.10):
+    """Acquire this Fleet state directory, optionally waiting for a closing prior owner.
+
+    Default wait_seconds=0 preserves strict fail-fast behavior. The Cockpit fresh-Start path
+    opts into a bounded wait because status.json can reach running:false before the old
+    coordinator has completed final persistence and released its OS lock.
+    """
+    wait_seconds = max(0.0, float(wait_seconds or 0.0))
+    poll_seconds = max(0.0, float(poll_seconds or 0.0))
+    deadline = time.monotonic() + wait_seconds
+    last_conflict = 0
+    while True:
+        owner = _active_run_conflict_pid(state_dir)
+        if owner:
+            last_conflict = owner
+        else:
+            lock = _acquire_run_lock(state_dir)
+            if lock is not None:
+                owner = _active_run_conflict_pid(state_dir)
+                if not owner:
+                    return lock, 0
+                last_conflict = owner
+                _release_run_lock(lock)
+            else:
+                last_conflict = 0
+
+        now = time.monotonic()
+        if wait_seconds <= 0.0 or now >= deadline:
+            return None, last_conflict
+        remaining = max(0.0, deadline - now)
+        time.sleep(min(poll_seconds, remaining) if poll_seconds > 0.0 else 0.0)
 
 
 def _clear_active_marker(state_dir, owner_pid=None):
@@ -2525,12 +2577,16 @@ def _validate_command(cmd, state_dir):
 
 def _goal_item_error(it):
     if isinstance(it, str):
+        if is_local_loop_control_submission(it):
+            return "LOCAL_LOOP control envelope is not Fleet work"
         return "" if _text_ok(it) else "text longer than %d chars" % MAX_COMMAND_TEXT
     if not isinstance(it, dict):
         return "an entry is %s, not text or an object" % type(it).__name__
     extra = sorted(str(k)[:20] for k in it if k not in _GOAL_KEYS)
     if extra:
         return "unknown key(s) %s" % extra[:5]
+    if it.get("text") is not None and is_local_loop_control_submission(it.get("text")):
+        return "LOCAL_LOOP control envelope is not Fleet work"
     if it.get("text") is not None and not _text_ok(it["text"]):
         return "text must be a string of at most %d chars" % MAX_COMMAND_TEXT
     if it.get("follow_up_to") is not None and not _text_ok(it["follow_up_to"]):
@@ -3288,6 +3344,9 @@ def main():
                          "correctness refuter; accept if upheld (cheap, no over-engineering), "
                          "escalate to research+panel only when it refutes. Beats a uniform ultra "
                          "by not over-engineering the easy tasks (ultra's observed failure mode).")
+    ap.add_argument("--wait-for-state-dir-seconds", type=float, default=0.0,
+                    help="opt-in fresh-start handoff: wait this many seconds for a closing "
+                         "coordinator to release the same state dir (default 0 = fail fast)")
     ap.add_argument("--state-dir", default=os.path.join(_repo_root(), ".fleet"),
                     help="where to write the live status.json the cockpit reads")
     args = ap.parse_args()
@@ -3298,32 +3357,20 @@ def main():
     # only layer that can make the invariant unconditional.
     os.makedirs(args.state_dir, exist_ok=True)
     _ACTIVE_STATE_DIR = args.state_dir
-    _owner = _active_run_conflict_pid(args.state_dir)
-    if _owner:
-        if _owner < 0:
-            print("REFUSING TO START: fleet state directory has an unreadable active-run marker: %s"
-                  % args.state_dir, flush=True)
-        else:
-            print("REFUSING TO START: fleet state directory is already owned by live pid %d: %s"
-                  % (_owner, args.state_dir), flush=True)
-        return 3
-    _ACTIVE_RUN_LOCK = _acquire_run_lock(args.state_dir)
+    _ACTIVE_RUN_LOCK, _owner = _acquire_run_slot(
+        args.state_dir, wait_seconds=args.wait_for_state_dir_seconds)
     if _ACTIVE_RUN_LOCK is None:
-        print("REFUSING TO START: another fleet coordinator holds the state-dir lock: %s"
-              % args.state_dir, flush=True)
-        return 3
-    # Close the marker-vs-lock race: another legacy runner may have written a marker after the
-    # first check but before this process took the new OS lock.
-    _owner = _active_run_conflict_pid(args.state_dir)
-    if _owner:
-        _release_run_lock(_ACTIVE_RUN_LOCK)
-        _ACTIVE_RUN_LOCK = None
+        waited = max(0.0, float(args.wait_for_state_dir_seconds or 0.0))
+        prefix = ("TIMED OUT WAITING TO START" if waited > 0.0 else "REFUSING TO START")
         if _owner < 0:
-            print("REFUSING TO START: fleet state directory gained an unreadable active-run marker: %s"
-                  % args.state_dir, flush=True)
+            print("%s: fleet state directory has an unreadable active-run marker: %s"
+                  % (prefix, args.state_dir), flush=True)
+        elif _owner > 0:
+            print("%s: fleet state directory is still owned by live pid %d: %s"
+                  % (prefix, _owner, args.state_dir), flush=True)
         else:
-            print("REFUSING TO START: fleet state directory became owned by live pid %d: %s"
-                  % (_owner, args.state_dir), flush=True)
+            print("%s: another fleet coordinator holds the state-dir lock: %s"
+                  % (prefix, args.state_dir), flush=True)
         return 3
 
     _adopt_claim = None
@@ -3344,6 +3391,16 @@ def main():
             _ACTIVE_RUN_LOCK = None
             return 4
 
+    _cli_goals = _read_goals(args)
+    _control_errors = reject_local_loop_control_goals(_cli_goals)
+    if _control_errors:
+        if _adopt_claim is not None:
+            restore_command_claim(_adopt_claim)
+        print("REFUSING TO START: %s" % "; ".join(_control_errors), flush=True)
+        _release_run_lock(_ACTIVE_RUN_LOCK)
+        _ACTIVE_RUN_LOCK = None
+        return 4
+
     # Capture the coordinator's own stdout/stderr to a durable log under state_dir, from
     # here (right after argparse) so it covers argparse-error exits too, regardless of
     # which launcher started this process. Best-effort -- never crashes on failure.
@@ -3353,7 +3410,7 @@ def main():
     # goal given on the command line appeared nowhere until the run was already going, so a run
     # that died on a precondition left the operator unable to tell it from a command never
     # typed. Cleared at run start, where the goals ledger takes over.
-    _cli_queue_paths = _record_cli_submission(args.state_dir, _adopt_goals + _read_goals(args), sys.argv)
+    _cli_queue_paths = _record_cli_submission(args.state_dir, _adopt_goals + _cli_goals, sys.argv)
 
     # RETENTION RUNS ONCE, HERE, AND NOT ON A TIMER -- the same reasoning as the session
     # store's pass: a sweep that can fire mid-run is a sweep that can delete the transcript
@@ -3433,7 +3490,7 @@ def main():
     print("[effort] %s  (refuter=%s lenses=%s refute<=%d research<=%d)"
           % (_eff, args.refuter, args._lenses, args.max_refute, args.max_research))
 
-    goals = _adopt_goals + _read_goals(args)
+    goals = _adopt_goals + _cli_goals
 
     # THE LENS IS CHOSEN BEFORE THE GOALS ARE READ, AND THE GOALS ARE THE EVIDENCE.
     #
@@ -3481,6 +3538,17 @@ def main():
         if not goals:
             # everything finished (and no new -g/--goals-file goals) -> nothing to launch.
             sys.exit(0)
+
+    # RESUME IS AN INGRESS TOO. An old run ledger may predate the intake guards above (the
+    # 2026-09-29 incident left LOCAL_LOOP wrapper text in last_run_goals.json). Never let a
+    # supervisor/manual --resume turn that historical protocol artifact back into Fleet work.
+    _control_errors = reject_local_loop_control_goals(goals)
+    if _control_errors:
+        print("REFUSING TO START: %s" % "; ".join(_control_errors), flush=True)
+        _release_run_lock(_ACTIVE_RUN_LOCK)
+        _ACTIVE_RUN_LOCK = None
+        return 4
+
     if not goals:
         if args.resume:
             ap.error("no goals -- --resume found an empty ledger and no -g/--goals-file given")
