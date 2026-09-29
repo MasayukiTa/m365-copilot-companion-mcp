@@ -8,11 +8,12 @@ COCKPIT = Path(__file__).with_name('FleetCockpit.cs').read_text(encoding='utf-8-
 
 def test_timeline_has_four_operator_meaning_colours():
     # Timeline colours are intentionally narrower than general status colours:
-    # neutral=ordinary text, work=blue, attention=orange, completed=green.
+    # neutral=secondary graphite, work=blue, attention=orange, completed=green.
     assert 'public static string TimelineColor(string canonical, bool dark)' in THEME
     block = THEME[THEME.index('public static string TimelineColor('):]
     block = block[:block.index('\n    }', 20) + 6]
-    assert 'return Text(dark);' in block
+    assert 'return Secondary(dark);' in block
+    assert 'return Text(dark);' not in block
     assert 'return Info(dark);' in block
     assert 'return Warning(dark);' in block
     assert 'return Success(dark);' in block
@@ -74,3 +75,12 @@ def test_expanded_timeline_no_longer_forces_every_event_to_muted_gray():
 
 def test_timeline_section_heading_localizes_in_both_views():
     assert 'SectLabel(_lang == 0 ? "タイムライン" : "Timeline")' in COCKPIT
+
+
+def test_neutral_timeline_uses_graphite_not_body_black():
+    # Light theme values are the visible regression from the supplied screenshot.
+    assert 'public static string Text(bool d)          { return d ? "#F4F4F5" : "#18181B"; }' in THEME
+    assert 'public static string Secondary(bool d)    { return d ? "#A1A1AA" : "#3F3F46"; }' in THEME
+    block = THEME[THEME.index('public static string TimelineColor('):]
+    block = block[:block.index('\n    }', 20) + 6]
+    assert 'return Secondary(dark);' in block
