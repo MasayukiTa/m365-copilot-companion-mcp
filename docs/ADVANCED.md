@@ -148,11 +148,11 @@ Copilotの構造化commitをSQLiteで待ち、`CANDIDATE_DONE`を従来のロー
 checkで検証します。SQLiteはPython標準機能であり、管理者権限やDBサービスは不要です。
 
 
-> LOCAL_LOOP protocol recovery: the published Copilot Studio Agent Instructions are still the
-> preferred fast path. If a browser response finishes without a SQLite commit, the controller
-> rotates the conversation and sends a compact protocol bootstrap without embedding the task text.
-> Bootstrap attempts are durably counted per sequence (default maximum: 2). Exhaustion changes the
-> job to `WAITING_RUNTIME` and names the Agent Instructions repair instead of retrying forever.
+> LOCAL_LOOP protocol recovery: the published Copilot Studio Agent Instructions are required.
+> If a browser response finishes without a SQLite commit, the controller fences that uncommitted
+> turn and immediately changes the job to `WAITING_RUNTIME`, naming the Agent Instructions repair.
+> It sends no automatic protocol retry: a misconfigured agent may route control text into ordinary
+> tools, so fail-closed behavior is safer than an in-band bootstrap.
 
 ```powershell
 # サンプルJSONのallowed_baseとtaskを変更してから実行

@@ -719,10 +719,6 @@ def _controller_resume_argv(args, job_id: str) -> list[str]:
         ("--edge-mb-limit", "edge_mb_limit"),
     ):
         out += [flag, str(getattr(args, attr))]
-    # Added after early LOCAL_LOOP deployments. Old Namespace-shaped callers and old active
-    # markers do not know the field, so preserve the product default rather than refusing resume.
-    out += ["--max-protocol-bootstrap-attempts",
-            str(getattr(args, "max_protocol_bootstrap_attempts", 2))]
     return out
 
 
@@ -780,35 +776,7 @@ def collect_browser_metrics(page, edge_mb_fn=None) -> dict:
 NO_COMMIT_REASON = "browser response finished without LOCAL_LOOP commit"
 
 
-def _protocol_bootstrap_trigger(base_trigger: str, job_id: str, seq: int, worker_id: str) -> str:
-    """Escalation message used only after a normal RUN produced a response without a commit.
-
-    Normal operation stays on the tiny one-line RUN protocol. This second-chance message makes
-    a missing/out-of-date Copilot Studio instruction visible and self-healing without echoing the
-    actual task text into chat: claim_turn remains the only task/instruction authority.
-    """
-    return (
-        base_trigger
-        + "\nLOCAL_LOOP protocol bootstrap: this is a control message, not the task. "
-          "Do not infer the task from chat history. "
-          f'Call claim_turn(job_id="{job_id}", expected_seq={int(seq)}, worker_id="{worker_id}"). '
-          "If claim_turn returns ok=false, stop and return only its error. "
-          "Execute only the returned instruction under the returned constraints. Preserve "
-          "lease_id and fencing_token exactly; call heartbeat during long work. Before replying, "
-          "call exactly one of commit_turn or abort_turn. For apparent completion use "
-          "commit_turn status=CANDIDATE_DONE, never DONE. For CONTINUE provide a concrete "
-          "next_instruction unless the returned job has a fixed turn_plan. Then reply with one "
-          "short receipt containing job_id, seq and status."
-    )
-
-
-def _missing_protocol_wait_reason(attempts: int) -> str:
-    return (
-        "LOCAL_LOOP agent instructions appear missing or stale: browser answered "
-        f"without commit after {int(attempts)} protocol bootstrap attempt(s). "
-        "Update/publish docs/examples/local_loop_agent_instructions.txt in the "
-        "Copilot Studio agent instructions, reconnect MCP, then resume."
-    )
+NO_COMMIT_REASON = "browser response finished without LOCAL_LOOP commit"
 
 
 class LocalLoopController:
@@ -822,7 +790,6 @@ class LocalLoopController:
                  dom_node_limit: int = 0,
                  edge_mb_limit: float = 0,
                  no_commit_idle_seconds: float = 8,
-                 max_protocol_bootstrap_attempts: int = 2,
                  rotate_driver=None, consent_probe=None, metrics_probe=None,
                  acceptance_runner=run_acceptance_checks,
                  sleep_fn=time.sleep, monotonic_fn=time.monotonic):
@@ -839,7 +806,6 @@ class LocalLoopController:
         self.dom_node_limit = max(0, int(dom_node_limit))
         self.edge_mb_limit = max(0.0, float(edge_mb_limit))
         self.no_commit_idle_seconds = max(1.0, float(no_commit_idle_seconds))
-        self.max_protocol_bootstrap_attempts = max(0, int(max_protocol_bootstrap_attempts))
         self.rotate_driver = rotate_driver
         self.consent_probe = consent_probe
         self.metrics_probe = metrics_probe or (lambda drv: {})
@@ -1106,17 +1072,6 @@ class LocalLoopController:
             if bool(constraints.get("read_only")):
                 trigger += " mode=read-only"
 
-            bootstrap_required = str(status.get("verification_detail") or "") == NO_COMMIT_REASON
-            bootstrap_sent = self.store.event_count(
-                self.job_id, "PROTOCOL_BOOTSTRAP_SENT", seq=seq,
-            )
-            if bootstrap_required:
-                if bootstrap_sent >= self.max_protocol_bootstrap_attempts:
-                    reason = _missing_protocol_wait_reason(bootstrap_sent)
-                    self.store.mark_waiting_runtime(self.job_id, reason)
-                    self._project()
-                    return "WAITING_RUNTIME"
-                trigger = _protocol_bootstrap_trigger(trigger, self.job_id, seq, self.worker_id)
             response_count_before = self._response_block_count()
             # Commit the attempt BEFORE touching the browser. If the process dies during send,
             # the next controller still sees that this attempt consumed budget.
@@ -1139,11 +1094,6 @@ class LocalLoopController:
                     self._project()
                     return "WAITING_RUNTIME"
                 continue
-            if bootstrap_required:
-                self.store.record_event(self.job_id, "PROTOCOL_BOOTSTRAP_SENT", {
-                    "seq": seq, "worker_id": self.worker_id,
-                    "attempt": bootstrap_sent + 1,
-                }, seq)
             self.store.record_event(self.job_id, "UI_TRIGGER_SENT", {
                 "seq": seq, "worker_id": self.worker_id,
             }, seq)
@@ -1151,27 +1101,22 @@ class LocalLoopController:
 
             commit = self._wait_for_commit(seq, retry_count_before, response_count_before)
             if commit is not None and commit.get("status") == "NO_COMMIT_AFTER_RESPONSE":
-                reason = NO_COMMIT_REASON
-                self.store.retry_uncommitted_turn(self.job_id, seq, reason)
-                bootstrap_attempt_used = bootstrap_sent + (1 if bootstrap_required else 0)
-                exhausted = (
-                    (bootstrap_required and
-                     bootstrap_attempt_used >= self.max_protocol_bootstrap_attempts)
-                    or (not bootstrap_required and self.max_protocol_bootstrap_attempts == 0)
+                # A correctly configured Copilot Studio agent claims/commits the SQLite turn.
+                # If it instead produces a normal chat answer, its persistent LOCAL_LOOP Agent
+                # Instructions are missing/stale. Do NOT try to teach the protocol in-band: real
+                # E2E showed a misconfigured agent can route that control text into ordinary
+                # Fleet tools, creating recursive/duplicate work. Fence the uncommitted lease and
+                # fail closed after exactly one browser response.
+                self.store.retry_uncommitted_turn(self.job_id, seq, NO_COMMIT_REASON)
+                reason = (
+                    "LOCAL_LOOP Agent Instructions are missing or stale: the browser answered "
+                    "RUN without a SQLite commit. Update/publish "
+                    "docs/examples/local_loop_agent_instructions.txt in the Copilot Studio "
+                    "agent instructions, reconnect MCP, then resume. No retry was sent."
                 )
-                if exhausted:
-                    self.store.mark_waiting_runtime(
-                        self.job_id, _missing_protocol_wait_reason(bootstrap_attempt_used),
-                    )
-                    self._project()
-                    return "WAITING_RUNTIME"
-                if not self._rotate("response finished without commit"):
-                    self.store.mark_waiting_runtime(
-                        self.job_id, reason + "; no replacement conversation",
-                    )
-                    self._project()
-                    return "WAITING_RUNTIME"
-                continue
+                self.store.mark_waiting_runtime(self.job_id, reason)
+                self._project()
+                return "WAITING_RUNTIME"
             if commit is None:
                 current_status = self.store.get_job_status(self.job_id)["status"]
                 if current_status == "CANCELLED":
@@ -1276,8 +1221,6 @@ def main(argv=None):
     ap.add_argument("--js-heap-limit-mb", type=float, default=0)
     ap.add_argument("--dom-node-limit", type=int, default=0)
     ap.add_argument("--edge-mb-limit", type=float, default=0)
-    ap.add_argument("--max-protocol-bootstrap-attempts", type=int, default=2,
-                    help="bounded self-healing retries when the agent answers RUN without committing LOCAL_LOOP")
     args = ap.parse_args(argv)
     if not _execution_profiles_enabled():
         ap.error("durable LOCAL_LOOP requires MCP_EXECUTION_PROFILES=1; enable it and restart the MCP server")
@@ -1378,7 +1321,6 @@ def main(argv=None):
                 js_heap_limit_mb=args.js_heap_limit_mb,
                 dom_node_limit=args.dom_node_limit,
                 edge_mb_limit=args.edge_mb_limit,
-                max_protocol_bootstrap_attempts=args.max_protocol_bootstrap_attempts,
                 rotate_driver=rotate,
                 consent_probe=probe_browser_interaction,
                 metrics_probe=lambda drv: collect_browser_metrics(drv.page, companion_edge_mb),
