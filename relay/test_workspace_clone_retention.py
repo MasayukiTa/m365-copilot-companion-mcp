@@ -26,6 +26,7 @@ Idioms mirrored from test_a_fleet_start_does_not_walk_a_workspace.py: `_touch`, 
 """
 import io
 import os
+import stat
 import shutil
 import sys
 import threading
@@ -460,3 +461,50 @@ def test_a_call_after_the_throttle_window_launches_again(tmp_path):
     assert launched == [True]
     handles[-1].join(timeout=10)
     assert not os.path.exists(clone2)
+
+
+def test_leftover_cleanup_retries_windows_readonly_files(tmp_path, monkeypatch):
+    """Git pack/index files are commonly read-only on Windows. One PermissionError must
+    clear the read-only bit and retry the failed unlink instead of wedging `.deleting-*` forever.
+    """
+    root = tmp_path / "swe" / "work" / ".deleting-readonly-123"
+    root.mkdir(parents=True)
+    victim = root / "pack.idx"
+    victim.write_bytes(b"x")
+
+    calls = []
+    real_chmod = R.os.chmod
+
+    def fake_unlink(path):
+        # onerror is invoked AFTER shutil's first unlink already failed; this call is the retry.
+        calls.append(("unlink", str(path)))
+        os.unlink(path)
+
+    def recording_chmod(path, mode):
+        calls.append(("chmod", str(path), mode))
+        return real_chmod(path, mode)
+
+    monkeypatch.setattr(R.os, "chmod", recording_chmod)
+    err = (PermissionError, PermissionError(13, "read-only", str(victim)), None)
+    R._rmtree_onerror(fake_unlink, str(victim), err)
+
+    assert any(c[0] == "chmod" for c in calls)
+    assert len([c for c in calls if c[0] == "unlink"]) == 1
+    assert not victim.exists()
+
+
+def test_real_readonly_git_style_file_does_not_wedge_leftover_on_windows(tmp_path):
+    if os.name != "nt":
+        pytest.skip("Windows read-only file semantics are the production failure being fixed")
+    now = time.time()
+    work_root = tmp_path / "swe" / "work"
+    leftover = work_root / ".deleting-git-pack-123"
+    victim = leftover / ".git" / "objects" / "pack" / "pack-a.idx"
+    victim.parent.mkdir(parents=True)
+    victim.write_bytes(b"pack")
+    os.chmod(victim, stat.S_IREAD)
+
+    freed, removed = R._clone_sweep_run_once(str(tmp_path), 14, _not_in_use, now)
+
+    assert not leftover.exists()
+    assert ".deleting-git-pack-123" in removed
