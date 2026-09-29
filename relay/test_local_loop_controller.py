@@ -40,7 +40,8 @@ class CommitOnSendDriver:
     def send(self, text, track_answer=True):
         assert track_answer is False
         self.sent.append(text)
-        parts = dict(part.split("=", 1) for part in text.split()[2:])
+        first = text.splitlines()[0]
+        parts = dict(part.split("=", 1) for part in first.split()[2:])
         seq = int(parts["seq"])
         worker = parts["worker"]
         claim = self.store.claim_turn("job_1", seq, worker)
@@ -97,7 +98,8 @@ class RetryAbortThenCommitDriver(CommitOnSendDriver):
     def send(self, text, track_answer=True):
         assert track_answer is False
         self.sent.append(text)
-        parts = dict(part.split("=", 1) for part in text.split()[2:])
+        first = text.splitlines()[0]
+        parts = dict(part.split("=", 1) for part in first.split()[2:])
         seq = int(parts["seq"])
         worker = parts["worker"]
         claim = self.store.claim_turn("job_1", seq, worker)
@@ -299,6 +301,100 @@ def test_finished_response_without_commit_rotates_immediately_and_retries(tmp_pa
     assert any(event["event"] == "TURN_FINISHED_WITHOUT_COMMIT"
                for event in status["events"])
 
+
+
+class BootstrapCommitDriver(FinishedWithoutCommitDriver):
+    """First browser answer ignores LOCAL_LOOP; bootstrap retry follows the protocol."""
+    def send(self, text, track_answer=True):
+        assert track_answer is False
+        self.sent.append(text)
+        first = text.splitlines()[0]
+        parts = dict(part.split("=", 1) for part in first.split()[2:])
+        seq = int(parts["seq"])
+        worker = parts["worker"]
+        claim = self.store.claim_turn("job_1", seq, worker)
+        self.responses += 1
+        if "LOCAL_LOOP protocol bootstrap:" in text:
+            self.store.commit_turn(
+                "job_1", seq, claim["lease_id"], claim["fencing_token"],
+                status="CANDIDATE_DONE", summary="bootstrap worked",
+            )
+
+
+class AlwaysNoCommitDriver(FinishedWithoutCommitDriver):
+    def send(self, text, track_answer=True):
+        assert track_answer is False
+        self.sent.append(text)
+        first = text.splitlines()[0]
+        parts = dict(part.split("=", 1) for part in first.split()[2:])
+        self.store.claim_turn("job_1", int(parts["seq"]), parts["worker"])
+        self.responses += 1
+
+
+def test_no_commit_retry_escalates_to_protocol_bootstrap(tmp_path):
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    store.create_job(_job())
+    first = FinishedWithoutCommitDriver(store)
+    second = BootstrapCommitDriver(store)
+    rotations = []
+    controller = LocalLoopController(
+        store, "job_1", first, rotate_after_turns=0, poll_seconds=.005,
+        no_commit_idle_seconds=.01,
+        rotate_driver=lambda old, reason: rotations.append(reason) or second,
+        acceptance_runner=lambda current: (True, "verified"),
+    )
+
+    assert controller.run() == "DONE"
+    assert len(first.sent) == 1 and len(second.sent) == 1
+    assert first.sent[0].startswith("RUN job_1 seq=1 worker=local_")
+    assert "LOCAL_LOOP protocol bootstrap:" not in first.sent[0]
+    retry = second.sent[0]
+    assert retry.startswith("RUN job_1 seq=1 worker=local_")
+    assert "LOCAL_LOOP protocol bootstrap:" in retry
+    assert "claim_turn" in retry and "commit_turn" in retry and "abort_turn" in retry
+    assert "Do not infer the task from chat history" in retry
+    status = store.get_job_status("job_1", event_limit=50)
+    assert any(e["event"] == "PROTOCOL_BOOTSTRAP_SENT" for e in status["events"])
+
+
+def test_missing_agent_protocol_stops_after_bounded_bootstrap_retries(tmp_path):
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    store.create_job(_job(max_turns=100))
+    drivers = [AlwaysNoCommitDriver(store) for _ in range(4)]
+    rotations = []
+    index = {"n": 0}
+
+    def rotate(old, reason):
+        rotations.append(reason)
+        index["n"] += 1
+        return drivers[index["n"]]
+
+    controller = LocalLoopController(
+        store, "job_1", drivers[0], rotate_after_turns=0, poll_seconds=.005,
+        no_commit_idle_seconds=.01, max_protocol_bootstrap_attempts=2,
+        rotate_driver=rotate,
+    )
+
+    assert controller.run() == "WAITING_RUNTIME"
+    sent = [msg for drv in drivers for msg in drv.sent]
+    assert len(sent) == 3  # one short RUN + two protocol bootstraps
+    assert "LOCAL_LOOP protocol bootstrap:" not in sent[0]
+    assert all("LOCAL_LOOP protocol bootstrap:" in msg for msg in sent[1:])
+    status = store.get_job_status("job_1", event_limit=80)
+    assert status["status"] == "WAITING_RUNTIME"
+    assert "agent instructions" in status["verification_detail"].lower()
+    assert sum(e["event"] == "PROTOCOL_BOOTSTRAP_SENT" for e in status["events"]) == 2
+
+
+def test_protocol_bootstrap_count_is_durable_per_sequence(tmp_path):
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    store.create_job(_job())
+    store.record_event("job_1", "PROTOCOL_BOOTSTRAP_SENT", {"seq": 1}, 1)
+    store.record_event("job_1", "PROTOCOL_BOOTSTRAP_SENT", {"seq": 1}, 1)
+    store.record_event("job_1", "PROTOCOL_BOOTSTRAP_SENT", {"seq": 2}, 2)
+    assert store.event_count("job_1", "PROTOCOL_BOOTSTRAP_SENT", seq=1) == 2
+    assert store.event_count("job_1", "PROTOCOL_BOOTSTRAP_SENT", seq=2) == 1
+    assert store.event_count("job_1", "PROTOCOL_BOOTSTRAP_SENT") == 3
 
 def test_send_failure_rotates_instead_of_terminating_controller(tmp_path):
     store = LocalJobStore(tmp_path / "jobs.sqlite3")

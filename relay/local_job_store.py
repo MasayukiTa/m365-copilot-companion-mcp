@@ -844,6 +844,27 @@ class LocalJobStore:
             conn.close()
 
 
+    def event_count(self, job_id: str, event_type: str, seq: int | None = None) -> int:
+        """Durably count one event type, optionally scoped to a logical sequence."""
+        job_id = self._validate_job_id(job_id)
+        event_type = _bounded_text(event_type, 128, "event_type")
+        conn = self._connect()
+        try:
+            if seq is None:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM events WHERE job_id=? AND event_type=?",
+                    (job_id, event_type),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM events WHERE job_id=? AND event_type=? AND seq=?",
+                    (job_id, event_type, int(seq)),
+                ).fetchone()
+            return int(row[0] if row else 0)
+        finally:
+            conn.close()
+
+
     def mark_waiting_runtime(self, job_id: str, reason: str,
                              now: float | None = None) -> dict:
         job_id = self._validate_job_id(job_id)
