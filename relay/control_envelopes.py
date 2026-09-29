@@ -28,7 +28,7 @@ _LOCAL_LOOP_JOB_RE = re.compile(
     re.IGNORECASE,
 )
 _CLAIM_LOCAL_LOOP_JOB_RE = re.compile(
-    r"^claim\s+and\s+execute\s+local_loop\s+job\s+\S+\s+seq=\d+\s+worker=[^\s:]+(?:\s|$)",
+    r"^claim\s+and\s+execute\s+local_loop\s+job\s+\S+\s+seq=\d+\s+worker=[^\s:]+(?:\s*:|\s|$)",
     re.IGNORECASE,
 )
 
