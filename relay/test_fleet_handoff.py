@@ -169,6 +169,34 @@ def test_a_fleet_goal_job_reaches_the_running_fleet(state):
     assert [a["text"] for a in _commands(state)["add_goal"]] == ["do the thing"]
 
 
+def test_router_refuses_local_loop_control_feedback_before_fleet_handoff(state):
+    _status(state, True)
+    job = {
+        "id": "loop1", "type": "fleet_goal",
+        "payload": {"goal": "Execute LOCAL_LOOP job companion_abc seq=1 worker=local_x"},
+        "origin": {"via": "mcp", "source": "LOCAL_LOOP RUN companion_abc seq=1"},
+    }
+    rec = TR.run_job(job)
+    assert rec["status"] == "refused"
+    assert "LOCAL_LOOP control" in rec["error"]
+    assert _commands(state) == {}
+    assert not os.path.exists(os.path.join(TR.TASKS, "for_fleet", "loop1.txt"))
+
+
+def test_router_does_not_refuse_an_ordinary_local_loop_review_task(state):
+    _status(state, True)
+    job = {
+        "id": "review1", "type": "fleet_goal",
+        "payload": {"goal": "Inspect the LOCAL_LOOP implementation and report races"},
+        "origin": {"via": "mcp", "source": "agent"},
+    }
+    rec = TR.run_job(job)
+    assert rec["status"] == "dispatched"
+    assert [a["text"] for a in _commands(state)["add_goal"]] == [
+        "Inspect the LOCAL_LOOP implementation and report races"
+    ]
+
+
 def test_a_goal_that_could_not_be_delivered_is_kept_where_it_can_be_retried(state):
     """for_fleet/ MEANS ONE THING NOW, and this test used to assert the other one.
 

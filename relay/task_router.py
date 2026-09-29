@@ -117,6 +117,31 @@ DESTINATION = {
 }
 DEFAULT_DESTINATION = "claude"
 
+
+def is_local_loop_control_submission(goal, source="") -> bool:
+    """True when an MCP/Fleet payload is a LOCAL_LOOP control envelope, not user work.
+
+    A misconfigured Copilot Studio agent was measured routing ``RUN <job> ...`` control text
+    back through ``fleet_submit``. That recursively created ordinary Fleet work from a durable
+    runtime trigger. Provenance is the strongest signal; the goal prefixes are a second guard
+    for callers that dropped/rewrote ``source``. Ordinary tasks *about* LOCAL_LOOP are allowed.
+    """
+    norm_source = " ".join(str(source or "").split()).casefold()
+    norm_goal = " ".join(str(goal or "").split()).casefold()
+    if norm_source.startswith((
+        "local_loop run ",
+        "local_loop bootstrap ",
+        "local_loop protocol ",
+    )):
+        return True
+    return norm_goal.startswith((
+        "local_loop run ",
+        "local_loop bootstrap ",
+        "local_loop protocol ",
+        "execute local_loop job ",
+    ))
+
+
 # A job may force its destination with payload {"escalate": true} -> CLAUDE, regardless of type.
 LOCAL_TIMEOUT_S = int(os.environ.get("TASK_LOCAL_TIMEOUT_S", "120"))
 
@@ -2195,6 +2220,19 @@ def run_job(job, now_ts=None):
                     rec["result"] = {"gate_token": token, "class_key": key}
                     rec["error"] = reason
         elif dest == "fleet":
+            payload = job.get("payload") or {}
+            goal = payload.get("goal") or payload.get("text", "")
+            source = ((job.get("origin") or {}).get("source")
+                      if isinstance(job.get("origin"), dict) else "")
+            if is_local_loop_control_submission(goal, source):
+                rec["status"] = "refused"
+                rec["error"] = (
+                    "LOCAL_LOOP control envelope is not executable Fleet work; repair the "
+                    "Copilot Studio LOCAL_LOOP Agent Instructions instead of routing RUN/control "
+                    "messages into fleet_submit"
+                )
+                rec["result"] = {"refused": True, "reason": "LOCAL_LOOP control feedback"}
+                return rec
             # A HANDOFF NOBODY COLLECTED. This branch wrote for_fleet/<id>.txt, marked the job
             # "dispatched" and stopped -- and no file in relay/, bridge/, tools/, ui/ or
             # scripts/ ever read that directory. Every fleet-bound job this router has ever
@@ -2210,8 +2248,6 @@ def run_job(job, now_ts=None):
             # that was delivered leaves no file, because its done/ record already says
             # "dispatched" and names how; a goal that was not leaves one, and every drain pass
             # tries the waiting ones again while a fleet is live.
-            payload = job.get("payload") or {}
-            goal = payload.get("goal") or payload.get("text", "")
             prio = bool(payload.get("priority"))
             rec["status"], rec["result"] = fleet_handoff(goal, jid, priority=prio)
             if rec["status"] != "dispatched":
