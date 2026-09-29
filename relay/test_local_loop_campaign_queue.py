@@ -156,6 +156,80 @@ def test_terminal_campaign_is_archived_so_supervisor_does_not_drain_forever(tmp_
     assert data['entries'][0]['job_id'] == job_id
 
 
+
+def test_terminal_job_marker_is_reaped_and_campaign_closes(tmp_path):
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    result = ll._enqueue_campaign_goals(store, tmp_path, ["finish then leave stale marker"], now=1)
+    job_id = result["job_ids"][0]
+    ll._write_controller_marker(tmp_path, job_id, ["--job-id", job_id], pid=777, started=1)
+    store.cancel_job(job_id, "done", now=2)
+
+    drained = ll._drain_campaign(store, tmp_path, _args(tmp_path), now=3, launcher=lambda argv: 999)
+    assert drained["closed"] is True
+    assert ll._read_controller_marker(tmp_path, job_id) is None
+    assert not (tmp_path / ll.LOCAL_LOOP_CAMPAIGN_MANIFEST).exists()
+
+
+def test_waiting_runtime_clears_stale_marker_and_blocks_campaign_children(tmp_path):
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    root = ll._job_from_goal("runtime-broken root", job_id="root_wait")
+    store.create_job(root, now=1)
+    ll._write_controller_marker(tmp_path, "root_wait", ["--job-id", "root_wait"], pid=777, started=1)
+    ll._write_atomic(tmp_path / ll.LOCAL_LOOP_CAMPAIGN_MANIFEST, {
+        "version": 1, "started": 1, "updated": 1,
+        "entries": [{"job_id": "root_wait", "joined_at": 1}],
+    })
+    store.mark_waiting_runtime("root_wait", "repair agent instructions", now=2, scope="campaign")
+    queued = ll._enqueue_campaign_goals(store, tmp_path, ["child must wait too"], now=3)
+    child = queued["job_ids"][0]
+    calls = []
+
+    drained = ll._drain_campaign(
+        store, tmp_path, _args(tmp_path), now=4,
+        launcher=lambda argv: calls.append(list(argv)) or 999,
+    )
+    assert drained["closed"] is False
+    assert drained["launched"] == []
+    assert calls == []
+    assert ll._read_controller_marker(tmp_path, "root_wait") is None
+    assert store.get_job_status("root_wait")["status"] == "WAITING_RUNTIME"
+    assert store.get_job_status(child)["status"] == "READY"
+
+
+
+def test_job_scoped_waiting_runtime_does_not_block_ready_sibling(tmp_path):
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    root = ll._job_from_goal("one browser is unhealthy", job_id="root_local_wait")
+    store.create_job(root, now=1)
+    store.mark_waiting_runtime("root_local_wait", "replacement conversation unavailable", now=2)
+    ll._write_atomic(tmp_path / ll.LOCAL_LOOP_CAMPAIGN_MANIFEST, {
+        "version": 1, "started": 1, "updated": 1,
+        "entries": [{"job_id": "root_local_wait", "joined_at": 1}],
+    })
+    queued = ll._enqueue_campaign_goals(store, tmp_path, ["healthy sibling may run"], now=3)
+    child = queued["job_ids"][0]
+    calls = []
+
+    drained = ll._drain_campaign(
+        store, tmp_path, _args(tmp_path), now=4,
+        launcher=lambda argv: calls.append(list(argv)) or 999,
+    )
+    assert drained["runtime_blocked"] is False
+    assert drained["launched"] == [child]
+    assert len(calls) == 1
+    assert store.get_job_status("root_local_wait")["status"] == "WAITING_RUNTIME"
+
+
+def test_old_waiting_runtime_event_without_scope_defaults_to_job_local(tmp_path):
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    store.create_job(ll._job_from_goal("legacy wait", job_id="legacy_wait"), now=1)
+    # Simulate an event created before runtime scope existed.
+    with store._transaction() as conn:
+        conn.execute("UPDATE jobs SET status='WAITING_RUNTIME',updated_at=? WHERE job_id=?", (2, "legacy_wait"))
+        store._event(conn, "legacy_wait", 1, "WAITING_RUNTIME", {"reason": "legacy"}, 2)
+    status = store.get_job_status("legacy_wait", event_limit=50)
+    assert ll._runtime_wait_scope(status) == "job"
+
 def test_marker_owned_manifest_entry_keeps_campaign_active_even_if_store_row_is_missing(tmp_path):
     store = LocalJobStore(tmp_path / 'jobs.sqlite3')
     ll._write_atomic(tmp_path / ll.LOCAL_LOOP_CAMPAIGN_MANIFEST, {

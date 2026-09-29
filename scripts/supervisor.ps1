@@ -1907,8 +1907,8 @@ Write-Log "supervisor up (tunnel=$TunnelName port=$Port interval=${IntervalSecon
 # Checked once, here, before the forever health-check loop starts.
 Invoke-FleetAutoResume -DryRun:$FleetResumeDryRun | Out-Null
 Invoke-ReviewAutoResume | Out-Null
-Invoke-LocalLoopAutoResume | Out-Null
 Invoke-LocalLoopCampaignDrain | Out-Null
+Invoke-LocalLoopAutoResume | Out-Null
 
 # THE DEBOUNCE IS FOR A SERVER THAT MIGHT COME BACK, NOT FOR ONE THAT WAS NEVER STARTED.
 # Starting at zero meant the FIRST launch waited out four consecutive failures. MEASURED on
@@ -2084,8 +2084,8 @@ while ($true) {
     foreach ($n in $shownToPass) { [void]$script:ExpressSeen.Add($n) }
 
     Invoke-ReviewAutoResume | Out-Null
-    Invoke-LocalLoopAutoResume | Out-Null
     Invoke-LocalLoopCampaignDrain | Out-Null
+    Invoke-LocalLoopAutoResume | Out-Null
 
     # Report any tracked fleet/review/LOCAL_LOOP auto-resume runner that has exited since the last tick.
     # Every tick, not just after a relaunch, because the runner that needs reporting may still
