@@ -383,10 +383,10 @@ This is the only manual step. Go to `https://copilotstudio.microsoft.com` and fo
    then save. This remains the normal/fast path for SQLite-backed LOCAL_LOOP and the Deep Review
    commands; it is activated only by the explicit `RUN <job_id> ...` protocol and does not replace
    normal chat rules. If the agent answers a `RUN` without making the required SQLite commit, the
-   local controller now retries in a fresh conversation with a bounded inline protocol bootstrap
-   (default: 2 attempts). If those attempts also produce no commit, the job stops in
-   `WAITING_RUNTIME` with an actionable instruction to update/publish these Agent Instructions; it
-   does not keep resending the task indefinitely.
+   local controller fails closed after that one response: it fences the uncommitted turn and stops
+   in `WAITING_RUNTIME` with an actionable instruction to update/publish these Agent Instructions.
+   It deliberately does not teach/retry the protocol in-band, because a misconfigured agent can
+   route control text into ordinary tools and create duplicate work.
 8. Click **"Publish"** → set visibility to **"Just me" only**. Never select organization-wide.
 
 Once registered, open the agent's chat and paste the URL from the browser's address bar into the STEP 6 dialog.
