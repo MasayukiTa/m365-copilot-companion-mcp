@@ -652,3 +652,26 @@ Focused follow-up suite:
 - local job store: **25 passed**
 
 The warnings observed were the repository's live-state canaries detecting writes from the concurrently running production supervisor/Fleet on this machine; they were explicitly non-failing and not attributed to the test code.
+
+
+# 2026-09-29 follow-up resolution 2
+
+## S-NOTE-1 — resolved by direct mutex coverage
+
+The audit note was partly stale by the time of follow-up: `scripts/test_supervisor_port_owner.py` already exercised the parent-command-line ownership rule with a real venv launcher/base-interpreter pair and directly asserted that foreign holders are neither killed nor treated as ours.
+
+The remaining gap was the supervisor Global Mutex `createdNew` loser branch. A Windows regression now extracts the production guard block itself, holds a unique named mutex, and verifies that a second acquisition takes the `createdNew=False` branch, writes the existing-supervisor log message, and returns before the sentinel. The same extracted guard is then run with a fresh name and must continue. This closes the only uncaptured subpart of S-NOTE-1 without changing supervisor runtime behavior.
+
+## R5-NOTE-2 — resolved by explicit latest-session lineage coverage
+
+Startup candidate selection is now factored through `startup_resume_candidate()`, which returns exactly `SessionStore.latest_session()`. A fake-store regression exposes a tempting `latest_attached()` method that raises if touched, proving startup does not search backward for a merely resumable older row. A second store-level regression persists an older attached session plus a newer unattached session and verifies that `latest_session()` returns the newer unattached row. A source contract pins the startup path to the tested helper. The authoritative behavior remains unchanged: `should_autoresume()` starts fresh when the newest row has no conversation instead of reopening an older one.
+
+## CI-ISSUE-1 — resolved
+
+The stale `.github/workflows/ci.yml` comment now says `nine files`, matching `scripts/check_ci_test_manifest.py` and the live manifest audit (`9 explicit exception(s)`). No CI execution logic changed.
+
+## Remaining observations / accepted limits
+
+- R5-NOTE-1 remains an environment-level observation: Playwright DOM submission behavior is not fully reproducible in the hermetic Linux suite. Existing logic is covered by pure/seam tests and live use, but this is not claimed as a browser-E2E proof.
+- SEC-ISSUE-1 remains intentionally documented: XFF/IP identity is still caller-supplied in this deployment, while the default-on unlock token requirement prevents IP-only authorization in current operation. No claim is made that the IP oracle itself is fixed.
+- S7-ISSUE-1 remains an architectural boundary: a same-user process with arbitrary code execution is outside what same-user file/tool gates can cryptographically exclude. The repository continues to describe this as narrowing/defence-in-depth, not closure.

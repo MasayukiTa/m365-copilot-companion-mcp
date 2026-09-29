@@ -821,7 +821,7 @@ jobs:
 
       # THE EXCLUSIONS, RUN WHERE THEY ARE EXCLUDED. REPORTING, NOT GATING.
       #
-      # scripts/check_ci_test_manifest.py keeps eleven files out of the hermetic suite, each
+      # scripts/check_ci_test_manifest.py keeps nine files out of the hermetic suite, each
       # with a written reason, and its own comment says four of the eight added in one batch
       # are "test-side portability defects -- meant to be fixed and returned; parked here, not
       # solved". Nobody has been able to tell which, because the reasons are about LINUX and
