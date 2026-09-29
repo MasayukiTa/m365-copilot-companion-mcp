@@ -118,30 +118,6 @@ DESTINATION = {
 DEFAULT_DESTINATION = "claude"
 
 
-def is_local_loop_control_submission(goal, source="") -> bool:
-    """True when an MCP/Fleet payload is a LOCAL_LOOP control envelope, not user work.
-
-    A misconfigured Copilot Studio agent was measured routing ``RUN <job> ...`` control text
-    back through ``fleet_submit``. That recursively created ordinary Fleet work from a durable
-    runtime trigger. Provenance is the strongest signal; the goal prefixes are a second guard
-    for callers that dropped/rewrote ``source``. Ordinary tasks *about* LOCAL_LOOP are allowed.
-    """
-    norm_source = " ".join(str(source or "").split()).casefold()
-    norm_goal = " ".join(str(goal or "").split()).casefold()
-    if norm_source.startswith((
-        "local_loop run ",
-        "local_loop bootstrap ",
-        "local_loop protocol ",
-    )):
-        return True
-    return norm_goal.startswith((
-        "local_loop run ",
-        "local_loop bootstrap ",
-        "local_loop protocol ",
-        "execute local_loop job ",
-    ))
-
-
 # A job may force its destination with payload {"escalate": true} -> CLAUDE, regardless of type.
 LOCAL_TIMEOUT_S = int(os.environ.get("TASK_LOCAL_TIMEOUT_S", "120"))
 
@@ -170,6 +146,8 @@ if TASK_JOB_APPROVAL_MODE not in ("default", "auto", "bypass"):
 # launched (`python relay/task_router.py` puts relay/ on sys.path[0], not REPO).
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
+
+from relay.control_envelopes import is_local_loop_control_submission
 
 from tools import childproc
 
