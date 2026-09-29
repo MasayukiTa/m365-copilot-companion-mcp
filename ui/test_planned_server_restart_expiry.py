@@ -1,7 +1,8 @@
-﻿from pathlib import Path
+from pathlib import Path
 
-SUP = Path('scripts/supervisor.ps1').read_text(encoding='utf-8-sig', errors='replace')
-UI = Path('ui/FleetCockpit.cs').read_text(encoding='utf-8-sig', errors='replace')
+ROOT = Path(__file__).resolve().parents[1]
+SUP = (ROOT / 'scripts' / 'supervisor.ps1').read_text(encoding='utf-8-sig', errors='replace')
+UI = (ROOT / 'ui' / 'FleetCockpit.cs').read_text(encoding='utf-8-sig', errors='replace')
 
 
 def test_supervisor_transition_expiry_matches_its_own_restart_budget():
