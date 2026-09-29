@@ -291,6 +291,45 @@ static class Theme
         }
     }
 
+
+    // Timeline/history vocabulary is intentionally distinct from status-chip vocabulary.
+    // A state chip answers "what is it now?" (Waiting / Starting / Needs attention); a timeline
+    // row records "what happened?" (Queued / Started / Stuck). Never reuse StatusLabel here:
+    // the 2026-09-29 color repair accidentally changed operator-facing history copy that way.
+    public static string TimelineLabel(string canonical, int lang)
+    {
+        bool jp = lang == 0;
+        string key = StatusKey(canonical);
+        switch (key)
+        {
+            case "pending":     return jp ? "投入"           : "Queued";
+            case "ready":       return jp ? "開始"           : "Started";
+            case "waiting":     return jp ? "実行中"         : "Running";
+            case "researching": return jp ? "調査中"         : "Researching";
+            case "refuting":    return jp ? "レビュー中"     : "Reviewing";
+            case "verifying":   return jp ? "検証中"         : "Verifying";
+            case "waiting_runtime": return jp ? "実行環境待ち" : "Runtime paused";
+            case "awaiting":    return jp ? "承認待ち"       : "Needs input";
+            case "awaiting_gate": return jp ? "承認待ち"     : "Needs approval";
+            case "done":        return jp ? "完了"           : "Completed";
+            case "stuck":       return jp ? "停滞"           : "Stuck";
+            case "maxturns":    return jp ? "ターン上限"     : "Max turns reached";
+            case "error":       return jp ? "エラー"         : "Error";
+            case "cancelled":   return jp ? "停止"           : "Cancelled";
+            case "freed":       return jp ? "解放"           : "Released";
+            case "job_created": return jp ? "ジョブ作成"     : "Job created";
+            case "job_cancelled": return jp ? "ジョブ停止"   : "Job cancelled";
+            case "ui_trigger_attempt": return jp ? "UI起動試行" : "UI trigger attempt";
+            case "ui_trigger_sent": return jp ? "UI起動送信"  : "UI trigger sent";
+            case "protocol_bootstrap_sent": return jp ? "プロトコル開始指示送信" : "Protocol bootstrap sent";
+            case "turn_finished_without_commit": return jp ? "コミットなしでターン終了" : "Turn finished without commit";
+            case "turn_controller_retry": return jp ? "コントローラ再試行" : "Controller retry";
+            case "conversation_rotated": return jp ? "会話を切替" : "Conversation rotated";
+            case "browser_metrics": return jp ? "ブラウザ計測" : "Browser metrics";
+            default: return canonical == null ? "" : canonical;
+        }
+    }
+
     // Color interpolation helper (shared by callers that still want a soft tint somewhere).
     public static Color Mix(Color a, Color b, double t)
     {

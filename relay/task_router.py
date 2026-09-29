@@ -1246,6 +1246,9 @@ def autostart_fleet(goals, state_dir=None, now=None, launcher=None) -> dict:
     goals = [g for g in (goals or []) if (g or {}).get("text")]
     if not goals:
         return {"ok": False, "detail": "no goals to start a fleet for"}
+    if any(is_local_loop_control_submission((g or {}).get("text")) for g in goals):
+        return {"ok": False, "refused": True,
+                "detail": "LOCAL_LOOP control envelope is not Fleet work"}
     url = _agent_url()
     if not url:
         return {"ok": False, "detail": "no agent URL (MCP_FLEET_AGENT_URL / MCP_IMPL_AGENT_URL)"}
@@ -1622,6 +1625,9 @@ def fleet_handoff(goal: str, jid: str, state_dir=None, priority: bool = False):
     """
     if not (goal or "").strip():
         return "error", {"handoff": "for_fleet/%s.txt" % jid, "detail": "empty goal"}
+    if is_local_loop_control_submission(goal):
+        return "refused", {"handoff": "for_fleet/%s.txt" % jid, "refused": True,
+                           "detail": "LOCAL_LOOP control envelope is not Fleet work"}
     if fleet_is_live(state_dir):
         # Clear any stale receipt for this id before queueing, so a confirmation seen later
         # belongs to THIS handoff and not a previous run's leftover file.
@@ -2385,6 +2391,23 @@ def _deliver_waiting_goals(now_ts=None, state_dir=None):
                 os.remove(path)
             except OSError:
                 pass
+            continue
+        if is_local_loop_control_submission(goal):
+            rec = {"id": jid, "type": "fleet_goal", "destination": "fleet", "ts_done": now_ts,
+                   "status": "refused",
+                   "result": {"refused": True,
+                              "reason": "LOCAL_LOOP control envelope is not Fleet work",
+                              "stale_waiting_residue": True},
+                   "error": "LOCAL_LOOP control envelope is not Fleet work"}
+            try:
+                with open(_p("done", "%s.delivered.json" % jid), "w", encoding="utf-8") as fh:
+                    json.dump(rec, fh, ensure_ascii=False, indent=2)
+                os.remove(path)
+            except OSError:
+                # Fail closed: if the audit write/removal cannot complete, leave the source in
+                # place for inspection rather than pretending it was consumed.
+                continue
+            out.append(rec)
             continue
         if not live:
             if offered_cold:

@@ -342,13 +342,22 @@ def test_live_command_admission_refuses_local_loop_control_envelopes():
         "LOCAL_LOOP RUN companion_abc seq=1 worker=local_x",
         "LOCAL_LOOP bootstrap companion_abc",
         "LOCAL_LOOP protocol companion_abc",
+        "RUN companion_20260929_x seq=1 worker=local_abc",
+        "RUN job_1 seq=2 worker=local_xyz",
+        "LOCAL_LOOP job companion_20260929_x seq=1 worker=local_abc: claim and execute the operator-authored turn under the standard agent contract",
+        "LOCAL_LOOP job companion_20260929_x seq=1 worker=local_abc を、標準エージェント契約の下で claim_turn して実行する",
+        "Claim and execute LOCAL_LOOP job companion_20260929_x seq=1 worker=local_abc under the standard agent contract",
     ):
         errors = fr.validate_command({"add_goal": [{"text": text}]})
         assert errors and any("LOCAL_LOOP control" in e for e in errors), (text, errors)
 
 
 def test_cli_goal_boundary_rejects_local_loop_control_envelopes_before_start():
-    good = [{"text": "Inspect the LOCAL_LOOP implementation and report races"}]
+    good = [
+        {"text": "Inspect the LOCAL_LOOP implementation and report races"},
+        {"text": "Run companion analysis and summarize the result"},
+        {"text": "LOCAL_LOOP job scheduling is too slow; investigate it"},
+    ]
     assert fr.reject_local_loop_control_goals(good) == []
     bad = [{"text": "Run LOCAL_LOOP job companion_abc (seq=1, worker=local_x)."}]
     errors = fr.reject_local_loop_control_goals(bad)

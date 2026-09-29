@@ -5033,12 +5033,12 @@ class CockpitWindow : Window
                         object peLabelRaw;
                         if (pe.TryGetValue("label", out peLabelRaw) && peLabelRaw != null)
                             peFallbackLabel = peLabelRaw.ToString();
-                        // Localized label via Theme.StatusLabel; fall back to stored English label
-                        string localLabel = Theme.StatusLabel(peEvent, _lang);
+                        // Localized timeline-event label; fall back to stored label for unknown events
+                        string localLabel = Theme.TimelineLabel(peEvent, _lang);
                         if (string.IsNullOrEmpty(localLabel) || localLabel == peEvent)
                         {
-                            // Theme.StatusLabel returns the key itself when unrecognized; use stored fallback
-                            string knownKey = Theme.StatusLabel(peEvent, _lang);
+                            // TimelineLabel returns the key itself when unrecognized; use stored fallback
+                            string knownKey = Theme.TimelineLabel(peEvent, _lang);
                             localLabel = (knownKey == peEvent && !string.IsNullOrEmpty(peFallbackLabel))
                                 ? peFallbackLabel : knownKey;
                         }
@@ -14274,8 +14274,8 @@ class CockpitWindow : Window
                         object peEvRaw;
                         if (pe.TryGetValue("event", out peEvRaw) && peEvRaw != null)
                             peEvent = peEvRaw.ToString();
-                        // Use same label vocab as the Spine (Theme.StatusLabel)
-                        string localLabel = Theme.StatusLabel(peEvent, _lang);
+                        // Use the same event-history vocabulary as the Spine (Theme.TimelineLabel)
+                        string localLabel = Theme.TimelineLabel(peEvent, _lang);
                         if (string.IsNullOrEmpty(localLabel) || localLabel == peEvent)
                         {
                             object peLblRaw;
