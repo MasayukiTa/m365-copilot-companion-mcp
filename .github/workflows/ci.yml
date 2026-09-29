@@ -238,6 +238,7 @@ jobs:
             ui/test_stale_submitted_tasks_are_observable.py \
             ui/test_goal_summary_display.py \
             ui/test_fleet_status_colors_preserved.py \
+            ui/test_timeline_semantics_localized.py \
             ui/test_live_add_survives_runner_shutdown.py \
             ui/test_live_composer_adds_tasks.py \
             ui/test_one_list_says_what_the_ui_compiles.py \
