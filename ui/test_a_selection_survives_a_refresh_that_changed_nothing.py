@@ -117,11 +117,13 @@ def test_the_signature_is_taken_from_what_is_displayed():
 
 
 def test_the_transcript_is_read_once():
-    """The guard needs the transcript before it can decide, and the render needs it after. Two
-    reads would put a second disk hit on a path that runs whenever the fleet writes."""
+    """The guard needs the persisted conversation before it can decide, and the render reuses
+    that same result. Conversation lineage may span multiple jsonl files, but the refresh must
+    resolve that lineage exactly once rather than doing a second disk pass."""
     body = _code_only(_method("void RefreshFleetSnapshot()"))
-    assert body.count("ReadTranscript(") == 1, (
-        "the transcript is read %d times per refresh" % body.count("ReadTranscript("))
+    assert body.count("ReadTranscriptLineage(") == 1, (
+        "the transcript lineage is read %d times per refresh"
+        % body.count("ReadTranscriptLineage("))
 
 
 # ── and the controls were never the problem ───────────────────────────────────────────────
