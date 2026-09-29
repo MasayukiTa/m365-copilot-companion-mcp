@@ -70,13 +70,13 @@ def test_open_from_fleet_resolves_a_goal_from_the_live_worker_or_the_transcript(
     worker dict first (survives a finished worker whose slot has not been reused), the
     transcript's own first-line "goal" as the fallback (survives a restarted fleet). The
     priority itself is FleetConvIdentity.ResolveGoal's job (see
-    ui/test_a_fleet_conversation_identity_merge_runs.py) -- this only checks the call site
+    ui/test_a_fleet_interrupt_survives_a_supervisor_restart.py) -- this only checks the call site
     passes it the right two values."""
     code = _code()
     body = _block(code, "void OpenFromFleet(string url, string worker, string transcriptHint)", 6500)
     assert 'string liveGoal = wkr != null ? SS(wkr, "goal") : ""' in body
-    assert "TranscriptMetaGoal(transcriptPath)" in body
-    assert "FleetConvIdentity.ResolveGoal(liveGoal, TranscriptMetaGoal(transcriptPath))" in body
+    assert "TranscriptMetaGoal(goalTranscriptPath)" in body
+    assert "FleetConvIdentity.ResolveGoal(liveGoal, TranscriptMetaGoal(goalTranscriptPath))" in body
     assert "bestGoal" in body
 
 
@@ -88,10 +88,10 @@ def test_open_from_fleet_copies_goal_and_transcript_onto_the_conversation():
     FleetConvIdentity.MergeForward's job -- checked at runtime, not here."""
     code = _code()
     body = _block(code, "void OpenFromFleet(string url, string worker, string transcriptHint)", 6500)
-    assert "c.Transcript = FleetConvIdentity.MergeForward(c.Transcript, transcriptPath)" in body, (
-        "the transcript path is computed and never stored on c -- LiveWorkerFor "
-        "(ChatSend.cs) requires c.Transcript non-empty and will always answer "
-        '"" (no live worker), so a mid-run interrupt cannot be steered')
+    assert "c.Transcripts = FleetConvIdentity.MergeTranscriptLineage" in body
+    assert "c.Transcript = FleetConvIdentity.LatestTranscript" in body, (
+        "the latest transcript identity is never stored on c -- LiveWorkerFor "
+        "(ChatSend.cs) requires c.Transcript non-empty and will not find a live worker")
     assert "c.Goal = FleetConvIdentity.MergeForward(c.Goal, bestGoal)" in body, (
         "the resolved goal is never stored on c -- DecideFleetSend (ChatSend.cs) refuses "
         "fleet_no_goal whenever c.Goal is empty, regardless of whether a real goal was "
@@ -133,7 +133,7 @@ def test_sync_registry_reads_the_goal_field():
 
 def test_sync_registry_sets_goal_on_a_freshly_discovered_row():
     code = _code()
-    body = _block(code, "void SyncRegistry()")
+    body = _block(code, "void SyncRegistry()", 7000)
     assert "c.Goal = regGoal" in body
 
 
@@ -145,9 +145,10 @@ def test_sync_registry_backfills_goal_via_the_extracted_merge_rule():
     FleetConvIdentity.MergeBackfillOnly implements (checked at runtime, not here -- this only
     checks the call site routes through it rather than re-inlining the guard)."""
     code = _code()
-    body = _block(code, "void SyncRegistry()")
+    body = _block(code, "void SyncRegistry()", 7000)
     assert "existingC.Goal = FleetConvIdentity.MergeBackfillOnly(existingC.Goal, regGoal)" in body
-    assert "existingC.Transcript = FleetConvIdentity.MergeBackfillOnly(existingC.Transcript, transcript)" in body
+    assert "existingC.Transcripts = FleetConvIdentity.MergeTranscriptLineage" in body
+    assert "existingC.Transcript = FleetConvIdentity.LatestTranscript" in body
 
 
 def test_the_running_binary_carries_this_change():
@@ -168,3 +169,46 @@ def test_the_running_binary_carries_this_change():
     needle2 = "FleetConvIdentity".encode("utf-8")
     assert needle2 in blob, (
         "CopilotChat.exe predates the FleetConvIdentity extraction -- rebuild it")
+
+
+def test_sync_registry_reads_and_merges_transcript_lineage():
+    code = _code()
+    body = _block(code, "void SyncRegistry()", 7000)
+    assert 'var regLineage = RegistryTranscriptLineage(d)' in body
+    assert 'existingC.Transcripts = FleetConvIdentity.MergeTranscriptLineage' in body
+    assert 'FleetConvIdentity.LatestTranscript' in body
+    assert 'regSource == c.Source && regName == c.Name' in body, (
+        "URL-less socket rows must use the same (source,name) identity as the Python registry merge")
+
+
+def test_sidebar_open_reads_all_segments_but_live_follow_keeps_latest_pointer():
+    code = _code()
+    open_body = _block(code, "void OpenConversation(Conversation c)", 3200)
+    assert 'ReadTranscriptLineage(c.Transcripts)' in open_body
+    assert 'c.Transcript = FleetConvIdentity.LatestTranscript' in open_body
+    assert 'MaybeFollowConversation(c, c.Transcript)' in open_body
+
+
+def test_open_from_fleet_preserves_exact_history_click_index_but_normal_open_uses_lineage():
+    code = _code()
+    body = _block(code, "void OpenFromFleet(string url, string worker, string transcriptHint)", 9000)
+    assert 'var transcriptLineage = RegistryTranscriptLineageFor(url, worker, liveTranscriptPath)' in body
+    assert 'bool exactTranscriptView = !string.IsNullOrEmpty(transcriptHint)' in body
+    assert 'string displayTranscriptPath = exactTranscriptView ? transcriptHint : identityTranscriptPath' in body
+    assert 'ReadTranscriptLineage(transcriptLineage)' in body
+    assert 'c.Transcripts = FleetConvIdentity.MergeTranscriptLineage' in body
+    assert 'FleetConvIdentity.MergeForward(c.Transcript, identityTranscriptPath)' in body
+    assert 'MaybeFollowConversation(c, identityTranscriptPath)' in body
+
+
+def test_live_refresh_rebuilds_from_full_lineage_not_only_latest_segment():
+    code = _code()
+    body = _block(code, "void RefreshFleetSnapshot()", 2600)
+    assert '_conv.Transcripts = FleetConvIdentity.MergeTranscriptLineage' in body
+    assert 'ReadTranscriptLineage(_conv.Transcripts)' in body
+
+
+def test_disk_discovery_seeds_lineage_for_legacy_rows():
+    code = _code()
+    body = _block(code, "void DiscoverTranscripts()", 5200)
+    assert 'discovered.Transcripts.Add(f)' in body

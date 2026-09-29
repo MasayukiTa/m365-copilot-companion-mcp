@@ -125,6 +125,8 @@ class _Tee:
         return getattr(self._real, name)
 
 
+from relay.conversation_lineage import merge_transcript_chains, with_transcript_lineage
+
 def _setup_coordinator_log(state_dir):
     """TEE sys.stdout/sys.stderr to a timestamped log under state_dir so a future
     incident (crash, reboot, kill) leaves a record of the coordinator's own output,
@@ -256,6 +258,9 @@ def merge_conv_rows(existing, entries, now=None):
         if hit is not None:
             row = rows[hit]
             fresh = {}
+            _chain = merge_transcript_chains(row, entry)
+            if _chain and row.get("transcripts") != _chain:
+                fresh["transcripts"] = _chain
             if tr and row.get("transcript") != tr:
                 fresh["transcript"] = tr
             nm = entry.get("name") or ""
@@ -278,7 +283,7 @@ def merge_conv_rows(existing, entries, now=None):
                     by_url[u] = hit
                 changed = True
             continue
-        row = dict(entry)
+        row = with_transcript_lineage(entry)
         row.setdefault("ts", time.time() if now is None else now)
         rows.append(row)
         if u:

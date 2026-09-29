@@ -75,11 +75,12 @@ SUBTASKS_READY"""
 
 def test_a_numbered_preamble_is_not_counted_as_subtasks():
     steps = fo.subtasks_from(TWO_LISTS)
-    assert len(steps) == 7, (
-        "前置きの番号付きリストがサブタスクに混ざっている（%d件）-- 上限を超えて分割が"
-        "丸ごと捨てられる" % len(steps))
+    # Six independent investigations remain parallel children. The seventh numbered item is an
+    # explicit merge of their intermediate files, so the dependent-subtask gate removes it and
+    # the fleet's aggregation_goal() owns that phase after the children finish.
+    assert len(steps) == 6, steps
     assert "ci.yml" in steps[0]
-    assert steps[-1].startswith("統合")
+    assert not any("統合" in step or "サブタスク1" in step for step in steps), steps
 
 
 def test_the_preamble_items_are_gone_not_merely_trimmed():
