@@ -76,3 +76,27 @@ def test_initial_durable_start_keeps_input_until_status_accepts_the_job():
 def test_durable_start_pending_blocks_duplicate_launch_clicks():
     start = SOURCE[SOURCE.index("void StartFleet()"):SOURCE.index("bool ActiveRunIsLocalLoop()") ]
     assert 'if (_durableStartPending)' in start
+
+
+def test_waiting_runtime_has_a_dedicated_same_job_resume_action():
+    assert 'bool isLocalRuntimeWait' in SOURCE
+    assert 'runtime_resume_allowed' in SOURCE
+    assert 'ResumeLocalLoopRuntime(' in SOURCE
+    assert 'ResumeLocalLoopRuntime(runtimeWaitWorker)' in SOURCE
+    method = SOURCE[SOURCE.index('bool ResumeLocalLoopRuntime('):]
+    method = method[:method.index('\n    void ', 20) if '\n    void ' in method[20:] else len(method)]
+    assert '-m relay.local_loop_controller' in method
+    assert '--job-id' in method
+    assert '--resume-runtime' in method
+    assert '--state-dir' in method
+    assert '--db' in method
+    assert 'S(w, "local_job_db")' in method
+    assert 'psi.CreateNoWindow = true;' in method
+    assert 'RetryGoal' not in method
+
+
+def test_waiting_runtime_status_has_a_human_label():
+    theme = Path(__file__).with_name('Theme.cs').read_text(encoding='utf-8-sig')
+    assert '{ "waiting_runtime", "warning" }' in theme
+    assert 'case "waiting_runtime"' in theme
+    assert 'Runtime paused' in theme
