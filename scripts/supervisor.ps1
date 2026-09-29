@@ -183,10 +183,17 @@ function Write-ServerTransition([string]$Reason) {
         if ([string]::IsNullOrWhiteSpace($Reason)) { return }
         if (-not (Test-Path $FleetDir)) { New-Item -ItemType Directory -Path $FleetDir -Force | Out-Null }
         $tmp = $ServerTransitionPath + ".tmp." + $PID
+        $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        # Keep the UI's planned-restart state aligned with THIS supervisor's actual policy:
+        # main.py may spend StartupGraceSeconds alive-but-not-listening, then ordinary failure
+        # debounce still consumes FailuresBeforeAction * IntervalSeconds before another action.
+        $transitionBudgetSeconds = $StartupGraceSeconds + ($FailuresBeforeAction * $IntervalSeconds)
+        if ($transitionBudgetSeconds -lt 1) { $transitionBudgetSeconds = 1 }
         $body = [ordered]@{
             state = "planned_restart"
             reason = $Reason
-            started = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+            started = $now
+            expires = $now + $transitionBudgetSeconds
             supervisor_pid = $PID
         } | ConvertTo-Json -Compress
         [IO.File]::WriteAllText($tmp, $body, (New-Object Text.UTF8Encoding($false)))

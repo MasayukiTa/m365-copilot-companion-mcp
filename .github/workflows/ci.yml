@@ -115,6 +115,7 @@ jobs:
             tools/test_a_tool_that_returns_its_failure_still_failed.py \
             ui/test_a_green_dot_must_have_established_the_thing.py \
             ui/test_planned_server_restart_signal.py \
+            ui/test_planned_server_restart_expiry.py \
             tools/test_a_new_way_to_say_failed_must_be_classified.py \
             relay/test_a_worker_that_wrote_about_limits_was_thrown_away.py \
             relay/test_a_control_that_does_nothing_is_worse_than_none.py \
