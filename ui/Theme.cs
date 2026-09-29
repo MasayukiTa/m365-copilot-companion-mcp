@@ -237,16 +237,17 @@ static class Theme
         return Muted(dark); // neutral
     }
 
-    // Timeline has four operator meanings: ordinary event = normal text, active work = blue,
-    // attention / runtime wait / error = orange, completed = green.  Do not flatten neutral
-    // timeline rows to secondary gray just because general status chips use a muted neutral.
+    // Timeline has four operator meanings: ordinary/administrative event = secondary graphite,
+    // active work = blue, attention/runtime wait/error = orange, completed = green.  The ordinary
+    // row is deliberately NOT body-text black: the timeline is metadata, and near-black labels
+    // visually outweighed the semantic blue/orange/green events in the light theme.
     public static string TimelineColor(string canonical, bool dark)
     {
         string kind = StatusKind(canonical);
         if (kind == "success") return Success(dark);
         if (kind == "warning" || kind == "danger") return Warning(dark);
         if (kind == "info") return Info(dark);
-        return Text(dark);
+        return Secondary(dark);
     }
 
     public static string StatusColor(string canonical, bool dark)
