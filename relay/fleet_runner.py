@@ -2499,6 +2499,17 @@ def _validate_command(cmd, state_dir):
         if mixed:
             errs.append("add_goal cannot be combined with control key(s): %s" % mixed[:8])
 
+    # MESSAGE-BEARING CONTROLS ARE THEIR OWN RETRY UNIT. If a command steers a worker and a
+    # later effect in the same claimed file fails, restoring the claim would send the steer a
+    # second time. Settings/close/pause/stop are locally idempotent; user turns and unlock turns
+    # are not. Keep each of these isolated (landing ack is metadata, not an effect).
+    for isolated in ("steer", "reunlock"):
+        if isolated in cmd:
+            mixed = sorted(k for k in cmd if k not in (isolated, "ack"))
+            if mixed:
+                errs.append("%s cannot be combined with other control key(s): %s"
+                            % (isolated, mixed[:8]))
+
     def _items(key, v):
         items = v if isinstance(v, list) else [v]
         if len(items) > MAX_ITEMS:
@@ -3848,7 +3859,11 @@ def main():
                 if not commit_command_claim(args.state_dir, claim, applied=False, rejected_errors=errs):
                     _pending_command_commits.append((claim, False, errs))
                     return
-            else:                    # application failed before a durable effect; retry next sweep
+            else:
+                # Application raised before the claim could commit. add_goal is ledger-idempotent;
+                # steer/reunlock are schema-isolated retry units; remaining controls are local
+                # idempotent assignments/cancellation. Restoring is therefore safe under the
+                # admitted command contract rather than an unqualified "no effect happened" claim.
                 restore_command_claim(claim)
                 return
 

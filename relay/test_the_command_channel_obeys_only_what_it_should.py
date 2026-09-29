@@ -339,3 +339,42 @@ def test_add_goal_cannot_share_one_command_with_live_control_effects(tmp_path):
         cmd = {'add_goal': [{'text': 'new goal'}], **c}
         errs = FR.validate_command(cmd, str(tmp_path))
         assert errs and any('add_goal' in e and 'control' in e for e in errs), (cmd, errs)
+
+def test_steer_and_reunlock_are_isolated_retry_units(tmp_path):
+    """A restored claim must never replay an already-delivered message/unlock turn.
+
+    add_goal already has this isolation because its durable ledger and external/control effects
+    cannot be one retry unit. steer/reunlock need the same rule: unlike settings/close/pause/stop,
+    sending a turn is not harmless to apply twice. ack is metadata and may accompany either.
+    """
+    other_controls = {
+        "close": ["w0"],
+        "set_maxtabs": 2,
+        "set_disk_floor_gb": 1,
+        "set_ram_floor_mb": 1,
+        "set_autoscale": {"on": 1},
+        "pause": True,
+        "stop": True,
+    }
+    steer = {"steer": [{"worker": "w0", "text": "redirect"}]}
+    reunlock = {"reunlock": "w0"}
+
+    for base_name, base in (("steer", steer), ("reunlock", reunlock)):
+        for key, value in other_controls.items():
+            cmd = dict(base)
+            cmd[key] = value
+            errs = FR.validate_command(cmd, str(tmp_path))
+            assert errs and any(base_name in e and "cannot be combined" in e for e in errs), (cmd, errs)
+
+    mixed = {**steer, **reunlock}
+    errs = FR.validate_command(mixed, str(tmp_path))
+    assert errs and any("cannot be combined" in e for e in errs), errs
+
+
+def test_steer_and_reunlock_may_carry_only_ack_metadata(tmp_path):
+    acks = tmp_path / "acks"
+    acks.mkdir()
+    ack1 = str(acks / "steer.ack")
+    ack2 = str(acks / "reunlock.ack")
+    assert FR.validate_command({"steer": {"worker": "w0", "text": "x"}, "ack": ack1}, str(tmp_path)) == []
+    assert FR.validate_command({"reunlock": "w0", "ack": ack2}, str(tmp_path)) == []
