@@ -102,7 +102,7 @@ def test_the_auto_retry_note_sits_with_its_own_fields():
 
 # ── 実行タイムライン ────────────────────────────────────────────────────────
 
-def test_the_timeline_follows_the_worker_being_inspected():
+def test_content_details_follow_the_worker_being_inspected():
     """タイムラインは workers[0] だけを描いていた。
 
     5ゴールの走行で w0 が 17:50 に完了した後、実行中の w1 を開いても、左の
@@ -119,9 +119,9 @@ def test_the_timeline_follows_the_worker_being_inspected():
     assert "return workers[0]" in body, "何も展開されていないときの既定が無い"
 
 
-def test_changing_the_selection_repaints_the_timeline():
+def test_changing_the_selection_repaints_content_details():
     """署名に載せなければ、選択を変えても『変化なし』と判断されて描き直されない。"""
     i = SRC.index("string spineSig = ")
     sig = SRC[max(0, i - 700):i + 400]
     assert "SpineFocusWorker(spineWorkers)" in sig, "署名が workers[0] を見ている"
-    assert 'S(primaryW, "name")' in sig, "署名にワーカー名が入っていない"
+    assert 'SpineDetailSignature(primaryW)' in sig, "内容詳細の再描画署名が選択ワーカーを追っていない"
