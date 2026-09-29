@@ -69,9 +69,26 @@ def test_no_retry_site_still_selects_on_not_done():
         "「DONE 以外は再試行」の判定が %d 箇所残っている" % len(bad))
 
 
+def _method(src, start, end):
+    i = src.index(start)
+    return src[i:src.index(end, i)]
+
+
 def test_every_retry_site_goes_through_the_shared_predicate():
-    """3経路とも同じ述語を通ること。増えた経路が独自判定を持たないように。"""
+    """All retry surfaces select workers through one worker-level predicate."""
     src = _cs()
-    code = re.sub(r"//[^\n]*", "", src)
-    assert code.count("IsRetryableOutcome(") >= 4, (
-        "共有述語の呼び出しが足りない(定義1 + 3経路を期待) -- どこかが独自判定に戻っている")
+    helper = _method(src, "static bool IsRetryableWorker(", "static bool IsInfraStuck(")
+    assert 'IsRetryableOutcome(S(w, "outcome"))' in helper
+
+    auto = _method(src, "void AutoRetryScan(", "Dictionary<string, object> ReadStatus(")
+    assert "IsRetryableWorker(w)" in auto
+
+    toolbar = _method(src, "UIElement BuildCardToolbar(", "Button _autoRetryBtn")
+    assert "IsRetryableWorker(rw)" in toolbar
+
+    card = _method(src, "Border Card(Dictionary<string, object> w)", "UIElement BuildCardTabs(")
+    assert "else if (IsRetryableWorker(w)) col.Children.Add(RetryRow(w));" in card
+    assert 'S(w, "outcome") != "DONE"' not in card
+
+    bulk = _method(src, "int RetryAllShown(", "static readonly string[] _retryableOutcomes")
+    assert "IsRetryableWorker(w)" in bulk

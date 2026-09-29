@@ -12615,7 +12615,7 @@ class CockpitWindow : Window
         foreach (Dictionary<string, object> rw in shown)
         {
             if (!IsTerminalWorker(rw)) continue;
-            if (!IsRetryableOutcome(S(rw, "outcome"))) continue;
+            if (!IsRetryableWorker(rw)) continue;
             retryTargets++;
         }
         if (retryTargets > 0)
@@ -13801,7 +13801,7 @@ class CockpitWindow : Window
             col.Children.Add(BuildCardTabs(w, name, goal, last, reason, terminal));
             // Actions live BELOW the tabs (not inside one) so steer/retry are always reachable.
             if (!terminal) col.Children.Add(SteerRow(name));
-            else if (S(w, "outcome") != "DONE") col.Children.Add(RetryRow(w));
+            else if (IsRetryableWorker(w)) col.Children.Add(RetryRow(w));
             else col.Children.Add(ContinueRow(name, goal, S(w, "conv_url")));
         }
 
