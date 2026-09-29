@@ -13616,7 +13616,13 @@ class CockpitWindow : Window
                     string currentStep = S(execution, "current_step");
                     int currentIndex = I(execution, "current_step_index");
                     int totalSteps = I(execution, "total_steps");
-                    if (!string.IsNullOrEmpty(currentStep))
+                    // Open-ended LOCAL_LOOP has no turn_plan, so current_step is initially the
+                    // authoritative goal itself. The headline already shows its compact task
+                    // identity; repeating the full (often English, multi-kilobyte) goal here makes
+                    // the collapsed card look like progress when it is only the original request.
+                    bool currentStepRepeatsGoal = string.Equals(
+                        (currentStep ?? "").Trim(), (goal ?? "").Trim(), StringComparison.Ordinal);
+                    if (!string.IsNullOrEmpty(currentStep) && !currentStepRepeatsGoal)
                     {
                         string stepPrefix = totalSteps > 0
                             ? (currentIndex + "/" + totalSteps + "  ")
