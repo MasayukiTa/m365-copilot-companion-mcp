@@ -13191,6 +13191,13 @@ class CockpitWindow : Window
         return status == "stuck" || status == "maxturns" || status == "error";
     }
 
+    static bool IsAgentSetupRuntimeWait(string reason)
+    {
+        if (string.IsNullOrWhiteSpace(reason)) return false;
+        return reason.IndexOf("Agent Instructions are missing or stale", StringComparison.OrdinalIgnoreCase) >= 0
+            && reason.IndexOf("browser answered RUN without a SQLite commit", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
     static bool IsLocalLoopControlGoal(string goal)
     {
         string norm = (goal ?? "").Replace("\r", " ").Replace("\n", " ").Replace("\t", " ").Trim().ToLowerInvariant();
@@ -13301,6 +13308,7 @@ class CockpitWindow : Window
             && status == "waiting_runtime"
             && string.Equals(S(w, "execution_profile"), "LOCAL_LOOP", StringComparison.OrdinalIgnoreCase)
             && string.Equals(S(w, "runtime_resume_allowed"), "True", StringComparison.OrdinalIgnoreCase);
+        bool isAgentSetupWait = isLocalRuntimeWait && IsAgentSetupRuntimeWait(reason);
         // Attention lane: stuck/maxturns/error and NOT yet expanded -- gets recovery surface treatment.
         // INFRA_STUCK is carved out of the red attention lane (handled by its own infra branch).
         bool isAttention = !closed && IsOperatorAttention(w);
@@ -13435,7 +13443,8 @@ class CockpitWindow : Window
         // INFRA_STUCK -> distinct ORANGE インフラ待ち pill; otherwise the normal status label.
         var chip = Pill(internalControl
             ? (_lang == 0 ? "内部制御" : "Internal control")
-            : (isInfra ? T("infra_wait") : Theme.StatusLabel(status, _lang)), chipKind);
+            : (isAgentSetupWait ? (_lang == 0 ? "エージェント設定待ち" : "Agent setup required")
+                : (isInfra ? T("infra_wait") : Theme.StatusLabel(status, _lang))), chipKind);
         chip.Margin = new Thickness(2, 0, 5, 0);
         DockPanel.SetDock(chip, Dock.Left); left.Children.Add(chip);
         // AGENT BADGE (P0 feature 4): which agent this conversation is bound to. Green subtle badge
@@ -13462,7 +13471,8 @@ class CockpitWindow : Window
                 {
                     var runtimeReason = new TextBlock
                     {
-                        Text = (_lang == 0 ? "実行環境待ち: " : "Runtime paused: ") + OneLine(reason),
+                        Text = (isAgentSetupWait ? (_lang == 0 ? "エージェント設定待ち: " : "Agent setup required: ")
+                            : (_lang == 0 ? "実行環境待ち: " : "Runtime paused: ")) + OneLine(reason),
                         Foreground = Muted, FontSize = 12.5,
                         TextTrimming = TextTrimming.CharacterEllipsis,
                         TextWrapping = TextWrapping.NoWrap,

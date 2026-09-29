@@ -152,3 +152,22 @@ def test_collapsed_card_does_not_repeat_the_full_goal_as_current_step():
     detail = _method(SOURCE, "UIElement ExecutionOverview(Dictionary<string, object> w)", "UIElement TabOverview(")
     assert 'string current = S(execution, "current_step");' in detail
     assert 'head += " · " + current' in detail or 'head += " �E " + current' in detail
+
+
+def test_stale_agent_instructions_get_a_specific_wait_label():
+    card = _method(SOURCE, "Border Card(Dictionary<string, object> w)", "UIElement BuildCardTabs(")
+    assert 'bool isAgentSetupWait = isLocalRuntimeWait && IsAgentSetupRuntimeWait(reason);' in card
+    assert '"エージェント設定待ち"' in card
+    assert '"Agent setup required"' in card
+    assert 'isAgentSetupWait ?' in card
+    # Generic WAITING_RUNTIME still exists for actual runtime/connector recovery cases.
+    assert 'Theme.StatusLabel(status, _lang)' in card
+    assert '"実行環境待ち: "' in card
+    assert '"Runtime paused: "' in card
+
+
+def test_agent_setup_wait_classifier_is_narrow_and_evidence_based():
+    helper = _method(SOURCE, "static bool IsAgentSetupRuntimeWait(", "static bool IsLocalLoopControlGoal(")
+    assert 'Agent Instructions are missing or stale' in helper
+    assert 'browser answered RUN without a SQLite commit' in helper
+    assert 'StringComparison.OrdinalIgnoreCase' in helper
