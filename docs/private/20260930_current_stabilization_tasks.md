@@ -52,9 +52,26 @@ Acceptance:
 - full underlying events/history remain available where required for evidence/debugging.
 
 ### STAB-003 -- foreground PowerShell / cmd window when CopilotAgent opens or work is submitted
-Status: REOPENED
+Status: PATCH VALIDATED LOCALLY / LIVE RE-VERIFY PENDING
 
 User reports a PowerShell or Command Prompt window still comes to the foreground, likely around CopilotAgent opening/submission.
+
+2026-09-30 live/static evidence so far:
+- C2C `execute_command` itself is **not** the direct culprit: its Windows spawn uses `windowsHide: true` in `src/system/full-access.ts`.
+- FleetCockpit `RunPowershellScript` / reconnect / repair launchers use `UseShellExecute=false` + `CreateNoWindow=true`.
+- `relay.edge_auth` and `relay.edge_recover` PowerShell launches use `childproc.headless_creationflags()`.
+- a live GUI submission moved the worker `pending -> waiting` while a 12-second sample detected no persistent visible PowerShell/cmd/Windows Terminal window; this does not exclude a short flash or a different caller path.
+- Windows PowerShell engine logs show **8 real `powershell.exe ... -File scripts\win\submit_via_ui.ps1` starts between 07:07 and 07:20**, immediately before the user's regression report.
+- tracked automation callers still nest a fresh `powershell.exe` merely to invoke `submit_via_ui.ps1` (`run_bestofn.ps1`, `run_effort_ab.ps1`, `run_swe_via_ui.ps1`, `swe_supervisor.ps1`). A console-less/unattended parent must not create that redundant child shell.
+- `McBrainLaneScaler` is a stale visible-form scheduled task but has no trigger, last ran 2026-07-04, and references a now-missing script; it is not the current 9/30 popup source.
+
+Stabilization patch applied locally: the four tracked automation callers now invoke `submit_via_ui.ps1` **in-process** (`& <script>`) rather than spawning a nested PowerShell. `run_swe_via_ui.ps1` now maps in-process success/throw explicitly instead of relying on native-child `$LASTEXITCODE`; `swe_supervisor.ps1` maps a failed ReadOnly probe to `$false`. Human terminal examples remain separate.
+
+Validation:
+- four modified PowerShell scripts: parser errors **0/4**;
+- GUI submitter + roundtrip + existing no-console-launch ratchet: **14 passed**;
+- new regression catches all four pre-fix nested launch sites and is registered in blocking CI;
+- still requires a live post-patch observation before this item can be called CLOSED.
 
 Existing fixes do not close this item:
 - `73bf387` added repository windowless policy to several unattended PowerShell/fleet launches;
@@ -112,7 +129,7 @@ Acceptance:
 - marker path/expiry/ownership are visible in evidence.
 
 ### STAB-007 -- finish current resend-policy work without losing the branch state
-Status: VALIDATED / COMMITTED
+Status: VALIDATED / COMMITTED / PUSHED (`cca3295`)
 
 The current `transport_policy.py` / `test_resend_checkable.py` change is retained as an atomic repair. It prevents explicit negative-imperative constraints in READ-ONLY prompts from falsely marking the goal as an external action while preserving fail-closed behavior for real, conditional, contrast, exception and negation-inverter actions.
 
@@ -135,7 +152,7 @@ The old 2026-09-28 handoff saying "main CI is red" is stale. PR #66 head `16c8c2
 - PowerShell lint: success
 - Workflow lint: success
 
-For the current follow-up branch, re-check all relevant GitHub runs after each atomic push. A green historical main does not make the present branch green.
+For the current follow-up branch, re-check all relevant GitHub runs after each atomic push. A green historical main does not make the present branch green.`r`n`r`n2026-09-30 after push `cca3295`: CI, Windows build, Install path, CodeQL, Secret scan, PowerShell lint and Workflow lint all started and were **in progress** at the first check. Current `main` head `b235e01` shows all seven corresponding workflows **success**; the older `1183e6f` CI failure is superseded.
 
 ## P1 -- follow-up after P0 stability
 
@@ -166,4 +183,5 @@ These do not outrank the live P0 regressions above unless they become direct blo
 ## Update log
 
 - 2026-09-30: ledger created after user identified task-tracking drift. Reopened `内容詳細`, foreground-console, long-wait, submission-visibility and health-signal items; recorded current uncommitted resend-policy work and corrected stale main-CI status.
-- 2026-09-30: STAB-007 resend-policy repair validated: 36 focused tests green; broader related set 88 passed / 2 skipped; committed atomically with this ledger. Pre-commit identity guard caught a repository-specific label in this private ledger; it was replaced with a generic placeholder rather than bypassing the guard.
+- 2026-09-30: STAB-007 resend-policy repair validated: 36 focused tests green; broader related set 88 passed / 2 skipped; committed atomically and pushed as `cca3295`. Pre-commit identity guard caught a repository-specific label in this private ledger; it was replaced with a generic placeholder rather than bypassing the guard.
+- 2026-09-30: STAB-003 foreground-console investigation ruled out C2C/Cockpit/Edge headless launchers, found eight recent nested `submit_via_ui.ps1` PowerShell starts and four tracked automation callers that created a redundant child shell. Those callers were converted to in-process invocation; parser 0/4 and 14 related tests green. Live re-verification remains pending.

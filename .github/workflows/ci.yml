@@ -159,6 +159,7 @@ jobs:
             scripts/test_the_identity_guard_speaks_before_the_push.py \
             scripts/test_run_script_style_tests.py \
             scripts/test_submit_via_ui_roundtrip.py \
+            scripts/test_gui_submitter_has_no_nested_console.py \
             tests/test_scroll_transcript.py \
             tests/test_golden.py \
             tests/test_listing_counts.py \
