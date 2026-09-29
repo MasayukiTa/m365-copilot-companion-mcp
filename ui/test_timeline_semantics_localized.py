@@ -57,7 +57,7 @@ def test_timeline_status_lookup_normalizes_protocol_event_case():
 def test_spine_uses_timeline_colour_and_localized_labels():
     i = COCKPIT.index('UIElement BuildSpineContent(')
     b = COCKPIT[i:COCKPIT.index('\n    //', i + 14000)]
-    assert 'Theme.StatusLabel(peEvent, _lang)' in b
+    assert 'Theme.TimelineLabel(peEvent, _lang)' in b
     assert 'Theme.TimelineColor(peEvent, _dark)' in b
     assert 'sectionLbl.Text = ja ? "実行タイムライン" : "Execution timeline";' in b
     assert 'ja ? "(フェーズ遷移)" : "(phase transitions)"' in b
@@ -117,3 +117,26 @@ def test_legacy_status_copy_survives_new_protocol_vocabulary():
     assert 'case "awaiting":    return jp ? "承認待ち"' in THEME
     assert 'case "error":       return jp ? "停止(エラー)"' in THEME
     assert 'case "freed":       return jp ? "解放済"' in THEME
+
+
+def test_real_mode_uses_event_history_vocabulary_not_status_chip_copy():
+    assert 'public static string TimelineLabel(string canonical, int lang)' in THEME
+    expected = {
+        'pending': ('投入', 'Queued'),
+        'ready': ('開始', 'Started'),
+        'waiting': ('実行中', 'Running'),
+        'done': ('完了', 'Completed'),
+        'stuck': ('停滞', 'Stuck'),
+        'maxturns': ('ターン上限', 'Max turns reached'),
+        'error': ('エラー', 'Error'),
+        'cancelled': ('停止', 'Cancelled'),
+    }
+    t = THEME[THEME.index('public static string TimelineLabel('):]
+    t = t[:t.index('\n    }', 20) + 6]
+    for key, (ja, en) in expected.items():
+        assert f'case "{key}"' in t
+        assert ja in t and en in t
+
+    # Both REAL phase-event renderers must use TimelineLabel; status chips keep StatusLabel.
+    assert COCKPIT.count('Theme.TimelineLabel(peEvent, _lang)') >= 2
+    assert 'Theme.StatusLabel(peEvent, _lang)' not in COCKPIT

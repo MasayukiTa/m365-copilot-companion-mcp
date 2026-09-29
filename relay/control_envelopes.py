@@ -6,6 +6,8 @@ same durable job.  Keep the classifier tiny and dependency-free so every ingress
 """
 from __future__ import annotations
 
+import re
+
 _LOCAL_LOOP_SOURCE_PREFIXES = (
     "local_loop run ",
     "local_loop bootstrap ",
@@ -15,6 +17,19 @@ _LOCAL_LOOP_SOURCE_PREFIXES = (
 _LOCAL_LOOP_GOAL_PREFIXES = _LOCAL_LOOP_SOURCE_PREFIXES + (
     "execute local_loop job ",
     "run local_loop job ",
+)
+
+# Exact durable-controller wire / wrapper shapes observed in production. Keep these structural,
+# not broad prefix matches: ordinary prose like "Run companion analysis" or
+# "LOCAL_LOOP job scheduling is slow" must remain legitimate user work.
+_CONTROLLER_RUN_RE = re.compile(r"^run\s+\S+\s+seq=\d+\s+worker=[^\s:]+\s*$", re.IGNORECASE)
+_LOCAL_LOOP_JOB_RE = re.compile(
+    r"^local_loop\s+job\s+\S+\s+seq=\d+\s+worker=[^\s:]+(?:\s*:|\s+を(?:、|\s)|\s*$)",
+    re.IGNORECASE,
+)
+_CLAIM_LOCAL_LOOP_JOB_RE = re.compile(
+    r"^claim\s+and\s+execute\s+local_loop\s+job\s+\S+\s+seq=\d+\s+worker=[^\s:]+(?:\s|$)",
+    re.IGNORECASE,
 )
 
 
@@ -31,4 +46,10 @@ def is_local_loop_control_submission(goal, source="") -> bool:
     """
     src = _norm(source)
     text = _norm(goal)
-    return src.startswith(_LOCAL_LOOP_SOURCE_PREFIXES) or text.startswith(_LOCAL_LOOP_GOAL_PREFIXES)
+    return (
+        src.startswith(_LOCAL_LOOP_SOURCE_PREFIXES)
+        or text.startswith(_LOCAL_LOOP_GOAL_PREFIXES)
+        or bool(_CONTROLLER_RUN_RE.match(text))
+        or bool(_LOCAL_LOOP_JOB_RE.match(text))
+        or bool(_CLAIM_LOCAL_LOOP_JOB_RE.match(text))
+    )
