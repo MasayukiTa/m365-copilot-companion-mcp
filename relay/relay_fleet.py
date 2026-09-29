@@ -6647,7 +6647,20 @@ class RelayWorker:
             from relay.transport_policy import resend_decision_for_landed_act
             return resend_decision_for_landed_act(
                 self.goal or "", checker=self._effect_checker())
-        except Exception:
+        except Exception as exc:
+            # Fail closed, but do not fail silently. A policy import/runtime failure and a
+            # deliberate policy refusal both return "refuse"; without telemetry operators
+            # cannot tell whether the safety policy itself is unavailable. Record only the
+            # exception TYPE (never its message, which can contain paths/tokens/provider text).
+            error_type = type(exc).__name__
+            try:
+                _socket_route().record(
+                    "resend_policy_error", worker=getattr(self, "name", ""),
+                    turn=getattr(self, "turn", 0), error_type=error_type, decision="refuse")
+            except Exception:
+                pass
+            print("[relay_fleet] %s: resend policy unavailable (%s); refusing re-send" %
+                  (getattr(self, "name", "worker"), error_type), flush=True)
             return "refuse"
 
     def _refuse_resend(self, reason, delivery):
