@@ -62,13 +62,17 @@ def test_the_title_is_not_rewritten_on_a_refresh():
     assert rows[0]["title"] == "銅箔の期限切れを調べる"
 
 
-def test_nothing_moved_means_nothing_is_written():
-    """ts orders the sidebar, so stamping it on every tick would shuffle the list while the
-    owner is reading it. `changed` is what the caller uses to skip the write entirely."""
+def test_nothing_moved_means_nothing_is_written_after_lineage_schema_migration():
+    """A legacy one-pointer row migrates once, then identical ticks stay write-free."""
     existing = [_row(url="u1", tr="same.jsonl", name="w0", ts=123.0)]
-    rows, changed = merge_conv_rows(existing, [_row(url="u1", tr="same.jsonl", name="w0")])
-    assert changed is False
-    assert rows[0]["ts"] == 123.0
+    rows, changed = merge_conv_rows(existing, [_row(url="u1", tr="same.jsonl", name="w0")], now=124.0)
+    assert changed is True
+    assert rows[0]["transcripts"] == ["same.jsonl"]
+    assert rows[0]["ts"] == 124.0
+
+    rows2, changed2 = merge_conv_rows(rows, [_row(url="u1", tr="same.jsonl", name="w0")], now=125.0)
+    assert changed2 is False
+    assert rows2[0]["ts"] == 124.0
 
 
 def test_a_url_arriving_later_fills_in_the_row_made_from_the_transcript():

@@ -75,11 +75,15 @@ SUBTASKS_READY"""
 
 def test_a_numbered_preamble_is_not_counted_as_subtasks():
     steps = fo.subtasks_from(TWO_LISTS)
-    assert len(steps) == 7, (
-        "前置きの番号付きリストがサブタスクに混ざっている（%d件）-- 上限を超えて分割が"
-        "丸ごと捨てられる" % len(steps))
+    # The proposal contains six independent workers plus a seventh "統合" child. Modern
+    # fanout deliberately drops that dependent tail because aggregation_goal() performs the
+    # merge only after every child finishes; launching it in parallel would create a DAG we
+    # do not schedule and duplicate the built-in merge.
+    assert len(steps) == 6, (
+        "前置きの番号付きリストがサブタスクに混ざっている、または統合childが残っている"
+        "（%d件）" % len(steps))
     assert "ci.yml" in steps[0]
-    assert steps[-1].startswith("統合")
+    assert not any(step.startswith("統合") for step in steps), steps
 
 
 def test_the_preamble_items_are_gone_not_merely_trimmed():
@@ -154,5 +158,7 @@ def test_the_reply_that_was_thrown_away_now_parses():
              if r.get("role") == "assistant" and r.get("turn") == 1][0]["text"]
     assert fo.fanout_ready(reply), "前提が崩れている: この返信は SUBTASKS_READY で終わっていた"
     steps = fo.subtasks_from(reply)
-    assert len(steps) == 7, (
-        "実測された返信が %d 件に解釈されている（当時は0件で分割が捨てられた）" % len(steps))
+    assert len(steps) == 6, (
+        "実測された返信が %d 件に解釈されている（6並列child + built-in merge が正しい）"
+        % len(steps))
+    assert not any(step.startswith("統合") for step in steps), steps

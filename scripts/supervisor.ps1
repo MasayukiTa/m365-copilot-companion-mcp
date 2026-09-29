@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Keeps the MCP server and the Dev Tunnel host alive.
 
@@ -57,6 +57,27 @@ $ErrorActionPreference = "SilentlyContinue"
 # This script lives in <repo>\scripts. $Root is the REPO ROOT: .env, .venv and main.py
 # (which this hosts) all live there.
 $Root = Split-Path -Parent $PSScriptRoot
+
+
+function Get-EnvBridgePort {
+    # start_bridge.ps1 supports MCP_BRIDGE_PORT; the lifecycle supervisor must ask the same port.
+    # Task Scheduler does not necessarily inherit the user's shell environment, so .env is the
+    # authoritative fallback just as it is for MCP_TUNNEL_NAME below.
+    $raw = [string]$env:MCP_BRIDGE_PORT
+    if (-not $raw) {
+        try {
+            $envp = Join-Path $Root ".env"
+            if (Test-Path $envp) {
+                $m = (Get-Content $envp | Where-Object { $_ -match '^\s*MCP_BRIDGE_PORT\s*=' } | Select-Object -First 1)
+                if ($m) { $raw = ($m -replace '^\s*MCP_BRIDGE_PORT\s*=\s*', '').Trim() }
+            }
+        } catch { }
+    }
+    $p = 0
+    if ($raw -and [int]::TryParse($raw, [ref]$p) -and $p -ge 1 -and $p -le 65535) { return $p }
+    return 8765
+}
+$BridgePort = Get-EnvBridgePort
 
 # Shared PURE helpers (Get-BareTunnelName / Test-SupervisorTunnelDrift) used below to
 # self-correct if .env's MCP_TUNNEL_NAME changes while this supervisor is already
@@ -436,6 +457,51 @@ function Test-ServerUp {
 }
 
 
+function Test-IsThisCheckoutBridgeCommandLine {
+    # PURE. The process which owns the bridge HTTP port is ours only when its command line names
+    # THIS checkout's bridge/copilot_bridge.py. A random local http.server on the reserved port is
+    # not a broken bridge and must not be allowed to hold an unrelated stale MCP server hostage.
+    param([string]$CommandLine, [string]$RootDir)
+    if (-not $CommandLine -or -not $RootDir) { return $false }
+    $bridge = Join-Path $RootDir "bridge\copilot_bridge.py"
+    $pat = "*" + [System.Management.Automation.WildcardPattern]::Escape($bridge) + "*"
+    return ($CommandLine -like $pat)
+}
+
+function Get-BridgePortVerdict {
+    # PURE-ISH observation: @{ Kind = ours|foreign|none|unknown; Desc }. `foreign` is PROOF that
+    # the real bridge cannot be serving this port, so no bridge turn can be in flight there.
+    # `unknown` stays fail-closed/busy.
+    param([int]$BridgePort)
+    $listeners = @()
+    try {
+        $listeners = @(Get-NetTCPConnection -LocalPort $BridgePort -State Listen -ErrorAction Stop)
+    } catch {
+        if ($_.CategoryInfo.Category -eq 'ObjectNotFound') {
+            return @{ Kind = "none"; Desc = ":$BridgePort has no listener" }
+        }
+        return @{ Kind = "unknown"; Desc = ":$BridgePort listener could not be inspected: $($_.Exception.Message)" }
+    }
+    if ($listeners.Count -eq 0) { return @{ Kind = "none"; Desc = ":$BridgePort has no listener" } }
+
+    $foreign = New-Object System.Collections.Generic.List[string]
+    $unknown = New-Object System.Collections.Generic.List[string]
+    foreach ($pid0 in @($listeners | Select-Object -ExpandProperty OwningProcess -Unique)) {
+        try { $p = Get-CimInstance Win32_Process -Filter ("ProcessId=" + [int]$pid0) -ErrorAction Stop }
+        catch { $unknown.Add("pid $pid0 (unreadable)"); continue }
+        if (-not $p -or -not $p.CommandLine) { $unknown.Add("pid $pid0 (no command line)"); continue }
+        $cl = [string]$p.CommandLine
+        if (Test-IsThisCheckoutBridgeCommandLine $cl $Root) {
+            return @{ Kind = "ours"; Desc = "pid ${pid0} (this checkout's bridge)" }
+        }
+        $foreign.Add("pid ${pid0} ($($p.Name))")
+    }
+    if ($unknown.Count -gt 0) {
+        return @{ Kind = "unknown"; Desc = ((@($foreign) + @($unknown)) -join " | ") }
+    }
+    return @{ Kind = "foreign"; Desc = ($foreign -join " | ") }
+}
+
 # A SERVER RUNNING CODE THE CHECKOUT HAS MOVED PAST, restarted by the thing that owns its
 # lifecycle instead of by whoever happens to look at the panel.
 #
@@ -474,15 +540,32 @@ function Invoke-StaleServerCycle {
         if (Test-Path $statusPath) {
             $fleetRunning = ((Get-Content $statusPath -Raw) -match '"running"\s*:\s*true')
         }
-        $breq = [System.Net.WebRequest]::Create("http://127.0.0.1:8765/status")
+        $breq = [System.Net.WebRequest]::Create("http://127.0.0.1:$BridgePort/status")
         $breq.Method = "GET"; $breq.Timeout = 5000; $breq.ReadWriteTimeout = 5000
         $bresp = $breq.GetResponse()
         $bbody = (New-Object System.IO.StreamReader($bresp.GetResponseStream())).ReadToEnd()
         $bresp.Close()
-        $bridgeBusy = ($bbody -match '"turn_running"\s*:\s*true') -or ($bbody -match '"busy"\s*:\s*true')
+        try { $bj = $bbody | ConvertFrom-Json -ErrorAction Stop } catch { $bj = $null }
+        if (-not $bj -or $bj.ok -ne $true) { throw "bridge /status did not return bridge JSON" }
+        $bridgeBusy = ($bj.turn_running -eq $true) -or ($bj.busy -eq $true)
         $busy = $fleetRunning -or $bridgeBusy
     } catch {
-        $busy = $true          # unreadable is busy, deliberately
+        # Unreadable remains busy UNLESS the port itself proves the bridge is absent. This exact
+        # distinction mattered 2026-09-28: an unrelated `python -m http.server 8765` returned
+        # 404 on /status, the old catch forced busy=true forever, and a server 5.5h stale could
+        # never cycle. `foreign` / `none` mean no bridge turn can exist on this port; `ours` /
+        # `unknown` stay fail-closed so a damaged live bridge never loses a tool server mid-turn.
+        $bv = Get-BridgePortVerdict $BridgePort
+        if ($bv.Kind -eq "foreign" -or $bv.Kind -eq "none") {
+            $bridgeBusy = $false
+            $busy = $fleetRunning
+            if ($bv.Kind -eq "foreign") {
+                Write-Log ("bridge status is unavailable because :$BridgePort is held by a foreign process; " +
+                           "treating the bridge as absent for stale-server safety: " + $bv.Desc)
+            }
+        } else {
+            $busy = $true
+        }
     }
     if ($busy) { $script:StaleStreak = 0; return }
 
@@ -1247,11 +1330,12 @@ function Get-TunnelHostExitDetail {
 $FleetDir = Join-Path $Root ".fleet"
 $FleetMarkerPath = Join-Path $Root ".fleet\fleet_run_active.json"
 $ReviewMarkerPath = Join-Path $Root ".fleet\review_run_active.json"
+$LocalLoopMarkerDir = Join-Path $Root ".fleet\local_loop_active"
+$LocalLoopCampaignPath = Join-Path $FleetDir "local_loop_campaign.json"
 $script:LastReviewResumeKey = ""
 $script:LastReviewResumeAttempt = [datetime]::MinValue
 
-# TRACKS AUTO-RESUME RUNNERS THIS SUPERVISOR ITSELF LAUNCHED (relay.fleet_runner /
-# bench.review_run below), so a LATER tick can read back their exit code instead of the
+# TRACKS AUTO-RESUME RUNNERS THIS SUPERVISOR ITSELF LAUNCHED (relay.fleet_runner / bench.review_run / relay.local_loop_controller below), so a LATER tick can read back their exit code instead of the
 # process vanishing the moment Start-Process returns -- the exact defect Get-ServerExitRecord
 # exists to fix for the MCP server, here applied one level up.
 #
@@ -1537,6 +1621,161 @@ function Invoke-ReviewAutoResume {
     }
 }
 
+
+function Test-LocalLoopAutoResumeEnabled {
+    $v = $env:MCP_LOCAL_LOOP_AUTORESUME
+    if ([string]::IsNullOrWhiteSpace($v)) { return $true }
+    return -not ($v -in @("0", "false", "False", "FALSE", "no", "No", "NO", "off", "Off", "OFF"))
+}
+
+function Test-LocalLoopMarkerProcessAlive {
+    param($Marker)
+    $procId = 0
+    $markerStarted = 0.0
+    try {
+        $procId = [int]$Marker.pid
+        $markerStarted = [double]$Marker.started
+    } catch { return $false }
+    if ($procId -le 0) { return $false }
+    $process = Get-Process -Id $procId -ErrorAction SilentlyContinue
+    if ($null -eq $process) { return $false }
+    try {
+        $processStarted = [DateTimeOffset]::new($process.StartTime).ToUnixTimeSeconds()
+        # Bind the marker to this process birth, not merely to a live/reused PID.  A different
+        # python that started long before OR after the marker must not suppress recovery forever.
+        if ($markerStarted -gt 0 -and [Math]::Abs($processStarted - $markerStarted) -gt 60) { return $false }
+        if ($process.ProcessName -notlike "python*") { return $false }
+    } catch { return $false }
+    return $true
+}
+
+function Write-LocalLoopMarkerAtomic {
+    param([string]$Path, $Marker)
+    try {
+        $dir = Split-Path -Parent $Path
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $tmp = $Path + ".tmp-" + $PID + "-" + [Guid]::NewGuid().ToString("N")
+        $json = $Marker | ConvertTo-Json -Depth 8 -Compress
+        [IO.File]::WriteAllText($tmp, $json, (New-Object Text.UTF8Encoding($false)))
+        Move-Item -Path $tmp -Destination $Path -Force
+        return $true
+    } catch {
+        try { if ($tmp -and (Test-Path $tmp)) { Remove-Item $tmp -Force } } catch { }
+        return $false
+    }
+}
+
+function Get-LocalLoopRetryDelaySeconds {
+    param([int]$RestartCount)
+    # Back off crash loops without making a previously-stable long job slow to recover.  The
+    # child preserves retry_after; if it survives past the deadline, a later crash resumes
+    # immediately because that deadline is already in the past.
+    $n = [Math]::Max(1, $RestartCount)
+    $exp = [Math]::Min(10, $n - 1)
+    $delay = [int](30 * [Math]::Pow(2, $exp))
+    return [int][Math]::Min(900, $delay)
+}
+
+
+function Invoke-LocalLoopAutoResume {
+    # Generic Cockpit LOCAL_LOOP jobs write one marker per job. Check EVERY cycle: the point of
+    # this runtime is multi-hour work, so waiting for a reboot to recover a dead coordinator is
+    # not acceptable. The controller itself also holds a per-job kernel lock; this supervisor is
+    # a relauncher, not the final exclusion layer.
+    if (-not (Test-LocalLoopAutoResumeEnabled)) { return $false }
+    if (-not (Test-Path $LocalLoopMarkerDir)) { return $false }
+    $did = $false
+    foreach ($file in @(Get-ChildItem -Path $LocalLoopMarkerDir -Filter "*.json" -File -ErrorAction SilentlyContinue)) {
+        $marker = $null
+        try { $marker = (Get-Content -Path $file.FullName -Raw -ErrorAction Stop) | ConvertFrom-Json -ErrorAction Stop }
+        catch { continue }
+        if ($null -eq $marker) { continue }
+        if (Test-LocalLoopMarkerProcessAlive $marker) { continue }
+        $nowEpoch = [DateTimeOffset]::Now.ToUnixTimeSeconds()
+        try { if ([double]$marker.retry_after -gt $nowEpoch) { continue } } catch { }
+        $resumeArgs = @($marker.resume_argv)
+        if ($resumeArgs.Count -eq 0) {
+            Write-Log "LOCAL_LOOP auto-resume skipped for $($file.Name): marker has no resume_argv"
+            continue
+        }
+        Update-PythonInterpreter "the LOCAL_LOOP auto-resume"
+        $jobId = [string]$marker.job_id
+        $shown = $resumeArgs -join " "
+        try { $restart = [int]$marker.restart_count + 1 } catch { $restart = 1 }
+        $retryDelay = Get-LocalLoopRetryDelaySeconds -RestartCount $restart
+
+        # Reserve this retry BEFORE spawning, but do not claim controller ownership here.
+        # The supervisor never rewrites pid/started ownership: only a controller that actually
+        # wins the per-job kernel lock may publish its process identity. This avoids both the
+        # fast-child race (child writes a newer marker before Start-Process returns) and the
+        # false-death race (a duplicate child loses the lock but would otherwise steal marker
+        # ownership from the still-live controller).
+        $marker | Add-Member -NotePropertyName restart_count -NotePropertyValue $restart -Force
+        $marker | Add-Member -NotePropertyName retry_after -NotePropertyValue ($nowEpoch + $retryDelay) -Force
+        if (-not (Write-LocalLoopMarkerAtomic -Path $file.FullName -Marker $marker)) {
+            Write-Log "LOCAL_LOOP auto-resume skipped for '$jobId': could not persist retry/backoff marker"
+            continue
+        }
+
+        try {
+            $launchAt = Get-Date
+            $proc = Start-Process -FilePath $Py -ArgumentList (@("-m", "relay.local_loop_controller") + $resumeArgs) `
+                -WorkingDirectory $Root -WindowStyle Hidden -PassThru
+            # A healthy child takes the per-job lock and then rewrites pid/started itself while
+            # preserving the restart_count/retry_after deadline reserved above.
+            Register-AutoResumeRunner -Proc $proc -LaunchTime $launchAt -Kind ("local-loop:" + $jobId) `
+                -CommandLine ('"' + $Py + '" -m relay.local_loop_controller ' + $shown)
+            Write-Log "LOCAL_LOOP job '$jobId' INTERRUPTED -> relaunched pid $($proc.Id) from $($file.Name)"
+            $did = $true
+        } catch {
+            # The backoff reservation is already durable. Do not alter pid/started here: the
+            # old dead owner remains evidence until a future lock-winning controller replaces it.
+            Write-Log "LOCAL_LOOP auto-resume FAILED for '$jobId' (retry in ${retryDelay}s): $($_.Exception.Message)"
+        }
+    }
+    return $did
+}
+
+function Invoke-LocalLoopCampaignDrain {
+    # Campaign intake is durable before a controller exists.  A short enqueue process normally
+    # launches its children immediately, but if it dies in that gap the active manifest remains.
+    # This pass makes the supervisor the recovery owner for those marker-less READY jobs.
+    # Do not duplicate Python's .env parser here. The controller owns the feature flag and loads
+    # .env; this supervisor only avoids spawning a drain when no active campaign exists.
+    if (-not (Test-Path $LocalLoopCampaignPath)) { return $false }
+    Update-PythonInterpreter "the LOCAL_LOOP campaign drain"
+    $out = ""
+    $code = 0
+    try {
+        Push-Location $Root
+        try {
+            $out = (& $Py -W ignore -m relay.local_loop_controller --drain-campaign --state-dir $FleetDir) -join ""
+            $code = $LASTEXITCODE
+        } finally {
+            Pop-Location
+        }
+    } catch {
+        Write-Log "LOCAL_LOOP campaign drain FAILED: $($_.Exception.Message)"
+        return $false
+    }
+    if ($code -ne 0) {
+        Write-Log "LOCAL_LOOP campaign drain exit $code"
+        return $false
+    }
+    if (-not [string]::IsNullOrWhiteSpace($out)) {
+        try {
+            $result = $out | ConvertFrom-Json -ErrorAction Stop
+            $launched = @($result.launched)
+            if ($launched.Count -gt 0) {
+                Write-Log ("LOCAL_LOOP campaign launched " + $launched.Count + " queued job(s): " + ($launched -join ", "))
+            }
+        } catch {
+            Write-Log "LOCAL_LOOP campaign drain returned unreadable output: $out"
+        }
+    }
+    return $true
+}
+
 # -- Queue delivery: the reaper + router pass, and the wait between ticks -----------------------
 # The two steps the tick has always run back to back, now callable from two places: the full
 # tick (unchanged position and order) and the express pass inside Wait-ForNextTick below.
@@ -1751,6 +1990,8 @@ Write-Log "supervisor up (tunnel=$TunnelName port=$Port interval=${IntervalSecon
 # Checked once, here, before the forever health-check loop starts.
 Invoke-FleetAutoResume -DryRun:$FleetResumeDryRun | Out-Null
 Invoke-ReviewAutoResume | Out-Null
+Invoke-LocalLoopCampaignDrain | Out-Null
+Invoke-LocalLoopAutoResume | Out-Null
 
 # THE DEBOUNCE IS FOR A SERVER THAT MIGHT COME BACK, NOT FOR ONE THAT WAS NEVER STARTED.
 # Starting at zero meant the FIRST launch waited out four consecutive failures. MEASURED on
@@ -1926,8 +2167,10 @@ while ($true) {
     foreach ($n in $shownToPass) { [void]$script:ExpressSeen.Add($n) }
 
     Invoke-ReviewAutoResume | Out-Null
+    Invoke-LocalLoopCampaignDrain | Out-Null
+    Invoke-LocalLoopAutoResume | Out-Null
 
-    # Report any tracked fleet/review auto-resume runner that has exited since the last tick.
+    # Report any tracked fleet/review/LOCAL_LOOP auto-resume runner that has exited since the last tick.
     # Every tick, not just after a relaunch, because the runner that needs reporting may still
     # be alive on the tick that launched it and only exit (quickly, if it never got past
     # argparse) on the very next one.

@@ -179,6 +179,17 @@ static class Theme
         { "refuting",    "info"    },
         { "verifying",   "info"    },
         { "awaiting",    "warning" },
+        { "awaiting_gate", "warning" },
+        { "waiting_runtime", "warning" },
+        { "turn_finished_without_commit", "warning" },
+        { "turn_controller_retry", "warning" },
+        { "ui_trigger_attempt", "info" },
+        { "ui_trigger_sent", "info" },
+        { "protocol_bootstrap_sent", "info" },
+        { "job_created", "neutral" },
+        { "job_cancelled", "neutral" },
+        { "conversation_rotated", "neutral" },
+        { "browser_metrics", "neutral" },
         { "done",        "success" },
         { "stuck",       "warning" },
         { "maxturns",    "warning" },
@@ -187,10 +198,16 @@ static class Theme
         { "freed",       "neutral" },
     };
 
+    static string StatusKey(string canonical)
+    {
+        return string.IsNullOrEmpty(canonical) ? "" : canonical.Trim().ToLowerInvariant();
+    }
+
     public static string StatusKind(string canonical)
     {
         string v;
-        if (canonical != null && _kind.TryGetValue(canonical, out v)) return v;
+        string key = StatusKey(canonical);
+        if (_kind.TryGetValue(key, out v)) return v;
         return "neutral";
     }
 
@@ -220,6 +237,19 @@ static class Theme
         return Muted(dark); // neutral
     }
 
+    // Timeline has four operator meanings: ordinary/administrative event = secondary graphite,
+    // active work = blue, attention/runtime wait/error = orange, completed = green.  The ordinary
+    // row is deliberately NOT body-text black: the timeline is metadata, and near-black labels
+    // visually outweighed the semantic blue/orange/green events in the light theme.
+    public static string TimelineColor(string canonical, bool dark)
+    {
+        string kind = StatusKind(canonical);
+        if (kind == "success") return Success(dark);
+        if (kind == "warning" || kind == "danger") return Warning(dark);
+        if (kind == "info") return Info(dark);
+        return Secondary(dark);
+    }
+
     public static string StatusColor(string canonical, bool dark)
     {
         return KindColor(StatusKind(canonical), dark);
@@ -230,22 +260,73 @@ static class Theme
     public static string StatusLabel(string canonical, int lang)
     {
         bool jp = lang == 0;
-        switch (canonical)
+        string key = StatusKey(canonical);
+        switch (key)
         {
-            case "pending":     return jp ? "待機"           : "Queued";
-            case "ready":       return jp ? "開始中"         : "Starting";
+            case "pending":     return jp ? "待機"                   : "Queued";
+            case "ready":       return jp ? "開始"                   : "Starting";
+            case "waiting":     return jp ? "実行中"                 : "Running";
+            case "researching": return jp ? "調査中"                 : "Researching";
+            case "refuting":    return jp ? "レビュー中"             : "Reviewing";
+            case "verifying":   return jp ? "検証中"                 : "Verifying";
+            case "waiting_runtime": return jp ? "実行環境待ち"       : "Runtime paused";
+            case "awaiting":    return jp ? "承認待ち"               : "Needs input";
+            case "awaiting_gate": return jp ? "承認待ち"             : "Needs approval";
+            case "done":        return jp ? "完了"                   : "Done";
+            case "stuck":       return jp ? "要対応"                 : "Needs attention";
+            case "maxturns":    return jp ? "要対応"                 : "Needs attention";
+            case "error":       return jp ? "停止(エラー)"           : "Stopped (error)";
+            case "cancelled":   return jp ? "停止"                   : "Stopped";
+            case "freed":       return jp ? "解放済"                 : "Released";
+            case "job_created": return jp ? "ジョブ作成"             : "Job created";
+            case "job_cancelled": return jp ? "ジョブ停止"           : "Job cancelled";
+            case "ui_trigger_attempt": return jp ? "UI起動試行"       : "UI trigger attempt";
+            case "ui_trigger_sent": return jp ? "UI起動送信"          : "UI trigger sent";
+            case "protocol_bootstrap_sent": return jp ? "プロトコル開始指示送信" : "Protocol bootstrap sent";
+            case "turn_finished_without_commit": return jp ? "コミットなしでターン終了" : "Turn finished without commit";
+            case "turn_controller_retry": return jp ? "コントローラ再試行" : "Controller retry";
+            case "conversation_rotated": return jp ? "会話を切替"     : "Conversation rotated";
+            case "browser_metrics": return jp ? "ブラウザ計測"        : "Browser metrics";
+            default:              return canonical == null ? "" : canonical;
+        }
+    }
+
+
+    // Timeline/history vocabulary is intentionally distinct from status-chip vocabulary.
+    // A state chip answers "what is it now?" (Waiting / Starting / Needs attention); a timeline
+    // row records "what happened?" (Queued / Started / Stuck). Never reuse StatusLabel here:
+    // the 2026-09-29 color repair accidentally changed operator-facing history copy that way.
+    public static string TimelineLabel(string canonical, int lang)
+    {
+        bool jp = lang == 0;
+        string key = StatusKey(canonical);
+        switch (key)
+        {
+            case "pending":     return jp ? "投入"           : "Queued";
+            case "ready":       return jp ? "開始"           : "Started";
             case "waiting":     return jp ? "実行中"         : "Running";
             case "researching": return jp ? "調査中"         : "Researching";
             case "refuting":    return jp ? "レビュー中"     : "Reviewing";
             case "verifying":   return jp ? "検証中"         : "Verifying";
+            case "waiting_runtime": return jp ? "実行環境待ち" : "Runtime paused";
             case "awaiting":    return jp ? "承認待ち"       : "Needs input";
-            case "done":        return jp ? "完了"           : "Done";
-            case "stuck":       return jp ? "要対応"         : "Needs attention";
-            case "maxturns":    return jp ? "要対応"         : "Needs attention";
-            case "error":       return jp ? "停止(エラー)"   : "Stopped (error)";
-            case "cancelled":   return jp ? "停止"           : "Stopped";
-            case "freed":       return jp ? "解放済"         : "Released";
-            default:            return canonical == null ? "" : canonical;
+            case "awaiting_gate": return jp ? "承認待ち"     : "Needs approval";
+            case "done":        return jp ? "完了"           : "Completed";
+            case "stuck":       return jp ? "停滞"           : "Stuck";
+            case "maxturns":    return jp ? "ターン上限"     : "Max turns reached";
+            case "error":       return jp ? "エラー"         : "Error";
+            case "cancelled":   return jp ? "停止"           : "Cancelled";
+            case "freed":       return jp ? "解放"           : "Released";
+            case "job_created": return jp ? "ジョブ作成"     : "Job created";
+            case "job_cancelled": return jp ? "ジョブ停止"   : "Job cancelled";
+            case "ui_trigger_attempt": return jp ? "UI起動試行" : "UI trigger attempt";
+            case "ui_trigger_sent": return jp ? "UI起動送信"  : "UI trigger sent";
+            case "protocol_bootstrap_sent": return jp ? "プロトコル開始指示送信" : "Protocol bootstrap sent";
+            case "turn_finished_without_commit": return jp ? "コミットなしでターン終了" : "Turn finished without commit";
+            case "turn_controller_retry": return jp ? "コントローラ再試行" : "Controller retry";
+            case "conversation_rotated": return jp ? "会話を切替" : "Conversation rotated";
+            case "browser_metrics": return jp ? "ブラウザ計測" : "Browser metrics";
+            default: return canonical == null ? "" : canonical;
         }
     }
 

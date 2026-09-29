@@ -43,6 +43,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -494,6 +495,29 @@ def _default_path_in_use(path):
     return False
 
 
+def _rmtree_onerror(func, path, exc_info):
+    """Retry a Windows read-only unlink after clearing the read-only bit.
+
+    Git object pack/index files are commonly mode 0444 on Windows. ``shutil.rmtree`` raises
+    WinError 5 on the first such file, which previously left every renamed `.deleting-*`
+    workspace permanently stranded. Only PermissionError gets retried; unrelated filesystem
+    failures still propagate to the caller and remain fail-safe.
+    """
+    exc = exc_info[1]
+    if not isinstance(exc, PermissionError):
+        raise exc
+    try:
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+    except OSError:
+        raise exc
+    func(path)
+
+
+def _rmtree_workspace(path):
+    """Remove one already-approved workspace, tolerating Windows Git read-only files."""
+    return shutil.rmtree(path, onerror=_rmtree_onerror)
+
+
 def _finish_leftover_deletes(work_root, dry_run):
     """Finish any `.deleting-*` directory a prior sweep renamed but never got to rmtree.
 
@@ -527,7 +551,7 @@ def _finish_leftover_deletes(work_root, dry_run):
             removed.append(e.name)
             continue
         try:
-            shutil.rmtree(e.path)
+            _rmtree_workspace(e.path)
             removed.append(e.name)
         except OSError:
             continue
@@ -618,7 +642,7 @@ def _clone_sweep_run_once(fleet_dir, keep_days, in_use, now, dry_run=False):
             except OSError:
                 continue
             try:
-                shutil.rmtree(deleting_path)
+                _rmtree_workspace(deleting_path)
             except OSError:
                 # Renamed but not fully removed -- exactly the state _finish_leftover_deletes()
                 # exists to clean up on the NEXT sweep. Still counted as freed/removed here:

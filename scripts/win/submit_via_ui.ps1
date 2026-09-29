@@ -10,9 +10,9 @@
 # in it; the same rule is how several goals are started together, which is the only way to
 # start several -- see below.
 #
-# CTRL+ENTER STEERS WHILE A RUN IS ACTIVE (FleetCockpit.cs:3488), it does not add a goal. So a
-# second submission during a run does not do what it looks like it does, and this refuses
-# rather than quietly steering something the caller did not mean to touch.
+# THE BOTTOM COMPOSER ADDS TASKS WHILE A RUN IS ACTIVE. Start/Send and Ctrl+Enter share the
+# same current cockpit path: idle starts a run, live enqueues add_goal work. Steering is a
+# per-worker card action and this helper intentionally does not emulate it.
 #
 #   powershell -NoProfile -File scripts/win/submit_via_ui.ps1 -Goal "..." [-Command "/fanout on"]
 #   powershell -NoProfile -File scripts/win/submit_via_ui.ps1 -ReadOnly
@@ -240,7 +240,46 @@ if ($target) {
 # focus-dependence the button-invoke exists to avoid. Deleted rather than kept "in case",
 # because the history above is the part worth keeping and it is right here.
 
-function Submit([string]$text) {
+function Get-GoalAcceptanceSnapshot([string[]]$goals) {
+    $statusPath = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) ".fleet/status.json"
+    $started = ""
+    $running = $false
+    $matchCount = 0
+    try {
+        if (Test-Path $statusPath) {
+            $st = Get-Content $statusPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($null -ne $st.started) { $started = [string]$st.started }
+            $running = [bool]$st.running
+            $wanted = @{}
+            foreach ($g in @($goals)) {
+                if (-not $wanted.ContainsKey($g)) { $wanted[$g] = 0 }
+                $wanted[$g]++
+            }
+            $seen = @{}
+            foreach ($w in @($st.workers)) {
+                $wg = [string]$w.goal
+                if (-not $wanted.ContainsKey($wg)) { continue }
+                if (-not $seen.ContainsKey($wg)) { $seen[$wg] = 0 }
+                $seen[$wg]++
+            }
+            foreach ($g in $wanted.Keys) {
+                $matchCount += [Math]::Min([int]$wanted[$g], [int]($seen[$g]))
+            }
+        }
+    } catch { }
+    return [PSCustomObject]@{ Started = $started; Running = $running; MatchCount = $matchCount }
+}
+
+function Test-GoalAccepted($before, $after, [int]$expectedCount) {
+    if ($expectedCount -le 0 -or $null -eq $before -or $null -eq $after) { return $false }
+    $fresh = $after.Running -and -not [String]::IsNullOrEmpty([string]$after.Started) -and
+             ($after.Started -ne $before.Started) -and ($after.MatchCount -ge $expectedCount)
+    $liveGrowth = ($after.Started -eq $before.Started) -and
+                  ($after.MatchCount -ge ($before.MatchCount + $expectedCount))
+    return [bool]($fresh -or $liveGrowth)
+}
+
+function Submit([string]$text, [switch]$ExpectFleetGoal) {
     # CTRL+ENTER, NOT ENTER. The composer sets AcceptsReturn, so a plain Enter inserts a
     # newline and nothing is submitted -- which is exactly what happened the first time
     # this ran: the goal went into the box, the box grew a line, and no run started while
@@ -289,22 +328,72 @@ function Submit([string]$text) {
     if (-not $startBtn.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$ip)) {
         throw "the start button does not support Invoke"
     }
+
+    # FAIL CLOSED ON COMPOSER CORRUPTION. ValuePattern.SetValue() above is supposed to replace
+    # the whole text atomically, but an unattended machine can still receive an external edit
+    # between that write and this button invoke. Measured 2026-09-28: a 645-char READ-ONLY goal
+    # reached goals_input.txt as 646 chars with a leading "3". Re-read the SAME textbox at the
+    # last possible moment and require an ordinal exact match before creating any durable work.
+    $vpVerify = $null
+    if (-not $target.TryGetCurrentPattern(
+            [System.Windows.Automation.ValuePattern]::Pattern, [ref]$vpVerify)) {
+        throw "cannot re-read the composer immediately before submit"
+    }
+    $observed = [string]$vpVerify.Current.Value
+    if (-not [String]::Equals($observed, $text, [StringComparison]::Ordinal)) {
+        $common = [Math]::Min($observed.Length, $text.Length)
+        $at = 0
+        while ($at -lt $common -and $observed[$at] -eq $text[$at]) { $at++ }
+        $expectedCode = if ($at -lt $text.Length) { "U+{0:X4}" -f [int][char]$text[$at] } else { "<end>" }
+        $observedCode = if ($at -lt $observed.Length) { "U+{0:X4}" -f [int][char]$observed[$at] } else { "<end>" }
+        throw ("composer text changed before submit at index {0}: expected {1}, observed {2}; lengths {3}->{4}. " +
+               "Nothing was submitted and the current composer text was left untouched." -f
+               $at, $expectedCode, $observedCode, $text.Length, $observed.Length)
+    }
+
+    $expectedGoals = @()
+    $baseline = $null
+    if ($ExpectFleetGoal) {
+        $expectedGoals = @($text -split "`r?`n" | ForEach-Object { $_.Trim() } |
+                           Where-Object { $_.Length -gt 0 -and -not $_.StartsWith('#') })
+        if ($expectedGoals.Count -eq 0) { throw "fleet goal submission contains no usable goal lines" }
+        $baseline = Get-GoalAcceptanceSnapshot $expectedGoals
+    }
+
     [Console]::Error.WriteLine(("submit: invoking button '{0}'" -f $startBtn.Current.Name))
     $ip.Invoke()
 
     Start-Sleep -Milliseconds 900
-    # AND VERIFY, because a submit that silently did nothing is the failure mode this
-    # whole script exists to catch. An emptied box is the cockpit acknowledging it.
+    # VERIFY THE HANDOFF, not one historical UI side-effect. Older cockpit builds cleared the
+    # composer immediately. Current fresh-Start deliberately keeps operator text until the new
+    # runner actually owns the state-dir and its goal appears in status.json. A still-filled box
+    # can therefore mean "durably waiting for the closing coordinator", not "nothing happened".
     $after = ""
     $vp2 = $null
     if ($target.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp2)) {
-        $after = $vp2.Current.Value
+        $after = [string]$vp2.Current.Value
     }
-    if ($after.Trim().Length -gt 0) {
-        throw ("the composer still holds text after Ctrl+Enter; nothing was submitted: " +
+    if ($after.Trim().Length -eq 0) {
+        Write-Output ("submitted: {0}" -f ($text.Substring(0, [Math]::Min(70, $text.Length))))
+        return
+    }
+    if (-not $ExpectFleetGoal) {
+        throw ("the composer still holds text after button invoke; command was not accepted: " +
                $after.Substring(0, [Math]::Min(60, $after.Length)))
     }
-    Write-Output ("submitted: {0}" -f ($text.Substring(0, [Math]::Min(70, $text.Length))))
+
+    $acceptDeadline = (Get-Date).AddSeconds([Math]::Max([int]$TimeoutSeconds, 65))
+    while ((Get-Date) -lt $acceptDeadline) {
+        $now = Get-GoalAcceptanceSnapshot $expectedGoals
+        $accepted = Test-GoalAccepted $baseline $now $expectedGoals.Count
+        if ($accepted) {
+            Write-Output ("submitted: {0}" -f ($text.Substring(0, [Math]::Min(70, $text.Length))))
+            return
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    throw ("submission was not accepted before the timeout; composer text was preserved: " +
+           $after.Substring(0, [Math]::Min(60, $after.Length)))
 }
 
 # IS A RUN ALREADY GOING? Keep this diagnostic visible because it is useful when a GUI submit
@@ -335,5 +424,5 @@ if ($Goal.Count -gt 0) {
     # The same visible button is Start when idle and Add while a run is live. Multiple goals are
     # placed in the composer together, one per line; Cockpit splits them into independent add_goal
     # items and its durable handoff/ack path owns the run-ending race.
-    Submit ($Goal -join "`n")
+    Submit ($Goal -join "`n") -ExpectFleetGoal
 }

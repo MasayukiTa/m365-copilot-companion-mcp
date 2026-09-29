@@ -9,10 +9,10 @@ and it never grew again for any conversation created afterward.
 
 Measured against this machine's real .fleet/conversations.json (2026-09-09): 1064/1064 fleet
 rows had an empty url; 718 of those had a transcript file still present on disk. The fix:
-accept a row when EITHER url or transcript is present (a transcript-only row is not degraded --
-the click handler already reads c.Transcript from disk BEFORE it ever needs ConvUrl, see the
-"a registry/fleet conversation we haven't loaded yet" branch), with dedup keyed on whichever
-identity the row actually has.
+accept a row when url, the legacy latest transcript pointer, OR the ordered transcript lineage is
+present. A transcript-only row is not degraded: the click handler reads disk transcripts before
+it needs ConvUrl. Socket rows without a URL now use the same (source,name) registry identity,
+and the legacy single Transcript pointer is derived from the newest lineage segment.
 
 Source-level checks: CopilotChat.cs is C# and has no test harness here, matching
 ui/test_copilot_chat_conv_lifecycle.py and ui/test_fleet_cockpit_approval_center.py.
@@ -35,14 +35,19 @@ def test_a_row_with_no_url_but_a_transcript_is_no_longer_skipped():
     # the old defect: any row with an empty url was `continue`d before ever looking at
     # transcript -- pin that this exact single-condition skip is gone.
     assert 'if (string.IsNullOrEmpty(url)) continue;' not in body
-    assert 'if (string.IsNullOrEmpty(url) && string.IsNullOrEmpty(transcript)) continue;' in body
+    assert 'if (string.IsNullOrEmpty(url) && string.IsNullOrEmpty(transcript) && regLineage.Count == 0) continue;' in body
 
 
-def test_a_row_with_neither_url_nor_transcript_is_still_skipped():
-    """The fix widens the gate, it does not remove it -- a row with nothing to show or open
-    must still be dropped, same as before."""
+def test_a_row_with_no_url_or_latest_pointer_is_still_accepted_when_lineage_exists():
     body = _sync_registry_body()
-    assert 'string.IsNullOrEmpty(url) && string.IsNullOrEmpty(transcript)' in body
+    assert 'var regLineage = RegistryTranscriptLineage(d)' in body
+    assert 'string.IsNullOrEmpty(url) && string.IsNullOrEmpty(transcript) && regLineage.Count == 0' in body
+
+
+def test_a_row_with_no_url_no_latest_pointer_and_no_lineage_is_still_skipped():
+    """The widened gate still drops a registry row with no usable conversation identity."""
+    body = _sync_registry_body()
+    assert 'string.IsNullOrEmpty(url) && string.IsNullOrEmpty(transcript) && regLineage.Count == 0' in body
 
 
 def test_dedup_falls_back_to_transcript_when_url_is_absent():
@@ -54,12 +59,11 @@ def test_dedup_falls_back_to_transcript_when_url_is_absent():
     assert 'c.Transcript == transcript' in body
 
 
-def test_the_transcript_field_is_still_captured_on_the_new_conversation():
-    """The existing "disk jsonl -> open from disk, no scrape" comment documents WHY Transcript
-    matters; the fix must still set it, not just gate on it."""
+def test_the_latest_transcript_pointer_is_derived_from_the_new_conversations_lineage():
+    """Transcript remains the compatibility/latest pointer; Transcripts is the full identity."""
     body = _sync_registry_body()
-    assert 'c.Transcript = transcript;' in body
-    assert 'disk jsonl -> open from disk, no scrape' in body
+    assert 'c.Transcripts = regLineage;' in body
+    assert 'c.Transcript = FleetConvIdentity.LatestTranscript(c.Transcripts, transcript);' in body
 
 
 def test_url_only_dedup_is_unaffected_when_url_is_present():

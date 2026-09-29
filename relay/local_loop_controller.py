@@ -12,16 +12,20 @@ import hashlib
 import json
 import os
 import secrets
+import subprocess
+import sys
 import time
 from pathlib import Path
 
 from relay.acceptance import Check, normalize_checks
+from relay.execution_profiles import ExecutionProfile
 from relay.local_job_store import (
     INTERACTION_WAIT_STATUSES,
     JobStoreError,
     LocalJobStore,
     TERMINAL_JOB_STATUSES,
 )
+from tools import childproc
 
 
 PAUSED_STATUSES = frozenset({
@@ -83,19 +87,449 @@ def _read_goal_file(path: str | os.PathLike) -> str:
     return text
 
 
-def _project_job_snapshot(store: LocalJobStore, job_id: str, status_path: str | os.PathLike) -> dict:
-    """Write a one-job FleetCockpit snapshot from the durable SQLite authority."""
-    snapshot = store.console_snapshot()
-    status = store.get_job_status(job_id)["status"]
-    snapshot["workers"] = [
-        worker for worker in snapshot.get("workers", []) if worker.get("name") == job_id
+def _read_enqueue_goals_file(path: str | os.PathLike) -> list[str]:
+    """Read the Cockpit's enqueue payload without teaching the UI the durable job schema."""
+    raw = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    if not isinstance(raw, list):
+        raise ValueError("enqueue goals file must contain a JSON array")
+    goals = [str(v or "").strip() for v in raw]
+    goals = [v for v in goals if v]
+    if not goals:
+        raise ValueError("enqueue goals file is empty")
+    return goals
+
+
+def _campaign_manifest_path(state_dir: str | os.PathLike) -> Path:
+    return Path(state_dir) / LOCAL_LOOP_CAMPAIGN_MANIFEST
+
+
+def _campaign_lock_path(state_dir: str | os.PathLike) -> Path:
+    return Path(state_dir) / LOCAL_LOOP_LOCK_DIR / LOCAL_LOOP_CAMPAIGN_LOCK
+
+
+def _active_marker_job_ids(state_dir: str | os.PathLike) -> set[str]:
+    ids = set()
+    marker_dir = Path(state_dir) / LOCAL_LOOP_MARKER_DIR
+    try:
+        for marker in marker_dir.glob("*.json"):
+            try:
+                ids.add(LocalJobStore._validate_job_id(marker.stem))
+            except JobStoreError:
+                continue
+    except OSError:
+        pass
+    return ids
+
+
+def _read_campaign_manifest(state_dir: str | os.PathLike) -> dict:
+    path = _campaign_manifest_path(state_dir)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, TypeError):
+        value = {}
+    if not isinstance(value, dict):
+        value = {}
+    rows = value.get("entries")
+    if not isinstance(rows, list):
+        rows = []
+    return {
+        "version": 1,
+        "started": float(value.get("started") or 0.0),
+        "updated": float(value.get("updated") or 0.0),
+        "entries": [dict(row) for row in rows if isinstance(row, dict)],
+    }
+
+
+def _archive_campaign_manifest(state_dir: str | os.PathLike, manifest: dict,
+                               *, now: float | None = None) -> Path:
+    """Move a completed active manifest out of the supervisor's hot path but keep it for audit."""
+    now = time.time() if now is None else float(now)
+    payload = dict(manifest or {})
+    payload["version"] = 1
+    payload["updated"] = now
+    payload["closed"] = now
+    active = _campaign_manifest_path(state_dir)
+    _write_atomic(active, payload)
+    history = Path(state_dir) / LOCAL_LOOP_CAMPAIGN_HISTORY_DIR
+    history.mkdir(parents=True, exist_ok=True)
+    started = int(float(payload.get("started") or now))
+    closed = int(now)
+    target = history / f"campaign_{started}_{closed}_{secrets.token_hex(4)}.json"
+    os.replace(active, target)
+    return target
+
+
+def _acquire_campaign_lock(state_dir: str | os.PathLike, timeout_seconds: float = 2.0):
+    """Serialize manifest read-modify-write; bounded so UI enqueue can never hang indefinitely."""
+    path = _campaign_lock_path(state_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    while True:
+        fh = None
+        try:
+            fh = open(path, "a+b", buffering=0)
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                fh.write(b"\0")
+            fh.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh
+        except (OSError, IOError):
+            if fh is not None:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.02)
+
+
+def _runtime_wait_scope(status: dict) -> str:
+    """Return the scope attached to the newest WAITING_RUNTIME event.
+
+    Old databases/events predate runtime scoping. Treat those as job-local so one historical
+    browser failure cannot freeze every sibling in a campaign indefinitely.
+    """
+    for event in reversed(status.get("events") or []):
+        if str(event.get("event") or "") != "WAITING_RUNTIME":
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        scope = str(payload.get("scope") or "job").strip().lower()
+        return "campaign" if scope == "campaign" else "job"
+    return "job"
+
+
+def _campaign_has_live_work(store: LocalJobStore, manifest: dict,
+                            marker_ids: set[str]) -> bool:
+    for row in manifest.get("entries", []):
+        try:
+            job_id = LocalJobStore._validate_job_id(row.get("job_id"))
+        except JobStoreError:
+            continue
+        try:
+            status = str(store.get_job_status(job_id).get("status") or "")
+        except JobStoreError as exc:
+            if exc.code == "JOB_NOT_FOUND":
+                # A root may live in another explicit DB; its marker is then the only ownership
+                # proof. A queued manifest copy can also still materialize locally.
+                if job_id in marker_ids or isinstance(row.get("job"), dict):
+                    return True
+            continue
+        if status not in TERMINAL_JOB_STATUSES:
+            return True
+        # Terminal SQLite state is authoritative: a leftover marker is stale, not live work.
+    return False
+
+
+def _materialize_campaign_entry(store: LocalJobStore, row: dict) -> bool:
+    try:
+        job_id = LocalJobStore._validate_job_id(row.get("job_id"))
+    except JobStoreError:
+        return False
+    try:
+        store.get_job_status(job_id)
+        return True
+    except JobStoreError as exc:
+        if exc.code != "JOB_NOT_FOUND":
+            raise
+    job = row.get("job")
+    if not isinstance(job, dict):
+        return False
+    try:
+        store.create_job(job)
+    except JobStoreError as exc:
+        if exc.code != "JOB_EXISTS":
+            raise
+    return True
+
+
+def _enqueue_campaign_goals(store: LocalJobStore, state_dir: str | os.PathLike,
+                            goals: list[str], *, cwd: str | None = None,
+                            max_turns: int = 1000, read_only: bool = False,
+                            now: float | None = None) -> dict:
+    """Durably enqueue LOCAL_LOOP jobs before any controller process is required to exist."""
+    now = time.time() if now is None else float(now)
+    clean = [str(goal or "").strip() for goal in goals]
+    clean = [goal for goal in clean if goal]
+    if not clean:
+        raise ValueError("campaign enqueue requires at least one goal")
+    jobs = [
+        _job_from_goal(goal, cwd=cwd, max_turns=max_turns, read_only=read_only)
+        for goal in clean
     ]
-    snapshot["total"] = len(snapshot["workers"])
-    snapshot["done_count"] = sum(
-        1 for worker in snapshot["workers"] if worker.get("outcome") == "DONE"
+    marker_ids = _active_marker_job_ids(state_dir)
+    lock = _acquire_campaign_lock(state_dir)
+    if lock is None:
+        raise RuntimeError("LOCAL_LOOP campaign queue is busy")
+    try:
+        manifest = _read_campaign_manifest(state_dir)
+        if not _campaign_has_live_work(store, manifest, marker_ids):
+            if manifest.get("entries") and _campaign_manifest_path(state_dir).is_file():
+                _archive_campaign_manifest(state_dir, manifest, now=now)
+            manifest = {"version": 1, "started": now, "updated": now, "entries": []}
+        if not manifest.get("started"):
+            manifest["started"] = now
+        entries = list(manifest.get("entries", []))
+        known = {str(row.get("job_id")) for row in entries if row.get("job_id")}
+        # A standalone controller becomes the campaign root the moment live work is added.
+        # Root entries need no job copy: SQLite already owns them and their marker proves scope.
+        for job_id in sorted(marker_ids):
+            if job_id not in known:
+                entries.append({"job_id": job_id, "joined_at": now})
+                known.add(job_id)
+        for job in jobs:
+            job_id = job["job_id"]
+            entries.append({
+                "job_id": job_id,
+                "job": job,
+                "enqueued_at": now,
+                "launch_attempts": 0,
+                "retry_after": 0.0,
+            })
+            known.add(job_id)
+        manifest.update({"version": 1, "updated": now, "entries": entries})
+        _write_atomic(_campaign_manifest_path(state_dir), manifest)
+    finally:
+        _release_job_lock(lock)
+
+    # The manifest is the intake source of truth. Materialise SQLite afterwards so a crash in
+    # this gap is repairable by campaign drain rather than turning an accepted task into an orphan.
+    for row in manifest["entries"]:
+        if row.get("job_id") in {job["job_id"] for job in jobs}:
+            _materialize_campaign_entry(store, row)
+    if jobs:
+        _project_job_snapshot(store, jobs[0]["job_id"], Path(state_dir) / "status.json", now=now)
+    return {"ok": True, "job_ids": [job["job_id"] for job in jobs]}
+
+
+def _campaign_commands_path(state_dir: str | os.PathLike, job_id: str) -> Path:
+    safe = LocalJobStore._validate_job_id(job_id)
+    return Path(state_dir) / "local_loop_commands" / (safe + ".json")
+
+
+def _campaign_child_argv(args, job_id: str) -> list[str]:
+    values = dict(vars(args))
+    values["commands_file"] = str(_campaign_commands_path(args.state_dir, job_id))
+    return _controller_resume_argv(argparse.Namespace(**values), job_id)
+
+
+def _default_campaign_launcher(argv: list[str]) -> int:
+    repo = Path(__file__).resolve().parent.parent
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "relay.local_loop_controller"] + list(argv),
+        cwd=str(repo), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, **childproc.tree_popen_kwargs(headless=True),
     )
-    snapshot["running"] = status not in TERMINAL_JOB_STATUSES
-    snapshot["open_tabs"] = 0 if status in TERMINAL_JOB_STATUSES else 1
+    return int(proc.pid)
+
+
+def _drain_campaign(store: LocalJobStore, state_dir: str | os.PathLike, args, *,
+                    now: float | None = None, launcher=None) -> dict:
+    """Reconcile campaign state, then launch eligible jobs without crossing a runtime pause."""
+    now = time.time() if now is None else float(now)
+    launcher = launcher or _default_campaign_launcher
+    lock = _acquire_campaign_lock(state_dir)
+    if lock is None:
+        return {"ok": False, "launched": [], "closed": False, "reason": "campaign queue busy"}
+    selected = []
+    manifest = None
+    closed = False
+    runtime_blocked = False
+    candidates = []
+    try:
+        manifest = _read_campaign_manifest(state_dir)
+        entries = manifest.get("entries", [])
+        changed = False
+        active = False
+
+        # PASS 1: materialise/read every durable status and clean markers that cannot represent
+        # crash-recoverable work. This pass must finish before selecting ANY sibling to launch:
+        # WAITING_RUNTIME usually means a shared runtime/configuration defect (for example missing
+        # Copilot Studio Agent Instructions), so starting later READY siblings just repeats it.
+        for row in entries:
+            try:
+                job_id = LocalJobStore._validate_job_id(row.get("job_id"))
+            except JobStoreError:
+                continue
+            marker_path = _controller_marker_path(state_dir, job_id)
+            has_marker = marker_path.is_file()
+            materialized = _materialize_campaign_entry(store, row)
+            if not materialized:
+                # A campaign root may be owned by another explicit DB. Preserve a live/unknown
+                # marker as scope evidence; without either source there is nothing to launch here.
+                if has_marker:
+                    active = True
+                continue
+            try:
+                status_row = store.get_job_status(job_id, event_limit=50)
+                status = str(status_row.get("status") or "")
+            except JobStoreError:
+                if has_marker:
+                    active = True
+                continue
+
+            if status in TERMINAL_JOB_STATUSES:
+                if has_marker:
+                    try:
+                        marker_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        # Failure to reap must not turn terminal work back into executable work.
+                        pass
+                continue
+
+            active = True
+            if status == "WAITING_RUNTIME":
+                if _runtime_wait_scope(status_row) == "campaign":
+                    runtime_blocked = True
+                if has_marker:
+                    try:
+                        marker_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        pass
+                continue
+            if status in INTERACTION_WAIT_STATUSES or status in PAUSED_STATUSES:
+                if has_marker:
+                    try:
+                        marker_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        pass
+                continue
+            if has_marker:
+                continue
+            candidates.append((row, job_id))
+
+        # PASS 2: only a campaign with no runtime-wide pause may launch READY/RUNNING candidates.
+        if not runtime_blocked:
+            for row, job_id in candidates:
+                try:
+                    retry_after = float(row.get("retry_after") or 0.0)
+                except Exception:
+                    retry_after = 0.0
+                if retry_after > now:
+                    continue
+                attempts = max(0, int(row.get("launch_attempts") or 0)) + 1
+                delay = min(900.0, 30.0 * float(2 ** min(attempts - 1, 5)))
+                row["launch_attempts"] = attempts
+                row["retry_after"] = now + delay
+                row["last_launch_at"] = now
+                selected.append(job_id)
+                changed = True
+
+        if entries and not active:
+            _archive_campaign_manifest(state_dir, manifest, now=now)
+            closed = True
+        elif changed:
+            manifest["updated"] = now
+            _write_atomic(_campaign_manifest_path(state_dir), manifest)
+    finally:
+        _release_job_lock(lock)
+
+    launched = []
+    pids = {}
+    if not closed:
+        for job_id in selected:
+            try:
+                pid = int(launcher(_campaign_child_argv(args, job_id)))
+            except Exception:
+                continue
+            launched.append(job_id)
+            pids[job_id] = pid
+    return {
+        "ok": True, "launched": launched, "pids": pids, "closed": closed,
+        "runtime_blocked": runtime_blocked,
+    }
+
+
+def _campaign_job_ids(state_dir: str | os.PathLike) -> set[str]:
+    rows = _read_campaign_manifest(state_dir).get("entries", [])
+    ids = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            ids.add(LocalJobStore._validate_job_id(row.get("job_id")))
+        except JobStoreError:
+            continue
+    return ids
+
+
+def _project_job_snapshot(store: LocalJobStore, job_id: str, status_path: str | os.PathLike,
+                          *, now: float | None = None, terminal_grace_seconds: float = 120.0) -> dict:
+    """Project every LOCAL_LOOP job visible in this state dir without leaking shared-DB jobs.
+
+    Controllers are locked per *job*, so several durable jobs may legitimately run at once and
+    all of them write the same FleetCockpit status file.  Projection membership therefore comes
+    from this state dir's active marker files plus LOCAL_LOOP rows already visible in the previous
+    status, never from every row in a potentially shared SQLite database.  Recently terminal rows
+    get a short display grace so another controller cannot erase completion before Cockpit/history
+    observes it.
+    """
+    now = time.time() if now is None else float(now)
+    terminal_grace_seconds = max(0.0, float(terminal_grace_seconds))
+    status_path = Path(status_path)
+    state_dir = status_path.parent
+    snapshot = store.console_snapshot()
+
+    marker_ids = _active_marker_job_ids(state_dir)
+
+    campaign_ids = _campaign_job_ids(state_dir)
+    # A completed campaign manifest may remain on disk for audit/resume. A standalone job that is
+    # unrelated to it must not resurrect those old rows. Treat the manifest as live membership
+    # only when this controller belongs to it or another active marker does.
+    if campaign_ids and job_id not in campaign_ids and not (marker_ids & campaign_ids):
+        campaign_ids = set()
+
+    previous_ids = set()
+    try:
+        previous = json.loads(status_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, TypeError):
+        previous = {}
+    for worker in previous.get("workers", []):
+        if worker.get("execution_profile") != ExecutionProfile.LOCAL_LOOP.value:
+            continue
+        try:
+            previous_ids.add(LocalJobStore._validate_job_id(worker.get("name")))
+        except JobStoreError:
+            continue
+
+    candidate_ids = marker_ids | campaign_ids | previous_ids | {LocalJobStore._validate_job_id(job_id)}
+    workers = []
+    for worker in snapshot.get("workers", []):
+        name = worker.get("name")
+        if name not in candidate_ids:
+            continue
+        if (worker.get("closed") and name != job_id and name not in marker_ids
+                and name not in campaign_ids):
+            updated = float(worker.get("updated_at") or 0.0)
+            if name not in previous_ids or now - updated > terminal_grace_seconds:
+                continue
+        workers.append(worker)
+
+    snapshot["workers"] = workers
+    snapshot["total"] = len(workers)
+    snapshot["done_count"] = sum(1 for worker in workers if worker.get("outcome") == "DONE")
+    snapshot["running"] = any(not bool(worker.get("closed")) for worker in workers)
+    snapshot["open_tabs"] = sum(
+        1 for worker in workers
+        if worker.get("name") in marker_ids and not bool(worker.get("closed"))
+    )
+    snapshot["started"] = min(
+        (float(worker.get("created_at") or worker.get("updated_at") or now) for worker in workers),
+        default=now,
+    )
+    snapshot["updated"] = now
     _write_atomic(status_path, snapshot)
     return snapshot
 
@@ -184,9 +618,171 @@ def probe_browser_interaction(driver) -> str:
 def _write_atomic(path: str | os.PathLike, payload: dict) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(target.name + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, target)
+    # Multiple LOCAL_LOOP controllers legitimately project the same status.json concurrently.
+    # A shared ``status.json.tmp`` lets one controller replace/delete another controller's temp
+    # file. Give each write its own same-directory temp so only the final os.replace is shared.
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        # Windows can transiently reject two concurrent replaces of the same destination with
+        # WinError 5/32 even though each source temp is independent. Retry only that sharing
+        # contention; the payload itself stays private to this writer until replace succeeds.
+        deadline = time.monotonic() + 1.0
+        while True:
+            try:
+                os.replace(tmp, target)
+                break
+            except PermissionError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.005)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+LOCAL_LOOP_MARKER_DIR = "local_loop_active"
+LOCAL_LOOP_LOCK_DIR = "local_loop_locks"
+LOCAL_LOOP_CAMPAIGN_MANIFEST = "local_loop_campaign.json"
+LOCAL_LOOP_CAMPAIGN_HISTORY_DIR = "local_loop_campaign_history"
+LOCAL_LOOP_CAMPAIGN_LOCK = "campaign.lock"
+
+
+def _controller_marker_path(state_dir: str | os.PathLike, job_id: str) -> Path:
+    # Marker/lock filenames are security boundaries too. Resume-by-id reaches these helpers
+    # before any browser work, so validate here rather than relying on a later SQLite lookup.
+    safe_id = LocalJobStore._validate_job_id(job_id)
+    return Path(state_dir) / LOCAL_LOOP_MARKER_DIR / (safe_id + ".json")
+
+
+def _controller_lock_path(state_dir: str | os.PathLike, job_id: str) -> Path:
+    safe_id = LocalJobStore._validate_job_id(job_id)
+    return Path(state_dir) / LOCAL_LOOP_LOCK_DIR / (safe_id + ".lock")
+
+
+def _read_controller_marker(state_dir: str | os.PathLike, job_id: str) -> dict | None:
+    path = _controller_marker_path(state_dir, job_id)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _write_controller_marker(state_dir: str | os.PathLike, job_id: str, resume_argv: list[str],
+                             *, pid: int | None = None, started: float | None = None,
+                             restart_count: int | None = None, retry_after: float | None = None) -> dict:
+    existing = _read_controller_marker(state_dir, job_id) or {}
+    if restart_count is None:
+        try:
+            restart_count = int(existing.get("restart_count", 0))
+        except Exception:
+            restart_count = 0
+    if retry_after is None:
+        try:
+            retry_after = float(existing.get("retry_after", 0.0))
+        except Exception:
+            retry_after = 0.0
+    payload = {
+        "version": 1,
+        "job_id": str(job_id),
+        "pid": int(os.getpid() if pid is None else pid),
+        "started": float(time.time() if started is None else started),
+        "resume_argv": [str(v) for v in resume_argv],
+        "restart_count": max(0, int(restart_count)),
+        "retry_after": max(0.0, float(retry_after)),
+    }
+    _write_atomic(_controller_marker_path(state_dir, job_id), payload)
+    return payload
+
+
+def _clear_controller_marker(state_dir: str | os.PathLike, job_id: str,
+                             *, owner_pid: int | None = None) -> bool:
+    owner = int(os.getpid() if owner_pid is None else owner_pid)
+    marker = _read_controller_marker(state_dir, job_id)
+    try:
+        marker_pid = int((marker or {}).get("pid") or 0)
+    except Exception:
+        return False
+    if marker_pid != owner:
+        return False
+    try:
+        _controller_marker_path(state_dir, job_id).unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
+
+
+def _acquire_job_lock(state_dir: str | os.PathLike, job_id: str):
+    """Take a non-blocking kernel lock for one controller per durable LOCAL_LOOP job."""
+    path = _controller_lock_path(state_dir, job_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = None
+    try:
+        fh = open(path, "a+b", buffering=0)
+        fh.seek(0, os.SEEK_END)
+        if fh.tell() == 0:
+            fh.write(b"\0")
+        fh.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fh
+    except (OSError, IOError):
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:
+                pass
+        return None
+
+
+def _release_job_lock(fh) -> None:
+    if fh is None:
+        return
+    try:
+        fh.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        fh.close()
+    except Exception:
+        pass
+
+
+def _controller_resume_argv(args, job_id: str) -> list[str]:
+    """Canonical crash-resume command line containing no task text or agent URL secrets."""
+    out = ["--job-id", str(job_id), "--state-dir", str(Path(args.state_dir).resolve())]
+    if getattr(args, "db", None):
+        out += ["--db", str(Path(args.db).resolve())]
+    if getattr(args, "cdp_url", None):
+        out += ["--cdp-url", str(args.cdp_url)]
+    if getattr(args, "commands_file", None):
+        out += ["--commands-file", str(Path(args.commands_file).resolve())]
+    for flag, attr in (
+        ("--poll-seconds", "poll_seconds"),
+        ("--turn-timeout", "turn_timeout"),
+        ("--ui-idle-timeout", "ui_idle_timeout"),
+        ("--rotate-after-turns", "rotate_after_turns"),
+        ("--js-heap-limit-mb", "js_heap_limit_mb"),
+        ("--dom-node-limit", "dom_node_limit"),
+        ("--edge-mb-limit", "edge_mb_limit"),
+    ):
+        out += [flag, str(getattr(args, attr))]
+    return out
 
 
 def run_acceptance_checks(job: dict) -> tuple[bool, str]:
@@ -238,6 +834,12 @@ def collect_browser_metrics(page, edge_mb_fn=None) -> dict:
         except Exception as exc:
             metrics["edge_metric_error"] = f"{type(exc).__name__}: {exc}"
     return metrics
+
+
+NO_COMMIT_REASON = "browser response finished without LOCAL_LOOP commit"
+
+
+NO_COMMIT_REASON = "browser response finished without LOCAL_LOOP commit"
 
 
 class LocalLoopController:
@@ -479,13 +1081,15 @@ class LocalLoopController:
         return self.store.verify_candidate(self.job_id, passed, detail)
 
     def run(self) -> str:
-        sent_attempts = 0
+        # Attempt budget is a durable job constraint, not a process-lifetime counter. A crash
+        # may resume from the marker; WAITING_RUNTIME is an explicit pause and never auto-resumes.
+        sent_attempts = self.store.ui_trigger_attempt_count(self.job_id)
         while True:
             self._assert_no_answer_content_read()
             status = self.store.get_job_status(self.job_id)
             if status["status"] == "WAITING_RUNTIME":
-                self.store.resume_runtime(self.job_id)
-                status = self.store.get_job_status(self.job_id)
+                self._project()
+                return "WAITING_RUNTIME"
             if status["status"] in INTERACTION_WAIT_STATUSES:
                 interaction = self._probe_consent()
                 if interaction == "CLEAR":
@@ -530,7 +1134,14 @@ class LocalLoopController:
                 trigger += f" plan={turn_number}/{len(turn_plan)}"
             if bool(constraints.get("read_only")):
                 trigger += " mode=read-only"
+
             response_count_before = self._response_block_count()
+            # Commit the attempt BEFORE touching the browser. If the process dies during send,
+            # the next controller still sees that this attempt consumed budget.
+            self.store.record_event(self.job_id, "UI_TRIGGER_ATTEMPT", {
+                "seq": seq, "worker_id": self.worker_id,
+            }, seq)
+            sent_attempts += 1
             try:
                 self.driver.send(trigger, track_answer=False)
             except Exception as exc:
@@ -539,7 +1150,6 @@ class LocalLoopController:
                     "seq": seq, "worker_id": self.worker_id, "reason": reason,
                 }, seq)
                 self.store.retry_uncommitted_turn(self.job_id, seq, reason)
-                sent_attempts += 1
                 if not self._rotate("send failed"):
                     self.store.mark_waiting_runtime(
                         self.job_id, "send failed; no replacement conversation",
@@ -550,20 +1160,26 @@ class LocalLoopController:
             self.store.record_event(self.job_id, "UI_TRIGGER_SENT", {
                 "seq": seq, "worker_id": self.worker_id,
             }, seq)
-            sent_attempts += 1
             self.turns_in_conversation += 1
 
             commit = self._wait_for_commit(seq, retry_count_before, response_count_before)
             if commit is not None and commit.get("status") == "NO_COMMIT_AFTER_RESPONSE":
-                reason = "browser response finished without LOCAL_LOOP commit"
-                self.store.retry_uncommitted_turn(self.job_id, seq, reason)
-                if not self._rotate("response finished without commit"):
-                    self.store.mark_waiting_runtime(
-                        self.job_id, reason + "; no replacement conversation",
-                    )
-                    self._project()
-                    return "WAITING_RUNTIME"
-                continue
+                # A correctly configured Copilot Studio agent claims/commits the SQLite turn.
+                # If it instead produces a normal chat answer, its persistent LOCAL_LOOP Agent
+                # Instructions are missing/stale. Do NOT try to teach the protocol in-band: real
+                # E2E showed a misconfigured agent can route that control text into ordinary
+                # Fleet tools, creating recursive/duplicate work. Fence the uncommitted lease and
+                # fail closed after exactly one browser response.
+                self.store.retry_uncommitted_turn(self.job_id, seq, NO_COMMIT_REASON)
+                reason = (
+                    "LOCAL_LOOP Agent Instructions are missing or stale: the browser answered "
+                    "RUN without a SQLite commit. Update/publish "
+                    "docs/examples/local_loop_agent_instructions.txt in the Copilot Studio "
+                    "agent instructions, reconnect MCP, then resume. No retry was sent."
+                )
+                self.store.mark_waiting_runtime(self.job_id, reason, scope="campaign")
+                self._project()
+                return "WAITING_RUNTIME"
             if commit is None:
                 current_status = self.store.get_job_status(self.job_id)["status"]
                 if current_status == "CANCELLED":
@@ -647,6 +1263,10 @@ def main(argv=None):
     ap.add_argument("--job-file", help="create/resume a LOCAL_LOOP job from this JSON file")
     ap.add_argument("--goal", help="create a durable LOCAL_LOOP job from one natural-language task")
     ap.add_argument("--goal-file", help="read the natural-language task from a UTF-8 text file")
+    ap.add_argument("--enqueue-goals-file", help="durably enqueue a JSON array of live LOCAL_LOOP goals")
+    ap.add_argument("--drain-campaign", action="store_true", help="materialize and launch queued campaign jobs, then exit")
+    ap.add_argument("--resume-runtime", action="store_true",
+                    help="explicitly resume an existing WAITING_RUNTIME job after its runtime condition is repaired")
     ap.add_argument("--cwd", help="optional local workspace boundary for an ad-hoc goal job")
     ap.add_argument("--max-turns", type=int, default=1000, help="maximum durable turns for --goal")
     ap.add_argument("--read-only", action="store_true", help="mark an ad-hoc --goal job read-only")
@@ -655,6 +1275,10 @@ def main(argv=None):
     ap.add_argument("--agent-url", default=os.environ.get("MCP_FLEET_AGENT_URL") or
                     os.environ.get("MCP_IMPL_AGENT_URL"))
     ap.add_argument("--state-dir", default=".fleet")
+    ap.add_argument(
+        "--commands-file",
+        help="optional controller-specific command file; defaults to <state-dir>/commands.json",
+    )
     ap.add_argument("--poll-seconds", type=float, default=1.0)
     ap.add_argument("--turn-timeout", type=float, default=1800)
     ap.add_argument("--ui-idle-timeout", type=float, default=300)
@@ -663,15 +1287,37 @@ def main(argv=None):
     ap.add_argument("--dom-node-limit", type=int, default=0)
     ap.add_argument("--edge-mb-limit", type=float, default=0)
     args = ap.parse_args(argv)
-    if not args.agent_url:
-        ap.error("--agent-url or MCP_FLEET_AGENT_URL/MCP_IMPL_AGENT_URL is required")
     if not _execution_profiles_enabled():
         ap.error("durable LOCAL_LOOP requires MCP_EXECUTION_PROFILES=1; enable it and restart the MCP server")
     goal_sources = sum(bool(value) for value in (args.job_file, args.goal, args.goal_file))
     if goal_sources > 1:
         ap.error("use exactly one of --job-file, --goal or --goal-file")
+    special_modes = int(bool(args.enqueue_goals_file)) + int(bool(args.drain_campaign))
+    if special_modes > 1 or (special_modes and (goal_sources or args.job_id or args.resume_runtime)):
+        ap.error("campaign enqueue/drain modes cannot be combined with a controller job")
+    if args.resume_runtime and (goal_sources or not args.job_id):
+        ap.error("--resume-runtime requires an existing --job-id and cannot create a new job")
 
     store = LocalJobStore(args.db)
+    if args.enqueue_goals_file:
+        goals = _read_enqueue_goals_file(args.enqueue_goals_file)
+        queued = _enqueue_campaign_goals(
+            store, args.state_dir, goals, cwd=args.cwd, max_turns=args.max_turns,
+            read_only=args.read_only,
+        )
+        launched = _drain_campaign(store, args.state_dir, args) if args.agent_url else {"launched": []}
+        queued["launched"] = launched.get("launched", [])
+        print(json.dumps(queued, ensure_ascii=False), flush=True)
+        return 0
+    if args.drain_campaign:
+        if not args.agent_url:
+            print(json.dumps({"ok": False, "launched": [], "reason": "agent URL unavailable"}), flush=True)
+            return 2
+        result = _drain_campaign(store, args.state_dir, args)
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+        return 0 if result.get("ok") else 2
+    if not args.agent_url:
+        ap.error("--agent-url or MCP_FLEET_AGENT_URL/MCP_IMPL_AGENT_URL is required")
     job_id = args.job_id
     job = None
     goal_text = _read_goal_file(args.goal_file) if args.goal_file else args.goal
@@ -696,67 +1342,92 @@ def main(argv=None):
                 raise
     if not job_id:
         ap.error("--job-id, --job-file, --goal or --goal-file is required")
+    if args.resume_runtime:
+        resumed = store.resume_runtime(job_id)
+        if str(resumed.get("status") or "") == "WAITING_RUNTIME":
+            print(f"LOCAL_LOOP {job_id}: runtime resume did not leave WAITING_RUNTIME", flush=True)
+            return 2
 
-    # Surface the durable task immediately, before CDP/browser startup. If browser setup fails,
-    # the operator still sees which task exists in SQLite instead of a blank cockpit.
-    _project_job_snapshot(store, job_id, Path(args.state_dir) / "status.json")
+    job_lock = _acquire_job_lock(args.state_dir, job_id)
+    if job_lock is None:
+        print(f"LOCAL_LOOP {job_id}: another controller already owns this job", flush=True)
+        return 3
+    marker_written = False
+    completed_normally = False
+    try:
+        resume_argv = _controller_resume_argv(args, job_id)
+        _write_controller_marker(args.state_dir, job_id, resume_argv)
+        marker_written = True
+        # Surface the durable task immediately, before CDP/browser startup. If browser setup fails,
+        # the operator still sees which task exists in SQLite instead of a blank cockpit.
+        _project_job_snapshot(store, job_id, Path(args.state_dir) / "status.json")
 
-    from playwright.sync_api import sync_playwright
-    from relay.edge_recover import companion_edge_mb
+        from playwright.sync_api import sync_playwright
+        from relay.edge_recover import companion_edge_mb
 
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.connect_over_cdp(args.cdp_url, timeout=20000)
-        context = browser.contexts[0] if browser.contexts else browser.new_context()
-        driver = _open_driver(context, args.agent_url)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.connect_over_cdp(args.cdp_url, timeout=20000)
+            context = browser.contexts[0] if browser.contexts else browser.new_context()
+            driver = _open_driver(context, args.agent_url)
 
-        def rotate(old, reason):
-            old_page = getattr(old, "page", None)
-            replacement = _open_driver(context, args.agent_url)
+            def rotate(old, reason):
+                old_page = getattr(old, "page", None)
+                replacement = _open_driver(context, args.agent_url)
+                try:
+                    if old_page is not None and not old_page.is_closed():
+                        old_page.close()
+                except Exception:
+                    pass
+                return replacement
+
+            controller = LocalLoopController(
+                store, job_id, driver,
+                status_path=Path(args.state_dir) / "status.json",
+                commands_path=(Path(args.commands_file) if args.commands_file else
+                               Path(args.state_dir) / "commands.json"),
+                poll_seconds=args.poll_seconds,
+                turn_timeout_seconds=args.turn_timeout,
+                ui_idle_timeout_seconds=args.ui_idle_timeout,
+                rotate_after_turns=args.rotate_after_turns,
+                js_heap_limit_mb=args.js_heap_limit_mb,
+                dom_node_limit=args.dom_node_limit,
+                edge_mb_limit=args.edge_mb_limit,
+                rotate_driver=rotate,
+                consent_probe=probe_browser_interaction,
+                metrics_probe=lambda drv: collect_browser_metrics(drv.page, companion_edge_mb),
+            )
             try:
-                if old_page is not None and not old_page.is_closed():
-                    old_page.close()
-            except Exception:
-                pass
-            return replacement
-
-        controller = LocalLoopController(
-            store, job_id, driver,
-            status_path=Path(args.state_dir) / "status.json",
-            commands_path=Path(args.state_dir) / "commands.json",
-            poll_seconds=args.poll_seconds,
-            turn_timeout_seconds=args.turn_timeout,
-            ui_idle_timeout_seconds=args.ui_idle_timeout,
-            rotate_after_turns=args.rotate_after_turns,
-            js_heap_limit_mb=args.js_heap_limit_mb,
-            dom_node_limit=args.dom_node_limit,
-            edge_mb_limit=args.edge_mb_limit,
-            rotate_driver=rotate,
-            consent_probe=probe_browser_interaction,
-            metrics_probe=lambda drv: collect_browser_metrics(drv.page, companion_edge_mb),
-        )
-        try:
-            result = controller.run()
-            print(f"LOCAL_LOOP {job_id}: {result}")
-            # Record the run per theme. Everything needed is already in the job spec, so
-            # this costs one write and gives the next job on the same theme its history.
-            # Frame-side and best-effort -- and deliberately AFTER the result is printed,
-            # so a memory failure can never change what the CLI reports or returns.
-            try:
-                from relay.project_memory import record_task, theme_from_goal
-                task = (job or {}).get("task") or {}
-                instruction = task.get("instruction") or task.get("type") or job_id
-                record_task(theme_from_goal(instruction), instruction, result,
-                            note="job=%s base=%s" % (
-                                job_id,
-                                ((job or {}).get("constraints") or {}).get("allowed_base", "")))
-            except Exception:
-                pass
-            return 0 if result == "DONE" else 2
-        finally:
-            # connect_over_cdp disconnect does not close pages created in the persistent
-            # companion Edge. Leaving one page per completed job steadily recreates the
-            # memory problem LOCAL_LOOP is meant to solve.
-            _close_driver_page(controller.driver)
+                result = controller.run()
+                completed_normally = True
+                print(f"LOCAL_LOOP {job_id}: {result}")
+                # Record the run per theme. Everything needed is already in the job spec, so
+                # this costs one write and gives the next job on the same theme its history.
+                # Frame-side and best-effort -- and deliberately AFTER the result is printed,
+                # so a memory failure can never change what the CLI reports or returns.
+                try:
+                    from relay.project_memory import record_task, theme_from_goal
+                    task = (job or {}).get("task") or {}
+                    instruction = task.get("instruction") or task.get("type") or job_id
+                    record_task(theme_from_goal(instruction), instruction, result,
+                                note="job=%s base=%s" % (
+                                    job_id,
+                                    ((job or {}).get("constraints") or {}).get("allowed_base", "")))
+                except Exception:
+                    pass
+                return 0 if result == "DONE" else 2
+            finally:
+                # connect_over_cdp disconnect does not close pages created in the persistent
+                # companion Edge. Leaving one page per completed job steadily recreates the
+                # memory problem LOCAL_LOOP is meant to solve.
+                _close_driver_page(controller.driver)
+    finally:
+        # Every ordinary return (terminal, human/consent/routing wait, or WAITING_RUNTIME) clears
+        # the crash-recovery marker. An unexpected exception leaves the marker behind while
+        # releasing the kernel lock, so the supervisor can auto-resume only true crashes.
+        # WAITING_RUNTIME resumes only through explicit --resume-runtime.
+        if marker_written and completed_normally:
+            _clear_controller_marker(args.state_dir, job_id, owner_pid=os.getpid())
+        _release_job_lock(job_lock)
 
 
 if __name__ == "__main__":

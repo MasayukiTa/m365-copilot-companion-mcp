@@ -67,7 +67,11 @@ def test_adopt_commit_happens_only_after_ledger_and_active_marker_exist():
     commit = main.index("commit_command_claim(args.state_dir, _adopt_claim")
     assert ledger < marker < commit
     assert "--adopt-command" in main
-    assert "_adopt_goals + _read_goals(args)" in main
+    cli_read = main.index("_cli_goals = _read_goals(args)")
+    combine = main.index("goals = _adopt_goals + _cli_goals")
+    queue = main.index("_record_cli_submission(args.state_dir, _adopt_goals + _cli_goals")
+    assert cli_read < queue < combine
+    assert main.count("_read_goals(args)") == 1, "goal sources must be read once before adoption is combined"
 
 
 def test_active_marker_can_be_required_before_an_adopted_command_is_committed(tmp_path, monkeypatch):

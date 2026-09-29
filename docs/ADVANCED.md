@@ -147,6 +147,13 @@ LOCAL_LOOPはWeb UIへ短い`RUN job seq worker`だけを入力し、回答本�
 Copilotの構造化commitをSQLiteで待ち、`CANDIDATE_DONE`を従来のローカルacceptance
 checkで検証します。SQLiteはPython標準機能であり、管理者権限やDBサービスは不要です。
 
+
+> LOCAL_LOOP protocol recovery: the published Copilot Studio Agent Instructions are required.
+> If a browser response finishes without a SQLite commit, the controller fences that uncommitted
+> turn and immediately changes the job to `WAITING_RUNTIME`, naming the Agent Instructions repair.
+> It sends no automatic protocol retry: a misconfigured agent may route control text into ordinary
+> tools, so fail-closed behavior is safer than an in-band bootstrap.
+
 ```powershell
 # サンプルJSONのallowed_baseとtaskを変更してから実行
 .\.venv\Scripts\python.exe -m relay.local_loop_controller `

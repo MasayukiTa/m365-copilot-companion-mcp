@@ -123,7 +123,8 @@ def atomic_write_text(path: Path, text: str, attempts: int = 10) -> None:
         with open(tmp, "wb") as fh:
             # The invariant above rejects the only legacy clear-text auth aliases before bytes
             # exist. Protected auth values are DPAPI ciphertext; CodeQL cannot infer either our
-            # explicit key-level rejection or the ctypes CryptProtectData sanitizer.
+            # explicit key-level rejection or the ctypes CryptProtectData sanitizer. The
+            # suppression is attached to the exact sink because CodeQL cannot model DPAPI.
             # codeql[py/clear-text-storage-sensitive-data]
             fh.write(data)
             fh.flush()

@@ -23,7 +23,7 @@ def test_directive_band_lists_one_summary_per_distinct_full_goal():
 def test_worker_card_prefers_goal_summary_for_headline():
     s = src()
     i = s.index("Border Card(Dictionary<string, object> w)")
-    b = s[i:i + 9000]
+    b = s[i:s.index("\n    UIElement BuildCardTabs(", i)]
     assert 'string goalSummary = S(w, "goal_summary")' in b
     assert 'string headline = !string.IsNullOrEmpty(goalSummary)' in b
     assert 'CardTitle(convTitle, goal)' in b  # old-history / old-snapshot fallback remains
