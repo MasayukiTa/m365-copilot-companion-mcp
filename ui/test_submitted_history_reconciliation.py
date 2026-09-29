@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import os
@@ -101,9 +101,11 @@ def test_submission_baseline_is_captured_before_handoff_can_create_a_worker():
     assert "NoteSubmitted(new List<string> { goal }, submitBaseline)" in durable
 
     retry = _method_block(src, "void RetryGoal(Dictionary<string, object> w)", "Dictionary<string, object> Cmd1")
-    live_branch = retry[:retry.index("string goal = S(w, \"goal\")")]
+    # A fail-closed LOCAL_LOOP-control guard now precedes the live branch. The ordering we care
+    # about is still baseline-before-delivery once RetryGoal has decided this is real Fleet work.
+    live_branch = retry[retry.index("if (RunIsLive())"):retry.index('try { SpawnFleet(')]
     assert live_branch.index("CaptureSubmissionBaseline()") < live_branch.index("SendCommand(")
-    assert "NoteSubmitted(new List<string> { S(w, \"goal\") }, submitBaseline)" in live_branch
+    assert 'NoteSubmitted(new List<string> { S(w, "goal") }, submitBaseline)' in live_branch
 
 
 def test_fresh_start_waits_for_closing_coordinator_before_clearing_input():

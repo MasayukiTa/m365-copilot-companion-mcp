@@ -5720,6 +5720,14 @@ class CockpitWindow : Window
                 _startNote.Text = _lang == 0 ? "ゴールを入力してください。" : "Enter goals (one per line).";
                 return;
             }
+            foreach (string goal in goals)
+            {
+                if (!IsLocalLoopControlGoal(goal)) continue;
+                if (_startNote != null) _startNote.Text = _lang == 0
+                    ? "LOCAL_LOOP の内部制御文は通常タスクとして再実行できません。耐久タスクのカードから再開してください。"
+                    : "LOCAL_LOOP control text cannot run as ordinary Fleet work. Resume the durable task card instead.";
+                return;
+            }
             if (goals.Count == 1 && goals[0].Equals("/help", StringComparison.OrdinalIgnoreCase))
             {
                 _goalInput.Text = "";
@@ -5925,6 +5933,14 @@ class CockpitWindow : Window
             if (goal.Length > 0 && !goal.StartsWith("#")) goals.Add(goal);
         }
         if (goals.Count == 0) return;
+        foreach (string goal in goals)
+        {
+            if (!IsLocalLoopControlGoal(goal)) continue;
+            if (_startNote != null) _startNote.Text = _lang == 0
+                ? "LOCAL_LOOP の内部制御文は通常Fleetへ追加できません。耐久タスクのカードから再開してください。"
+                : "LOCAL_LOOP control text cannot be added to ordinary Fleet. Resume the durable task card instead.";
+            return;
+        }
         SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
 
         // This method is entered from the ACTIVE composer. Do not re-decide ownership from one
@@ -6313,6 +6329,14 @@ class CockpitWindow : Window
     bool SpawnFleet(List<string> goals, string goalsFileName, bool planMode = false,
                     bool waitForClosingRun = false, string submittedText = null)
     {
+        foreach (string rawGoal in (goals ?? new List<string>()))
+        {
+            if (!IsLocalLoopControlGoal(SubmittedTasks.GoalTextOf(rawGoal))) continue;
+            if (_startNote != null) _startNote.Text = _lang == 0
+                ? "LOCAL_LOOP の内部制御文は通常Fleetとして起動できません。耐久タスクのカードから再開してください。"
+                : "LOCAL_LOOP control text cannot start ordinary Fleet work. Resume the durable task card instead.";
+            return false;
+        }
         SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
         string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
         string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
@@ -11077,7 +11101,7 @@ class CockpitWindow : Window
             //
             // So the fan-out was not broken. It ran, it split, it merged, and then this
             // line threw the answer away.
-            if (!IsRetryableOutcome(S(w, "outcome"))) continue;
+            if (!IsRetryableWorker(w)) continue;
             string goal = S(w, "goal");
             if (string.IsNullOrEmpty(goal)) continue;
             int n = 0;
@@ -11245,8 +11269,7 @@ class CockpitWindow : Window
                     var ww2 = ow2 as Dictionary<string, object>;
                     if (ww2 == null) continue;
                     if (!IsTerminalWorker(ww2)) { allTerminal = false; }
-                    string wst2 = S(ww2, "status");
-                    if (wst2 == "stuck" || wst2 == "maxturns" || wst2 == "error") cntAttn++;
+                    if (IsOperatorAttention(ww2)) cntAttn++;
                 }
             }
         }
@@ -13031,6 +13054,7 @@ class CockpitWindow : Window
     Border HistoryRow(Dictionary<string, object> e)
     {
         string status = S(e, "status");
+        bool internalControl = IsLocalLoopControlGoal(S(e, "goal"));
         string ck = ColorKey(status);
         string conv = S(e, "conv_url");
         // Default COLLAPSED, exactly like a live card: a terminal worker that scrolls down into
@@ -13056,7 +13080,9 @@ class CockpitWindow : Window
             dp.Children.Add(chev);
         }
         string hcanon = status == "ready" ? "waiting" : status;
-        var pill = Pill(Theme.StatusLabel(hcanon, _lang), Theme.StatusKind(hcanon));
+        var pill = internalControl
+            ? Pill(_lang == 0 ? "内部制御" : "Internal control", "neutral")
+            : Pill(Theme.StatusLabel(hcanon, _lang), Theme.StatusKind(hcanon));
         pill.Margin = new Thickness(0, 0, 5, 0);
         DockPanel.SetDock(pill, Dock.Left);
         dp.Children.Add(pill);
@@ -13141,7 +13167,7 @@ class CockpitWindow : Window
                         : "Started a continuation of the prior task (it re-reads the saved outputs, then runs the follow-up).";
                 }
             };
-            col.Children.Add(contBtn);
+            if (!internalControl) col.Children.Add(contBtn);
         }
 
         row.Child = col;
@@ -13164,6 +13190,32 @@ class CockpitWindow : Window
     static bool IsAttentionStatus(string status)
     {
         return status == "stuck" || status == "maxturns" || status == "error";
+    }
+
+    static bool IsLocalLoopControlGoal(string goal)
+    {
+        string norm = (goal ?? "").Replace("\r", " ").Replace("\n", " ").Replace("\t", " ").Trim().ToLowerInvariant();
+        while (norm.Contains("  ")) norm = norm.Replace("  ", " ");
+        return norm.StartsWith("local_loop run ")
+            || norm.StartsWith("local_loop bootstrap ")
+            || norm.StartsWith("local_loop protocol ")
+            || norm.StartsWith("execute local_loop job ")
+            || norm.StartsWith("run local_loop job ");
+    }
+
+    static bool IsOperatorAttention(Dictionary<string, object> w)
+    {
+        return w != null
+            && !IsLocalLoopControlGoal(S(w, "goal"))
+            && !IsInfraStuck(w)
+            && IsAttentionStatus(S(w, "status"));
+    }
+
+    static bool IsRetryableWorker(Dictionary<string, object> w)
+    {
+        return w != null
+            && !IsLocalLoopControlGoal(S(w, "goal"))
+            && IsRetryableOutcome(S(w, "outcome"));
     }
 
     // P0: an INFRA_STUCK worker is NOT a task failure — the engine parked it because the infra
@@ -13241,17 +13293,18 @@ class CockpitWindow : Window
         bool terminal = status == "done" || status == "stuck" || status == "maxturns"
                         || status == "error" || status == "cancelled";
         bool isOpen = _expanded.Contains(name);
+        bool internalControl = IsLocalLoopControlGoal(goal);
         // P0: INFRA_STUCK is an infra pause (Edge/sign-in/connector broke), NOT a task failure. It
         // gets the distinct ORANGE インフラ待ち treatment: a warning rail/pill, its actionable reason
         // shown as-is, and a 再投入 re-queue action — NOT the red stuck/error recovery surface.
-        bool isInfra = !closed && IsInfraStuck(w);
+        bool isInfra = !closed && !internalControl && IsInfraStuck(w);
         bool isLocalRuntimeWait = !closed
             && status == "waiting_runtime"
             && string.Equals(S(w, "execution_profile"), "LOCAL_LOOP", StringComparison.OrdinalIgnoreCase)
             && string.Equals(S(w, "runtime_resume_allowed"), "True", StringComparison.OrdinalIgnoreCase);
         // Attention lane: stuck/maxturns/error and NOT yet expanded -- gets recovery surface treatment.
         // INFRA_STUCK is carved out of the red attention lane (handled by its own infra branch).
-        bool isAttention = !closed && !isInfra && IsAttentionStatus(status);
+        bool isAttention = !closed && IsOperatorAttention(w);
 
         // The chip carries the status. There used to be a 3px coloured rail down the left edge of
         // every row as well, and removing it cost nothing measurable: the chip sits at a nearly
@@ -13259,7 +13312,8 @@ class CockpitWindow : Window
         // chip, not the rail thirty pixels to its left. The rail restated what the chip already
         // said, in the one shape the operator has objected to for months.
         bool isDone = status == "done" || string.Equals(S(w, "outcome"), "DONE", StringComparison.OrdinalIgnoreCase);
-        string chipKind = isDone ? "success" : (isInfra ? "warning" : Theme.StatusKind(status));
+        string chipKind = internalControl ? "neutral"
+            : (isDone ? "success" : (isInfra ? "warning" : Theme.StatusKind(status)));
 
         // Pass A2-1 TASK 1: demote the collapsed row to a LEDGER ROW.
         // - No rounded corners, no card background fill, no full border.
@@ -13342,8 +13396,11 @@ class CockpitWindow : Window
                 });
             }
 
-            menuLabels.Add(T("rerun_same"));
-            menuActions.Add(delegate { RetryGoal(wt2); ShowScaleToast(T("rerun_started")); });
+            if (!IsLocalLoopControlGoal(goal))
+            {
+                menuLabels.Add(T("rerun_same"));
+                menuActions.Add(delegate { RetryGoal(wt2); ShowScaleToast(T("rerun_started")); });
+            }
 
             menuLabels.Add(null);
             menuActions.Add(null);
@@ -13377,7 +13434,9 @@ class CockpitWindow : Window
         var left = new DockPanel { LastChildFill = true };
         var chev = ChevronToggle(name, isOpen); DockPanel.SetDock(chev, Dock.Left); left.Children.Add(chev);
         // INFRA_STUCK -> distinct ORANGE インフラ待ち pill; otherwise the normal status label.
-        var chip = Pill(isInfra ? T("infra_wait") : Theme.StatusLabel(status, _lang), chipKind);
+        var chip = Pill(internalControl
+            ? (_lang == 0 ? "内部制御" : "Internal control")
+            : (isInfra ? T("infra_wait") : Theme.StatusLabel(status, _lang)), chipKind);
         chip.Margin = new Thickness(2, 0, 5, 0);
         DockPanel.SetDock(chip, Dock.Left); left.Children.Add(chip);
         // AGENT BADGE (P0 feature 4): which agent this conversation is bound to. Green subtle badge
@@ -14935,6 +14994,15 @@ class CockpitWindow : Window
     // The auto-retry scanner only calls this while live, so its add_goal path is unchanged.
     void RetryGoal(Dictionary<string, object> w)
     {
+        string goal = S(w, "goal");
+        if (string.IsNullOrEmpty(goal)) return;
+        if (IsLocalLoopControlGoal(goal))
+        {
+            if (_startNote != null) _startNote.Text = _lang == 0
+                ? "これはLOCAL_LOOPの内部制御記録です。通常Fleetとして再実行せず、耐久タスクのカードから再開してください。"
+                : "This is a LOCAL_LOOP control record. Do not rerun it as Fleet work; resume the durable task card instead.";
+            return;
+        }
         if (RunIsLive())
         {
             SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
@@ -14944,8 +15012,6 @@ class CockpitWindow : Window
             NoteSubmitted(new List<string> { S(w, "goal") }, submitBaseline);
             return;
         }
-        string goal = S(w, "goal");
-        if (string.IsNullOrEmpty(goal)) return;
         try { SpawnFleet(new List<string> { goal }, "retry_input.txt"); _lastSig = ""; } catch (Exception) { }
     }
 
@@ -14975,7 +15041,7 @@ class CockpitWindow : Window
             // Same closed set as AutoRetryScan and as relay/outcomes.py. "Retry all" used to
             // mean "everything that is not DONE", which swept up fan-out parents and threw
             // away the merged answers they carried.
-            if (!IsRetryableOutcome(S(w, "outcome"))) continue;
+            if (!IsRetryableWorker(w)) continue;
             string g = S(w, "goal");
             // Same counter, same key (goal text), same ceiling as AutoRetryScan, so the auto
             // and manual paths cannot each spend a full allowance on the same goal.

@@ -103,6 +103,7 @@ def test_local_loop_control_provenance_is_refused_before_queueing(source):
 
 @pytest.mark.parametrize("goal", [
     "Execute LOCAL_LOOP job companion_20260929_012240_0dcf12d3_30f0 (seq=1, worker=local_x).",
+    "Run LOCAL_LOOP job companion_20260929_012240_0dcf12d3_30f0 (seq=1, worker=local_x).",
     "LOCAL_LOOP RUN companion_20260929_012240_0dcf12d3_30f0 seq=1 worker=local_x",
     "LOCAL_LOOP bootstrap companion_20260929_012240_0dcf12d3_30f0",
 ])

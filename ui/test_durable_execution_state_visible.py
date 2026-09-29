@@ -100,3 +100,45 @@ def test_waiting_runtime_status_has_a_human_label():
     assert '{ "waiting_runtime", "warning" }' in theme
     assert 'case "waiting_runtime"' in theme
     assert 'Runtime paused' in theme
+
+
+def _method(src, start, end):
+    i = src.index(start)
+    return src[i:src.index(end, i)]
+
+
+def test_local_loop_control_artifacts_never_use_generic_fleet_retry():
+    helper = _method(SOURCE, "static bool IsLocalLoopControlGoal(", "static bool IsOperatorAttention(")
+    for prefix in ("execute local_loop job ", "run local_loop job ", "local_loop run ",
+                   "local_loop bootstrap ", "local_loop protocol "):
+        assert prefix in helper.lower()
+
+    retry = _method(SOURCE, "void RetryGoal(Dictionary<string, object> w)", "int RetryAllShown(")
+    assert retry.index('IsLocalLoopControlGoal(goal)') < retry.index('RunIsLive()')
+
+    auto = _method(SOURCE, "void AutoRetryScan(Dictionary<string, object> root)", "Dictionary<string, object> ReadStatus()")
+    assert 'IsRetryableWorker(w)' in auto
+
+    bulk = _method(SOURCE, "int RetryAllShown(", "static readonly string[] _retryableOutcomes")
+    assert 'IsRetryableWorker(w)' in bulk
+
+    spawn = _method(SOURCE, "bool SpawnFleet(List<string> goals", "static bool FreshRunContainsGoals(")
+    assert 'IsLocalLoopControlGoal(SubmittedTasks.GoalTextOf(' in spawn
+
+
+def test_internal_control_stuck_rows_are_not_operator_attention():
+    helper = _method(SOURCE, "static bool IsOperatorAttention(", "static bool IsRetryableWorker(")
+    assert '!IsLocalLoopControlGoal(S(w, "goal"))' in helper
+    assert '!IsInfraStuck(w)' in helper
+
+    header = SOURCE[SOURCE.index('int cntAttn = 0;'):SOURCE.index('string triple;', SOURCE.index('int cntAttn = 0;'))]
+    assert 'IsOperatorAttention(ww2)' in header
+
+    card = _method(SOURCE, "Border Card(Dictionary<string, object> w)", "UIElement BuildCardTabs(")
+    assert 'bool isAttention = !closed && IsOperatorAttention(w);' in card
+    assert 'if (!IsLocalLoopControlGoal(goal))' in card
+
+    hist = _method(SOURCE, "Border HistoryRow(Dictionary<string, object> e)", "static bool IsAttentionStatus(")
+    assert 'bool internalControl = IsLocalLoopControlGoal(S(e, "goal"));' in hist
+    assert 'Internal control' in hist
+    assert 'if (!internalControl)' in hist

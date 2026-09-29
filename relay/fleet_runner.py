@@ -77,6 +77,7 @@ from relay.copilot_autopilot_relay import default_notify  # noqa: E402
 from relay.refuter import PANEL_LENSES  # noqa: E402
 from relay.fanout import fanout_family_view  # noqa: E402
 from relay.control_markers import CLOSING_INSTRUCTION  # noqa: E402
+from relay.control_envelopes import is_local_loop_control_submission  # noqa: E402
 
 
 # ── COORDINATOR OUTPUT CAPTURE (TEE) ────────────────────────────────────────────
@@ -1285,6 +1286,16 @@ def _read_goals(args):
     if args.goals_file:
         goals.extend(_read_goals_file(args.goals_file))
     return goals
+
+
+def reject_local_loop_control_goals(goals):
+    """Return launch-admission errors for internal LOCAL_LOOP envelopes in ordinary Fleet goals."""
+    errors = []
+    for i, item in enumerate(goals or []):
+        text = item.get("text", "") if isinstance(item, dict) else str(item or "")
+        if is_local_loop_control_submission(text):
+            errors.append("goal %d: LOCAL_LOOP control envelope is not Fleet work" % (i + 1))
+    return errors
 
 
 def _pending_gates(started=0.0):
@@ -2561,12 +2572,16 @@ def _validate_command(cmd, state_dir):
 
 def _goal_item_error(it):
     if isinstance(it, str):
+        if is_local_loop_control_submission(it):
+            return "LOCAL_LOOP control envelope is not Fleet work"
         return "" if _text_ok(it) else "text longer than %d chars" % MAX_COMMAND_TEXT
     if not isinstance(it, dict):
         return "an entry is %s, not text or an object" % type(it).__name__
     extra = sorted(str(k)[:20] for k in it if k not in _GOAL_KEYS)
     if extra:
         return "unknown key(s) %s" % extra[:5]
+    if it.get("text") is not None and is_local_loop_control_submission(it.get("text")):
+        return "LOCAL_LOOP control envelope is not Fleet work"
     if it.get("text") is not None and not _text_ok(it["text"]):
         return "text must be a string of at most %d chars" % MAX_COMMAND_TEXT
     if it.get("follow_up_to") is not None and not _text_ok(it["follow_up_to"]):
@@ -3371,6 +3386,16 @@ def main():
             _ACTIVE_RUN_LOCK = None
             return 4
 
+    _cli_goals = _read_goals(args)
+    _control_errors = reject_local_loop_control_goals(_cli_goals)
+    if _control_errors:
+        if _adopt_claim is not None:
+            restore_command_claim(_adopt_claim)
+        print("REFUSING TO START: %s" % "; ".join(_control_errors), flush=True)
+        _release_run_lock(_ACTIVE_RUN_LOCK)
+        _ACTIVE_RUN_LOCK = None
+        return 4
+
     # Capture the coordinator's own stdout/stderr to a durable log under state_dir, from
     # here (right after argparse) so it covers argparse-error exits too, regardless of
     # which launcher started this process. Best-effort -- never crashes on failure.
@@ -3380,7 +3405,7 @@ def main():
     # goal given on the command line appeared nowhere until the run was already going, so a run
     # that died on a precondition left the operator unable to tell it from a command never
     # typed. Cleared at run start, where the goals ledger takes over.
-    _cli_queue_paths = _record_cli_submission(args.state_dir, _adopt_goals + _read_goals(args), sys.argv)
+    _cli_queue_paths = _record_cli_submission(args.state_dir, _adopt_goals + _cli_goals, sys.argv)
 
     # RETENTION RUNS ONCE, HERE, AND NOT ON A TIMER -- the same reasoning as the session
     # store's pass: a sweep that can fire mid-run is a sweep that can delete the transcript
@@ -3460,7 +3485,7 @@ def main():
     print("[effort] %s  (refuter=%s lenses=%s refute<=%d research<=%d)"
           % (_eff, args.refuter, args._lenses, args.max_refute, args.max_research))
 
-    goals = _adopt_goals + _read_goals(args)
+    goals = _adopt_goals + _cli_goals
 
     # THE LENS IS CHOSEN BEFORE THE GOALS ARE READ, AND THE GOALS ARE THE EVIDENCE.
     #
@@ -3508,6 +3533,17 @@ def main():
         if not goals:
             # everything finished (and no new -g/--goals-file goals) -> nothing to launch.
             sys.exit(0)
+
+    # RESUME IS AN INGRESS TOO. An old run ledger may predate the intake guards above (the
+    # 2026-09-29 incident left LOCAL_LOOP wrapper text in last_run_goals.json). Never let a
+    # supervisor/manual --resume turn that historical protocol artifact back into Fleet work.
+    _control_errors = reject_local_loop_control_goals(goals)
+    if _control_errors:
+        print("REFUSING TO START: %s" % "; ".join(_control_errors), flush=True)
+        _release_run_lock(_ACTIVE_RUN_LOCK)
+        _ACTIVE_RUN_LOCK = None
+        return 4
+
     if not goals:
         if args.resume:
             ap.error("no goals -- --resume found an empty ledger and no -g/--goals-file given")
