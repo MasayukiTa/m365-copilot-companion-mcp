@@ -206,6 +206,6 @@ def test_codeql_suppression_is_tied_to_the_sink_guard():
     assert "_assert_no_plaintext_auth_escalation(path, text)" in src
     lines = src.splitlines()
     i = next(i for i, line in enumerate(lines) if "fh.write(data)" in line)
-    assert "# codeql[py/clear-text-storage-sensitive-data]" in lines[i]
+    assert "# codeql[py/clear-text-storage-sensitive-data]" in lines[i - 1]
     guard_i = next(i for i, line in enumerate(lines) if "_assert_no_plaintext_auth_escalation(path, text)" in line and not line.lstrip().startswith("def "))
     assert guard_i < i
