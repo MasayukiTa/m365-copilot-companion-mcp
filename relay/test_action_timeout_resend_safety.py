@@ -83,3 +83,33 @@ def test_checkably_absent_action_may_retry(monkeypatch):
     assert w.poll() is False
     assert w.retried is True
     assert w.refused is None
+
+
+def test_transport_policy_import_failure_is_fail_closed_and_observable(monkeypatch, capsys):
+    import builtins
+
+    events = []
+    route = SimpleNamespace(record=lambda event, **fields: events.append((event, fields)))
+    monkeypatch.setattr(RF, "_socket_route", lambda: route)
+
+    real_import = builtins.__import__
+    def broken_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "relay.transport_policy" and "resend_decision_for_landed_act" in tuple(fromlist or ()):
+            raise ImportError("synthetic transport policy load failure")
+        return real_import(name, globals, locals, fromlist, level)
+    monkeypatch.setattr(builtins, "__import__", broken_import)
+
+    w = SimpleNamespace(
+        goal="send an email", name="w9", turn=7,
+        _goal_may_act=lambda: True, _effect_checker=lambda: None,
+    )
+    assert RF.RelayWorker._timeout_resend_decision(w) == "refuse"
+    assert events and events[0][0] == "resend_policy_error"
+    fields = events[0][1]
+    assert fields["worker"] == "w9"
+    assert fields["turn"] == 7
+    assert fields["error_type"] == "ImportError"
+    assert "synthetic transport policy load failure" not in repr(fields)
+    out = capsys.readouterr().out
+    assert "resend policy unavailable" in out
+    assert "ImportError" in out
