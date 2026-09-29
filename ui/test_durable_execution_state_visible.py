@@ -142,3 +142,13 @@ def test_internal_control_stuck_rows_are_not_operator_attention():
     assert 'bool internalControl = IsLocalLoopControlGoal(S(e, "goal"));' in hist
     assert 'Internal control' in hist
     assert 'if (!internalControl)' in hist
+
+
+def test_collapsed_card_does_not_repeat_the_full_goal_as_current_step():
+    card = _method(SOURCE, "Border Card(Dictionary<string, object> w)", "UIElement BuildCardTabs(")
+    assert 'bool currentStepRepeatsGoal = string.Equals(' in card
+    assert '!currentStepRepeatsGoal' in card
+    # Expanded execution details keep the authoritative raw current_step visible.
+    detail = _method(SOURCE, "UIElement ExecutionOverview(Dictionary<string, object> w)", "UIElement TabOverview(")
+    assert 'string current = S(execution, "current_step");' in detail
+    assert 'head += " · " + current' in detail or 'head += " �E " + current' in detail
