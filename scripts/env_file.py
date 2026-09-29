@@ -125,7 +125,8 @@ def atomic_write_text(path: Path, text: str, attempts: int = 10) -> None:
             # exist. Protected auth values are DPAPI ciphertext; CodeQL cannot infer either our
             # explicit key-level rejection or the ctypes CryptProtectData sanitizer. The
             # suppression is attached to the exact sink because CodeQL cannot model DPAPI.
-            fh.write(data)  # codeql[py/clear-text-storage-sensitive-data]
+            # codeql[py/clear-text-storage-sensitive-data]
+            fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
         last = None
