@@ -1110,6 +1110,15 @@ class CockpitWindow : Window
     // component -- bridge/copilot_bridge.py + tools/tool_probe.py -- this file only reads it).
     enum HealthState { Gray = 0, Green = 1, Yellow = 2, Red = 3, Checking = 4 }
     class DotState { public HealthState State = HealthState.Gray; public string Detail = ""; public DateTime Checked = DateTime.MinValue; }
+    class PlannedServerTransition
+    {
+        public string State = "";
+        public string Reason = "";
+        public double Started = 0;
+    }
+    // A planned stale-code cycle normally takes only seconds.  Sixty seconds covers slow import /
+    // bind on a loaded workstation but cannot turn a forgotten marker into a permanent false-green.
+    const double SERVER_TRANSITION_MAX_AGE_S = 60.0;
     // Index map: 0=server 1=tunnel 2=edge 3=signin 4=agent 5=tool(bridge probe).
     // SIZED BY THE COUNT, never by however many literals somebody typed. This was six
     // `new DotState()` in a row. Adding a seventh dot compiled cleanly, and the first
@@ -2675,10 +2684,40 @@ class CockpitWindow : Window
         }
     }
 
+    PlannedServerTransition ReadPlannedServerTransition()
+    {
+        try
+        {
+            string path = Path.Combine(RepoRootForSettings(), ".fleet", "server_transition.json");
+            if (!File.Exists(path)) return null;
+            var raw = _js.DeserializeObject(File.ReadAllText(path, Encoding.UTF8)) as Dictionary<string, object>;
+            if (raw == null) return null;
+            object stateObj, reasonObj, startedObj;
+            if (!raw.TryGetValue("state", out stateObj) || stateObj == null) return null;
+            string state = Convert.ToString(stateObj).Trim().ToLowerInvariant();
+            if (state != "planned_restart") return null;
+            if (!raw.TryGetValue("started", out startedObj) || startedObj == null) return null;
+            double started = Convert.ToDouble(startedObj, System.Globalization.CultureInfo.InvariantCulture);
+            double age = NowUnix() - started;
+            if (age < -5.0 || age > SERVER_TRANSITION_MAX_AGE_S) return null;
+            string reason = "planned restart";
+            if (raw.TryGetValue("reason", out reasonObj) && reasonObj != null)
+                reason = Convert.ToString(reasonObj).Trim();
+            if (string.IsNullOrEmpty(reason)) reason = "planned restart";
+            return new PlannedServerTransition { State = state, Reason = reason, Started = started };
+        }
+        catch (Exception)
+        {
+            // An unreadable transition is not permission to soften a red health signal.
+            return null;
+        }
+    }
+
     // One full infra sweep. Writes results into _health under _healthLock.
     void PollHealthOnce()
     {
         DateTime now = DateTime.UtcNow;
+        PlannedServerTransition plannedRestart = ReadPlannedServerTransition();
 
         // 0) Server: GET http://127.0.0.1:8000/health, and READ WHAT IT SAYS.
         //
@@ -2715,7 +2754,14 @@ class CockpitWindow : Window
         // scripts/stale_server_check.classify_staleness.
         string codeState = HealthField(srvBody, "server_code");
         if (!srvOk)
-            SetDot(0, HealthState.Red, T("hs_srv_detail_bad"), now);
+        {
+            if (plannedRestart != null)
+                SetDot(0, HealthState.Yellow,
+                       (_lang == 0 ? "計画されたサーバ再起動中: " : "Planned server restart in progress: ")
+                       + plannedRestart.Reason, now);
+            else
+                SetDot(0, HealthState.Red, T("hs_srv_detail_bad"), now);
+        }
         else if (authStorm)
             SetDot(0, HealthState.Yellow,
                    T("hs_srv_detail_auth") + " (" + authFails + ")", now);
@@ -2794,7 +2840,16 @@ class CockpitWindow : Window
             string locPid = HealthField(srvBody, "server_pid");
             bool pidsDisagree = tunPid.Length > 0 && locPid.Length > 0 && tunPid != locPid;
             if (!tunOk)
-                SetDot(1, HealthState.Red, T("hs_tun_detail_bad"), now);
+            {
+                // If the local server is deliberately between processes, the tunnel cannot reach
+                // it either.  That is the same planned transition, not a second independent fault.
+                if (plannedRestart != null && !srvOk)
+                    SetDot(1, HealthState.Yellow,
+                           (_lang == 0 ? "計画されたサーバ再起動に伴いトンネル待機中"
+                                       : "Tunnel waiting for the planned server restart"), now);
+                else
+                    SetDot(1, HealthState.Red, T("hs_tun_detail_bad"), now);
+            }
             else if (pidsDisagree)
                 SetDot(1, HealthState.Yellow,
                        T("hs_tun_detail_other") + " (" + tunPid + " != " + locPid + ")", now);
