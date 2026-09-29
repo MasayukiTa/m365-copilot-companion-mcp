@@ -6632,6 +6632,24 @@ class RelayWorker:
                 cached = self._acting_goal = True      # unknown goes to the careful side
         return cached
 
+    def _timeout_resend_decision(self):
+        """Whether a timed-out turn may be sent again without risking a duplicate effect.
+
+        A turn that reached ``waiting`` was submitted successfully. If no answer comes back we
+        know nothing about whether the agent already performed its side effect. Use the exact
+        same action/effect policy as socket reconnect: reads are safe to repeat; an acting goal
+        is repeated only when an observable effect checker can establish that the effect is absent.
+        Unknown goes to the careful side.
+        """
+        if not self._goal_may_act():
+            return "resend"
+        try:
+            from relay.transport_policy import resend_decision_for_landed_act
+            return resend_decision_for_landed_act(
+                self.goal or "", checker=self._effect_checker())
+        except Exception:
+            return "refuse"
+
     def _refuse_resend(self, reason, delivery):
         """End the worker rather than repeat an act it cannot verify. Never silent."""
         self.status, self.outcome = "stuck", "STUCK"
@@ -7158,7 +7176,17 @@ class RelayWorker:
                     )[:500]
                     self._settle_done(outcome_override="EVIDENCE_CONTRADICTED")
                     return True
-                # a turn with NO reply is a transient stall -- retry before STUCK
+                # A turn with no reply MAY already have executed. Reads are safe to repeat,
+                # but an acting goal (mail/send/write/etc.) must use the same duplicate-effect
+                # rule as socket reconnect. Measured r6abb8657_a0/w17: an audit allowed one md
+                # write, timed out seven times, and was blindly re-sent every ~240s.
+                _timeout_policy = getattr(self, "_timeout_resend_decision", None)
+                _timeout_resend = _timeout_policy() if callable(_timeout_policy) else "resend"
+                if _timeout_resend != "resend":
+                    self._note_timeout(_origin, _elapsed, "resend-refused", budget_s=_bound)
+                    self._refuse_resend("turn timeout without a reply", "unknown")
+                    return True
+                # Read-only / checkably-absent work keeps the existing transient retry path.
                 if self._retry_transient():
                     self._note_timeout(_origin, _elapsed, "retry", budget_s=_bound)
                     self.reason = "turn timeout -> retry %d/%d" % (self.transient, self.max_transient)
