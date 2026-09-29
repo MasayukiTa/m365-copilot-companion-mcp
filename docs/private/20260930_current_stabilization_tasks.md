@@ -35,7 +35,7 @@ Acceptance:
 - no old handoff is treated as the current task list without reconciling this file first.
 
 ### STAB-002 -- FleetCockpit left panel: `実行タイムライン` -> `内容詳細`
-Status: REOPENED / REQUIREMENT DRIFT
+Status: PATCH VALIDATED LOCALLY / LIVE TASK RE-VERIFY PENDING
 
 User reports that the intended/current change is to replace the execution-timeline presentation with `内容詳細`, but neither the current local source nor git history contains `内容詳細`.
 
@@ -50,6 +50,21 @@ Acceptance:
 - the operator-facing left panel matches the intended `内容詳細` UX rather than being silently restored to the old timeline;
 - tests assert the NEW contract, not the old timeline wording;
 - full underlying events/history remain available where required for evidence/debugging.
+
+2026-09-30 stabilization patch:
+- the 220px left Spine no longer renders a second execution timeline; its section is now `内容詳細` / `Content details`;
+- it follows `SpineFocusWorker`, so opening another worker changes the inspected task exactly as before;
+- normal Fleet rows show compact task identity + status/turn/reason; durable rows additionally show execution state, current step, progress, next step, waiting reason and up to five artifacts;
+- the repaint signature now tracks those content fields instead of `phase_events` count;
+- authoritative `phase_events` / timeline colors / historical wording remain in the expanded card `Timeline` section, so evidence was not deleted;
+- full goal text remains in the expanded Overview; the left panel uses `goal_summary` with the old `CardTitle` fallback for legacy snapshots.
+
+Validation:
+- focused/new left-spine contract: 5 passed;
+- related timeline/selection/approval/left-rail set: 60 passed;
+- rebuilt FleetCockpit + CopilotChat successfully; post-build related UI set: 74 passed;
+- both UI processes launched from the rebuilt binaries;
+- idle Fleet hides the Spine by design, so one live-task visual/UIA verification is still required before CLOSED.
 
 ### STAB-003 -- foreground PowerShell / cmd window when CopilotAgent opens or work is submitted
 Status: PATCH VALIDATED LOCALLY / LIVE RE-VERIFY PENDING
@@ -154,6 +169,9 @@ The old 2026-09-28 handoff saying "main CI is red" is stale. PR #66 head `16c8c2
 
 For the current follow-up branch, re-check all relevant GitHub runs after each atomic push. A green historical main does not make the present branch green.`r`n`r`n2026-09-30 after push `cca3295`: CI, Windows build, Install path, CodeQL, Secret scan, PowerShell lint and Workflow lint all started and were **in progress** at the first check. Current `main` head `b235e01` shows all seven corresponding workflows **success**; the older `1183e6f` CI failure is superseded.
 
+
+2026-09-30 pre-STAB-002 head `c2f2416`: PR #67 was CLEAN/MERGEABLE and CI, Windows build, Install path, CodeQL (Python + C#), Secret scan, PowerShell lint and Workflow lint were all SUCCESS. The STAB-002 patch below creates a new head and therefore requires a fresh check after push.
+
 ## P1 -- follow-up after P0 stability
 
 ### STAB-101 -- GUI-visible CopilotAgent route remains mandatory
@@ -185,3 +203,4 @@ These do not outrank the live P0 regressions above unless they become direct blo
 - 2026-09-30: ledger created after user identified task-tracking drift. Reopened `内容詳細`, foreground-console, long-wait, submission-visibility and health-signal items; recorded current uncommitted resend-policy work and corrected stale main-CI status.
 - 2026-09-30: STAB-007 resend-policy repair validated: 36 focused tests green; broader related set 88 passed / 2 skipped; committed atomically and pushed as `cca3295`. Pre-commit identity guard caught a repository-specific label in this private ledger; it was replaced with a generic placeholder rather than bypassing the guard.
 - 2026-09-30: STAB-003 foreground-console investigation ruled out C2C/Cockpit/Edge headless launchers, found eight recent nested `submit_via_ui.ps1` PowerShell starts and four tracked automation callers that created a redundant child shell. Those callers were converted to in-process invocation; parser 0/4 and 14 related tests green. Live re-verification remains pending.
+- 2026-09-30: STAB-002 operator-facing left Spine changed from the duplicate execution timeline to `内容詳細`. Timeline evidence remains in expanded cards. New/related tests 60 green; rebuilt-binary UI set 74 green. Live-task visual verification remains pending because the current Fleet is idle and hides the Spine.
