@@ -263,21 +263,21 @@ static class Theme
         string key = StatusKey(canonical);
         switch (key)
         {
-            case "pending":     return jp ? "キュー待ち"             : "Queued";
+            case "pending":     return jp ? "待機"                   : "Queued";
             case "ready":       return jp ? "開始"                   : "Starting";
             case "waiting":     return jp ? "実行中"                 : "Running";
             case "researching": return jp ? "調査中"                 : "Researching";
             case "refuting":    return jp ? "レビュー中"             : "Reviewing";
             case "verifying":   return jp ? "検証中"                 : "Verifying";
             case "waiting_runtime": return jp ? "実行環境待ち"       : "Runtime paused";
-            case "awaiting":    return jp ? "入力待ち"               : "Needs input";
+            case "awaiting":    return jp ? "承認待ち"               : "Needs input";
             case "awaiting_gate": return jp ? "承認待ち"             : "Needs approval";
             case "done":        return jp ? "完了"                   : "Done";
             case "stuck":       return jp ? "要対応"                 : "Needs attention";
             case "maxturns":    return jp ? "要対応"                 : "Needs attention";
-            case "error":       return jp ? "エラー停止"             : "Stopped (error)";
+            case "error":       return jp ? "停止(エラー)"           : "Stopped (error)";
             case "cancelled":   return jp ? "停止"                   : "Stopped";
-            case "freed":       return jp ? "解放済み"               : "Released";
+            case "freed":       return jp ? "解放済"                 : "Released";
             case "job_created": return jp ? "ジョブ作成"             : "Job created";
             case "job_cancelled": return jp ? "ジョブ停止"           : "Job cancelled";
             case "ui_trigger_attempt": return jp ? "UI起動試行"       : "UI trigger attempt";

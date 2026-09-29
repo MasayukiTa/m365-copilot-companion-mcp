@@ -5065,7 +5065,7 @@ class CockpitWindow : Window
             ? (ja ? "(フェーズ遷移)" : "(phase transitions)")
             // "from turns" did not say that these times are INFERRED. That was the whole content
             // of the [COMPUTED] tag underneath, so it moves up here where it is read first.
-            : (ja ? "(ターン記録から推定)" : "(estimated from turns)");
+            : (ja ? "(会話ターンから推定)" : "(estimated from turns)");
         subLbl.Foreground = Theme.Br(Theme.Faint(_dark));
         subLbl.FontSize = 9.5;
         subLbl.Margin = new Thickness(0, 0, 0, 8);
@@ -5221,7 +5221,7 @@ class CockpitWindow : Window
         string danger = Theme.Warning(_dark);
 
         // Marker 1: Queued / directive received
-        string qLabel = Theme.StatusLabel("pending", _lang);
+        string qLabel = ja ? "投入" : "Queued";
         string qTime = fmtHM(metaTs);
         events.Add(new Tuple<string, string, string>(qLabel, qTime, graphite));
 
@@ -5245,7 +5245,7 @@ class CockpitWindow : Window
         string sTime = fmtHM(firstTurnTs);
         if (firstTurnTs > 0 && sTime != "" && sTime != qTime)
         {
-            string sLabel = Theme.StatusLabel("ready", _lang);
+            string sLabel = ja ? "開始" : "Started";
             events.Add(new Tuple<string, string, string>(sLabel, sTime, live));
         }
 
@@ -5256,22 +5256,22 @@ class CockpitWindow : Window
             string phColor;
             if (overallPhase == "attn")
             {
-                phLabel = Theme.StatusLabel("stuck", _lang);
+                phLabel = ja ? "要対応" : "Needs attention";
                 phColor = attn;
             }
             else if (overallPhase == "verifying")
             {
-                phLabel = Theme.StatusLabel("verifying", _lang);
+                phLabel = ja ? "検証中" : "Verifying";
                 phColor = attn;
             }
             else if (overallPhase == "running")
             {
-                phLabel = Theme.StatusLabel("waiting", _lang);
+                phLabel = ja ? "実行中" : "Running";
                 phColor = live;
             }
             else
             {
-                phLabel = Theme.StatusLabel("waiting", _lang);
+                phLabel = ja ? "実行中" : "Running";
                 phColor = live;
             }
             string nowTime = fmtHM(NowUnix());
@@ -14328,12 +14328,12 @@ class CockpitWindow : Window
 
         var evs = new List<Tuple<string, string>>();
         string queuedTs = hasTs ? fmtTs(metaTs) : "";
-        evs.Add(new Tuple<string, string>(queuedTs + Theme.StatusLabel("pending", _lang), Theme.TimelineColor("pending", _dark)));
+        evs.Add(new Tuple<string, string>(queuedTs + (ja ? "投入" : "Queued"), Theme.TimelineColor("pending", _dark)));
         string startTs = (firstTurnTs > 0) ? fmtTs(firstTurnTs) : "";
-        evs.Add(new Tuple<string, string>(startTs + Theme.StatusLabel("ready", _lang), Theme.TimelineColor("ready", _dark)));
+        evs.Add(new Tuple<string, string>(startTs + (ja ? "開始" : "Started"), Theme.TimelineColor("ready", _dark)));
         if (reviews > 0)
             evs.Add(new Tuple<string, string>(
-                ja ? ("レビュー (" + reviews + "回)") : ("Reviewed (" + reviews + "x)"),
+                ja ? ("レビュー (" + reviews + "x)") : ("Reviewed (" + reviews + "x)"),
                 Theme.TimelineColor("refuting", _dark)));
         if (terminal)
         {
@@ -14342,8 +14342,8 @@ class CockpitWindow : Window
             switch (outcome)
             {
                 case "DONE":      outcomeEv = ja ? "完了" : "Completed"; outcomeKey = "done"; break;
-                case "MAXTURNS":  outcomeEv = ja ? "最大ターン到達" : "Max turns reached"; outcomeKey = "maxturns"; break;
-                case "STUCK":     outcomeEv = ja ? "要対応" : "Stuck"; outcomeKey = "stuck"; break;
+                case "MAXTURNS":  outcomeEv = ja ? "ターン上限" : "Max turns reached"; outcomeKey = "maxturns"; break;
+                case "STUCK":     outcomeEv = ja ? "停滞" : "Stuck"; outcomeKey = "stuck"; break;
                 case "ERROR":     outcomeEv = ja ? "エラー" : "Error"; outcomeKey = "error"; break;
                 case "CANCELLED": outcomeEv = ja ? "停止" : "Cancelled"; outcomeKey = "cancelled"; break;
                 case "EVIDENCE_CONTRADICTED": outcomeEv = ja ? "記録と矛盾" : "Contradicted"; outcomeKey = "stuck"; break;
