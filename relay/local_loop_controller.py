@@ -802,6 +802,15 @@ def _protocol_bootstrap_trigger(base_trigger: str, job_id: str, seq: int, worker
     )
 
 
+def _missing_protocol_wait_reason(attempts: int) -> str:
+    return (
+        "LOCAL_LOOP agent instructions appear missing or stale: browser answered "
+        f"without commit after {int(attempts)} protocol bootstrap attempt(s). "
+        "Update/publish docs/examples/local_loop_agent_instructions.txt in the "
+        "Copilot Studio agent instructions, reconnect MCP, then resume."
+    )
+
+
 class LocalLoopController:
     def __init__(self, store: LocalJobStore, job_id: str, driver,
                  status_path: str | os.PathLike | None = None,
@@ -1103,12 +1112,7 @@ class LocalLoopController:
             )
             if bootstrap_required:
                 if bootstrap_sent >= self.max_protocol_bootstrap_attempts:
-                    reason = (
-                        "LOCAL_LOOP agent instructions appear missing or stale: browser answered "
-                        f"without commit after {bootstrap_sent} protocol bootstrap attempt(s). "
-                        "Update/publish docs/examples/local_loop_agent_instructions.txt in the "
-                        "Copilot Studio agent instructions, reconnect MCP, then resume."
-                    )
+                    reason = _missing_protocol_wait_reason(bootstrap_sent)
                     self.store.mark_waiting_runtime(self.job_id, reason)
                     self._project()
                     return "WAITING_RUNTIME"
@@ -1149,6 +1153,18 @@ class LocalLoopController:
             if commit is not None and commit.get("status") == "NO_COMMIT_AFTER_RESPONSE":
                 reason = NO_COMMIT_REASON
                 self.store.retry_uncommitted_turn(self.job_id, seq, reason)
+                bootstrap_attempt_used = bootstrap_sent + (1 if bootstrap_required else 0)
+                exhausted = (
+                    (bootstrap_required and
+                     bootstrap_attempt_used >= self.max_protocol_bootstrap_attempts)
+                    or (not bootstrap_required and self.max_protocol_bootstrap_attempts == 0)
+                )
+                if exhausted:
+                    self.store.mark_waiting_runtime(
+                        self.job_id, _missing_protocol_wait_reason(bootstrap_attempt_used),
+                    )
+                    self._project()
+                    return "WAITING_RUNTIME"
                 if not self._rotate("response finished without commit"):
                     self.store.mark_waiting_runtime(
                         self.job_id, reason + "; no replacement conversation",
