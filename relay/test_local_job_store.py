@@ -472,3 +472,46 @@ def test_console_snapshot_exposes_runtime_resume_metadata(tmp_path):
     assert worker["execution_profile"] == "LOCAL_LOOP"
     assert worker["runtime_resume_allowed"] is True
     assert worker["local_job_db"] == str(store.path)
+
+@pytest.mark.parametrize("operation", ["heartbeat", "commit", "abort", "read_context"])
+def test_current_lease_with_stale_fencing_token_is_rejected_on_every_guarded_path(tmp_path, operation):
+    """The lease id may still be current while an older controller holds a stale fence.
+
+    This is distinct from LEASE_MISMATCH and is the case fencing_token exists to reject.
+    Every API that can mutate/read a leased turn must name FENCE_MISMATCH for that condition.
+    """
+    store = _store(tmp_path)
+    store.create_job(_job(), now=0)
+    claim = store.claim_turn("job_1", 1, "current-worker", lease_seconds=60, now=1)
+    stale_fence = claim["fencing_token"] - 1
+
+    with pytest.raises(JobStoreError) as stale:
+        if operation == "heartbeat":
+            store.heartbeat(
+                "job_1", 1, claim["lease_id"], stale_fence,
+                "RUNNING", "stale controller", now=2,
+            )
+        elif operation == "commit":
+            store.commit_turn(
+                "job_1", 1, claim["lease_id"], stale_fence,
+                "CANDIDATE_DONE", "stale result", now=2,
+            )
+        elif operation == "abort":
+            store.abort_turn(
+                "job_1", 1, claim["lease_id"], stale_fence,
+                "NETWORK", "stale abort", True, now=2,
+            )
+        else:
+            store.read_job_context(
+                "job_1", 1, claim["lease_id"], stale_fence,
+                ["task"], now=2,
+            )
+
+    assert stale.value.code == "FENCE_MISMATCH"
+
+    # A rejected stale controller must not invalidate the current owner's lease.
+    hb = store.heartbeat(
+        "job_1", 1, claim["lease_id"], claim["fencing_token"],
+        "RUNNING", "current controller still owns the turn", now=2.5,
+    )
+    assert hb["ok"] is True
