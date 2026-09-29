@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import os
-import subprocess
 from pathlib import Path
 
 import pytest
+
+from tools import childproc
 
 REPO = Path(__file__).resolve().parents[1]
 UI = REPO / "ui"
@@ -53,11 +54,11 @@ def test_submitted_rows_reconcile_against_new_history_without_swallowing_retries
     h = tmp_path / "H.cs"
     h.write_text(HARNESS, encoding="utf-8")
     exe = tmp_path / "H.exe"
-    r = subprocess.run([str(CSC), "/nologo", "/target:exe", "/out:" + str(exe),
-                        "/r:" + str(FW / "System.Web.Extensions.dll"),
-                        str(UI / "SubmittedTasks.cs"), str(h)], capture_output=True, text=True, timeout=120)
+    r = childproc.run([str(CSC), "/nologo", "/target:exe", "/out:" + str(exe),
+                      "/r:" + str(FW / "System.Web.Extensions.dll"),
+                      str(UI / "SubmittedTasks.cs"), str(h)], timeout=120)
     assert r.returncode == 0 and exe.is_file(), (r.stdout, r.stderr)
-    q = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
+    q = childproc.run([str(exe)], timeout=30)
     assert q.returncode == 0, (q.returncode, q.stdout, q.stderr)
 
 
