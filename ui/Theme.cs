@@ -179,6 +179,7 @@ static class Theme
         { "refuting",    "info"    },
         { "verifying",   "info"    },
         { "awaiting",    "warning" },
+        { "waiting_runtime", "warning" },
         { "done",        "success" },
         { "stuck",       "warning" },
         { "maxturns",    "warning" },
@@ -238,6 +239,7 @@ static class Theme
             case "researching": return jp ? "調査中"         : "Researching";
             case "refuting":    return jp ? "レビュー中"     : "Reviewing";
             case "verifying":   return jp ? "検証中"         : "Verifying";
+            case "waiting_runtime": return jp ? "実行環境待ち" : "Runtime paused";
             case "awaiting":    return jp ? "承認待ち"       : "Needs input";
             case "done":        return jp ? "完了"           : "Done";
             case "stuck":       return jp ? "要対応"         : "Needs attention";

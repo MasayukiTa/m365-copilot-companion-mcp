@@ -1057,6 +1057,8 @@ class LocalJobStore:
                 "last": execution.get("last_progress") or commit.get("summary", ""),
                 "transcript": "", "closed": terminal,
                 "execution_profile": item["execution_profile"],
+                "runtime_resume_allowed": item["status"] == "WAITING_RUNTIME",
+                "local_job_db": str(self.path),
                 "artifacts": execution.get("artifacts", []),
                 "phase_events": item.get("events", []),
                 "next_step": execution.get("next_step", ""),

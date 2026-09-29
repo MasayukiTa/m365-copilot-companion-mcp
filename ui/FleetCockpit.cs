@@ -6152,6 +6152,53 @@ class CockpitWindow : Window
         return raw == "1" || raw == "true" || raw == "yes" || raw == "on";
     }
 
+    bool ResumeLocalLoopRuntime(Dictionary<string, object> w)
+    {
+        try
+        {
+            if (w == null) return false;
+            string jobId = S(w, "name").Replace("\"", "");
+            string db = S(w, "local_job_db").Replace("\"", "");
+            if (string.IsNullOrWhiteSpace(jobId)) return false;
+            if (!DurableRuntimeEnabled())
+            {
+                if (_startNote != null)
+                    _startNote.Text = _lang == 0
+                        ? "長時間実行は無効です。MCP_EXECUTION_PROFILES=1 を設定してください。"
+                        : "Durable runtime is disabled. Set MCP_EXECUTION_PROFILES=1 first.";
+                return false;
+            }
+
+            string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+            string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
+            if (!File.Exists(py)) py = "python";
+            string stateDir = Path.GetDirectoryName(_statusPath);
+            var psi = new System.Diagnostics.ProcessStartInfo();
+            psi.FileName = py;
+            psi.Arguments = "-m relay.local_loop_controller --job-id \"" + jobId
+                          + "\" --resume-runtime --state-dir \"" + stateDir + "\"";
+            if (!string.IsNullOrWhiteSpace(db)) psi.Arguments += " --db \"" + db + "\"";
+            psi.WorkingDirectory = repo;
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
+            var proc = System.Diagnostics.Process.Start(psi);
+            if (proc == null) throw new InvalidOperationException("LOCAL_LOOP resume process did not start");
+            if (_startNote != null)
+                _startNote.Text = _lang == 0
+                    ? "実行環境の修復後として、同じ長時間タスクを再開しています。"
+                    : "Resuming the same durable task after runtime repair.";
+            _lastSig = "";
+            return true;
+        }
+        catch (Exception ex)
+        {
+            if (_startNote != null)
+                _startNote.Text = (_lang == 0 ? "長時間タスクの再開に失敗: " : "Durable resume failed: ") + ex.Message;
+            return false;
+        }
+    }
+
     bool SpawnDurableTask(string goal, string submittedText)
     {
         SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
@@ -13198,6 +13245,10 @@ class CockpitWindow : Window
         // gets the distinct ORANGE インフラ待ち treatment: a warning rail/pill, its actionable reason
         // shown as-is, and a 再投入 re-queue action — NOT the red stuck/error recovery surface.
         bool isInfra = !closed && IsInfraStuck(w);
+        bool isLocalRuntimeWait = !closed
+            && status == "waiting_runtime"
+            && string.Equals(S(w, "execution_profile"), "LOCAL_LOOP", StringComparison.OrdinalIgnoreCase)
+            && string.Equals(S(w, "runtime_resume_allowed"), "True", StringComparison.OrdinalIgnoreCase);
         // Attention lane: stuck/maxturns/error and NOT yet expanded -- gets recovery surface treatment.
         // INFRA_STUCK is carved out of the red attention lane (handled by its own infra branch).
         bool isAttention = !closed && !isInfra && IsAttentionStatus(status);
@@ -13253,7 +13304,21 @@ class CockpitWindow : Window
             openLink.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e) { e.Handled = true; FlashOpen(card); OpenWorker(onm, ourl); };
             right.Children.Add(openLink);
         }
-        if (closed || terminal)
+        if (isLocalRuntimeWait)
+        {
+            var runtimeResume = AttentionBtn(_lang == 0 ? "再開" : "Resume");
+            runtimeResume.ToolTip = _lang == 0
+                ? "実行環境を修復した後、同じ永続タスクを再開します"
+                : "Resume the same durable task after repairing the runtime";
+            Dictionary<string, object> runtimeWaitWorker = w;
+            runtimeResume.Click += delegate (object s2, RoutedEventArgs e2)
+            {
+                e2.Handled = true;
+                ResumeLocalLoopRuntime(runtimeWaitWorker);
+            };
+            right.Children.Add(runtimeResume);
+        }
+        else if (closed || terminal)
         {
             // Completed/released Fleet card menu: keep the kebab available after its agent tab is
             // released. The result and artifacts remain useful, and the same goal can be run again.
@@ -13333,7 +13398,22 @@ class CockpitWindow : Window
         if (!isOpen)
         {
             // ── COLLAPSED ROW body (ledger row, not expanded drawer) ──────────────────────────
-            if (isInfra)
+            if (isLocalRuntimeWait)
+            {
+                if (!string.IsNullOrEmpty(reason))
+                {
+                    var runtimeReason = new TextBlock
+                    {
+                        Text = (_lang == 0 ? "実行環境待ち: " : "Runtime paused: ") + OneLine(reason),
+                        Foreground = Muted, FontSize = 12.5,
+                        TextTrimming = TextTrimming.CharacterEllipsis,
+                        TextWrapping = TextWrapping.NoWrap,
+                        Margin = new Thickness(24, 4, 0, 0)
+                    };
+                    col.Children.Add(runtimeReason);
+                }
+            }
+            else if (isInfra)
             {
                 // P0 INFRA_STUCK collapsed row: the reason text is actionable (e.g. "sign-in
                 // required" / "default-Copilot fallback"), so render it verbatim, then offer a

@@ -460,3 +460,15 @@ def test_waiting_runtime_rejects_unknown_scope(tmp_path):
     with pytest.raises(JobStoreError) as exc:
         store.mark_waiting_runtime("job_1", "bad", scope="fleet-wide")
     assert exc.value.code == "INVALID_RUNTIME_SCOPE"
+
+
+def test_console_snapshot_exposes_runtime_resume_metadata(tmp_path):
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    store.create_job(_job())
+    store.mark_waiting_runtime("job_1", "repair runtime first")
+    snap = store.console_snapshot()
+    worker = next(w for w in snap["workers"] if w["name"] == "job_1")
+    assert worker["status"] == "waiting_runtime"
+    assert worker["execution_profile"] == "LOCAL_LOOP"
+    assert worker["runtime_resume_allowed"] is True
+    assert worker["local_job_db"] == str(store.path)
