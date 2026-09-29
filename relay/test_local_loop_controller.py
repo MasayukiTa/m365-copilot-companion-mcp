@@ -380,6 +380,10 @@ def test_missing_agent_protocol_stops_after_bounded_bootstrap_retries(tmp_path):
     assert len(sent) == 3  # one short RUN + two protocol bootstraps
     assert "LOCAL_LOOP protocol bootstrap:" not in sent[0]
     assert all("LOCAL_LOOP protocol bootstrap:" in msg for msg in sent[1:])
+    assert rotations == [
+        "response finished without commit",
+        "response finished without commit",
+    ], "the final failed bootstrap must stop in-place, not waste another conversation rotation"
     status = store.get_job_status("job_1", event_limit=80)
     assert status["status"] == "WAITING_RUNTIME"
     assert "agent instructions" in status["verification_detail"].lower()
