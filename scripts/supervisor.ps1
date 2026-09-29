@@ -176,7 +176,7 @@ function Write-Log($msg) {
 # replacing stale code".  Without a machine-readable transition, both are a few seconds of
 # connection refused and both render as the same red Server/Tunnel pair.  This marker is advisory
 # only and intentionally short-lived on the reader side; a stale file can never mask a real outage.
-$ServerTransitionPath = Join-Path $FleetDir "server_transition.json"
+$ServerTransitionPath = Join-Path (Join-Path $Root ".fleet") "server_transition.json"
 
 function Write-ServerTransition([string]$Reason) {
     try {
