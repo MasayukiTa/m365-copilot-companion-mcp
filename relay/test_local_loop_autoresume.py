@@ -77,22 +77,25 @@ def test_main_clears_marker_only_after_controller_returns_normally():
     assert 'completed_normally = False' in main
     assert 'completed_normally = True' in main
     finally_block = main[main.index('finally:', main.index('job_lock = _acquire_job_lock')):]
-    assert 'if marker_written and completed_normally and not keep_marker_for_runtime:' in finally_block
+    assert 'if marker_written and completed_normally:' in finally_block
+    assert 'keep_marker_for_runtime' not in finally_block
     assert '_clear_controller_marker(' in finally_block
 
 
 def test_crash_marker_comment_explains_why_exception_must_leave_it():
     src = Path(ll.__file__).read_text(encoding='utf-8')
-    assert 'leaves the marker behind while releasing the kernel lock' in src
+    assert 'leaves the marker behind' in src
+    assert 'releasing the kernel lock' in src
     assert 'unexpected exception' in src
 
 
-def test_waiting_runtime_is_the_only_normal_result_kept_for_autoresume():
+def test_waiting_runtime_is_a_pause_not_an_autoresume_marker():
     src = Path(ll.__file__).read_text(encoding='utf-8')
     main = src[src.index('def main(argv=None):'):]
-    assert 'keep_marker_for_runtime = (result == "WAITING_RUNTIME")' in main
-    assert 'if marker_written and completed_normally and not keep_marker_for_runtime:' in main
-    # Human/consent/routing waits are ordinary returns and therefore clear their marker.
+    assert 'keep_marker_for_runtime' not in main
+    assert 'if marker_written and completed_normally:' in main
+    assert '--resume-runtime' in main
+    # Unexpected exceptions still leave the marker; every ordinary return clears it.
     assert 'completed_normally = True' in main
 
 
@@ -170,12 +173,11 @@ def test_main_crash_waiting_runtime_and_done_have_distinct_marker_semantics(tmp_
     ll._release_job_lock(h)
     assert ll._clear_controller_marker(state, "job_crash", owner_pid=os.getpid())
 
-    # Runtime unavailable is a normal controller return, but intentionally auto-resumable.
+    # Runtime unavailable is a normal paused return: no crash marker survives to auto-resume it.
     FakeController.exc = None
     FakeController.result = "WAITING_RUNTIME"
     assert ll.main(argv("job_runtime")) == 2
-    assert ll._read_controller_marker(state, "job_runtime")["pid"] == os.getpid()
-    assert ll._clear_controller_marker(state, "job_runtime", owner_pid=os.getpid())
+    assert ll._read_controller_marker(state, "job_runtime") is None
 
     # True terminal completion removes the recovery marker.
     FakeController.result = "DONE"
@@ -213,3 +215,14 @@ def test_resume_job_id_is_rejected_before_any_lock_or_marker_path_escape(tmp_pat
     assert exc.value.code == "INVALID_JOB_ID"
     assert not (tmp_path / "outside.json").exists()
     assert not (tmp_path / "outside.lock").exists()
+
+
+
+def test_runtime_resume_is_explicit_cli_only():
+    src = Path(ll.__file__).read_text(encoding="utf-8")
+    main = src[src.index("def main(argv=None):"):]
+    assert 'ap.add_argument("--resume-runtime", action="store_true"' in main
+    assert 'if args.resume_runtime:' in main
+    assert 'store.resume_runtime(job_id)' in main
+    resume = src[src.index("def _controller_resume_argv"):src.index("def _write_active_marker", src.index("def _controller_resume_argv")) if "def _write_active_marker" in src[src.index("def _controller_resume_argv"):] else src.index("class LocalLoopController")]
+    assert "--resume-runtime" not in resume

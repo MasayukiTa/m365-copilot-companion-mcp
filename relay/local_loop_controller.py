@@ -190,6 +190,21 @@ def _acquire_campaign_lock(state_dir: str | os.PathLike, timeout_seconds: float 
             time.sleep(0.02)
 
 
+def _runtime_wait_scope(status: dict) -> str:
+    """Return the scope attached to the newest WAITING_RUNTIME event.
+
+    Old databases/events predate runtime scoping. Treat those as job-local so one historical
+    browser failure cannot freeze every sibling in a campaign indefinitely.
+    """
+    for event in reversed(status.get("events") or []):
+        if str(event.get("event") or "") != "WAITING_RUNTIME":
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        scope = str(payload.get("scope") or "job").strip().lower()
+        return "campaign" if scope == "campaign" else "job"
+    return "job"
+
+
 def _campaign_has_live_work(store: LocalJobStore, manifest: dict,
                             marker_ids: set[str]) -> bool:
     for row in manifest.get("entries", []):
@@ -197,16 +212,18 @@ def _campaign_has_live_work(store: LocalJobStore, manifest: dict,
             job_id = LocalJobStore._validate_job_id(row.get("job_id"))
         except JobStoreError:
             continue
-        if job_id in marker_ids:
-            return True
         try:
-            status = store.get_job_status(job_id).get("status")
+            status = str(store.get_job_status(job_id).get("status") or "")
         except JobStoreError as exc:
-            if exc.code == "JOB_NOT_FOUND" and isinstance(row.get("job"), dict):
-                return True                 # manifest can still materialize this queued job
+            if exc.code == "JOB_NOT_FOUND":
+                # A root may live in another explicit DB; its marker is then the only ownership
+                # proof. A queued manifest copy can also still materialize locally.
+                if job_id in marker_ids or isinstance(row.get("job"), dict):
+                    return True
             continue
         if status not in TERMINAL_JOB_STATUSES:
             return True
+        # Terminal SQLite state is authoritative: a leftover marker is stale, not live work.
     return False
 
 
@@ -314,7 +331,7 @@ def _default_campaign_launcher(argv: list[str]) -> int:
 
 def _drain_campaign(store: LocalJobStore, state_dir: str | os.PathLike, args, *,
                     now: float | None = None, launcher=None) -> dict:
-    """Materialise and launch queued campaign jobs; reservations make repeated drains harmless."""
+    """Reconcile campaign state, then launch eligible jobs without crossing a runtime pause."""
     now = time.time() if now is None else float(now)
     launcher = launcher or _default_campaign_launcher
     lock = _acquire_campaign_lock(state_dir)
@@ -323,50 +340,93 @@ def _drain_campaign(store: LocalJobStore, state_dir: str | os.PathLike, args, *,
     selected = []
     manifest = None
     closed = False
+    runtime_blocked = False
+    candidates = []
     try:
         manifest = _read_campaign_manifest(state_dir)
         entries = manifest.get("entries", [])
         changed = False
         active = False
+
+        # PASS 1: materialise/read every durable status and clean markers that cannot represent
+        # crash-recoverable work. This pass must finish before selecting ANY sibling to launch:
+        # WAITING_RUNTIME usually means a shared runtime/configuration defect (for example missing
+        # Copilot Studio Agent Instructions), so starting later READY siblings just repeats it.
         for row in entries:
             try:
                 job_id = LocalJobStore._validate_job_id(row.get("job_id"))
             except JobStoreError:
                 continue
-            # Marker ownership is stronger evidence than this store instance.  A campaign root
-            # may have been created with an explicit DB, and an interrupted child may temporarily
-            # be between durable store reads. Never archive or duplicate-launch while its marker
-            # exists; the controller/supervisor recovery path owns it.
-            if _controller_marker_path(state_dir, job_id).is_file():
-                active = True
-                continue
-            if not _materialize_campaign_entry(store, row):
+            marker_path = _controller_marker_path(state_dir, job_id)
+            has_marker = marker_path.is_file()
+            materialized = _materialize_campaign_entry(store, row)
+            if not materialized:
+                # A campaign root may be owned by another explicit DB. Preserve a live/unknown
+                # marker as scope evidence; without either source there is nothing to launch here.
+                if has_marker:
+                    active = True
                 continue
             try:
-                status = str(store.get_job_status(job_id).get("status") or "")
+                status_row = store.get_job_status(job_id, event_limit=50)
+                status = str(status_row.get("status") or "")
             except JobStoreError:
+                if has_marker:
+                    active = True
                 continue
+
             if status in TERMINAL_JOB_STATUSES:
+                if has_marker:
+                    try:
+                        marker_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        # Failure to reap must not turn terminal work back into executable work.
+                        pass
                 continue
+
             active = True
-            if status in INTERACTION_WAIT_STATUSES:
+            if status == "WAITING_RUNTIME":
+                if _runtime_wait_scope(status_row) == "campaign":
+                    runtime_blocked = True
+                if has_marker:
+                    try:
+                        marker_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        pass
                 continue
-            try:
-                retry_after = float(row.get("retry_after") or 0.0)
-            except Exception:
-                retry_after = 0.0
-            if retry_after > now:
+            if status in INTERACTION_WAIT_STATUSES or status in PAUSED_STATUSES:
+                if has_marker:
+                    try:
+                        marker_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        pass
                 continue
-            attempts = max(0, int(row.get("launch_attempts") or 0)) + 1
-            # The child writes its marker before browser work, but Python import + SQLite/lock setup
-            # can still take seconds on a busy Windows host.  Reserve 30s first, then exponential
-            # backoff; the per-job kernel lock remains the final duplicate-execution barrier.
-            delay = min(900.0, 30.0 * float(2 ** min(attempts - 1, 5)))
-            row["launch_attempts"] = attempts
-            row["retry_after"] = now + delay
-            row["last_launch_at"] = now
-            selected.append(job_id)
-            changed = True
+            if has_marker:
+                continue
+            candidates.append((row, job_id))
+
+        # PASS 2: only a campaign with no runtime-wide pause may launch READY/RUNNING candidates.
+        if not runtime_blocked:
+            for row, job_id in candidates:
+                try:
+                    retry_after = float(row.get("retry_after") or 0.0)
+                except Exception:
+                    retry_after = 0.0
+                if retry_after > now:
+                    continue
+                attempts = max(0, int(row.get("launch_attempts") or 0)) + 1
+                delay = min(900.0, 30.0 * float(2 ** min(attempts - 1, 5)))
+                row["launch_attempts"] = attempts
+                row["retry_after"] = now + delay
+                row["last_launch_at"] = now
+                selected.append(job_id)
+                changed = True
+
         if entries and not active:
             _archive_campaign_manifest(state_dir, manifest, now=now)
             closed = True
@@ -386,7 +446,10 @@ def _drain_campaign(store: LocalJobStore, state_dir: str | os.PathLike, args, *,
                 continue
             launched.append(job_id)
             pids[job_id] = pid
-    return {"ok": True, "launched": launched, "pids": pids, "closed": closed}
+    return {
+        "ok": True, "launched": launched, "pids": pids, "closed": closed,
+        "runtime_blocked": runtime_blocked,
+    }
 
 
 def _campaign_job_ids(state_dir: str | os.PathLike) -> set[str]:
@@ -1018,15 +1081,15 @@ class LocalLoopController:
         return self.store.verify_candidate(self.job_id, passed, detail)
 
     def run(self) -> str:
-        # Attempt budget is a durable job constraint, not a process-lifetime counter.  A crash /
-        # WAITING_RUNTIME auto-resume must not reset it and create an unbounded RUN loop.
+        # Attempt budget is a durable job constraint, not a process-lifetime counter. A crash
+        # may resume from the marker; WAITING_RUNTIME is an explicit pause and never auto-resumes.
         sent_attempts = self.store.ui_trigger_attempt_count(self.job_id)
         while True:
             self._assert_no_answer_content_read()
             status = self.store.get_job_status(self.job_id)
             if status["status"] == "WAITING_RUNTIME":
-                self.store.resume_runtime(self.job_id)
-                status = self.store.get_job_status(self.job_id)
+                self._project()
+                return "WAITING_RUNTIME"
             if status["status"] in INTERACTION_WAIT_STATUSES:
                 interaction = self._probe_consent()
                 if interaction == "CLEAR":
@@ -1114,7 +1177,7 @@ class LocalLoopController:
                     "docs/examples/local_loop_agent_instructions.txt in the Copilot Studio "
                     "agent instructions, reconnect MCP, then resume. No retry was sent."
                 )
-                self.store.mark_waiting_runtime(self.job_id, reason)
+                self.store.mark_waiting_runtime(self.job_id, reason, scope="campaign")
                 self._project()
                 return "WAITING_RUNTIME"
             if commit is None:
@@ -1202,6 +1265,8 @@ def main(argv=None):
     ap.add_argument("--goal-file", help="read the natural-language task from a UTF-8 text file")
     ap.add_argument("--enqueue-goals-file", help="durably enqueue a JSON array of live LOCAL_LOOP goals")
     ap.add_argument("--drain-campaign", action="store_true", help="materialize and launch queued campaign jobs, then exit")
+    ap.add_argument("--resume-runtime", action="store_true",
+                    help="explicitly resume an existing WAITING_RUNTIME job after its runtime condition is repaired")
     ap.add_argument("--cwd", help="optional local workspace boundary for an ad-hoc goal job")
     ap.add_argument("--max-turns", type=int, default=1000, help="maximum durable turns for --goal")
     ap.add_argument("--read-only", action="store_true", help="mark an ad-hoc --goal job read-only")
@@ -1228,8 +1293,10 @@ def main(argv=None):
     if goal_sources > 1:
         ap.error("use exactly one of --job-file, --goal or --goal-file")
     special_modes = int(bool(args.enqueue_goals_file)) + int(bool(args.drain_campaign))
-    if special_modes > 1 or (special_modes and (goal_sources or args.job_id)):
+    if special_modes > 1 or (special_modes and (goal_sources or args.job_id or args.resume_runtime)):
         ap.error("campaign enqueue/drain modes cannot be combined with a controller job")
+    if args.resume_runtime and (goal_sources or not args.job_id):
+        ap.error("--resume-runtime requires an existing --job-id and cannot create a new job")
 
     store = LocalJobStore(args.db)
     if args.enqueue_goals_file:
@@ -1275,6 +1342,11 @@ def main(argv=None):
                 raise
     if not job_id:
         ap.error("--job-id, --job-file, --goal or --goal-file is required")
+    if args.resume_runtime:
+        resumed = store.resume_runtime(job_id)
+        if str(resumed.get("status") or "") == "WAITING_RUNTIME":
+            print(f"LOCAL_LOOP {job_id}: runtime resume did not leave WAITING_RUNTIME", flush=True)
+            return 2
 
     job_lock = _acquire_job_lock(args.state_dir, job_id)
     if job_lock is None:
@@ -1282,7 +1354,6 @@ def main(argv=None):
         return 3
     marker_written = False
     completed_normally = False
-    keep_marker_for_runtime = False
     try:
         resume_argv = _controller_resume_argv(args, job_id)
         _write_controller_marker(args.state_dir, job_id, resume_argv)
@@ -1328,7 +1399,6 @@ def main(argv=None):
             try:
                 result = controller.run()
                 completed_normally = True
-                keep_marker_for_runtime = (result == "WAITING_RUNTIME")
                 print(f"LOCAL_LOOP {job_id}: {result}")
                 # Record the run per theme. Everything needed is already in the job spec, so
                 # this costs one write and gives the next job on the same theme its history.
@@ -1351,11 +1421,11 @@ def main(argv=None):
                 # memory problem LOCAL_LOOP is meant to solve.
                 _close_driver_page(controller.driver)
     finally:
-        # Terminal and human/consent/routing waits are intentional ordinary returns and must not
-        # auto-relaunch. WAITING_RUNTIME is different: the store is explicitly resumable on the
-        # next controller start, so keep its marker and let the supervisor retry with backoff.
-        # An unexpected exception also leaves the marker behind while releasing the kernel lock.
-        if marker_written and completed_normally and not keep_marker_for_runtime:
+        # Every ordinary return (terminal, human/consent/routing wait, or WAITING_RUNTIME) clears
+        # the crash-recovery marker. An unexpected exception leaves the marker behind while
+        # releasing the kernel lock, so the supervisor can auto-resume only true crashes.
+        # WAITING_RUNTIME resumes only through explicit --resume-runtime.
+        if marker_written and completed_normally:
             _clear_controller_marker(args.state_dir, job_id, owner_pid=os.getpid())
         _release_job_lock(job_lock)
 

@@ -22,11 +22,11 @@ def test_campaign_drain_runs_only_when_manifest_is_present_and_leaves_feature_fl
     assert 'MCP_EXECUTION_PROFILES' not in block
 
 
-def test_campaign_drain_runs_after_autoresume_at_startup_and_each_tick():
+def test_campaign_reconcile_runs_before_autoresume_at_startup_and_each_tick():
     startup = SRC[SRC.index('# Checked once, here'):SRC.index('$serverMiss = 0')]
-    assert startup.index('Invoke-LocalLoopAutoResume') < startup.index('Invoke-LocalLoopCampaignDrain')
+    assert startup.index('Invoke-LocalLoopCampaignDrain') < startup.index('Invoke-LocalLoopAutoResume')
     loop = SRC[SRC.index('while ($true) {'):]
-    assert loop.index('Invoke-LocalLoopAutoResume') < loop.index('Invoke-LocalLoopCampaignDrain')
+    assert loop.index('Invoke-LocalLoopCampaignDrain') < loop.index('Invoke-LocalLoopAutoResume')
 
 
 def test_campaign_drain_logs_real_launches_but_not_empty_passes():

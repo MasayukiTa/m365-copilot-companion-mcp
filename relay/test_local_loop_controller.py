@@ -247,6 +247,9 @@ def test_ui_idle_failure_without_replacement_waits_and_resumes_safely(tmp_path):
     assert stopped.run() == "WAITING_RUNTIME"
     assert store.get_job_status("job_1")["status"] == "WAITING_RUNTIME"
 
+    # WAITING_RUNTIME is now a real pause: repairing/replacing the runtime is not enough by
+    # itself; the operator/supervisor must explicitly resume the durable job first.
+    assert store.resume_runtime("job_1")["status"] == "READY"
     second = CommitOnSendDriver(store, ["CANDIDATE_DONE"])
     resumed = LocalLoopController(
         store, "job_1", second, rotate_after_turns=0,
@@ -304,6 +307,25 @@ def test_finished_response_without_commit_fails_closed_without_retry_send(tmp_pa
     assert "no retry was sent" in status["verification_detail"].lower()
     assert any(e["event"] == "TURN_FINISHED_WITHOUT_COMMIT" for e in status["events"])
     assert not any(e["event"] == "PROTOCOL_BOOTSTRAP_SENT" for e in status["events"])
+
+
+
+def test_waiting_runtime_is_not_implicitly_resumed_by_controller_start(tmp_path):
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    store.create_job(_job())
+    store.mark_waiting_runtime("job_1", "repair runtime first")
+
+    class MustNotSend:
+        answer_content_reads = 0
+        def send(self, *args, **kwargs):
+            raise AssertionError("WAITING_RUNTIME must not send another browser RUN")
+
+    controller = LocalLoopController(store, "job_1", MustNotSend(), poll_seconds=.005)
+    assert controller.run() == "WAITING_RUNTIME"
+    status = store.get_job_status("job_1", event_limit=20)
+    assert status["status"] == "WAITING_RUNTIME"
+    assert status["verification_detail"] == "repair runtime first"
+    assert not any(e["event"] == "RUNTIME_RESUMED" for e in status["events"])
 
 
 def test_send_failure_rotates_instead_of_terminating_controller(tmp_path):

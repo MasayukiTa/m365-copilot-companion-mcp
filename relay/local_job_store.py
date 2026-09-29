@@ -845,10 +845,13 @@ class LocalJobStore:
 
 
     def mark_waiting_runtime(self, job_id: str, reason: str,
-                             now: float | None = None) -> dict:
+                             now: float | None = None, scope: str = "job") -> dict:
         job_id = self._validate_job_id(job_id)
         now = time.time() if now is None else float(now)
         reason = _bounded_text(reason, 2048, "runtime reason")
+        scope = str(scope or "job").strip().lower()
+        if scope not in {"job", "campaign"}:
+            raise JobStoreError("INVALID_RUNTIME_SCOPE", f"unsupported runtime scope {scope!r}")
         with self._transaction() as conn:
             job, turn = self._job_and_turn(conn, job_id)
             if job["status"] in TERMINAL_JOB_STATUSES:
@@ -857,8 +860,10 @@ class LocalJobStore:
                 "UPDATE jobs SET status='WAITING_RUNTIME',verification_detail=?,updated_at=? "
                 "WHERE job_id=?", (reason, now, job_id),
             )
-            self._event(conn, job_id, int(turn["seq"]), "WAITING_RUNTIME", {"reason": reason}, now)
-        return {"ok": True, "status": "WAITING_RUNTIME"}
+            self._event(conn, job_id, int(turn["seq"]), "WAITING_RUNTIME", {
+                "reason": reason, "scope": scope,
+            }, now)
+        return {"ok": True, "status": "WAITING_RUNTIME", "scope": scope}
 
     def mark_waiting_interaction(self, job_id: str, status: str, reason: str,
                                  now: float | None = None) -> dict:

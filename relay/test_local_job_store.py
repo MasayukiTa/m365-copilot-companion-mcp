@@ -440,3 +440,23 @@ def test_console_projection_started_is_job_creation_not_last_update(tmp_path):
     assert worker["created_at"] == 10
     assert worker["updated_at"] == 20
     assert snapshot["started"] == 10
+
+
+def test_waiting_runtime_records_scope_without_schema_change(tmp_path):
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    store.create_job(_job())
+    result = store.mark_waiting_runtime("job_1", "shared agent config", scope="campaign")
+    assert result["scope"] == "campaign"
+    status = store.get_job_status("job_1", event_limit=20)
+    evt = [e for e in status["events"] if e["event"] == "WAITING_RUNTIME"][-1]
+    assert evt["payload"]["scope"] == "campaign"
+    assert evt["payload"]["reason"] == "shared agent config"
+
+
+def test_waiting_runtime_rejects_unknown_scope(tmp_path):
+    import pytest
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    store.create_job(_job())
+    with pytest.raises(JobStoreError) as exc:
+        store.mark_waiting_runtime("job_1", "bad", scope="fleet-wide")
+    assert exc.value.code == "INVALID_RUNTIME_SCOPE"
