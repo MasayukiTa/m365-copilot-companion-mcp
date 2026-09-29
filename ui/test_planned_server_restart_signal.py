@@ -33,3 +33,15 @@ def test_transition_reader_is_bounded_and_fail_closed():
     assert 'SERVER_TRANSITION_HARD_MAX_AGE_S' in block
     assert 'return null' in block
     assert 'planned_restart' in block
+
+
+def test_transition_path_is_initialized_from_root_before_any_restart_can_publish():
+    root_i = SUP.index('$Root = Split-Path -Parent $PSScriptRoot')
+    path_i = SUP.index('$ServerTransitionPath =')
+    write_i = SUP.index('function Write-ServerTransition')
+    late_fleet_i = SUP.index('$FleetDir = Join-Path $Root ".fleet"')
+    assert root_i < path_i < write_i
+    assert path_i < late_fleet_i, "transition path must not depend on FleetDir initialized ~1200 lines later"
+    line = SUP[path_i:SUP.index('\n', path_i)]
+    assert '$Root' in line and '".fleet"' in line
+    assert '$FleetDir' not in line

@@ -54,6 +54,8 @@
 ## 検出した論点
 
 ### C-ISSUE-1 part-way 失敗時、steer / reunlock の副作用が再 apply で重複し得る（優先度: 中〜低）
+> Resolution: see `2026-09-29 follow-up resolution / C-ISSUE-1` below. The original finding is retained as audit history.
+
 
 **再現条件**
 1. 1 つのコマンドが `add_goal`(goals) と `steer` または `reunlock` を同時に含む、あるいは `steer` を含む。
@@ -331,6 +333,8 @@ ubuntu ジョブの「Excluded tests (reporting, not gating)」（ci.yml:837-888
 ## 検出した論点
 
 ### CI-ISSUE-1 ci.yml コメントの除外件数表記が実数と不一致（ドキュメント齊齬）
+> Resolution: see `2026-09-29 follow-up resolution 2 / CI-ISSUE-1` below. This issue is retained for traceability.
+
 
 - **再現条件**: ci.yml:821 付近のコメントは「scripts/check_ci_test_manifest.py keeps eleven files out of the hermetic suite」と記述するが、現在の EXCLUDED は **9 件**（監査スクリプト出力も「9 explicit exception(s)」）。check_ci_test_manifest.py:55-66 のコメントに、2 件（tests/test_integration_evidence.py, tests/test_outcome_enum_closed.py）が 2026-09-22 に除外から外され戻された経緯が残るが、ci.yml 側の「eleven」表記が更新されていない。
 - **影響**: 機能影響なし（コメントのみ、監査ロジックは len(EXCLUDED) を動的参照）。ただし将来の読み手が除外件数を誤解し得る。
@@ -675,3 +679,12 @@ The stale `.github/workflows/ci.yml` comment now says `nine files`, matching `sc
 - R5-NOTE-1 remains an environment-level observation: Playwright DOM submission behavior is not fully reproducible in the hermetic Linux suite. Existing logic is covered by pure/seam tests and live use, but this is not claimed as a browser-E2E proof.
 - SEC-ISSUE-1 remains intentionally documented: XFF/IP identity is still caller-supplied in this deployment, while the default-on unlock token requirement prevents IP-only authorization in current operation. No claim is made that the IP oracle itself is fixed.
 - S7-ISSUE-1 remains an architectural boundary: a same-user process with arbitrary code execution is outside what same-user file/tool gates can cryptographically exclude. The repository continues to describe this as narrowing/defence-in-depth, not closure.
+
+
+# 2026-09-30 live supervisor follow-up
+
+## Planned-restart transition path initialization -- resolved
+
+A live residue (`.tmp.<supervisor_pid>` at repository root) exposed a runtime-only initialization-order bug that the earlier source-presence tests did not catch. `ServerTransitionPath` was computed from `$FleetDir` near the top of `scripts/supervisor.ps1`, but `$FleetDir` itself was not assigned until roughly 1,200 lines later. The long-running supervisor therefore attempted to publish a planned-restart marker through an empty path; `Write-ServerTransition` wrote a root `.tmp.<pid>` file and its fail-open catch intentionally hid the telemetry failure while allowing the stale-code restart itself to proceed.
+
+Resolution: `ServerTransitionPath` is now derived directly from `$Root/.fleet`, where `$Root` is initialized before the transition helper is defined. A regression test asserts the initialization order and forbids the early path assignment from depending on `$FleetDir`. This preserves the intended rule that health telemetry can never block a restart while making the yellow planned-restart signal actually publishable in the live supervisor.
