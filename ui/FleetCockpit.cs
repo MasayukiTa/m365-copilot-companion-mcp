@@ -1115,10 +1115,13 @@ class CockpitWindow : Window
         public string State = "";
         public string Reason = "";
         public double Started = 0;
+        public double Expires = 0;
     }
-    // A planned stale-code cycle normally takes only seconds.  Sixty seconds covers slow import /
-    // bind on a loaded workstation but cannot turn a forgotten marker into a permanent false-green.
-    const double SERVER_TRANSITION_MAX_AGE_S = 60.0;
+    // Old supervisors wrote only `started`; preserve that format for one deployment generation.
+    // New supervisors write their own policy-derived expiry. The hard cap is only corruption /
+    // stale-file safety: it is intentionally NOT the normal restart budget.
+    const double LEGACY_SERVER_TRANSITION_MAX_AGE_S = 60.0;
+    const double SERVER_TRANSITION_HARD_MAX_AGE_S = 600.0;
     // Index map: 0=server 1=tunnel 2=edge 3=signin 4=agent 5=tool(bridge probe).
     // SIZED BY THE COUNT, never by however many literals somebody typed. This was six
     // `new DotState()` in a row. Adding a seventh dot compiled cleanly, and the first
@@ -2692,19 +2695,29 @@ class CockpitWindow : Window
             if (!File.Exists(path)) return null;
             var raw = _js.DeserializeObject(File.ReadAllText(path, Encoding.UTF8)) as Dictionary<string, object>;
             if (raw == null) return null;
-            object stateObj, reasonObj, startedObj;
+            object stateObj, reasonObj, startedObj, expiresObj;
             if (!raw.TryGetValue("state", out stateObj) || stateObj == null) return null;
             string state = Convert.ToString(stateObj).Trim().ToLowerInvariant();
             if (state != "planned_restart") return null;
             if (!raw.TryGetValue("started", out startedObj) || startedObj == null) return null;
             double started = Convert.ToDouble(startedObj, System.Globalization.CultureInfo.InvariantCulture);
-            double age = NowUnix() - started;
-            if (age < -5.0 || age > SERVER_TRANSITION_MAX_AGE_S) return null;
+            double nowUnix = NowUnix();
+            double age = nowUnix - started;
+            if (age < -5.0 || age > SERVER_TRANSITION_HARD_MAX_AGE_S) return null;
+
+            double expires = started + LEGACY_SERVER_TRANSITION_MAX_AGE_S;
+            if (raw.TryGetValue("expires", out expiresObj) && expiresObj != null)
+                expires = Convert.ToDouble(expiresObj, System.Globalization.CultureInfo.InvariantCulture);
+            double declaredWindow = expires - started;
+            if (declaredWindow <= 0.0 || declaredWindow > SERVER_TRANSITION_HARD_MAX_AGE_S) return null;
+            double effectiveExpiry = Math.Min(expires, started + SERVER_TRANSITION_HARD_MAX_AGE_S);
+            if (nowUnix > effectiveExpiry) return null;
+
             string reason = "planned restart";
             if (raw.TryGetValue("reason", out reasonObj) && reasonObj != null)
                 reason = Convert.ToString(reasonObj).Trim();
             if (string.IsNullOrEmpty(reason)) reason = "planned restart";
-            return new PlannedServerTransition { State = state, Reason = reason, Started = started };
+            return new PlannedServerTransition { State = state, Reason = reason, Started = started, Expires = expires };
         }
         catch (Exception)
         {
