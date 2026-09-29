@@ -347,6 +347,7 @@ def test_live_command_admission_refuses_local_loop_control_envelopes():
         "LOCAL_LOOP job companion_20260929_x seq=1 worker=local_abc: claim and execute the operator-authored turn under the standard agent contract",
         "LOCAL_LOOP job companion_20260929_x seq=1 worker=local_abc を、標準エージェント契約の下で claim_turn して実行する",
         "Claim and execute LOCAL_LOOP job companion_20260929_x seq=1 worker=local_abc under the standard agent contract",
+        "Claim and execute LOCAL_LOOP job companion_20260929_x seq=1 worker=local_abc: claim_turn(expected_seq=1) then execute the operator-authored turn",
     ):
         errors = fr.validate_command({"add_goal": [{"text": text}]})
         assert errors and any("LOCAL_LOOP control" in e for e in errors), (text, errors)
