@@ -5042,8 +5042,7 @@ class CockpitWindow : Window
                             localLabel = (knownKey == peEvent && !string.IsNullOrEmpty(peFallbackLabel))
                                 ? peFallbackLabel : knownKey;
                         }
-                        string kind = Theme.StatusKind(peEvent);
-                        string colorHex = Theme.KindColor(kind, _dark);
+                        string colorHex = Theme.TimelineColor(peEvent, _dark);
                         string timeStr = "";
                         if (peTs > 0)
                         {
@@ -5066,7 +5065,7 @@ class CockpitWindow : Window
             ? (ja ? "(フェーズ遷移)" : "(phase transitions)")
             // "from turns" did not say that these times are INFERRED. That was the whole content
             // of the [COMPUTED] tag underneath, so it moves up here where it is read first.
-            : (ja ? "(会話ターンから推定)" : "(estimated from turns)");
+            : (ja ? "(ターン記録から推定)" : "(estimated from turns)");
         subLbl.Foreground = Theme.Br(Theme.Faint(_dark));
         subLbl.FontSize = 9.5;
         subLbl.Margin = new Thickness(0, 0, 0, 8);
@@ -5215,14 +5214,14 @@ class CockpitWindow : Window
         // [COMPUTED] Honest markers only: queued/received, started (first turn), now/phase, ended.
         var events = new List<Tuple<string, string, string>>();
         // Each tuple: (label, time-string, railColor-hex)
-        string graphite = Theme.Muted(_dark);
+        string graphite = Theme.Text(_dark);
         string live = Theme.Info(_dark);
         string attn = Theme.Warning(_dark);
         string ended = Theme.Success(_dark);
-        string danger = Theme.Danger(_dark);
+        string danger = Theme.Warning(_dark);
 
         // Marker 1: Queued / directive received
-        string qLabel = ja ? "投入" : "Queued";
+        string qLabel = Theme.StatusLabel("pending", _lang);
         string qTime = fmtHM(metaTs);
         events.Add(new Tuple<string, string, string>(qLabel, qTime, graphite));
 
@@ -5246,7 +5245,7 @@ class CockpitWindow : Window
         string sTime = fmtHM(firstTurnTs);
         if (firstTurnTs > 0 && sTime != "" && sTime != qTime)
         {
-            string sLabel = ja ? "開始" : "Started";
+            string sLabel = Theme.StatusLabel("ready", _lang);
             events.Add(new Tuple<string, string, string>(sLabel, sTime, live));
         }
 
@@ -5257,22 +5256,22 @@ class CockpitWindow : Window
             string phColor;
             if (overallPhase == "attn")
             {
-                phLabel = ja ? "要対応" : "Needs attention";
+                phLabel = Theme.StatusLabel("stuck", _lang);
                 phColor = attn;
             }
             else if (overallPhase == "verifying")
             {
-                phLabel = ja ? "検証中" : "Verifying";
+                phLabel = Theme.StatusLabel("verifying", _lang);
                 phColor = attn;
             }
             else if (overallPhase == "running")
             {
-                phLabel = ja ? "実行中" : "Running";
+                phLabel = Theme.StatusLabel("waiting", _lang);
                 phColor = live;
             }
             else
             {
-                phLabel = ja ? "実行中" : "Running";
+                phLabel = Theme.StatusLabel("waiting", _lang);
                 phColor = live;
             }
             string nowTime = fmtHM(NowUnix());
@@ -14215,9 +14214,9 @@ class CockpitWindow : Window
         // Prefer phase_events (same source as Evidence Spine) when available; fall back to transcript.
         sp.Children.Add(SectLabel(_lang == 0 ? "タイムライン" : "Timeline"));
         var tsEvents = BuildTimelineEvents(tpath, outcome, terminal, reviews, w);
-        foreach (string ev in tsEvents)
+        foreach (var ev in tsEvents)
             sp.Children.Add(new TextBlock {
-                Text = "・" + ev, Foreground = Muted, FontSize = 12,
+                Text = "・" + ev.Item1, Foreground = Theme.Br(ev.Item2), FontSize = 12,
                 Margin = new Thickness(0, 1, 0, 1), TextWrapping = TextWrapping.Wrap });
 
         sp.Children.Add(SectLabel(_lang == 0 ? "指示" : "Goal"));
@@ -14228,7 +14227,7 @@ class CockpitWindow : Window
     // Build the ordered event list for the Timeline section.
     // Prefers phase_events from the worker dict (same source as Evidence Spine) when present.
     // Falls back to transcript-derived timestamps when phase_events is absent.
-    List<string> BuildTimelineEvents(string tpath, string outcome, bool terminal, int reviews,
+    List<Tuple<string, string>> BuildTimelineEvents(string tpath, string outcome, bool terminal, int reviews,
                                      Dictionary<string, object> w)
     {
         bool ja = _lang == 0;
@@ -14252,7 +14251,7 @@ class CockpitWindow : Window
                 object[] peArr = (object[])peRaw;
                 if (peArr.Length > 0)
                 {
-                    var evs2 = new List<string>();
+                    var evs2 = new List<Tuple<string, string>>();
                     foreach (object peObj in peArr)
                     {
                         var pe = peObj as Dictionary<string, object>;
@@ -14276,7 +14275,7 @@ class CockpitWindow : Window
                         }
                         if (string.IsNullOrEmpty(localLabel)) localLabel = peEvent;
                         string timePrefix = peTs > 0 ? fmtTs(peTs) : "";
-                        evs2.Add(timePrefix + localLabel);
+                        evs2.Add(new Tuple<string, string>(timePrefix + localLabel, Theme.TimelineColor(peEvent, _dark)));
                     }
                     if (evs2.Count > 0) return evs2;
                 }
@@ -14317,27 +14316,30 @@ class CockpitWindow : Window
         }
         catch { }
 
-        var evs = new List<string>();
+        var evs = new List<Tuple<string, string>>();
         string queuedTs = hasTs ? fmtTs(metaTs) : "";
-        evs.Add(queuedTs + (ja ? "投入" : "Queued"));
+        evs.Add(new Tuple<string, string>(queuedTs + Theme.StatusLabel("pending", _lang), Theme.TimelineColor("pending", _dark)));
         string startTs = (firstTurnTs > 0) ? fmtTs(firstTurnTs) : "";
-        evs.Add(startTs + (ja ? "開始" : "Started"));
+        evs.Add(new Tuple<string, string>(startTs + Theme.StatusLabel("ready", _lang), Theme.TimelineColor("ready", _dark)));
         if (reviews > 0)
-            evs.Add(ja ? ("レビュー (" + reviews + "x)") : ("Reviewed (" + reviews + "x)"));
+            evs.Add(new Tuple<string, string>(
+                ja ? ("レビュー (" + reviews + "回)") : ("Reviewed (" + reviews + "x)"),
+                Theme.TimelineColor("refuting", _dark)));
         if (terminal)
         {
             string outcomeEv;
+            string outcomeKey;
             switch (outcome)
             {
-                case "DONE":      outcomeEv = ja ? "完了" : "Completed"; break;
-                case "MAXTURNS":  outcomeEv = ja ? "ターン上限" : "Max turns reached"; break;
-                case "STUCK":     outcomeEv = ja ? "停滞" : "Stuck"; break;
-                case "ERROR":     outcomeEv = ja ? "エラー" : "Error"; break;
-                case "CANCELLED": outcomeEv = ja ? "停止" : "Cancelled"; break;
-                case "EVIDENCE_CONTRADICTED": outcomeEv = ja ? "記録と矛盾" : "Contradicted"; break;
-                default:          outcomeEv = string.IsNullOrEmpty(outcome) ? (ja ? "終了" : "Ended") : outcome; break;
+                case "DONE":      outcomeEv = ja ? "完了" : "Completed"; outcomeKey = "done"; break;
+                case "MAXTURNS":  outcomeEv = ja ? "最大ターン到達" : "Max turns reached"; outcomeKey = "maxturns"; break;
+                case "STUCK":     outcomeEv = ja ? "要対応" : "Stuck"; outcomeKey = "stuck"; break;
+                case "ERROR":     outcomeEv = ja ? "エラー" : "Error"; outcomeKey = "error"; break;
+                case "CANCELLED": outcomeEv = ja ? "停止" : "Cancelled"; outcomeKey = "cancelled"; break;
+                case "EVIDENCE_CONTRADICTED": outcomeEv = ja ? "記録と矛盾" : "Contradicted"; outcomeKey = "stuck"; break;
+                default:           outcomeEv = string.IsNullOrEmpty(outcome) ? (ja ? "終了" : "Ended") : outcome; outcomeKey = "cancelled"; break;
             }
-            evs.Add(outcomeEv);
+            evs.Add(new Tuple<string, string>(outcomeEv, Theme.TimelineColor(outcomeKey, _dark)));
         }
         return evs;
     }
