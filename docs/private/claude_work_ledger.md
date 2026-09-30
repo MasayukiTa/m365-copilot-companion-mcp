@@ -134,6 +134,11 @@ Under `%USERPROFILE%\.claude\tools\<tool>\README.md`:
 - Replaced on branch fix/continuation-compact-ledger-20260930: the first message keeps the full goal; later prompts carry a deterministic ledger of at most 1000 characters (LEDGER_MAX_CHARS, relay/relay_fleet.py): task line, fixed-constraint sentences, fan-out scope block, pointer to the first message. Empty-goal guards, neutral wording and the theme_from_goal date fix are unchanged.
 - Design and limits (extraction is a heuristic): docs/private/20260930_goal_fidelity_design.md.
 
+## 2026-10-01 - split-group ledger view, Python side (PR 1 of the family-view design)
+
+- New pure module relay/family_view.py (+ relay/test_family_view.py, registered in ci.yml): builds one compact summary per 分割グループ from status.json workers and campaigns.jsonl: group id, parent state, children by state (queued/running/done/failed/interrupted), merge state, and the constraint lines/tokens the goal ledger carries. The goal is shown only as the relay_fleet.goal_ledger output, clipped again (task 160, constraint 120 chars, max 5 lines), never the long text.
+- `display_state` (awaiting_children = 待機中, ready_to_merge, merging, done, merge_failed, interrupted) is derived only; the parent's real status/outcome (FANOUT) and relay_fleet.TERMINAL are unchanged. JSON contract is in the module docstring for the C# side. No caller is wired yet and no C# changed.
+
 ## 2026-10-01 - phase 2 of interrupted-run resume (Python only)
 
 - Branch feat/reap-phase2-resume-20261001 (worktree, not the live tree). Design: docs/private/20260930_fleet_interrupted_resume_design.md sections 2-4.
@@ -141,3 +146,6 @@ Under `%USERPROFILE%\.claude\tools\<tool>\README.md`:
 - Loop guard: `resume_gate` (pure) in relay/fleet_resume.py, mirrored by Get-FleetResumeGate / Test-FleetShouldAutoResume -Gate in scripts/supervisor.ps1; parity test feeds one case table to both. The floor is only READ (settings_disk_floor); no value defined. Lineage: the resumer puts MCP_FLEET_RESUME_LINEAGE in the child env, the marker records it, the reaper's next snapshot inherits the resume block (otherwise a resumed run's new run_id would reset the count).
 - Supervisor cycle call: after Invoke-FleetReap, DRY RUN unless -FleetCycleResumeLive; logs once per interrupted pid. Startup call also reads the pending snapshot.
 - Free-space ring `.fleet/free_space_ring.jsonl` (32 KB fixed, 256 x 128 B, cap_jsonl only trims above 64 MB) and `.fleet/fault_p<pid>.log` (64 KB pre-zeroed, faulthandler); status.json `disk` block. Deferred: fleet_diag, cockpit dot, display_state, C#.
+
+## 2026-10-01 family view production caller (PR #87)
+- relay/fleet_runner.py `_snapshot` now calls `_attach_split_groups`: adds `groups` (family_view.build_groups, max 50) and a per-parent `display_state` key (annotate_display_state copies; status/outcome/pill untouched); any exception only omits the additions. Added `python -m relay.family_view [--fleet-dir DIR]` (main()). Fixes tools/test_nothing_new_is_built_without_a_caller.py without touching any allowlist.
