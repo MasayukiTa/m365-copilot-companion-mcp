@@ -210,9 +210,14 @@ def test_the_detached_scan_can_see_every_spelling(tmp_path):
         "b = getattr(subprocess, 'DETACHED_PROCESS', 0)\n"
         "from subprocess import DETACHED_PROCESS\n"
         "c = DETACHED_PROCESS\n", encoding="utf-8")
-    _sp.run(["git", "init", "-q", str(tmp_path)], check=True,
+    # No GIT_DIR & co: under a pre-push hook they would make `git init` re-initialise the
+    # repository being pushed (core.bare = true) instead of tmp_path.
+    _env = {k: v for k, v in os.environ.items()
+            if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_PREFIX",
+                         "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY")}
+    _sp.run(["git", "init", "-q", str(tmp_path)], check=True, env=_env,
             creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0))
-    _sp.run(["git", "-C", str(tmp_path), "add", "m.py"], check=True,
+    _sp.run(["git", "-C", str(tmp_path), "add", "m.py"], check=True, env=_env,
             creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0))
     assert L.detached_uses(str(tmp_path)) == ["m.py:4", "m.py:5", "m.py:7"]
 
