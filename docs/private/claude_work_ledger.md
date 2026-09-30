@@ -59,12 +59,20 @@ Under `%USERPROFILE%\.claude\tools\<tool>\README.md`:
 
 ## Open items
 
-- [ ] effort_policy settings key + env-override surfacing (branch feat/effort-policy-setting-20260930, PR pending)
+- [x] effort_policy settings key + env-override surfacing (branch feat/effort-policy-setting-20260930, PR pending)
 - [ ] GUI control in the cockpit (design doc pending; C# edit after codex's FleetCockpit changes are committed)
-- [ ] enable shadow via settings
+- [x] enable shadow via settings
 - [ ] live in-run switching
 - [ ] bench A/B: uniform min/auto/ultra vs policy on non-burned problems
 - [ ] Copilot model/agent switching (unverified)
 - [ ] Cowork / other disk items
 - [ ] miasma-wsl decision
 - [ ] end-to-end verification of the fixes on the fresh PC via quickstart.bat / start_all.bat only
+
+## 2026-09-30 13:49 JST - effort setting merged, shadow enabled
+
+- PR #71 merged (75c157d): settings key `effort_policy=off|shadow|on` (default off); mode() precedence is env MCP_EFFORT_POLICY > settings.txt > off; mode_info() returns (mode, source, conflict) and an env/settings conflict is logged once; telemetry rows carry extra.mode_source. GUI design: `docs/private/20260930_effort_policy_gui_design.md` (no C# edited yet: ui/FleetCockpit.cs is under active change by the other engineer; the control goes in a small PR after their changes are committed). PR #72 (the previous ledger entry) merged (cfcab4d).
+- The live tree's branch received merges of origin/main twice (effort policy phases 1-2 with the git-env scrub; then the setting key), each after read-only checks (no overlap with uncommitted changes, merge-tree clean) and followed by checks (core.bare=false, git status works, import sanity, 87 effort/git-env tests passed). Push of that branch is still blocked by the pre-push guard because of another engineer's untracked test file scripts/test_repair_children_are_windowless.py (not ours, not bypassed).
+- Shadow enabled: `effort_policy=shadow` was written directly into .config/settings.txt (backup kept in the temp dir) as a one-time exception on the owner's explicit instruction, because the GUI control does not exist yet. The cockpit's SaveKey rewrites line by line, so the unknown key survives (verified in code). Live check: mode_info() = ('shadow', 'settings', False). No effort_policy telemetry rows existed yet at 13:0x because the fleet run in progress had loaded the old code; rows are expected from the next fleet run (a watcher waits for the first row).
+- Fan-out rate (measured from .fleet/mechanisms.jsonl, before shadow): real triggered fan-outs 1,1,4,6 on 09-26..09-29 (triggered was only recorded from 09-26); child judgement rows 9,5,31,62; top-level eligibility rate 56%,12%,76%,87% (goal mix changes daily; no causal claim). Correction of an earlier statement: 2,165 fanout rows were judgements, not fan-outs.
+- Open items list ticked: settings key, enable shadow. Still open: first shadow row confirmation; cockpit C# control after the other engineer's FleetCockpit.cs commit; in-run switching (still shadow only); bench A/B; Copilot model/agent switching (unverified).
