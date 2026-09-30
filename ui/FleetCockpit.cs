@@ -5016,6 +5016,24 @@ class CockpitWindow : Window
         parts.Add(I(w, "max_turns").ToString());
         parts.Add(S(w, "goal_summary"));
         parts.Add(S(w, "reason"));
+        parts.Add(S(w, "outcome"));
+        parts.Add(I(w, "verify_attempts").ToString());
+        object phaseRaw;
+        if (w.TryGetValue("phase_events", out phaseRaw) && phaseRaw is object[])
+        {
+            object[] phaseArr = (object[])phaseRaw;
+            parts.Add(phaseArr.Length.ToString());
+            if (phaseArr.Length > 0)
+            {
+                var lastPhase = phaseArr[phaseArr.Length - 1] as Dictionary<string, object>;
+                if (lastPhase != null)
+                {
+                    parts.Add(S(lastPhase, "event"));
+                    parts.Add(S(lastPhase, "label"));
+                    parts.Add(S(lastPhase, "ts"));
+                }
+            }
+        }
         var execution = Obj(w, "execution");
         if (execution != null)
         {
@@ -5042,9 +5060,9 @@ class CockpitWindow : Window
         return string.Join("|", parts.ToArray());
     }
 
-    // Left task-inspection spine. This is CONTENT DETAILS, not a second timeline. Historical
-    // phase evidence remains in the expanded card's Timeline section; this surface answers the
-    // operator's immediate question: what is the selected task doing now, and what comes next?
+    // Left task-inspection spine. Content details answer "what is it doing now?"; the timeline
+    // directly below answers "how did it get here?". Both follow the same selected worker, and
+    // the expanded card keeps the richer evidence view rather than being the only timeline.
     // GIVE THE SPINE A VIEWPORT. The column is a fixed 220px lane whose content has NO upper
     // bound: the timeline is one entry per phase transition, and the Border it sat in simply
     // CLIPPED everything past the fold. The entries were rendered and unreachable, with no
@@ -5074,6 +5092,98 @@ class CockpitWindow : Window
                 if (e.ExtentHeightChange != 0) sv.ScrollToEnd();
             };
         return sv;
+    }
+
+    void AddSpineTimeline(StackPanel outer, Dictionary<string, object> w)
+    {
+        if (outer == null || w == null) return;
+        bool ja = _lang == 0;
+
+        var divider = new Border();
+        divider.Height = 1;
+        divider.Background = Theme.Br(Theme.Border(_dark));
+        divider.Margin = new Thickness(0, 11, 0, 10);
+        outer.Children.Add(divider);
+
+        var title = new TextBlock();
+        title.Text = ja ? "実行タイムライン" : "Execution timeline";
+        title.Foreground = Theme.Br(Theme.Muted(_dark));
+        title.FontSize = 10.5;
+        title.FontWeight = FontWeights.SemiBold;
+        title.Margin = new Thickness(0, 0, 0, 2);
+        outer.Children.Add(title);
+
+        bool real = false;
+        object peRaw;
+        if (w.TryGetValue("phase_events", out peRaw) && peRaw is object[])
+            real = ((object[])peRaw).Length > 0;
+        outer.Children.Add(new TextBlock {
+            Text = real ? (ja ? "(フェーズ遷移)" : "(phase transitions)")
+                        : (ja ? "(ターン記録から推定)" : "(estimated from turns)"),
+            Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 9.5,
+            Margin = new Thickness(0, 0, 0, 7) });
+
+        // The phase name alone is not enough operationally. Surface what this selected worker
+        // is doing NOW, but only from fields the runner actually published -- no invented step.
+        string timelineNow = "";
+        var timelineExec = Obj(w, "execution");
+        if (timelineExec != null)
+        {
+            string current = S(timelineExec, "current_step");
+            string progress = S(timelineExec, "last_progress");
+            if (!string.IsNullOrEmpty(current)) timelineNow = current;
+            if (!string.IsNullOrEmpty(progress) && progress != current)
+                timelineNow = string.IsNullOrEmpty(timelineNow) ? progress : (timelineNow + " · " + progress);
+        }
+        if (string.IsNullOrEmpty(timelineNow)) timelineNow = S(w, "reason");
+        timelineNow = (timelineNow ?? "").Replace("\r", " ").Replace("\n", " ").Trim();
+        if (timelineNow.Length > 180) timelineNow = timelineNow.Substring(0, 179).TrimEnd() + "…";
+        if (!string.IsNullOrEmpty(timelineNow))
+            outer.Children.Add(new TextBlock {
+                Text = (ja ? "現在: " : "Now: ") + timelineNow,
+                Foreground = Muted, FontSize = 10.5, TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 0, 0, 8) });
+
+        string status = S(w, "status");
+        string outcome = S(w, "outcome");
+        bool terminal = status == "done" || status == "stuck" || status == "maxturns"
+                     || status == "error" || status == "cancelled";
+        int reviews = I(w, "verify_attempts");
+        var events = BuildTimelineEvents(S(w, "transcript"), outcome, terminal, reviews, w);
+        for (int i = 0; i < events.Count; i++)
+        {
+            bool last = i == events.Count - 1;
+            string label = events[i].Item1;
+            string color = events[i].Item2;
+
+            var row = new Grid();
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(18) });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+            var rail = new DockPanel();
+            rail.HorizontalAlignment = HorizontalAlignment.Center;
+            var head = new Border { Width = 1.5, Height = 7,
+                Background = i > 0 ? Theme.Br(Theme.Border(_dark)) : Brushes.Transparent,
+                HorizontalAlignment = HorizontalAlignment.Center };
+            DockPanel.SetDock(head, Dock.Top);
+            rail.Children.Add(head);
+            var dot = new System.Windows.Shapes.Ellipse { Width = 8, Height = 8,
+                Fill = Theme.Br(color), HorizontalAlignment = HorizontalAlignment.Center };
+            DockPanel.SetDock(dot, Dock.Top);
+            rail.Children.Add(dot);
+            rail.Children.Add(new Border { Width = 1.5,
+                Background = last ? Brushes.Transparent : Theme.Br(Theme.Border(_dark)),
+                HorizontalAlignment = HorizontalAlignment.Center });
+            Grid.SetColumn(rail, 0);
+            row.Children.Add(rail);
+
+            var tb = new TextBlock { Text = label, Foreground = Theme.Br(color), FontSize = 11.0,
+                FontWeight = FontWeights.SemiBold, TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(4, i == 0 ? 1 : 0, 0, 5) };
+            Grid.SetColumn(tb, 1);
+            row.Children.Add(tb);
+            outer.Children.Add(row);
+        }
     }
 
     // Derives events honestly from available data: run started ts, transcript first-turn ts,
@@ -5203,6 +5313,7 @@ class CockpitWindow : Window
                 TextWrapping = TextWrapping.Wrap });
         }
 
+        AddSpineTimeline(outer, primaryWorker);
         return outer;
     }
 

@@ -54,13 +54,14 @@ def test_timeline_status_lookup_normalizes_protocol_event_case():
     assert 'canonical.Trim().ToLowerInvariant()' in THEME
 
 
-def test_left_spine_is_not_a_second_timeline():
-    i = COCKPIT.index('UIElement BuildSpineContent(')
-    b = COCKPIT[i:COCKPIT.index('List<Tuple<string, string>> BuildTimelineEvents', i)]
-    assert 'sectionLbl.Text = ja ? "内容詳細" : "Content details";' in b
-    assert 'Theme.TimelineLabel(peEvent, _lang)' not in b
-    assert 'Theme.TimelineColor(peEvent, _dark)' not in b
-    assert 'Execution timeline' not in b
+def test_left_spine_reuses_the_execution_timeline_contract():
+    helper = COCKPIT[COCKPIT.index('void AddSpineTimeline('):COCKPIT.index('UIElement BuildSpineContent(')]
+    spine = COCKPIT[COCKPIT.index('UIElement BuildSpineContent('):COCKPIT.index('List<Tuple<string, string>> BuildTimelineEvents', COCKPIT.index('UIElement BuildSpineContent('))]
+    assert '"Content details"' in spine
+    assert 'AddSpineTimeline(outer, primaryWorker);' in spine
+    assert '"Execution timeline"' in helper
+    assert 'BuildTimelineEvents(' in helper
+    assert '"phase_events"' in helper
 
 
 def test_expanded_timeline_no_longer_forces_every_event_to_muted_gray():
@@ -124,8 +125,10 @@ def test_real_mode_uses_event_history_vocabulary_not_status_chip_copy():
         assert f'case "{key}"' in t
         assert ja in t and en in t
 
-    # The single REAL phase-event renderer is the expanded-card Timeline. The left spine is
-    # content details now; status-chip vocabulary must still not leak into event history.
+    # Both surfaces share BuildTimelineEvents; protocol event labels are produced there once and
+    # consumed by both the left Spine and the expanded-card Timeline.
     assert COCKPIT.count('Theme.TimelineLabel(peEvent, _lang)') == 1
+    helper = COCKPIT[COCKPIT.index('void AddSpineTimeline('):COCKPIT.index('UIElement BuildSpineContent(')]
+    assert 'BuildTimelineEvents(' in helper
     timeline = COCKPIT[COCKPIT.index('List<Tuple<string, string>> BuildTimelineEvents'):]
     assert 'Theme.StatusLabel(peEvent, _lang)' not in timeline
