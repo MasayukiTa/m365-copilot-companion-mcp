@@ -191,7 +191,7 @@ Acceptance:
 - closing-run and durable-runtime paths are included in live validation.
 
 ### STAB-006 -- server health red/yellow behavior must be truthful
-Status: OWNER-BOUND / LIVE PLANNED-RESTART LIFECYCLE VERIFIED; YELLOW SAMPLE STILL PENDING
+Status: CLOSED / EXACT PRODUCTION HEALTH-POLL PATH VERIFIED (2026-10-01 08:4x JST)
 
 Relevant current branch work:
 - `7d59d47` planned server restart distinction;
@@ -213,7 +213,11 @@ Acceptance:
 - repair: new markers also publish `supervisor_started` from the supervisor process birth. `ReadPlannedServerTransition()` now requires both PID and birth, verifies the live Windows process, and fails closed to no planned transition on missing/dead/reused/mismatched ownership;
 - focused transition tests: 6 passed; health/Cockpit related set: 24 passed; PowerShell parser: 0 errors; FleetCockpit/CopilotChat rebuild: success; `git diff --check`: clean.
 
-Do not call STAB-006 fully CLOSED yet: the 07:42 replacement gap was about 3s while the ordinary Cockpit health cadence is 15s, so that real planned restart did not leave a retained sample proving the visible dot became yellow. The lifecycle/ownership/expiry contract is now evidenced; one future natural planned restart sampled by the Cockpit (or equivalent exact health-poll execution) remains the last visual acceptance item. Do not manufacture a long production outage merely to make a 15s poll catch it.
+STAB-006 closure evidence (2026-10-01 08:4x JST): the remaining acceptance was completed through the ledger-approved **equivalent exact health-poll execution**, without stopping the production MCP server. A Windows C# harness compiles the shipping FleetCockpit source list and invokes the real `CockpitWindow.PollHealthOnce()` server-health branch under `--selftest`; the only injected inputs are the server HTTP result and a temporary `server_transition.json` path. With server-unreachable plus a fresh `planned_restart` marker owned by the live harness PID and matching process birth, the actual server dot became **Yellow** and retained the planned-restart reason. The same exact poll became **Red** when the marker was absent, named a dead PID, or reused the live PID with a mismatched birth time. Thus the owner/expiry checks do not mask a real outage, and planned supervisor-owned downtime is no longer falsely red. The production URL/path remain the defaults because both overrides are null and gated by `WindowSelfTest.Active`.
+
+Validation: exact-poll harness **5 passed**; related planned-restart/expiry/health/operability/window-construction set **32 passed**; both WPF binaries rebuilt successfully and FleetCockpit/CopilotChat were observed running from the rebuilt executables; `git diff --check` clean. Natural planned restarts were also observed at 07:42:16-07:42:19 and 08:30:08-08:30:12 JST, but their ~3-4s gaps were shorter than the ordinary 15s Cockpit cadence, which is why exact polling was required rather than manufacturing a longer production outage.
+
+STAB-006 is CLOSED. Reopen only if a future planned restart renders Red despite a live matching supervisor marker, or if a dead/stale/reused marker can soften a real outage to Yellow.
 
 ### STAB-007 -- finish current resend-policy work without losing the branch state
 Status: VALIDATED / COMMITTED / PUSHED (`cca3295`)
@@ -387,3 +391,7 @@ Validation:
 - `git diff --check`: clean.
 
 This item is CLOSED. Reopen only if a reply that explicitly says unlock is unnecessary still enters unlock probe/injection, or if a real lock refusal is newly suppressed. The next unresolved P0 in this ledger is STAB-006's missing retained yellow-state sample during a natural planned server restart.
+
+### 2026-10-01 08:4x JST P0 stabilization convergence checkpoint
+
+All P0 behavior regressions listed in the current stabilization ledger are now CLOSED with the required live/exact evidence: left-panel details+timeline, foreground console suppression, long-wait recovery, live task reflection/async capture, unlock/no-tool false-positive handling, and truthful planned-restart server health. The resume queue now advances to **INTEGRATION**: validate the current branch head through blocking CI / Windows build / install path / CodeQL / Secret scan / PowerShell lint / Workflow lint, then merge/converge through the existing branch plan and verify post-merge `main`. Do not resume unrelated durable-runtime/C2C feature expansion before this integration gate is green.

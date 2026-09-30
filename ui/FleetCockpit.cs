@@ -1140,6 +1140,12 @@ class CockpitWindow : Window
         return a;
     }
     readonly object _healthLock = new object();
+    // EXACT HEALTH-POLL SELFTEST SEAMS. Null in every normal process. They exist so a temp
+    // harness can execute PollHealthOnce() itself against an unreachable synthetic server and a
+    // temp transition marker without stopping the production MCP server. Both uses are gated by
+    // WindowSelfTest.Active below; normal cockpit behaviour cannot redirect either source.
+    string _serverTransitionPathForSelfTest = null;
+    Func<string, int, string> _serverHealthBodyForSelfTest = null;
     // The last /health body, captured by the Server dot's poll so dot 5 can read the FLEET
     // tool path from it without a second HTTP round trip. Empty until the first successful
     // poll, and empty must read as "no evidence" everywhere it is used.
@@ -2703,7 +2709,9 @@ class CockpitWindow : Window
     {
         try
         {
-            string path = Path.Combine(RepoRootForSettings(), ".fleet", "server_transition.json");
+            string path = (WindowSelfTest.Active && !string.IsNullOrEmpty(_serverTransitionPathForSelfTest))
+                ? _serverTransitionPathForSelfTest
+                : Path.Combine(RepoRootForSettings(), ".fleet", "server_transition.json");
             if (!File.Exists(path)) return null;
             var raw = _js.DeserializeObject(File.ReadAllText(path, Encoding.UTF8)) as Dictionary<string, object>;
             if (raw == null) return null;
@@ -2759,6 +2767,35 @@ class CockpitWindow : Window
         }
     }
 
+    // Execute the REAL server segment of PollHealthOnce in a --selftest process. This is not a
+    // second implementation: it only supplies the two external inputs (HTTP body + marker path),
+    // calls PollHealthOnce below, and returns the dot state it actually wrote. Production callers
+    // cannot use it because WindowSelfTest.Active is false.
+    internal string SelfTestServerHealthPoll(string transitionPath, bool reachable)
+    {
+        if (!WindowSelfTest.Active)
+            throw new InvalidOperationException("server health selftest seam is available only under --selftest");
+        string oldPath = _serverTransitionPathForSelfTest;
+        Func<string, int, string> oldBody = _serverHealthBodyForSelfTest;
+        try
+        {
+            _serverTransitionPathForSelfTest = transitionPath;
+            _serverHealthBodyForSelfTest = delegate(string url, int timeoutMs)
+            {
+                if (!reachable) return null;
+                return "{\"status\":\"ok\",\"auth_fail_10m\":0,\"server_code\":\"current\"}";
+            };
+            PollHealthOnce();
+            lock (_healthLock)
+                return _health[0].State.ToString() + "|" + (_health[0].Detail ?? "");
+        }
+        finally
+        {
+            _serverTransitionPathForSelfTest = oldPath;
+            _serverHealthBodyForSelfTest = oldBody;
+        }
+    }
+
     // One full infra sweep. Writes results into _health under _healthLock.
     void PollHealthOnce()
     {
@@ -2775,7 +2812,9 @@ class CockpitWindow : Window
         // So: unreachable stays Red, and a reachable server that is REPORTING A PROBLEM about
         // itself goes Amber rather than Green. Amber, not Red, because the server process is
         // genuinely up -- the distinction matters for what a person does next.
-        string srvBody = HttpBody("http://127.0.0.1:8000/health", 3500);
+        string srvBody = (WindowSelfTest.Active && _serverHealthBodyForSelfTest != null)
+            ? _serverHealthBodyForSelfTest("http://127.0.0.1:8000/health", 3500)
+            : HttpBody("http://127.0.0.1:8000/health", 3500);
         bool srvOk = srvBody != null;
         if (srvOk) { _lastHealthBody = srvBody; _lastHealthBodyAt = NowUnix(); }
         string authFails = HealthField(srvBody, "auth_fail_10m");
@@ -2829,6 +2868,8 @@ class CockpitWindow : Window
             SetDot(0, HealthState.Green, T("hs_srv_detail_stale_recent"), now);
         else
             SetDot(0, HealthState.Green, T("hs_srv_detail_ok"), now);
+
+        if (WindowSelfTest.Active && _serverHealthBodyForSelfTest != null) return;
 
         // 1) Tunnel: read MCP_TUNNEL_URL from ..\.env; GET <url>/health == 200. Gray if none.
         //
