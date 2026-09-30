@@ -159,3 +159,8 @@ Under `%USERPROFILE%\.claude\tools\<tool>\README.md`:
 
 ## 2026-10-01 effort policy: shadow_tick reads goal_record
 - relay/effort_policy.py: shadow_tick read worker.goal (TEXT) so an explicit goal effort never set the shadow initial level/floor. Added goal_dict(worker) (reads worker.goal_record) as the one accessor; status_fields and shadow_tick both use it, and shadow_tick seeds level/floor via initial_level. Sweep: no other .goal reader in effort_policy.py; relay_fleet hooks (shadow_tick, observe_child, worker_level, sibling_adjust, shadow_assign) take goal dicts or knobs. Tests: relay/test_effort_shadow_reads_goal_record.py (in ci.yml).
+
+## 2026-10-01 resume scoped to the interrupted run
+- Root cause: PR #86 G2 (fleet_runner --resume -> fleet_resume.resume_children_goals) re-queued the unfinished children of EVERY campaign in .fleet/campaigns.jsonl lacking merge_done (63 old campaigns -> 545 degraded goals for a 2-goal run), reset last_run_done.json to {} on resume, and each snapshot embedded every plan (80KB-2.6MB).
+- Fix: fleet_resume.campaigns_of_run/interrupted_run_scope decide membership (new header stamp run_id+ts; else worker campaign id / parent-goal hash / lineage chain; nothing else, fail closed); snapshot embeds only scoped plans (cap 40x64, campaigns_scoped flag; unflagged old snapshots are not trusted); hard cap max(20, 4x goals) refuses with state pending (exit 6); resume no longer resets the done map. Sweep: relay_fleet._campaigns_from_disk left unscoped with reason in a comment; family_view/_campaign_already_on_disk are read-only/per-id.
+- Tests: tests/test_resume_scoped_to_interrupted_run.py (in ci.yml); existing phase2 tests now pass scope explicitly.

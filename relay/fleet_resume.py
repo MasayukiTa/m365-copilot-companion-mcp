@@ -107,16 +107,172 @@ def _child_done(child, fam, done_map):
     return False
 
 
-def resume_children_goals(state_dir, done_map=None, log=print):
+#: Hard ceiling on what one resume may queue: max(RESUME_CAP_FLOOR, RESUME_CAP_FACTOR x the
+#: interrupted run's own goal count). Membership scoping is the real fix; this is the net that
+#: turns any future membership mistake into a refusal instead of hundreds of queued goals.
+RESUME_CAP_FLOOR = 20
+RESUME_CAP_FACTOR = 4
+#: Bounds for the campaign plans embedded in an interrupted snapshot.
+SNAPSHOT_MAX_CAMPAIGNS = 40
+SNAPSHOT_MAX_CHILDREN = 64
+RESUME_CAP_REASON = "resume_queue_cap_exceeded"
+
+
+def resume_queue_cap(original_goal_count):
+    try:
+        n = int(original_goal_count or 0)
+    except (TypeError, ValueError):
+        n = 0
+    return max(RESUME_CAP_FLOOR, RESUME_CAP_FACTOR * max(n, 0))
+
+
+def run_identity(run_id, workers):
+    """(run_ids, worker_campaign_ids, goal_texts) of one run, from its worker entries."""
+    run_ids = {str(run_id)} if run_id else set()
+    cids, texts = set(), []
+    for w in workers or []:
+        if not isinstance(w, dict):
+            continue
+        if w.get("run_id"):
+            run_ids.add(str(w["run_id"]))
+        c = w.get("campaign_id") or w.get("campaign")
+        if c:
+            cids.add(str(c))
+        g = w.get("goal")
+        if isinstance(g, dict):
+            g = g.get("text") or g.get("goal")
+        if isinstance(g, str) and g.strip():
+            texts.append(g)
+    return run_ids, cids, texts
+
+
+def campaigns_of_run(fams, run_ids=(), worker_cids=(), goal_texts=(), prior_cids=()):
+    """The campaign ids in `fams` that BELONG to one run. Fail closed: nothing is a member
+    unless some evidence says so, so a ledger of old campaigns contributes none.
+
+    * header stamped with a run id (new ledgers): member iff the stamp is one of `run_ids`;
+    * header with no stamp (legacy ledgers carry no run id and no timestamp): member iff the
+      campaign id is the hash of a goal this run held (the parent job), which is how a split
+      parent is tied to its family;
+    * either kind: member when a worker of this run carries the campaign id, or `prior_cids`
+      (the scoped list of the run this one resumed) names it.
+    """
+    run_ids = {str(r) for r in run_ids or () if r}
+    worker_cids = {str(c) for c in worker_cids or () if c}
+    prior = {str(c) for c in prior_cids or () if c}
+    parents = set()
+    for t in goal_texts or ():
+        try:
+            parents.add(campaign_id_for_goal((t or "").strip()))
+            parents.add(campaign_id_for_goal(t or ""))
+        except Exception:
+            pass
+    out = set()
+    for cid, fam in (fams or {}).items():
+        stamped = [str(r) for r in (fam.get("run_ids") or []) if r]
+        if cid in worker_cids or cid in prior:
+            out.add(cid)
+        elif stamped:
+            if run_ids & set(stamped):
+                out.add(cid)
+        elif cid in parents:
+            out.add(cid)
+    return out
+
+
+def _snapshot_files(state_dir):
+    d = os.path.join(state_dir, "interrupted")
+    try:
+        return [os.path.join(d, n) for n in os.listdir(d) if n.endswith(".json")]
+    except OSError:
+        return []
+
+
+def _scoped_ids(data):
+    if not isinstance(data, dict) or not data.get("campaigns_scoped"):
+        return set()
+    return {str(c.get("campaign_id")) for c in data.get("campaigns") or []
+            if isinstance(c, dict) and c.get("campaign_id")}
+
+
+def lineage_campaign_ids(state_dir, lineage, depth=6):
+    """Scoped campaign ids carried by the snapshot chain a resumed run descends from."""
+    out, seen = set(), set()
+    while lineage and depth > 0 and lineage not in seen and re.fullmatch(r"[A-Za-z0-9_\-]+", str(lineage)):
+        seen.add(lineage)
+        depth -= 1
+        data = _snapshot_read(os.path.join(state_dir, "interrupted", str(lineage) + ".json"))
+        if not isinstance(data, dict):
+            break
+        out |= _scoped_ids(data)
+        lineage = (data.get("resume") or {}).get("lineage")
+    return out
+
+
+def interrupted_run_scope(state_dir, lineage=None):
+    """The campaign ids that belong to the run being resumed -> (set, origin).
+
+    Evidence, in order: the snapshot the resumer named (MCP_FLEET_RESUME_LINEAGE), else the
+    newest pending/resumed snapshot; its workers give the run ids, the campaign ids and the
+    parent goal texts; last_run_goals.json adds goal texts. No snapshot and no goals ledger
+    -> empty set (nothing is resumed from the campaign ledger).
+    """
+    if lineage is None:
+        lineage = os.environ.get("MCP_FLEET_RESUME_LINEAGE", "")
+    lineage = str(lineage or "").strip()
+    snap = None
+    if lineage and re.fullmatch(r"[A-Za-z0-9_\-]+", lineage):
+        snap = _snapshot_read(os.path.join(state_dir, "interrupted", lineage + ".json"))
+    if not isinstance(snap, dict):
+        snap, best = None, -1.0
+        for path in _snapshot_files(state_dir):
+            d = _snapshot_read(path)
+            if isinstance(d, dict) and d.get("state") in ("pending", "resumed"):
+                ts = _num(d.get("written_ts"), 0.0)
+                if ts > best:
+                    snap, best = d, ts
+    run_ids, cids, texts, prior = set(), set(), [], set()
+    origin = "none"
+    if isinstance(snap, dict):
+        origin = "snapshot"
+        run_ids, cids, texts = run_identity(snap.get("run_id"), snap.get("workers"))
+        prior |= _scoped_ids(snap)
+        prior |= lineage_campaign_ids(state_dir, (snap.get("resume") or {}).get("lineage"))
+    try:
+        with open(os.path.join(state_dir, "last_run_goals.json"), encoding="utf-8-sig") as fh:
+            led = json.load(fh)
+        for e in led.get("goals") or []:
+            if isinstance(e, dict) and e.get("text"):
+                texts.append(str(e["text"]))
+        if origin == "none" and texts:
+            origin = "goals_ledger"
+    except Exception:
+        pass
+    if not (run_ids or cids or texts or prior):
+        return set(), origin
+    return campaigns_of_run(read_campaigns(state_dir), run_ids, cids, texts, prior), origin
+
+
+def resume_children_goals(state_dir, done_map=None, log=print, scope=None):
     """G2: goals to re-queue for campaign children that are not DONE.
 
-    Only campaigns with a header and WITHOUT `merge_done` count. Returns
-    (goals, degraded) where `degraded` is the number of goals rebuilt from the old truncated
-    `text` + header cwd because the child line predates the `goal` object.
+    Only campaigns that belong to the interrupted run (`scope`, a set of campaign ids; derived
+    by interrupted_run_scope when None) with a header and WITHOUT `merge_done` count. The
+    ledger keeps every campaign ever split, so taking all unfinished ones re-queued 545 goals
+    for a 2-goal run. Returns (goals, degraded) where `degraded` is the number of goals
+    rebuilt from the old truncated `text` + header cwd because the child line predates the
+    `goal` object.
     """
     done_map = read_done_map(state_dir) if done_map is None else done_map
-    goals, degraded = [], 0
-    for cid, fam in sorted(read_campaigns(state_dir).items()):
+    if scope is None:
+        scope, _origin = interrupted_run_scope(state_dir)
+    scope = set(scope)
+    goals, degraded, skipped = [], 0, 0
+    camps = read_campaigns(state_dir)
+    for cid, fam in sorted(camps.items()):
+        if cid not in scope:
+            skipped += 1
+            continue
         if fam.get("merge_done"):
             continue
         for child in fam.get("children") or []:
@@ -141,6 +297,8 @@ def resume_children_goals(state_dir, done_map=None, log=print):
                     "(degraded: old ledger line has no goal object)"
                     % (child.get("subtask_index"), cid))
             goals.append(goal)
+    log("[resume] campaign ledger: %d campaign(s) belong to the interrupted run, %d other(s) "
+        "ignored" % (len(scope & set(camps)), skipped))
     return goals, degraded
 
 
@@ -242,6 +400,26 @@ def _snapshot_read(path):
     return _read_json(path)
 
 
+def record_resume_refused(state_dir, lineage, now, queued, cap):
+    """The coordinator refused to queue `queued` goals (> cap): the snapshot stays `pending`
+    and carries the reason. The count is NOT reset, so the loop guard still ends retries."""
+    try:
+        if not lineage or not re.fullmatch(r"[A-Za-z0-9_\-]+", str(lineage)):
+            return False
+        path = os.path.join(state_dir, "interrupted", str(lineage) + ".json")
+        data = _snapshot_read(path)
+        if not isinstance(data, dict):
+            return False
+        data.setdefault("resume", {})["blocked"] = {
+            "reason": RESUME_CAP_REASON, "ts": now, "queued": queued, "cap": cap}
+        data["state"] = "pending"
+        data["state_ts"] = now
+        _snapshot_write(path, data)
+        return True
+    except Exception:
+        return False
+
+
 def record_resume(path, now, free_bytes, signature):
     """After a real relaunch: state=resumed, resume.count += 1, history. Never raises."""
     try:
@@ -255,9 +433,11 @@ def record_resume(path, now, free_bytes, signature):
         r["last_free_bytes"] = free_bytes
         r.setdefault("history", []).append(
             {"ts": now, "free_bytes": free_bytes, "signature": signature or ""})
-        r.pop("blocked", None)
-        data["state"] = "resumed"
-        data["state_ts"] = now
+        refused = (r.get("blocked") or {}).get("reason") == RESUME_CAP_REASON
+        if not refused:
+            r.pop("blocked", None)
+            data["state"] = "resumed"
+            data["state_ts"] = now
         _snapshot_write(path, data)
         return True
     except Exception:
