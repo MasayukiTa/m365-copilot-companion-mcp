@@ -3706,6 +3706,23 @@ def main():
             if _kids:
                 print("RESUME: %d unfinished campaign child(ren) re-queued from the campaign "
                       "ledger (%d degraded)." % (len(_kids), _degraded))
+            # HARD SAFETY CAP. Scoping to the interrupted run is the fix; this refuses, loudly
+            # and with the snapshot left pending, anything that would still queue an absurd
+            # number of goals (545 were queued for a 2-goal run before the scoping existed).
+            _cap = _fr.resume_queue_cap(m_total)
+            _would = len(resume_goals) + len(_kids)
+            if _would > _cap:
+                print("REFUSING TO RESUME: it would queue %d goals (%d from the goals ledger, "
+                      "%d campaign children) but the cap is %d (max(%d, %dx the run's %d "
+                      "goals)). State left pending; nothing was queued."
+                      % (_would, len(resume_goals), len(_kids), _cap, _fr.RESUME_CAP_FLOOR,
+                         _fr.RESUME_CAP_FACTOR, m_total), flush=True)
+                _fr.record_resume_refused(
+                    args.state_dir, os.environ.get("MCP_FLEET_RESUME_LINEAGE", "").strip(),
+                    time.time(), _would, _cap)
+                _release_run_lock(_ACTIVE_RUN_LOCK)
+                _ACTIVE_RUN_LOCK = None
+                return 6
             resume_goals = resume_goals + _kids
         except Exception as _e:
             print("RESUME: could not read campaign children: %s: %s" % (type(_e).__name__, _e))
@@ -3786,7 +3803,12 @@ def main():
         _ACTIVE_RUN_LOCK = None
         return 5
     try:
-        _write_atomic(os.path.join(args.state_dir, LAST_RUN_DONE), {})
+        # A RESUME KEEPS THE DONE MAP. It is monotonic (DONE keys are only ever added), and the
+        # goals ledger written above holds just the unfinished goals, so wiping the map here
+        # forgot every finished goal -- a second resume could then re-run them. Only a fresh
+        # run starts from {}.
+        if not args.resume:
+            _write_atomic(os.path.join(args.state_dir, LAST_RUN_DONE), {})
     except Exception as e:
         sys.stderr.write("[resume] WARN: could not reset done map: %s\n" % e)
 
