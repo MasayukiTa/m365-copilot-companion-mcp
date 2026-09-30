@@ -76,3 +76,11 @@ Under `%USERPROFILE%\.claude\tools\<tool>\README.md`:
 - Shadow enabled: `effort_policy=shadow` was written directly into .config/settings.txt (backup kept in the temp dir) as a one-time exception on the owner's explicit instruction, because the GUI control does not exist yet. The cockpit's SaveKey rewrites line by line, so the unknown key survives (verified in code). Live check: mode_info() = ('shadow', 'settings', False). No effort_policy telemetry rows existed yet at 13:0x because the fleet run in progress had loaded the old code; rows are expected from the next fleet run (a watcher waits for the first row).
 - Fan-out rate (measured from .fleet/mechanisms.jsonl, before shadow): real triggered fan-outs 1,1,4,6 on 09-26..09-29 (triggered was only recorded from 09-26); child judgement rows 9,5,31,62; top-level eligibility rate 56%,12%,76%,87% (goal mix changes daily; no causal claim). Correction of an earlier statement: 2,165 fanout rows were judgements, not fan-outs.
 - Open items list ticked: settings key, enable shadow. Still open: first shadow row confirmation; cockpit C# control after the other engineer's FleetCockpit.cs commit; in-run switching (still shadow only); bench A/B; Copilot model/agent switching (unverified).
+
+## 2026-09-30 15:28 JST - first effort_policy shadow row observed
+
+- The first `effort_policy` telemetry row appeared in .fleet/mechanisms.jsonl for run r6abcab48_a0, worker w0, turn 0.
+- It records the initial assignment as level `auto` with config_source run, and extra.mode_source = settings: settings.txt effort_policy=shadow is what took effect, so the GUI-key path works end to end.
+- Only 1 row so far, because only one worker has started since the merge; in-run evaluation rows will accumulate with turns.
+- Next: after a few days of data, run scripts/effort_policy_replay.py on the live ledger and decide whether to set effort_policy=on (initial assignment for fan-out children).
+- Open items: first shadow row confirmation is done. Hidden-tool and disk items unchanged.
