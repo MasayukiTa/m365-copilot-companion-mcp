@@ -116,7 +116,12 @@ def _migrate_legacy_plaintext_auth(text: str) -> str:
             continue
         if key in found:
             raise ValueError("cannot protect legacy plaintext auth: duplicate assignment for %s" % key)
-        found[key] = line[m.end():].strip()
+        value = line[m.end():].strip()
+        # Match bootstrap.py's legacy migration semantics: dotenv-style matching outer quotes
+        # are syntax, not part of the logical secret value. Do not otherwise reinterpret it.
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        found[key] = value
     if not found:
         return text
 

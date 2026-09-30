@@ -178,6 +178,21 @@ def test_quickstart_unrelated_edit_migrates_existing_unlock_password(tmp_path, m
     assert "OTHER=1" in got
 
 
+def test_quoted_legacy_secret_keeps_the_same_logical_value_when_migrated(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text(
+        'MCP_API_KEY="quoted-secret"\nMCP_TUNNEL_ALLOW_ANONYMOUS=1\n',
+        encoding="utf-8")
+    seen = []
+    def protect(value):
+        seen.append(value)
+        return "dpapi:protected"
+    monkeypatch.setattr(E, "_protect_secret", protect)
+    assert E.unset_key(env, "MCP_TUNNEL_ALLOW_ANONYMOUS") is True
+    assert seen == ["quoted-secret"]
+    assert env.read_text(encoding="utf-8") == "MCP_API_KEY_PROTECTED=dpapi:protected\n"
+
+
 def test_legacy_plaintext_supersedes_stale_protected_copy_during_migration(tmp_path, monkeypatch):
     env = tmp_path / ".env"
     env.write_text(
