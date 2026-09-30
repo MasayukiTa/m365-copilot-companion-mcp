@@ -813,6 +813,7 @@ class CockpitWindow : Window
                                // The free RAM the autoscale keeps for the user (RAM analog of the disk
                                // floor). Persisted via SaveKey AND pushed live via {"set_ram_floor_mb":N}.
     string _effort = "auto";   // effort mode min|max|ultra|auto -> settings.txt effort= (NEW)
+    string _effortPolicy = "off";   // effort policy off|shadow|on -> settings.txt effort_policy= (EffortPolicy.cs)
     // Split a goal into independent sub-goals, run them in parallel, and merge the answers.
     // For work whose SIZE is the problem: a goal that cannot fit in one conversation fails at
     // the conversation, not at the work. Off by default -- a goal that fits should not pay for
@@ -1485,6 +1486,7 @@ class CockpitWindow : Window
         if (k == "rate") return ja ? "件/時" : "/h";
         // Effort selector + fleet-wide pause/stop (NEW)
         if (k == "effort") return ja ? "推論" : "Reasoning";
+        if (k == "effort_policy") return ja ? "推論方針" : "Effort policy";
         if (k == "approval") return ja ? "承認" : "Approval";
         if (k == "run_mode") return ja ? "実行方式" : "Run mode";
         if (k == "pause") return ja ? "一時停止" : "Pause";
@@ -1823,6 +1825,11 @@ class CockpitWindow : Window
                                         System.Globalization.CultureInfo.InvariantCulture, out ut))
                     { _scaleTarget = Math.Max(0.8, Math.Min(3.0, ut)); _scaleTargetLoaded = true; }
                 }
+                else if (ln.StartsWith(EffortPolicyView.Key + "="))
+                {
+                    string epm = EffortPolicyView.ParseMode(ln);
+                    if (epm != null) _effortPolicy = epm;
+                }
                 else if (ln.StartsWith("effort="))
                 {
                     string ef = ln.Substring(7).Trim();
@@ -1961,6 +1968,7 @@ class CockpitWindow : Window
         ctrls.Children.Add(_workerChipBorder);
 
         ctrls.Children.Add(EffortControl());
+        ctrls.Children.Add(EffortPolicyControl());
         ctrls.Children.Add(ApprovalControl());
         ctrls.Children.Add(ApprovalCenterControl());
         ctrls.Children.Add(FleetControls());
@@ -7352,6 +7360,21 @@ class CockpitWindow : Window
         effortVal.VerticalAlignment = VerticalAlignment.Center;
         effortVal.Margin = new Thickness(4, 0, 24, 0);
         effortRow.Children.Add(effortVal);
+        // read-only mirror of the header effort-policy combo (the header dropdown is authoritative)
+        var epLbl = new TextBlock();
+        epLbl.Text = T("effort_policy") + ": ";
+        epLbl.FontSize = 12;
+        epLbl.Foreground = Theme.Br(Theme.Muted(_dark));
+        epLbl.VerticalAlignment = VerticalAlignment.Center;
+        effortRow.Children.Add(epLbl);
+        var epVal = new TextBlock();
+        epVal.Text = _effortPolicy;
+        epVal.FontSize = 12;
+        epVal.FontWeight = FontWeights.SemiBold;
+        epVal.Foreground = Theme.Br(Theme.Text(_dark));
+        epVal.VerticalAlignment = VerticalAlignment.Center;
+        epVal.Margin = new Thickness(4, 0, 24, 0);
+        effortRow.Children.Add(epVal);
         var approvalLbl = new TextBlock();
         approvalLbl.Text = (ja ? "実行方式 / Run mode: " : "Run mode: ");
         approvalLbl.FontSize = 12;
@@ -7474,6 +7497,8 @@ class CockpitWindow : Window
     ComboBox _effortBox;
     ComboBox _approvalBox;
     TextBlock _effortLbl;
+    ComboBox _effortPolicyBox;
+    TextBlock _effortPolicyLbl, _effortPolicyNow, _effortPolicyWarn;
     TextBlock _approvalLbl;
     Button _pauseBtn, _stopBtn;
     System.Windows.Shapes.Path _pauseIcon, _stopIcon;   // drawn geometry (no font glyph needed)
@@ -7698,6 +7723,7 @@ class CockpitWindow : Window
                 return "live";
             case "rate_ceiling_rpm":
             case "job_approval_mode":
+            case "effort_policy":
                 return "each_gate";
             case "session_retention_days":
             case "session_max_mb":
@@ -8949,6 +8975,85 @@ class CockpitWindow : Window
 
         PaintEffort();
         return wrap;
+    }
+    // Effort policy selector (off|shadow|on). Persists effort_policy= to settings.txt, which
+    // relay/effort_policy.py re-reads at every decision (each_gate). This control never passes
+    // MCP_EFFORT_POLICY itself; what is REALLY in effect is what the runner reports in
+    // status.json (see PaintEffortPolicyInEffect), and an inherited env override is shown as a
+    // conflict. All wording/parsing lives in the WPF-free EffortPolicy.cs.
+    UIElement EffortPolicyControl()
+    {
+        var wrap = new StackPanel(); wrap.Orientation = Orientation.Horizontal;
+        wrap.VerticalAlignment = VerticalAlignment.Center; wrap.Margin = new Thickness(0, 0, 12, 0);
+
+        _effortPolicyLbl = new TextBlock(); _effortPolicyLbl.VerticalAlignment = VerticalAlignment.Center;
+        _effortPolicyLbl.FontSize = 12; _effortPolicyLbl.Margin = new Thickness(0, 0, 8, 0);
+        wrap.Children.Add(_effortPolicyLbl);
+
+        _effortPolicyBox = new ComboBox();
+        _effortPolicyBox.ToolTip = EffortPolicyView.Help(_lang == 0) + "\n" + EffortPolicyView.TakeEffectTip(_lang == 0);
+        _effortPolicyBox.Cursor = Cursors.Hand; _effortPolicyBox.FontSize = 12;
+        _effortPolicyBox.FontWeight = FontWeights.SemiBold; _effortPolicyBox.MinWidth = 78;
+        _effortPolicyBox.Padding = new Thickness(8, 2, 4, 2);
+        _effortPolicyBox.VerticalAlignment = VerticalAlignment.Center;
+        var epHelp = new Dictionary<string, string>();
+        foreach (string m in EffortPolicyView.Modes) epHelp[m] = EffortPolicyView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_effortPolicyBox, EffortPolicyView.Modes, epHelp, _effortPolicy);
+        _effortPolicyBox.DropDownOpened += delegate { CloseHeaderPopups("effort"); };
+        _effortPolicyBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_effortPolicyBox);
+            if (!EffortPolicyView.IsMode(sel) || sel == _effortPolicy) return;
+            _effortPolicy = sel;
+            SaveKey(EffortPolicyView.Key, _effortPolicy);
+            PaintEffortPolicyInEffect(_lastRoot);
+        };
+        wrap.Children.Add(_effortPolicyBox);
+
+        _effortPolicyNow = new TextBlock(); _effortPolicyNow.VerticalAlignment = VerticalAlignment.Center;
+        _effortPolicyNow.FontSize = 11.5; _effortPolicyNow.Margin = new Thickness(8, 0, 0, 0);
+        wrap.Children.Add(_effortPolicyNow);
+        _effortPolicyWarn = new TextBlock(); _effortPolicyWarn.VerticalAlignment = VerticalAlignment.Center;
+        _effortPolicyWarn.FontSize = 11.5; _effortPolicyWarn.FontWeight = FontWeights.SemiBold;
+        _effortPolicyWarn.Margin = new Thickness(8, 0, 0, 0);
+        _effortPolicyWarn.Visibility = Visibility.Collapsed;
+        wrap.Children.Add(_effortPolicyWarn);
+
+        PaintEffortPolicy();
+        return wrap;
+    }
+    void PaintEffortPolicy()
+    {
+        if (_effortPolicyLbl != null) { _effortPolicyLbl.Text = T("effort_policy"); _effortPolicyLbl.Foreground = Muted; }
+        if (_effortPolicyBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_effortPolicyBox), _effortPolicy)) ComboSelectVal(_effortPolicyBox, _effortPolicy);
+        _effortPolicyBox.Background = BtnBg; _effortPolicyBox.Foreground = Fg; _effortPolicyBox.BorderBrush = Border;
+        StyleFlatCombo(_effortPolicyBox);
+        PaintEffortPolicyInEffect(_lastRoot);
+    }
+    // What the RUNNER says is in effect (status.json "effort_policy"), beside the combo. No
+    // report (old runner, no run yet) -> nothing shown, never a guess from the combo.
+    void PaintEffortPolicyInEffect(Dictionary<string, object> root)
+    {
+        if (_effortPolicyNow == null || _effortPolicyWarn == null) return;
+        bool ja = _lang == 0;
+        string now = null, warn = null;
+        Dictionary<string, object> ep = root != null ? Obj(root, "effort_policy") : null;
+        if (ep != null)
+        {
+            string mode = S(ep, "mode");
+            object cf;
+            bool conflict = ep.TryGetValue("conflict", out cf) && cf is bool && (bool)cf;
+            now = EffortPolicyView.Describe(mode, S(ep, "source"), conflict, ja);
+            warn = EffortPolicyView.ConflictText(mode, _effortPolicy, conflict, ja);
+        }
+        _effortPolicyNow.Text = now ?? "";
+        _effortPolicyNow.Foreground = Muted;
+        _effortPolicyNow.Visibility = now != null ? Visibility.Visible : Visibility.Collapsed;
+        _effortPolicyWarn.Text = warn ?? "";
+        _effortPolicyWarn.Foreground = Theme.Br(Theme.Warning(_dark));
+        _effortPolicyWarn.Visibility = warn != null ? Visibility.Visible : Visibility.Collapsed;
     }
     void PaintEffort()
     {
@@ -10717,6 +10822,7 @@ class CockpitWindow : Window
         PaintAutoToggle();
         UpdateAutoEnabled();
         PaintEffort();
+        PaintEffortPolicy();
         PaintApproval();
         PaintApprovalCenterButton(PendingGates(ReadStatus()).Count);
         PaintPause();
@@ -10788,6 +10894,7 @@ class CockpitWindow : Window
         if (_autoValue != null) _autoValue.Text = _autoMax.ToString();
         PaintAutoToggle();
         PaintEffort();
+        PaintEffortPolicy();
         PaintApproval();
         PaintApprovalCenterButton(PendingGates(ReadStatus()).Count);
         PaintPause();
@@ -11657,6 +11764,7 @@ class CockpitWindow : Window
     void RenderCards(Dictionary<string, object> root)
     {
         _lastRoot = root;               // cache for single-card toggles
+        PaintEffortPolicyInEffect(root);   // what the runner reports is in effect (effort policy)
         // Preserve scroll position across the rebuild. Without this, every worker update
         // (status/turn change) reset the list and snapped the view back to the TOP -- which is
         // exactly why scrolling "didn't work" while tasks were live: the user scrolled down, a
@@ -12044,6 +12152,10 @@ class CockpitWindow : Window
                   .Append(':').Append(StableShortHash(S(w, "conv_title")));
                 // TASK 3 (Bucket C): track next_step + self_confidence so the collapsed row re-renders.
                 sb.Append('|').Append(S(w, "next_step").Length).Append(':').Append(S(w, "self_confidence"));
+                // effort badge fields: re-render when the level/source/last switch change
+                sb.Append("|ef:").Append(S(w, "effort_level")).Append(S(w, "effort_source"))
+                  .Append(StableShortHash(S(Obj(w, "effort_last_switch") ?? new Dictionary<string, object>(), "reason")))
+                  .Append(S(Obj(w, "effort_last_switch") ?? new Dictionary<string, object>(), "turn"));
                 var ex = Obj(w, "execution");
                 if (ex != null)
                     sb.Append("|exec:").Append(S(ex, "state"))
@@ -13496,6 +13608,9 @@ class CockpitWindow : Window
         // for the configured agent, WARNING-colored 既定Copilot badge for a plain /chat/ (default) url.
         var agentBadge = BuildAgentBadge(conv, convTitle);
         if (agentBadge != null) { DockPanel.SetDock(agentBadge, Dock.Left); left.Children.Add(agentBadge); }
+        // EFFORT BADGE: only when the runner sent effort_level (policy not off); absent = none.
+        var effBadge = BuildEffortBadge(w);
+        if (effBadge != null) { DockPanel.SetDock(effBadge, Dock.Left); left.Children.Add(effBadge); }
         string headline = !string.IsNullOrEmpty(goalSummary)
             ? goalSummary : CardTitle(convTitle, goal);
         var ht = new TextBlock {
@@ -15247,6 +15362,20 @@ class CockpitWindow : Window
             ? (_lang == 0 ? "既定Copilotの会話（MCPコネクタ無し）。エージェントに接続し直してください。"
                           : "Default-Copilot conversation (no MCP connector). Reconnect to the agent.")
             : (_lang == 0 ? "この会話はエージェントに接続されています" : "This conversation is bound to the agent");
+        return b;
+    }
+
+    // Per-worker effort pill from the additive status.json fields (EffortPolicyView words it).
+    Border BuildEffortBadge(Dictionary<string, object> w)
+    {
+        bool ja = _lang == 0;
+        Dictionary<string, object> last = Obj(w, "effort_last_switch");
+        string level = S(w, "effort_level"), src = S(w, "effort_source");
+        string text = EffortPolicyView.BadgeText(level, src, last, ja);
+        if (text == null) return null;
+        var b = Pill(text, "neutral");
+        b.Margin = new Thickness(0, 0, 5, 0);
+        b.ToolTip = EffortPolicyView.BadgeTip(level, src, last, ja);
         return b;
     }
 
