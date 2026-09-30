@@ -47,6 +47,7 @@ from .copilot_autopilot_relay import (
 )
 from relay import settle as _settle
 from relay import fanout as fanout_mod
+from relay import fleet_resume as resume_mod
 from relay.control_markers import CLOSING_INSTRUCTION
 from relay import invariants as _invariants
 
@@ -8077,13 +8078,19 @@ def _campaigns_from_disk(transcript_dir):
     except OSError:
         return {}
     out = {}
+    done_map = resume_mod.read_done_map(os.path.dirname(transcript_dir))
     for cid, fam in (fams or {}).items():
-        if fam.get("merged"):
+        # merge_done -> drop; merged (queued) without merge_done and no aggregator DONE ->
+        # re-issue exactly once; otherwise carry. See fleet_resume.rehydrate_decision.
+        verdict = resume_mod.rehydrate_decision(fam, done_map)
+        if verdict == "drop":
             continue
         out[cid] = {"goal": fam.get("goal") or "", "n": int(fam.get("n") or 0),
                     "merged": False, "cwd": fam.get("cwd"),
                     "checks": list(fam.get("checks") or []),
-                    "partial": fam.get("partial") or ""}
+                    "partial": fam.get("partial") or "",
+                    "child_results": list(fam.get("child_results") or []),
+                    "requeue_merge": verdict == "reissue"}
     if out:
         print("[fanout] rehydrated %d unmerged campaign(s) from the ledger" % len(out),
               flush=True)
@@ -8241,23 +8248,59 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     # which is the one thing the merge needs that the children do not carry themselves.
     campaigns = _campaigns_from_disk(transcript_dir)
 
-    def _note_merged(cid):
-        """Record on disk that this family has been assembled.
-
-        The counterpart of the header line. Without it the ledger can say a campaign was split
-        but not that it was finished, so a run rebuilt from the file would queue every past
-        merge again. Best-effort: failing to write it costs a duplicate merge after a crash,
-        while refusing to merge because the note could not be written costs the answer itself.
-        """
+    def _note_marker(row):
+        """Append one marker line to campaigns.jsonl. Best-effort by design: failing to write
+        it costs a duplicate merge (or a re-run child) after a crash, while refusing to
+        proceed because the note could not be written costs the answer itself."""
         if not transcript_dir:
             return
         try:
             with open(os.path.join(os.path.dirname(transcript_dir), "campaigns.jsonl"),
                       "a", encoding="utf-8") as fh:
-                fh.write(json.dumps({"kind": "merged", "campaign_id": cid},
-                                    ensure_ascii=False) + "\n")
+                fh.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
         except OSError:
             pass
+
+    def _note_merged(cid, agg_key=None):
+        """Record on disk that this family's merge was QUEUED (`merged`; compat), and with
+        `agg_key` the resume key of the aggregator goal so a later run can find it DONE in
+        last_run_done.json. That the merge FINISHED is the separate `merge_done` line."""
+        row = {"kind": "merged", "campaign_id": cid}
+        if agg_key:
+            row["agg_key"] = agg_key
+        _note_marker(row)
+
+    _noted_done = set()
+
+    def _note_finished_workers():
+        """G3 + G2 evidence: write `merge_done` when an aggregator worker ends DONE, and a
+        `child_result` line when a subtask ends DONE (its answer, capped like the merge
+        prompt caps it), once each. Read at resume so a merge can be rebuilt and a DONE child
+        is never run twice."""
+        for _w in workers:
+            if getattr(_w, "outcome", None) != "DONE":
+                continue
+            _env = getattr(_w, "task_envelope", None)
+            _cid = getattr(_env, "campaign_id", "") or ""
+            _role = getattr(_env, "role", "") or ""
+            if not _cid or _role not in ("aggregator", "subtask"):
+                continue
+            if _role == "aggregator":
+                _mark = (_cid, "merge_done")
+                if _mark in _noted_done:
+                    continue
+                _noted_done.add(_mark)
+                _note_marker({"kind": "merge_done", "campaign_id": _cid})
+            else:
+                _idx = getattr(_w, "subtask_index", None)
+                _mark = (_cid, "child", _idx)
+                if _mark in _noted_done:
+                    continue
+                _noted_done.add(_mark)
+                _note_marker({"kind": "child_result", "campaign_id": _cid,
+                              "subtask_index": _idx, "outcome": "DONE",
+                              "result": ((getattr(_w, "display_result", "")
+                                          or getattr(_w, "last_response", "") or "")[:1200])})
 
     def _campaign_already_on_disk(cid):
         """Whether this campaign was split by an EARLIER run.
@@ -8396,8 +8439,12 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                         fh.write(json.dumps(
                             {"campaign_id": cid, "task_id": k.get("task_id"),
                              "subtask_index": k.get("subtask_index"),
-                             "text": (k.get("text") or "")[:4000]},
-                            ensure_ascii=False) + "\n")
+                             "text": (k.get("text") or "")[:4000],
+                             # THE WHOLE GOAL (cwd, metadata, jid, effort ...), so a resume
+                             # can re-queue an unfinished child without depending on the
+                             # 4000-char `text`. Old lines lack it and resume degrades.
+                             "goal": k},
+                            ensure_ascii=False, default=str) + "\n")
         except Exception:
             pass
         # STEP THREE. Written HERE, where the split actually happens, because everything
@@ -8423,6 +8470,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         nine, and ended without ever writing the answer they were collected for.
         """
         queued = 0
+        _note_finished_workers()
         for _cid, _camp in campaigns.items():
             if _camp.get("merged"):
                 continue
@@ -8434,6 +8482,17 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                       "subtask_index": getattr(w, "subtask_index", "?"),
                       "result": (getattr(w, "display_result", "") or w.last_response or "")}
                      for w in _kids]
+            # ANSWERS OF CHILDREN THAT FINISHED IN AN EARLIER PROCESS come from the ledger
+            # (`child_result` lines), so a resumed family is not stuck waiting for workers
+            # that will never exist again. A live worker for the same slice wins.
+            _live_idx = {r["subtask_index"] for r in _recs}
+            for _cr in (_camp.get("child_results") or []):
+                _ci = _cr.get("subtask_index")
+                if _ci in _live_idx:
+                    continue
+                _live_idx.add(_ci)
+                _recs.append({"finished": True, "outcome": "DONE", "subtask_index": _ci,
+                              "result": _cr.get("result") or ""})
             # Every child ADMITTED must be finished, and all of them must have been admitted:
             # a family half of which is still queued is not a finished campaign, and merging
             # it would report a sweep that never ran as though it had.
@@ -8445,18 +8504,24 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             _recs = fanout_mod.collapse_retries(_recs)
             if len(_recs) < _camp.get("n", 0):
                 continue
-            _camp["merged"] = True
-            _note_merged(_cid)
             # THE PARENT'S WORKING DIRECTORY GOES WITH IT. The children get it from
             # child_goals; the merge was starting wherever the fleet happened to be, while
             # being asked to write a combined file and report its path.
-            add_box.append(fanout_mod.aggregation_goal(_camp["goal"], _recs,
-                                                       campaign_id=_cid,
-                                                       cwd=_camp.get("cwd"),
-                                                       parent_checks=_camp.get("checks"),
-                                                       parent_partial=_camp.get("partial"),
-                                                       parent_level=_camp.get("parent_level"),
-                                                       run_id=run_id))
+            _agg = fanout_mod.aggregation_goal(_camp["goal"], _recs,
+                                               campaign_id=_cid,
+                                               cwd=_camp.get("cwd"),
+                                               parent_checks=_camp.get("checks"),
+                                               parent_partial=_camp.get("partial"),
+                                               parent_level=_camp.get("parent_level"),
+                                               run_id=run_id)
+            _camp["merged"] = True
+            _note_merged(_cid, resume_mod.goal_resume_key(_agg))
+            if _camp.get("requeue_merge"):
+                # A merge queued before a death that never finished is re-issued once; the
+                # cap (fleet_resume.rehydrate_decision) reads this line.
+                _camp["requeue_merge"] = False
+                _note_marker({"kind": "merge_requeued", "campaign_id": _cid, "attempt": 1})
+            add_box.append(_agg)
             queued += 1
             print("[fanout] %s: %d/%d subtask(s) done -> merging"
                   % (_cid, sum(1 for r in _recs if (r["outcome"] or "").upper() == "DONE"),
