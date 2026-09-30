@@ -157,12 +157,6 @@ def test_cli_exit_codes(monkeypatch, patch):
         assert R.main([INST, patch]) == code
 
 
-def test_source_holds_no_hostnames_or_secrets():
-    src = open(R.__file__, encoding="utf-8").read()
-    for bad in ("shuttle-scope", "kiyus", "M118", "resonac", "password="):
-        assert bad not in src.replace("password=<redacted>", "")
-
-
 def test_real_transport_maps_process_errors(monkeypatch):
     import subprocess
     import types

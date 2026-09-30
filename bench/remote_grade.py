@@ -46,6 +46,7 @@ from dataclasses import asdict, dataclass
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
+import bench.verdicts as _V  # noqa: E402  (the one definition of a verdict)
 from tools.childproc import run as _child_run  # noqa: E402  (decodes without the locale codec)
 
 REMOTE_DIR = "C:/wsl-setup"
@@ -224,11 +225,11 @@ def grade(instance: str, patch_file: str, transport, timeout: float = DEFAULT_TI
                     "no complete verdict file (wsl distro or dockerd may be down); host said: " + out)
     m = re.search(r"VERDICT=([A-Za-z]+)", content)
     verdict = m.group(1) if m else ""
-    if verdict == "RESOLVED":
+    if _V.is_resolved(verdict):
         return done(True, verdict, NONE)
-    if verdict == "not":
+    if _V.normalise(verdict) == "NOT":
         return done(False, verdict, GRADED_FAIL)
-    if verdict == "EVALERR":
+    if verdict and not _V.is_measurement(verdict):
         return done(False, verdict, INFRA, "evalerr", "grader ran but produced no report")
     return done(False, verdict, INFRA, "malformed", "unrecognised verdict text: " + content)
 
