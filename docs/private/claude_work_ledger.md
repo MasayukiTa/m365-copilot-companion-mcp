@@ -85,6 +85,13 @@ Under `%USERPROFILE%\.claude\tools\<tool>\README.md`:
 - Next: after a few days of data, run scripts/effort_policy_replay.py on the live ledger and decide whether to set effort_policy=on (initial assignment for fan-out children).
 - Open items: first shadow row confirmation is done. Hidden-tool and disk items unchanged.
 
+## 2026-09-30 - interrupted-run reap incident and resume design
+
+- Incident: at 18:14:34 the fleet coordinator (pid 21520) crashed natively (sqlite3.dll 0xC0000006 on sessions.sqlite3-shm) while C: was full (0.2 GB free at 18:06). At 18:16:48 the supervisor's reaper marked every non-closed worker cancelled, including five healthy fan-out children; the fan-out parent had already ended done/FANOUT.
+- Finding: the reaper's liveness check was correct. The misjudgement is what it writes: `cancelled` (terminal, reads as a user stop) instead of a resumable state, it also rewrites unclosed done workers, and it deletes fleet_run_active.json, the only input of the resume path, while auto-resume only runs at supervisor start.
+- Design doc: docs/private/20260930_fleet_interrupted_resume_design.md (status `interrupted`, snapshot in .fleet/interrupted/, exactly-once merge via campaign id, free-space ring log, pre-resume crash gate, fan-out display state; no code changed).
+- Owner's rule, restated: the disk floor (disk_floor_gb) is the owner's own setting. The assistant never changes it or its default; the design only reads and reports it and is independent of its value.
+
 ## 2026-09-30 - remote grading adapter and host probe
 
 - Probed the remote grading host read-only over ssh: reachable non-interactively; memory and disk healthy (49.8 GB RAM free, 235.5 GB free on C:), but the grading WSL distro is Stopped and the dockerd task (SweDockerd) has been idle since 2026-09-15 with last result 1, so nothing can be graded until the owner starts it. Nothing on the host was started, changed or deleted.
