@@ -98,3 +98,10 @@ Under `%USERPROFILE%\.claude\tools\<tool>\README.md`:
 - Added bench/remote_grade.py (one instance + one patch file -> structured result, infra vs graded-fail, injectable transport, CLI) and bench/test_remote_grade.py (20 tests, registered in ci.yml). bench/swe_check.py is untouched.
 - Known-answer validation (gold resolves, empty patch rejected) NOT run: blocked by the stopped distro. Cached image list and swebench version are unknown for the same reason. grade.py is Lite-only, which limits the pilot to ids that are in Lite.
 - Details and tags in docs/private/20260930_effort_bench_design.md, section "Remote grading: measured".
+
+## 2026-09-30 - owner-facing prompt and family view design
+
+- Design doc: docs/private/20260930_family_view_design.md (design only, no product code changed).
+- Measured: over 313 sampled transcripts the first prompt contains the goal in all; of 1102 later user prompts 33% carry the whole goal, 44% only the 160-char `_task_anchor` line, 23% neither. 2096 of 2124 transcript files are gzipped and the cockpit has no gzip reader. FleetCockpit.cs never reads the `fanout`/`campaign_id`/`role`/`subtask_index` row fields. `_final_worker_entry` does not copy `subtask_index`. history.json rows carry no family keys.
+- Decisions: refs and hashes only in status.json (first_prompt, latest_prompt, prompt_goal_intact, family_role, scope, family_members, family); pure module relay/family_view.py; UI in a WPF-free ui/FamilyView.cs extending the STAB-002 Content details, plus a Prompt tab. Overlap warning only for path-shaped scopes, labelled as claimed.
+- Scanned for existing work (live tree, incl. untracked/ignored): relay/, ui/, tools/, docs/ (tracked and docs/private, docs/research read-only), .fleet small files and campaigns.jsonl/transcripts/status.json/history.json, reviews/. Only relay/fanout.py:754 family markers and relay/test_fanout_family_view.py existed.
