@@ -114,7 +114,7 @@ Updated acceptance:
 - 2026-09-30 13:36 JST live visual acceptance completed against a real running Fleet (`running=true`, three workers present). A non-focus-stealing `PrintWindow` capture of the live 1080x760 FleetCockpit showed the left Spine rendering `内容詳細` first with the focused W0 task identity, `実行中 / Turn 3/40`, wait/reason context, and then `実行タイムライン` below it with a concrete `現在:` line plus timestamped launch/running events. This is the exact combined surface required by the latest user correction; STAB-002 is now CLOSED.
 
 ### STAB-003 -- foreground PowerShell / cmd window when CopilotAgent opens or work is submitted
-Status: REOPENED / LIVE REGRESSION CONFIRMED BY USER
+Status: CLOSED / LIVE POST-PATCH GUI SUBMISSION VERIFIED (2026-09-30 15:25 JST)
 
 User reports a PowerShell or Command Prompt window still comes to the foreground, likely around CopilotAgent opening/submission.
 
@@ -136,6 +136,7 @@ Validation:
 - new regression catches all four pre-fix nested launch sites and is registered in blocking CI;
 - still requires a live post-patch observation before this item can be called CLOSED.
 - 2026-09-30 additional repair-dispatcher hardening committed/pushed as `66cce14` (`fix(windows): keep repair child processes windowless`): `scripts/repair.ps1` no longer reparses fixed PowerShell repair commands through a fresh visible `powershell.exe`. PowerShell-backed registry entries now carry structured `Script + Args` metadata and run via one `ProcessStartInfo` launcher with `UseShellExecute=false`, `CreateNoWindow=true`, `WindowStyle=Hidden`, and redirected stdout/stderr; live doctor JSON invocation uses the same hidden launcher. Focused repair tests **12 passed**, PowerShell parser clean, CI manifest clean after staging, and a `-DryRun -MockJson` dispatcher run completed exit 0 without executing the repair. Branch workflows already reported Windows build / PowerShell lint / Workflow lint / CodeQL / Secret scan / install-path green; main latest CI also finished green. This narrows the remaining STAB-003 acceptance to an actual post-patch GUI-visible submission/open observation, not more source inspection.
+- 2026-09-30 15:24:55-15:25:40 JST live acceptance: a real `submit_via_ui.ps1 -Goal ...` invocation foregrounded the intended FleetCockpit and successfully started the task. In parallel, a separate `pythonw.exe` Win32 `EnumWindows` watcher sampled every **50ms for 45s** and recorded visibility transitions for `powershell.exe`, `pwsh.exe`, `cmd.exe`, `WindowsTerminal.exe`, `wt.exe`, `conhost.exe` and `OpenConsole.exe`. The watcher log contained **zero baseline-visible or became-visible shell windows**. This directly exercises the post-patch GUI-visible path and closes STAB-003 for the reproduced submit/open route; if the user sees a future recurrence, capture that exact event rather than reopening from static suspicion alone.
 
 Existing fixes do not close this item:
 - `73bf387` added repository windowless policy to several unattended PowerShell/fleet launches;
@@ -175,6 +176,7 @@ Acceptance:
 - 90s is not the final target: quantify healthy socket `generation_idle_s` and reduce the threshold / recovery loop to the smallest safe evidence-based latency.
 - 2026-09-30 current repair: removed the contradictory socket worker-count admission gate. Socket workers no longer sit PENDING behind the tab/RAM cap; request-rate pacing now occurs at the actual generative socket send, while tabs retain attach-time pacing. New `relay/test_socket_admission_no_pending.py` plus related socket/timeout/resend coverage: **170 passed, 2 skipped**; CI manifest now lists **716 pytest files**; `py_compile` and `git diff --check` clean. Committed/pushed as `b3d9ce5` (`fix(fleet): pace socket sends without pending workers`). This closes the synthetic admission regression, but live latency measurement is still required before STAB-004 closes.
 - 2026-09-30 15:16 JST live-evidence review: the 13:44 GUI/Fleet transcript `r6abc7f6c_a2_w0` shows turn 1 user send -> assistant reply in **22.3s**, then turn 2 produced no assistant reply and hit the generic timeout at **240.5s**. Separately, `socket_route.jsonl` records a 13:29 socket attempt falling back at **91s meaningful idle** (`limit 90s`). These are evidence that current long waits are transport-silence dominated, but they are not enough to lower the threshold safely because healthy tool/search progress gaps were not recorded. Next measurement step: record only first crossings of 5/10/20/30/45/60/90s `generation_idle_s` per socket turn, then submit a GUI-visible read-only task and measure healthy max-idle vs stalled recovery before changing the 90s limit. The diagnostic-only `socket_idle_probe` instrumentation is now implemented locally; full `relay/test_socket_route.py` is **121 passed**, related resend/timeout/settle/policy coverage is **85 passed, 2 skipped**, CI manifest reports **722 pytest files / OK**, `py_compile` and `git diff --check` are clean.
+- 2026-09-30 17:xx JST live GUI probe `r6abcab48_a0` supplied the missing threshold evidence. Across **10 socket turns / 22 first-crossing probe events**, the longest healthy continuous meaningful-idle gap was **46.165s** (`w3` turn 2), and that turn still completed `DONE` after **214.8s total**. Other healthy long turns took **120.6-124.2s total** while their continuous idle only crossed the 5s bucket, confirming that total response latency is not a stall signal when tool/search progress resets the idle clock. The one true no-reply stall (`w1` turn 2) crossed **60s and 90s continuously** before recovery. Therefore 45s is empirically unsafe, while 60s retains ~14s observed headroom and removes ~30s of the old 90s silent wait. Dedicated branch `fix/socket-idle-60s-20260930`, commit `92e1754`, lowers only the default to **60s**, preserves `MCP_FLEET_SOCKET_IDLE_S` override and keeps the 90s diagnostic bucket. Validation: `test_socket_route.py` **123 passed**; socket-adjacent **98 passed**; timeout/resend **59 passed, 2 skipped**; settle/retry/admission **142 passed**; transient script **17/17**; CI manifest **722 / OK**; `py_compile` and `git diff --check` clean. Status remains open until this patch is merged/deployed and one post-60s live task confirms early stalled-turn recovery without false recovery on a healthy long turn.
 
 ### STAB-005 -- task entered/submitted but not reflected in Fleet UI
 Status: REOPENED / VERIFY CURRENT PATH
@@ -230,6 +232,7 @@ For the current follow-up branch, re-check all relevant GitHub runs after each a
 
 
 2026-09-30 pre-STAB-002 head `c2f2416`: PR #67 was CLEAN/MERGEABLE and CI, Windows build, Install path, CodeQL (Python + C#), Secret scan, PowerShell lint and Workflow lint were all SUCCESS. The STAB-002 patch below creates a new head and therefore requires a fresh check after push.
+2026-09-30 latest `main` head `38f4f77`: CI, Windows install smoke, CodeQL, Secret scan, PowerShell lint and Workflow lint completed **SUCCESS**. The latest historical main CI failure (`75c157d`, run 36670394581) was isolated to `test_ten_clicks_200ms_apart_start_one_bringup`: all functional invariants passed (`bringups=1`, nine losers / foreground requests, no leftovers) and only one hosted-Windows leaver measured **5.08s** against the 5.0s hard tail bound. The same Windows-only suite passed on later main runs including `38f4f77`, so no product/threshold change was made from that single 80ms tail; monitor for recurrence rather than weakening the gate pre-emptively.
 
 ## P1 -- follow-up after P0 stability
 
@@ -273,3 +276,16 @@ These do not outrank the live P0 regressions above unless they become direct blo
 - 2026-09-30: STAB-004 socket admission/send-pacing repair completed and pushed as `b3d9ce5`; 170 related tests passed, 2 skipped, CI manifest 716/OK. Live latency measurement remains open.
 
 - 2026-09-30: STAB-002 combined Content details + Execution timeline implementation completed and pushed as `540ebdb`; 61 related UI tests green and both WPF binaries rebuilt/restarted. Live visual verification remains open.
+
+## 2026-09-30 19:xx JST continuation / CI integration checkpoint
+
+User instruction: continue current stabilization work and, when possible, inspect failures on `main` as well. Commit/push at meaningful boundaries so CI and code scanning actually run.
+
+Current evidence after refresh:
+- PR #67 is already MERGED; its merge-head checks were all green (CI, Windows build, install path, CodeQL Python/C#, Secret scan, PowerShell lint, Workflow lint).
+- Current branch `fix/phase2-audit-followups-20260929` later gained two post-merge commits: `a050a4a` (60s silent-socket recovery) and `eb6c03c` (serialized automated GUI submissions).
+- Those two commits have **zero GitHub check-runs** because the previous PR is closed and the workflow set does not create the full check matrix for this post-merge feature-branch push. This is not a green result; it is unvalidated remote state.
+- `origin/main` is currently 9 commits ahead while this branch is 2 commits ahead. The branch must first converge with current main, then the same branch (do not create another stabilization branch) must be submitted as a fresh PR so current-head CI/CodeQL/Windows/secret/lint checks run.
+- Latest inspected `main` workflow head is green. Historical main CI failures already recorded below were superseded by later green runs; do not weaken timing gates from a single hosted-runner tail unless recurrence is demonstrated.
+
+Resume point after integration hygiene: STAB-004 post-60s live validation remains the first active product item; then STAB-005/STAB-006 live re-verification, followed by main integration.
