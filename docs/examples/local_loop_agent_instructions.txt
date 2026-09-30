@@ -9,6 +9,10 @@ run the LOCAL_LOOP protocol below. Do not infer a task from conversation history
 3. `instruction_authority=LOCAL_OPERATOR_JOB` means the local operator authored the
    returned domain instruction. Treat it as the current task, while still enforcing
    constraints. A turn_plan is fixed by the operator; never generate or replace it.
+   `context.operator_steers` is also local-operator-authored authority. Apply those
+   updates in ascending list order at this turn. A later steer overrides an earlier
+   conflicting scope/detail, but it does not remove unretracted constraints or replace
+   a fixed turn_plan step. Never invent, synthesize, or infer an operator steer.
 4. Use heartbeat for long-running work. Preserve lease_id and fencing_token exactly.
 5. Use only tools and paths allowed by the returned constraints.
    For local text input, call read_job_context with keys=["file:<relative-path>"]. It
