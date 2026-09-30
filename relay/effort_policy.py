@@ -105,28 +105,114 @@ class PolicyConfig:
 # ---------------------------------------------------------------------------------------
 MODES = ("off", "shadow", "on")
 _warned_on = [False]
+_warned_conflict = set()
+
+#: (path, mtime_ns, size) -> value read from settings.txt. One os.stat per mode() call, a
+#: re-read only when the file changed, so a change made in the cockpit is seen by the NEXT
+#: mode() call in a RUNNING process (the next worker, fan-out or turn evaluation) with no
+#: restart. Work already decided keeps its decision: this is a per-call read, not a live push.
+_settings_cache = {}
+
+
+def _settings_value(env):
+    """`effort_policy=` from settings.txt, lower-cased, or None (absent/invalid/unreadable).
+
+    Path: with the real environment (env is None) the repository's one resolver
+    (tools.settings_path.settings_file, the same file settings_effort reads). With an injected
+    env dict, ONLY the file named by its MCP_EFFORT_POLICY_SETTINGS entry, so a test that
+    injects `env` can never be steered by the developer's real .config. First match wins, as in
+    settings_effort; a BOM is tolerated. Never raises.
+    """
+    try:
+        if env is None:
+            from tools.settings_path import settings_file
+            path = settings_file()
+        else:
+            path = str(env.get("MCP_EFFORT_POLICY_SETTINGS", "") or "")
+        if not path:
+            return None
+        st = os.stat(path)
+        key = (path, st.st_mtime_ns, st.st_size)
+        hit = _settings_cache.get(path)
+        if hit is not None and hit[0] == key:
+            return hit[1]
+        val = None
+        with open(path, encoding="utf-8-sig") as fh:
+            for ln in fh:
+                ln = ln.strip()
+                if ln.startswith("effort_policy="):
+                    v = ln.split("=", 1)[1].strip().lower()
+                    val = v if v in MODES else None
+                    break
+        _settings_cache[path] = (key, val)
+        return val
+    except Exception:
+        return None
+
+
+def _say(log, msg):
+    try:
+        if log:
+            log(msg)
+        else:
+            import sys
+            sys.stderr.write(msg + "\n")
+    except Exception:
+        pass
+
+
+def mode_info(env=None, log=None):
+    """(mode, source, conflict). source is env | settings | default.
+
+    RESOLUTION ORDER: a valid MCP_EFFORT_POLICY in the environment > `effort_policy=` in
+    settings.txt (the cockpit's setting) > off. The environment wins by documented precedence,
+    which is exactly how a hand-passed value silently beats the screen; so when the two are
+    both valid and DIFFER, `conflict` is True and it is logged once per (env, settings) pair,
+    for a UI or the telemetry to show what is really in effect. Never raises.
+    """
+    try:
+        e = os.environ if env is None else env
+        raw = str(e.get("MCP_EFFORT_POLICY", "") or "").strip().lower()
+        cfg = _settings_value(env)
+        if raw in MODES:
+            conflict = cfg is not None and cfg != raw
+            if conflict and (raw, cfg) not in _warned_conflict:
+                _warned_conflict.add((raw, cfg))
+                _say(log, "[effort_policy] env MCP_EFFORT_POLICY=%s overrides settings.txt "
+                          "effort_policy=%s" % (raw, cfg))
+            return raw, "env", conflict
+        if cfg is not None:
+            return cfg, "settings", False
+    except Exception:
+        pass
+    return "off", "default", False
 
 
 def mode(env=None, log=None):
-    """MCP_EFFORT_POLICY = off|shadow|on, default off. Unknown values mean off.
+    """Effective policy mode: off|shadow|on. Order: env MCP_EFFORT_POLICY > settings.txt
+    `effort_policy` > off (see mode_info). Unknown values are ignored.
 
     `on` = initial assignment (fan-out children, merge, sibling rule) is ACTIVE; live
     switching (evaluate) is still shadow. Said once per process so nobody believes more is
     steering than is.
     """
-    env = os.environ if env is None else env
-    raw = str(env.get("MCP_EFFORT_POLICY", "") or "").strip().lower()
-    if raw not in MODES:
-        return "off"
-    if raw == "on" and not _warned_on[0]:
+    m = mode_info(env, log)[0]
+    if m == "on" and not _warned_on[0]:
         _warned_on[0] = True
         if log:
             try:
-                log("[effort_policy] MCP_EFFORT_POLICY=on: initial assignment active "
+                log("[effort_policy] effort policy=on: initial assignment active "
                     "(fan-out children, sibling de-escalation); live switching still shadow")
             except Exception:
                 pass
-    return raw
+    return m
+
+
+def _src(env):
+    try:
+        return mode_info(env)[1]
+    except Exception:
+        return "default"
 
 
 # ---------------------------------------------------------------------------------------
@@ -336,7 +422,7 @@ def assign_children(kids, parent_level, *, run_id="", record=None, log=None, env
                     turn=0, configured=True, config_source="parent", config_value=level,
                     eligible=True, triggered=(m == "on"), executed=(m == "on"),
                     changed_decision=(m == "on"), before=parent_level, after=level,
-                    extra={"event": "child", "mode": m, "parent_level": parent_level,
+                    extra={"event": "child", "mode_source": _src(env), "mode": m, "parent_level": parent_level,
                            "campaign_id": _cid_of(k), "subtask_index": k.get("subtask_index"),
                            "verb": "assigned" if m == "on" else "would assign"})
             except Exception:
@@ -363,7 +449,7 @@ def merge_effort(item, parent_level, *, run_id="", record=None, log=None, env=No
             "effort_policy", run_id=run_id, instance=str(item.get("task_id") or ""), turn=0,
             configured=True, config_source="parent", config_value=level, eligible=True,
             triggered=True, executed=True, changed_decision=True, before=parent_level,
-            after=level, extra={"event": "merge", "mode": "on", "verb": "assigned",
+            after=level, extra={"event": "merge", "mode_source": _src(env), "mode": "on", "verb": "assigned",
                                 "campaign_id": _cid_of(item)})
     except Exception:
         pass
@@ -401,7 +487,7 @@ def sibling_adjust(goal, *, run_id="", instance="", record=None, log=None, env=N
             turn=0, configured=True, config_source="sibling", config_value=new or "lower",
             eligible=True, triggered=(m == "on"), executed=(m == "on"),
             changed_decision=(m == "on"), before=cur or "", after=new or "lower",
-            extra={"event": "sibling", "mode": m, "campaign_id": cid, "streak": streak,
+            extra={"event": "sibling", "mode_source": _src(env), "mode": m, "campaign_id": cid, "streak": streak,
                    "verb": "lowered" if m == "on" else "would lower"})
         if m != "on":
             return goal
@@ -504,7 +590,7 @@ def shadow_assign(goal, knobs, *, run_id="", instance="", record=None, log=None,
             configured=True, config_source=source, config_value=level,
             eligible=True, triggered=False, executed=False, changed_decision=False,
             before=run_level, after=level,
-            extra={"event": "initial", "run_level": run_level, "mode": mode(env)})
+            extra={"event": "initial", "run_level": run_level, "mode_source": _src(env), "mode": mode(env)})
         return level, source
     except Exception:
         return None
@@ -598,7 +684,7 @@ def shadow_tick(worker, *, record=None, log=None, env=None):
             executed=False, changed_decision=False, before=before, after=d.target_level,
             extra={"event": "turn", "decision": d.action, "reason": d.reason,
                    "level": before, "target": d.target_level, "signals": sig.as_dict(),
-                   "mode": "shadow"})   # live switching is record-only in every mode
+                   "mode_source": _src(env), "mode": "shadow"})   # live switching is record-only in every mode
         return d
     except Exception:
         return None
