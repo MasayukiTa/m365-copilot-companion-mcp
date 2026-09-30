@@ -180,7 +180,7 @@ Acceptance:
 - 2026-09-30 19:xx JST post-60s live acceptance: GUI/Fleet run `r6abcdee1_a0` exercised the deployed 60s contract. Two stalled socket turns crossed the diagnostic buckets through **60.097s / 60.102s** at `limit_s=60.0` and moved to the fallback route instead of waiting for the generic 240s turn timeout. Healthy socket workers did not false-recover: `w0` finished `DONE` directly on socket in 1 turn with no fallback (max observed continuous idle **10.663s**), while `w4` finished `DONE` directly on socket after 5 turns with no fallback (max observed continuous idle **11.094s** across instrumented turns). `w3` eventually became `STUCK` only after tab fallback and 15 turns due repeated-conclusion settling, which is a separate semantic path rather than a silent-wait timeout. Combined with the earlier healthy **46.165s** continuous-idle observation, 45s remains empirically unsafe and 60s is the smallest currently evidence-supported default. STAB-004 is CLOSED; reopen only on new live evidence of false 60s recovery or a >60s healthy continuous-idle interval.
 
 ### STAB-005 -- task entered/submitted but not reflected in Fleet UI
-Status: REOPENED / VERIFY CURRENT PATH
+Status: CLOSED / LIVE VERIFIED (2026-09-30 23:08 JST)
 
 Past fixes covered bottom-composer steer-vs-add confusion, live add durability, applied receipts, shutdown handoff, and GUI text verification. The user reports current regressions have increased, so historical green tests are not enough.
 
@@ -338,3 +338,17 @@ Repair:
 - both WPF binaries rebuilt successfully.
 
 Live re-check after rebuild: a real GUI submission printed `start button: found by AutomationId`. A subsequent in-flight add (`STAB005F-20260930-230221586`) reported `run in flight: True`, was accepted through that AutomationId path, and produced `applied=true` ack at 23:02:33 (`ts=1790776953.880...`), about **11.93s** after submission start. This is materially below the earlier ~57s live-add stall. It does not yet close the async-capture overlap acceptance: the preceding async capture completed at `1790776938.147...`, roughly 3.8s before this live add began. A fresh A/B test must still place B inside the actual helper-in-flight window.
+
+
+### 2026-09-30 23:08 JST STAB-005 live acceptance
+
+Fresh GUI A/B validation closed the remaining live-command critical-path question. A (`STAB005A2-20260930-230730326`) started a fresh run through `submit_via_ui.ps1`. B (`STAB005B2-20260930-230745239`) was then submitted immediately through the same visible cockpit composer and reported `run in flight: True` plus `start button: found by AutomationId`. Immediately after B submission the real `relay.socket_capture_async --worker` process tree was still alive.
+
+Measured ordering:
+- B GUI submit start: 23:07:45.240 JST;
+- B durable `applied=true` ack: `ts=1790777284.1886287` / 23:08:04.191 wall time;
+- async capture success: `at=1790777288.65013` / 23:08:08.652 file time;
+- therefore the Fleet command drain durably applied B **4.462s before the capture helper completed**;
+- the run identity (`started=1790777264.61075`) remained the same, status reached `total=2, queued=0`, and B became real worker `w1` (observed `refuting`, turn 1).
+
+This directly disproves the old blocking behavior for the repaired path: the expensive Playwright/CDP capture can be in flight while the single Fleet sweep continues consuming and acknowledging live commands. Together with the exact-goal/ack/history durability fixes and the `startButton` AutomationId repair, STAB-005 is CLOSED. Reopen only on new live evidence of a command/status stall during async capture or a visible GUI submission that fails reconciliation.
