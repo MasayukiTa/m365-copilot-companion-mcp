@@ -5102,7 +5102,7 @@ class CockpitWindow : Window
         var divider = new Border();
         divider.Height = 1;
         divider.Background = Theme.Br(Theme.Border(_dark));
-        divider.Margin = new Thickness(0, 11, 0, 10);
+        divider.Margin = new Thickness(0, 12, 0, 8);
         outer.Children.Add(divider);
 
         var title = new TextBlock();
