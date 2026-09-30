@@ -1933,6 +1933,29 @@ def _socket_route():
 _REOPEN_POLICY = None
 
 
+def _consider_socket_refresh(route, agent_url):
+    """Kick a credential refresh without ever blocking the fleet sweep.
+
+    The manager lives on the route instance so a reset automatically gets a fresh manager and a
+    late result from the old browser can only install into the old, unreachable route object.
+    """
+    try:
+        manager = getattr(route, "_async_capture_manager", None)
+        if manager is None:
+            from relay.socket_capture_async import AsyncCaptureManager
+            manager = AsyncCaptureManager(log=lambda m: print(m, flush=True))
+            setattr(route, "_async_capture_manager", manager)
+        return bool(manager.consider(route, agent_url,
+                                     os.environ.get("MCP_CDP_URL", "http://localhost:9222")))
+    except Exception as exc:
+        try:
+            print("[socket_capture_async] launch declined: %s: %s"
+                  % (type(exc).__name__, str(exc)[:160]), flush=True)
+        except Exception:
+            pass
+        return False
+
+
 def _reopen_policy():
     """The run's reopen policy, built once. Backoff is stateful, so it must outlive a pass.
 
@@ -8282,7 +8305,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     def _socket_open_now():
         """Whether a worker admitted right now would take a socket rather than a tab."""
         try:
-            return bool(_socket_route().open())
+            return bool(_socket_route().ready(agent_url))
         except Exception:
             return False
 
@@ -8691,6 +8714,15 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         # This separates three different resources instead of pretending one integer is all of
         # them: browser tabs/RAM at admission, disk at eval admission, request rate at send.
         while pending:
+            # A refresh may take 5-60s of sync Playwright browser work. It runs in an independent
+            # helper PROCESS with its own CDP connection; this sweep only launches it and returns.
+            # If no usable token exists yet, admission honestly budgets this candidate as a tab.
+            try:
+                route = _socket_route()
+                if route.open() and route.needs_refresh(agent_url):
+                    _consider_socket_refresh(route, agent_url)
+            except Exception:
+                pass
             _candidate_socket = _socket_open_now()
             if not admits_another_tab(
                     _active_open(), _projected_peak(),
@@ -8743,15 +8775,6 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 w = pending.pop(0)
             if w.status in TERMINAL:   # (shouldn't happen, but be safe)
                 continue
-            # BEFORE ADMITTING, make sure there is a live token to hand out -- a capture opens
-            # a tab, captures and CLOSES it, so nothing is held open between refreshes. When
-            # the route is off or the capture fails this is a no-op and the worker opens a tab.
-            try:
-                route = _socket_route()
-                if route.open() and route.needs_refresh():
-                    route.refresh(context, agent_url)
-            except Exception:
-                pass
             if not _candidate_socket:
                 note_admitted()
             ok = w.attach(context, agent_url)
