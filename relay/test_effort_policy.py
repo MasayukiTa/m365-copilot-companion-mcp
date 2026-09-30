@@ -171,18 +171,10 @@ def test_env_overrides_and_bad_values_fall_back():
 
 @pytest.mark.parametrize("raw,want", [(None, "off"), ("", "off"), ("off", "off"),
                                       ("shadow", "shadow"), (" SHADOW ", "shadow"),
-                                      ("garbage", "off"), ("on", "shadow")])
+                                      ("garbage", "off"), ("on", "on")])
 def test_mode_parsing(raw, want):
     env = {} if raw is None else {"MCP_EFFORT_POLICY": raw}
     assert ep.mode(env) == want
-
-
-def test_on_is_treated_as_shadow_and_says_so_once():
-    ep._warned_on[0] = False
-    msgs = []
-    assert ep.mode({"MCP_EFFORT_POLICY": "on"}, msgs.append) == "shadow"
-    assert ep.mode({"MCP_EFFORT_POLICY": "on"}, msgs.append) == "shadow"
-    assert len(msgs) == 1 and "not active" in msgs[0]
 
 
 # ---- the hook -----------------------------------------------------------------------------
