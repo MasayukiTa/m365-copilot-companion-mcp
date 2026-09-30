@@ -490,17 +490,17 @@ class LocalJobStore:
                 "next_instruction",
             )
             plan = data.get("turn_plan") if isinstance(data.get("turn_plan"), list) else []
-            if plan and status == "CANDIDATE_DONE":
-                initial_seq = int(data.get("initial_seq", 1))
-                current_plan_index = int(seq) - initial_seq
+            initial_seq = int(data.get("initial_seq", 1))
+            current_plan_index = int(seq) - initial_seq
+            in_fixed_plan = bool(plan) and 0 <= current_plan_index < len(plan)
+            if in_fixed_plan and status == "CANDIDATE_DONE":
                 if current_plan_index < len(plan) - 1:
                     raise JobStoreError(
                         "TURN_PLAN_INCOMPLETE",
                         "CANDIDATE_DONE is allowed only on the final planned turn",
                     )
-            if status == "CONTINUE" and plan:
-                initial_seq = int(data.get("initial_seq", 1))
-                next_plan_index = int(seq) - initial_seq + 1
+            if status == "CONTINUE" and in_fixed_plan:
+                next_plan_index = current_plan_index + 1
                 if next_plan_index >= len(plan):
                     raise JobStoreError(
                         "TURN_PLAN_EXHAUSTED", "last planned turn must use CANDIDATE_DONE",
