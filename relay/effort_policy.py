@@ -498,6 +498,13 @@ def sibling_adjust(goal, *, run_id="", instance="", record=None, log=None, env=N
         return goal
 
 
+def goal_dict(worker):
+    """The worker's goal as a dict ({} when unknowable). worker.goal is the goal TEXT; the
+    dict that carries effort and metadata is worker.goal_record. The ONE place that reads it."""
+    rec = getattr(worker, "goal_record", None)
+    return rec if isinstance(rec, dict) else {}
+
+
 def worker_level(worker):
     """The ladder level a worker is running at (from the knobs it was given), else None."""
     try:
@@ -661,9 +668,7 @@ def status_fields(worker, env=None):
         if level is None:
             return {}
         out = {"effort_level": level}
-        # worker.goal is the goal TEXT; the dict (effort, metadata) is worker.goal_record.
-        goal = getattr(worker, "goal_record", None)
-        goal = goal if isinstance(goal, dict) else {}
+        goal = goal_dict(worker)
         src = _meta(goal).get("effort_source")
         base = (src if src in ("parent", "sibling") else
                 "goal" if effort_mod.goal_effort(goal) in LADDER else "run")
@@ -696,10 +701,12 @@ def shadow_tick(worker, *, record=None, log=None, env=None):
                  "max_research": getattr(worker, "max_research", None),
                  "review_lenses": getattr(worker, "review_lenses", None)}
         run_level = level_of_knobs(knobs)
-        goal = getattr(worker, "goal", None)
-        explicit = effort_mod.goal_effort(goal if isinstance(goal, dict) else {})
-        floor = explicit if explicit in LADDER else "min"
-        ctx = _shadow_state(worker, run_level if run_level in LADDER else "auto", floor)
+        # Same precedence as initial_level (explicit goal effort > run level), read from the
+        # goal DICT through the one accessor.
+        level0, _src0 = initial_level(goal_dict(worker),
+                                      run_level if run_level in LADDER else "auto")
+        floor = level0 if _src0 == "goal" else "min"
+        ctx = _shadow_state(worker, level0, floor)
         sig = build_signals(worker, ctx["streak"], cfg)
         state = ctx["state"]
         before = state.level
