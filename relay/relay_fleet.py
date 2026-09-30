@@ -3910,6 +3910,15 @@ class RelayWorker:
             else:
                 self.status, self.outcome, self.reason = "maxturns", "MAXTURNS", "reached max_turns"
             return
+        # SOCKET WORKERS DO NOT SPEND A TAB SLOT, but their generative turns still spend the
+        # shared Copilot/Dataverse request budget. Gate that budget HERE, at the operation that
+        # actually consumes it, rather than leaving socket workers PENDING behind a tab/worker
+        # admission cap. Keep the worker READY and leave steer/job state untouched while waiting.
+        if getattr(self, "socket", False) and not admission_is_due():
+            ok_rate, why_rate = rate_headroom_ok()
+            self.reason = why_rate or "socket send pacing -- waiting for next send slot"
+            return
+
         # a queued steering message preempts the normal CONTINUE/FIX job for this turn
         if self.steer_msgs:
             _steer_text = self.steer_msgs.pop(0)
@@ -3984,6 +3993,8 @@ class RelayWorker:
             # (max_gen_wait_s), not one blocking call. (run_relay's single-conversation path
             # keeps the full 240s.)
             self.drv.send(self.job, gen_wait_s=2.0)
+            if getattr(self, "socket", False):
+                note_admitted()
         except ConversationClosed as e:
             # The target tab/composer is gone (conversation ended). Retrying a dead
             # target can never succeed -- terminal, skip the transient budget entirely
@@ -8606,38 +8617,19 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         # tab_weight charges 1 for a tab and 0 for a socket, ram_room_for_tab gates each lazy
         # side-page at the moment it opens, and the autoscale sets mc_box from free RAM.
         #
-        # THAT ARGUMENT WAS ABOUT RAM. IT WAS NEVER TRUE OF THE COPILOT QUOTA. A socket worker
-        # weighs 0 tab_weight forever -- not just at admission but for every sweep it stays
-        # open -- so `projected_peak` (the sum admission reserves against) never grows past 0
-        # once the fleet is on sockets, and `admits_another_tab` says yes to the ENTIRE pending
-        # queue in the same run of sweeps regardless of mc_box[0]. Measured 2026-09-25, OWNER
-        # report: a run with autoscale holding mc_box[0] at 1 ("RAM-adjust 1..1 tab(s)") grew to
-        # 41 workers, more than 10 of them running at once -- the tab budget was never touched
-        # because nothing they were doing ever showed up in it. Each running worker still spends
-        # Microsoft's per-Dataverse-environment 100 RPM quota one generative turn at a time
-        # (see quota_meter.py), and that quota does not care whether the turn came over a socket
-        # or a tab -- ten-plus concurrent workers is exactly how 111 unlock refusals happened in
-        # 30 minutes on this run. So there IS a per-worker price after all, just not a RAM one:
-        # a COUNT gate, bounding how many workers may be concurrently admitted (tab or socket)
-        # regardless of tab_weight, applied on top of (never instead of) the tab-weight gate
-        # above. `_active_open()` already counts sockets (see _holds_slot's own docstring), so
-        # this reuses it rather than adding new bookkeeping. The `max(1, ...)` mirrors
-        # admits_another_tab's own empty-fleet bootstrap: a cap that reaches 0 must not stop the
-        # fleet forever with work queued and nothing running.
-        while pending and admits_another_tab(
-                _active_open(), _projected_peak(),
-                pending[0].tab_weight(assume_socket=_socket_open_now()), mc_box[0]) \
-                and _active_open() < max(1, mc_box[0]):
-            # SPACING, AND IT SITS HERE BECAUSE THERE ARE TWO WAYS OUT OF THIS LOOP.
-            # The first version of this guard was placed next to `pending.pop(0)` in the flat
-            # branch, and the per-repo branch a few lines above pops with `pending.pop(pick)`
-            # -- so the spacing would have covered every kind of run EXCEPT the benchmark runs
-            # that produced the measurement. Guarding one caller of a failure class and calling
-            # it fixed is a mistake this repository has already paid for.
-            #
-            # Costs at most one interval of delay before a disk/RAM deferral is logged, which
-            # is the right trade for covering both paths with one line.
-            if not admission_is_due():
+        # SOCKET ATTACHMENT IS NOT THE QUOTA-SPENDING OPERATION. A socket worker reserves zero
+        # tabs (tab_weight==0), so it may become READY without sitting behind the browser/RAM
+        # cap. The shared request ceiling is enforced in RelayWorker._begin_send immediately
+        # before each generative socket send. Tabs keep the historical attach pacing below.
+        # This separates three different resources instead of pretending one integer is all of
+        # them: browser tabs/RAM at admission, disk at eval admission, request rate at send.
+        while pending:
+            _candidate_socket = _socket_open_now()
+            if not admits_another_tab(
+                    _active_open(), _projected_peak(),
+                    pending[0].tab_weight(assume_socket=_candidate_socket), mc_box[0]):
+                break
+            if not _candidate_socket and not admission_is_due():
                 break
             # reserve disk for THIS eval plus every already-open eval still in flight, so we never
             # admit N tabs that look fine individually but crash C: once their builds run at once.
@@ -8693,7 +8685,8 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     route.refresh(context, agent_url)
             except Exception:
                 pass
-            note_admitted()
+            if not _candidate_socket:
+                note_admitted()
             ok = w.attach(context, agent_url)
             if not ok:
                 # attach failed. If the WHOLE Edge/context died mid-open (e.g. the
