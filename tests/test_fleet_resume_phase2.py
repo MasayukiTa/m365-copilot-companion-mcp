@@ -205,8 +205,9 @@ def test_a_resumed_run_does_not_requeue_a_child_the_ledger_already_carries(tmp_p
 @pytest.mark.parametrize("fam,done,want", [
     ({"merge_done": True, "merged": True}, {}, "drop"),
     ({"merged": False}, {}, "carry"),
-    ({"merged": True}, {}, "reissue"),
-    ({"merged": True, "merge_requeued": 1}, {}, "drop"),
+    ({"merged": True}, {}, "drop"),                      # legacy `merged` line: no agg_key
+    ({"merged": True, "agg_key": "K"}, {}, "reissue"),
+    ({"merged": True, "agg_key": "K", "merge_requeued": 1}, {}, "drop"),
     ({"merged": True, "agg_key": "K"}, {"K": "DONE"}, "drop"),
     ({"merged": True, "agg_key": "K"}, {"K": "STUCK"}, "reissue"),
 ])
@@ -226,9 +227,10 @@ def test_campaigns_from_disk_applies_the_rules(tmp_path):
     _rows(tmp_path, [
         _header("cDONE"), {"kind": "merged", "campaign_id": "cDONE"},
         {"kind": "merge_done", "campaign_id": "cDONE"},
-        _header("cQUEUED"), {"kind": "merged", "campaign_id": "cQUEUED"},
-        _header("cTWICE"), {"kind": "merged", "campaign_id": "cTWICE"},
+        _header("cQUEUED"), {"kind": "merged", "campaign_id": "cQUEUED", "agg_key": "K"},
+        _header("cTWICE"), {"kind": "merged", "campaign_id": "cTWICE", "agg_key": "K"},
         {"kind": "merge_requeued", "campaign_id": "cTWICE", "attempt": 1},
+        _header("cLEGACY"), {"kind": "merged", "campaign_id": "cLEGACY"},
         _header("cOPEN")])
     out = rf._campaigns_from_disk(str(t))
     assert sorted(out) == ["cOPEN", "cQUEUED"]
@@ -264,6 +266,9 @@ def test_merge_done_is_written_when_the_aggregator_finishes(tmp_path, monkeypatc
 
 def _finished_children_rows(h, n=2):
     rows = h._header(n=n, merged=True)
+    for r in rows:
+        if r.get("kind") == "merged":
+            r["agg_key"] = "AGGKEY"          # written by the merge_done-aware writer
     for i in range(1, n + 1):
         rows.append({"kind": "child_result", "campaign_id": h.CID, "subtask_index": i,
                      "outcome": "DONE", "result": "answer %d" % i})
