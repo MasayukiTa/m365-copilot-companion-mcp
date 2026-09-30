@@ -8472,7 +8472,6 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             _recs = fanout_mod.collapse_retries(_recs)
             if len(_recs) < _camp.get("n", 0):
                 continue
-            _camp["merged"] = True
             # THE PARENT'S WORKING DIRECTORY GOES WITH IT. The children get it from
             # child_goals; the merge was starting wherever the fleet happened to be, while
             # being asked to write a combined file and report its path.
@@ -8483,6 +8482,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                                                parent_partial=_camp.get("partial"),
                                                parent_level=_camp.get("parent_level"),
                                                run_id=run_id)
+            _camp["merged"] = True
             _note_merged(_cid, resume_mod.goal_resume_key(_agg))
             if _camp.get("requeue_merge"):
                 # A merge queued before a death that never finished is re-issued once; the

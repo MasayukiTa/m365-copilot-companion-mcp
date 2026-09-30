@@ -154,6 +154,10 @@ def rehydrate_decision(fam, done_map):
         return "drop"
     if not fam.get("merged"):
         return "carry"
+    if not fam.get("agg_key"):
+        # A `merged` line from before merge_done existed (it has no agg_key): its meaning was
+        # "assembled", and a ledger full of historical campaigns must not be merged again.
+        return "drop"
     if fam.get("agg_key") and done_map.get(fam.get("agg_key")) == "DONE":
         return "drop"                      # finished after all; merge_done just was not written
     if int(fam.get("merge_requeued") or 0) >= 1:
