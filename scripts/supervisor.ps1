@@ -172,6 +172,41 @@ function Write-Log($msg) {
     "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $msg" | Out-File -FilePath $Log -Append -Encoding utf8
 }
 
+# The cockpit must distinguish "the server died" from "the supervisor is deliberately
+# replacing stale code".  Without a machine-readable transition, both are a few seconds of
+# connection refused and both render as the same red Server/Tunnel pair.  This marker is advisory
+# only and intentionally short-lived on the reader side; a stale file can never mask a real outage.
+$ServerTransitionPath = Join-Path (Join-Path $Root ".fleet") "server_transition.json"
+
+function Write-ServerTransition([string]$Reason) {
+    try {
+        if ([string]::IsNullOrWhiteSpace($Reason)) { return }
+        if (-not (Test-Path $FleetDir)) { New-Item -ItemType Directory -Path $FleetDir -Force | Out-Null }
+        $tmp = $ServerTransitionPath + ".tmp." + $PID
+        $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        # Keep the UI's planned-restart state aligned with THIS supervisor's actual policy:
+        # main.py may spend StartupGraceSeconds alive-but-not-listening, then ordinary failure
+        # debounce still consumes FailuresBeforeAction * IntervalSeconds before another action.
+        $transitionBudgetSeconds = $StartupGraceSeconds + ($FailuresBeforeAction * $IntervalSeconds)
+        if ($transitionBudgetSeconds -lt 1) { $transitionBudgetSeconds = 1 }
+        $body = [ordered]@{
+            state = "planned_restart"
+            reason = $Reason
+            started = $now
+            expires = $now + $transitionBudgetSeconds
+            supervisor_pid = $PID
+        } | ConvertTo-Json -Compress
+        [IO.File]::WriteAllText($tmp, $body, (New-Object Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $tmp -Destination $ServerTransitionPath -Force
+    } catch {
+        # Health telemetry must never be able to block the restart it describes.
+    }
+}
+
+function Clear-ServerTransition {
+    try { Remove-Item -LiteralPath $ServerTransitionPath -Force -ErrorAction SilentlyContinue } catch { }
+}
+
 # -- WHICH PYTHON: re-decided before every launch, not once at startup (new-PC analysis D2) ----
 # $Py above is resolved ONCE, when this process starts. A supervisor started before the .venv
 # existed -- start_all run before quickstart, or a logon autostart that fires while setup.bat is
@@ -577,6 +612,7 @@ function Invoke-StaleServerCycle {
     # Get-ServerExitRecord (see Start-Server) will show for this cycle's exit record instead of
     # the generic default Start-Server falls back to when nothing upstream has said why.
     $script:ServerPlannedEndReason = "stale code cycle"
+    Write-ServerTransition $script:ServerPlannedEndReason
     Start-Server
 }
 
@@ -2178,6 +2214,9 @@ while ($true) {
 
     if (Test-ServerUp) {
         $serverMiss = 0
+        # The planned-transition marker is useful only while the replacement server is absent.
+        # Clear any old marker first; Invoke-StaleServerCycle may immediately publish a fresh one.
+        Clear-ServerTransition
         Invoke-StaleServerCycle
     } else {
         # DO NOT KILL A SERVER THAT IS STILL STARTING. main.py takes 10-25 seconds just to

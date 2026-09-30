@@ -1,4 +1,4 @@
-# Three effort arms over the SAME instances, driven through the UI.
+﻿# Three effort arms over the SAME instances, driven through the UI.
 #
 # WHAT THIS ANSWERS. relay/fleet_runner.py records the cost of uniform effort -- "a UNIFORM
 # ultra over-engineers easy tasks (observed: 44-47 line diffs for 2-7 line gold fixes)" -- and
@@ -77,7 +77,9 @@ foreach ($arm in $Arms) {
     $submitted = $false
     for ($try = 1; $try -le 3 -and -not $submitted; $try++) {
         try {
-            & powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\win\submit_via_ui.ps1 -GoalFile "$OutDir/lines_$arm.txt" 2>&1 |
+            # Stay in this PowerShell process. A redundant powershell.exe child can flash a
+            # console when this driver itself was launched headless.
+            & .\scripts\win\submit_via_ui.ps1 -GoalFile "$OutDir/lines_$arm.txt" 2>&1 |
                 Select-Object -Last 2 | ForEach-Object { Say ("submit: " + $_) }
             $submitted = $true
         } catch { Say ("submit {0}/3 failed: {1}" -f $try, $_.Exception.Message); Start-Sleep -Seconds 20 }

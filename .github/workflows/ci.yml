@@ -114,6 +114,8 @@ jobs:
             tools/test_an_idle_machine_is_not_a_broken_one.py \
             tools/test_a_tool_that_returns_its_failure_still_failed.py \
             ui/test_a_green_dot_must_have_established_the_thing.py \
+            ui/test_planned_server_restart_signal.py \
+            ui/test_planned_server_restart_expiry.py \
             tools/test_a_new_way_to_say_failed_must_be_classified.py \
             relay/test_a_worker_that_wrote_about_limits_was_thrown_away.py \
             relay/test_a_control_that_does_nothing_is_worse_than_none.py \
@@ -158,6 +160,7 @@ jobs:
             scripts/test_the_identity_guard_speaks_before_the_push.py \
             scripts/test_run_script_style_tests.py \
             scripts/test_submit_via_ui_roundtrip.py \
+            scripts/test_gui_submitter_has_no_nested_console.py \
             tests/test_scroll_transcript.py \
             tests/test_golden.py \
             tests/test_listing_counts.py \
@@ -203,6 +206,7 @@ jobs:
             relay/test_goal_display_summary.py \
             relay/test_live_added_goals_keep_capacity.py \
             relay/test_reply_beats_timeout.py \
+            relay/test_action_timeout_resend_safety.py \
             relay/test_a_job_marked_done_reads_as_dispatched_not_finished.py \
             tests/test_fleet_landing_ack_e2e.py \
             tests/test_fleet_landing_reconcile_e2e.py \
@@ -236,6 +240,7 @@ jobs:
             ui/test_the_chat_window_sends_what_was_typed.py \
             ui/test_both_windows_can_be_constructed.py \
             ui/test_a_submitted_task_is_on_top_at_once.py \
+            ui/test_content_details_spine.py \
             ui/test_submitted_history_reconciliation.py \
             ui/test_stale_submitted_tasks_are_observable.py \
             ui/test_goal_summary_display.py \
@@ -369,6 +374,7 @@ jobs:
             scripts/test_install_path_batch.py \
             tools/test_file_scope_fails_closed.py \
             scripts/test_repair_unlock_output.py \
+            scripts/test_repair_children_are_windowless.py \
             scripts/test_no_direct_ps1_py_advice.py \
             scripts/test_setup_devtunnel_access_and_identity.py \
             scripts/test_doctor_reports_the_last_start.py \
@@ -504,6 +510,7 @@ jobs:
             relay/test_resend_checkable.py \
             relay/test_socket_driver.py \
             relay/test_socket_route.py \
+            relay/test_socket_admission_no_pending.py \
             relay/test_fanout.py \
             tests/test_ownership.py \
             tests/test_watchdog_arming.py \
@@ -823,8 +830,8 @@ jobs:
 
       # THE EXCLUSIONS, RUN WHERE THEY ARE EXCLUDED. REPORTING, NOT GATING.
       #
-      # scripts/check_ci_test_manifest.py keeps eleven files out of the hermetic suite, each
-      # with a written reason, and its own comment says four of the eight added in one batch
+      # scripts/check_ci_test_manifest.py keeps nine files out of the hermetic suite, each
+      # with a written reason. A historical note in the checker says four of the eight originally added in one batch
       # are "test-side portability defects -- meant to be fixed and returned; parked here, not
       # solved". Nobody has been able to tell which, because the reasons are about LINUX and
       # they were only ever re-read on Windows.

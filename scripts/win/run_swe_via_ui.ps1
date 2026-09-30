@@ -190,22 +190,22 @@ for ($round = 1; $round -le $MaxRounds; $round++) {
         # SendKeys' journal hook fails when the foreground application is not pumping
         # messages, which is a transient condition and worth another attempt -- but a batch
         # that never got submitted must not fall through to the wait.
-        # SUCCESS IS THE EXIT CODE AND THE MARKER, NOT THE ABSENCE OF STDERR.
-        #
-        # This read `... 2>&1 | Select-Object -Last 3` under $ErrorActionPreference = "Stop".
-        # In PowerShell 5.1, merging a native command's stderr into the pipeline wraps each
-        # line in an ErrorRecord, which that preference turns into a TERMINATING error -- so
-        # the moment submit_via_ui.ps1 wrote its diagnostics to stderr (they were moved there
-        # deliberately, because on stdout they became the function's return value), every
-        # SUCCESSFUL submit threw. Measured: three attempts, three "FAILED", and the reported
-        # reason was the progress line "invoking button" -- the last thing the child printed
-        # before succeeding. The batch was submitted and the driver gave up on it.
+        # SUCCESS IS THE explicit in-process return/exception outcome plus the submitted marker.
+        # Keeping the submitter in this process also removes the native-child stderr ambiguity
+        # that previously required interpreting $LASTEXITCODE from another powershell.exe.
         $submitted = $false
         for ($try = 1; $try -le 3 -and -not $submitted; $try++) {
             $prevEap = $ErrorActionPreference
             $ErrorActionPreference = "Continue"
-            $out = & powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\win\submit_via_ui.ps1 -GoalFile $uiFile 2>&1 | Out-String
-            $rc = $LASTEXITCODE
+            # Invoke the GUI submitter in this PowerShell process. The old nested powershell.exe
+            # could allocate a visible console when this driver was started by a hidden/GUI parent.
+            try {
+                $out = & .\scripts\win\submit_via_ui.ps1 -GoalFile $uiFile 2>&1 | Out-String
+                $rc = 0
+            } catch {
+                $out = ($_ | Out-String)
+                $rc = 1
+            }
             $ErrorActionPreference = $prevEap
             foreach ($l in (($out -split "`r?`n") | Where-Object { $_.Trim() } | Select-Object -Last 3)) {
                 Say ("submit: " + $l)

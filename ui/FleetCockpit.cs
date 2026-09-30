@@ -1110,6 +1110,18 @@ class CockpitWindow : Window
     // component -- bridge/copilot_bridge.py + tools/tool_probe.py -- this file only reads it).
     enum HealthState { Gray = 0, Green = 1, Yellow = 2, Red = 3, Checking = 4 }
     class DotState { public HealthState State = HealthState.Gray; public string Detail = ""; public DateTime Checked = DateTime.MinValue; }
+    class PlannedServerTransition
+    {
+        public string State = "";
+        public string Reason = "";
+        public double Started = 0;
+        public double Expires = 0;
+    }
+    // Old supervisors wrote only `started`; preserve that format for one deployment generation.
+    // New supervisors write their own policy-derived expiry. The hard cap is only corruption /
+    // stale-file safety: it is intentionally NOT the normal restart budget.
+    const double LEGACY_SERVER_TRANSITION_MAX_AGE_S = 60.0;
+    const double SERVER_TRANSITION_HARD_MAX_AGE_S = 600.0;
     // Index map: 0=server 1=tunnel 2=edge 3=signin 4=agent 5=tool(bridge probe).
     // SIZED BY THE COUNT, never by however many literals somebody typed. This was six
     // `new DotState()` in a row. Adding a seventh dot compiled cleanly, and the first
@@ -2675,10 +2687,50 @@ class CockpitWindow : Window
         }
     }
 
+    PlannedServerTransition ReadPlannedServerTransition()
+    {
+        try
+        {
+            string path = Path.Combine(RepoRootForSettings(), ".fleet", "server_transition.json");
+            if (!File.Exists(path)) return null;
+            var raw = _js.DeserializeObject(File.ReadAllText(path, Encoding.UTF8)) as Dictionary<string, object>;
+            if (raw == null) return null;
+            object stateObj, reasonObj, startedObj, expiresObj;
+            if (!raw.TryGetValue("state", out stateObj) || stateObj == null) return null;
+            string state = Convert.ToString(stateObj).Trim().ToLowerInvariant();
+            if (state != "planned_restart") return null;
+            if (!raw.TryGetValue("started", out startedObj) || startedObj == null) return null;
+            double started = Convert.ToDouble(startedObj, System.Globalization.CultureInfo.InvariantCulture);
+            double nowUnix = NowUnix();
+            double age = nowUnix - started;
+            if (age < -5.0 || age > SERVER_TRANSITION_HARD_MAX_AGE_S) return null;
+
+            double expires = started + LEGACY_SERVER_TRANSITION_MAX_AGE_S;
+            if (raw.TryGetValue("expires", out expiresObj) && expiresObj != null)
+                expires = Convert.ToDouble(expiresObj, System.Globalization.CultureInfo.InvariantCulture);
+            double declaredWindow = expires - started;
+            if (declaredWindow <= 0.0 || declaredWindow > SERVER_TRANSITION_HARD_MAX_AGE_S) return null;
+            double effectiveExpiry = Math.Min(expires, started + SERVER_TRANSITION_HARD_MAX_AGE_S);
+            if (nowUnix > effectiveExpiry) return null;
+
+            string reason = "planned restart";
+            if (raw.TryGetValue("reason", out reasonObj) && reasonObj != null)
+                reason = Convert.ToString(reasonObj).Trim();
+            if (string.IsNullOrEmpty(reason)) reason = "planned restart";
+            return new PlannedServerTransition { State = state, Reason = reason, Started = started, Expires = expires };
+        }
+        catch (Exception)
+        {
+            // An unreadable transition is not permission to soften a red health signal.
+            return null;
+        }
+    }
+
     // One full infra sweep. Writes results into _health under _healthLock.
     void PollHealthOnce()
     {
         DateTime now = DateTime.UtcNow;
+        PlannedServerTransition plannedRestart = ReadPlannedServerTransition();
 
         // 0) Server: GET http://127.0.0.1:8000/health, and READ WHAT IT SAYS.
         //
@@ -2715,7 +2767,14 @@ class CockpitWindow : Window
         // scripts/stale_server_check.classify_staleness.
         string codeState = HealthField(srvBody, "server_code");
         if (!srvOk)
-            SetDot(0, HealthState.Red, T("hs_srv_detail_bad"), now);
+        {
+            if (plannedRestart != null)
+                SetDot(0, HealthState.Yellow,
+                       (_lang == 0 ? "計画されたサーバ再起動中: " : "Planned server restart in progress: ")
+                       + plannedRestart.Reason, now);
+            else
+                SetDot(0, HealthState.Red, T("hs_srv_detail_bad"), now);
+        }
         else if (authStorm)
             SetDot(0, HealthState.Yellow,
                    T("hs_srv_detail_auth") + " (" + authFails + ")", now);
@@ -2794,7 +2853,16 @@ class CockpitWindow : Window
             string locPid = HealthField(srvBody, "server_pid");
             bool pidsDisagree = tunPid.Length > 0 && locPid.Length > 0 && tunPid != locPid;
             if (!tunOk)
-                SetDot(1, HealthState.Red, T("hs_tun_detail_bad"), now);
+            {
+                // If the local server is deliberately between processes, the tunnel cannot reach
+                // it either.  That is the same planned transition, not a second independent fault.
+                if (plannedRestart != null && !srvOk)
+                    SetDot(1, HealthState.Yellow,
+                           (_lang == 0 ? "計画されたサーバ再起動に伴いトンネル待機中"
+                                       : "Tunnel waiting for the planned server restart"), now);
+                else
+                    SetDot(1, HealthState.Red, T("hs_tun_detail_bad"), now);
+            }
             else if (pidsDisagree)
                 SetDot(1, HealthState.Yellow,
                        T("hs_tun_detail_other") + " (" + tunPid + " != " + locPid + ")", now);
@@ -4886,26 +4954,19 @@ class CockpitWindow : Window
             if (runEnded || allDone) overallPhase = "ended";
         }
         string started = root != null ? S(root, "started") : "";
-        // Re-key on the PRIMARY worker's own status + phase-event count so this panel repaints
-        // when workers[0] itself progresses, even while sibling workers keep overallPhase pinned
-        // to "running" (a repaint-gating bug, not a BuildSpineContent rendering bug -- that method
-        // already reads workers[0].phase_events correctly, it just wasn't being re-invoked).
-        string primaryStatus = "";
-        int primaryPhaseCount = 0;
+        // Re-key on the selected task's OPERATOR-FACING CONTENT. The old spine was a timeline,
+        // so phase-event count was enough. Content details must repaint when progress/current/next/
+        // waiting/artifacts change even if status and phase-event count do not.
+        string primaryDetailSig = "";
         if (spineWorkers != null && spineWorkers.Count > 0)
         {
             Dictionary<string, object> primaryW = SpineFocusWorker(spineWorkers);
-            if (primaryW != null)
-            {
-                primaryStatus = S(primaryW, "name") + ":" + S(primaryW, "status");
-                object pe;
-                if (primaryW.TryGetValue("phase_events", out pe) && pe is object[]) primaryPhaseCount = ((object[])pe).Length;
-            }
+            if (primaryW != null) primaryDetailSig = SpineDetailSignature(primaryW);
         }
         string spineSig = (hasWorkers ? "1" : "0") + "|" + started + "|" + overallPhase
                           + "|" + (_toolbarAll != null ? _toolbarAll.Count : 0)
                           + "|" + (_dark ? "D" : "L") + _lang
-                          + "|" + primaryStatus + "|" + primaryPhaseCount;
+                          + "|" + primaryDetailSig;
         if (spineSig == _spineSig) return;
         _spineSig = spineSig;
 
@@ -4945,7 +5006,63 @@ class CockpitWindow : Window
         return workers[0];
     }
 
-    // Build the spine panel content: section header + vertical [COMPUTED] execution timeline.
+    string SpineDetailSignature(Dictionary<string, object> w)
+    {
+        if (w == null) return "";
+        var parts = new List<string>();
+        parts.Add(S(w, "name"));
+        parts.Add(S(w, "status"));
+        parts.Add(I(w, "turn").ToString());
+        parts.Add(I(w, "max_turns").ToString());
+        parts.Add(S(w, "goal_summary"));
+        parts.Add(S(w, "reason"));
+        parts.Add(S(w, "outcome"));
+        parts.Add(I(w, "verify_attempts").ToString());
+        object phaseRaw;
+        if (w.TryGetValue("phase_events", out phaseRaw) && phaseRaw is object[])
+        {
+            object[] phaseArr = (object[])phaseRaw;
+            parts.Add(phaseArr.Length.ToString());
+            if (phaseArr.Length > 0)
+            {
+                var lastPhase = phaseArr[phaseArr.Length - 1] as Dictionary<string, object>;
+                if (lastPhase != null)
+                {
+                    parts.Add(S(lastPhase, "event"));
+                    parts.Add(S(lastPhase, "label"));
+                    parts.Add(S(lastPhase, "ts"));
+                }
+            }
+        }
+        var execution = Obj(w, "execution");
+        if (execution != null)
+        {
+            parts.Add(S(execution, "state"));
+            parts.Add(S(execution, "current_step"));
+            parts.Add(S(execution, "last_progress"));
+            parts.Add(S(execution, "next_step"));
+            parts.Add(S(execution, "waiting_reason"));
+            parts.Add(I(execution, "completed_count").ToString());
+            parts.Add(I(execution, "total_steps").ToString());
+            object artsRaw;
+            if (execution.TryGetValue("artifacts", out artsRaw) && artsRaw is object[])
+            {
+                foreach (object obj in (object[])artsRaw)
+                {
+                    var artifact = obj as Dictionary<string, object>;
+                    if (artifact == null) continue;
+                    parts.Add(S(artifact, "path"));
+                    parts.Add(S(artifact, "name"));
+                    parts.Add(S(artifact, "uri"));
+                }
+            }
+        }
+        return string.Join("|", parts.ToArray());
+    }
+
+    // Left task-inspection spine. Content details answer "what is it doing now?"; the timeline
+    // directly below answers "how did it get here?". Both follow the same selected worker, and
+    // the expanded card keeps the richer evidence view rather than being the only timeline.
     // GIVE THE SPINE A VIEWPORT. The column is a fixed 220px lane whose content has NO upper
     // bound: the timeline is one entry per phase transition, and the Border it sat in simply
     // CLIPPED everything past the fold. The entries were rendered and unreachable, with no
@@ -4977,409 +5094,226 @@ class CockpitWindow : Window
         return sv;
     }
 
+    void AddSpineTimeline(StackPanel outer, Dictionary<string, object> w)
+    {
+        if (outer == null || w == null) return;
+        bool ja = _lang == 0;
+
+        var divider = new Border();
+        divider.Height = 1;
+        divider.Background = Theme.Br(Theme.Border(_dark));
+        divider.Margin = new Thickness(0, 12, 0, 8);
+        outer.Children.Add(divider);
+
+        var title = new TextBlock();
+        title.Text = ja ? "実行タイムライン" : "Execution timeline";
+        title.Foreground = Theme.Br(Theme.Muted(_dark));
+        title.FontSize = 10.5;
+        title.FontWeight = FontWeights.SemiBold;
+        title.Margin = new Thickness(0, 0, 0, 2);
+        outer.Children.Add(title);
+
+        bool real = false;
+        object peRaw;
+        if (w.TryGetValue("phase_events", out peRaw) && peRaw is object[])
+            real = ((object[])peRaw).Length > 0;
+        outer.Children.Add(new TextBlock {
+            Text = real ? (ja ? "(フェーズ遷移)" : "(phase transitions)")
+                        : (ja ? "(ターン記録から推定)" : "(estimated from turns)"),
+            Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 9.5,
+            Margin = new Thickness(0, 0, 0, 7) });
+
+        // The phase name alone is not enough operationally. Surface what this selected worker
+        // is doing NOW, but only from fields the runner actually published -- no invented step.
+        string timelineNow = "";
+        var timelineExec = Obj(w, "execution");
+        if (timelineExec != null)
+        {
+            string current = S(timelineExec, "current_step");
+            string progress = S(timelineExec, "last_progress");
+            if (!string.IsNullOrEmpty(current)) timelineNow = current;
+            if (!string.IsNullOrEmpty(progress) && progress != current)
+                timelineNow = string.IsNullOrEmpty(timelineNow) ? progress : (timelineNow + " · " + progress);
+        }
+        if (string.IsNullOrEmpty(timelineNow)) timelineNow = S(w, "reason");
+        timelineNow = (timelineNow ?? "").Replace("\r", " ").Replace("\n", " ").Trim();
+        if (timelineNow.Length > 180) timelineNow = timelineNow.Substring(0, 179).TrimEnd() + "…";
+        if (!string.IsNullOrEmpty(timelineNow))
+            outer.Children.Add(new TextBlock {
+                Text = (ja ? "現在: " : "Now: ") + timelineNow,
+                Foreground = Muted, FontSize = 10.5, TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 0, 0, 8) });
+
+        string status = S(w, "status");
+        string outcome = S(w, "outcome");
+        bool terminal = status == "done" || status == "stuck" || status == "maxturns"
+                     || status == "error" || status == "cancelled";
+        int reviews = I(w, "verify_attempts");
+        var events = BuildTimelineEvents(S(w, "transcript"), outcome, terminal, reviews, w);
+        for (int i = 0; i < events.Count; i++)
+        {
+            bool last = i == events.Count - 1;
+            string label = events[i].Item1;
+            string color = events[i].Item2;
+
+            var row = new Grid();
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(18) });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+            var rail = new DockPanel();
+            rail.HorizontalAlignment = HorizontalAlignment.Center;
+            var head = new Border { Width = 1.5, Height = 7,
+                Background = i > 0 ? Theme.Br(Theme.Border(_dark)) : Brushes.Transparent,
+                HorizontalAlignment = HorizontalAlignment.Center };
+            DockPanel.SetDock(head, Dock.Top);
+            rail.Children.Add(head);
+            var dot = new System.Windows.Shapes.Ellipse { Width = 8, Height = 8,
+                Fill = Theme.Br(color), HorizontalAlignment = HorizontalAlignment.Center };
+            DockPanel.SetDock(dot, Dock.Top);
+            rail.Children.Add(dot);
+            rail.Children.Add(new Border { Width = 1.5,
+                Background = last ? Brushes.Transparent : Theme.Br(Theme.Border(_dark)),
+                HorizontalAlignment = HorizontalAlignment.Center });
+            Grid.SetColumn(rail, 0);
+            row.Children.Add(rail);
+
+            var tb = new TextBlock { Text = label, Foreground = Theme.Br(color), FontSize = 11.0,
+                FontWeight = FontWeights.SemiBold, TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(4, i == 0 ? 1 : 0, 0, 5) };
+            Grid.SetColumn(tb, 1);
+            row.Children.Add(tb);
+            outer.Children.Add(row);
+        }
+    }
+
     // Derives events honestly from available data: run started ts, transcript first-turn ts,
     // current overall phase (polled), run ended state. No fabricated phase_events.
     UIElement BuildSpineContent(Dictionary<string, object> root, string overallPhase, bool runEnded,
                                 List<Dictionary<string, object>> workers)
     {
         bool ja = _lang == 0;
-
         var outer = new StackPanel();
         outer.Margin = new Thickness(12, 12, 8, 12);
 
-        // ── Section label ──────────────────────────────────────────────────────────
         var sectionLbl = new TextBlock();
-        sectionLbl.Text = ja ? "実行タイムライン" : "Execution timeline";
+        sectionLbl.Text = ja ? "内容詳細" : "Content details";
         sectionLbl.Foreground = Theme.Br(Theme.Muted(_dark));
         sectionLbl.FontSize = 10.5;
         sectionLbl.FontWeight = FontWeights.SemiBold;
-        sectionLbl.Margin = new Thickness(0, 0, 0, 1);
+        sectionLbl.Margin = new Thickness(0, 0, 0, 7);
         outer.Children.Add(sectionLbl);
 
-        // ── Check for real phase_events from the primary worker ────────────────────
-        // The primary worker is the first/earliest worker in the workers list.
-        // If phase_events is present and non-empty, render from those (REAL mode).
-        // Otherwise, fall through to the [COMPUTED] turn-timestamp fallback below.
-        bool usingRealEvents = false;
-        var realPhaseEvents = new List<Tuple<string, string, string>>();  // label, timeStr, colorHex
-        if (workers != null && workers.Count > 0)
+        Dictionary<string, object> primaryWorker = SpineFocusWorker(workers);
+        if (primaryWorker == null)
         {
-            Dictionary<string, object> primaryWorker = SpineFocusWorker(workers);
-            object peRaw;
-            if (primaryWorker.TryGetValue("phase_events", out peRaw) && peRaw is object[])
-            {
-                object[] peArr = (object[])peRaw;
-                if (peArr.Length > 0)
-                {
-                    usingRealEvents = true;
-                    foreach (object peObj in peArr)
-                    {
-                        var pe = peObj as Dictionary<string, object>;
-                        if (pe == null) continue;
-                        // ts: epoch double
-                        double peTs = 0;
-                        object peTsRaw;
-                        if (pe.TryGetValue("ts", out peTsRaw) && peTsRaw != null)
-                        {
-                            try { peTs = Convert.ToDouble(peTsRaw); } catch { }
-                        }
-                        // event: the status-key string
-                        string peEvent = "";
-                        object peEventRaw;
-                        if (pe.TryGetValue("event", out peEventRaw) && peEventRaw != null)
-                            peEvent = peEventRaw.ToString();
-                        // label: English fallback from the stored label field
-                        string peFallbackLabel = peEvent;
-                        object peLabelRaw;
-                        if (pe.TryGetValue("label", out peLabelRaw) && peLabelRaw != null)
-                            peFallbackLabel = peLabelRaw.ToString();
-                        // Localized timeline-event label; fall back to stored label for unknown events
-                        string localLabel = Theme.TimelineLabel(peEvent, _lang);
-                        if (string.IsNullOrEmpty(localLabel) || localLabel == peEvent)
-                        {
-                            // TimelineLabel returns the key itself when unrecognized; use stored fallback
-                            string knownKey = Theme.TimelineLabel(peEvent, _lang);
-                            localLabel = (knownKey == peEvent && !string.IsNullOrEmpty(peFallbackLabel))
-                                ? peFallbackLabel : knownKey;
-                        }
-                        string colorHex = Theme.TimelineColor(peEvent, _dark);
-                        string timeStr = "";
-                        if (peTs > 0)
-                        {
-                            try
-                            {
-                                timeStr = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)
-                                    .AddSeconds(peTs).ToLocalTime().ToString("HH:mm");
-                            }
-                            catch { }
-                        }
-                        realPhaseEvents.Add(new Tuple<string, string, string>(localLabel, timeStr, colorHex));
-                    }
-                }
-            }
-        }
-
-        // Sub-label changes based on mode (real vs computed)
-        var subLbl = new TextBlock();
-        subLbl.Text = usingRealEvents
-            ? (ja ? "(フェーズ遷移)" : "(phase transitions)")
-            // "from turns" did not say that these times are INFERRED. That was the whole content
-            // of the [COMPUTED] tag underneath, so it moves up here where it is read first.
-            : (ja ? "(会話ターンから推定)" : "(estimated from turns)");
-        subLbl.Foreground = Theme.Br(Theme.Faint(_dark));
-        subLbl.FontSize = 9.5;
-        subLbl.Margin = new Thickness(0, 0, 0, 8);
-        outer.Children.Add(subLbl);
-
-        // ── If real events mode: render from phase_events and skip [COMPUTED] path ─
-        if (usingRealEvents)
-        {
-            for (int i = 0; i < realPhaseEvents.Count; i++)
-            {
-                string evLabel = realPhaseEvents[i].Item1;
-                string evTime  = realPhaseEvents[i].Item2;
-                string evColor = realPhaseEvents[i].Item3;
-                bool isLast = (i == realPhaseEvents.Count - 1);
-                var row = new Grid();
-                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(18) });
-                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-                // A DOCKPANEL, NOT A STACKPANEL. Measured on screen: an 8px hole in every
-                // connector, at every step, in both of this widget's two implementations. The
-                // rail was drawn as a fixed 8px above the dot and a fixed 8px below it -- 24px
-                // of column against a row whose height is set by the label and its timestamp,
-                // about 32px. It could never reach, and a wrapped label opens the gap further.
-                // Docking the head to the top and letting the tail take the remaining height
-                // makes the rail follow the row instead of guessing at it.
-                var lineAndDot = new DockPanel();
-                lineAndDot.HorizontalAlignment = HorizontalAlignment.Center;
-                {
-                    var connector = new Border();
-                    connector.Width = 1.5; connector.Height = 8;
-                    // Transparent rather than absent on the first row: the head still has to
-                    // occupy its 8px so every dot lands at the same height down the column.
-                    connector.Background = i > 0 ? Theme.Br(Theme.Border(_dark)) : Brushes.Transparent;
-                    connector.HorizontalAlignment = HorizontalAlignment.Center;
-                    DockPanel.SetDock(connector, Dock.Top);
-                    lineAndDot.Children.Add(connector);
-                }
-                var dot = new System.Windows.Shapes.Ellipse();
-                dot.Width = 8; dot.Height = 8;
-                dot.Fill = Theme.Br(evColor);
-                dot.HorizontalAlignment = HorizontalAlignment.Center;
-                DockPanel.SetDock(dot, Dock.Top);
-                lineAndDot.Children.Add(dot);
-                {
-                    // The last child of a DockPanel fills what is left, so this is the piece that
-                    // reaches the next dot however tall the row turns out to be. Added even on the
-                    // last row -- invisible there -- because if it were absent the dot would
-                    // become the filling child and stretch.
-                    var tail = new Border();
-                    tail.Width = 1.5;
-                    tail.Background = isLast ? Brushes.Transparent : Theme.Br(Theme.Border(_dark));
-                    tail.HorizontalAlignment = HorizontalAlignment.Center;
-                    lineAndDot.Children.Add(tail);
-                }
-                Grid.SetColumn(lineAndDot, 0);
-                row.Children.Add(lineAndDot);
-                var labelBlock = new StackPanel();
-                labelBlock.VerticalAlignment = VerticalAlignment.Top;
-                labelBlock.Margin = new Thickness(4, i == 0 ? 2 : 0, 0, 4);
-                var labelTb = new TextBlock();
-                labelTb.Text = evLabel;
-                labelTb.Foreground = Theme.Br(evColor);
-                labelTb.FontSize = 11; labelTb.FontWeight = FontWeights.SemiBold;
-                labelTb.TextTrimming = TextTrimming.CharacterEllipsis;
-                labelBlock.Children.Add(labelTb);
-                if (!string.IsNullOrEmpty(evTime))
-                {
-                    var timeTb = new TextBlock();
-                    timeTb.Text = evTime;
-                    timeTb.Foreground = Theme.Br(Theme.Muted(_dark));
-                    timeTb.FontSize = 10;
-                    labelBlock.Children.Add(timeTb);
-                }
-                Grid.SetColumn(labelBlock, 1);
-                row.Children.Add(labelBlock);
-                outer.Children.Add(row);
-            }
-            // [REAL] used to be printed here. It is a tag from this project's own spec, where
-            // every displayed field is marked [REAL] / [COMPUTED] / [FUTURE] so nobody ships a
-            // fabricated number -- a good rule that had leaked into the product as jargon. The
-            // distinction it carried is already stated in words at the top of this panel:
-            // "(phase transitions)" against "(estimated from turns)". Saying it twice, once in
-            // brackets, is not more honest.
+            outer.Children.Add(new TextBlock {
+                Text = ja ? "表示できるタスク情報がありません" : "No task details available",
+                Foreground = Theme.Br(Theme.Muted(_dark)), FontSize = 12.0,
+                TextWrapping = TextWrapping.Wrap });
             return outer;
         }
 
-        // ── [COMPUTED] fallback: derive timestamps from transcript ────────────────
-        // Use the first worker in the workers list that has a transcript path.
-        string transcriptPath = "";
-        if (workers != null)
-        {
-            foreach (Dictionary<string, object> tw in workers)
-            {
-                string tp = S(tw, "transcript");
-                if (!string.IsNullOrEmpty(tp) && File.Exists(tp)) { transcriptPath = tp; break; }
-            }
-            if (string.IsNullOrEmpty(transcriptPath) && workers.Count > 0)
-                transcriptPath = S(workers[0], "transcript");
-        }
+        string fullGoal = S(primaryWorker, "goal");
+        string goalSummary = S(primaryWorker, "goal_summary");
+        if (string.IsNullOrEmpty(goalSummary))
+            goalSummary = CardTitle(S(primaryWorker, "conv_title"), fullGoal);
+        if (!string.IsNullOrEmpty(goalSummary))
+            outer.Children.Add(new TextBlock {
+                Text = goalSummary, Foreground = Fg, FontSize = 13.0,
+                FontWeight = FontWeights.SemiBold, TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 0, 0, 7) });
 
-        // Read meta ts (= "queued") and first turn ts (= "started") from transcript.
-        double metaTs = 0, firstTurnTs = 0;
-        try
+        string status = S(primaryWorker, "status");
+        int turn = I(primaryWorker, "turn");
+        int maxTurns = I(primaryWorker, "max_turns");
+        string statusText = StatusLabel(status);
+        if (string.IsNullOrEmpty(statusText)) statusText = overallPhase;
+        if (turn > 0)
+            statusText += maxTurns > 0 ? ("  ·  Turn " + turn + "/" + maxTurns) : ("  ·  Turn " + turn);
+        if (!string.IsNullOrEmpty(statusText))
+            outer.Children.Add(new TextBlock {
+                Text = statusText, Foreground = Theme.Br(Theme.Secondary(_dark)), FontSize = 11.5,
+                TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 7) });
+
+        var execution = Obj(primaryWorker, "execution");
+        string waiting = "";
+        if (execution != null)
         {
-            if (!string.IsNullOrEmpty(transcriptPath) && File.Exists(transcriptPath))
+            string state = S(execution, "state");
+            string current = S(execution, "current_step");
+            string progress = S(execution, "last_progress");
+            string next = S(execution, "next_step");
+            waiting = S(execution, "waiting_reason");
+
+            if (!string.IsNullOrEmpty(current))
             {
-                string[] tlines;
-                using (var fsr = new FileStream(transcriptPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-                using (var sr = new StreamReader(fsr, Encoding.UTF8))
-                    tlines = sr.ReadToEnd().Replace("\r", "").Split('\n');
-                foreach (var tln in tlines)
+                outer.Children.Add(new TextBlock { Text = ja ? "現在" : "Current",
+                    Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 10.5,
+                    FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 2, 0, 1) });
+                string currentText = current;
+                if (!string.IsNullOrEmpty(state) && state != current) currentText = state + "  ·  " + current;
+                outer.Children.Add(new TextBlock { Text = currentText, Foreground = Fg, FontSize = 12.0,
+                    TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 5) });
+            }
+            else if (!string.IsNullOrEmpty(state))
+            {
+                outer.Children.Add(new TextBlock { Text = (ja ? "状態: " : "State: ") + state,
+                    Foreground = Fg, FontSize = 12.0, TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(0, 2, 0, 5) });
+            }
+
+            if (!string.IsNullOrEmpty(progress))
+                outer.Children.Add(new TextBlock { Text = (ja ? "進捗: " : "Progress: ") + progress,
+                    Foreground = Muted, FontSize = 11.5, TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(0, 1, 0, 4) });
+            if (!string.IsNullOrEmpty(next))
+                outer.Children.Add(new TextBlock { Text = (ja ? "次: " : "Next: ") + next,
+                    Foreground = Muted, FontSize = 11.5, TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(0, 1, 0, 4) });
+
+            object artsRaw;
+            if (execution.TryGetValue("artifacts", out artsRaw) && artsRaw is object[])
+            {
+                object[] arts = (object[])artsRaw;
+                if (arts.Length > 0)
                 {
-                    if (string.IsNullOrEmpty(tln)) continue;
-                    Dictionary<string, object> obj;
-                    try { obj = _js.DeserializeObject(tln) as Dictionary<string, object>; } catch { continue; }
-                    if (obj == null) continue;
-                    if (obj.ContainsKey("meta") && Convert.ToBoolean(obj["meta"]))
+                    outer.Children.Add(new TextBlock { Text = ja ? "成果物" : "Artifacts",
+                        Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 10.5,
+                        FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 5, 0, 1) });
+                    int shown = 0;
+                    foreach (object obj in arts)
                     {
-                        if (obj.ContainsKey("ts") && obj["ts"] != null) metaTs = Convert.ToDouble(obj["ts"]);
-                        continue;
+                        var artifact = obj as Dictionary<string, object>;
+                        if (artifact == null) continue;
+                        string label = S(artifact, "path");
+                        if (string.IsNullOrEmpty(label)) label = S(artifact, "name");
+                        if (string.IsNullOrEmpty(label)) label = S(artifact, "uri");
+                        if (string.IsNullOrEmpty(label)) continue;
+                        outer.Children.Add(new TextBlock { Text = "• " + label,
+                            Foreground = Muted, FontSize = 11.0, TextWrapping = TextWrapping.Wrap,
+                            Margin = new Thickness(5, 1, 0, 1) });
+                        shown++;
+                        if (shown >= 5) break;
                     }
-                    if (obj.ContainsKey("role") && obj.ContainsKey("ts") && obj["ts"] != null && firstTurnTs == 0)
-                        firstTurnTs = Convert.ToDouble(obj["ts"]);
-                    if (firstTurnTs > 0) break;
+                    if (arts.Length > shown)
+                        outer.Children.Add(new TextBlock { Text = "+" + (arts.Length - shown),
+                            Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 10.5,
+                            Margin = new Thickness(5, 1, 0, 2) });
                 }
             }
         }
-        catch { }
 
-        // Fall back: if meta ts is absent, use root["started"] (epoch, top-level).
-        if (metaTs <= 0 && root != null) metaTs = Dbl(root, "started");
-
-        // ── Helper: format epoch as "HH:mm" ──────────────────────────────────────
-        // C# 5: use a local method-delegate pattern
-        Func<double, string> fmtHM = delegate(double ts)
+        string reason = !string.IsNullOrEmpty(waiting) ? waiting : S(primaryWorker, "reason");
+        if (!string.IsNullOrEmpty(reason))
         {
-            if (ts <= 0) return "";
-            try
-            {
-                return new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)
-                    .AddSeconds(ts).ToLocalTime().ToString("HH:mm");
-            }
-            catch { return ""; }
-        };
-
-        // ── Build events list ──────────────────────────────────────────────────────
-        // [COMPUTED] Honest markers only: queued/received, started (first turn), now/phase, ended.
-        var events = new List<Tuple<string, string, string>>();
-        // Each tuple: (label, time-string, railColor-hex)
-        string graphite = Theme.Text(_dark);
-        string live = Theme.Info(_dark);
-        string attn = Theme.Warning(_dark);
-        string ended = Theme.Success(_dark);
-        string danger = Theme.Warning(_dark);
-
-        // Marker 1: Queued / directive received
-        string qLabel = ja ? "投入" : "Queued";
-        string qTime = fmtHM(metaTs);
-        events.Add(new Tuple<string, string, string>(qLabel, qTime, graphite));
-
-        // Marker 2: Started (first turn in transcript)
-        //
-        // ONLY WHEN IT SAYS SOMETHING THE PREVIOUS MARKER DID NOT. The meta line and the first
-        // user turn are usually written within the same second, so at HH:mm resolution 投入 and
-        // 開始 carried the identical clock time on every task first measured -- two rows, one
-        // fact. A timeline whose steps repeat each other reads as a template rather than as
-        // this task's history, which is how the wrong 終了 above stayed invisible.
-        //
-        // THE TEST IS WHETHER THE DISPLAYED TIMES DIFFER, not whether the gap clears some
-        // number of seconds. The first version used >= 60s as a stand-in for "the minute will
-        // have changed", which is sound in one direction only: 60s guarantees a different
-        // minute, but a shorter wait can straddle a boundary and be equally informative. On
-        // the real records the waits run median 6.5s with 13% over thirty seconds -- the queue
-        // does wait, in steps, as admission control staggers the workers -- so a threshold
-        // picked in seconds hides real history at 10:59:50 -> 11:00:48 while claiming to show
-        // it. Comparing the strings that will actually be rendered is the exact question, and
-        // it needs no threshold at all.
-        string sTime = fmtHM(firstTurnTs);
-        if (firstTurnTs > 0 && sTime != "" && sTime != qTime)
-        {
-            string sLabel = ja ? "開始" : "Started";
-            events.Add(new Tuple<string, string, string>(sLabel, sTime, live));
+            outer.Children.Add(new TextBlock { Text = ja ? "待機・補足" : "Waiting / note",
+                Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 10.5,
+                FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 6, 0, 1) });
+            outer.Children.Add(new TextBlock { Text = reason, Foreground = Muted, FontSize = 11.5,
+                TextWrapping = TextWrapping.Wrap });
         }
 
-        // Marker 3: Current / overall phase (polled; [COMPUTED])
-        if (!runEnded)
-        {
-            string phLabel;
-            string phColor;
-            if (overallPhase == "attn")
-            {
-                phLabel = ja ? "要対応" : "Needs attention";
-                phColor = attn;
-            }
-            else if (overallPhase == "verifying")
-            {
-                phLabel = ja ? "検証中" : "Verifying";
-                phColor = attn;
-            }
-            else if (overallPhase == "running")
-            {
-                phLabel = ja ? "実行中" : "Running";
-                phColor = live;
-            }
-            else
-            {
-                phLabel = ja ? "実行中" : "Running";
-                phColor = live;
-            }
-            string nowTime = fmtHM(NowUnix());
-            events.Add(new Tuple<string, string, string>(phLabel, nowTime, phColor));
-        }
-        else
-        {
-            // Marker 3 (ended). root["updated"] is the RUN's clock, and for a past task that is
-            // the wrong one: RefreshSpine focuses a single history entry, and every one of them
-            // was then shown ending at the same minute the run did. Measured on the last eight
-            // entries of .fleet/history.json -- true ends 10:53, 10:53, 10:56, 10:57, 10:57,
-            // 10:59, 11:01, 11:05, all displayed as 11:05. Seven of eight wrong, and wrong in
-            // the way that hides it: identical, so it reads as a rendering of the run rather
-            // than as a mistake about the task.
-            //
-            // The focused entry carries its own finish time. Use it whenever exactly one task
-            // is in view; a live run's spine covers many workers, and there the run's clock is
-            // the right one.
-            double endedTs = 0;
-            if (workers != null && workers.Count == 1)
-                endedTs = Dbl(workers[0], "ts");
-            if (endedTs <= 0 && root != null) endedTs = Dbl(root, "updated");
-            string eLabel = ja ? "終了" : "Ended";
-            string eTime = fmtHM(endedTs);
-            string eColor = (overallPhase == "attn") ? danger : ended;
-            events.Add(new Tuple<string, string, string>(eLabel, eTime, eColor));
-        }
-
-        // ── Render the vertical timeline ───────────────────────────────────────────
-        for (int i = 0; i < events.Count; i++)
-        {
-            string evLabel = events[i].Item1;
-            string evTime = events[i].Item2;
-            string evColor = events[i].Item3;
-            bool isLast = (i == events.Count - 1);
-
-            var row = new Grid();
-            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(18) });  // dot + line col
-            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) }); // label col
-
-            // Vertical connector: a thin line above the dot (hidden for first item).
-            // Same rail, same hole, second copy. See the note in the phase-events branch.
-            var lineAndDot = new DockPanel();
-            lineAndDot.HorizontalAlignment = HorizontalAlignment.Center;
-            {
-                var connector = new Border();
-                connector.Width = 1.5;
-                connector.Height = 8;
-                connector.Background = i > 0 ? Theme.Br(Theme.Border(_dark)) : Brushes.Transparent;
-                connector.HorizontalAlignment = HorizontalAlignment.Center;
-                DockPanel.SetDock(connector, Dock.Top);
-                lineAndDot.Children.Add(connector);
-            }
-
-            // Dot
-            var dot = new System.Windows.Shapes.Ellipse();
-            dot.Width = 8;
-            dot.Height = 8;
-            dot.Fill = Theme.Br(evColor);
-            dot.HorizontalAlignment = HorizontalAlignment.Center;
-            dot.Margin = new Thickness(0, i == 0 ? 4 : 0, 0, 0);
-            DockPanel.SetDock(dot, Dock.Top);
-            lineAndDot.Children.Add(dot);
-
-            // Tail connector below dot (hidden for last item)
-            if (!isLast)
-            {
-                var tail = new Border();
-                tail.Width = 1.5;
-                tail.Background = isLast ? Brushes.Transparent : Theme.Br(Theme.Border(_dark));
-                tail.HorizontalAlignment = HorizontalAlignment.Center;
-                lineAndDot.Children.Add(tail);
-            }
-
-            Grid.SetColumn(lineAndDot, 0);
-            row.Children.Add(lineAndDot);
-
-            // Label + time block
-            var labelBlock = new StackPanel();
-            labelBlock.VerticalAlignment = VerticalAlignment.Top;
-            labelBlock.Margin = new Thickness(4, i == 0 ? 2 : 0, 0, 4);
-
-            var labelTb = new TextBlock();
-            labelTb.Text = evLabel;
-            labelTb.Foreground = Theme.Br(evColor);
-            labelTb.FontSize = 11;
-            labelTb.FontWeight = FontWeights.SemiBold;
-            labelTb.TextTrimming = TextTrimming.CharacterEllipsis;
-            labelBlock.Children.Add(labelTb);
-
-            if (!string.IsNullOrEmpty(evTime))
-            {
-                var timeTb = new TextBlock();
-                timeTb.Text = evTime;
-                timeTb.Foreground = Theme.Br(Theme.Muted(_dark));
-                timeTb.FontSize = 10;
-                labelBlock.Children.Add(timeTb);
-            }
-
-            Grid.SetColumn(labelBlock, 1);
-            row.Children.Add(labelBlock);
-
-            outer.Children.Add(row);
-        }
-
-        // ── [COMPUTED] footer tag ─────────────────────────────────────────────────
-        // The [COMPUTED] tag stood here; the subtitle now carries the same warning in words.
-
+        AddSpineTimeline(outer, primaryWorker);
         return outer;
     }
 
