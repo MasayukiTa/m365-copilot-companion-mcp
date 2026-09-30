@@ -1762,7 +1762,48 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
     _fv = fanout_family_view(_snap["workers"])
     for _w in _snap["workers"]:
         _w["fanout"] = _fv.get(_w["name"], {"kind": "solo", "campaign_id": _w.get("campaign_id", ""), "label": ""})
+    _attach_split_groups(_snap)
     return _snap
+
+
+#: Most split groups status.json carries. build_groups already clips every ledger string; this
+#: bounds the COUNT so a run with hundreds of campaigns cannot bloat the file the cockpit polls.
+_MAX_SPLIT_GROUPS = 50
+_MAX_CAMPAIGN_LEDGER_BYTES = 2_000_000
+
+
+def _campaign_lines():
+    """campaigns.jsonl lines from the active state dir; [] when absent, torn or too large."""
+    if not _ACTIVE_STATE_DIR:
+        return []
+    try:
+        path = os.path.join(_ACTIVE_STATE_DIR, "campaigns.jsonl")
+        if os.path.getsize(path) > _MAX_CAMPAIGN_LEDGER_BYTES:
+            return []
+        with open(path, encoding="utf-8-sig") as f:
+            return f.read().splitlines()
+    except Exception:
+        return []
+
+
+def _attach_split_groups(snap):
+    """Add the owner-facing split-group ledger to `snap`, DERIVED READ-ONLY from its workers.
+
+    `groups` is relay.family_view.build_groups over the workers already in the snapshot, and each
+    fan-out parent's row gains a separate `display_state` key (annotate_display_state returns
+    copies and never touches status / outcome / pill, which the cockpit and the reaper read).
+    ANY failure only omits the additions: the snapshot is the liveness signal of the whole
+    fleet and must never be lost to a display feature.
+    """
+    try:
+        from relay import family_view as _fvw
+        lines = _campaign_lines()
+        groups = _fvw.build_groups(snap["workers"], lines)[:_MAX_SPLIT_GROUPS]
+        annotated = _fvw.annotate_display_state(snap["workers"], lines)
+        snap["groups"] = groups
+        snap["workers"] = annotated
+    except Exception:
+        snap.pop("groups", None)
 
 
 #: How long to keep trying to replace a status file a reader is holding open. The cockpit
