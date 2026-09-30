@@ -44,6 +44,23 @@ def read_marker(state_dir: str):
         return None
 
 
+def read_resume_source(state_dir: str):
+    """(marker, snapshot_path) -- the live marker if there is one, else the marker COPY the
+    reaper kept in the newest pending `.fleet/interrupted/<run_id>.json` (the reaper deletes
+    the live marker once it has marked the run interrupted). (None, None) when neither."""
+    marker = read_marker(state_dir)
+    if marker:
+        return marker, None
+    from relay.fleet_reaper import read_interrupted_snapshot
+    found = read_interrupted_snapshot(state_dir)
+    if found:
+        data, path = found
+        copy = data.get("marker")
+        if isinstance(copy, dict) and copy.get("pid"):
+            return copy, path
+    return None, None
+
+
 def pid_alive(pid) -> bool:
     """Is that process still running?
 
@@ -81,7 +98,7 @@ def main(argv=None) -> int:
                     help="relaunch it (default: report what would happen)")
     args = ap.parse_args(sys.argv[1:] if argv is None else argv)
 
-    marker = read_marker(args.state_dir)
+    marker, snapshot_path = read_resume_source(args.state_dir)
     if not marker:
         print("no interrupted fleet run (no active-run marker).")
         return 0
@@ -110,6 +127,9 @@ def main(argv=None) -> int:
     except Exception as exc:
         print("could not relaunch: %s: %s" % (type(exc).__name__, exc))
         return 1
+    if snapshot_path:
+        from relay.fleet_reaper import mark_snapshot_state
+        mark_snapshot_state(snapshot_path, "resumed")
     print("relaunched. It reconstructs the unfinished goals from the ledger.")
     return 0
 

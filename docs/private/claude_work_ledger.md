@@ -84,3 +84,52 @@ Under `%USERPROFILE%\.claude\tools\<tool>\README.md`:
 - Only 1 row so far, because only one worker has started since the merge; in-run evaluation rows will accumulate with turns.
 - Next: after a few days of data, run scripts/effort_policy_replay.py on the live ledger and decide whether to set effort_policy=on (initial assignment for fan-out children).
 - Open items: first shadow row confirmation is done. Hidden-tool and disk items unchanged.
+
+## 2026-09-30 - interrupted-run reap incident and resume design
+
+- Incident: at 18:14:34 the fleet coordinator (pid 21520) crashed natively (sqlite3.dll 0xC0000006 on sessions.sqlite3-shm) while C: was full (0.2 GB free at 18:06). At 18:16:48 the supervisor's reaper marked every non-closed worker cancelled, including five healthy fan-out children; the fan-out parent had already ended done/FANOUT.
+- Finding: the reaper's liveness check was correct. The misjudgement is what it writes: `cancelled` (terminal, reads as a user stop) instead of a resumable state, it also rewrites unclosed done workers, and it deletes fleet_run_active.json, the only input of the resume path, while auto-resume only runs at supervisor start.
+- Design doc: docs/private/20260930_fleet_interrupted_resume_design.md (status `interrupted`, snapshot in .fleet/interrupted/, exactly-once merge via campaign id, free-space ring log, pre-resume crash gate, fan-out display state; no code changed).
+- Owner's rule, restated: the disk floor (disk_floor_gb) is the owner's own setting. The assistant never changes it or its default; the design only reads and reports it and is independent of its value.
+
+## 2026-09-30 - remote grading adapter and host probe
+
+- Probed the remote grading host read-only over ssh: reachable non-interactively; memory and disk healthy (49.8 GB RAM free, 235.5 GB free on C:), but the grading WSL distro is Stopped and the dockerd task (SweDockerd) has been idle since 2026-09-15 with last result 1, so nothing can be graded until the owner starts it. Nothing on the host was started, changed or deleted.
+- Added bench/remote_grade.py (one instance + one patch file -> structured result, infra vs graded-fail, injectable transport, CLI) and bench/test_remote_grade.py (20 tests, registered in ci.yml). bench/swe_check.py is untouched.
+- Known-answer validation (gold resolves, empty patch rejected) NOT run: blocked by the stopped distro. Cached image list and swebench version are unknown for the same reason. grade.py is Lite-only, which limits the pilot to ids that are in Lite.
+- Details and tags in docs/private/20260930_effort_bench_design.md, section "Remote grading: measured".
+
+## 2026-09-30 - owner-facing prompt and family view design
+
+- Design doc: docs/private/20260930_family_view_design.md (design only, no product code changed).
+- Measured: over 313 sampled transcripts the first prompt contains the goal in all; of 1102 later user prompts 33% carry the whole goal, 44% only the 160-char `_task_anchor` line, 23% neither. 2096 of 2124 transcript files are gzipped and the cockpit has no gzip reader. FleetCockpit.cs never reads the `fanout`/`campaign_id`/`role`/`subtask_index` row fields. `_final_worker_entry` does not copy `subtask_index`. history.json rows carry no family keys.
+- Decisions: refs and hashes only in status.json (first_prompt, latest_prompt, prompt_goal_intact, family_role, scope, family_members, family); pure module relay/family_view.py; UI in a WPF-free ui/FamilyView.cs extending the STAB-002 Content details, plus a Prompt tab. Overlap warning only for path-shaped scopes, labelled as claimed.
+- Scanned for existing work (live tree, incl. untracked/ignored): relay/, ui/, tools/, docs/ (tracked and docs/private, docs/research read-only), .fleet small files and campaigns.jsonl/transcripts/status.json/history.json, reviews/. Only relay/fanout.py:754 family markers and relay/test_fanout_family_view.py existed.
+
+
+## 2026-09-30 - common audit / lane policy / credential placeholder / exec pinning design
+
+- Design doc only: docs/private/20260930_common_audit_and_policy_design.md (no product code changed). Ideas from a read-only study of a public sandbox runtime; nothing copied.
+- Measured on this machine (100 runs each): tool_ledger append p50 11.2 ms / p95 13.9 ms, of which redact_secrets p50 8.7 ms (it re-reads .env and re-decrypts DPAPI per call); bare open-append-close p50 1.1 ms; msedge.exe (5.2 MB stub) SHA256 180 ms cold / 17 ms warm; Get-AuthenticodeSignature 221 ms in-process, 510 ms via a fresh powershell.
+- Findings: .fleet/gate_audit.jsonl has no writer (last row 2026-08-31); decision ledgers other than tool_ledger write free text unredacted; sanitized_child_env already strips secrets from run_python/shell children; PyYAML is in requirements but tomllib is absent (Python 3.10.0); decision volume about 1,000 events/day.
+- Friction budget: zero new prompts in any mode, <= 2 ms p50 added per audited action, 4 MiB fixed ring, enforcement off/shadow by default, promotion bar of at most 3 false would_deny per lane per day over 14 days. No disk-floor value read for or proposed by the design.
+## 2026-09-30 - continuation prompts keep the whole goal; goal-fidelity analyzers
+
+- Root cause from three trip-run transcripts: RelayWorker._task_anchor restated only the first 160 characters of the goal on every continuation turn, so a hard constraint after character 200 vanished from turn 3 on; one worker then told the reviewer the constraint was not in the original text (a false claim). An unlock/recovery payload with an empty goal section also replaced the whole task for several turns and, delivered as a follow-up, became a worker's goal (seeding a recycle prompt's goal).
+- Fix on branch fix/continuation-keeps-the-goal-20260930: anchor restates the whole goal (6000-char cap, head and tail kept, cut marked), neutral wording unless the worker has checks, every continuation type anchored; recovery payloads get the goal back; recycle/replay raise EmptyGoalError instead of building with no goal; theme_from_goal no longer splits dates at the slash.
+- Tests: relay/test_continuation_keeps_the_goal.py (28), relay/test_theme_from_goal_dates.py (4), scripts/test_goal_fidelity_report.py (13), all registered in ci.yml. Mutation check on a copy: 11 of 11 mutants killed. Full relay suite: 3982 passed; the 2 non-passing (test_repo_bug_fix_skill goal-builder test, test_gateway_executes) need a gitignored slice file / MCP_API_KEY absent from a fresh worktree.
+- scripts/goal_fidelity_report.py: constraint-drift score and false-denial detector, read-only over transcripts. Baseline over r6abc7f6c_a0, r6abcd114_a0, r6abcdb87_a0 (26 transcripts, 83 assistant turns): drift 5/57 (0.088) with heuristic tokens, 8/57 (0.140) with explicit --must tokens; false denials 1, true 0.
+- Design and planned before/after experiment: docs/private/20260930_goal_fidelity_design.md. Not merged into the live tree's branch.
+
+## 2026-09-30 - reap marks an unfinished run interrupted, not cancelled
+
+- Incident: coordinator pid 21520 died natively with the disk full; the supervisor reaper then rewrote every non-closed worker to `cancelled`, including healthy children, and deleted fleet_run_active.json (the only resume input).
+- Fix (branch fix/reap-marks-interrupted-20260930, phase 1 of docs/private/20260930_fleet_interrupted_resume_design.md): relay/fleet_reaper.py marks only unfinished workers `interrupted` (outcome INTERRUPTED, pill 中断, color warn, reason "coordinator died: pid N is gone; last coordinator log write T", resumable, closed unchanged), leaves done/terminal workers byte-identical (done-but-not-closed included), `cancelled` only when an unconsumed `stop` command exists, done_count counts finished workers only. Snapshot `.fleet/interrupted/<run_id>.json` (marker copy, worker states, campaign plan from campaigns.jsonl, death evidence) is written atomically first; if that write fails nothing else is touched. Found and fixed on the way: the reaper's TERMINAL_STATUSES lacked `content_refused`.
+- Vocabulary: relay/outcomes.py (STATUS_OF, NON_RETRYABLE, not FINISHED, SCORING fail, EXCLUDED_WITHOUT_WORK), relay_fleet.py label map (TERMINAL deliberately unchanged), fleet_runner.py pill map, task_router.py comment, ui/FleetCockpit.cs (IsInterruptedWorker, StatusLabel, auto-archive not blocked, counters/header, timeline, card tooltip), ui/Theme.cs (warning kind, ja/en labels). scripts/win/resume_interrupted_fleet.py reads the snapshot's marker copy.
+- Tests: tests/test_reaper_marks_interrupted.py (17), tests/test_interrupted_status_is_classified_everywhere.py (6), retention pin in relay/test_fleet_retention.py, mirror test in tests/test_retry_sets_agree.py, outcome walker extended to `["outcome"] = ...` sidecar writes. Mutation checks on the worktree (5 of 5 killed): marking done workers, writing cancelled, retention including the dir, no snapshot, C# auto-archive block. Full cockpit compiled with csc in a temp dir (exit 0); rebuild_ui.ps1 not run. Deployment order: rebuild the cockpit before the supervisor pulls this reaper (an old cockpit paints an unknown status raw and stalls auto-archive).
+
+## 2026-09-30 - continuation anchor is a compact ledger, not the whole goal
+
+- The owner rejected PR #80's design of restating the whole goal (cap 6000 characters) in every continuation prompt: the context is small and long text every turn is wasteful.
+- Replaced on branch fix/continuation-compact-ledger-20260930: the first message keeps the full goal; later prompts carry a deterministic ledger of at most 1000 characters (LEDGER_MAX_CHARS, relay/relay_fleet.py): task line, fixed-constraint sentences, fan-out scope block, pointer to the first message. Empty-goal guards, neutral wording and the theme_from_goal date fix are unchanged.
+- Design and limits (extraction is a heuristic): docs/private/20260930_goal_fidelity_design.md.
