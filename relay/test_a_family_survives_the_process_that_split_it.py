@@ -93,9 +93,9 @@ def test_the_merged_note_is_carried_across_the_header(tmp_path):
 def test_the_merge_writes_that_note():
     src = open(os.path.join(REPO, "relay", "relay_fleet.py"), encoding="utf-8").read()
     i = src.index('_camp["merged"] = True')
-    assert "_note_merged(_cid)" in src[i:i + 200], (
+    assert "_note_merged(_cid" in src[i:i + 200], (
         "統合してもその事実が台帳に残らない -- 再起動のたびに同じ統合が積まれる")
-    j = src.index("def _note_merged(cid):")
+    j = src.index("def _note_merged(cid")
     assert '"kind": "merged"' in src[j:j + 1400]
 
 

@@ -192,6 +192,7 @@ jobs:
             relay/test_fleet_handoff.py \
             relay/test_priority_survives_every_delivery_route.py \
             relay/test_fanout_family_view.py \
+            relay/test_family_view.py \
             relay/test_verification_survives_the_archive.py \
             relay/test_fleet_autostart.py \
             relay/test_refute_resend.py \
@@ -241,6 +242,7 @@ jobs:
             ui/test_the_chat_window_sends_what_was_typed.py \
             ui/test_both_windows_can_be_constructed.py \
             ui/test_a_submitted_task_is_on_top_at_once.py \
+            ui/test_the_effort_policy_says_what_is_in_effect.py \
             ui/test_content_details_spine.py \
             ui/test_submitted_history_reconciliation.py \
             ui/test_stale_submitted_tasks_are_observable.py \
@@ -547,8 +549,10 @@ jobs:
             relay/test_campaign_ledger.py \
             relay/test_effort_per_goal.py \
             relay/test_effort_policy.py \
+            relay/test_effort_shadow_reads_goal_record.py \
             relay/test_effort_policy_fanout.py \
             relay/test_effort_policy_setting.py \
+            relay/test_effort_policy_status.py \
             scripts/test_effort_policy_replay.py \
             relay/test_instruction_budget.py \
             tests/test_identity_guard_reports_every_hit.py \
@@ -568,6 +572,7 @@ jobs:
             tests/test_faulthandler_rotation.py \
             tests/test_verify_stack_interrupted.py \
             tests/test_resume_interrupted.py \
+            tests/test_fleet_resume_phase2.py \
             tests/test_a_matched_skill_is_checked_before_it_is_followed.py \
             tests/test_skill_match_japanese.py \
             tests/test_skills_business_draft.py \
