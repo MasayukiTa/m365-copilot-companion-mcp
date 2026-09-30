@@ -53,7 +53,7 @@ This section is updated immediately when the user interrupts ongoing work. It is
 1. ACTIVE -- STAB-002 latest UX requirement: the left 220px Spine must contain BOTH `内容詳細` and `実行タイムライン`. Keep the useful content-detail implementation; restore timeline in the same left frame using the historical/shared `phase_events` / `BuildTimelineEvents` contract. Expanded-card Timeline remains as detailed evidence.
 2. CLOSED -- STAB-004: the 240s blind-wait defect is repaired to consult meaningful-idle at 90s, but 90s is only an intermediate ceiling. User requirement is to minimize waiting as far as safely possible. Measure what `generation_idle_s` actually means, distinguish healthy long computation from transport silence, then drive the safe recovery latency down to the smallest evidence-supported value without causing false reconnects or duplicate work.
 3. ACTIVE -- STAB-003 foreground console regression: user reconfirmed shell/cmd still appears in foreground during CopilotAgent open/submit. Reproduce with process-tree/window-owner capture and remove the remaining visible-console spawn path; static `CreateNoWindow` evidence is not sufficient.
-4. ACTIVE -- unlock false-positive investigation: recent transcripts repeatedly contain responses equivalent to `no tool was executed, therefore unlock is unnecessary`; Fleet then sees unlock/lock marker words and promotes the response into lock suspicion / intervention. Distinguish an explicit `unlock not required` / read-only/no-tool response from an actual write/tool lock refusal before escalating to unlock probe or needs-attention.
+4. CLOSED / REAL-TRANSCRIPT REPLAY + WORKER-LEVEL VERIFIED (2026-10-01 08:xx JST) -- unlock false-positive investigation: explicit `unlock not required` / read-only responses are now negative lock evidence for the ambiguous paraphrase/fallback/probe paths. Literal server lock markers and exclusive server-attribution remain authoritative and still recover through unlock.
 5. INTEGRATION -- after the active items above are green, commit/push them on PR #67, verify current-head checks, merge to `main`, verify post-merge main, then reconcile superseded old branches/PRs.
 
 Resume rule: after any newly injected user instruction is handled, return automatically to the first still-ACTIVE item above. Do not wait for another user prompt.
@@ -368,3 +368,22 @@ Measured ordering:
 - the run identity (`started=1790777264.61075`) remained the same, status reached `total=2, queued=0`, and B became real worker `w1` (observed `refuting`, turn 1).
 
 This directly disproves the old blocking behavior for the repaired path: the expensive Playwright/CDP capture can be in flight while the single Fleet sweep continues consuming and acknowledging live commands. Together with the exact-goal/ack/history durability fixes and the `startButton` AutomationId repair, STAB-005 is CLOSED. Reopen only on new live evidence of a command/status stall during async capture or a visible GUI submission that fails reconciliation.
+
+### 2026-10-01 08:xx JST unlock/no-tool false-positive closure
+
+The remaining resume-queue P0 around unlock semantics was reproduced directly. Before the repair, the real historical reply `unlockは予定の読み取りに不要なため実行していません。DONE` classified as locked whenever an unrelated fresh refusal record existed in the global window. A long security-review reply that merely quoted `[locked: no valid unlock token]` while explicitly saying the current read-only task required no unlock also entered the lock-probe path.
+
+Repair in `relay/relay_fleet.py`:
+- add `_explicit_unlock_not_required()` with narrow English/Japanese semantic patterns for `unlock/解錠/ロック解除` + `not required / not needed / unnecessary / 不要 / 必要ない`;
+- do **not** treat `did not execute unlock` alone as negative evidence, because a genuinely blocked worker says that when password/tool access is unavailable;
+- contradictory prose fails closed when a separate positive `unlock is required` statement exists;
+- literal short server lock markers and exclusive server refusal attribution are evaluated before the negative-prose guard and therefore remain authoritative;
+- the guard suppresses only ambiguous paraphrase/fallback classification and long-marker probe escalation.
+
+Validation:
+- new replay + worker-level regression: **18 passed**, including exact read-only/calendar wording preserved in the research transcript corpus;
+- existing lock evidence / long-marker probe / session attribution / unlock injection / recovery set: **92 passed**;
+- real lock paraphrase, literal `[locked ...]`, and failure-to-unlock cases remain classified as locked;
+- `git diff --check`: clean.
+
+This item is CLOSED. Reopen only if a reply that explicitly says unlock is unnecessary still enters unlock probe/injection, or if a real lock refusal is newly suppressed. The next unresolved P0 in this ledger is STAB-006's missing retained yellow-state sample during a natural planned server restart.

@@ -1124,8 +1124,59 @@ _LOCK_PARAPHRASES = (
 )
 
 
+_UNLOCK_NOT_REQUIRED_RE = (
+    # English: keep this meaning-specific. Merely saying "did not execute unlock" is NOT enough
+    # because a genuinely blocked worker says that when the password/tool is unavailable.
+    re.compile(r"\bno\s+unlock\s+(?:is\s+)?(?:required|needed)\b", re.I),
+    re.compile(r"\bunlock\b.{0,60}\b(?:is\s+|was\s+)?(?:not\s+required|not\s+needed|unnecessary|unneeded)\b", re.I),
+    # Japanese, including the real calendar/read-only replies preserved in the research corpus.
+    re.compile(r"(?:unlock|解錠|ロック解除).{0,80}?(?:不要|必要(?:は|が)?(?:ない|ありません)|要りません)", re.I),
+    re.compile(r"(?:不要|必要(?:は|が)?(?:ない|ありません)|要りません).{0,80}?(?:unlock|解錠|ロック解除)", re.I),
+)
+
+# Contradictory prose fails closed. These are deliberately narrower than the negative patterns;
+# their job is only to stop a sentence that ALSO says a real unlock is required from being
+# suppressed by an earlier "not required" quote/example.
+_UNLOCK_REQUIRED_RE = (
+    re.compile(r"\b(?:requires?|need(?:s)?|must|have\s+to)\s+(?:an?\s+|to\s+)?unlock\b", re.I),
+    re.compile(r"\bunlock\b.{0,30}\b(?:is|was)\s+(?!not\b)(?:required|needed)\b", re.I),
+    re.compile(r"(?:unlock|解錠|ロック解除).{0,30}?(?:が必要|は必要|必要です|必要とな)", re.I),
+)
+
+
+def _explicit_unlock_not_required(resp: str) -> bool:
+    """True only for an explicit semantic statement that unlock is unnecessary.
+
+    This is NEGATIVE lock evidence for the prose/fallback/probe paths.  It is intentionally not
+    a generic "no tool call" detector: "I did not execute unlock because the password is missing"
+    is a real blocked state and must still fail closed.  Likewise contradictory prose containing
+    a positive requirement wins.  The server's literal lock markers and exclusive attribution
+    are evaluated before this helper by `_looks_locked`, so they can never be hidden by prose.
+    """
+    text = resp or ""
+    negative = [m for rx in _UNLOCK_NOT_REQUIRED_RE for m in rx.finditer(text)]
+    if not negative:
+        return False
+
+    # "No unlock is required" and 「ロック解除は必要ありません」 necessarily contain the
+    # lexical positive fragments "unlock is required" / 「は必要」. Those are not
+    # contradictions; they are part of the negative phrase. Only a SEPARATE positive requirement
+    # elsewhere in the reply defeats the guard.
+    def overlaps_negative(match):
+        a, b = match.span()
+        return any(a < nb and b > na for na, nb in (n.span() for n in negative))
+
+    for rx in _UNLOCK_REQUIRED_RE:
+        for match in rx.finditer(text):
+            if not overlaps_negative(match):
+                return False
+    return True
+
+
 def _mentions_being_locked(resp: str) -> bool:
-    """Does this reply talk about being refused for lock, in any wording at all."""
+    """Does this reply affirmatively talk about being refused for lock, in any wording at all."""
+    if _explicit_unlock_not_required(resp):
+        return False
     low = (resp or "").lower()
     return any(p.lower() in low for p in _LOCK_PARAPHRASES)
 
@@ -1284,7 +1335,15 @@ def _looks_locked(resp: str, since: float = 0.0, worker: str = "") -> bool:
         hit = len(resp or "") < LOCKED_DOMINANCE_MAX_CHARS
         if hit:
             _note_locked("marker", resp, since, None)
-        return hit
+            return True
+        # A long marker is only quoted/prose evidence.  If that same prose explicitly says the
+        # current task does not require unlock, do not let a concurrent refusal turn the quote
+        # into a lock classification; `_looks_locked_ambiguous` applies the same rule to probes.
+        if _explicit_unlock_not_required(resp):
+            return False
+
+    if _explicit_unlock_not_required(resp):
+        return False
 
     # The marker rule only fires while the agent pastes the tool error back
     # verbatim. It often does not: the operator discipline injected into every
@@ -1485,6 +1544,8 @@ def _looks_locked_ambiguous(resp: str) -> bool:
     function is the trigger for the PROBE path in _decide: instead of guessing from length,
     ask the worker whether that reply really was a lock refusal.
     """
+    if _explicit_unlock_not_required(resp):
+        return False
     low = (resp or "").lower()
     return (any(m in low for m in LOCKED_MARKERS)
             and len(resp or "") >= LOCKED_DOMINANCE_MAX_CHARS)
