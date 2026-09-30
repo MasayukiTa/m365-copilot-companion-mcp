@@ -191,7 +191,7 @@ Acceptance:
 - closing-run and durable-runtime paths are included in live validation.
 
 ### STAB-006 -- server health red/yellow behavior must be truthful
-Status: PARTIALLY FIXED / LIVE RE-VERIFY
+Status: OWNER-BOUND / LIVE PLANNED-RESTART LIFECYCLE VERIFIED; YELLOW SAMPLE STILL PENDING
 
 Relevant current branch work:
 - `7d59d47` planned server restart distinction;
@@ -204,6 +204,16 @@ Acceptance:
 - planned restart renders the intended transitional/yellow state rather than false red;
 - real server failure cannot be masked indefinitely by a stale marker;
 - marker path/expiry/ownership are visible in evidence.
+
+2026-10-01 continuation evidence / hardening:
+- a real supervisor-owned planned restart occurred at 07:42:16-07:42:19 JST: the supervisor logged `server is running stale code and nothing is in flight -- cycling it`, then `previous server pid=9304 ... planned: stale code cycle`, then launched the replacement; current `/health` reports `server_code=current`, `server_pid=23792`, `server_head=2dc86ba28fe4`, and `auth_fail_10m=0`;
+- Fleet was not running during this verification, so no user task was interrupted;
+- the normal transition budget is 240s (`StartupGraceSeconds=180` + `FailuresBeforeAction=4` * `IntervalSeconds=15`) with a 600s hard corruption/staleness cap on the reader;
+- remaining defect found: the marker contained `supervisor_pid` but the Cockpit did not validate it, so a dead supervisor could leave a real outage yellow until expiry and PID reuse could falsely preserve ownership;
+- repair: new markers also publish `supervisor_started` from the supervisor process birth. `ReadPlannedServerTransition()` now requires both PID and birth, verifies the live Windows process, and fails closed to no planned transition on missing/dead/reused/mismatched ownership;
+- focused transition tests: 6 passed; health/Cockpit related set: 24 passed; PowerShell parser: 0 errors; FleetCockpit/CopilotChat rebuild: success; `git diff --check`: clean.
+
+Do not call STAB-006 fully CLOSED yet: the 07:42 replacement gap was about 3s while the ordinary Cockpit health cadence is 15s, so that real planned restart did not leave a retained sample proving the visible dot became yellow. The lifecycle/ownership/expiry contract is now evidenced; one future natural planned restart sampled by the Cockpit (or equivalent exact health-poll execution) remains the last visual acceptance item. Do not manufacture a long production outage merely to make a 15s poll catch it.
 
 ### STAB-007 -- finish current resend-policy work without losing the branch state
 Status: VALIDATED / COMMITTED / PUSHED (`cca3295`)
@@ -234,6 +244,12 @@ For the current follow-up branch, re-check all relevant GitHub runs after each a
 
 2026-09-30 pre-STAB-002 head `c2f2416`: PR #67 was CLEAN/MERGEABLE and CI, Windows build, Install path, CodeQL (Python + C#), Secret scan, PowerShell lint and Workflow lint were all SUCCESS. The STAB-002 patch below creates a new head and therefore requires a fresh check after push.
 2026-09-30 latest `main` head `38f4f77`: CI, Windows install smoke, CodeQL, Secret scan, PowerShell lint and Workflow lint completed **SUCCESS**. The latest historical main CI failure (`75c157d`, run 36670394581) was isolated to `test_ten_clicks_200ms_apart_start_one_bringup`: all functional invariants passed (`bringups=1`, nine losers / foreground requests, no leftovers) and only one hosted-Windows leaver measured **5.08s** against the 5.0s hard tail bound. The same Windows-only suite passed on later main runs including `38f4f77`, so no product/threshold change was made from that single 80ms tail; monitor for recurrence rather than weakening the gate pre-emptively.
+
+
+2026-10-01 current-head CI checkpoint:
+- current `main` heads through PR #90 are green for CI, CodeQL, Secret scan, Windows build, Workflow lint, and the other corresponding workflows reported by GitHub; no present main regression was reproduced;
+- PR #78 / branch head `e71a805` completed CI, Windows build, install path, CodeQL, Secret scan, PowerShell lint and Workflow lint successfully;
+- local branch then merged newer `origin/main` as `2dc86ba` and is ahead of its remote branch, so this new STAB-006 commit must be pushed and the checks re-read on the resulting current head before integration.
 
 ## P1 -- follow-up after P0 stability
 
