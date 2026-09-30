@@ -278,6 +278,11 @@ class LocalJobStore:
             job, turn = self._job_and_turn(conn, job_id)
             if job["status"] in TERMINAL_JOB_STATUSES:
                 raise JobStoreError("JOB_TERMINAL", f"job status is {job['status']}")
+            if job["status"] in {"WAITING_USER", "WAITING_EXTERNAL", "NEEDS_ROUTING"}:
+                raise JobStoreError(
+                    "JOB_OPERATOR_WAIT",
+                    f"job status {job['status']} needs its dedicated interaction/resume path",
+                )
             data = json.loads(job["job_json"])
             constraints = data.get("constraints") if isinstance(data.get("constraints"), dict) else {}
             limit = int(constraints.get("max_claim_bytes", 8192))
