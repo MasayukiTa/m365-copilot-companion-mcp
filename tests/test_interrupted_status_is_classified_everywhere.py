@@ -91,3 +91,33 @@ def test_cockpit_sites_that_count_or_block_know_about_interrupted():
     # AutoRetryScan only looks at terminal workers, and retry is by outcome: both exclude it
     k = src.index("void AutoRetryScan")
     assert "if (!IsTerminalWorker(w)) continue;" in src[k:k + 600]
+
+
+def test_cockpit_has_an_interrupted_filter_chip_and_its_own_counter():
+    src = _strip_comments(_read("ui/FleetCockpit.cs"))
+    assert 'if (IsInterruptedWorker(w)) intN++;' in src
+    assert 'if (_cardFilter == 4 && !IsInterruptedWorker(w)) continue;' in src
+    assert 'SegFilterButton(T("flt_intr") + " " + cntIntr, 4' in src
+    assert 'if (k == "flt_intr")' in src
+    # the interrupted tally is not the failure tally
+    i = src.index('else if (oc == "STUCK" || oc == "ERROR"')
+    assert "INTERRUPTED" not in src[i:i + 200]
+
+
+def test_cockpit_shows_the_split_group_line_and_parent_display_label():
+    src = _strip_comments(_read("ui/FleetCockpit.cs"))
+    # the parent chip uses the derived label; real status/outcome stay untouched
+    assert 'S(w, "display_label")' in src and 'S(w, "display_state")' in src
+    assert 'parentLabel.Length > 0 ? parentLabel : Theme.StatusLabel(status, _lang)' in src
+    # the one-line group summary: reads the `groups` the coordinator writes, plain wording
+    assert '"groups"' in src and 'Obj(g, "ledger")' in src and 'Obj(g, "children")' in src
+    assert '"分割グループ 子"' in src and '" / 統合: "' in src
+    # never the long goal: the group line reads only the capped ledger keys, not a goal field
+    j = src.index("UIElement BuildGroupLine")
+    body = src[j:src.index("Border Card(Dictionary", j)]
+    assert 'S(w, "goal")' not in body and 'S(g, "goal")' not in body
+    assert 'S(led, "task")' in body and '"constraints"' in body and '"tokens"' in body
+    # the derived strings the UI relies on exist on the Python side of the contract
+    from relay import family_view
+    for k in ("children_total", "merge_label", "display_label", "tokens"):
+        assert k in family_view.__doc__

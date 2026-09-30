@@ -149,3 +149,6 @@ Under `%USERPROFILE%\.claude\tools\<tool>\README.md`:
 
 ## 2026-10-01 family view production caller (PR #87)
 - relay/fleet_runner.py `_snapshot` now calls `_attach_split_groups`: adds `groups` (family_view.build_groups, max 50) and a per-parent `display_state` key (annotate_display_state copies; status/outcome/pill untouched); any exception only omits the additions. Added `python -m relay.family_view [--fleet-dir DIR]` (main()). Fixes tools/test_nothing_new_is_built_without_a_caller.py without touching any allowlist.
+
+## 2026-10-01 cockpit: split group line + interrupted filter (C# side)
+- ui/FleetCockpit.cs only (no new .cs file, build list unchanged): fan-out parent chip shows display_label (kind by display_state), a one-line group summary (children counts, merge label, up to 4 token chips, tooltip = capped ledger only, never the goal) read from status.json groups; Interrupted filter tab (filter 4, shown only while one is on the board) with its own counter intN, not in badN. Phase-1 items already present were left alone. Tests appended to tests/test_interrupted_status_is_classified_everywhere.py. Compiled with bench/ui_build_check.build into a temp dir.

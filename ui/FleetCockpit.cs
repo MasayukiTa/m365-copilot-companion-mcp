@@ -1468,6 +1468,7 @@ class CockpitWindow : Window
         if (k == "flt_active") return ja ? "実行中" : "Active";
         if (k == "flt_needs") return ja ? "承認待ち" : "Needs input";
         if (k == "flt_done") return ja ? "完了" : "Done";
+        if (k == "flt_intr") return ja ? "中断" : "Interrupted";
         // legacy key kept for safety (no longer rendered)
         // Feature C: retry
         if (k == "retry") return ja ? "再試行" : "Retry";
@@ -11724,7 +11725,7 @@ class CockpitWindow : Window
         string g = (_dark ? "D" : "L") + _lang.ToString();
         string sig = "T|" + g + "|" + _toolbarShown.Count + "/" + _toolbarAll.Count
                      + "|all" + tc[0] + ":act" + tc[1] + ":need" + tc[2] + ":done" + tc[3]
-                     + ":max" + tc[5] + ":bad" + tc[6] + ":hid" + tc[7]
+                     + ":max" + tc[5] + ":bad" + tc[6] + ":hid" + tc[7] + ":int" + tc[8]
                      + "|ar" + (_autoRetry ? 1 : 0) + ":" + _autoRetryMax + "|f" + _cardFilter;
         _pinnedToolbarHost.Visibility = Visibility.Visible;
         if (sig == _pinnedToolbarSig && _pinnedToolbarHost.Child != null) return;   // unchanged -> keep as-is
@@ -11765,6 +11766,8 @@ class CockpitWindow : Window
             if (_cardFilter == 2 && st != "awaiting") continue;
             // Tab 3 = Done: outcome == DONE
             if (_cardFilter == 3 && oc != "DONE") continue;
+            // Tab 4 = Interrupted (coordinator died, resumable); the tab only exists while one is on the board
+            if (_cardFilter == 4 && !IsInterruptedWorker(w)) continue;
             shown.Add(w);
         }
         // THE LIST'S ORDER, decided in one place (SubmittedTasks.Compose, executed by
@@ -11992,7 +11995,7 @@ class CockpitWindow : Window
                 int[] tc0 = ToolbarCounts(_toolbarAll);
                 return "T|" + g + "|" + _toolbarShown.Count + "/" + _toolbarAll.Count
                        + "|all" + tc0[0] + ":act" + tc0[1] + ":need" + tc0[2] + ":done" + tc0[3]
-                       + ":max" + tc0[5] + ":bad" + tc0[6] + ":hid" + tc0[7]
+                       + ":max" + tc0[5] + ":bad" + tc0[6] + ":hid" + tc0[7] + ":int" + tc0[8]
                        + "|ar" + (_autoRetry ? 1 : 0) + ":" + _autoRetryMax + "|f" + _cardFilter;
             case 2: return "HH|" + g;                          // history header (static chrome; search box preserved across renders)
             case 7:                                            // date-group subheader: keyed on its label
@@ -12067,6 +12070,7 @@ class CockpitWindow : Window
                 bool hasDraft = _steerDraft.TryGetValue(nm, out draftSt) && !string.IsNullOrEmpty(draftSt);
                 bool hasFocus = _steerFocusWorker == nm;
                 sb.Append('|').Append(hasDraft ? "d1" : "d0").Append(hasFocus ? "f1" : "f0");
+                sb.Append("|grp:").Append(StableShortHash(GroupLineText(w) + "|" + S(w, "display_label")));
                 return sb.ToString();
         }
     }
@@ -12492,7 +12496,7 @@ class CockpitWindow : Window
     int[] ToolbarCounts(List<Dictionary<string, object>> all)
     {
         int cntAll = 0, cntActive = 0, cntNeeds = 0, cntDone = 0;
-        int doneN = 0, maxN = 0, badN = 0, hiddenTerminal = 0;
+        int doneN = 0, maxN = 0, badN = 0, hiddenTerminal = 0, intN = 0;
         string startedRootTb = _lastRoot != null ? S(_lastRoot, "started") : "";
         if (all != null)
         {
@@ -12515,10 +12519,11 @@ class CockpitWindow : Window
                 else if (oc == "STUCK" || oc == "ERROR" || oc == "CANCELLED"
                          || oc == "EVIDENCE_CONTRADICTED") badN++;
                 if (st == "awaiting") cntNeeds++;
+                if (IsInterruptedWorker(w)) intN++;   // own counter: resumable, not a failure of the goal
                 if (!IsTerminalWorker(w) && !IsInterruptedWorker(w) && st != "pending") cntActive++;
             }
         }
-        return new int[] { cntAll, cntActive, cntNeeds, cntDone, doneN, maxN, badN, hiddenTerminal };
+        return new int[] { cntAll, cntActive, cntNeeds, cntDone, doneN, maxN, badN, hiddenTerminal, intN };
     }
 
     UIElement BuildCardToolbar(List<Dictionary<string, object>> all,
@@ -12532,7 +12537,7 @@ class CockpitWindow : Window
         // the render and RowSig can never diverge.
         int[] tc = ToolbarCounts(all);
         int cntAll = tc[0], cntActive = tc[1], cntNeeds = tc[2], cntDone = tc[3];
-        int doneN = tc[4], maxN = tc[5], badN = tc[6];
+        int doneN = tc[4], maxN = tc[5], badN = tc[6], cntIntr = tc[8];
 
         var bar = new Border();
         bar.BorderThickness = new Thickness(1); bar.BorderBrush = Border;
@@ -12616,7 +12621,13 @@ class CockpitWindow : Window
         segRow.Children.Add(SegDivider());
         segRow.Children.Add(SegFilterButton(needsLabel, 2, true, cntNeeds, false, false));
         segRow.Children.Add(SegDivider());
-        segRow.Children.Add(SegFilterButton(doneLabel, 3, false, 0, false, true));
+        bool showIntr = cntIntr > 0 || _cardFilter == 4;
+        segRow.Children.Add(SegFilterButton(doneLabel, 3, false, 0, false, !showIntr));
+        if (showIntr)
+        {
+            segRow.Children.Add(SegDivider());
+            segRow.Children.Add(SegFilterButton(T("flt_intr") + " " + cntIntr, 4, false, 0, false, true));
+        }
 
         seg.Child = segRow;
         left.Children.Add(seg);
@@ -13220,6 +13231,90 @@ class CockpitWindow : Window
         catch (Exception) { ShowScaleToast(T("copy_result_fail")); }
     }
 
+    // ── Split group (分割グループ) line on a fan-out parent card ─────────────────────────────
+    // `groups` in status.json is written by relay/family_view.py (contract in its docstring).
+    // OWNER RULES: never the long goal text -- only the capped `ledger` strings it carries;
+    // plain Japanese wording; one small line, no popup, no toast. Read-only.
+    Dictionary<string, object> GroupOfParent(Dictionary<string, object> w)
+    {
+        if (w == null || _lastRoot == null) return null;
+        object go;
+        if (!_lastRoot.TryGetValue("groups", out go) || !(go is object[])) return null;
+        string nm = S(w, "name");
+        if (nm.Length == 0) return null;
+        foreach (object o in (object[])go)
+        {
+            var g = o as Dictionary<string, object>;
+            var par = g != null ? Obj(g, "parent") : null;
+            if (par != null && S(par, "name") == nm) return g;
+        }
+        return null;
+    }
+
+    static string GroupCount(Dictionary<string, object> ch, string key, string label)
+    {
+        int n = I(ch, key);
+        return n > 0 ? label + " " + n : "";
+    }
+
+    // One line: 分割グループ 子N件: 待機 a · 実行中 b · 完了 c · 失敗 d · 中断 e / 統合: <label>
+    string GroupLineText(Dictionary<string, object> w)
+    {
+        var g = GroupOfParent(w);
+        if (g == null) return "";
+        bool ja = _lang == 0;
+        var ch = Obj(g, "children") ?? new Dictionary<string, object>();
+        var parts = new List<string>();
+        string[] counts = {
+            GroupCount(ch, "queued", ja ? "待機" : "queued"),
+            GroupCount(ch, "running", ja ? "実行中" : "running"),
+            GroupCount(ch, "done", ja ? "完了" : "done"),
+            GroupCount(ch, "failed", ja ? "失敗" : "failed"),
+            GroupCount(ch, "interrupted", ja ? "中断" : "interrupted") };
+        foreach (string p in counts) if (p.Length > 0) parts.Add(p);
+        string head = (ja ? "分割グループ 子" : "Split group, ") + I(g, "children_total")
+                      + (ja ? "件" : " parts");
+        string body = parts.Count > 0 ? ": " + string.Join(" · ", parts.ToArray()) : "";
+        string ml = S(g, "merge_label");
+        return head + body + (ml.Length > 0 ? (ja ? " / 統合: " : " / merge: ") + ml : "");
+    }
+
+    UIElement BuildGroupLine(Dictionary<string, object> w)
+    {
+        string text = GroupLineText(w);
+        if (text.Length == 0) return null;
+        var g = GroupOfParent(w);
+        var row = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(24, 3, 0, 0) };
+        row.MouseLeftButtonUp += delegate (object s2, MouseButtonEventArgs e2) { e2.Handled = true; };
+        row.Children.Add(new TextBlock {
+            Text = text, Foreground = Muted, FontSize = 12,
+            VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis,
+            TextWrapping = TextWrapping.NoWrap, MaxWidth = 560 });
+        // Constraint tokens (dates, quoted names, amounts) from the capped ledger: small chips.
+        var led = Obj(g, "ledger");
+        int shown = 0;
+        var tip = new List<string>();
+        if (led != null)
+        {
+            if (S(led, "task").Length > 0) tip.Add(S(led, "task"));
+            object co, to;
+            if (led.TryGetValue("constraints", out co) && co is object[])
+                foreach (object c in (object[])co) tip.Add("- " + (c != null ? c.ToString() : ""));
+            if (led.TryGetValue("tokens", out to) && to is object[])
+                foreach (object t in (object[])to)
+                {
+                    string ts = t != null ? t.ToString() : "";
+                    if (ts.Length == 0 || shown >= 4) continue;
+                    var chip = Pill(ts, "neutral");
+                    chip.Margin = new Thickness(8, 0, 0, 0);
+                    row.Children.Add(chip);
+                    shown++;
+                }
+        }
+        if (tip.Count > 0) row.ToolTip = string.Join("\n", tip.ToArray());
+        return row;
+    }
+
     Border Card(Dictionary<string, object> w)
     {
         string name = S(w, "name");
@@ -13260,6 +13355,16 @@ class CockpitWindow : Window
         bool isDone = status == "done" || string.Equals(S(w, "outcome"), "DONE", StringComparison.OrdinalIgnoreCase);
         string chipKind = internalControl ? "neutral"
             : (isDone ? "success" : (isInfra ? "warning" : Theme.StatusKind(status)));
+        // Fan-out PARENT: its real status is done/FANOUT on purpose, which reads as "finished"
+        // while its children still run. The coordinator-side derived display_label (waiting etc.)
+        // replaces the chip text only; status/outcome are untouched.
+        string parentLabel = internalControl ? "" : S(w, "display_label");
+        if (parentLabel.Length > 0)
+        {
+            string pds = S(w, "display_state");
+            chipKind = pds == "merge_failed" ? "danger"
+                     : (pds == "interrupted" ? "warning" : (pds == "done" ? "success" : "info"));
+        }
 
         // Pass A2-1 TASK 1: demote the collapsed row to a LEDGER ROW.
         // - No rounded corners, no card background fill, no full border.
@@ -13383,7 +13488,7 @@ class CockpitWindow : Window
         var chip = Pill(internalControl
             ? (_lang == 0 ? "内部制御" : "Internal control")
             : (isAgentSetupWait ? (_lang == 0 ? "エージェント設定待ち" : "Agent setup required")
-                : (isInfra ? T("infra_wait") : Theme.StatusLabel(status, _lang))), chipKind);
+                : (isInfra ? T("infra_wait") : (parentLabel.Length > 0 ? parentLabel : Theme.StatusLabel(status, _lang)))), chipKind);
         chip.Margin = new Thickness(2, 0, 5, 0);
         if (status == "interrupted" && !string.IsNullOrEmpty(reason)) chip.ToolTip = reason;
         DockPanel.SetDock(chip, Dock.Left); left.Children.Add(chip);
@@ -13401,6 +13506,8 @@ class CockpitWindow : Window
         left.Children.Add(ht);
         Grid.SetColumn(left, 0); top.Children.Add(left);
         col.Children.Add(top);
+        UIElement groupLine = BuildGroupLine(w);
+        if (groupLine != null) col.Children.Add(groupLine);
 
         if (!isOpen)
         {
