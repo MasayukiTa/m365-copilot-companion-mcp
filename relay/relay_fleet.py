@@ -923,6 +923,61 @@ def is_recovery_payload(text: str) -> bool:
     return bool(text) and _UNLOCK_MARKER in text
 
 
+#: The heading UNLOCK_PREFIX / RECYCLE_PREFIX end with; what follows it must be the goal.
+GOAL_HEADING = "--- 元のゴール ---"
+
+#: How much of the goal a continuation prompt may restate. The whole goal, up to this cap.
+#: Measured need: real goals are 100-2,500 characters; a hard constraint can sit anywhere in
+#: them (2026-09-28..30 trip runs: after character 200 of ~550), so a fixed head slice is the
+#: defect, not a tuning knob. Past the cap the head and the tail survive (a fan-out child's
+#: scope block and a closing constraint both live at the end) and the cut is announced.
+ANCHOR_GOAL_CAP = 6000
+
+
+class EmptyGoalError(ValueError):
+    """A fresh-conversation prompt was about to be built with no goal in it."""
+
+
+def bounded_goal(goal: str, cap: int = ANCHOR_GOAL_CAP) -> str:
+    """The goal in full, or head + an explicit marker + tail when longer than `cap`."""
+    goal = str(goal or "")
+    if len(goal) <= cap:
+        return goal
+    head_n = (cap * 2) // 3
+    tail_n = cap - head_n
+    return "%s\n...(truncated %d chars)...\n%s" % (
+        goal[:head_n], len(goal) - cap, goal[len(goal) - tail_n:])
+
+
+def effective_goal(goal: str) -> str:
+    """The goal a prompt should restate. When `goal` is really a recovery payload (the
+    unlock text, or a follow-up wrapper around it, became the worker's goal), only what
+    follows the goal heading is the goal -- the password/instruction text never is."""
+    goal = str(goal or "")
+    if is_recovery_payload(goal):
+        if GOAL_HEADING in goal:
+            return goal.split(GOAL_HEADING, 1)[1].strip()
+        return ""
+    return goal
+
+
+def fill_recovery_goal(text: str, goal: str) -> str:
+    """Re-insert the goal into a recovery payload whose goal section is empty.
+
+    UNLOCK_PREFIX ends with the goal heading and the delivery channels (reunlock steer,
+    follow-up) send it bare, so the worker received a turn with no task in it."""
+    try:
+        if not is_recovery_payload(text) or GOAL_HEADING not in text:
+            return text
+        head, tail = text.split(GOAL_HEADING, 1)
+        goal = effective_goal(goal).strip()
+        if tail.strip() or not goal:
+            return text
+        return head + GOAL_HEADING + "\n" + bounded_goal(goal)
+    except Exception:
+        return text
+
+
 #: Honest replacement for "【ユーザーからの追加指示】" when what is being redelivered is
 #: _inject_unlock's own payload, not anything a person wrote. Says what is actually true --
 #: this machine's own recovery automation composed it -- instead of claiming user authorship.
@@ -3427,7 +3482,13 @@ class RelayWorker:
             return False
 
         # This is the same initial payload as the original non-plan review task.
-        self.job = self._replay_job()
+        try:
+            self.job = self._replay_job()
+        except EmptyGoalError as e:
+            # A fresh conversation with no goal in it would answer some other question.
+            self.status, self.outcome = "error", "ERROR"
+            self.reason = "fresh replay refused: %s" % (e,)
+            return False
         self.status = "ready"
         return True
 
@@ -3750,8 +3811,15 @@ class RelayWorker:
         against it. Same reasoning as _recycle_job's reset, below.
         """
         self._unlock_attempts = 0
+        goal = effective_goal(self.goal)
+        if not goal.strip():
+            raise EmptyGoalError("replay prompt would carry no goal")
+        # If the worker's goal is a recovery payload, its composition ends with that payload,
+        # not the goal: rebuild from the context prefix + the real goal.
+        body = (self._composed_prefix + goal if is_recovery_payload(self.goal)
+                else self._composed_goal)
         return (conversation_start_label(self.name + "-replay%d" % self.fresh_replay_count)
-                + PROTOCOL + self._composed_goal)
+                + PROTOCOL + body)
 
     #: How much of the previous conversation may travel. The recycle exists BECAUSE the last
     #: conversation ran out of context, so an expensive handover would recreate the condition
@@ -3848,6 +3916,9 @@ class RelayWorker:
         no longer a proactive attempt to count against it in the first place.
         """
         self._unlock_attempts = 0
+        goal = effective_goal(self.goal)
+        if not goal.strip():
+            raise EmptyGoalError("recycle prompt would carry no goal")
         head = PROTOCOL
         # The compaction note goes AFTER the goal, not before it: RECYCLE_PREFIX ends with a
         # heading that introduces the goal, and the invariant that the composition ends with
@@ -3855,7 +3926,7 @@ class RelayWorker:
         # keeps the goal intact and contiguous; the note is an addendum, which is also what
         # it is epistemically.
         return (conversation_start_label(self.name + "-recycle%d" % self._recycles)
-                + head + self._composed_prefix + RECYCLE_PREFIX + self.goal
+                + head + self._composed_prefix + RECYCLE_PREFIX + goal
                 + self._compaction_note())
 
     def goal_as_amended(self):
@@ -3887,23 +3958,41 @@ class RelayWorker:
         forget WHICH task it is on. We re-state cwd + a one-line goal summary every time.
         Uses only fields already on the worker (self.cwd, self.goal); never raises."""
         try:
-            anchor = ""
-            one = ""
-            for ln in (self.goal or "").splitlines():
-                ln = ln.strip()
-                if ln:
-                    one = ln[:160]
-                    break
+            # THE WHOLE GOAL, NOT ITS FIRST LINE. A 160-character head slice dropped a hard
+            # constraint that sat after character 200 and the worker answered another
+            # question from turn 3 on (see docs/private/20260930_goal_fidelity_design.md).
+            # A fan-out child's goal ends with its scope block, which the head/tail bound
+            # keeps. Wording follows the worker's own signal that it is a coding task: a
+            # verification card (self.checks). No wording heuristic.
+            one = bounded_goal(effective_goal(self.goal).strip())
             where = (self.cwd or "").strip()
-            if where and one:
-                anchor = "あなたは %s で「%s」を修正中です。その作業を続けてください。\n" % (where, one)
+            if one and self.checks:
+                anchor = ("あなたは %s で次のタスクを修正中です。その作業を続けてください。\n"
+                          "--- タスク全文 ---\n%s\n--- タスク全文ここまで ---\n"
+                          % (where or "この作業フォルダ", one))
             elif one:
-                anchor = "あなたは「%s」を修正中です。その作業を続けてください。\n" % one
+                anchor = ("作業中のタスクの原文（全文）を再掲します。原文の条件（日時・場所・数値・"
+                          "固定の制約）をすべて満たして続けてください。\n"
+                          "--- 原文 ---\n%s\n--- 原文ここまで ---\n" % one)
             elif where:
                 anchor = "あなたは %s での作業を続けてください。\n" % where
+            else:
+                anchor = ""
             return anchor + nudge if anchor else nudge
         except Exception:
             return nudge
+
+    def _steer_job(self, steer_text):
+        """The turn that delivers one queued steer. A recovery payload is system text, not a
+        person's; and because it ends at the goal heading it is sent with the goal put back,
+        so the recovery turn never replaces the task with nothing."""
+        if is_recovery_payload(steer_text):
+            return (SYSTEM_RECOVERY_PREFIX + fill_recovery_goal(steer_text, self.goal)
+                    + "\n上記の運用上の指示に従って作業を続行してください。"
+                    + CLOSING_INSTRUCTION)
+        return ("【ユーザーからの追加指示】" + steer_text
+                + "\n上記を最優先で踏まえて作業を続行してください。"
+                + CLOSING_INSTRUCTION)
 
     def _begin_send(self):
         # max_turns=0 (or falsy) means unlimited -- no turn-cap check at all.
@@ -3948,14 +4037,7 @@ class RelayWorker:
             # is_recovery_payload's honest, system-authored framing instead whenever the queued
             # text is recognizably _inject_unlock's own marker, and reserve the "user
             # instruction" wording for text that did not originate here.
-            if is_recovery_payload(_steer_text):
-                self.job = (SYSTEM_RECOVERY_PREFIX + _steer_text
-                            + "\n上記の運用上の指示に従って作業を続行してください。"
-                            + CLOSING_INSTRUCTION)
-            else:
-                self.job = ("【ユーザーからの追加指示】" + _steer_text
-                            + "\n上記を最優先で踏まえて作業を続行してください。"
-                            + CLOSING_INSTRUCTION)
+            self.job = self._steer_job(_steer_text)
             self._last_was_steer = True
             # A PERSON INTERVENED, SO THE CHAIN BEFORE THEM IS NOT EVIDENCE ABOUT WHAT COMES
             # AFTER. `_continue_count` has had this rule in three places since it was written
@@ -3988,7 +4070,8 @@ class RelayWorker:
                 and self.job == self._last_sent_job
                 and not self._last_was_steer):
             self._refute_attempt += 1
-            self.job = _refute_fix_job(self._refute_reason, self._refute_attempt)
+            self.job = self._task_anchor(
+                _refute_fix_job(self._refute_reason, self._refute_attempt))
         try:
             self._count_before = self.drv._answers().count()
             self.drv._count_before = self._count_before
@@ -4485,12 +4568,12 @@ class RelayWorker:
             return False                     # still researching; the sweep keeps moving
         self._research_session = None
         if report:
-            self.job = ("依頼された調査が完了しました。以下が結果です。これを踏まえて作業を続けて"
+            self.job = self._task_anchor("依頼された調査が完了しました。以下が結果です。これを踏まえて作業を続けて"
                         "ください。\n--- 調査結果 ---\n" + report + "\n--- 調査結果ここまで ---\n"
                         + CONTINUE_JOB)
             self.reason = "research %d/%d 反映して続行" % (self.research_count, self.max_research)
         else:
-            self.job = ("調査結果を取得できませんでした。調査なしで可能な範囲で進めるか、無理なら"
+            self.job = self._task_anchor("調査結果を取得できませんでした。調査なしで可能な範囲で進めるか、無理なら"
                         "最後の行に STUCK: 理由 と書いてください。")
             self.reason = "research %d/%d 結果なし" % (self.research_count, self.max_research)
         self.status = "ready"
@@ -5170,7 +5253,12 @@ class RelayWorker:
                                "conversation" if getattr(self, "socket", False) else
                                "token-limit recycle: fresh conversation did not render")
                 return
-            self.job = self._recycle_job()   # re-anchor in the fresh chat
+            try:
+                self.job = self._recycle_job()   # re-anchor in the fresh chat
+            except EmptyGoalError as e:
+                self.status, self.outcome = "stuck", "STUCK"
+                self.reason = "token-limit recycle refused: %s" % (e,)
+                return
             self.reason = (
                 f"ヒープ {getattr(self, '_last_heap_mb', 0):.0f}MB → 新会話で続行 "
                 f"({self._recycles}/{self._max_recycles})" if heavy else
@@ -5807,7 +5895,7 @@ class RelayWorker:
         if rq and self._context is not None and self.max_research > 0:
             self._record_effort_budget("research")
             if self.research_count >= self.max_research:
-                self.job = ("これ以上は調査を依頼できません（上限到達）。今ある情報で進めるか、"
+                self.job = self._task_anchor("これ以上は調査を依頼できません（上限到達）。今ある情報で進めるか、"
                             "無理なら最後の行に STUCK: 理由 と書いてください。")
                 self.status = "ready"
                 return
@@ -5838,14 +5926,14 @@ class RelayWorker:
             apath, ainstr = az
             self._record_effort_budget("analyze")
             if self.research_count >= self.max_research:
-                self.job = ("これ以上は分析を依頼できません（上限到達）。自前ツールで分析するか、"
+                self.job = self._task_anchor("これ以上は分析を依頼できません（上限到達）。自前ツールで分析するか、"
                             "無理なら最後の行に STUCK: 理由 と書いてください。")
                 self.status = "ready"
                 return
             if not os.path.isfile(apath):
                 # NAMED, NOT SILENT. A missing file used to be indistinguishable from the
                 # feature not existing, which is exactly how this stayed unnoticed.
-                self.job = ("指定されたファイルが見つかりません: %s。パスを確認するか、"
+                self.job = self._task_anchor("指定されたファイルが見つかりません: %s。パスを確認するか、"
                             "自前ツールで分析してください。" % apath[:200])
                 self.status = "ready"
                 return
@@ -5996,7 +6084,7 @@ class RelayWorker:
             self._continue_count = 0   # real progress signal -> the continue streak resets
         elif self._last_was_steer:
             # bridge off the steer instead of a raw CONTINUE so the redirection sticks
-            self.job = ("先ほどの追加指示を踏まえて作業を続行してください。"
+            self.job = self._task_anchor("先ほどの追加指示を踏まえて作業を続行してください。"
                         + CLOSING_INSTRUCTION)
             self._continue_count = 0   # a steer is real progress -> the continue streak resets
         else:
@@ -6633,7 +6721,7 @@ class RelayWorker:
             self._refute_reason = reason or "(no reason)"
             self._refute_attempt = 1
             self._refute_fix_pending = True
-            self.job = _refute_fix_job(self._refute_reason, 1)
+            self.job = self._task_anchor(_refute_fix_job(self._refute_reason, 1))
             self.status = "ready"
             return False
         if self.fresh_replay_count:
@@ -6667,7 +6755,7 @@ class RelayWorker:
             self.reason = ("acceptance check failed %d time(s): %s"
                            % (self.verify_attempts, (detail or "")[:200]))
             return True
-        self.job = VERIFY_FIX_JOB % (detail or "(no detail)")
+        self.job = self._task_anchor(VERIFY_FIX_JOB % (detail or "(no detail)"))
         self._pending_checks = []
         self._active_check = None
         self.status = "ready"
