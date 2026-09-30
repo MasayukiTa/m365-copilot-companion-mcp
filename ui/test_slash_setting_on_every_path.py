@@ -77,7 +77,10 @@ SUBMIT_UI = (Path(__file__).resolve().parents[1] / "scripts" / "win" / "submit_v
 
 
 def test_visible_gui_submitter_matches_the_live_composer_task_intake_contract():
-    assert '"追加", "Add"' in SUBMIT_UI
+    # The shipped cockpit exposes a stable AutomationId; button text changes with language and
+    # live/idle state, so labels are compatibility fallback only and must not be the contract.
+    assert "AutomationIdProperty, 'startButton'" in SUBMIT_UI
+    assert '"Add"' in SUBMIT_UI
     assert 'if ($running -and -not $Steer)' not in SUBMIT_UI
     assert 'Submit ($Goal -join "`n")' in SUBMIT_UI
     assert '-Steer is not supported by the current cockpit bottom composer' in SUBMIT_UI
