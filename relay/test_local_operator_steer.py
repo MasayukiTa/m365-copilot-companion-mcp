@@ -189,3 +189,25 @@ def test_agent_can_receive_but_cannot_mint_operator_steers():
     # The model-facing LOCAL_LOOP MCP surface must not expose the operator-authority write API.
     ops = (repo / "tools" / "local_loop_ops.py").read_text(encoding="utf-8")
     assert "queue_operator_steer" not in ops
+
+
+def test_post_plan_operator_followup_can_continue_open_ended(tmp_path):
+    store = _store(tmp_path)
+    store.create_job(_job(plan=["Produce final answer"]), now=1)
+    first = store.claim_turn("job_1", 1, "worker-a", now=2)
+    store.commit_turn(
+        "job_1", 1, first["lease_id"], first["fencing_token"],
+        "CANDIDATE_DONE", "candidate complete", now=3,
+    )
+    store.queue_operator_steer("job_1", "Rework the sensitivity section", now=4)
+    store.verify_candidate("job_1", True, "checks passed", now=5)
+
+    followup = store.claim_turn("job_1", 2, "worker-b", now=6)
+    assert followup["turn_total"] is None
+    continued = store.commit_turn(
+        "job_1", 2, followup["lease_id"], followup["fencing_token"],
+        "CONTINUE", "first steer pass complete", "Double-check the revised numbers", now=7,
+    )
+    assert continued["next_seq"] == 3
+    third = store.claim_turn("job_1", 3, "worker-c", now=8)
+    assert third["instruction"] == "Double-check the revised numbers"
