@@ -88,11 +88,13 @@ def test_a_pending_worker_is_weighed_as_the_route_it_will_take():
 
 
 def test_admission_asks_for_the_route_it_will_take():
-    """引数を足しただけで呼び出し側が渡していなければ、直っていない。"""
+    """候補の経路を一度判定し、その同じ値でタブ重量と送信前pacingを分けること。"""
     import ast
     import inspect
     src = inspect.getsource(RF.run_relay_fleet)
-    assert "tab_weight(assume_socket=_socket_open_now())" in src
+    assert "_candidate_socket = _socket_open_now()" in src
+    assert "tab_weight(assume_socket=_candidate_socket)" in src
+    assert "if not _candidate_socket and not admission_is_due():" in src
     tree = ast.parse(src.lstrip())
     assert any(isinstance(n, ast.FunctionDef) and n.name == "_socket_open_now"
                for n in ast.walk(tree)), "判定関数が無い"
