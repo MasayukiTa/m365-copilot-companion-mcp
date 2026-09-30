@@ -120,3 +120,9 @@ Under `%USERPROFILE%\.claude\tools\<tool>\README.md`:
 - Tests: relay/test_continuation_keeps_the_goal.py (28), relay/test_theme_from_goal_dates.py (4), scripts/test_goal_fidelity_report.py (13), all registered in ci.yml. Mutation check on a copy: 11 of 11 mutants killed. Full relay suite: 3982 passed; the 2 non-passing (test_repo_bug_fix_skill goal-builder test, test_gateway_executes) need a gitignored slice file / MCP_API_KEY absent from a fresh worktree.
 - scripts/goal_fidelity_report.py: constraint-drift score and false-denial detector, read-only over transcripts. Baseline over r6abc7f6c_a0, r6abcd114_a0, r6abcdb87_a0 (26 transcripts, 83 assistant turns): drift 5/57 (0.088) with heuristic tokens, 8/57 (0.140) with explicit --must tokens; false denials 1, true 0.
 - Design and planned before/after experiment: docs/private/20260930_goal_fidelity_design.md. Not merged into the live tree's branch.
+
+## 2026-09-30 - continuation anchor is a compact ledger, not the whole goal
+
+- The owner rejected PR #80's design of restating the whole goal (cap 6000 characters) in every continuation prompt: the context is small and long text every turn is wasteful.
+- Replaced on branch fix/continuation-compact-ledger-20260930: the first message keeps the full goal; later prompts carry a deterministic ledger of at most 1000 characters (LEDGER_MAX_CHARS, relay/relay_fleet.py): task line, fixed-constraint sentences, fan-out scope block, pointer to the first message. Empty-goal guards, neutral wording and the theme_from_goal date fix are unchanged.
+- Design and limits (extraction is a heuristic): docs/private/20260930_goal_fidelity_design.md.
