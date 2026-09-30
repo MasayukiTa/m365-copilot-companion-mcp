@@ -1557,6 +1557,49 @@ def _goal_summary(goal):
         return one if len(one) <= 64 else one[:63].rstrip() + "…"
 
 
+# FREE-SPACE RING (design section 3). One fixed-size, pre-allocated file per coordinator, so a
+# full disk cannot make the write fatal and the last minutes before a death survive it. Only
+# REPORTS; the floor shown is whatever the run resolved, never a value of its own.
+_FREE_RING = None
+_LAST_DISK = {}
+
+
+def _start_forensics(state_dir):
+    """Open the free-space ring and the faulthandler log. Best-effort, never raises."""
+    global _FREE_RING
+    try:
+        from relay import fleet_resume as _fr
+        _FREE_RING = _fr.FreeSpaceRing(os.path.join(state_dir, _fr.RING_FILE))
+        _fr.enable_fault_log(state_dir)
+    except Exception as e:
+        sys.stderr.write("[forensics] WARN: ring/fault log unavailable: %s\n" % e)
+
+
+def _sample_free_space(state_dir, floor_gb, now=None, force=False):
+    """Take a free-space sample at most every RING_SAMPLE_S. Never raises."""
+    try:
+        from relay import fleet_resume as _fr
+        now = time.time() if now is None else now
+        if not force and (now - _LAST_DISK.get("sampled_ts", 0.0)) < _fr.RING_SAMPLE_S:
+            return
+        import shutil
+        u = shutil.disk_usage(state_dir)
+        floor = floor_gb if (isinstance(floor_gb, (int, float)) and floor_gb > 0) else None
+        _LAST_DISK.update({"free_bytes": u.free, "total_bytes": u.total,
+                           "floor_gb": floor, "sampled_ts": now})
+        if _FREE_RING is not None:
+            _FREE_RING.sample(u.free, u.total, floor, now=now)
+    except Exception:
+        pass
+
+
+def _disk_block(disk_floor_gb):
+    from relay import fleet_resume as _fr
+    return _fr.disk_status(_LAST_DISK.get("free_bytes"), _LAST_DISK.get("total_bytes"),
+                           disk_floor_gb, _LAST_DISK.get("sampled_ts"),
+                           _FREE_RING.failures if _FREE_RING is not None else 0)
+
+
 def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paused=False,
               ram_floor_mb=0.0, directive="", run_label="", goal_count=0, queued=0,
               reunlock=None, command_rejections=None):
@@ -1591,6 +1634,7 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         # disk admission reserve + current C: free, so the cockpit can show the disk gate.
         "disk_floor_gb": round(disk_floor_gb, 1),
         "free_disk_gb": round(free_disk_gb(), 1),
+        "disk": _disk_block(disk_floor_gb),
         # RAM admission reserve (free RAM kept for the user) so the cockpit can show the RAM gate.
         "ram_floor_mb": round(ram_floor_mb),
         # THE THIRD GATE, and the one that was invisible. Disk and RAM have been on this panel
@@ -1779,6 +1823,10 @@ LAST_RUN_GOALS = "last_run_goals.json"
 LAST_RUN_DONE = "last_run_done.json"
 # outcome strings that count as a goal being genuinely finished (don't re-queue on resume)
 _RESUME_SUCCESS_OUTCOMES = ("DONE",)
+# A FANOUT parent ended on purpose when it split (its children carry the work). It is recorded
+# in the done-map so resume can tell "split" from "never ran", but it is NOT a success outcome:
+# it counts as finished only if its campaign header is on disk (see _resume_goal_is_done).
+_RESUME_FANOUT_OUTCOME = "FANOUT"
 
 
 def _goal_key(text):
@@ -1936,11 +1984,14 @@ def _update_done_map(state_dir, workers):
         done = _read_done_map(state_dir)
         for w in workers:
             outcome = getattr(w, "outcome", None)
-            if outcome in _RESUME_SUCCESS_OUTCOMES:
-                done[_goal_resume_key({
+            if outcome in _RESUME_SUCCESS_OUTCOMES or outcome == _RESUME_FANOUT_OUTCOME:
+                _k = _goal_resume_key({
                     "text": getattr(w, "goal", "") or "",
                     "jid": getattr(w, "jid", None),
-                })] = outcome
+                })
+                # monotonic: a later FANOUT never downgrades a recorded DONE
+                if not (outcome == _RESUME_FANOUT_OUTCOME and done.get(_k) in _RESUME_SUCCESS_OUTCOMES):
+                    done[_k] = outcome
         _write_atomic(os.path.join(state_dir, LAST_RUN_DONE), done)
     except Exception as e:
         # log ONCE per process (not once per tick) to avoid stderr spam every sweep.
@@ -1965,10 +2016,31 @@ def _merge_final_done_map(state_dir, results):
             goal = r.get("goal") or ""
         except Exception:
             continue
-        if outcome in _RESUME_SUCCESS_OUTCOMES and goal:
-            done[_goal_resume_key({"text": goal, "jid": r.get("jid")})] = outcome
+        if (outcome in _RESUME_SUCCESS_OUTCOMES or outcome == _RESUME_FANOUT_OUTCOME) and goal:
+            _k = _goal_resume_key({"text": goal, "jid": r.get("jid")})
+            if not (outcome == _RESUME_FANOUT_OUTCOME and done.get(_k) in _RESUME_SUCCESS_OUTCOMES):
+                done[_k] = outcome
     _write_atomic(os.path.join(state_dir, LAST_RUN_DONE), done)
     return done
+
+
+def _resume_goal_is_done(entry, key, done_map, state_dir):
+    """Did this ledger goal finish? DONE, or FANOUT whose campaign header is on disk.
+
+    G1: the FANOUT parent ends `done/FANOUT` at the split and used to be re-queued on every
+    resume (one wasted turn, nothing queued). It counts as finished only when the header line
+    for its campaign exists in campaigns.jsonl; without one (that write is best-effort) the
+    parent is re-queued so the work is not lost."""
+    outcome = done_map.get(key)
+    if outcome in _RESUME_SUCCESS_OUTCOMES:
+        return True
+    if outcome == _RESUME_FANOUT_OUTCOME:
+        try:
+            from relay import fleet_resume
+            return fleet_resume.has_campaign_header(state_dir, entry.get("text", ""))
+        except Exception:
+            return False
+    return False
 
 
 def _resume_goals(state_dir):
@@ -1992,8 +2064,8 @@ def _resume_goals(state_dir):
     remainder = []
     for entry in ledger:
         primary = _goal_resume_key(entry)
-        if done_map.get(primary) in _RESUME_SUCCESS_OUTCOMES:
-            continue                       # already finished successfully -- skip
+        if _resume_goal_is_done(entry, primary, done_map, state_dir):
+            continue                       # already finished successfully (or split) -- skip
         stored = entry.get("key") or _goal_key(entry.get("text", ""))
         if (primary != stored and legacy_key_counts.get(stored) == 1
                 and done_map.get(stored) in _RESUME_SUCCESS_OUTCOMES):
@@ -2059,6 +2131,12 @@ def _write_active_marker(state_dir, argv=None, pid=None, start_ts=None, raise_on
                    "start_ts": float(start_ts if start_ts is not None else time.time()),
                    "argv": raw_argv,
                    "resume_argv": _resume_argv(raw_argv)}
+        # WHICH INTERRUPTED RUN THIS ONE RESUMED, set by the resumer in the environment, so a
+        # run that dies again inherits its predecessor's resume count (the loop guard) via
+        # relay.fleet_reaper. Absent for an ordinary run.
+        _lineage = os.environ.get("MCP_FLEET_RESUME_LINEAGE", "").strip()
+        if _lineage:
+            payload["resume_lineage"] = _lineage
         _write_atomic(os.path.join(state_dir, ACTIVE_MARKER), payload)
         return True
     except Exception as e:
@@ -3551,6 +3629,20 @@ def main():
                   "(no last-run ledger found -- nothing to resume)")
         else:
             print("RESUME: %d of %d goals unfinished -- requeueing." % (n_unfinished, m_total))
+        # G2: campaign children that never finished were only ever queued in memory, so they
+        # are not in the goals ledger. Re-queue every child not DONE for campaigns whose merge
+        # has not finished, skipping any the ledger already carries (a second resume).
+        try:
+            from relay import fleet_resume as _fr
+            _kids, _degraded = _fr.resume_children_goals(args.state_dir)
+            _have = {_goal_resume_key(g) for g in resume_goals}
+            _kids = [k for k in _kids if _goal_resume_key(k) not in _have]
+            if _kids:
+                print("RESUME: %d unfinished campaign child(ren) re-queued from the campaign "
+                      "ledger (%d degraded)." % (len(_kids), _degraded))
+            resume_goals = resume_goals + _kids
+        except Exception as _e:
+            print("RESUME: could not read campaign children: %s: %s" % (type(_e).__name__, _e))
         # resume set goes first so it keeps its original order ahead of any new goals.
         goals = resume_goals + goals
         if not goals:
@@ -3645,6 +3737,8 @@ def main():
         _release_run_lock(_ACTIVE_RUN_LOCK)
         _ACTIVE_RUN_LOCK = None
         return 5
+    _start_forensics(args.state_dir)
+    _sample_free_space(args.state_dir, None, force=True)   # floor not resolved yet; ticks carry it
     if _adopt_claim is not None:
         if not commit_command_claim(args.state_dir, _adopt_claim, applied=True):
             restore_command_claim(_adopt_claim)
@@ -4097,6 +4191,7 @@ def main():
         # RUN-RESUME: refresh the completion map so a crash after this sweep can resume
         # only the still-unfinished goals. Cheap (in-memory scan + one atomic write).
         _update_done_map(args.state_dir, workers)
+        _sample_free_space(args.state_dir, disk_box[0])
         try:
             _write_atomic(status_path, _snapshot(workers, started, len(goals), mc_box[0],
                                                  disk_floor_gb=disk_box[0], paused=pause_box[0],
