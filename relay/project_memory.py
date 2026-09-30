@@ -107,7 +107,8 @@ def theme_from_goal(goal, folder=""):
     if not text:
         return os.path.basename(str(folder or "").rstrip("/\\")) or "general"
     # first clause: split on the punctuation people actually end a topic with
-    head = re.split(r"[。．\.\n:：,、/／]", text, 1)[0]
+    # A slash between digits is a date (10/2, 2026/10/2), not a clause boundary.
+    head = re.split(r"[。．\.\n:：,、]|(?<!\d)[/／]|[/／](?!\d)", text, 1)[0]
     return (head or text)[:_GOAL_CAP]
 
 

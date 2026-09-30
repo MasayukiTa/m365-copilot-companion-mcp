@@ -24,7 +24,9 @@ supervisor.ps1's `Invoke-FleetAutoResume`, which auto-RELAUNCHES the coordinator
 before the main polling loop begins. A coordinator that dies mid-session (supervisor
 itself keeps running) is never noticed by that path. `reap_stale_run()` never
 relaunches anything; it only FINALIZES the dead sidecars to a clean terminal
-"cancelled" state so the phantom clears. It is meant to be called on every supervisor
+state so the phantom clears: `interrupted` (non-terminal,
+resumable) for workers the death cut short, `cancelled` only for a pending user stop;
+finished workers are untouched. It is meant to be called on every supervisor
 poll cycle -- idempotent, cheap, and safe to call from a tight loop.
 
 Design:
@@ -49,7 +51,20 @@ ACTIVE_MARKER = "fleet_run_active.json"
 STATUS_FILE = "status.json"
 HISTORY_FILE = "history.json"
 
-TERMINAL_STATUSES = frozenset({"done", "stuck", "maxturns", "error", "cancelled"})
+#: Mirror of relay.relay_fleet.TERMINAL (pinned equal by a test). content_refused was missing
+#: here, which would have made a finished refused worker look "unfinished" to the reaper.
+TERMINAL_STATUSES = frozenset({"done", "stuck", "maxturns", "error", "cancelled",
+                               "content_refused"})
+
+#: NON-terminal and resumable: written only here, into the sidecars of a dead coordinator.
+#: Deliberately NOT in TERMINAL_STATUSES. `cancelled` remains only for a user stop.
+INTERRUPTED_STATUS = "interrupted"
+INTERRUPTED_OUTCOME = "INTERRUPTED"
+INTERRUPTED_PILL = "中断"
+INTERRUPTED_COLOR = "warn"
+INTERRUPTED_REASON = "coordinator died"
+INTERRUPTED_DIR = "interrupted"     # .fleet/interrupted/<run_id>.json; never swept
+COMMANDS_DIR = "commands.d"
 
 CANCELLED_PILL = "停止"
 CANCELLED_COLOR = "muted"
@@ -87,76 +102,277 @@ def _write_atomic(path: str, payload) -> None:
     os.replace(tmp, path)
 
 
-def _finalize_status(status: dict) -> int:
-    """Mutate `status` in place to a finalized/cancelled state. Returns the count of
-    workers actually flipped to closed by this call."""
+def _has_unconsumed_stop(fleet_dir: str) -> bool:
+    """True when a user `stop` command is still sitting unread in the command queue.
+
+    A clean stop reaches the coordinator's normal completion path and never leaves a dead
+    marker behind, so this is only the narrow case of a stop written just before the
+    coordinator died. The user's intent wins: that run is `cancelled`, not `interrupted`.
+    Layout (relay/fleet_runner.py): `commands.json` (legacy) and `commands.d/*.json`, either
+    of which may already be renamed to `*.claim-<pid>` by a coordinator that then died."""
+    try:
+        candidates = [os.path.join(fleet_dir, "commands.json")]
+        d = os.path.join(fleet_dir, COMMANDS_DIR)
+        if os.path.isdir(d):
+            candidates.extend(os.path.join(d, n) for n in os.listdir(d))
+        try:
+            candidates.extend(os.path.join(fleet_dir, n) for n in os.listdir(fleet_dir)
+                              if n.startswith("commands.json.claim-"))
+        except OSError:
+            pass
+        for path in candidates:
+            name = os.path.basename(path)
+            if not (name.endswith(".json") or ".json.claim-" in name):
+                continue
+            cmd = _read_json(path)
+            if isinstance(cmd, dict) and cmd.get("stop") is True:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _coordinator_log_evidence(fleet_dir: str, pid) -> tuple:
+    """(name, mtime) of the newest coordinator log of this pid, or (None, None). Cheap: one
+    directory listing, one stat per matching file."""
+    best = (None, None)
+    try:
+        suffix = "_p%d.log" % int(pid) if pid is not None else None
+        for name in os.listdir(fleet_dir):
+            if not name.startswith("coordinator_"):
+                continue
+            if suffix is not None and not name.endswith(suffix):
+                continue
+            try:
+                m = os.path.getmtime(os.path.join(fleet_dir, name))
+            except OSError:
+                continue
+            if best[1] is None or m > best[1]:
+                best = (name, m)
+    except Exception:
+        pass
+    return best
+
+
+def _free_bytes(path: str):
+    try:
+        import shutil
+        return int(shutil.disk_usage(path).free)
+    except Exception:
+        return None
+
+
+def _is_unfinished(w) -> bool:
+    """A worker the death actually cut short: not closed, not terminal, not already
+    interrupted. Everything else (done-but-not-yet-closed included) is left as it is."""
+    if not isinstance(w, dict) or w.get("closed"):
+        return False
+    st = w.get("status")
+    return st not in TERMINAL_STATUSES and st != INTERRUPTED_STATUS
+
+
+def _append_event(w: dict, event: str, label: str) -> None:
+    events = w.get("phase_events")
+    if not isinstance(events, list):
+        events = []
+        w["phase_events"] = events
+    if events and isinstance(events[-1], dict) and events[-1].get("event") == event:
+        return
+    last_ts = events[-1].get("ts") if events and isinstance(events[-1], dict) else None
+    ts = (last_ts + 1) if isinstance(last_ts, (int, float)) else time.time()
+    events.append({"ts": ts, "event": event, "label": label})
+
+
+def _finalize_status(status: dict, evidence: Optional[dict] = None, *,
+                     stopped: bool = False) -> int:
+    """Mutate `status` in place. Returns how many workers were actually changed.
+
+    Only workers the death cut short (`_is_unfinished`) change. With `stopped` (a user stop
+    was pending) they become `cancelled`; otherwise `interrupted`, a NON-terminal, resumable
+    status. Workers that are done/terminal are never rewritten, closed or not."""
     status["running"] = False
     status["paused"] = False
 
     workers = status.get("workers")
-    closed_count = 0
+    changed = 0
+    reason = INTERRUPTED_REASON
+    if evidence and evidence.get("pid") is not None:
+        reason = "%s: pid %s is gone" % (INTERRUPTED_REASON, evidence["pid"])
+        if evidence.get("last_coordinator_log_ts"):
+            reason += "; last coordinator log write %s" % time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.localtime(evidence["last_coordinator_log_ts"]))
     if isinstance(workers, list):
         for w in workers:
-            if not isinstance(w, dict):
+            if not _is_unfinished(w):
                 continue
-            if w.get("closed"):
-                continue
-            w["closed"] = True
-            w["status"] = "cancelled"
-            if not w.get("outcome"):
-                w["outcome"] = "CANCELLED"
-            w["pill"] = CANCELLED_PILL
-            w["color"] = CANCELLED_COLOR
-            if not w.get("reason"):
-                w["reason"] = CANCELLED_REASON
-            events = w.get("phase_events")
-            if not isinstance(events, list):
-                events = []
-                w["phase_events"] = events
-            already_cancelled = bool(events) and isinstance(events[-1], dict) and \
-                events[-1].get("event") == "cancelled"
-            if not already_cancelled:
-                last_ts = None
-                if events and isinstance(events[-1], dict):
-                    last_ts = events[-1].get("ts")
-                ts = (last_ts + 1) if isinstance(last_ts, (int, float)) else time.time()
-                events.append({"ts": ts, "event": "cancelled", "label": "Stopped (reaped)"})
-            closed_count += 1
+            if stopped:
+                w["closed"] = True
+                w["status"] = "cancelled"
+                if not w.get("outcome"):
+                    w["outcome"] = "CANCELLED"
+                w["pill"] = CANCELLED_PILL
+                w["color"] = CANCELLED_COLOR
+                if not w.get("reason"):
+                    w["reason"] = CANCELLED_REASON
+                _append_event(w, "cancelled", "Stopped (reaped)")
+            else:
+                w["prior_status"] = w.get("status")
+                if w.get("outcome"):
+                    w["prior_outcome"] = w.get("outcome")
+                if w.get("reason"):
+                    w["prior_reason"] = w.get("reason")
+                w["status"] = INTERRUPTED_STATUS
+                w["outcome"] = "INTERRUPTED"  # == INTERRUPTED_OUTCOME; literal so the outcome-closure walker sees it
+                w["pill"] = INTERRUPTED_PILL
+                w["color"] = INTERRUPTED_COLOR
+                w["reason"] = reason
+                w["resumable"] = True
+                _append_event(w, "interrupted", "Interrupted (coordinator died)")
+            changed += 1
 
     total = status.get("total")
     if not isinstance(total, int) or (isinstance(workers, list) and total != len(workers)):
         total = len(workers) if isinstance(workers, list) else total
         status["total"] = total
-    status["done_count"] = total if isinstance(total, int) else status.get("done_count")
+    if isinstance(workers, list):
+        # done_count is what FINISHED, so an interrupted worker is not counted as one.
+        status["done_count"] = sum(
+            1 for w in workers if isinstance(w, dict)
+            and w.get("status") in TERMINAL_STATUSES)
+    if evidence is not None and not stopped and changed:
+        status["interrupted"] = dict(evidence)
+    return changed
 
-    return closed_count
 
-
-def _finalize_history(entries) -> int:
-    """Mutate the list in place. Returns count of entries actually terminated."""
-    terminated = 0
+def _finalize_history(entries, *, stopped: bool = False) -> int:
+    """Mutate the list in place. Returns count of entries actually changed. Terminal and
+    already-interrupted entries are left alone."""
+    changed = 0
     for e in entries:
         if not isinstance(e, dict):
             continue
-        if e.get("status") in TERMINAL_STATUSES:
+        st = e.get("status")
+        if st in TERMINAL_STATUSES or st == INTERRUPTED_STATUS:
             continue
-        e["status"] = "cancelled"
-        e["closed"] = True
-        if "outcome" in e:
-            e["outcome"] = "CANCELLED"
-        terminated += 1
-    return terminated
+        if stopped:
+            e["status"] = "cancelled"
+            e["closed"] = True
+            if "outcome" in e:
+                e["outcome"] = "CANCELLED"
+        else:
+            e["status"] = INTERRUPTED_STATUS
+            if "outcome" in e:
+                e["outcome"] = "INTERRUPTED"
+        changed += 1
+    return changed
+
+
+def _campaign_plans(fleet_dir: str) -> list:
+    """The fan-out plan(s) on record, from campaigns.jsonl (header + child keys only)."""
+    try:
+        path = os.path.join(fleet_dir, "campaigns.jsonl")
+        if not os.path.isfile(path):
+            return []
+        with open(path, encoding="utf-8-sig", errors="replace") as fh:
+            lines = fh.read().splitlines()
+        from relay.fanout import campaigns_from_ledger
+        plans = []
+        for cid, fam in campaigns_from_ledger(lines).items():
+            plans.append({
+                "campaign_id": cid,
+                "goal": str(fam.get("goal") or "")[:400],
+                "n": fam.get("n"),
+                "cwd": fam.get("cwd"),
+                "merged": bool(fam.get("merged")),
+                "children": [{"task_id": c.get("task_id"),
+                              "subtask_index": c.get("subtask_index")}
+                             for c in fam.get("children", []) if isinstance(c, dict)],
+            })
+        return plans
+    except Exception:
+        return []
+
+
+def _run_id(status, marker, pid) -> str:
+    """`r<hex>_a<n>` of the first worker that has one; else `p<pid>_<start_ts>`."""
+    try:
+        for w in (status or {}).get("workers") or []:
+            rid = w.get("run_id") if isinstance(w, dict) else None
+            if isinstance(rid, str) and rid and all(c.isalnum() or c in "_-" for c in rid):
+                return rid
+    except Exception:
+        pass
+    start = (marker or {}).get("start_ts") if isinstance(marker, dict) else None
+    return "p%s_%d" % (pid if pid is not None else "x",
+                       int(start) if isinstance(start, (int, float)) else int(time.time()))
+
+
+def _snapshot_payload(status: dict, marker, evidence: dict, run_id: str,
+                      fleet_dir: str) -> dict:
+    workers = []
+    for w in status.get("workers") or []:
+        if not isinstance(w, dict):
+            continue
+        workers.append({k: w.get(k) for k in (
+            "name", "status", "outcome", "run_id", "jid", "campaign", "role",
+            "subtask_index", "turns", "closed", "goal") if k in w})
+    return {
+        "schema": 1,
+        "run_id": run_id,
+        "state": "pending",
+        "written_ts": time.time(),
+        "marker": marker if isinstance(marker, dict) else None,
+        "interrupted": evidence,
+        "workers": workers,
+        "campaigns": _campaign_plans(fleet_dir),
+    }
+
+
+def read_interrupted_snapshot(fleet_dir: str = ".fleet"):
+    """(data, path) of the newest `.fleet/interrupted/*.json` whose state is `pending`, or
+    None. This is what the resumer reads once the reaper has consumed the live marker."""
+    try:
+        d = os.path.join(fleet_dir, INTERRUPTED_DIR)
+        best = None
+        for name in os.listdir(d):
+            if not name.endswith(".json"):
+                continue
+            data = _read_json(os.path.join(d, name))
+            if not isinstance(data, dict) or data.get("state") != "pending":
+                continue
+            ts = data.get("written_ts")
+            ts = ts if isinstance(ts, (int, float)) else 0
+            if best is None or ts > best[0]:
+                best = (ts, data, os.path.join(d, name))
+        return (best[1], best[2]) if best else None
+    except Exception:
+        return None
+
+
+def mark_snapshot_state(path: str, state: str) -> bool:
+    """Flip a snapshot's `state` (e.g. to `resumed`) atomically. Never raises."""
+    try:
+        data = _read_json(path)
+        if not isinstance(data, dict):
+            return False
+        data["state"] = state
+        data["state_ts"] = time.time()
+        _write_atomic(path, data)
+        return True
+    except Exception:
+        return False
 
 
 def reap_stale_run(fleet_dir: str = ".fleet", *, alive: Optional[Callable[[int], bool]] = None,
-                    stale_after_s: float = 600.0) -> Optional[dict]:
+                    stale_after_s: float = 600.0, exit_code: Optional[int] = None,
+                    exit_evidence: Optional[list] = None) -> Optional[dict]:
     """Best-effort, idempotent, NEVER-raising finalizer for a fleet run whose
     coordinator process has died without a supervisor restart happening.
 
-    Never relaunches anything -- purely finalizes dead sidecar state (see module
-    docstring). Returns a summary dict on an actual reap, or None if there was nothing
-    to do (including on any internal error -- this function must be safe to call from a
-    tight polling loop).
+    Never relaunches anything. Workers the death cut short become `interrupted` (a
+    non-terminal, resumable status), NOT `cancelled`; `cancelled` is only for a user stop
+    that was still pending. Returns a summary dict on an actual reap, or None if there was
+    nothing to do (including on any internal error -- safe to call from a tight loop).
     """
     try:
         alive_fn = alive if alive is not None else _pid_alive_psutil
@@ -197,25 +413,54 @@ def reap_stale_run(fleet_dir: str = ".fleet", *, alive: Optional[Callable[[int],
             return None
 
         status = _read_json(status_path)
+        stopped = _has_unconsumed_stop(fleet_dir)
+        unfinished = 0
+        if isinstance(status, dict):
+            unfinished = sum(1 for w in (status.get("workers") or []) if _is_unfinished(w))
+
+        evidence = None
+        snapshot_path = None
+        if unfinished and not stopped:
+            log_name, log_ts = _coordinator_log_evidence(fleet_dir, pid)
+            marker_d = marker if isinstance(marker, dict) else {}
+            evidence = {
+                "pid": pid,
+                "pid_birth": marker_d.get("pid_birth"),
+                "start_ts": marker_d.get("start_ts"),
+                "detected_ts": time.time(),
+                "last_coordinator_log_ts": log_ts,
+                "coordinator_log": log_name,
+                "exit_code": exit_code,
+                "exit_evidence": list(exit_evidence or []),
+                "free_bytes_at_detection": _free_bytes(fleet_dir),
+                "resumable": True,
+            }
+            # Snapshot FIRST and fail closed: if it cannot be written, nothing else is
+            # touched and the next cycle tries again. The marker (the only resume input)
+            # is deleted below only after this copy is safely on disk.
+            run_id = _run_id(status, marker, pid)
+            snapshot_path = os.path.join(fleet_dir, INTERRUPTED_DIR, run_id + ".json")
+            os.makedirs(os.path.dirname(snapshot_path), exist_ok=True)
+            _write_atomic(snapshot_path, _snapshot_payload(status, marker, evidence,
+                                                           run_id, fleet_dir))
+
         workers_closed = 0
         if isinstance(status, dict):
             was_running = status.get("running") is True
-            workers_closed = _finalize_status(status)
+            workers_closed = _finalize_status(status, evidence, stopped=stopped)
             if was_running or workers_closed:
                 _write_atomic(status_path, status)
 
         history_terminated = 0
         history = _read_json(history_path)
         if isinstance(history, list) and history:
-            history_terminated = _finalize_history(history)
+            history_terminated = _finalize_history(history, stopped=stopped)
             if history_terminated:
                 _write_atomic(history_path, history)
 
-        marker_removed = False
         if os.path.isfile(active_path):
             try:
                 os.remove(active_path)
-                marker_removed = True
             except Exception:
                 pass
 
@@ -224,6 +469,9 @@ def reap_stale_run(fleet_dir: str = ".fleet", *, alive: Optional[Callable[[int],
             "pid": pid,
             "workers_closed": workers_closed,
             "history_terminated": history_terminated,
+            "interrupted": bool(evidence),
+            "stopped": stopped,
+            "snapshot": snapshot_path,
         }
     except Exception:
         return None
@@ -275,9 +523,11 @@ def main(argv=None) -> int:                                      # pragma: no co
     if not result:
         print("nothing to reap.")
         return 0
-    print("reaped pid=%s: %d worker(s) closed, %d history entr(ies) terminated"
+    print("reaped pid=%s: %d worker(s) %s, %d history entr(ies) updated%s"
           % (result.get("pid"), result.get("workers_closed") or 0,
-             result.get("history_terminated") or 0))
+             "cancelled" if result.get("stopped") else "marked interrupted",
+             result.get("history_terminated") or 0,
+             ("; snapshot " + str(result.get("snapshot"))) if result.get("snapshot") else ""))
     return 0
 
 

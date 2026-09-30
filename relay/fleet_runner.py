@@ -171,6 +171,7 @@ STATUS_PILL = {
     "maxturns":  ("上限",   "bad"),
     "error":     ("エラー", "bad"),
     "cancelled": ("停止",   "muted"),    # user released it from the cockpit
+    "interrupted": ("中断", "warn"),     # coordinator died; reaper-written, resumable, not a stop
     "fresh_replay": ("新規会話", "good"),
     "content_refused": ("内容拒否", "bad"),
 }
@@ -377,8 +378,14 @@ def _follow_up(worker, text, enqueue, say):
         return False
     try:
         from relay.relay_fleet import is_recovery_payload as _is_recovery
+        from relay.relay_fleet import fill_recovery_goal as _fill_goal
     except Exception:
         _is_recovery = None
+        _fill_goal = None
+    if _fill_goal is not None:
+        # The recovery payload ends at the goal heading; without the goal the new worker's
+        # whole task would be the unlock text.
+        text = _fill_goal(text, goal)
     template = FOLLOW_UP_PROMPT
     if _is_recovery is not None:
         try:

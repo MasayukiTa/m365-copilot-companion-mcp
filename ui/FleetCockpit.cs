@@ -1718,6 +1718,7 @@ class CockpitWindow : Window
         if (s == "maxturns") return ja ? "上限" : "Max turns";
         if (s == "error") return ja ? "エラー" : "Error";
         if (s == "cancelled") return ja ? "停止" : "Stopped";
+        if (s == "interrupted") return ja ? "中断" : "Interrupted";
         if (s == "pending") return ja ? "待機列" : "Queued";
         if (s == "ready") return ja ? "準備" : "Ready";
         return s;
@@ -10995,6 +10996,7 @@ class CockpitWindow : Window
         {
             var w = o as Dictionary<string, object>;
             if (w == null) continue;
+            if (IsInterruptedWorker(w)) continue;              // resumable: never archived, never blocks
             if (!IsTerminalWorker(w)) return;                  // not fully finished yet -> wait
         }
         // _toolbarShown is populated by the last RenderCards; on the finished tick it holds this
@@ -11170,7 +11172,7 @@ class CockpitWindow : Window
         _header.Text = "Fleet";
 
         // Compute running/queued/done counts from the workers array.
-        int cntRunning = 0, cntQueued = 0, cntDoneW = 0;
+        int cntRunning = 0, cntQueued = 0, cntDoneW = 0, cntIntr = 0;
         object wo2;
         if (root.TryGetValue("workers", out wo2) && wo2 is object[])
         {
@@ -11180,6 +11182,7 @@ class CockpitWindow : Window
                 if (ww == null) continue;
                 string wst = S(ww, "status");
                 if (IsTerminalWorker(ww)) cntDoneW++;
+                else if (IsInterruptedWorker(ww)) cntIntr++;   // not running, not done, not a failure
                 else if (wst == "pending") cntQueued++;
                 else cntRunning++;
             }
@@ -11202,7 +11205,7 @@ class CockpitWindow : Window
                 {
                     var ww2 = ow2 as Dictionary<string, object>;
                     if (ww2 == null) continue;
-                    if (!IsTerminalWorker(ww2)) { allTerminal = false; }
+                    if (!IsTerminalWorker(ww2) && !IsInterruptedWorker(ww2)) { allTerminal = false; }
                     if (IsOperatorAttention(ww2)) cntAttn++;
                 }
             }
@@ -11214,11 +11217,11 @@ class CockpitWindow : Window
             // Run-ended header: "{done} done · {attn} needs attention · run ended"
             if (ja2)
             {
-                triple = cntDoneW + " 完了 · " + cntAttn + " 要対応 · 終了";
+                triple = cntDoneW + " 完了 · " + cntAttn + " 要対応 · " + (cntIntr > 0 ? cntIntr + " 中断 · " : "") + "終了";
             }
             else
             {
-                triple = cntDoneW + " done · " + cntAttn + " needs attention · run ended";
+                triple = cntDoneW + " done · " + cntAttn + " needs attention · " + (cntIntr > 0 ? cntIntr + " interrupted · " : "") + "run ended";
             }
         }
         else
@@ -11292,6 +11295,8 @@ class CockpitWindow : Window
                 _subChips.Children.Add(ChipMargin(Pill(cntDoneW + " " + (ja2 ? "完了" : "done"), "success")));
                 _subChips.Children.Add(ChipMargin(Pill(cntAttn + " " + (ja2 ? "要対応" : "needs attention"),
                     cntAttn > 0 ? "warning" : "neutral")));
+                if (cntIntr > 0)
+                    _subChips.Children.Add(ChipMargin(Pill(cntIntr + " " + (ja2 ? "中断" : "interrupted"), "warning")));
                 _subChips.Children.Add(ChipMargin(Pill(ja2 ? "終了" : "run ended", "neutral")));
             }
             else
@@ -11756,7 +11761,7 @@ class CockpitWindow : Window
             string oc = S(w, "outcome");
             string st = S(w, "status");
             // Tab 1 = Active: non-terminal AND not pending (actively working statuses)
-            if (_cardFilter == 1 && (IsTerminalWorker(w) || st == "pending")) continue;
+            if (_cardFilter == 1 && (IsTerminalWorker(w) || IsInterruptedWorker(w) || st == "pending")) continue;
             // Tab 2 = Needs input: awaiting only
             if (_cardFilter == 2 && st != "awaiting") continue;
             // Tab 3 = Done: outcome == DONE
@@ -11820,7 +11825,7 @@ class CockpitWindow : Window
                    : (Dbl(root, "updated") > 0 && dbStarted > 0 ? Dbl(root, "updated") - dbStarted : 0));
             int dbActive = 0;
             foreach (Dictionary<string, object> dw in onBoard)
-                if (!IsTerminalWorker(dw) && S(dw, "status") != "pending") dbActive++;
+                if (!IsTerminalWorker(dw) && !IsInterruptedWorker(dw) && S(dw, "status") != "pending") dbActive++;
             bool dbJa = _lang == 0;
             var dbMeta = new StringBuilder();
             if (dbStarted > 0)
@@ -12511,7 +12516,7 @@ class CockpitWindow : Window
                 else if (oc == "STUCK" || oc == "ERROR" || oc == "CANCELLED"
                          || oc == "EVIDENCE_CONTRADICTED") badN++;
                 if (st == "awaiting") cntNeeds++;
-                if (!IsTerminalWorker(w) && st != "pending") cntActive++;
+                if (!IsTerminalWorker(w) && !IsInterruptedWorker(w) && st != "pending") cntActive++;
             }
         }
         return new int[] { cntAll, cntActive, cntNeeds, cntDone, doneN, maxN, badN, hiddenTerminal };
@@ -13381,6 +13386,7 @@ class CockpitWindow : Window
             : (isAgentSetupWait ? (_lang == 0 ? "エージェント設定待ち" : "Agent setup required")
                 : (isInfra ? T("infra_wait") : Theme.StatusLabel(status, _lang))), chipKind);
         chip.Margin = new Thickness(2, 0, 5, 0);
+        if (status == "interrupted" && !string.IsNullOrEmpty(reason)) chip.ToolTip = reason;
         DockPanel.SetDock(chip, Dock.Left); left.Children.Add(chip);
         // AGENT BADGE (P0 feature 4): which agent this conversation is bound to. Green subtle badge
         // for the configured agent, WARNING-colored 既定Copilot badge for a plain /chat/ (default) url.
@@ -14270,7 +14276,7 @@ class CockpitWindow : Window
             evs.Add(new Tuple<string, string>(
                 ja ? ("レビュー (" + reviews + "x)") : ("Reviewed (" + reviews + "x)"),
                 Theme.TimelineColor("refuting", _dark)));
-        if (terminal)
+        if (terminal || outcome == "INTERRUPTED")
         {
             string outcomeEv;
             string outcomeKey;
@@ -14281,6 +14287,7 @@ class CockpitWindow : Window
                 case "STUCK":     outcomeEv = ja ? "停滞" : "Stuck"; outcomeKey = "stuck"; break;
                 case "ERROR":     outcomeEv = ja ? "エラー" : "Error"; outcomeKey = "error"; break;
                 case "CANCELLED": outcomeEv = ja ? "停止" : "Cancelled"; outcomeKey = "cancelled"; break;
+                case "INTERRUPTED": outcomeEv = ja ? "中断" : "Interrupted"; outcomeKey = "interrupted"; break;
                 case "EVIDENCE_CONTRADICTED": outcomeEv = ja ? "記録と矛盾" : "Contradicted"; outcomeKey = "stuck"; break;
                 default:           outcomeEv = string.IsNullOrEmpty(outcome) ? (ja ? "終了" : "Ended") : outcome; outcomeKey = "cancelled"; break;
             }
@@ -14383,6 +14390,7 @@ class CockpitWindow : Window
             case "STUCK": return ja ? "停滞して終了" : "Stuck";
             case "ERROR": return ja ? "エラーで終了" : "Error";
             case "CANCELLED": return ja ? "停止されました" : "Cancelled";
+            case "INTERRUPTED": return ja ? "中断されました(コーディネータ停止)" : "Interrupted (coordinator died)";
             // The worker said it was finished; the recorded tool calls say otherwise -- the
             // acceptance command was never run, or nothing was written. NOT an error and NOT a
             // completion: a claim that could not be believed. DONE is a self-report measured at
@@ -15047,6 +15055,15 @@ class CockpitWindow : Window
                || status == "content_refused";
     }
 
+    // relay/fleet_reaper.py writes status "interrupted" into the sidecars of a coordinator that
+    // DIED (crash, kill, disk full). It is NOT terminal (never add it to IsTerminalWorker: the
+    // work is resumable and must not be archived or counted as finished) and it is NOT running
+    // and NOT a failure of the goal. Mirrors relay/outcomes.py STATUS_OF["INTERRUPTED"].
+    static bool IsInterruptedWorker(Dictionary<string, object> w)
+    {
+        return w != null && S(w, "status") == "interrupted";
+    }
+
     // Severity rank for the "unfinished only" sort: failures first, then max-turns, then
     // cancelled, then still-running/other (stable within a rank).
     static int SeverityRank(Dictionary<string, object> w)
@@ -15055,6 +15072,7 @@ class CockpitWindow : Window
         if (oc == "STUCK" || oc == "ERROR") return 0;
         if (oc == "MAXTURNS") return 1;
         if (oc == "CANCELLED") return 2;
+        if (oc == "INTERRUPTED") return 2;
         return 3;   // still-running / other
     }
 

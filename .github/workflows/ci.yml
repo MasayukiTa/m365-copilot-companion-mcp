@@ -266,6 +266,7 @@ jobs:
             tests/test_theme_japanese_font.py \
             relay/test_a_doc_id_is_used_where_it_was_made.py \
             bench/test_swe_grade_batch.py \
+            bench/test_remote_grade.py \
             relay/selfimprove/test_the_slice_refusal_fires_through_the_real_entry.py \
             ui/test_a_setting_that_is_off_is_said_out_loud.py \
             ui/test_fleet_cockpit_health.py \
@@ -514,6 +515,9 @@ jobs:
             relay/test_socket_capture_async.py \
             relay/test_socket_admission_no_pending.py \
             relay/test_fanout.py \
+            relay/test_continuation_keeps_the_goal.py \
+            relay/test_theme_from_goal_dates.py \
+            scripts/test_goal_fidelity_report.py \
             tests/test_ownership.py \
             tests/test_watchdog_arming.py \
             tests/test_control_markers.py \
@@ -536,6 +540,8 @@ jobs:
             bridge/test_one_rule_for_the_active_session.py \
             bridge/test_conv_url_follows_the_turn.py \
             tests/test_retry_sets_agree.py \
+            tests/test_reaper_marks_interrupted.py \
+            tests/test_interrupted_status_is_classified_everywhere.py \
             tests/test_idle_edge_release.py \
             relay/test_merge_delivery.py \
             relay/test_campaign_ledger.py \
