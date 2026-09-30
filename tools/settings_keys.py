@@ -131,6 +131,12 @@ KEYS = OrderedDict([
        "relay/fleet_runner.py:settings_effort (once, in main)",
        "Takes effect on the NEXT run."),
 
+    _k("effort_policy", EACH_GATE, "off",
+       "relay/effort_policy.py:mode_info (every mode() call, mtime-cached)",
+       "off|shadow|on. Re-read at each policy decision (next worker, fan-out or turn "
+       "evaluation) with no restart; decisions already made stand. An MCP_EFFORT_POLICY "
+       "environment variable beats this setting and is reported as a conflict."),
+
     _k("autoretry", SWEEP_START, 1,
        "relay/fleet_runner.py:settings_autoretry (once, before the sweep)",
        "Takes effect on the NEXT run."),
