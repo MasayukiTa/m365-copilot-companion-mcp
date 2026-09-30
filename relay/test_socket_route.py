@@ -1024,6 +1024,44 @@ def test_a_ping_only_socket_turn_does_not_get_twenty_minutes_of_patience(monkeyp
     assert w.status == "ready"
 
 
+
+
+def _waiting_socket_worker(idle_s, *, socket=True):
+    import time as _t
+    w = _worker()
+    w.socket = socket
+    w.drv = _GenDrv2(generating=True, idle_s=idle_s)
+    w.status = "waiting"
+    w._count_before = 0
+    w._t_send = _t.time() - 100.0   # below the old 240s outer timeout
+    return w
+
+
+def test_waiting_socket_uses_meaningful_idle_watchdog_before_outer_timeout(monkeypatch):
+    monkeypatch.setattr(rf, "SOCKET_MEANINGFUL_IDLE_S", 90.0)
+    w = _waiting_socket_worker(91.0)
+    assert w.poll() is False
+    assert "no meaningful progress" in w.drv.failed
+    assert "reconnect/fallback" in w.reason
+    assert w.status == "ready"
+    assert w.transient == 0, "transport stall detection is not a turn-timeout retry"
+
+
+def test_waiting_socket_with_recent_progress_keeps_waiting(monkeypatch):
+    monkeypatch.setattr(rf, "SOCKET_MEANINGFUL_IDLE_S", 90.0)
+    w = _waiting_socket_worker(89.0)
+    assert w.poll() is False
+    assert not w.drv.failed
+    assert w.status == "waiting"
+
+
+def test_waiting_tab_is_not_subject_to_socket_meaningful_idle(monkeypatch):
+    monkeypatch.setattr(rf, "SOCKET_MEANINGFUL_IDLE_S", 90.0)
+    w = _waiting_socket_worker(999.0, socket=False)
+    assert w.poll() is False
+    assert not w.drv.failed
+    assert w.status == "waiting"
+
 def test_a_socket_turn_that_has_stopped_falls_back_to_the_normal_rules():
     """生成が止まっているのに待ち続けるのは、ただのハングになる。"""
     w = _deferring_worker(_GenDrv2(generating=False))
