@@ -1117,6 +1117,8 @@ class CockpitWindow : Window
         public string Reason = "";
         public double Started = 0;
         public double Expires = 0;
+        public int SupervisorPid = 0;
+        public double SupervisorStarted = 0;
     }
     // Old supervisors wrote only `started`; preserve that format for one deployment generation.
     // New supervisors write their own policy-derived expiry. The hard cap is only corruption /
@@ -2705,7 +2707,7 @@ class CockpitWindow : Window
             if (!File.Exists(path)) return null;
             var raw = _js.DeserializeObject(File.ReadAllText(path, Encoding.UTF8)) as Dictionary<string, object>;
             if (raw == null) return null;
-            object stateObj, reasonObj, startedObj, expiresObj;
+            object stateObj, reasonObj, startedObj, expiresObj, supervisorPidObj, supervisorStartedObj;
             if (!raw.TryGetValue("state", out stateObj) || stateObj == null) return null;
             string state = Convert.ToString(stateObj).Trim().ToLowerInvariant();
             if (state != "planned_restart") return null;
@@ -2723,11 +2725,32 @@ class CockpitWindow : Window
             double effectiveExpiry = Math.Min(expires, started + SERVER_TRANSITION_HARD_MAX_AGE_S);
             if (nowUnix > effectiveExpiry) return null;
 
+            // OWNERSHIP IS PART OF FRESHNESS. A PID alone is unsafe on Windows because it can be
+            // reused after the supervisor dies. New markers therefore name both PID and process
+            // birth. If either is missing/unreadable/mismatched, fail closed: an unverifiable
+            // marker is never permission to soften a real server outage from red to yellow.
+            if (!raw.TryGetValue("supervisor_pid", out supervisorPidObj) || supervisorPidObj == null) return null;
+            if (!raw.TryGetValue("supervisor_started", out supervisorStartedObj) || supervisorStartedObj == null) return null;
+            int supervisorPid = Convert.ToInt32(supervisorPidObj, System.Globalization.CultureInfo.InvariantCulture);
+            double supervisorStarted = Convert.ToDouble(supervisorStartedObj, System.Globalization.CultureInfo.InvariantCulture);
+            if (supervisorPid <= 0 || supervisorStarted <= 0.0) return null;
+            try
+            {
+                var supervisorProcess = System.Diagnostics.Process.GetProcessById(supervisorPid);
+                if (supervisorProcess.HasExited) return null;
+                double processStarted = new DateTimeOffset(supervisorProcess.StartTime.ToUniversalTime()).ToUnixTimeSeconds();
+                if (Math.Abs(processStarted - supervisorStarted) > 2.0) return null;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+
             string reason = "planned restart";
             if (raw.TryGetValue("reason", out reasonObj) && reasonObj != null)
                 reason = Convert.ToString(reasonObj).Trim();
             if (string.IsNullOrEmpty(reason)) reason = "planned restart";
-            return new PlannedServerTransition { State = state, Reason = reason, Started = started, Expires = expires };
+            return new PlannedServerTransition { State = state, Reason = reason, Started = started, Expires = expires, SupervisorPid = supervisorPid, SupervisorStarted = supervisorStarted };
         }
         catch (Exception)
         {
