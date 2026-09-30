@@ -43,6 +43,11 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass
 
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
+from tools.childproc import run as _child_run  # noqa: E402  (decodes without the locale codec)
+
 REMOTE_DIR = "C:/wsl-setup"
 REMOTE_DIFFS_WIN = REMOTE_DIR + "/diffs"
 REMOTE_DIFFS_WSL = "/mnt/c/wsl-setup/diffs"
@@ -101,15 +106,6 @@ def _scrub(text: str, host: str = "", limit: int = 300) -> str:
     return t[:limit]
 
 
-def _decode(raw: bytes) -> str:
-    if not raw:
-        return ""
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return raw.decode("cp932", errors="replace")
-
-
 # -- the injectable transport --------------------------------------------------------------------
 
 class Transport:
@@ -124,7 +120,7 @@ class Transport:
 
     def _run(self, argv, timeout):
         try:
-            r = subprocess.run(argv, capture_output=True, timeout=timeout)
+            r = _child_run(argv, timeout=timeout)
         except subprocess.TimeoutExpired:
             raise TransportError("timeout")
         except OSError as exc:
@@ -138,7 +134,7 @@ class Transport:
         r = self._run([self._exe("ssh"), "-o", "ConnectTimeout=45", "-o", "BatchMode=yes",
                        "-o", "ServerAliveInterval=30", self.host,
                        "powershell", "-NoProfile", "-EncodedCommand", b64], timeout)
-        return r.returncode, _decode(r.stdout).replace("\x00", "") + "\n" + _decode(r.stderr)
+        return r.returncode, (r.stdout or "").replace("\x00", "") + "\n" + (r.stderr or "")
 
     def scp_to(self, local: str, remote_win: str, timeout: float = 120) -> bool:
         r = self._run([self._exe("scp"), "-o", "ConnectTimeout=45", "-o", "BatchMode=yes",

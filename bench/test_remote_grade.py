@@ -161,3 +161,20 @@ def test_source_holds_no_hostnames_or_secrets():
     src = open(R.__file__, encoding="utf-8").read()
     for bad in ("shuttle-scope", "kiyus", "M118", "resonac", "password="):
         assert bad not in src.replace("password=<redacted>", "")
+
+
+def test_real_transport_maps_process_errors(monkeypatch):
+    import subprocess
+    import types
+
+    def boom(argv, timeout=None):
+        raise subprocess.TimeoutExpired(argv, timeout)
+    monkeypatch.setattr(R, "_child_run", boom)
+    with pytest.raises(R.TransportError) as ei:
+        R.Transport(HOST).ps("x", 1)
+    assert ei.value.kind == "timeout"
+
+    ok = types.SimpleNamespace(returncode=0, stdout="ok\x00\n", stderr="")
+    monkeypatch.setattr(R, "_child_run", lambda argv, timeout=None: ok)
+    rc, out = R.Transport(HOST).ps("x", 1)
+    assert rc == 0 and "ok" in out and "\x00" not in out
