@@ -4232,6 +4232,41 @@ class RelayWorker:
         except Exception:
             return False
 
+    def _socket_meaningful_idle_stalled(self, now=None):
+        """Fail one live socket turn after meaningful-progress silence.
+
+        This guard used to exist only in ``_defer_generation`` (the *next-send* path). A socket
+        already in ``status == waiting`` therefore sat behind the outer 240s turn timeout even
+        when the transport itself had reported >90s without meaningful progress. Keep the
+        transport decision in one place and call it from BOTH wait states. It is deliberately
+        socket-only; tab workers retain their existing generation/timeout rules.
+        """
+        if not getattr(self, "socket", False):
+            return False
+        is_generating = getattr(self.drv, "_is_generating", None)
+        if not callable(is_generating):
+            return False
+        try:
+            if not is_generating():
+                return False
+            idle_fn = getattr(self.drv, "generation_idle_s", None)
+            idle_s = float(idle_fn()) if callable(idle_fn) else 0.0
+            if idle_s < SOCKET_MEANINGFUL_IDLE_S:
+                return False
+            reason = ("socket turn made no meaningful progress for %.0fs "
+                      "(limit %.0fs)" % (idle_s, SOCKET_MEANINGFUL_IDLE_S))
+            fail_fn = getattr(self.drv, "fail_stalled_turn", None)
+            if callable(fail_fn):
+                fail_fn(reason)
+            else:
+                self.drv.failed = reason
+            self.reason = reason + " -> reconnect/fallback"
+            self._cooldown_until = (time.time() if now is None else float(now)) + 0.5
+            self.status = "ready"
+            return True
+        except Exception:
+            return False
+
     def _defer_generation(self):
         """Schedule a non-failure RESCHEDULE because the previous turn is still generating.
         Unlike _retry_transient this does NOT touch self.transient (the transient/STUCK
@@ -4260,22 +4295,10 @@ class RelayWorker:
         # snapshot at the end, so `_gen_progress_sig` is flat for a turn that is streaming
         # perfectly well underneath.
         if getattr(self, "socket", False) and getattr(self.drv, "_is_generating", None):
+            if RelayWorker._socket_meaningful_idle_stalled(self, now):
+                return True
             try:
                 if self.drv._is_generating():
-                    idle_fn = getattr(self.drv, "generation_idle_s", None)
-                    idle_s = float(idle_fn()) if callable(idle_fn) else 0.0
-                    if idle_s >= SOCKET_MEANINGFUL_IDLE_S:
-                        reason = ("socket turn made no meaningful progress for %.0fs "
-                                  "(limit %.0fs)" % (idle_s, SOCKET_MEANINGFUL_IDLE_S))
-                        fail_fn = getattr(self.drv, "fail_stalled_turn", None)
-                        if callable(fail_fn):
-                            fail_fn(reason)
-                        else:
-                            self.drv.failed = reason
-                        self.reason = reason + " -> reconnect/fallback"
-                        self._cooldown_until = now + 0.5
-                        self.status = "ready"
-                        return True
                     self.gen_waits += 1          # still counted, so the wait is observable
                     self._cooldown_until = now + 2.0
                     self.status = "ready"
@@ -7134,6 +7157,11 @@ class RelayWorker:
             return self.status in TERMINAL
         if self.status == "waiting":
             self._capture_url()
+            # The transport knows sooner than the generic 240s turn clock when a socket has
+            # stopped making meaningful progress. Consult that signal while the turn is actually
+            # waiting, not only later when a subsequent send discovers the previous generation.
+            if RelayWorker._socket_meaningful_idle_stalled(self, time.time()):
+                return False
             # THE LABEL NAMES THE CLOCK THAT FIRED, AND THE BUDGET IS THE ONE COMPARED. This
             # branch compares against per_turn_timeout_s for every worker, and then chose
             # `origin` from the worker's TRANSPORT -- so a socket worker's row said

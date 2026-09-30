@@ -6,6 +6,15 @@ This file is the CURRENT operational task authority for the `<companion-repo>` w
 
 Every material user-requested change, regression, newly discovered blocker, implementation, validation result, commit, push, CI/CodeQL result, or status reversal MUST update this ledger in the same work session. Do not continue by memory or by an older handoff after the user's requested behavior changes.
 
+Mid-stream user interruptions are FIRST-CLASS TASK INPUT, not chat-only context. On every interruption that changes/extends the work:
+1. record the new instruction in this ledger immediately, before doing substantial new implementation;
+2. record how it changes priority/acceptance and the exact resume point of the interrupted work;
+3. execute the new instruction;
+4. automatically resume the interrupted work without waiting for another `continue`/`続けて` from the user;
+5. when the interruption reveals a durable operating rule (for example branch convergence, GUI-visible submission, or evidence requirements), update the rule section as well as the individual task.
+
+A user should never need to remind the agent to resume a previously active task merely because they supplied an additional instruction in the middle of it.
+
 While any P0 regression below is OPEN / REOPENED / IN PROGRESS, do not resume unrelated C2C/durable-runtime feature development. Stabilize the product the user is actually running first.
 
 CopilotAgent delegated work must use the GUI-visible route. Long-running investigation may be delegated, but the submission must remain visible in the product UI. Commit/push at meaningful atomic boundaries so CI, Windows build, CodeQL, Secret scan, PowerShell lint and workflow checks can run; do not blindly commit incidental files.
@@ -22,6 +31,32 @@ CopilotAgent delegated work must use the GUI-visible route. Long-running investi
 - `origin/main`: `b235e01` (merged PR #66 baseline)
 - PR #66 head `16c8c29` passed CI, Windows build, install path, CodeQL, Secret scan, PowerShell lint and Workflow lint before merge.
 
+## CONVERGENCE / MAIN INTEGRATION -- binding plan
+
+Status: IN PROGRESS / DO NOT CREATE ANOTHER STABILIZATION BRANCH
+
+Current stabilization work converges through `fix/phase2-audit-followups-20260929` / PR #67 into `main`. Do not create another stabilization branch unless PR #67 becomes technically unusable; if an exceptional split is required, record the reason here before creating it.
+
+Merge gate for PR #67:
+1. finish the current P0 regressions on THIS branch: combined left `内容詳細` + `実行タイムライン`, socket long-wait/watchdog placement, and unlock/no-tool false-positive handling;
+2. run focused regressions plus CI manifest; rebuild Windows UI whenever UI source changes;
+3. commit/push each meaningful atomic repair to PR #67 so CI/Windows/CodeQL/Secret scan/PowerShell lint/Workflow lint can run;
+4. once current-head checks are green and P0 acceptance is met, merge PR #67 to `main` promptly rather than continuing unrelated feature work on the branch;
+5. verify post-merge `main` workflows, then reconcile old branches/PRs by patch equivalence. Close/delete only those whose unique changes are already merged or explicitly superseded; do not mass-delete by branch name.
+
+Current convergence snapshot (2026-09-30): `origin/main` = `b235e01`; PR #67 remote head before the current uncommitted fixes = `fb21c93`. The local worktree currently has tracked edits in `ui/FleetCockpit.cs` (combined details+timeline work) and `relay/test_socket_route.py` (socket waiting watchdog regression tests); untracked `reviews/` remains intentionally untouched.
+
+## CURRENT MID-STREAM INSTRUCTION / RESUME QUEUE
+
+This section is updated immediately when the user interrupts ongoing work. It is the resume authority after the interrupt is handled.
+
+1. ACTIVE -- STAB-002 latest UX requirement: the left 220px Spine must contain BOTH `内容詳細` and `実行タイムライン`. Keep the useful content-detail implementation; restore timeline in the same left frame using the historical/shared `phase_events` / `BuildTimelineEvents` contract. Expanded-card Timeline remains as detailed evidence.
+2. LIVE VERIFY -- STAB-004: waiting-path meaningful-idle repair is implemented and regression-green. Re-measure one GUI-submitted task under the new runner and confirm a socket with >90s no meaningful progress transitions to reconnect/fallback before the generic 240s timeout.
+3. ACTIVE -- unlock false-positive investigation: recent transcripts repeatedly contain responses equivalent to `no tool was executed, therefore unlock is unnecessary`; Fleet then sees unlock/lock marker words and promotes the response into lock suspicion / intervention. Distinguish an explicit `unlock not required` / read-only/no-tool response from an actual write/tool lock refusal before escalating to unlock probe or needs-attention.
+4. INTEGRATION -- after the three items above are green, commit/push them on PR #67, verify current-head checks, merge to `main`, verify post-merge main, then reconcile superseded old branches/PRs.
+
+Resume rule: after any newly injected user instruction is handled, return automatically to the first still-ACTIVE item above. Do not wait for another user prompt.
+
 ## P0 -- restore current product behavior before feature work
 
 ### STAB-001 -- keep this ledger synchronized
@@ -34,8 +69,8 @@ Acceptance:
 - each meaningful implementation/validation/commit updates this file before moving to another topic;
 - no old handoff is treated as the current task list without reconciling this file first.
 
-### STAB-002 -- FleetCockpit left panel: `実行タイムライン` -> `内容詳細`
-Status: PATCH VALIDATED LOCALLY / LIVE TASK RE-VERIFY PENDING
+### STAB-002 -- FleetCockpit left panel: combined `内容詳細` + `実行タイムライン`
+Status: IN PROGRESS / REQUIREMENT RECONCILED FROM LIVE SCREENSHOT
 
 User reports that the intended/current change is to replace the execution-timeline presentation with `内容詳細`, but neither the current local source nor git history contains `内容詳細`.
 
@@ -65,6 +100,14 @@ Validation:
 - rebuilt FleetCockpit + CopilotChat successfully; post-build related UI set: 74 passed;
 - both UI processes launched from the rebuilt binaries;
 - idle Fleet hides the Spine by design, so one live-task visual/UIA verification is still required before CLOSED.
+2026-09-30 latest user correction (from live screenshot): `内容詳細` was a good addition but replacing the left timeline entirely was wrong. The intended left frame contains both surfaces. Historical git lineage was traced immediately: `90690ee` introduced the Evidence Spine; `25d7f1c` / `e7a3283` preserved selected-worker progress; `d639ea6` introduced durable execution progress (`current_step`, `last_progress`, `next_step`). Current implementation should combine those contracts instead of choosing one.
+
+Updated acceptance:
+- left Spine shows compact current task/content details FIRST (`goal_summary`, state/current/progress/next/waiting/artifacts where available);
+- the same left Spine also shows `実行タイムライン` / `Execution timeline` using the shared historical event contract (`phase_events` first, transcript-derived fallback);
+- timeline repaint tracks phase-event changes as well as content-detail changes;
+- expanded-card Timeline remains detailed evidence; full Goal remains in Overview;
+- live-task screenshot/visual verification required after rebuild.
 
 ### STAB-003 -- foreground PowerShell / cmd window when CopilotAgent opens or work is submitted
 Status: PATCH VALIDATED LOCALLY / LIVE RE-VERIFY PENDING
@@ -116,6 +159,13 @@ Acceptance:
 - read-only audit goals no longer become acting merely because they prohibit actions;
 - positive/conditional/ambiguous real actions still fail closed as acting;
 - live validation measures submit/reply/wait timestamps before calling this resolved.
+
+2026-09-30 waiting-path repair:
+- measured root cause reproduced: socket workers in `status == waiting` did not consult `SOCKET_MEANINGFUL_IDLE_S`; they could sit behind the generic 240s turn timeout even after the transport had already reported >90s without meaningful progress;
+- extracted `_socket_meaningful_idle_stalled()` as the single transport-level guard and call it from both `_defer_generation()` and the live `waiting` poll path; tabs are explicitly excluded;
+- a stalled socket becomes `ready` with `reconnect/fallback` reason without consuming the generic transient timeout retry budget;
+- `relay/test_socket_route.py`: full suite **119 passed**; related timeout/resend/settle/policy set **85 passed, 2 skipped**; CI manifest **715 pytest files listed / OK**; `git diff --check` clean;
+- status remains REOPENED until a live GUI-submitted task is re-measured after the new runner code is actually active.
 
 ### STAB-005 -- task entered/submitted but not reflected in Fleet UI
 Status: REOPENED / VERIFY CURRENT PATH
@@ -204,3 +254,4 @@ These do not outrank the live P0 regressions above unless they become direct blo
 - 2026-09-30: STAB-007 resend-policy repair validated: 36 focused tests green; broader related set 88 passed / 2 skipped; committed atomically and pushed as `cca3295`. Pre-commit identity guard caught a repository-specific label in this private ledger; it was replaced with a generic placeholder rather than bypassing the guard.
 - 2026-09-30: STAB-003 foreground-console investigation ruled out C2C/Cockpit/Edge headless launchers, found eight recent nested `submit_via_ui.ps1` PowerShell starts and four tracked automation callers that created a redundant child shell. Those callers were converted to in-process invocation; parser 0/4 and 14 related tests green. Live re-verification remains pending.
 - 2026-09-30: STAB-002 operator-facing left Spine changed from the duplicate execution timeline to `内容詳細`. Timeline evidence remains in expanded cards. New/related tests 60 green; rebuilt-binary UI set 74 green. Live-task visual verification remains pending because the current Fleet is idle and hides the Spine.
+- 2026-09-30: user explicitly required interruption-safe operation. Added mandatory rule: every mid-stream instruction is recorded immediately with priority + resume point, handled, then interrupted work auto-resumes without another `continue`. Also recorded binding PR #67 -> main convergence plan and latest combined content-details + timeline requirement.
