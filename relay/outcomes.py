@@ -63,6 +63,11 @@ STATUS_OF = {
     #: already ran to completion.
     "EVIDENCE_CONTRADICTED": "done",
     "ERROR": "error",
+    #: The coordinator process died (crash, kill, disk full) while this worker was unfinished.
+    #: Written ONLY by relay/fleet_reaper.py into the sidecars of a dead process; a live
+    #: coordinator never holds it. NOT "cancelled": nobody asked for a stop, and the work is
+    #: resumable, so showing it as Stopped told the owner healthy workers had been cancelled.
+    "INTERRUPTED": "interrupted",
 }
 
 #: The closed set. Nothing outside it may be assigned to a worker's outcome.
@@ -86,7 +91,9 @@ RETRYABLE = frozenset({"STUCK", "INFRA_STUCK", "REFUSED"})
 #: saying stop. CONTENT_REFUSED is a judgement about the request, and
 #: repeating a request unchanged does not change a judgement of it. VERIFY_FAILED produced an
 #: answer that failed its acceptance check -- a retry is the caller's decision, not the
-#: loop's. ERROR is an exception whose cause is not known to be transient.
+#: loop's. ERROR is an exception whose cause is not known to be transient. INTERRUPTED is not
+#: retried per worker: recovery belongs to the coordinator-level resume, and letting the
+#: cockpit's per-worker requeue also fire would run the same work twice.
 NON_RETRYABLE = frozenset(OUTCOMES - RETRYABLE)
 
 #: Finished as a goal, so a context-loss recovery must not resurrect it. NOT the complement of
@@ -96,6 +103,7 @@ NON_RETRYABLE = frozenset(OUTCOMES - RETRYABLE)
 FINISHED = frozenset({
     "DONE", "FANOUT", "MAXTURNS", "CANCELLED", "CONTENT_REFUSED",
     "STUCK",
+    # (INTERRUPTED is deliberately absent: it did NOT finish, so a recovery must re-queue it.)
     # The worker ran to the end; only the truth of its claim is in question.
     "EVIDENCE_CONTRADICTED",
 })
@@ -167,6 +175,8 @@ SCORING = {
     # A claim the record does not support does not count as a pass.
     "EVIDENCE_CONTRADICTED": "fail",
     "ERROR": "fail",
+    # Fail closed: an interrupted worker has no answer yet. Excluded only with zero turns.
+    "INTERRUPTED": "fail",
 }
 
 #: Outcomes that leave the denominator WHEN THE WORKER TOOK NO TURNS, and only then.
@@ -177,7 +187,7 @@ SCORING = {
 #: stopped at turn nine was tried, and an INFRA_STUCK after nine turns is a connection that
 #: died mid-work, not one that never opened. The turn count is what separates them, and it is
 #: the only part of this that cannot be argued with after the fact.
-EXCLUDED_WITHOUT_WORK = frozenset({"CANCELLED", "INFRA_STUCK"})
+EXCLUDED_WITHOUT_WORK = frozenset({"CANCELLED", "INFRA_STUCK", "INTERRUPTED"})
 
 
 def scoring_of(outcome, turns=None) -> str:
