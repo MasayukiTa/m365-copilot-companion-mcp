@@ -156,6 +156,15 @@ def test_generic_atomic_sink_refuses_even_existing_legacy_plaintext_auth(tmp_pat
     assert env.read_bytes() == old
 
 
+
+
+def test_migration_aware_atomic_edit_protects_legacy_before_final_sink(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_bytes(b"MCP_API_KEY=legacy\r\nOTHER=1\r\n")
+    monkeypatch.setattr(E, "_protect_secret", lambda value: "dpapi:test-" + value)
+    E.atomic_edit_text(env, "MCP_API_KEY=legacy\r\nOTHER=2\r\n")
+    assert env.read_bytes() == b"MCP_API_KEY_PROTECTED=dpapi:test-legacy\r\nOTHER=2\r\n"
+
 def test_unrelated_edit_migrates_existing_api_key_to_dpapi(tmp_path, monkeypatch):
     env = tmp_path / ".env"
     env.write_bytes(b"MCP_API_KEY=legacy-api\r\nMCP_TUNNEL_ALLOW_ANONYMOUS=1\r\nOTHER=1\r\n")
@@ -265,7 +274,9 @@ def test_codeql_suppression_is_tied_to_the_sink_guard():
     src = (HERE / "env_file.py").read_text(encoding="utf-8")
     assert "_assert_no_plaintext_auth_persistence(text)" in src
     assert "def _migrate_legacy_plaintext_auth(text: str)" in src
-    assert src.count("_migrate_legacy_plaintext_auth(candidate)") == 2
+    assert "def atomic_edit_text(path: Path, text: str, attempts: int = 10)" in src
+    assert "atomic_write_text(path, _migrate_legacy_plaintext_auth(text), attempts=attempts)" in src
+    assert src.count("atomic_edit_text(path, candidate)") == 2
     lines = src.splitlines()
     i = next(i for i, line in enumerate(lines) if "fh.write(data)" in line)
     assert "# codeql[py/clear-text-storage-sensitive-data]" in lines[i - 1]

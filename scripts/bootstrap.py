@@ -1399,7 +1399,7 @@ def step_gen_env() -> None:
         if appended:
             # ATOMIC (D28): a truncated .env makes the next run mint a new MCP_API_KEY, and
             # Copilot Studio then gets 401 with every local check green.
-            env_file.atomic_write_text(env_path, env_file.append_lines(current, appended))
+            env_file.atomic_edit_text(env_path, env_file.append_lines(current, appended))
             if missing:
                 log("    OK: .env already exists; added the template key(s) it lacked: "
                     + ", ".join(line.split("=", 1)[0] for line in missing))
@@ -1938,7 +1938,7 @@ def _set_aside_machine_bound_tunnel_keys(env_path: Path, text: str) -> list | No
             out.append("# " + line)
         else:
             out.append(line)
-    env_file.atomic_write_text(env_path, nl.join(out) + nl)
+    env_file.atomic_edit_text(env_path, nl.join(out) + nl)
     return keys
 
 
@@ -1992,7 +1992,7 @@ def _write_tunnel_to_env(tunnel: str, url: str | None) -> None:
         # that is keeping it, which is the machine that must host it.
         kept.append("MCP_TUNNEL_HOST=" + _this_host())
     # CRLF endings, UTF-8 WITHOUT BOM, and ATOMIC (D28): tmp file + rename, never a truncate.
-    env_file.atomic_write_text(env_path, "\r\n".join(kept) + "\r\n")
+    env_file.atomic_edit_text(env_path, "\r\n".join(kept) + "\r\n")
 
 
 def _devtunnel_logged_in(dt: str) -> bool:
