@@ -93,6 +93,10 @@ _RECOVERY_RESULT = {
 # The cost of a phantom is not nothing: it reads as a state the system can reach, so anybody
 # reasoning about refusals had a case to consider that cannot occur, and anybody adding a
 # real one would have found the name taken.
+# "interrupted" is DELIBERATELY not here: it is written only by relay/fleet_reaper.py into the
+# sidecars of a DEAD coordinator (resumable work), so no live coordinator ever holds it. Adding
+# it would make an interrupted worker count as finished. Pinned by
+# tests/test_interrupted_status_is_classified_everywhere.py.
 TERMINAL = (
     "done", "stuck", "maxturns", "error", "cancelled",
     "content_refused",
@@ -2958,6 +2962,7 @@ _PHASE_LABELS = {
     "maxturns":    "Needs attention",
     "error":       "Stopped (error)",
     "cancelled":   "Stopped",
+    "interrupted": "Interrupted",   # written only by relay/fleet_reaper.py; never held live
     "fresh_replay": "Fresh replay",
     "content_refused": "Content refused",
 }
