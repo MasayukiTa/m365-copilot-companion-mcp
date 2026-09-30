@@ -2318,6 +2318,10 @@ SOCKET_TURN_TIMEOUT_S = float(os.environ.get("MCP_FLEET_SOCKET_TURN_S", "1200"))
 # nor a progress frame, fail the socket turn and let the existing reconnect/fallback policy act.
 # Long research is unaffected as long as it emits progress.
 SOCKET_MEANINGFUL_IDLE_S = float(os.environ.get("MCP_FLEET_SOCKET_IDLE_S", "90"))
+# Diagnostic-only thresholds. Each socket turn records the first crossing of each bucket so we
+# can lower SOCKET_MEANINGFUL_IDLE_S from evidence instead of guessing. These do not affect
+# recovery, retry budgets or transport state.
+SOCKET_IDLE_PROBE_BUCKETS = (5.0, 10.0, 20.0, 30.0, 45.0, 60.0, 90.0)
 
 
 def free_disk_gb(path=None):
@@ -2839,6 +2843,10 @@ class RelayWorker:
         #: it nothing reports SUCCESS, the breaker's consecutive counter never resets, and a
         #: long healthy run closes the route on three failures scattered across hours.
         self._socket_turns_seen = 0
+        # Diagnostic crossing memory for meaningful-idle telemetry. Reset lazily when `turn`
+        # changes so a healthy long-lived worker emits at most seven tiny records per turn.
+        self._socket_idle_probe_turn = -1
+        self._socket_idle_probe_seen = set()
         #: Whether this worker STARTED on a socket and had to open a tab. Distinct from
         #: `socket`, which is False afterwards and so cannot answer "which route did this
         #: goal actually need" -- the one question the classifier will be built to predict.
@@ -4244,6 +4252,35 @@ class RelayWorker:
         except Exception:
             return False
 
+    def _record_socket_idle_probe(self, idle_s):
+        """Record first meaningful-idle threshold crossings for this socket turn.
+
+        This is measurement only. It must never change status, cooldowns, retry counts or the
+        driver's failure state. `SocketRoute.record` itself is best-effort/non-blocking.
+        """
+        try:
+            turn = int(getattr(self, "turn", 0) or 0)
+            if getattr(self, "_socket_idle_probe_turn", -1) != turn:
+                self._socket_idle_probe_turn = turn
+                self._socket_idle_probe_seen = set()
+            seen = getattr(self, "_socket_idle_probe_seen", set())
+            route = _socket_route()
+            for bucket in SOCKET_IDLE_PROBE_BUCKETS:
+                bucket = float(bucket)
+                if idle_s < bucket or bucket in seen:
+                    continue
+                seen.add(bucket)
+                if route is not None:
+                    route.record(
+                        "socket_idle_probe", worker=self.name, turn=turn,
+                        run_id=getattr(self, "run_id", "") or "",
+                        jid=getattr(self, "jid", None), status=self.status,
+                        bucket_s=bucket, idle_s=round(float(idle_s), 3),
+                        limit_s=float(SOCKET_MEANINGFUL_IDLE_S))
+            self._socket_idle_probe_seen = seen
+        except Exception:
+            pass
+
     def _socket_meaningful_idle_stalled(self, now=None):
         """Fail one live socket turn after meaningful-progress silence.
 
@@ -4263,6 +4300,7 @@ class RelayWorker:
                 return False
             idle_fn = getattr(self.drv, "generation_idle_s", None)
             idle_s = float(idle_fn()) if callable(idle_fn) else 0.0
+            self._record_socket_idle_probe(idle_s)
             if idle_s < SOCKET_MEANINGFUL_IDLE_S:
                 return False
             reason = ("socket turn made no meaningful progress for %.0fs "

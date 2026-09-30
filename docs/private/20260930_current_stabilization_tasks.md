@@ -71,7 +71,7 @@ Acceptance:
 - no old handoff is treated as the current task list without reconciling this file first.
 
 ### STAB-002 -- FleetCockpit left panel: combined `内容詳細` + `実行タイムライン`
-Status: PATCH COMMITTED / PUSHED (`540ebdb`) / LIVE VISUAL VERIFY PENDING
+Status: CLOSED / LIVE VISUALLY VERIFIED (2026-09-30 13:36 JST)
 
 User reports that the intended/current change is to replace the execution-timeline presentation with `内容詳細`, but neither the current local source nor git history contains `内容詳細`.
 
@@ -111,6 +111,7 @@ Updated acceptance:
 - live-task screenshot/visual verification required after rebuild;
 - timeline labels alone are insufficient when richer worker data exists: visible entries should identify the concrete work/progress (current step / progress / reason / phase label or equivalent) without inventing details.
 - 2026-09-30 implementation completed/pushed as `540ebdb` (`fix(cockpit): restore timeline beside content details`). The left Spine now keeps `内容詳細` first, restores the shared execution timeline beneath it, and adds a bounded `現在 / Now` line sourced only from `execution.current_step`, `last_progress`, then worker `reason` so timeline context identifies the concrete work instead of showing phase names alone. Related UI regressions: **61 passed**; rebuilt `FleetCockpit.exe` / `CopilotChat.exe` and both relaunched successfully. Remaining acceptance item: live-task visual screenshot/UIA verification only.
+- 2026-09-30 13:36 JST live visual acceptance completed against a real running Fleet (`running=true`, three workers present). A non-focus-stealing `PrintWindow` capture of the live 1080x760 FleetCockpit showed the left Spine rendering `内容詳細` first with the focused W0 task identity, `実行中 / Turn 3/40`, wait/reason context, and then `実行タイムライン` below it with a concrete `現在:` line plus timestamped launch/running events. This is the exact combined surface required by the latest user correction; STAB-002 is now CLOSED.
 
 ### STAB-003 -- foreground PowerShell / cmd window when CopilotAgent opens or work is submitted
 Status: REOPENED / LIVE REGRESSION CONFIRMED BY USER
@@ -134,6 +135,7 @@ Validation:
 - GUI submitter + roundtrip + existing no-console-launch ratchet: **14 passed**;
 - new regression catches all four pre-fix nested launch sites and is registered in blocking CI;
 - still requires a live post-patch observation before this item can be called CLOSED.
+- 2026-09-30 additional repair-dispatcher hardening committed/pushed as `66cce14` (`fix(windows): keep repair child processes windowless`): `scripts/repair.ps1` no longer reparses fixed PowerShell repair commands through a fresh visible `powershell.exe`. PowerShell-backed registry entries now carry structured `Script + Args` metadata and run via one `ProcessStartInfo` launcher with `UseShellExecute=false`, `CreateNoWindow=true`, `WindowStyle=Hidden`, and redirected stdout/stderr; live doctor JSON invocation uses the same hidden launcher. Focused repair tests **12 passed**, PowerShell parser clean, CI manifest clean after staging, and a `-DryRun -MockJson` dispatcher run completed exit 0 without executing the repair. Branch workflows already reported Windows build / PowerShell lint / Workflow lint / CodeQL / Secret scan / install-path green; main latest CI also finished green. This narrows the remaining STAB-003 acceptance to an actual post-patch GUI-visible submission/open observation, not more source inspection.
 
 Existing fixes do not close this item:
 - `73bf387` added repository windowless policy to several unattended PowerShell/fleet launches;
@@ -172,6 +174,7 @@ Acceptance:
 - status remains REOPENED until a live GUI-submitted task is re-measured after the new runner code is actually active;
 - 90s is not the final target: quantify healthy socket `generation_idle_s` and reduce the threshold / recovery loop to the smallest safe evidence-based latency.
 - 2026-09-30 current repair: removed the contradictory socket worker-count admission gate. Socket workers no longer sit PENDING behind the tab/RAM cap; request-rate pacing now occurs at the actual generative socket send, while tabs retain attach-time pacing. New `relay/test_socket_admission_no_pending.py` plus related socket/timeout/resend coverage: **170 passed, 2 skipped**; CI manifest now lists **716 pytest files**; `py_compile` and `git diff --check` clean. Committed/pushed as `b3d9ce5` (`fix(fleet): pace socket sends without pending workers`). This closes the synthetic admission regression, but live latency measurement is still required before STAB-004 closes.
+- 2026-09-30 15:16 JST live-evidence review: the 13:44 GUI/Fleet transcript `r6abc7f6c_a2_w0` shows turn 1 user send -> assistant reply in **22.3s**, then turn 2 produced no assistant reply and hit the generic timeout at **240.5s**. Separately, `socket_route.jsonl` records a 13:29 socket attempt falling back at **91s meaningful idle** (`limit 90s`). These are evidence that current long waits are transport-silence dominated, but they are not enough to lower the threshold safely because healthy tool/search progress gaps were not recorded. Next measurement step: record only first crossings of 5/10/20/30/45/60/90s `generation_idle_s` per socket turn, then submit a GUI-visible read-only task and measure healthy max-idle vs stalled recovery before changing the 90s limit. The diagnostic-only `socket_idle_probe` instrumentation is now implemented locally; full `relay/test_socket_route.py` is **121 passed**, related resend/timeout/settle/policy coverage is **85 passed, 2 skipped**, CI manifest reports **722 pytest files / OK**, `py_compile` and `git diff --check` are clean.
 
 ### STAB-005 -- task entered/submitted but not reflected in Fleet UI
 Status: REOPENED / VERIFY CURRENT PATH
