@@ -1900,6 +1900,8 @@ def _socket_route_path(state_dir=None):
 #: outcome=None) is not a real terminal state -- an artifact of a row recorded before the
 #: worker had settled -- so it deliberately maps to nothing and is treated the same as no row
 #: at all: not yet resolved.
+# "interrupted" (fleet reaper: the coordinator died, work resumable) is deliberately absent, so it
+# maps to "unknown" = not yet resolved, which is right for a job whose fleet may resume.
 _WORKER_STATUS_TO_JOB_STATUS = {"done": "done", "cancelled": "cancelled",
                                 "error": "error", "stuck": "stuck"}
 
