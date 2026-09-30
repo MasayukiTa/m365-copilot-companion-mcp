@@ -78,3 +78,11 @@ def test_durable_steer_does_not_require_a_live_browser_controller():
     # LOCAL_LOOP is routed before the Fleet-only RunIsLive refusal so WAITING_RUNTIME /
     # browser-rotated durable jobs can still accept an operator correction into SQLite.
     assert method.index("IsLocalLoopWorker(worker)") < method.index("if (!RunIsLive())")
+
+
+def test_local_operator_wait_does_not_offer_a_steer_box():
+    card = _method("Border Card(Dictionary<string, object> w)", "UIElement BuildCardTabs(")
+    assert 'bool localSteerBlocked = isLocalLoop && (status == "waiting_user"' in card
+    assert 'status == "waiting_external" || status == "needs_routing"' in card
+    assert 'if (!terminal && !localSteerBlocked) col.Children.Add(CollapsedSteerRow(name));' in card
+    assert 'if (!terminal && !localSteerBlocked) col.Children.Add(SteerRow(name));' in card
