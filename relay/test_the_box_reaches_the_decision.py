@@ -140,24 +140,25 @@ def test_the_ram_floor_the_operator_set_reaches_the_autoscale(settings):
 # ---- the one link that is still source, said out loud ------------------------------------------
 
 def test_the_admission_loop_asks_with_the_box_and_not_a_copy():
-    """WHAT THE TESTS ABOVE DO NOT PROVE.
+    """The live tab budget still reaches the tab admission decision.
 
-    They pass `mc_box[0]` to the predicate themselves, so they show the box and the decision
-    agree -- not that `run()` is the one passing it. That call still lives inside a 700-line
-    function with a browser and a clock in scope, so it is asserted from source, exactly as the
-    sibling file does for `.watch("maxtabs")`.
-
-    The difference from before is the SIZE of what is assumed: it was a four-line inline
-    comparison buried in the loop, and it is now one named call on one line. An assumption you
-    can see in one line is a different risk from one spread over four, and naming it here means
-    the next person does not have to rediscover which half is which.
+    Socket workers intentionally carry zero tab weight and are paced at their generative send,
+    so the loop is no longer shaped as `while pending and admits_another_tab(...)`. What must
+    remain true is narrower and more accurate: the candidate route is measured once, that route
+    chooses the pending worker's tab weight, and the live `mc_box[0]` is the cap passed to the
+    named tab predicate. Tab attaches keep the admission pacing gate; socket sends do not.
     """
     from conftest import code_only
 
     here = os.path.dirname(os.path.abspath(__file__))
     src = code_only(os.path.join(here, "relay_fleet.py"))
-    assert "admits_another_tab(" in src, "the loop stopped asking the named predicate"
-    i = src.index("while pending and admits_another_tab(")
-    call = src[i:i + 300]
+    i = src.index("while pending:")
+    call = src[i:i + 1400]
+    assert "_candidate_socket = _socket_open_now()" in call
+    assert "admits_another_tab(" in call, "the loop stopped asking the named tab predicate"
+    assert "tab_weight(assume_socket=_candidate_socket)" in call, \
+        "the pending worker is no longer weighed for the route it is about to take"
     assert "mc_box[0]" in call, \
-        "the admission loop is no longer passing the live box as the cap"
+        "the tab admission loop is no longer passing the live box as the cap"
+    assert "if not _candidate_socket and not admission_is_due():" in call, \
+        "attach-time pacing must remain tab-only; socket pacing belongs at generative send"
