@@ -73,3 +73,20 @@ def test_automated_gui_submissions_are_serialized_across_processes():
 def test_readonly_probe_returns_to_inprocess_caller_instead_of_exiting_parent_shell():
     assert "if ($ReadOnly) { return }" in SRC
     assert "if ($ReadOnly) { exit 0 }" not in SRC
+
+
+def test_start_add_button_uses_stable_automation_identity_before_localized_name_fallback():
+    i = SRC.index("function Submit([string]$text")
+    block = SRC[i:SRC.index("# FAIL CLOSED ON COMPOSER CORRUPTION", i)]
+    id_i = block.index("AutomationIdProperty, 'startButton'")
+    fallback_i = block.index('$wanted = @(')
+    invoke_i = block.index("$ip = $null")
+    assert id_i < fallback_i < invoke_i
+    assert "start button: found by AutomationId" in block
+
+
+def test_cockpit_source_assigns_start_button_automation_id():
+    cockpit = Path(__file__).resolve().parents[1].joinpath("ui", "FleetCockpit.cs").read_text(
+        encoding="utf-8-sig", errors="replace"
+    )
+    assert 'SetAutomationId(_startBtn, "startButton")' in cockpit

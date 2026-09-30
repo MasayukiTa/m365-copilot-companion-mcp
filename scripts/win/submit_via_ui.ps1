@@ -313,14 +313,23 @@ function Submit([string]$text, [switch]$ExpectFleetGoal) {
     # the composer's Return handler the same body -- and InvokePattern needs no focus, no
     # foreground window and no keyboard at all.
     $startBtn = $null
+    # BY AUTOMATION ID FIRST. The button text changes with language AND run state (Start -> Add),
+    # and a localized/corrupted label already made a live add impossible while goalInput was
+    # found correctly. Identity must not depend on presentation text.
+    $startId = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'startButton')
+    $byId = $win.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $startId)
+    if ($byId -and $byId.Current.IsEnabled) {
+        $startBtn = $byId
+        Write-Output 'start button: found by AutomationId'
+    }
+
+    # Compatibility fallback for a cockpit binary that predates startButton.
     $bc = New-Object System.Windows.Automation.PropertyCondition(
         [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
         [System.Windows.Automation.ControlType]::Button)
     $btns = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants, $bc)
-    # BY NAME, in both languages the cockpit ships. The name comes from T("start"), so these
-    # two strings are the whole set -- matching on width instead would pick a different
-    # button the moment the layout changes.
-    $wanted = @("並列実行を開始", "Start parallel run", "送信", "Send", "追加", "Add")
+    $wanted = @("������s���J�n", "Start parallel run", "���M", "Send", "�ǉ�", "Add")
     for ($i = 0; $i -lt $btns.Count -and -not $startBtn; $i++) {
         $b = $btns.Item($i)
         if ($wanted -contains $b.Current.Name -and $b.Current.IsEnabled) { $startBtn = $b }
