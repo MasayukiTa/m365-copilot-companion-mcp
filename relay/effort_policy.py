@@ -602,6 +602,7 @@ def _shadow_state(worker, level, floor):
         st = {"state": EffortState(level=level, floor=floor), "streak": {},
               "seen_verdict": None, "seen_verify": 0, "seen_fresh": 0}
         worker._effort_shadow = st
+        worker.effort_state = st["state"]     # read by status_fields (the cockpit badge)
     return st
 
 
@@ -643,6 +644,41 @@ def build_signals(worker, ctx, cfg):
         retries_used=int(getattr(worker, "transient", 0) or 0),
         verify_failed=vfail, confidence_low=0, turns_used=turn, turn_budget=budget,
         budget_pressure=bool(budget and turn >= cfg.budget_pressure_frac * budget))
+
+
+def status_fields(worker, env=None):
+    """Additive per-worker fields for status.json; {} when the policy is off or unknowable.
+
+    effort_level is the level the worker REALLY runs at (from its knobs); effort_source is why
+    (EffortState.source once the shadow state exists, else what the goal's metadata says).
+    effort_last_switch is the last virtual switch and is ALWAYS record_only: live switching
+    changes nothing. Absent key = the cockpit shows no badge. Never raises.
+    """
+    try:
+        if mode(env) == "off":
+            return {}
+        level = worker_level(worker)
+        if level is None:
+            return {}
+        out = {"effort_level": level}
+        # worker.goal is the goal TEXT; the dict (effort, metadata) is worker.goal_record.
+        goal = getattr(worker, "goal_record", None)
+        goal = goal if isinstance(goal, dict) else {}
+        src = _meta(goal).get("effort_source")
+        base = (src if src in ("parent", "sibling") else
+                "goal" if effort_mod.goal_effort(goal) in LADDER else "run")
+        state = getattr(worker, "effort_state", None)
+        # An unswitched state still says "run"; the goal knows better. Only a (virtual)
+        # switch changes the source the policy itself would report.
+        out["effort_source"] = (state.source if state is not None and getattr(state, "source", "")
+                                in ("policy", "escalation") else base)
+        if state is not None and getattr(state, "history", None):
+            t, a, b, why = state.history[-1]
+            out["effort_last_switch"] = {"turn": int(t), "from": a, "to": b,
+                                         "reason": str(why), "record_only": True}
+        return out
+    except Exception:
+        return {}
 
 
 def shadow_tick(worker, *, record=None, log=None, env=None):
