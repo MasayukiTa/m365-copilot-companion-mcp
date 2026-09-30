@@ -67,6 +67,7 @@ _INV_RESET_KEEPS_NO_TOKEN = _invariants.register(
 # there is no cycle to avoid by deferring it.
 from relay import mechanism_telemetry as _mt
 from relay import effort as effort_mod
+from relay import effort_policy as effort_policy_mod
 from .planner import PLAN_PROMPT, extract_plan, opening_turn, plan_ready
 from .review_resilience import (
     RecoveryAction, diagnose_after_fresh_replay, freeze_goal_dict,
@@ -4900,6 +4901,8 @@ class RelayWorker:
                 self._diagnose_terminal_give_up(before)
             except Exception:
                 pass
+            # Shadow effort policy (phase 1): records only; never raises; no-op when off.
+            effort_policy_mod.shadow_tick(self)
 
     def _diagnose_terminal_give_up(self, status_before):
         """Apply the diagnosis when THIS turn ended a worker that had already replayed fresh.
@@ -8103,6 +8106,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         _cap = (effective_max_turns if _checks
                 else (min(effective_max_turns, UNVERIFIABLE_MAX_TURNS)
                       if effective_max_turns else UNVERIFIABLE_MAX_TURNS))
+        effort_policy_mod.shadow_assign(goal_item, knobs, run_id=run_id, instance="w%d" % index)
         return RelayWorker(goal_item, "w%d" % index, max_turns=_cap,
                            refuter=knobs["refuter"], max_refute=knobs["max_refute"],
                            plan_mode=plan_mode,
