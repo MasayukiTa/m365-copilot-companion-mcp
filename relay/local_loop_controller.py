@@ -1340,11 +1340,10 @@ def main(argv=None):
         except FileNotFoundError:
             pass
         except OSError as exc:
-            print(json.dumps({
-                "ok": False, "error": "STEER_FILE_CLEANUP_FAILED",
-                "detail": str(exc), "queued": result,
-            }, ensure_ascii=False), flush=True)
-            return 2
+            # SQLite is already authoritative. Reporting failure here would make the Cockpit
+            # restore/re-send the same operator update and duplicate it. Cleanup is housekeeping.
+            result = dict(result)
+            result["warning"] = f"steer file cleanup failed: {exc}"
         print(json.dumps(result, ensure_ascii=False), flush=True)
         return 0
     if not args.agent_url:
