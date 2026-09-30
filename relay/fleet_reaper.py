@@ -316,9 +316,21 @@ def _snapshot_payload(status: dict, marker, evidence: dict, run_id: str,
         workers.append({k: w.get(k) for k in (
             "name", "status", "outcome", "run_id", "jid", "campaign", "role",
             "subtask_index", "turns", "closed", "goal") if k in w})
+    # A RUN THAT DESCENDS FROM AN EARLIER RESUME keeps that resume's count, so the loop guard
+    # (fleet_resume.resume_gate) counts a crash loop across the new run ids a resume creates.
+    resume = {"count": 0, "history": []}
+    try:
+        from relay.fleet_resume import inherit_resume
+        inherited = inherit_resume(fleet_dir, (marker or {}).get("resume_lineage")
+                                   if isinstance(marker, dict) else None)
+        if inherited:
+            resume = inherited
+    except Exception:
+        pass
     return {
         "schema": 1,
         "run_id": run_id,
+        "resume": resume,
         "state": "pending",
         "written_ts": time.time(),
         "marker": marker if isinstance(marker, dict) else None,
