@@ -13309,6 +13309,10 @@ class CockpitWindow : Window
             && string.Equals(S(w, "execution_profile"), "LOCAL_LOOP", StringComparison.OrdinalIgnoreCase)
             && string.Equals(S(w, "runtime_resume_allowed"), "True", StringComparison.OrdinalIgnoreCase);
         bool isAgentSetupWait = isLocalRuntimeWait && IsAgentSetupRuntimeWait(reason);
+        bool isLocalLoop = string.Equals(
+            S(w, "execution_profile"), "LOCAL_LOOP", StringComparison.OrdinalIgnoreCase);
+        bool localSteerBlocked = isLocalLoop && (status == "waiting_user"
+            || status == "waiting_external" || status == "needs_routing");
         // Attention lane: stuck/maxturns/error and NOT yet expanded -- gets recovery surface treatment.
         // INFRA_STUCK is carved out of the red attention lane (handled by its own infra branch).
         bool isAttention = !closed && IsOperatorAttention(w);
@@ -13790,7 +13794,7 @@ class CockpitWindow : Window
             // Feature 1: always-visible steer affordance -- reachable WITHOUT expanding the card.
             // Same terminal gate the expanded drawer's SteerRow/RetryRow/ContinueRow switch uses
             // (below): a terminal card (done/stuck/maxturns/error/cancelled) gets nothing here.
-            if (!terminal) col.Children.Add(CollapsedSteerRow(name));
+            if (!terminal && !localSteerBlocked) col.Children.Add(CollapsedSteerRow(name));
         }
         else
         {
@@ -13800,7 +13804,7 @@ class CockpitWindow : Window
             // dump onto the surface at once. Heavy content is built ONLY when expanded.
             col.Children.Add(BuildCardTabs(w, name, goal, last, reason, terminal));
             // Actions live BELOW the tabs (not inside one) so steer/retry are always reachable.
-            if (!terminal) col.Children.Add(SteerRow(name));
+            if (!terminal && !localSteerBlocked) col.Children.Add(SteerRow(name));
             else if (IsRetryableWorker(w)) col.Children.Add(RetryRow(w));
             else col.Children.Add(ContinueRow(name, goal, S(w, "conv_url")));
         }
