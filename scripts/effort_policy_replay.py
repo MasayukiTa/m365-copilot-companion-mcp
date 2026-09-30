@@ -39,8 +39,6 @@ def default_ledger():
     """This checkout's .fleet/mechanisms.jsonl; from a linked git worktree, the MAIN
     checkout's (the live one), found through the worktree's `.git` pointer file."""
     here = os.path.join(ROOT, ".fleet", "mechanisms.jsonl")
-    if os.path.exists(here):
-        return here
     try:
         with io.open(os.path.join(ROOT, ".git"), "r", encoding="utf-8") as fh:
             ptr = fh.read().strip()
