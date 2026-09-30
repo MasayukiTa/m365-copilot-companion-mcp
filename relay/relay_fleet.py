@@ -5298,6 +5298,18 @@ class RelayWorker:
                                 recycles=self._recycles)
         except Exception:
             pass
+        # HOW LONG THE TURN TOOK FROM SEND TO REPLY, RECORDED. This is the whole wait a worker
+        # experienced: generation plus any tool calls it made in between. The tool-call share of
+        # it is in .fleet/tool_events.jsonl (scripts/tool_event_report.py), so generation time
+        # is the difference, and the two are compared there rather than estimated here. Derived
+        # from the existing send stamp; nothing on the socket route is touched.
+        try:
+            if not _resume and self._t_send:
+                _now = time.time()
+                self._tx.metric(self.turn, "turn_wait_s", round(max(0.0, _now - self._t_send), 3),
+                                t_send=round(self._t_send, 3), t_done=round(_now, 3))
+        except Exception:
+            pass
         # WHAT CLASS OF TURN THIS WAS, RECORDED BESIDE THE HEAP NUMBER ABOVE.
         #
         # relay/turn_outcome.py partitions one assistant reply by the STRUCTURED error code
