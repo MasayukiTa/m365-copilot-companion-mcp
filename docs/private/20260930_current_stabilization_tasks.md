@@ -299,3 +299,30 @@ Resume point after integration hygiene: STAB-004 post-60s live validation is CLO
 - CI manifest: **723 pytest files listed / OK**;
 - `git diff --check origin/main...HEAD`: clean;
 - next action: push this converged head and open a fresh PR from the SAME stabilization branch (PR #67 is already merged) so CI, Windows build, install path, CodeQL, Secret scan, PowerShell lint and Workflow lint run on the actual current head.
+
+### 2026-09-30 19:5x JST STAB-005 live-add latency finding
+
+A real GUI-visible A/B submission reproduced the current reflection-delay symptom without task loss. B (`STAB005B-20260930-195207056`) appeared first as the Cockpit optimistic submitted row while no B worker existed yet, then its exact `commands.d` JSON remained durable until the runner consumed it. The applied receipt was later written with `read=true, applied=true`, B became exact-goal worker `w1`, finished `DONE`, and the identical full goal reached `history.json`. This validates the non-loss path and the worker-before/after reconciliation contract.
+
+New P0 performance defect discovered from the same run: B took about **57s** from live command landing to applied receipt / worker creation. Transcript timing for A shows its worker object existed around 19:52:18 but its first user send did not occur until 19:53:19 (~60.9s). During that interval `status.updated` / `on_tick` / command drain did not advance. `_begin_send` rate pacing is already non-blocking; the synchronous pre-attach `route.refresh(context, agent_url)` in `run_relay_fleet` can call the Playwright-backed token/template capture on the single fleet sweep thread. Full capture is documented at ~35s and the measured stall here was ~61s. `capture_floor` does not sleep.
+
+Priority/acceptance change: STAB-005 is NOT closed merely because the optimistic row prevents disappearance. The runner must continue consuming live commands/status while socket token refresh/capture is in progress, or otherwise move the refresh cost off the command-draining critical path without violating Playwright thread ownership. Do not move a sync Playwright context to an arbitrary thread. Search existing independent-process/CDP/light-token mechanisms first and add a regression that command drain/status remains live across capture latency.
+
+Safety constraint from the current live state: the run that began with the controlled A/B validation now also contains user travel-planning workers (`w2`-`w7`). Do **not** stop/kill/restart this runner or use it for closing-run race tests. Continue source/test work non-destructively and defer destructive handoff validation until the user work finishes naturally.
+
+- 2026-09-30: STAB-005 source repair moved socket credential refresh/capture off the Fleet sweep into a windowless helper process (`relay/socket_capture_async.py`). While capture is in flight, command draining/status ticks continue and admission counts a worker as socket-only only when token+template are actually ready; otherwise it honestly budgets the ordinary tab path. `SocketRoute` now has per-agent capture revisions so a late async result cannot overwrite a newer Research/Refuter synchronous refresh, and route-close vs late-install is serialized. Focused validation so far: async capture 9 green, socket admission 3 green, socket route 123 green, targeted Research/Refuter/summary socket compatibility 8 green. Live A/B re-measurement remains required on a fresh run before STAB-005 closes.
+
+### 2026-09-30 22:4x JST async-capture pre-commit validation
+
+STAB-005 source repair is ready for a remote-check boundary. The blocking `route.refresh(context, agent_url)` call has been removed from the Fleet admission sweep. A windowless helper process now owns its own Playwright/CDP connection and returns only plain token/template data; the parent sweep only launches/polls that helper and continues command/status work. Admission treats a worker as socket-only only when `SocketRoute.ready(agent_url)` has a live token/template; otherwise it budgets the ordinary tab path. Per-agent capture revisions prevent late async results from overwriting newer synchronous Research/Refuter captures, and route-close/install are serialized.
+
+Pre-commit validation on the exact dirty tree:
+- `relay/test_socket_capture_async.py` + `relay/test_socket_admission_no_pending.py`: **12 passed**;
+- `relay/test_socket_route.py`: **123 passed**;
+- Research/Refuter/socket/timeout/resend compatibility slice: **113 passed, 2 skipped**;
+- transient retry script: **17/17**;
+- `py_compile` for async helper / route / fleet: green;
+- CI manifest: **724 listed / OK** before staging the new test; re-run after staging is mandatory;
+- `git diff --check`: clean.
+
+This is source/test validation only. STAB-005 remains REOPENED until a fresh GUI-visible A/B submission demonstrates that command receipt / status ticks remain live while an actual capture helper is in flight.
