@@ -65,6 +65,8 @@ RESERVED_EVENT_TYPES = frozenset({
     "TURN_ABORTED",
     "INTERACTION_RESUMED",
     "RUNTIME_RESUMED",
+    "OPERATOR_STEER_QUEUED",
+    "OPERATOR_STEER_APPLIED",
     "VERIFICATION_PASSED",
     "VERIFICATION_FAILED",
     "JOB_CANCELLED",
@@ -171,6 +173,17 @@ class LocalJobStore:
                     FOREIGN KEY (job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
                 );
                 CREATE INDEX IF NOT EXISTS events_job_id_idx ON events(job_id, id);
+                CREATE TABLE IF NOT EXISTS operator_steers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    applied_seq INTEGER,
+                    applied_at REAL,
+                    FOREIGN KEY (job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS operator_steers_job_idx
+                    ON operator_steers(job_id, applied_seq, id);
                 """
             )
         finally:
@@ -251,6 +264,83 @@ class LocalJobStore:
             raise JobStoreError("TURN_NOT_FOUND", f"turn {job_id!r}/{target} not found")
         return job, turn
 
+    def queue_operator_steer(self, job_id: str, text: str,
+                             now: float | None = None) -> dict:
+        """Durably queue a local-operator correction for the next safe claim boundary.
+
+        This is intentionally not an MCP/model-facing operation. The local operator writes it
+        through the controller/Cockpit path, while the model can only receive it in
+        context.operator_steers after a fenced claim. An active lease is never mutated.
+        """
+        job_id = self._validate_job_id(job_id)
+        now = time.time() if now is None else float(now)
+        with self._transaction() as conn:
+            job, turn = self._job_and_turn(conn, job_id)
+            if job["status"] in TERMINAL_JOB_STATUSES:
+                raise JobStoreError("JOB_TERMINAL", f"job status is {job['status']}")
+            data = json.loads(job["job_json"])
+            constraints = data.get("constraints") if isinstance(data.get("constraints"), dict) else {}
+            limit = int(constraints.get("max_claim_bytes", 8192))
+            value = _bounded_text(text, limit, "operator steer").strip()
+            if not value:
+                raise JobStoreError("INVALID_OPERATOR_STEER", "operator steer must not be empty")
+            cur = conn.execute(
+                "INSERT INTO operator_steers(job_id,text,created_at) VALUES(?,?,?)",
+                (job_id, value, now),
+            )
+            steer_id = int(cur.lastrowid)
+            conn.execute("UPDATE jobs SET updated_at=? WHERE job_id=?", (now, job_id))
+            self._event(conn, job_id, int(turn["seq"]), "OPERATOR_STEER_QUEUED", {
+                "steer_id": steer_id, "detail": value,
+            }, now)
+            pending = conn.execute(
+                "SELECT COUNT(*) FROM operator_steers WHERE job_id=? AND applied_seq IS NULL",
+                (job_id,),
+            ).fetchone()
+        return {
+            "ok": True, "job_id": job_id, "steer_id": steer_id,
+            "status": str(job["status"]), "pending": int(pending[0] if pending else 0),
+        }
+
+    @staticmethod
+    def _bind_operator_steers(conn, job_id: str, seq: int, now: float) -> list[dict]:
+        """Bind every not-yet-delivered steer to one logical turn, preserving it on retries."""
+        rows = conn.execute(
+            "SELECT id,text,created_at,applied_seq FROM operator_steers "
+            "WHERE job_id=? AND (applied_seq IS NULL OR applied_seq=?) ORDER BY id",
+            (job_id, int(seq)),
+        ).fetchall()
+        fresh = [row for row in rows if row["applied_seq"] is None]
+        if fresh:
+            conn.executemany(
+                "UPDATE operator_steers SET applied_seq=?,applied_at=? WHERE id=? AND applied_seq IS NULL",
+                [(int(seq), now, int(row["id"])) for row in fresh],
+            )
+            LocalJobStore._event(conn, job_id, int(seq), "OPERATOR_STEER_APPLIED", {
+                "count": len(fresh), "steer_ids": [int(row["id"]) for row in fresh],
+                "detail": str(fresh[-1]["text"]),
+            }, now)
+        return [
+            {"id": int(row["id"]), "text": str(row["text"]), "created_at": float(row["created_at"])}
+            for row in rows
+        ]
+
+    def _operator_steers_for_seq(self, job_id: str, seq: int) -> list[dict]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT id,text,created_at FROM operator_steers "
+                "WHERE job_id=? AND applied_seq=? ORDER BY id",
+                (job_id, int(seq)),
+            ).fetchall()
+            return [
+                {"id": int(row["id"]), "text": str(row["text"]),
+                 "created_at": float(row["created_at"])}
+                for row in rows
+            ]
+        finally:
+            conn.close()
+
     def claim_turn(self, job_id: str, expected_seq: int, worker_id: str,
                    lease_seconds: int = 3600, now: float | None = None) -> dict:
         job_id = self._validate_job_id(job_id)
@@ -275,6 +365,7 @@ class LocalJobStore:
             expires = float(turn["lease_expires_at"] or 0)
             if turn["lease_id"] and expires > now:
                 if turn["worker_id"] == worker_id:
+                    self._bind_operator_steers(conn, job_id, int(expected_seq), now)
                     return self._claim_result(job, turn)
                 raise JobStoreError("LEASE_ACTIVE", "turn already has an active lease")
             fence = int(turn["fencing_token"] or 0) + 1
@@ -293,6 +384,7 @@ class LocalJobStore:
                 "worker_id": worker_id, "fencing_token": fence,
                 "lease_expires_at": lease_expires,
             }, now)
+            self._bind_operator_steers(conn, job_id, int(expected_seq), now)
             job, turn = self._job_and_turn(conn, job_id)
             return self._claim_result(job, turn)
 
@@ -315,6 +407,8 @@ class LocalJobStore:
         plan = data.get("turn_plan") if isinstance(data.get("turn_plan"), list) else []
         initial_seq = int(data.get("initial_seq", 1))
         turn_number = max(1, int(turn["seq"]) - initial_seq + 1)
+        turn_total = len(plan) if plan and turn_number <= len(plan) else None
+        operator_steers = self._operator_steers_for_seq(job["job_id"], int(turn["seq"]))
         return {
             "ok": True,
             "job_id": job["job_id"],
@@ -325,11 +419,12 @@ class LocalJobStore:
             "instruction": turn["instruction"],
             "instruction_authority": "LOCAL_OPERATOR_JOB",
             "turn_number": turn_number,
-            "turn_total": len(plan) if plan else None,
+            "turn_total": turn_total,
             "context": {
                 "workspace": constraints.get("allowed_base") or data.get("workspace") or "",
                 "previous_summary": previous_summary,
                 "constraints": constraints,
+                "operator_steers": operator_steers,
             },
         }
 
@@ -558,15 +653,44 @@ class LocalJobStore:
             commit = json.loads(turn["commit_json"] or "{}")
             if commit.get("status") != "CANDIDATE_DONE":
                 raise JobStoreError("NO_CANDIDATE", "current turn is not CANDIDATE_DONE")
-            if passed:
+            data = json.loads(job["job_json"])
+            constraints = data.get("constraints") if isinstance(data.get("constraints"), dict) else {}
+            pending_steers = conn.execute(
+                "SELECT COUNT(*) FROM operator_steers WHERE job_id=? AND applied_seq IS NULL",
+                (job_id,),
+            ).fetchone()
+            pending_steer_count = int(pending_steers[0] if pending_steers else 0)
+            if passed and not pending_steer_count:
                 conn.execute(
                     "UPDATE jobs SET status='DONE',verification_detail=?,updated_at=? WHERE job_id=?",
                     (detail, now, job_id),
                 )
                 self._event(conn, job_id, int(turn["seq"]), "VERIFICATION_PASSED", {"detail": detail}, now)
                 return {"ok": True, "idempotent": False, "status": "DONE"}
-            data = json.loads(job["job_json"])
-            constraints = data.get("constraints") if isinstance(data.get("constraints"), dict) else {}
+            if passed and pending_steer_count:
+                instruction = _bounded_text(
+                    "Continue the same durable job and apply the queued operator update(s) "
+                    "from context.operator_steers.",
+                    int(constraints.get("max_claim_bytes", 8192)), "operator steer continuation",
+                )
+                next_seq = int(turn["seq"]) + 1
+                conn.execute(
+                    "INSERT INTO turns(job_id,seq,instruction,status,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (job_id, next_seq, instruction, "READY", now, now),
+                )
+                conn.execute(
+                    "UPDATE jobs SET status='READY',current_seq=?,verification_detail=?,updated_at=? "
+                    "WHERE job_id=?", (next_seq, detail, now, job_id),
+                )
+                self._event(conn, job_id, int(turn["seq"]), "VERIFICATION_PASSED", {
+                    "detail": detail, "completion_deferred": True,
+                    "pending_operator_steers": pending_steer_count,
+                }, now)
+                return {
+                    "ok": True, "idempotent": False, "status": "READY",
+                    "next_seq": next_seq, "completion_deferred": True,
+                }
             instruction = failure_instruction or (
                 "Local acceptance checks failed. Fix the failure and re-run the checks.\n" + detail
             )
@@ -677,12 +801,17 @@ class LocalJobStore:
                 ).fetchone()
                 if previous:
                     commit = json.loads(previous["commit_json"])
+            pending_steers = conn.execute(
+                "SELECT COUNT(*) FROM operator_steers WHERE job_id=? AND applied_seq IS NULL",
+                (job_id,),
+            ).fetchone()
             return {
                 "ok": True, "job_id": job_id, "execution_profile": job["execution_profile"],
                 "status": job["status"], "current_seq": int(job["current_seq"]),
                 "last_committed_seq": int(job["last_committed_seq"]),
                 "turn_status": turn["status"], "lease_expires_at": turn["lease_expires_at"],
                 "retry_count": int(turn["retry_count"]), "commit": commit,
+                "operator_steer_pending": int(pending_steers[0] if pending_steers else 0),
                 "verification_detail": job["verification_detail"],
                 "events": [{"seq": e["seq"], "event": e["event_type"],
                             "payload": json.loads(e["payload_json"]), "ts": e["created_at"]}
@@ -1033,6 +1162,7 @@ class LocalJobStore:
             "last_progress_at": last_progress_at,
             "waiting_reason": waiting_reason,
             "artifacts": artifacts,
+            "operator_steer_pending": int(status.get("operator_steer_pending") or 0),
             "retry_count": int(status.get("retry_count") or 0),
         }
 
