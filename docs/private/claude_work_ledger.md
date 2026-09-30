@@ -159,3 +159,8 @@ Under `%USERPROFILE%\.claude\tools\<tool>\README.md`:
 
 ## 2026-10-01 effort policy: shadow_tick reads goal_record
 - relay/effort_policy.py: shadow_tick read worker.goal (TEXT) so an explicit goal effort never set the shadow initial level/floor. Added goal_dict(worker) (reads worker.goal_record) as the one accessor; status_fields and shadow_tick both use it, and shadow_tick seeds level/floor via initial_level. Sweep: no other .goal reader in effort_policy.py; relay_fleet hooks (shadow_tick, observe_child, worker_level, sibling_adjust, shadow_assign) take goal dicts or knobs. Tests: relay/test_effort_shadow_reads_goal_record.py (in ci.yml).
+
+## 2026-10-01 tool-event measurement (timing + attribution), stage 1
+- tools/tool_ledger.py: call rows gain `mono`, `proc`, `attr`; outcome rows gain `proc`, `mono`, `ts_start`, `ts_end`, `dur_mono_s` (existing fields unchanged). `task`/`worker` are now filled only from the worker's own turn-loop declaration (claim_turn/heartbeat/read_job_context job_id and worker_id) on the same MCP session, cleared at commit_turn/abort_turn; otherwise left empty.
+- relay/relay_fleet.py: transcript metric `turn_wait_s` (send-to-reply, with t_send/t_done) derived from the existing send stamp; no frozen file touched.
+- scripts/tool_event_report.py (read-only, markdown to stdout) with tools/test_tool_ledger_timing.py and scripts/test_tool_event_report.py, both registered in ci.yml. The ledger stays under the existing *.jsonl cap in relay/fleet_retention.py.
