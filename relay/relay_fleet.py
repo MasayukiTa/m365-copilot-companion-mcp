@@ -930,27 +930,145 @@ def is_recovery_payload(text: str) -> bool:
 #: The heading UNLOCK_PREFIX / RECYCLE_PREFIX end with; what follows it must be the goal.
 GOAL_HEADING = "--- 元のゴール ---"
 
-#: How much of the goal a continuation prompt may restate. The whole goal, up to this cap.
-#: Measured need: real goals are 100-2,500 characters; a hard constraint can sit anywhere in
-#: them (2026-09-28..30 trip runs: after character 200 of ~550), so a fixed head slice is the
-#: defect, not a tuning knob. Past the cap the head and the tail survive (a fan-out child's
-#: scope block and a closing constraint both live at the end) and the cut is announced.
-ANCHOR_GOAL_CAP = 6000
+#: Upper bound, in characters, on what a continuation prompt restates of the goal (the wording
+#: line plus the ledger). NOT a user setting. The conversation's FIRST message carries the whole
+#: goal; every later prompt carries only this ledger, because the context window is small and
+#: handing the full text back every turn (PR #80) spends it on repetition. The owner rejected
+#: that design on 2026-09-30. The bound is a hard one: the ledger builder budgets to it.
+LEDGER_MAX_CHARS = 1000
+_LEDGER_TASK_CAP = 120          # the one-line task: the goal's first sentence
+_LEDGER_SENTENCE_CAP = 160      # one fixed-constraint sentence
+_LEDGER_SCOPE_CAP = 320         # a fan-out child's scope block
+_LEDGER_TAIL_SENTENCES = 2      # fallback when no sentence carries a marker
+
+# A sentence states a hard requirement when it contains one of these (a transparent rule, not a
+# model): Japanese markers match as substrings, English ones as whole words.
+_STRONG_JA = ("絶対", "必ず", "動かせ", "変えられ")
+_WEAK_JA = ("ただし", "条件", "制約", "前提", "以外", "だけ", "まで")
+_STRONG_EN = re.compile(r"\b(must|never|required|mandatory)\b", re.I)
+_WEAK_EN = re.compile(r"\b(only|at most|at least|no later than|by)\b", re.I)
+# ...or when it contains a time, a date, an amount, or a quoted name.
+_FACT_RE = re.compile(
+    r"\d{1,2}:\d{2}"
+    r"|\d{1,2}/\d{1,2}|\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}月|"
+    r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2}\b"
+    r"|[万千百]?円(?![滑満環周形])|ドル|[$¥￥€]\s?\d|\b(?:USD|JPY)\b"
+    r"|「[^」]+」|\"[^\"]+\"|“[^”]+”"
+)
+_SENTENCE_SPLIT = re.compile(r"(?<=[。！？!?])\s*|\n+|(?<=\.)\s+")
+_SCOPE_START = "【この会話が担当する範囲"
+_SCOPE_DONT_TOUCH = "手を出さないこと。"
+_SCOPE_REPORT = "担当範囲を完了したら"
 
 
 class EmptyGoalError(ValueError):
     """A fresh-conversation prompt was about to be built with no goal in it."""
 
 
-def bounded_goal(goal: str, cap: int = ANCHOR_GOAL_CAP) -> str:
-    """The goal in full, or head + an explicit marker + tail when longer than `cap`."""
-    goal = str(goal or "")
-    if len(goal) <= cap:
-        return goal
-    head_n = (cap * 2) // 3
-    tail_n = cap - head_n
-    return "%s\n...(truncated %d chars)...\n%s" % (
-        goal[:head_n], len(goal) - cap, goal[len(goal) - tail_n:])
+def _clip(text: str, cap: int) -> str:
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= cap else text[:max(cap - 1, 0)] + "…"
+
+
+def _split_scope_block(text: str):
+    """(scope block, the rest) for a fan-out child's goal, or ("", text). The block is the
+    '担当範囲 N/M' header, its step, and the 'do not touch the other parts' line."""
+    start = text.find(_SCOPE_START)
+    if start < 0:
+        return "", text
+    dont = text.find(_SCOPE_DONT_TOUCH, start)
+    if dont < 0:
+        return text[start:], text[:start]
+    end = dont + len(_SCOPE_DONT_TOUCH)
+    report = text.find(_SCOPE_REPORT, end)
+    if 0 <= report - end < 8:
+        stop = text.find("。", report)
+        end = stop + 1 if stop >= 0 else len(text)
+    return text[start:end], text[:start] + text[end:]
+
+
+def _scope_line(block: str, cap: int) -> str:
+    """The scope block compressed to header + step + the do-not-touch line, within `cap`."""
+    if not block:
+        return ""
+    head, _, body = block.partition("】")
+    head = _clip(head + "】", 80)
+    body = body.strip()
+    dont_at = body.find("上の範囲だけを")
+    step = body if dont_at < 0 else body[:dont_at]
+    dont = body[dont_at:] if dont_at >= 0 else ""
+    if dont:
+        stop = dont.find(_SCOPE_DONT_TOUCH)
+        dont = dont[:stop + len(_SCOPE_DONT_TOUCH)] if stop >= 0 else _clip(dont, 90)
+    room = max(cap - len(head) - len(dont) - 2, 20)
+    return " ".join([head, _clip(step, room), dont]).strip()
+
+
+def _sentences(text: str):
+    return [s.strip() for s in _SENTENCE_SPLIT.split(text) if s and s.strip()]
+
+
+def _marker_rank(sentence: str):
+    """0 = strong requirement (kept first when space runs out), 1 = weak, None = no marker."""
+    if any(m in sentence for m in _STRONG_JA) or _STRONG_EN.search(sentence) \
+            or _FACT_RE.search(sentence):
+        return 0
+    if any(m in sentence for m in _WEAK_JA) or _WEAK_EN.search(sentence):
+        return 1
+    return None
+
+
+def goal_ledger(goal: str, job_id: str = "", cap: int = LEDGER_MAX_CHARS) -> str:
+    """A compact, DETERMINISTIC ledger of `goal`, at most `cap` characters ("" for no goal).
+
+    Lines: the task (the first sentence), the fixed constraints (the goal's sentences that
+    carry a requirement marker, a time, a date, an amount or a quoted name -- or, when none
+    does, its closing sentences), a fan-out child's scope block, and a pointer to the full
+    goal (the first message of the conversation). It is a transparent heuristic: a constraint
+    phrased without any marker is not extracted (the first message still holds it)."""
+    goal = str(goal or "").replace(CLOSING_INSTRUCTION, "").strip()
+    if not goal:
+        return ""
+    scope_block, rest = _split_scope_block(goal)
+    sents = _sentences(rest)
+    if not sents and not scope_block:
+        return ""
+    task = _clip(sents[0], _LEDGER_TASK_CAP) if sents else ""
+    scope = _scope_line(scope_block, _LEDGER_SCOPE_CAP)
+    pointer = "(全文: この会話の最初のメッセージ" + (" / ジョブID: %s" % _clip(job_id, 60)
+                                                  if job_id else "") + ")"
+    fixed = ("タスク: %s\n" % task if task else "") + (
+        "担当範囲: %s\n" % scope if scope else "") + pointer + "\n"
+    budget = cap - len(fixed) - len("固定条件:\n") - 24   # 24: the "(他N件)" note
+    picked = []
+    candidates = [(i, s) for i, s in enumerate(sents)
+                  if not (i == 0 and len(s) <= _LEDGER_TASK_CAP)]
+    marked = [(i, s) for i, s in candidates if _marker_rank(s) is not None]
+    if not marked:
+        marked = candidates[-_LEDGER_TAIL_SENTENCES:] if len(sents) > 1 else []
+    order = sorted(marked, key=lambda t: (_marker_rank(t[1]) if _marker_rank(t[1]) is not None
+                                          else 0, t[0]))
+    used = 0
+    for i, s in order:
+        line = _clip(s, _LEDGER_SENTENCE_CAP)
+        if used + len(line) + 3 > budget:
+            continue
+        picked.append((i, line))
+        used += len(line) + 3
+    picked.sort()
+    out = ""
+    if task:
+        out += "タスク: %s\n" % task
+    if picked or marked:
+        out += "固定条件:\n" + "".join("- %s\n" % line for _, line in picked)
+        if len(picked) < len(marked):
+            out += "(他%d件は原文)\n" % (len(marked) - len(picked))
+    if scope:
+        out += "担当範囲: %s\n" % scope
+    out += pointer + "\n"
+    if len(out) > cap:
+        out = out[:max(cap - 1, 0)] + "…"
+    return out
 
 
 def effective_goal(goal: str) -> str:
@@ -965,8 +1083,8 @@ def effective_goal(goal: str) -> str:
     return goal
 
 
-def fill_recovery_goal(text: str, goal: str) -> str:
-    """Re-insert the goal into a recovery payload whose goal section is empty.
+def fill_recovery_goal(text: str, goal: str, job_id: str = "") -> str:
+    """Re-insert the goal LEDGER into a recovery payload whose goal section is empty.
 
     UNLOCK_PREFIX ends with the goal heading and the delivery channels (reunlock steer,
     follow-up) send it bare, so the worker received a turn with no task in it."""
@@ -977,7 +1095,10 @@ def fill_recovery_goal(text: str, goal: str) -> str:
         goal = effective_goal(goal).strip()
         if tail.strip() or not goal:
             return text
-        return head + GOAL_HEADING + "\n" + bounded_goal(goal)
+        ledger = goal_ledger(goal, job_id)
+        if not ledger:
+            return text
+        return head + GOAL_HEADING + "\n" + ledger
     except Exception:
         return text
 
@@ -3963,36 +4084,48 @@ class RelayWorker:
         forget WHICH task it is on. We re-state cwd + a one-line goal summary every time.
         Uses only fields already on the worker (self.cwd, self.goal); never raises."""
         try:
-            # THE WHOLE GOAL, NOT ITS FIRST LINE. A 160-character head slice dropped a hard
-            # constraint that sat after character 200 and the worker answered another
-            # question from turn 3 on (see docs/private/20260930_goal_fidelity_design.md).
-            # A fan-out child's goal ends with its scope block, which the head/tail bound
-            # keeps. Wording follows the worker's own signal that it is a coding task: a
-            # verification card (self.checks). No wording heuristic.
-            one = bounded_goal(effective_goal(self.goal).strip())
+            # A COMPACT LEDGER, NEITHER THE FIRST LINE NOR THE WHOLE GOAL. A 160-character head
+            # slice dropped a hard constraint that sat after character 200 and the worker
+            # answered another question from turn 3 on (docs/private/20260930_goal_fidelity_design.md);
+            # restating the whole goal every turn (PR #80) fixed that but spends the small
+            # context on repetition, and the owner rejected it. The first message keeps the
+            # full goal; this carries the task line, the goal's fixed-constraint sentences and a
+            # fan-out child's scope block, within LEDGER_MAX_CHARS in total. Wording follows the
+            # worker's own signal that it is a coding task: a verification card (self.checks).
             where = (self.cwd or "").strip()
-            if one and self.checks:
-                anchor = ("あなたは %s で次のタスクを修正中です。その作業を続けてください。\n"
-                          "--- タスク全文 ---\n%s\n--- タスク全文ここまで ---\n"
-                          % (where or "この作業フォルダ", one))
-            elif one:
-                anchor = ("作業中のタスクの原文（全文）を再掲します。原文の条件（日時・場所・数値・"
-                          "固定の制約）をすべて満たして続けてください。\n"
-                          "--- 原文 ---\n%s\n--- 原文ここまで ---\n" % one)
-            elif where:
-                anchor = "あなたは %s での作業を続けてください。\n" % where
+            job_id = self._ledger_job_id()
+            if not effective_goal(self.goal).strip():
+                anchor = ("あなたは %s での作業を続けてください。\n" % where) if where else ""
             else:
-                anchor = ""
+                if self.checks:
+                    lead = ("あなたは %s で次のタスクを修正中です。その作業を続けてください。\n"
+                            % _clip(where or "この作業フォルダ", 200))
+                else:
+                    lead = "作業中のタスクの台帳です。固定条件をすべて満たして続けてください。\n"
+                ledger = goal_ledger(effective_goal(self.goal), job_id,
+                                     cap=LEDGER_MAX_CHARS - len(lead))
+                anchor = lead + ledger if ledger else lead
             return anchor + nudge if anchor else nudge
         except Exception:
             return nudge
+
+    def _ledger_job_id(self):
+        """The id the ledger's pointer may name: the record's task id, else the transcript file."""
+        try:
+            rec = getattr(self, "goal_record", None) or {}
+            jid = str(rec.get("task_id") or "").strip()
+            if jid:
+                return jid
+            return os.path.basename(getattr(self, "transcript", "") or "")
+        except Exception:
+            return ""
 
     def _steer_job(self, steer_text):
         """The turn that delivers one queued steer. A recovery payload is system text, not a
         person's; and because it ends at the goal heading it is sent with the goal put back,
         so the recovery turn never replaces the task with nothing."""
         if is_recovery_payload(steer_text):
-            return (SYSTEM_RECOVERY_PREFIX + fill_recovery_goal(steer_text, self.goal)
+            return (SYSTEM_RECOVERY_PREFIX + fill_recovery_goal(steer_text, self.goal, self._ledger_job_id())
                     + "\n上記の運用上の指示に従って作業を続行してください。"
                     + CLOSING_INSTRUCTION)
         return ("【ユーザーからの追加指示】" + steer_text

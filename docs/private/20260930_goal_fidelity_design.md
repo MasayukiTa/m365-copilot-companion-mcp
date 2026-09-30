@@ -19,9 +19,8 @@ Diagnosed from transcripts:
 
 ## The fix
 
-* Anchor design: restate the WHOLE goal, capped at `ANCHOR_GOAL_CAP` = 6000 characters. Past the cap the head
-  (two thirds) and the tail (one third) are kept with an explicit `...(truncated N chars)...` marker; a fan-out
-  child's scope block lives at the end and so survives. No hash block, no summarising.
+* Anchor design (REVISED, see "Anchor is a ledger" below): PR #80 restated the whole goal (cap 6000 characters)
+  in every continuation prompt. The owner rejected that; the anchor is now a compact ledger.
 * Wording follows the worker's own signal: with a verification card (`self.checks`) the working-tree wording
   is kept; without one the anchor is neutral ("original text, satisfy every condition"). No wording heuristic.
 * Every continuation type is anchored: retry, continue, fix, split, escalating continue, refute-fix, verify-fix,
@@ -36,6 +35,39 @@ Tests: relay/test_continuation_keeps_the_goal.py (28), relay/test_theme_from_goa
 check on a copy: 11 mutants (head-only anchor, always-code wording, no goal fill, recycle/replay empty goal
 allowed, raw goal seeded, verify job unanchored, replay uses composed goal, follow-up unfilled, date split
 restored, no cap) all killed.
+
+## Anchor is a ledger (2026-09-30, replaces the whole-goal anchor of PR #80)
+
+Owner decision: "the context does not hold much; handing long text every turn is a bad move". The first message of
+a conversation keeps the full goal. Every later prompt (continuation, refute-fix, verify-fix, research result,
+cap notice, steer continuation, recovery steer, follow-up) carries only a ledger of at most
+`LEDGER_MAX_CHARS` = 1000 characters, wording line included. The constant is in relay/relay_fleet.py, not a user
+setting. `goal_ledger(goal, job_id, cap)` builds it deterministically:
+
+1. Task: the goal's first sentence, capped at 120 characters.
+2. Fixed constraints: sentences (split on 。！？ / ! ? / ". " and newlines) that contain a marker (絶対, 必ず, 動かせ,
+   変えられ, ただし, 条件, 制約, 前提, 以外, だけ, まで; must, never, only, required, ...) or a time (H:MM), a date
+   (10/3, 2026-10-03, 10月, "Oct 4"), an amount (円, ドル, $, ¥), or a quoted name (「」, ""). Each is capped at 160
+   characters, kept in original order. When they do not all fit, strong markers and facts are kept before weak
+   markers, and "(他N件は原文)" says some were left out. With no matching sentence, the goal's last two sentences
+   are used (closing instructions often hold the constraint).
+3. Scope: a fan-out child's "担当範囲 N/M" header, its step (capped) and the "do not touch other parts" line, always
+   kept. The DONE/FAIL closing instruction is protocol and is removed before extraction.
+4. Pointer: "(全文: この会話の最初のメッセージ / ジョブID: <task id>)"; the id is the goal record's task_id, else the
+   transcript file name.
+
+Wording keeps PR #80's rule: with a verification card (`self.checks`) the working-tree wording, otherwise neutral.
+Empty goal: as before (cwd line or nothing). `fill_recovery_goal` inserts the ledger of the ORIGINAL goal into a
+recovery payload whose goal section is empty; `effective_goal` and `EmptyGoalError` are unchanged. A recycle or
+replay opens a brand-new conversation, whose first message is the full goal, so it still carries it.
+
+Limits: extraction is a transparent heuristic. It misses a constraint phrased without any marker, time, date, amount
+or quote (the first message still has it), and it can keep a sentence that only looks like a constraint. Fidelity
+is measured with scripts/goal_fidelity_report.py (drift score and false denials), not assumed.
+
+Tests: relay/test_continuation_keeps_the_goal.py (33). Mutation check on a copy: 9 mutants (constraints dropped,
+cap ignored, scope dropped, pointer dropped, empty goal allowed in replay and in recycle, marker rule disabled,
+whole goal restated, recovery goal not filled) all killed.
 
 ## Metrics (scripts/goal_fidelity_report.py, tests: scripts/test_goal_fidelity_report.py, 13)
 
@@ -71,5 +103,6 @@ and tokens are chosen before either batch runs.
 ## Open risks
 
 * The nudge constants (RETRY_JOB, FIX_JOB) still mention files and commands; only the anchor is neutral.
-* The anchor is up to 6000 characters longer per continuation turn; token cost is not measured.
+* The ledger adds at most `LEDGER_MAX_CHARS` (1000) characters per continuation turn; token cost is not measured.
+* The ledger extraction is a heuristic (see below): a constraint phrased without any marker is not extracted.
 * A human steer still replaces the turn with the steer text alone (unchanged).
