@@ -365,8 +365,8 @@ class LocalJobStore:
             expires = float(turn["lease_expires_at"] or 0)
             if turn["lease_id"] and expires > now:
                 if turn["worker_id"] == worker_id:
-                    self._bind_operator_steers(conn, job_id, int(expected_seq), now)
-                    return self._claim_result(job, turn)
+                    operator_steers = self._bind_operator_steers(conn, job_id, int(expected_seq), now)
+                    return self._claim_result(job, turn, operator_steers=operator_steers)
                 raise JobStoreError("LEASE_ACTIVE", "turn already has an active lease")
             fence = int(turn["fencing_token"] or 0) + 1
             lease_id = "lease_" + secrets.token_urlsafe(24)
@@ -384,11 +384,11 @@ class LocalJobStore:
                 "worker_id": worker_id, "fencing_token": fence,
                 "lease_expires_at": lease_expires,
             }, now)
-            self._bind_operator_steers(conn, job_id, int(expected_seq), now)
+            operator_steers = self._bind_operator_steers(conn, job_id, int(expected_seq), now)
             job, turn = self._job_and_turn(conn, job_id)
-            return self._claim_result(job, turn)
+            return self._claim_result(job, turn, operator_steers=operator_steers)
 
-    def _claim_result(self, job, turn) -> dict:
+    def _claim_result(self, job, turn, operator_steers: list[dict] | None = None) -> dict:
         data = json.loads(job["job_json"])
         constraints = data.get("constraints") if isinstance(data.get("constraints"), dict) else {}
         previous_summary = ""
@@ -408,7 +408,8 @@ class LocalJobStore:
         initial_seq = int(data.get("initial_seq", 1))
         turn_number = max(1, int(turn["seq"]) - initial_seq + 1)
         turn_total = len(plan) if plan and turn_number <= len(plan) else None
-        operator_steers = self._operator_steers_for_seq(job["job_id"], int(turn["seq"]))
+        if operator_steers is None:
+            operator_steers = self._operator_steers_for_seq(job["job_id"], int(turn["seq"]))
         return {
             "ok": True,
             "job_id": job["job_id"],
