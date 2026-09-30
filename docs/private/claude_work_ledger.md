@@ -106,6 +106,13 @@ Under `%USERPROFILE%\.claude\tools\<tool>\README.md`:
 - Decisions: refs and hashes only in status.json (first_prompt, latest_prompt, prompt_goal_intact, family_role, scope, family_members, family); pure module relay/family_view.py; UI in a WPF-free ui/FamilyView.cs extending the STAB-002 Content details, plus a Prompt tab. Overlap warning only for path-shaped scopes, labelled as claimed.
 - Scanned for existing work (live tree, incl. untracked/ignored): relay/, ui/, tools/, docs/ (tracked and docs/private, docs/research read-only), .fleet small files and campaigns.jsonl/transcripts/status.json/history.json, reviews/. Only relay/fanout.py:754 family markers and relay/test_fanout_family_view.py existed.
 
+
+## 2026-09-30 - common audit / lane policy / credential placeholder / exec pinning design
+
+- Design doc only: docs/private/20260930_common_audit_and_policy_design.md (no product code changed). Ideas from a read-only study of a public sandbox runtime; nothing copied.
+- Measured on this machine (100 runs each): tool_ledger append p50 11.2 ms / p95 13.9 ms, of which redact_secrets p50 8.7 ms (it re-reads .env and re-decrypts DPAPI per call); bare open-append-close p50 1.1 ms; msedge.exe (5.2 MB stub) SHA256 180 ms cold / 17 ms warm; Get-AuthenticodeSignature 221 ms in-process, 510 ms via a fresh powershell.
+- Findings: .fleet/gate_audit.jsonl has no writer (last row 2026-08-31); decision ledgers other than tool_ledger write free text unredacted; sanitized_child_env already strips secrets from run_python/shell children; PyYAML is in requirements but tomllib is absent (Python 3.10.0); decision volume about 1,000 events/day.
+- Friction budget: zero new prompts in any mode, <= 2 ms p50 added per audited action, 4 MiB fixed ring, enforcement off/shadow by default, promotion bar of at most 3 false would_deny per lane per day over 14 days. No disk-floor value read for or proposed by the design.
 ## 2026-09-30 - continuation prompts keep the whole goal; goal-fidelity analyzers
 
 - Root cause from three trip-run transcripts: RelayWorker._task_anchor restated only the first 160 characters of the goal on every continuation turn, so a hard constraint after character 200 vanished from turn 3 on; one worker then told the reviewer the constraint was not in the original text (a false claim). An unlock/recovery payload with an empty goal section also replaced the whole task for several turns and, delivered as a follow-up, became a worker's goal (seeding a recycle prompt's goal).
