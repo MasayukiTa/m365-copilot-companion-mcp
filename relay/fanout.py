@@ -31,6 +31,7 @@ import re
 from typing import Any          # `dict[Any, dict]` below; a local annotation is not evaluated,
                                 # so this missing import never raised and was never noticed.
 
+from relay import effort_policy
 from relay.planner import _clean_step, extract_plan
 from relay.control_markers import CLOSING_INSTRUCTION
 
@@ -362,7 +363,7 @@ def subtasks_from(resp):
 
 
 def child_goals(parent_goal, steps, *, parent_task_id="", campaign_id="", depth=0,
-                cwd=None):
+                cwd=None, parent_level=None, run_id=""):
     """Turn the accepted steps into goal items the fleet can admit.
 
     NO `checks` PARAMETER, AND ITS REMOVAL IS THE POINT. It used to take the parent's
@@ -412,6 +413,10 @@ def child_goals(parent_goal, steps, *, parent_task_id="", campaign_id="", depth=
             "subtask_index": i,
             "subtask_of": len(steps),
         })
+    # EFFORT POLICY (phase 2). Additive: with the policy off, or no parent level, `out` is
+    # exactly what it was. `on` adds metadata["effort"] one step below the parent's level.
+    if parent_level is not None:
+        effort_policy.assign_children(out, parent_level, run_id=run_id)
     return out
 
 
@@ -597,7 +602,8 @@ def merge_acceptance_checks(records):
 
 
 def aggregation_goal(parent_goal, records, *, campaign_id="", parent_task_id="",
-                     limit_each=1200, cwd=None, parent_checks=None, parent_partial=""):
+                     limit_each=1200, cwd=None, parent_checks=None, parent_partial="",
+                     parent_level=None, run_id=""):
     """The goal item that merges a finished campaign.
 
     A goal rather than a turn on the parent, because a parent parked waiting for its own
@@ -631,6 +637,10 @@ def aggregation_goal(parent_goal, records, *, campaign_id="", parent_task_id="",
     checks.extend(merge_acceptance_checks(records))
     if checks:
         item["checks"] = checks
+    # EFFORT POLICY (phase 2): the merge judges the children's combined work, so it keeps the
+    # PARENT's level. No-op unless MCP_EFFORT_POLICY=on and a parent level is known.
+    if parent_level is not None:
+        effort_policy.merge_effort(item, parent_level, run_id=run_id)
     return item
 
 

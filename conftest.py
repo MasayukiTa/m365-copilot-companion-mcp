@@ -20,6 +20,25 @@ import os
 import pytest
 
 
+#: Variables git exports to a hook (pre-push runs this suite) that pin every git command to the
+#: PUSHING repository. A test that runs `git init <tmp>` under them re-initialises THAT repo
+#: instead (core.bare = true in the shared config, breaking every worktree) and its next
+#: `git add` fails "must be run in a work tree".
+GIT_LOCATION_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_PREFIX",
+                    "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY")
+
+
+def scrub_git_env(env=None):
+    """Remove the repo-pinning variables from `env` (default os.environ) so that every
+    subprocess a test starts discovers its repository from its own cwd."""
+    env = os.environ if env is None else env
+    for name in GIT_LOCATION_ENV:
+        env.pop(name, None)
+
+
+scrub_git_env()
+
+
 #: Shared operational state that a test must never write to, as DATA rather than as a series
 #: of try-blocks: {"module path": {"CONSTANT": "filename under the tmp base"}}.
 #:
