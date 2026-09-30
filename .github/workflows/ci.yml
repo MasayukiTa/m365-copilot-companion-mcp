@@ -784,6 +784,8 @@ jobs:
             tools/test_setup_tls.py \
             tools/test_shell_timeout_tree.py \
             tools/test_tool_ledger.py \
+            tools/test_tool_ledger_timing.py \
+            scripts/test_tool_event_report.py \
             bench/test_attempt_budget.py \
             bench/test_grade_reasons.py \
             scripts/test_bootstrap_transcript.py \
