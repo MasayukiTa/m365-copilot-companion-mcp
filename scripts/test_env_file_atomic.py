@@ -147,17 +147,62 @@ def test_rotation_backup_never_keeps_legacy_plaintext_auth_secrets(monkeypatch):
     assert "OTHER=1" in joined
 
 
-def test_unrelated_atomic_edit_may_preserve_existing_legacy_plaintext_auth(tmp_path):
+def test_generic_atomic_sink_refuses_even_existing_legacy_plaintext_auth(tmp_path):
     env = tmp_path / ".env"
-    env.write_bytes(b"MCP_API_KEY=legacy\r\nMCP_TUNNEL_ALLOW_ANONYMOUS=1\r\nOTHER=1\r\n")
-    E.atomic_write_text(env, "MCP_API_KEY=legacy\r\nOTHER=1\r\n")
-    assert env.read_bytes() == b"MCP_API_KEY=legacy\r\nOTHER=1\r\n"
+    old = b"MCP_API_KEY=legacy\r\nMCP_TUNNEL_ALLOW_ANONYMOUS=1\r\nOTHER=1\r\n"
+    env.write_bytes(old)
+    with pytest.raises(ValueError, match="plaintext auth secret"):
+        E.atomic_write_text(env, "MCP_API_KEY=legacy\r\nOTHER=1\r\n")
+    assert env.read_bytes() == old
 
-def test_quickstart_can_remove_unrelated_setting_while_legacy_auth_is_unchanged(tmp_path):
+
+def test_unrelated_edit_migrates_existing_api_key_to_dpapi(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_bytes(b"MCP_API_KEY=legacy-api\r\nMCP_TUNNEL_ALLOW_ANONYMOUS=1\r\nOTHER=1\r\n")
+    monkeypatch.setattr(E, "_protect_secret", lambda value: "dpapi:protected-" + value)
+    assert E.unset_key(env, "MCP_TUNNEL_ALLOW_ANONYMOUS") is True
+    got = env.read_text(encoding="utf-8")
+    assert "MCP_API_KEY=legacy-api" not in got
+    assert "MCP_API_KEY_PROTECTED=dpapi:protected-legacy-api" in got
+    assert "OTHER=1" in got
+
+
+def test_quickstart_unrelated_edit_migrates_existing_unlock_password(tmp_path, monkeypatch):
     env = tmp_path / ".env"
     env.write_bytes(b"MCP_UNLOCK_PASSWORD=legacy-password\r\nMCP_TUNNEL_ALLOW_ANONYMOUS=1\r\nOTHER=1\r\n")
+    monkeypatch.setattr(E, "_protect_secret", lambda value: "dpapi:protected-" + value)
     assert E.unset_key(env, "MCP_TUNNEL_ALLOW_ANONYMOUS") is True
-    assert env.read_bytes() == b"MCP_UNLOCK_PASSWORD=legacy-password\r\nOTHER=1\r\n"
+    got = env.read_text(encoding="utf-8")
+    assert "MCP_UNLOCK_PASSWORD=legacy-password" not in got
+    assert "MCP_UNLOCK_PASSWORD_PROTECTED=dpapi:protected-legacy-password" in got
+    assert "OTHER=1" in got
+
+
+def test_legacy_plaintext_supersedes_stale_protected_copy_during_migration(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text(
+        "MCP_API_KEY_PROTECTED=dpapi:stale\n"
+        "MCP_API_KEY=legacy-authoritative\n"
+        "MCP_TUNNEL_ALLOW_ANONYMOUS=1\n", encoding="utf-8")
+    monkeypatch.setattr(E, "_protect_secret", lambda value: "dpapi:fresh-" + value)
+    assert E.unset_key(env, "MCP_TUNNEL_ALLOW_ANONYMOUS") is True
+    got = env.read_text(encoding="utf-8")
+    assert "MCP_API_KEY=" not in got.replace("MCP_API_KEY_PROTECTED=", "")
+    assert got.count("MCP_API_KEY_PROTECTED=") == 1
+    assert "MCP_API_KEY_PROTECTED=dpapi:fresh-legacy-authoritative" in got
+    assert "dpapi:stale" not in got
+
+
+def test_failed_legacy_migration_leaves_the_old_file_whole(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    old = b"MCP_API_KEY=legacy-api\r\nMCP_TUNNEL_ALLOW_ANONYMOUS=1\r\nOTHER=1\r\n"
+    env.write_bytes(old)
+    def fail(_value):
+        raise RuntimeError("DPAPI unavailable")
+    monkeypatch.setattr(E, "_protect_secret", fail)
+    with pytest.raises(ValueError, match="protect legacy plaintext auth"):
+        E.unset_key(env, "MCP_TUNNEL_ALLOW_ANONYMOUS")
+    assert env.read_bytes() == old
 
 
 def test_atomic_sink_rejects_new_changed_or_duplicated_legacy_plaintext_auth(tmp_path):
@@ -203,9 +248,11 @@ def test_rotate_writer_refuses_plaintext_auth_at_its_final_sink(tmp_path):
 
 def test_codeql_suppression_is_tied_to_the_sink_guard():
     src = (HERE / "env_file.py").read_text(encoding="utf-8")
-    assert "_assert_no_plaintext_auth_escalation(path, text)" in src
+    assert "_assert_no_plaintext_auth_persistence(text)" in src
+    assert "def _migrate_legacy_plaintext_auth(text: str)" in src
+    assert src.count("_migrate_legacy_plaintext_auth(candidate)") == 2
     lines = src.splitlines()
     i = next(i for i, line in enumerate(lines) if "fh.write(data)" in line)
     assert "# codeql[py/clear-text-storage-sensitive-data]" in lines[i - 1]
-    guard_i = next(i for i, line in enumerate(lines) if "_assert_no_plaintext_auth_escalation(path, text)" in line and not line.lstrip().startswith("def "))
+    guard_i = next(i for i, line in enumerate(lines) if "_assert_no_plaintext_auth_persistence(text)" in line and not line.lstrip().startswith("def "))
     assert guard_i < i
