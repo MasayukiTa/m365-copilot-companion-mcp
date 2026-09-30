@@ -5458,6 +5458,7 @@ class CockpitWindow : Window
         _folderBtn.Click += delegate { FolderToGoals(); };
         btns.Children.Add(_folderBtn);
         _startBtn = new Button();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_startBtn, "startButton");
         _startBtn.Cursor = Cursors.Hand; _startBtn.BorderThickness = new Thickness(0);
         _startBtn.Height = Theme.BtnH; _startBtn.MinWidth = 132; _startBtn.FontWeight = FontWeights.SemiBold;
         _startBtn.Margin = new Thickness(8, 0, 0, 0); _startBtn.Padding = new Thickness(16, 0, 16, 0);

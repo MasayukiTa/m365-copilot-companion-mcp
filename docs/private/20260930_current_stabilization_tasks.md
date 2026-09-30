@@ -326,3 +326,15 @@ Pre-commit validation on the exact dirty tree:
 - `git diff --check`: clean.
 
 This is source/test validation only. STAB-005 remains REOPENED until a fresh GUI-visible A/B submission demonstrates that command receipt / status ticks remain live while an actual capture helper is in flight.
+
+### 2026-09-30 23:0x JST live Add-button identity regression and repair
+
+A real GUI live-add attempt reproduced a second STAB-005 surface failure independent of Fleet command durability. At 22:57:03 the cockpit correctly reported `run in flight: True`, but `scripts/win/submit_via_ui.ps1` could not find the live `Add` button because the composer had a stable AutomationId (`goalInput`) while the Start/Add button was identified only by localized display names. The task therefore never reached the runner.
+
+Repair:
+- FleetCockpit assigns `_startBtn` the stable AutomationId `startButton`;
+- GUI submitter resolves `startButton` first and keeps localized-name matching only as old-binary compatibility fallback;
+- focused submit/GUI-lock/no-nested-console tests: **14 passed**;
+- both WPF binaries rebuilt successfully.
+
+Live re-check after rebuild: a real GUI submission printed `start button: found by AutomationId`. A subsequent in-flight add (`STAB005F-20260930-230221586`) reported `run in flight: True`, was accepted through that AutomationId path, and produced `applied=true` ack at 23:02:33 (`ts=1790776953.880...`), about **11.93s** after submission start. This is materially below the earlier ~57s live-add stall. It does not yet close the async-capture overlap acceptance: the preceding async capture completed at `1790776938.147...`, roughly 3.8s before this live add began. A fresh A/B test must still place B inside the actual helper-in-flight window.
