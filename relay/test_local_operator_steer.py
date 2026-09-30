@@ -211,3 +211,17 @@ def test_post_plan_operator_followup_can_continue_open_ended(tmp_path):
     assert continued["next_seq"] == 3
     third = store.claim_turn("job_1", 3, "worker-c", now=8)
     assert third["instruction"] == "Double-check the revised numbers"
+
+
+def test_domain_wait_states_reject_steer_instead_of_false_success(tmp_path):
+    store = _store(tmp_path)
+    store.create_job(_job(), now=1)
+    claim = store.claim_turn("job_1", 1, "worker-a", now=2)
+    store.commit_turn(
+        "job_1", 1, claim["lease_id"], claim["fencing_token"],
+        "WAITING_USER", "Need a domain answer", now=3,
+    )
+    with pytest.raises(JobStoreError) as exc:
+        store.queue_operator_steer("job_1", "Here is an answer", now=4)
+    assert exc.value.code == "JOB_OPERATOR_WAIT"
+    assert store.get_job_status("job_1")["operator_steer_pending"] == 0
