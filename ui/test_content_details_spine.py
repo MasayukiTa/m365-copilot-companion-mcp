@@ -1,5 +1,5 @@
 ﻿# -*- coding: utf-8 -*-
-"""The left FleetCockpit spine is task CONTENT, not a second execution timeline."""
+"""The left FleetCockpit spine combines live task content with execution history."""
 from pathlib import Path
 
 SRC = Path(__file__).with_name("FleetCockpit.cs").read_text(encoding="utf-8-sig")
@@ -15,12 +15,18 @@ def _spine():
     return SRC[i:k]
 
 
-def test_left_spine_is_content_details_not_execution_timeline():
+def test_left_spine_combines_content_details_and_execution_timeline():
     b = _spine()
-    assert '"内容詳細" : "Content details"' in b
-    assert '"Execution timeline"' not in b
-    assert 'Theme.TimelineLabel(' not in b
-    assert 'Theme.TimelineColor(' not in b
+    helper = SRC[SRC.index("void AddSpineTimeline("):SRC.index("UIElement BuildSpineContent(")]
+    assert '"Content details"' in b
+    assert "AddSpineTimeline(outer, primaryWorker);" in b
+    assert '"Execution timeline"' in helper
+    assert "BuildTimelineEvents(" in helper
+    assert '"phase_events"' in helper
+    # Timeline itself must carry concrete current-work context when richer execution data exists.
+    for token in ('"current_step"', '"last_progress"', '"reason"'):
+        assert token in helper
+    assert '"Now: "' in helper
 
 
 def test_content_details_follows_the_worker_being_inspected():
@@ -41,11 +47,11 @@ def test_content_details_surfaces_durable_execution_state_when_present():
     assert 'execution.TryGetValue("artifacts"' in b
 
 
-def test_spine_repaint_signature_tracks_content_not_phase_event_count():
+def test_spine_repaint_signature_tracks_content_and_timeline_state():
     assert "string SpineDetailSignature(Dictionary<string, object> w)" in SRC
     refresh = SRC[SRC.index("string SpineDetailSignature(Dictionary<string, object> w)"):]
     refresh = refresh[:refresh.index("\n    void ", 20)] if "\n    void " in refresh[20:] else refresh[:3000]
-    for token in ('"goal_summary"', '"reason"', '"current_step"', '"last_progress"', '"next_step"', '"waiting_reason"'):
+    for token in ('"goal_summary"', '"reason"', '"current_step"', '"last_progress"', '"next_step"', '"waiting_reason"', '"phase_events"', '"outcome"', '"verify_attempts"'):
         assert token in refresh
     around = SRC[SRC.index("string spineSig =") - 1200:SRC.index("string spineSig =") + 800]
     assert "SpineDetailSignature(primaryW)" in around
