@@ -2317,10 +2317,19 @@ SOCKET_TURN_TIMEOUT_S = float(os.environ.get("MCP_FLEET_SOCKET_TURN_S", "1200"))
 # confuse transport liveness with agent progress: after this much time with neither answer growth
 # nor a progress frame, fail the socket turn and let the existing reconnect/fallback policy act.
 # Long research is unaffected as long as it emits progress.
-SOCKET_MEANINGFUL_IDLE_S = float(os.environ.get("MCP_FLEET_SOCKET_IDLE_S", "90"))
-# Diagnostic-only thresholds. Each socket turn records the first crossing of each bucket so we
-# can lower SOCKET_MEANINGFUL_IDLE_S from evidence instead of guessing. These do not affect
-# recovery, retry budgets or transport state.
+#
+# Evidence for the 60 s default (2026-09-30 live GUI probe): the longest
+# healthy continuous meaningful-idle gap observed was 46.165 s (the turn later completed DONE
+# after 214.8 s total), while the one no-reply stall crossed 60 s and then 90 s continuously.
+# 45 s would therefore cut a measured healthy turn; 60 s keeps ~14 s observed headroom while
+# recovering the measured stall ~30 s earlier than the old 90 s default. The env override remains.
+SOCKET_MEANINGFUL_IDLE_DEFAULT_S = 60.0
+SOCKET_MEANINGFUL_IDLE_S = float(os.environ.get(
+    "MCP_FLEET_SOCKET_IDLE_S", str(SOCKET_MEANINGFUL_IDLE_DEFAULT_S)))
+# Diagnostic-only thresholds. Each socket turn records the first crossing of each bucket so future
+# evidence can move the default again without guessing. These do not affect recovery, retry
+# budgets or transport state. Keep the 90 s bucket even though the default is 60 s: an explicit
+# env override may still choose a longer watchdog and the probe should remain useful there.
 SOCKET_IDLE_PROBE_BUCKETS = (5.0, 10.0, 20.0, 30.0, 45.0, 60.0, 90.0)
 
 
