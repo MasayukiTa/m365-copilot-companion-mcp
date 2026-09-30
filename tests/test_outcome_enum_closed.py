@@ -93,7 +93,13 @@ def _assigned_outcomes():
                     targets.append(tgt)
                     values.append(node.value)
             for tgt, val in zip(targets, values):
-                if not (isinstance(tgt, ast.Attribute) and tgt.attr == "outcome"):
+                # `.outcome = ...` on a worker, or `["outcome"] = ...` on a sidecar dict
+                # (relay/fleet_reaper.py writes INTERRUPTED that way, into a dead run's files).
+                is_attr = isinstance(tgt, ast.Attribute) and tgt.attr == "outcome"
+                is_key = (isinstance(tgt, ast.Subscript)
+                          and isinstance(tgt.slice, ast.Constant)
+                          and tgt.slice.value == "outcome")
+                if not (is_attr or is_key):
                     continue
                 for value, line, kind in _strings_from_expr(tree, val):
                     found.setdefault(value, []).append(

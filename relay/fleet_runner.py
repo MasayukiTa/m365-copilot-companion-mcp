@@ -171,6 +171,7 @@ STATUS_PILL = {
     "maxturns":  ("上限",   "bad"),
     "error":     ("エラー", "bad"),
     "cancelled": ("停止",   "muted"),    # user released it from the cockpit
+    "interrupted": ("中断", "warn"),     # coordinator died; reaper-written, resumable, not a stop
     "fresh_replay": ("新規会話", "good"),
     "content_refused": ("内容拒否", "bad"),
 }
