@@ -27,14 +27,21 @@ jobs:
       - name: Install PSScriptAnalyzer
         shell: pwsh
         run: |
-          # PSGallery is not always registered on the runner image -- it stopped being
-          # there on 2026-08-06 and Set-PSRepository failed outright, taking the job
-          # with it. Register it when missing instead of assuming it is there.
-          if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
-            Register-PSRepository -Default -ErrorAction SilentlyContinue
+          # Hosted runners occasionally lose/break the built-in PSGallery registration.
+          # `Register-PSRepository -Default` itself failed on 2026-09-29 with NuGet
+          # `Missing option value for: -source`, so repair from explicit canonical endpoints
+          # instead of asking PowerShellGet to rediscover its defaults.
+          $gallery = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
+          if (-not $gallery -or [string]::IsNullOrWhiteSpace([string]$gallery.SourceLocation)) {
+            if ($gallery) { Unregister-PSRepository -Name PSGallery -ErrorAction SilentlyContinue }
+            Register-PSRepository -Name PSGallery `
+              -SourceLocation 'https://www.powershellgallery.com/api/v2' `
+              -ScriptSourceLocation 'https://www.powershellgallery.com/api/v2/items/psscript' `
+              -InstallationPolicy Trusted
+          } else {
+            Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop
           }
-          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue
-          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force -Repository PSGallery
+          Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force -Repository PSGallery -ErrorAction Stop
 
       - name: Run PSScriptAnalyzer
         shell: pwsh

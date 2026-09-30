@@ -1,4 +1,4 @@
-# WHY A SUPERVISOR EXISTS, AND WHY THE FIRST ONE DID NOT WORK.
+﻿# WHY A SUPERVISOR EXISTS, AND WHY THE FIRST ONE DID NOT WORK.
 #
 # 2026-08-29 19:17: the driver printed "DONE" with 23 of 40 instances unanswered, exited,
 # and the machine sat idle for three hours. The answer to that was a supervisor -- and the
@@ -44,9 +44,15 @@ function Say([string]$m) {
 # this is a probe and not a side effect. The string is the composer's automation id, which
 # is what the submit path actually needs to exist.
 function Test-Composer {
-    $out = & powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\win\submit_via_ui.ps1 `
-                -GoalFile ".fleet/swe/ui_batch_lines.txt" -ReadOnly 2>&1 | Out-String
-    return ($out -match 'goalInput')
+    # Do not create a nested powershell.exe merely to probe UI Automation. This supervisor is
+    # normally hidden; a child shell from a console-less parent can allocate/flash a new console.
+    try {
+        $out = & .\scripts\win\submit_via_ui.ps1 `
+                    -GoalFile ".fleet/swe/ui_batch_lines.txt" -ReadOnly 2>&1 | Out-String
+        return ($out -match 'goalInput')
+    } catch {
+        return $false
+    }
 }
 
 function Repair-Cockpit([int]$level) {

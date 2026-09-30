@@ -165,6 +165,18 @@ def classify_conv_ref(ref):
     return "bare_url"
 
 
+def startup_resume_candidate(store=None):
+    """Return exactly the newest session row for startup resume policy.
+
+    Do not search backward for a row that merely happens to be attached.  ``should_autoresume``
+    decides whether this newest row is resumable; if it is not, startup must be fresh rather
+    than silently reopening an older conversation.  ``store`` is injectable for a hermetic
+    regression test of the selection rule.
+    """
+    source = S if store is None else store
+    return source.latest_session()
+
+
 def should_autoresume(sess, fresh_flag=False):
     """Pure decision function for startup auto-resume: given the MOST RECENT session (dict or
     None) and the --fresh CLI flag, decide whether main() should attempt to reattach. No
@@ -7446,7 +7458,7 @@ def _page_main(cdp, fresh):
         latest = None
         try:
             # THE NEWEST SESSION, not the newest resumable one -- see should_autoresume.
-            latest = S.latest_session()
+            latest = startup_resume_candidate()
         except Exception:
             logger.warning("startup auto-resume: S.latest_session() failed", exc_info=True)
         do_resume, why = should_autoresume(latest, fresh_flag=fresh)

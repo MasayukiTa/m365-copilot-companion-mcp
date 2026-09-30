@@ -2318,6 +2318,10 @@ SOCKET_TURN_TIMEOUT_S = float(os.environ.get("MCP_FLEET_SOCKET_TURN_S", "1200"))
 # nor a progress frame, fail the socket turn and let the existing reconnect/fallback policy act.
 # Long research is unaffected as long as it emits progress.
 SOCKET_MEANINGFUL_IDLE_S = float(os.environ.get("MCP_FLEET_SOCKET_IDLE_S", "90"))
+# Diagnostic-only thresholds. Each socket turn records the first crossing of each bucket so we
+# can lower SOCKET_MEANINGFUL_IDLE_S from evidence instead of guessing. These do not affect
+# recovery, retry budgets or transport state.
+SOCKET_IDLE_PROBE_BUCKETS = (5.0, 10.0, 20.0, 30.0, 45.0, 60.0, 90.0)
 
 
 def free_disk_gb(path=None):
@@ -2839,6 +2843,10 @@ class RelayWorker:
         #: it nothing reports SUCCESS, the breaker's consecutive counter never resets, and a
         #: long healthy run closes the route on three failures scattered across hours.
         self._socket_turns_seen = 0
+        # Diagnostic crossing memory for meaningful-idle telemetry. Reset lazily when `turn`
+        # changes so a healthy long-lived worker emits at most seven tiny records per turn.
+        self._socket_idle_probe_turn = -1
+        self._socket_idle_probe_seen = set()
         #: Whether this worker STARTED on a socket and had to open a tab. Distinct from
         #: `socket`, which is False afterwards and so cannot answer "which route did this
         #: goal actually need" -- the one question the classifier will be built to predict.
@@ -3911,6 +3919,15 @@ class RelayWorker:
             else:
                 self.status, self.outcome, self.reason = "maxturns", "MAXTURNS", "reached max_turns"
             return
+        # SOCKET WORKERS DO NOT SPEND A TAB SLOT, but their generative turns still spend the
+        # shared Copilot/Dataverse request budget. Gate that budget HERE, at the operation that
+        # actually consumes it, rather than leaving socket workers PENDING behind a tab/worker
+        # admission cap. Keep the worker READY and leave steer/job state untouched while waiting.
+        if getattr(self, "socket", False) and not admission_is_due():
+            ok_rate, why_rate = rate_headroom_ok()
+            self.reason = why_rate or "socket send pacing -- waiting for next send slot"
+            return
+
         # a queued steering message preempts the normal CONTINUE/FIX job for this turn
         if self.steer_msgs:
             _steer_text = self.steer_msgs.pop(0)
@@ -3985,6 +4002,8 @@ class RelayWorker:
             # (max_gen_wait_s), not one blocking call. (run_relay's single-conversation path
             # keeps the full 240s.)
             self.drv.send(self.job, gen_wait_s=2.0)
+            if getattr(self, "socket", False):
+                note_admitted()
         except ConversationClosed as e:
             # The target tab/composer is gone (conversation ended). Retrying a dead
             # target can never succeed -- terminal, skip the transient budget entirely
@@ -4233,6 +4252,71 @@ class RelayWorker:
         except Exception:
             return False
 
+    def _record_socket_idle_probe(self, idle_s):
+        """Record first meaningful-idle threshold crossings for this socket turn.
+
+        This is measurement only. It must never change status, cooldowns, retry counts or the
+        driver's failure state. `SocketRoute.record` itself is best-effort/non-blocking.
+        """
+        try:
+            turn = int(getattr(self, "turn", 0) or 0)
+            if getattr(self, "_socket_idle_probe_turn", -1) != turn:
+                self._socket_idle_probe_turn = turn
+                self._socket_idle_probe_seen = set()
+            seen = getattr(self, "_socket_idle_probe_seen", set())
+            route = _socket_route()
+            for bucket in SOCKET_IDLE_PROBE_BUCKETS:
+                bucket = float(bucket)
+                if idle_s < bucket or bucket in seen:
+                    continue
+                seen.add(bucket)
+                if route is not None:
+                    route.record(
+                        "socket_idle_probe", worker=self.name, turn=turn,
+                        run_id=getattr(self, "run_id", "") or "",
+                        jid=getattr(self, "jid", None), status=self.status,
+                        bucket_s=bucket, idle_s=round(float(idle_s), 3),
+                        limit_s=float(SOCKET_MEANINGFUL_IDLE_S))
+            self._socket_idle_probe_seen = seen
+        except Exception:
+            pass
+
+    def _socket_meaningful_idle_stalled(self, now=None):
+        """Fail one live socket turn after meaningful-progress silence.
+
+        This guard used to exist only in ``_defer_generation`` (the *next-send* path). A socket
+        already in ``status == waiting`` therefore sat behind the outer 240s turn timeout even
+        when the transport itself had reported >90s without meaningful progress. Keep the
+        transport decision in one place and call it from BOTH wait states. It is deliberately
+        socket-only; tab workers retain their existing generation/timeout rules.
+        """
+        if not getattr(self, "socket", False):
+            return False
+        is_generating = getattr(self.drv, "_is_generating", None)
+        if not callable(is_generating):
+            return False
+        try:
+            if not is_generating():
+                return False
+            idle_fn = getattr(self.drv, "generation_idle_s", None)
+            idle_s = float(idle_fn()) if callable(idle_fn) else 0.0
+            self._record_socket_idle_probe(idle_s)
+            if idle_s < SOCKET_MEANINGFUL_IDLE_S:
+                return False
+            reason = ("socket turn made no meaningful progress for %.0fs "
+                      "(limit %.0fs)" % (idle_s, SOCKET_MEANINGFUL_IDLE_S))
+            fail_fn = getattr(self.drv, "fail_stalled_turn", None)
+            if callable(fail_fn):
+                fail_fn(reason)
+            else:
+                self.drv.failed = reason
+            self.reason = reason + " -> reconnect/fallback"
+            self._cooldown_until = (time.time() if now is None else float(now)) + 0.5
+            self.status = "ready"
+            return True
+        except Exception:
+            return False
+
     def _defer_generation(self):
         """Schedule a non-failure RESCHEDULE because the previous turn is still generating.
         Unlike _retry_transient this does NOT touch self.transient (the transient/STUCK
@@ -4261,22 +4345,10 @@ class RelayWorker:
         # snapshot at the end, so `_gen_progress_sig` is flat for a turn that is streaming
         # perfectly well underneath.
         if getattr(self, "socket", False) and getattr(self.drv, "_is_generating", None):
+            if RelayWorker._socket_meaningful_idle_stalled(self, now):
+                return True
             try:
                 if self.drv._is_generating():
-                    idle_fn = getattr(self.drv, "generation_idle_s", None)
-                    idle_s = float(idle_fn()) if callable(idle_fn) else 0.0
-                    if idle_s >= SOCKET_MEANINGFUL_IDLE_S:
-                        reason = ("socket turn made no meaningful progress for %.0fs "
-                                  "(limit %.0fs)" % (idle_s, SOCKET_MEANINGFUL_IDLE_S))
-                        fail_fn = getattr(self.drv, "fail_stalled_turn", None)
-                        if callable(fail_fn):
-                            fail_fn(reason)
-                        else:
-                            self.drv.failed = reason
-                        self.reason = reason + " -> reconnect/fallback"
-                        self._cooldown_until = now + 0.5
-                        self.status = "ready"
-                        return True
                     self.gen_waits += 1          # still counted, so the wait is observable
                     self._cooldown_until = now + 2.0
                     self.status = "ready"
@@ -6640,6 +6712,37 @@ class RelayWorker:
                 cached = self._acting_goal = True      # unknown goes to the careful side
         return cached
 
+    def _timeout_resend_decision(self):
+        """Whether a timed-out turn may be sent again without risking a duplicate effect.
+
+        A turn that reached ``waiting`` was submitted successfully. If no answer comes back we
+        know nothing about whether the agent already performed its side effect. Use the exact
+        same action/effect policy as socket reconnect: reads are safe to repeat; an acting goal
+        is repeated only when an observable effect checker can establish that the effect is absent.
+        Unknown goes to the careful side.
+        """
+        if not self._goal_may_act():
+            return "resend"
+        try:
+            from relay.transport_policy import resend_decision_for_landed_act
+            return resend_decision_for_landed_act(
+                self.goal or "", checker=self._effect_checker())
+        except Exception as exc:
+            # Fail closed, but do not fail silently. A policy import/runtime failure and a
+            # deliberate policy refusal both return "refuse"; without telemetry operators
+            # cannot tell whether the safety policy itself is unavailable. Record only the
+            # exception TYPE (never its message, which can contain paths/tokens/provider text).
+            error_type = type(exc).__name__
+            try:
+                _socket_route().record(
+                    "resend_policy_error", worker=getattr(self, "name", ""),
+                    turn=getattr(self, "turn", 0), error_type=error_type, decision="refuse")
+            except Exception:
+                pass
+            print("[relay_fleet] %s: resend policy unavailable (%s); refusing re-send" %
+                  (getattr(self, "name", "worker"), error_type), flush=True)
+            return "refuse"
+
     def _refuse_resend(self, reason, delivery):
         """End the worker rather than repeat an act it cannot verify. Never silent."""
         self.status, self.outcome = "stuck", "STUCK"
@@ -7111,6 +7214,11 @@ class RelayWorker:
             return self.status in TERMINAL
         if self.status == "waiting":
             self._capture_url()
+            # The transport knows sooner than the generic 240s turn clock when a socket has
+            # stopped making meaningful progress. Consult that signal while the turn is actually
+            # waiting, not only later when a subsequent send discovers the previous generation.
+            if RelayWorker._socket_meaningful_idle_stalled(self, time.time()):
+                return False
             # THE LABEL NAMES THE CLOCK THAT FIRED, AND THE BUDGET IS THE ONE COMPARED. This
             # branch compares against per_turn_timeout_s for every worker, and then chose
             # `origin` from the worker's TRANSPORT -- so a socket worker's row said
@@ -7166,7 +7274,17 @@ class RelayWorker:
                     )[:500]
                     self._settle_done(outcome_override="EVIDENCE_CONTRADICTED")
                     return True
-                # a turn with NO reply is a transient stall -- retry before STUCK
+                # A turn with no reply MAY already have executed. Reads are safe to repeat,
+                # but an acting goal (mail/send/write/etc.) must use the same duplicate-effect
+                # rule as socket reconnect. Measured r6abb8657_a0/w17: an audit allowed one md
+                # write, timed out seven times, and was blindly re-sent every ~240s.
+                _timeout_policy = getattr(self, "_timeout_resend_decision", None)
+                _timeout_resend = _timeout_policy() if callable(_timeout_policy) else "resend"
+                if _timeout_resend != "resend":
+                    self._note_timeout(_origin, _elapsed, "resend-refused", budget_s=_bound)
+                    self._refuse_resend("turn timeout without a reply", "unknown")
+                    return True
+                # Read-only / checkably-absent work keeps the existing transient retry path.
                 if self._retry_transient():
                     self._note_timeout(_origin, _elapsed, "retry", budget_s=_bound)
                     self.reason = "turn timeout -> retry %d/%d" % (self.transient, self.max_transient)
@@ -8557,38 +8675,19 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         # tab_weight charges 1 for a tab and 0 for a socket, ram_room_for_tab gates each lazy
         # side-page at the moment it opens, and the autoscale sets mc_box from free RAM.
         #
-        # THAT ARGUMENT WAS ABOUT RAM. IT WAS NEVER TRUE OF THE COPILOT QUOTA. A socket worker
-        # weighs 0 tab_weight forever -- not just at admission but for every sweep it stays
-        # open -- so `projected_peak` (the sum admission reserves against) never grows past 0
-        # once the fleet is on sockets, and `admits_another_tab` says yes to the ENTIRE pending
-        # queue in the same run of sweeps regardless of mc_box[0]. Measured 2026-09-25, OWNER
-        # report: a run with autoscale holding mc_box[0] at 1 ("RAM-adjust 1..1 tab(s)") grew to
-        # 41 workers, more than 10 of them running at once -- the tab budget was never touched
-        # because nothing they were doing ever showed up in it. Each running worker still spends
-        # Microsoft's per-Dataverse-environment 100 RPM quota one generative turn at a time
-        # (see quota_meter.py), and that quota does not care whether the turn came over a socket
-        # or a tab -- ten-plus concurrent workers is exactly how 111 unlock refusals happened in
-        # 30 minutes on this run. So there IS a per-worker price after all, just not a RAM one:
-        # a COUNT gate, bounding how many workers may be concurrently admitted (tab or socket)
-        # regardless of tab_weight, applied on top of (never instead of) the tab-weight gate
-        # above. `_active_open()` already counts sockets (see _holds_slot's own docstring), so
-        # this reuses it rather than adding new bookkeeping. The `max(1, ...)` mirrors
-        # admits_another_tab's own empty-fleet bootstrap: a cap that reaches 0 must not stop the
-        # fleet forever with work queued and nothing running.
-        while pending and admits_another_tab(
-                _active_open(), _projected_peak(),
-                pending[0].tab_weight(assume_socket=_socket_open_now()), mc_box[0]) \
-                and _active_open() < max(1, mc_box[0]):
-            # SPACING, AND IT SITS HERE BECAUSE THERE ARE TWO WAYS OUT OF THIS LOOP.
-            # The first version of this guard was placed next to `pending.pop(0)` in the flat
-            # branch, and the per-repo branch a few lines above pops with `pending.pop(pick)`
-            # -- so the spacing would have covered every kind of run EXCEPT the benchmark runs
-            # that produced the measurement. Guarding one caller of a failure class and calling
-            # it fixed is a mistake this repository has already paid for.
-            #
-            # Costs at most one interval of delay before a disk/RAM deferral is logged, which
-            # is the right trade for covering both paths with one line.
-            if not admission_is_due():
+        # SOCKET ATTACHMENT IS NOT THE QUOTA-SPENDING OPERATION. A socket worker reserves zero
+        # tabs (tab_weight==0), so it may become READY without sitting behind the browser/RAM
+        # cap. The shared request ceiling is enforced in RelayWorker._begin_send immediately
+        # before each generative socket send. Tabs keep the historical attach pacing below.
+        # This separates three different resources instead of pretending one integer is all of
+        # them: browser tabs/RAM at admission, disk at eval admission, request rate at send.
+        while pending:
+            _candidate_socket = _socket_open_now()
+            if not admits_another_tab(
+                    _active_open(), _projected_peak(),
+                    pending[0].tab_weight(assume_socket=_candidate_socket), mc_box[0]):
+                break
+            if not _candidate_socket and not admission_is_due():
                 break
             # reserve disk for THIS eval plus every already-open eval still in flight, so we never
             # admit N tabs that look fine individually but crash C: once their builds run at once.
@@ -8644,7 +8743,8 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     route.refresh(context, agent_url)
             except Exception:
                 pass
-            note_admitted()
+            if not _candidate_socket:
+                note_admitted()
             ok = w.attach(context, agent_url)
             if not ok:
                 # attach failed. If the WHOLE Edge/context died mid-open (e.g. the

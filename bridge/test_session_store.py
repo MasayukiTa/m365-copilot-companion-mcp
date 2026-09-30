@@ -55,6 +55,17 @@ def test_list_ordering():
     assert sids_in_order == [s2["sid"], s3["sid"], s1["sid"]]
 
 
+def test_latest_session_does_not_skip_an_unattached_newest_row():
+    older = ss.new_session(title="older attached")
+    ss.touch(older["sid"], conv_url="sess:older", last_active_ts=100.0)
+    newest = ss.new_session(title="newest unattached")
+    ss.touch(newest["sid"], conv_url="", last_active_ts=200.0)
+
+    got = ss.latest_session()
+    assert got["sid"] == newest["sid"]
+    assert got["conv_url"] == ""
+
+
 def test_touch_merge():
     sess = ss.new_session(title="orig")
     old_ts = sess["last_active_ts"]
