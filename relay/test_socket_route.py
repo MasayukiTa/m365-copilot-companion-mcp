@@ -1055,6 +1055,66 @@ def test_waiting_socket_with_recent_progress_keeps_waiting(monkeypatch):
     assert w.status == "waiting"
 
 
+
+
+def test_socket_idle_probe_records_each_threshold_once_per_turn(monkeypatch):
+    import relay.relay_fleet as rf
+
+    class Recorder:
+        def __init__(self):
+            self.events = []
+        def record(self, event, **fields):
+            self.events.append((event, fields))
+
+    rec = Recorder()
+    monkeypatch.setattr(rf, "_socket_route", lambda: rec)
+    monkeypatch.setattr(rf, "SOCKET_MEANINGFUL_IDLE_S", 90.0)
+    monkeypatch.setattr(rf, "SOCKET_IDLE_PROBE_BUCKETS", (5.0, 10.0, 20.0, 30.0, 45.0, 60.0, 90.0))
+
+    w = _waiting_socket_worker(12.0)
+    w.turn = 3
+    assert w._socket_meaningful_idle_stalled() is False
+    assert [e[1]["bucket_s"] for e in rec.events] == [5.0, 10.0]
+    assert all(e[0] == "socket_idle_probe" for e in rec.events)
+    assert all(e[1]["turn"] == 3 for e in rec.events)
+
+    # Same turn does not spam the same buckets. Crossing one new boundary adds one record.
+    w.drv.idle_s = 24.0
+    assert w._socket_meaningful_idle_stalled() is False
+    assert [e[1]["bucket_s"] for e in rec.events] == [5.0, 10.0, 20.0]
+    w.drv.idle_s = 24.0
+    assert w._socket_meaningful_idle_stalled() is False
+    assert [e[1]["bucket_s"] for e in rec.events] == [5.0, 10.0, 20.0]
+
+    # A new turn gets a fresh measurement set.
+    w.turn = 4
+    w.drv.idle_s = 6.0
+    assert w._socket_meaningful_idle_stalled() is False
+    assert rec.events[-1][1]["bucket_s"] == 5.0
+    assert rec.events[-1][1]["turn"] == 4
+
+
+def test_socket_idle_probe_never_runs_for_tab_or_finished_turn(monkeypatch):
+    import relay.relay_fleet as rf
+
+    class Recorder:
+        def __init__(self):
+            self.events = []
+        def record(self, event, **fields):
+            self.events.append((event, fields))
+
+    rec = Recorder()
+    monkeypatch.setattr(rf, "_socket_route", lambda: rec)
+
+    tab = _waiting_socket_worker(999.0, socket=False)
+    assert tab._socket_meaningful_idle_stalled() is False
+    assert rec.events == []
+
+    finished = _waiting_socket_worker(999.0)
+    finished.drv.generating = False
+    assert finished._socket_meaningful_idle_stalled() is False
+    assert rec.events == []
+
 def test_waiting_tab_is_not_subject_to_socket_meaningful_idle(monkeypatch):
     monkeypatch.setattr(rf, "SOCKET_MEANINGFUL_IDLE_S", 90.0)
     w = _waiting_socket_worker(999.0, socket=False)
