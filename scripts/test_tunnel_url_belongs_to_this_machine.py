@@ -28,6 +28,7 @@ def _env(tmp_path, text):
 def at(tmp_path, monkeypatch):
     """Point bootstrap at a temporary ROOT so a real .env is never read or written."""
     monkeypatch.setattr(B, "ROOT", tmp_path)
+    monkeypatch.setattr(B.env_file, "_protect_secret", lambda value: "dpapi:test-" + value)
     return tmp_path
 
 
@@ -38,7 +39,9 @@ def test_the_host_is_recorded_beside_a_minted_url(at, monkeypatch):
     out = (at / ".env").read_text(encoding="utf-8")
     assert "MCP_TUNNEL_URL=https://abc-8000.devtunnels.ms" in out
     assert "MCP_TUNNEL_HOST=pc-new" in out
-    assert "MCP_API_KEY=k" in out, "every other line must survive"
+    assert "MCP_API_KEY=k" not in out
+    assert "MCP_API_KEY_PROTECTED=dpapi:test-k" in out, \
+        "an unrelated tunnel edit must migrate a legacy API key rather than persist plaintext"
 
 
 def test_a_stale_host_line_is_replaced_not_duplicated(at, monkeypatch):

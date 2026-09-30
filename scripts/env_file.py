@@ -194,6 +194,18 @@ def atomic_write_text(path: Path, text: str, attempts: int = 10) -> None:
             pass
 
 
+def atomic_edit_text(path: Path, text: str, attempts: int = 10) -> None:
+    """Atomically rewrite an EXISTING .env-derived candidate, migrating legacy auth first.
+
+    ``atomic_write_text`` is the final sink and deliberately refuses every active plaintext auth
+    alias.  Callers that read an existing .env, change unrelated settings, and write the result
+    must use this edit-layer helper so old installs are migrated to DPAPI instead of deadlocking
+    on the stricter sink.  Fresh-file and already-protected writers may keep using the sink
+    directly.
+    """
+    atomic_write_text(path, _migrate_legacy_plaintext_auth(text), attempts=attempts)
+
+
 def active_keys(text: str) -> set:
     """Keys that have an ACTIVE (uncommented) assignment."""
     out = set()
@@ -259,7 +271,7 @@ def set_key(path: Path, key: str, value: str) -> None:
     if not done:
         out.append("%s=%s" % (key, value))
     candidate = nl.join(out) + nl
-    atomic_write_text(path, _migrate_legacy_plaintext_auth(candidate))
+    atomic_edit_text(path, candidate)
 
 
 def unset_key(path: Path, key: str) -> bool:
@@ -278,7 +290,7 @@ def unset_key(path: Path, key: str) -> bool:
         kept.append(line)
     if removed:
         candidate = nl.join(kept) + nl
-        atomic_write_text(path, _migrate_legacy_plaintext_auth(candidate))
+        atomic_edit_text(path, candidate)
     return removed
 
 
