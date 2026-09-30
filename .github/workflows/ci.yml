@@ -538,6 +538,8 @@ jobs:
             bridge/test_one_rule_for_the_active_session.py \
             bridge/test_conv_url_follows_the_turn.py \
             tests/test_retry_sets_agree.py \
+            tests/test_reaper_marks_interrupted.py \
+            tests/test_interrupted_status_is_classified_everywhere.py \
             tests/test_idle_edge_release.py \
             relay/test_merge_delivery.py \
             relay/test_campaign_ledger.py \

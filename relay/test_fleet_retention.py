@@ -358,3 +358,26 @@ def test_the_surviving_registry_is_still_valid_json(tmp_path):
     R.conversations(str(tmp_path), now=now)
     got = _read_registry(tmp_path)
     assert isinstance(got, list) and len(got) == 1 and got[0]["name"] == "keep"
+
+
+def test_the_interrupted_run_snapshots_are_never_swept(tmp_path):
+    """`.fleet/interrupted/<run_id>.json` is the ONLY copy of a dead run's resume input once the
+    reaper has consumed the live marker. No retention rule may touch it, however old, however
+    large the rest of the directory, and in a real (non-dry) run. It is outside every rule by
+    construction (allow-listed store dirs, root-only globs); this pins that."""
+    now = time.time()
+    year = 400.0
+    snaps = [
+        _touch(str(tmp_path / "interrupted" / ("r%d_a1.json" % i)), size=2048, age_days=year, now=now)
+        for i in range(3)
+    ]
+    _touch(str(tmp_path / "interrupted" / "r9_a1.json.tmp"), size=10, age_days=year, now=now)
+    # neighbours that ARE swept, so the run provably deleted something
+    for i in range(30):
+        _touch(str(tmp_path / ("coordinator_2026080%d_p%d.log" % (i % 9, i))),
+               size=1000, age_days=40 + i, now=now)
+    rep = R.apply(str(tmp_path), now=now + 10 * 365 * 86400.0, dry_run=False)
+    assert rep["freed_bytes"] > 0, "the sweep removed nothing, so this proves nothing"
+    for p in snaps:
+        assert os.path.isfile(p), "retention deleted a resume snapshot: %s" % p
+    assert os.path.isfile(str(tmp_path / "interrupted" / "r9_a1.json.tmp"))
