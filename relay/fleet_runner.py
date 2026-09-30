@@ -1310,6 +1310,25 @@ def reject_local_loop_control_goals(goals):
     return errors
 
 
+def _effort_policy_block():
+    """{"effort_policy": {mode, source, conflict}} for the snapshot, or {} on any failure."""
+    try:
+        from relay import effort_policy as _ep
+        m, src, conflict = _ep.mode_info()
+        return {"effort_policy": {"mode": m, "source": src, "conflict": bool(conflict)}}
+    except Exception:
+        return {}
+
+
+def _effort_worker_fields(w):
+    """Per-worker effort badge fields (see effort_policy.status_fields); {} on any failure."""
+    try:
+        from relay import effort_policy as _ep
+        return _ep.status_fields(w)
+    except Exception:
+        return {}
+
+
 def _pending_gates(started=0.0):
     """Scan .companion_gates/ for unanswered HITL gates and return a list of dicts.
 
@@ -1747,6 +1766,9 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
             "recovery_result": getattr(w, "recovery_result", ""),
             "recovery_state": getattr(w, "recovery_state", ""),
             "attempt_transcripts": list(getattr(w, "attempt_transcripts", [])),
+            # Effort-policy badge data (additive; absent when the policy is off). Status,
+            # outcome and pill above are untouched: this is display only, and shadow is record-only.
+            **_effort_worker_fields(w),
         } for w in workers],
         # Pending HITL gates from the autonomy contract gate (contract_gate.py).
         # Each entry: {"token": str, "question": str, "context": str, "ts": float, "path": str}
@@ -1756,6 +1778,9 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         # Set {"answered": true, "answer": "approved"}  to approve
         # Set {"answered": true, "answer": "denied"}    to deny
         "pending_gates": _pending_gates(started=started),
+        # What the effort policy is REALLY set to (env > settings > off) so the cockpit shows
+        # the truth, not its own combo. Additive; absent if it cannot be resolved.
+        **_effort_policy_block(),
     }
     # Derived fan-out family markers (parent / child / aggregator / stalled) so the
     # cockpit can render the split-and-merge structure the lineage already implies.
