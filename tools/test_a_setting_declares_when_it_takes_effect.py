@@ -91,6 +91,11 @@ def _reader_rate():
     return rate_ceiling()
 
 
+def _reader_effort_policy():
+    from relay.effort_policy import mode
+    return mode()
+
+
 #: The reader whose return value an operator would see change, per key that claims to follow
 #: the file. A registry rather than a literal parameter list: a key declared live with no
 #: entry here FAILS the next test instead of quietly not being checked, which is how the
@@ -100,7 +105,16 @@ _LIVE_READERS = {
     "ram_floor_mb": (_reader_ram, "512", "3072"),
     "maxtabs": (_reader_maxtabs, "2", "7"),
     "rate_ceiling_rpm": (_reader_rate, "40", "90"),
+    "effort_policy": (_reader_effort_policy, "shadow", "on"),
 }
+
+
+def _norm(v):
+    """Numbers compare as numbers, words as words (effort_policy is off|shadow|on)."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return str(v)
 
 #: job_approval_mode follows the file too, but its reader short-circuits under pytest and is
 #: checked in a subprocess below; it is not a gap, it is a different harness.
@@ -126,9 +140,10 @@ def test_a_key_declared_live_is_seen_again_without_a_restart(key, tmp_path, monk
     path = tmp_path / "settings.txt"
     monkeypatch.setattr(SP, "NEW_PATH", str(path))
     _write_settings(str(path), **{key: first})
-    assert float(reader()) == float(first)
+    monkeypatch.delenv("MCP_EFFORT_POLICY", raising=False)   # env would beat the file
+    assert _norm(reader()) == _norm(first)
     _write_settings(str(path), **{key: second})
-    assert float(reader()) == float(second), \
+    assert _norm(reader()) == _norm(second), \
         "%s is declared live but a second read still returned the old value" % key
 
 
