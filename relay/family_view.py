@@ -275,5 +275,20 @@ def read_fleet_dir(fleet_dir):
     return workers, lines
 
 
+def main(argv=None):
+    """`python -m relay.family_view [--fleet-dir DIR]`: print the split-group ledger as text."""
+    import argparse
+    ap = argparse.ArgumentParser(description="Show the split-group (分割グループ) ledger.")
+    ap.add_argument("--fleet-dir", default=".fleet", help="directory holding status.json")
+    args = ap.parse_args(argv)
+    workers, lines = read_fleet_dir(args.fleet_dir)
+    print(render_text(build_groups(workers, lines)))
+    return 0
+
+
 __all__ = ["build_groups", "annotate_display_state", "render_text", "read_fleet_dir",
            "parse_ledger", "DISPLAY_LABELS", "MERGE_LABELS"]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

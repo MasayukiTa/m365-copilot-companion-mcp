@@ -144,3 +144,53 @@ def test_read_fleet_dir_tolerates_missing_and_torn(tmp_path):
                                           encoding="utf-8")
     ws, lines = fv.read_fleet_dir(str(tmp_path))
     assert len(ws) == 2 and lines == []
+
+
+# ---- the status.json snapshot writer is the production caller ----------------------------
+
+def _snap_with(ws):
+    return {"workers": [dict(w, pill="P") for w in ws], "status_marker": 1}
+
+
+def test_snapshot_gains_groups_and_display_state_without_touching_status():
+    from relay import fleet_runner as fr
+    snap = _snap_with(_family([("running", ""), ("done", "DONE")]))
+    before = {w["name"]: (w["status"], w["outcome"], w["pill"]) for w in snap["workers"]}
+    fr._attach_split_groups(snap)
+    assert len(snap["groups"]) == 1 and snap["groups"][0]["group_id"] == "c1"
+    parent = next(w for w in snap["workers"] if w["name"] == "p")
+    assert parent["display_state"] == "awaiting_children"
+    assert {w["name"]: (w["status"], w["outcome"], w["pill"])
+            for w in snap["workers"]} == before
+    assert all("display_state" not in w for w in snap["workers"] if w["name"] != "p")
+
+
+def test_failure_in_build_groups_leaves_snapshot_intact(monkeypatch):
+    from relay import fleet_runner as fr
+
+    def boom(*a, **k):
+        raise RuntimeError("x")
+    monkeypatch.setattr(fv, "build_groups", boom)
+    snap = _snap_with(_family([("running", "")]))
+    orig = [dict(w) for w in snap["workers"]]
+    fr._attach_split_groups(snap)
+    assert "groups" not in snap and snap["workers"] == orig and snap["status_marker"] == 1
+
+
+def test_groups_are_capped():
+    from relay import fleet_runner as fr
+    ws = []
+    for i in range(fr._MAX_SPLIT_GROUPS + 5):
+        ws += [dict(w, name="%s%d" % (w["name"], i), task_id="%s%d" % (w["task_id"], i),
+                    parent_task_id=(("tp%d" % i) if w["parent_task_id"] else None))
+               for w in _family([("running", "")], cid="c%03d" % i)]
+    snap = _snap_with(ws)
+    fr._attach_split_groups(snap)
+    assert len(snap["groups"]) == fr._MAX_SPLIT_GROUPS
+
+
+def test_module_cli_prints_ledger(tmp_path, capsys):
+    (tmp_path / "status.json").write_text(
+        json.dumps({"workers": _family([("running", "")])}), encoding="utf-8")
+    assert fv.main(["--fleet-dir", str(tmp_path)]) == 0
+    assert "分割グループ c1" in capsys.readouterr().out
