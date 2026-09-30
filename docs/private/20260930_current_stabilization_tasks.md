@@ -289,3 +289,12 @@ Current evidence after refresh:
 - Latest inspected `main` workflow head is green. Historical main CI failures already recorded below were superseded by later green runs; do not weaken timing gates from a single hosted-runner tail unless recurrence is demonstrated.
 
 Resume point after integration hygiene: STAB-004 post-60s live validation remains the first active product item; then STAB-005/STAB-006 live re-verification, followed by main integration.
+
+### 2026-09-30 19:xx JST main convergence validation
+
+- merged current `origin/main` (`dfa157e`) into `fix/phase2-audit-followups-20260929` as `8cab371`; no conflicts; untracked `kanazawa-trip/` and `reviews/` were not staged or modified;
+- branch-vs-main product delta remains the intended post-PR#67 socket/GUI stabilization plus this private ledger checkpoint;
+- focused socket / timeout / resend / GUI-submit integration regression set: **184 passed, 2 skipped**;
+- CI manifest: **723 pytest files listed / OK**;
+- `git diff --check origin/main...HEAD`: clean;
+- next action: push this converged head and open a fresh PR from the SAME stabilization branch (PR #67 is already merged) so CI, Windows build, install path, CodeQL, Secret scan, PowerShell lint and Workflow lint run on the actual current head.
