@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from relay.local_job_store import JobStoreError, LocalJobStore
@@ -173,3 +175,17 @@ def test_console_projection_surfaces_pending_steer_as_real_progress(tmp_path):
     worker = store.console_snapshot()["workers"][0]
     assert worker["execution"]["operator_steer_pending"] == 1
     assert worker["execution"]["last_progress"] == "Prioritize the executive summary"
+
+
+def test_agent_can_receive_but_cannot_mint_operator_steers():
+    repo = Path(__file__).resolve().parents[1]
+    instructions = (repo / "docs" / "examples" / "local_loop_agent_instructions.txt").read_text(
+        encoding="utf-8",
+    )
+    assert "context.operator_steers" in instructions
+    assert "local-operator-authored authority" in instructions
+    assert "Never invent, synthesize, or infer an operator steer." in instructions
+
+    # The model-facing LOCAL_LOOP MCP surface must not expose the operator-authority write API.
+    ops = (repo / "tools" / "local_loop_ops.py").read_text(encoding="utf-8")
+    assert "queue_operator_steer" not in ops
