@@ -84,3 +84,10 @@ Under `%USERPROFILE%\.claude\tools\<tool>\README.md`:
 - Only 1 row so far, because only one worker has started since the merge; in-run evaluation rows will accumulate with turns.
 - Next: after a few days of data, run scripts/effort_policy_replay.py on the live ledger and decide whether to set effort_policy=on (initial assignment for fan-out children).
 - Open items: first shadow row confirmation is done. Hidden-tool and disk items unchanged.
+
+## 2026-09-30 - remote grading adapter and host probe
+
+- Probed the remote grading host read-only over ssh: reachable non-interactively; memory and disk healthy (49.8 GB RAM free, 235.5 GB free on C:), but the grading WSL distro is Stopped and the dockerd task (SweDockerd) has been idle since 2026-09-15 with last result 1, so nothing can be graded until the owner starts it. Nothing on the host was started, changed or deleted.
+- Added bench/remote_grade.py (one instance + one patch file -> structured result, infra vs graded-fail, injectable transport, CLI) and bench/test_remote_grade.py (20 tests, registered in ci.yml). bench/swe_check.py is untouched.
+- Known-answer validation (gold resolves, empty patch rejected) NOT run: blocked by the stopped distro. Cached image list and swebench version are unknown for the same reason. grade.py is Lite-only, which limits the pilot to ids that are in Lite.
+- Details and tags in docs/private/20260930_effort_bench_design.md, section "Remote grading: measured".
