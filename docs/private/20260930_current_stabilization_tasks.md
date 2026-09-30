@@ -51,9 +51,10 @@ Current convergence snapshot (2026-09-30): `origin/main` = `b235e01`; PR #67 rem
 This section is updated immediately when the user interrupts ongoing work. It is the resume authority after the interrupt is handled.
 
 1. ACTIVE -- STAB-002 latest UX requirement: the left 220px Spine must contain BOTH `内容詳細` and `実行タイムライン`. Keep the useful content-detail implementation; restore timeline in the same left frame using the historical/shared `phase_events` / `BuildTimelineEvents` contract. Expanded-card Timeline remains as detailed evidence.
-2. LIVE VERIFY -- STAB-004: waiting-path meaningful-idle repair is implemented and regression-green. Re-measure one GUI-submitted task under the new runner and confirm a socket with >90s no meaningful progress transitions to reconnect/fallback before the generic 240s timeout.
-3. ACTIVE -- unlock false-positive investigation: recent transcripts repeatedly contain responses equivalent to `no tool was executed, therefore unlock is unnecessary`; Fleet then sees unlock/lock marker words and promotes the response into lock suspicion / intervention. Distinguish an explicit `unlock not required` / read-only/no-tool response from an actual write/tool lock refusal before escalating to unlock probe or needs-attention.
-4. INTEGRATION -- after the three items above are green, commit/push them on PR #67, verify current-head checks, merge to `main`, verify post-merge main, then reconcile superseded old branches/PRs.
+2. ACTIVE -- STAB-004: the 240s blind-wait defect is repaired to consult meaningful-idle at 90s, but 90s is only an intermediate ceiling. User requirement is to minimize waiting as far as safely possible. Measure what `generation_idle_s` actually means, distinguish healthy long computation from transport silence, then drive the safe recovery latency down to the smallest evidence-supported value without causing false reconnects or duplicate work.
+3. ACTIVE -- STAB-003 foreground console regression: user reconfirmed shell/cmd still appears in foreground during CopilotAgent open/submit. Reproduce with process-tree/window-owner capture and remove the remaining visible-console spawn path; static `CreateNoWindow` evidence is not sufficient.
+4. ACTIVE -- unlock false-positive investigation: recent transcripts repeatedly contain responses equivalent to `no tool was executed, therefore unlock is unnecessary`; Fleet then sees unlock/lock marker words and promotes the response into lock suspicion / intervention. Distinguish an explicit `unlock not required` / read-only/no-tool response from an actual write/tool lock refusal before escalating to unlock probe or needs-attention.
+5. INTEGRATION -- after the active items above are green, commit/push them on PR #67, verify current-head checks, merge to `main`, verify post-merge main, then reconcile superseded old branches/PRs.
 
 Resume rule: after any newly injected user instruction is handled, return automatically to the first still-ACTIVE item above. Do not wait for another user prompt.
 
@@ -70,7 +71,7 @@ Acceptance:
 - no old handoff is treated as the current task list without reconciling this file first.
 
 ### STAB-002 -- FleetCockpit left panel: combined `内容詳細` + `実行タイムライン`
-Status: IN PROGRESS / REQUIREMENT RECONCILED FROM LIVE SCREENSHOT
+Status: PATCH COMMITTED / PUSHED (`540ebdb`) / LIVE VISUAL VERIFY PENDING
 
 User reports that the intended/current change is to replace the execution-timeline presentation with `内容詳細`, but neither the current local source nor git history contains `内容詳細`.
 
@@ -107,15 +108,18 @@ Updated acceptance:
 - the same left Spine also shows `実行タイムライン` / `Execution timeline` using the shared historical event contract (`phase_events` first, transcript-derived fallback);
 - timeline repaint tracks phase-event changes as well as content-detail changes;
 - expanded-card Timeline remains detailed evidence; full Goal remains in Overview;
-- live-task screenshot/visual verification required after rebuild.
+- live-task screenshot/visual verification required after rebuild;
+- timeline labels alone are insufficient when richer worker data exists: visible entries should identify the concrete work/progress (current step / progress / reason / phase label or equivalent) without inventing details.
+- 2026-09-30 implementation completed/pushed as `540ebdb` (`fix(cockpit): restore timeline beside content details`). The left Spine now keeps `内容詳細` first, restores the shared execution timeline beneath it, and adds a bounded `現在 / Now` line sourced only from `execution.current_step`, `last_progress`, then worker `reason` so timeline context identifies the concrete work instead of showing phase names alone. Related UI regressions: **61 passed**; rebuilt `FleetCockpit.exe` / `CopilotChat.exe` and both relaunched successfully. Remaining acceptance item: live-task visual screenshot/UIA verification only.
 
 ### STAB-003 -- foreground PowerShell / cmd window when CopilotAgent opens or work is submitted
-Status: PATCH VALIDATED LOCALLY / LIVE RE-VERIFY PENDING
+Status: REOPENED / LIVE REGRESSION CONFIRMED BY USER
 
 User reports a PowerShell or Command Prompt window still comes to the foreground, likely around CopilotAgent opening/submission.
 
 2026-09-30 live/static evidence so far:
 - C2C `execute_command` itself is **not** the direct culprit: its Windows spawn uses `windowsHide: true` in `src/system/full-access.ts`.
+- 2026-09-30 12:xx JST: user explicitly reconfirmed that shell/cmd windows are STILL appearing in the foreground. Therefore the previous nested-submit repair was insufficient; do not close this item from static/process-launcher tests. Trace the actual process tree/window owner at the moment CopilotAgent opens/submits and remove the remaining visible-console launcher.
 - FleetCockpit `RunPowershellScript` / reconnect / repair launchers use `UseShellExecute=false` + `CreateNoWindow=true`.
 - `relay.edge_auth` and `relay.edge_recover` PowerShell launches use `childproc.headless_creationflags()`.
 - a live GUI submission moved the worker `pending -> waiting` while a 12-second sample detected no persistent visible PowerShell/cmd/Windows Terminal window; this does not exclude a short flash or a different caller path.
@@ -165,7 +169,9 @@ Acceptance:
 - extracted `_socket_meaningful_idle_stalled()` as the single transport-level guard and call it from both `_defer_generation()` and the live `waiting` poll path; tabs are explicitly excluded;
 - a stalled socket becomes `ready` with `reconnect/fallback` reason without consuming the generic transient timeout retry budget;
 - `relay/test_socket_route.py`: full suite **119 passed**; related timeout/resend/settle/policy set **85 passed, 2 skipped**; CI manifest **715 pytest files listed / OK**; `git diff --check` clean;
-- status remains REOPENED until a live GUI-submitted task is re-measured after the new runner code is actually active.
+- status remains REOPENED until a live GUI-submitted task is re-measured after the new runner code is actually active;
+- 90s is not the final target: quantify healthy socket `generation_idle_s` and reduce the threshold / recovery loop to the smallest safe evidence-based latency.
+- 2026-09-30 current repair: removed the contradictory socket worker-count admission gate. Socket workers no longer sit PENDING behind the tab/RAM cap; request-rate pacing now occurs at the actual generative socket send, while tabs retain attach-time pacing. New `relay/test_socket_admission_no_pending.py` plus related socket/timeout/resend coverage: **170 passed, 2 skipped**; CI manifest now lists **716 pytest files**; `py_compile` and `git diff --check` clean. Committed/pushed as `b3d9ce5` (`fix(fleet): pace socket sends without pending workers`). This closes the synthetic admission regression, but live latency measurement is still required before STAB-004 closes.
 
 ### STAB-005 -- task entered/submitted but not reflected in Fleet UI
 Status: REOPENED / VERIFY CURRENT PATH
@@ -255,3 +261,12 @@ These do not outrank the live P0 regressions above unless they become direct blo
 - 2026-09-30: STAB-003 foreground-console investigation ruled out C2C/Cockpit/Edge headless launchers, found eight recent nested `submit_via_ui.ps1` PowerShell starts and four tracked automation callers that created a redundant child shell. Those callers were converted to in-process invocation; parser 0/4 and 14 related tests green. Live re-verification remains pending.
 - 2026-09-30: STAB-002 operator-facing left Spine changed from the duplicate execution timeline to `内容詳細`. Timeline evidence remains in expanded cards. New/related tests 60 green; rebuilt-binary UI set 74 green. Live-task visual verification remains pending because the current Fleet is idle and hides the Spine.
 - 2026-09-30: user explicitly required interruption-safe operation. Added mandatory rule: every mid-stream instruction is recorded immediately with priority + resume point, handled, then interrupted work auto-resumes without another `continue`. Also recorded binding PR #67 -> main convergence plan and latest combined content-details + timeline requirement.
+
+- 2026-09-30: during STAB-002 validation, `.git/config` was observed modified at 12:20 with `core.bare=true`, causing Git to stop recognizing the primary checkout as a work tree. Backed up the exact config and restored `core.bare=false`; branch/status became readable again. Root writer still requires attribution.
+- 2026-09-30: user clarified that the timeline must show concrete work content, not merely exist, and that waiting latency must be minimized beyond the interim 90s meaningful-idle ceiling. STAB-002/STAB-004 acceptance and resume queue updated accordingly.
+
+- 2026-09-30: user reconfirmed foreground shell/cmd still appears. STAB-003 reopened as a live regression; this is now a mandatory process-tree/window-owner investigation, not a static-launcher recheck. The same checkpoint records the socket admission/send-pacing repair (122 focused tests green).
+
+- 2026-09-30: STAB-004 socket admission/send-pacing repair completed and pushed as `b3d9ce5`; 170 related tests passed, 2 skipped, CI manifest 716/OK. Live latency measurement remains open.
+
+- 2026-09-30: STAB-002 combined Content details + Execution timeline implementation completed and pushed as `540ebdb`; 61 related UI tests green and both WPF binaries rebuilt/restarted. Live visual verification remains open.
