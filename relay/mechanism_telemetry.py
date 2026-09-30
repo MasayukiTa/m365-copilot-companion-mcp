@@ -70,7 +70,10 @@ MECHANISMS = ("fanout", "refuter", "panel", "veto", "retry", "bestofn", "skill",
               # declares an INFRASTRUCTURE fault rather than a task failure, so the first time
               # it is right about that should not land only in a status field the next sweep
               # overwrites.
-              "unlanded_calls")
+              "unlanded_calls",
+              # Phase 1 of the per-goal effort policy: SHADOW rows only (what it would have
+              # done). Registered so summarise() reads it; see relay/effort_policy.py.
+              "effort_policy")
 
 
 def patch_hash(text):
