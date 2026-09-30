@@ -1,9 +1,10 @@
 """A per-goal effort POLICY: when should one goal's effort change, on what evidence.
 
-PHASE 1 OF 5, SHADOW ONLY. Nothing in this module changes what a worker does. With
-MCP_EFFORT_POLICY=shadow it records, per turn, the decision it WOULD have taken; with the
-default (off) it does nothing at all. `on` is reserved and, until phase 3, behaves exactly
-like shadow. See docs/private/20260930_effort_policy_design.md.
+PHASE 2 OF 5. With MCP_EFFORT_POLICY=shadow (phase 1) it records, per turn, the decision it
+WOULD have taken; with the default (off) it does nothing at all. `on` (phase 2) makes ONE
+thing real: the INITIAL effort of fan-out children (one step below the parent, the merge turn
+keeping the parent's level) and the sibling de-escalation rule. In-run switching (evaluate)
+is still record-only in every mode. See docs/private/20260930_effort_policy_design.md.
 
 THE REPOSITORY RULE THIS FOLLOWS. Difficulty is never inferred from a goal's wording. Effort
 is set from (a) something that KNEW -- an explicit goal effort, the parent goal, a measured
@@ -62,6 +63,9 @@ class PolicyConfig:
     confidence_low_up: int = 2
     #: de-escalate after this many consecutive first-pass UPHELD verdicts.
     upheld_down: int = 3
+    #: LATER siblings of a fan-out campaign start one step lower once this many finished
+    #: siblings in a row were UPHELD on the first refuter pass (env ..._SIBLING_UPHELD_STREAK).
+    sibling_upheld_streak: int = 2
     #: fraction of the turn budget after which budget pressure de-escalates.
     budget_pressure_frac: float = 0.8
     #: no reversal of direction within this many turns of the previous switch.
@@ -106,23 +110,22 @@ _warned_on = [False]
 def mode(env=None, log=None):
     """MCP_EFFORT_POLICY = off|shadow|on, default off. Unknown values mean off.
 
-    `on` is NOT implemented in phase 1: it is treated exactly as shadow, and the fact is
-    logged once per process so nobody believes the policy is steering.
+    `on` = initial assignment (fan-out children, merge, sibling rule) is ACTIVE; live
+    switching (evaluate) is still shadow. Said once per process so nobody believes more is
+    steering than is.
     """
     env = os.environ if env is None else env
     raw = str(env.get("MCP_EFFORT_POLICY", "") or "").strip().lower()
     if raw not in MODES:
         return "off"
-    if raw == "on":
-        if not _warned_on[0]:
-            _warned_on[0] = True
-            if log:
-                try:
-                    log("[effort_policy] MCP_EFFORT_POLICY=on is not active yet "
-                        "(phase 1): running as shadow, behaviour unchanged")
-                except Exception:
-                    pass
-        return "shadow"
+    if raw == "on" and not _warned_on[0]:
+        _warned_on[0] = True
+        if log:
+            try:
+                log("[effort_policy] MCP_EFFORT_POLICY=on: initial assignment active "
+                    "(fan-out children, sibling de-escalation); live switching still shadow")
+            except Exception:
+                pass
     return raw
 
 
@@ -139,12 +142,14 @@ class EffortState:
 
 
 def initial_level(goal, run_level, *, parent_level=None, is_merge_turn=False,
-                  calibration_level=None):
+                  calibration_level=None, sibling_streak=0, sibling_threshold=2):
     """The level a goal STARTS at, and where that came from. Returns (level, source).
 
     Precedence: explicit goal effort > parent-derived > calibration > run level.
     A fan-out child sits ONE STEP BELOW its parent (floor min); the merge/verify turn of a
     parent keeps the parent's level, because it judges the children's combined work.
+    A sibling streak (finished siblings UPHELD first pass in a row) >= the threshold starts a
+    LATER sibling one step lower still (floor min); source "sibling". Not for merge turns.
     Unknown names at any layer are skipped, not trusted.
     """
     explicit = effort_mod.goal_effort(goal)
@@ -153,7 +158,12 @@ def initial_level(goal, run_level, *, parent_level=None, is_merge_turn=False,
     if parent_level in LADDER:
         if is_merge_turn:
             return parent_level, "parent"
-        return step(parent_level, -1), "parent"
+        lowered = step(parent_level, -1)
+        if sibling_threshold > 0 and sibling_streak >= sibling_threshold:
+            lower = step(lowered, -1)
+            if lower != lowered:
+                return lower, "sibling"
+        return lowered, "parent"
     if calibration_level in LADDER:
         return calibration_level, "policy"
     return (run_level if run_level in LADDER else "auto"), "run"
@@ -254,19 +264,219 @@ def apply(state, decision, turn):
 
 
 # ---------------------------------------------------------------------------------------
+# campaign evidence (phase 2): siblings of one fan-out campaign share what they learned
+# ---------------------------------------------------------------------------------------
+class CampaignEvidence:
+    """Consecutive first-pass UPHELD count among FINISHED siblings, per campaign id.
+
+    Pure and bounded: at most `max_campaigns` campaigns are remembered (least recently
+    touched forgotten first). `observe(cid, True)` extends the streak; `observe(cid, False)`
+    (a REFUTED / STUCK / failed sibling) resets it. The key is the campaign id fanout.py
+    already mints; nothing here invents one.
+    """
+
+    def __init__(self, max_campaigns=256):
+        from collections import OrderedDict
+        self.max_campaigns = max(1, int(max_campaigns))
+        self._streak = OrderedDict()
+
+    def observe(self, cid, first_pass_upheld):
+        if not cid:
+            return 0
+        n = self._streak.pop(cid, 0)
+        n = n + 1 if first_pass_upheld else 0
+        self._streak[cid] = n
+        while len(self._streak) > self.max_campaigns:
+            self._streak.popitem(last=False)
+        return n
+
+    def streak(self, cid):
+        return self._streak.get(cid, 0) if cid else 0
+
+    def reset(self):
+        self._streak.clear()
+
+
+EVIDENCE = CampaignEvidence()
+
+
+def _meta(goal):
+    m = goal.get("metadata") if isinstance(goal, dict) else None
+    return m if isinstance(m, dict) else {}
+
+
+def _cid_of(goal):
+    return str(goal.get("campaign_id") or "") if isinstance(goal, dict) else ""
+
+
+def assign_children(kids, parent_level, *, run_id="", record=None, log=None, env=None):
+    """Initial effort for fan-out children. off: untouched. shadow: record "would assign".
+    on: set metadata effort (one step below `parent_level`) and record "assigned".
+
+    Returns `kids`. NEVER RAISES; a child that cannot be processed is left as it was.
+    """
+    try:
+        m = mode(env, log)
+        if m == "off" or parent_level not in LADDER:
+            return kids
+        rec = record or _default_record
+        for k in kids:
+            try:
+                level, source = initial_level(k, "auto", parent_level=parent_level)
+                if source != "parent":
+                    continue                      # an explicit goal effort wins; leave it
+                if m == "on":
+                    meta = k.get("metadata")
+                    if not isinstance(meta, dict):
+                        meta = k["metadata"] = {}
+                    meta["effort"] = level
+                    meta["effort_source"] = "parent"
+                    meta["parent_effort"] = parent_level
+                rec("effort_policy", run_id=run_id, instance=str(k.get("task_id") or ""),
+                    turn=0, configured=True, config_source="parent", config_value=level,
+                    eligible=True, triggered=(m == "on"), executed=(m == "on"),
+                    changed_decision=(m == "on"), before=parent_level, after=level,
+                    extra={"event": "child", "mode": m, "parent_level": parent_level,
+                           "campaign_id": _cid_of(k), "subtask_index": k.get("subtask_index"),
+                           "verb": "assigned" if m == "on" else "would assign"})
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return kids
+
+
+def merge_effort(item, parent_level, *, run_id="", record=None, log=None, env=None):
+    """The merge/verify turn keeps the PARENT's level (on only). Returns `item`. Never raises."""
+    try:
+        if mode(env, log) != "on" or parent_level not in LADDER or not isinstance(item, dict):
+            return item
+        level, source = initial_level(item, "auto", parent_level=parent_level,
+                                      is_merge_turn=True)
+        if source != "parent":
+            return item
+        meta = item.get("metadata")
+        if not isinstance(meta, dict):
+            meta = item["metadata"] = {}
+        meta["effort"], meta["effort_source"], meta["parent_effort"] = level, "parent", parent_level
+        (record or _default_record)(
+            "effort_policy", run_id=run_id, instance=str(item.get("task_id") or ""), turn=0,
+            configured=True, config_source="parent", config_value=level, eligible=True,
+            triggered=True, executed=True, changed_decision=True, before=parent_level,
+            after=level, extra={"event": "merge", "mode": "on", "verb": "assigned",
+                                "campaign_id": _cid_of(item)})
+    except Exception:
+        pass
+    return item
+
+
+def sibling_adjust(goal, *, run_id="", instance="", record=None, log=None, env=None,
+                   evidence=None):
+    """At worker creation: a LATER sibling of a campaign whose finished siblings were UPHELD
+    first pass `sibling_upheld_streak` times running starts one step lower than its
+    parent-derived level (floor min). on: returns a copy of `goal` with the lower effort.
+    shadow: records "would lower", returns `goal` unchanged. Never raises.
+    """
+    try:
+        m = mode(env, log)
+        if m == "off" or not isinstance(goal, dict) or goal.get("role") != "subtask":
+            return goal
+        cid = _cid_of(goal)
+        streak = (evidence or EVIDENCE).streak(cid)
+        cfg = PolicyConfig.from_env(env)
+        if cfg.sibling_upheld_streak <= 0 or streak < cfg.sibling_upheld_streak:
+            return goal
+        meta = _meta(goal)
+        cur = meta.get("effort")
+        if meta.get("effort_source") == "parent":
+            new = step(cur, -1)
+        elif m == "shadow":
+            cur, new = "", ""                     # shadow children carry no derived level
+        else:
+            return goal                            # explicit effort wins
+        if m == "on" and (new == cur or new not in LADDER):
+            return goal                            # already at the floor
+        (record or _default_record)(
+            "effort_policy", run_id=run_id, instance=instance or str(goal.get("task_id") or ""),
+            turn=0, configured=True, config_source="sibling", config_value=new or "lower",
+            eligible=True, triggered=(m == "on"), executed=(m == "on"),
+            changed_decision=(m == "on"), before=cur or "", after=new or "lower",
+            extra={"event": "sibling", "mode": m, "campaign_id": cid, "streak": streak,
+                   "verb": "lowered" if m == "on" else "would lower"})
+        if m != "on":
+            return goal
+        out = dict(goal)
+        out["metadata"] = dict(meta, effort=new, effort_source="sibling")
+        return out
+    except Exception:
+        return goal
+
+
+def worker_level(worker):
+    """The ladder level a worker is running at (from the knobs it was given), else None."""
+    try:
+        lvl = level_of_knobs({"refuter": getattr(worker, "refuter", None),
+                              "max_refute": getattr(worker, "max_refute", None),
+                              "max_research": getattr(worker, "max_research", None),
+                              "review_lenses": getattr(worker, "review_lenses", None)})
+        return lvl if lvl in LADDER else None
+    except Exception:
+        return None
+
+
+_FINISHED = ("done", "stuck", "maxturns", "error", "cancelled", "content_refused")
+
+
+def observe_child(worker, *, env=None, evidence=None):
+    """Feed a finished subtask's outcome into the campaign evidence. Never raises.
+
+    first pass UPHELD -> extend the streak; REFUTED at any point, or any non-DONE terminal
+    (STUCK, refused, error...) -> reset; a DONE with no refuter verdict is no evidence.
+    Once per worker.
+    """
+    try:
+        if mode(env) == "off":
+            return None
+        envelope = getattr(worker, "task_envelope", None)
+        if getattr(envelope, "role", "") != "subtask":
+            return None
+        if str(getattr(worker, "status", "") or "").lower() not in _FINISHED:
+            return None
+        if getattr(worker, "_effort_observed", False):
+            return None
+        worker._effort_observed = True
+        outcome = str(getattr(worker, "outcome", "") or "").upper()
+        verdict = str(getattr(worker, "_last_refute_verdict", "") or "").upper()
+        rc = int(getattr(worker, "refute_count", 0) or 0)
+        if outcome != "DONE" or verdict == "REFUTED" or rc > 1:
+            good = False
+        elif verdict == "UPHELD":
+            good = True
+        else:
+            return None
+        return (evidence or EVIDENCE).observe(getattr(envelope, "campaign_id", ""), good)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------------------
 # shadow hooks (the only functions relay_fleet calls)
 # ---------------------------------------------------------------------------------------
 _TROUBLE_OUTCOMES = ("STUCK", "INFRA_STUCK", "REFUSED", "CONTENT_REFUSED")
 
 
 def level_of_knobs(knobs):
-    """Name the ladder level whose knobs equal `knobs`, else "custom"."""
+    """Name the ladder level whose knobs equal `knobs`, else "custom".
+
+    The lenses compare as lists with None == [] (a worker stores its lenses as [] where the
+    level table says None); the other knobs compare as they are.
+    """
+    def norm(k, v):
+        return list(v or []) if k == "review_lenses" else v
     try:
         for name in LADDER:
             spec = effort_mod.LEVELS[name]
-            if all((list(spec[k]) if isinstance(spec[k], tuple) else spec[k])
-                   == (list(knobs.get(k)) if isinstance(knobs.get(k), (list, tuple))
-                       else knobs.get(k)) for k in effort_mod.KNOBS):
+            if all(norm(k, spec[k]) == norm(k, knobs.get(k)) for k in effort_mod.KNOBS):
                 return name
     except Exception:
         pass
@@ -287,12 +497,14 @@ def shadow_assign(goal, knobs, *, run_id="", instance="", record=None, log=None,
         run_level = level_of_knobs(knobs or {})
         level, source = initial_level(goal, run_level if run_level != "custom" else "auto",
                                       **initial_kw)
+        if source == "goal" and _meta(goal).get("effort_source") in ("parent", "sibling"):
+            source = _meta(goal)["effort_source"]      # derived by this policy, not asked for
         (record or _default_record)(
             "effort_policy", run_id=run_id, instance=instance, turn=0,
             configured=True, config_source=source, config_value=level,
             eligible=True, triggered=False, executed=False, changed_decision=False,
             before=run_level, after=level,
-            extra={"event": "initial", "run_level": run_level, "mode": "shadow"})
+            extra={"event": "initial", "run_level": run_level, "mode": mode(env)})
         return level, source
     except Exception:
         return None
@@ -386,7 +598,7 @@ def shadow_tick(worker, *, record=None, log=None, env=None):
             executed=False, changed_decision=False, before=before, after=d.target_level,
             extra={"event": "turn", "decision": d.action, "reason": d.reason,
                    "level": before, "target": d.target_level, "signals": sig.as_dict(),
-                   "mode": "shadow"})
+                   "mode": "shadow"})   # live switching is record-only in every mode
         return d
     except Exception:
         return None

@@ -4903,6 +4903,8 @@ class RelayWorker:
                 pass
             # Shadow effort policy (phase 1): records only; never raises; no-op when off.
             effort_policy_mod.shadow_tick(self)
+            # Campaign evidence (phase 2): a finished subtask feeds its siblings' streak.
+            effort_policy_mod.observe_child(self)
 
     def _diagnose_terminal_give_up(self, status_before):
         """Apply the diagnosis when THIS turn ended a worker that had already replayed fresh.
@@ -5819,7 +5821,10 @@ class RelayWorker:
                 kids = (fanout_mod.child_goals(
                     self.goal, steps,
                     parent_task_id=getattr(self.task_envelope, "task_id", "") or "",
-                    cwd=getattr(self, "cwd", None)) if steps else [])
+                    cwd=getattr(self, "cwd", None),
+                    parent_level=(effort_policy_mod.worker_level(self)
+                                  if effort_policy_mod.mode() != "off" else None),
+                    run_id=getattr(self, "run_id", "") or "") if steps else [])
                 if kids and self._spawn_fn:
                     # THE PARENT'S CHECK GOES TO THE MERGE, NOT ONTO EVERY CHILD. It used to
                     # ride in child_goals(checks=...) and land identically on all of them, so
@@ -7975,6 +7980,11 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         # combined file and report its path.
         campaigns[cid] = {"goal": parent_goal, "n": len(kids), "merged": False,
                           "cwd": (kids[0] or {}).get("cwd"),
+                          # the parent's effort level (only present when the effort policy
+                          # is on); the merge keeps it. Not persisted: a family adopted from
+                          # disk merges at the run's level, exactly as before.
+                          "parent_level": ((kids[0] or {}).get("metadata") or {}).get(
+                              "parent_effort"),
                           # THE WHOLE GOAL'S ACCEPTANCE CHECK, PARKED UNTIL THE MERGE. The
                           # children are each responsible for one slice and cannot answer it;
                           # the merge can, and runs in the same tree.
@@ -8068,7 +8078,9 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                                                        campaign_id=_cid,
                                                        cwd=_camp.get("cwd"),
                                                        parent_checks=_camp.get("checks"),
-                                                       parent_partial=_camp.get("partial")))
+                                                       parent_partial=_camp.get("partial"),
+                                                       parent_level=_camp.get("parent_level"),
+                                                       run_id=run_id))
             queued += 1
             print("[fanout] %s: %d/%d subtask(s) done -> merging"
                   % (_cid, sum(1 for r in _recs if (r["outcome"] or "").upper() == "DONE"),
@@ -8097,6 +8109,10 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                    "max_research": max_research, "review_lenses": review_lenses}
 
     def _worker_for(index, goal_item):
+        # Sibling de-escalation (effort policy): a later sibling may start one step lower.
+        # Returns the goal untouched unless MCP_EFFORT_POLICY=on and the streak is met.
+        goal_item = effort_policy_mod.sibling_adjust(goal_item, run_id=run_id,
+                                                     instance="w%d" % index)
         knobs = effort_mod.resolve(goal_item, _run_effort,
                                    log=lambda m: print(m, flush=True))
         if knobs != _run_effort:
