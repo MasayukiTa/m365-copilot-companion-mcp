@@ -146,7 +146,7 @@ def test_unfinished_children_are_requeued_and_done_ones_are_not(tmp_path):
     cid = "cKIDS"
     _rows(tmp_path, [_header(cid), _child(cid, 1), _child(cid, 2), _child(cid, 3)])
     done = {fr.goal_resume_key({"text": "child 1 of cKIDS"}): "DONE"}
-    goals, degraded = fr.resume_children_goals(str(tmp_path), done, log=lambda m: None)
+    goals, degraded = fr.resume_children_goals(str(tmp_path), done, log=lambda m: None, scope={"cKIDS"})
     assert [g["subtask_index"] for g in goals] == [2, 3] and degraded == 0
     assert goals[0]["metadata"] == {"effort": "low"} and goals[0]["cwd"] == "C:/w"
 
@@ -155,8 +155,8 @@ def test_old_child_lines_fall_back_to_text_and_header_cwd_and_are_logged(tmp_pat
     cid = "cOLD"
     _rows(tmp_path, [_header(cid), _child(cid, 1, full=False), _child(cid, 2, full=False)])
     logged = []
-    goals, degraded = fr.resume_children_goals(str(tmp_path), {}, log=logged.append)
-    assert degraded == 2 and len(logged) == 2 and "degraded" in logged[0]
+    goals, degraded = fr.resume_children_goals(str(tmp_path), {}, log=logged.append, scope={"cOLD"})
+    assert degraded == 2 and len([m for m in logged if "degraded" in m]) == 2
     assert all(g["degraded"] and g["cwd"] == "C:/w" and g["role"] == "subtask" for g in goals)
 
 
@@ -165,19 +165,19 @@ def test_a_child_result_line_covers_a_degraded_child_whose_text_hash_cannot_matc
     _rows(tmp_path, [_header(cid), _child(cid, 1, full=False), _child(cid, 2, full=False),
                      {"kind": "child_result", "campaign_id": cid, "subtask_index": 1,
                       "outcome": "DONE", "result": "r"}])
-    goals, _ = fr.resume_children_goals(str(tmp_path), {}, log=lambda m: None)
+    goals, _ = fr.resume_children_goals(str(tmp_path), {}, log=lambda m: None, scope={"cOLD"})
     assert [g["subtask_index"] for g in goals] == [2]
 
 
 def test_a_merged_campaign_re_queues_nothing(tmp_path):
     cid = "cM"
     _rows(tmp_path, [_header(cid), _child(cid, 1), {"kind": "merge_done", "campaign_id": cid}])
-    assert fr.resume_children_goals(str(tmp_path), {}, log=lambda m: None)[0] == []
+    assert fr.resume_children_goals(str(tmp_path), {}, log=lambda m: None, scope={"cM"})[0] == []
 
 
 def test_a_family_without_a_header_re_queues_nothing(tmp_path):
     _rows(tmp_path, [_child("cX", 1)])
-    assert fr.resume_children_goals(str(tmp_path), {}, log=lambda m: None)[0] == []
+    assert fr.resume_children_goals(str(tmp_path), {}, log=lambda m: None, scope={"cX"})[0] == []
 
 
 def test_the_child_ledger_line_carries_the_whole_goal():
@@ -195,7 +195,7 @@ def test_a_resumed_run_does_not_requeue_a_child_the_ledger_already_carries(tmp_p
     fleet_runner._write_goals_ledger(str(tmp_path), [kid], time.time())
     _rows(tmp_path, [_header(cid, n=1), _child(cid, 1)])
     remainder, _, _ = fleet_runner._resume_goals(str(tmp_path))
-    extra, _ = fr.resume_children_goals(str(tmp_path), {}, log=lambda m: None)
+    extra, _ = fr.resume_children_goals(str(tmp_path), {}, log=lambda m: None, scope={"cTWICE"})
     have = {fleet_runner._goal_resume_key(g) for g in remainder}
     assert [k for k in extra if fleet_runner._goal_resume_key(k) not in have] == []
 

@@ -8140,6 +8140,12 @@ def _campaigns_from_disk(transcript_dir):
         return {}
     out = {}
     done_map = resume_mod.read_done_map(os.path.dirname(transcript_dir))
+    # NOT SCOPED TO THE INTERRUPTED RUN, ON PURPOSE (swept with the resume-scope fix): this only
+    # CARRIES families in memory; a family with no children in this run queues nothing. The one
+    # thing it can queue is a re-issued merge, and that needs `merged` WITH an agg_key (written
+    # only by phase-2 code, so none of a legacy ledger), no DONE aggregator and merge_requeued
+    # < 1: at most one merge per campaign, only for a family whose merge was already queued.
+    # Scoping it would break the no-snapshot FleetContextLost path G3 exists for.
     for cid, fam in (fams or {}).items():
         # merge_done -> drop; merged (queued) without merge_done and no aggregator DONE ->
         # re-issue exactly once; otherwise carry. See fleet_resume.rehydrate_decision.
@@ -8494,7 +8500,11 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                          # The partial is here for the harder version of that: rebuilt without
                          # it, work the parent actually finished is gone permanently.
                          "checks": list(parent_checks or []),
-                         "partial": parent_partial or ""},
+                         "partial": parent_partial or "",
+                         # WHICH RUN SPLIT IT, so a resume takes only the interrupted run's
+                         # families instead of every unmerged one in a ledger that never
+                         # shrinks. Additive: readers ignore unknown header keys.
+                         "run_id": run_id, "ts": round(time.time(), 1)},
                         ensure_ascii=False) + "\n")
                     for k in kids:
                         fh.write(json.dumps(
