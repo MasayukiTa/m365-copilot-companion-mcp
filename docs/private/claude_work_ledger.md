@@ -133,3 +133,8 @@ Under `%USERPROFILE%\.claude\tools\<tool>\README.md`:
 - The owner rejected PR #80's design of restating the whole goal (cap 6000 characters) in every continuation prompt: the context is small and long text every turn is wasteful.
 - Replaced on branch fix/continuation-compact-ledger-20260930: the first message keeps the full goal; later prompts carry a deterministic ledger of at most 1000 characters (LEDGER_MAX_CHARS, relay/relay_fleet.py): task line, fixed-constraint sentences, fan-out scope block, pointer to the first message. Empty-goal guards, neutral wording and the theme_from_goal date fix are unchanged.
 - Design and limits (extraction is a heuristic): docs/private/20260930_goal_fidelity_design.md.
+
+## 2026-10-01 - split-group ledger view, Python side (PR 1 of the family-view design)
+
+- New pure module relay/family_view.py (+ relay/test_family_view.py, registered in ci.yml): builds one compact summary per 分割グループ from status.json workers and campaigns.jsonl: group id, parent state, children by state (queued/running/done/failed/interrupted), merge state, and the constraint lines/tokens the goal ledger carries. The goal is shown only as the relay_fleet.goal_ledger output, clipped again (task 160, constraint 120 chars, max 5 lines), never the long text.
+- `display_state` (awaiting_children = 待機中, ready_to_merge, merging, done, merge_failed, interrupted) is derived only; the parent's real status/outcome (FANOUT) and relay_fleet.TERMINAL are unchanged. JSON contract is in the module docstring for the C# side. No caller is wired yet and no C# changed.
