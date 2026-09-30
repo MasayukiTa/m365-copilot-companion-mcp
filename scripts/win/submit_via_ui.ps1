@@ -28,6 +28,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+. (Join-Path $PSScriptRoot 'gui_submit_lock.ps1')
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Windows.Forms
 
 if (-not ('Win32.Wnd' -as [type])) {
@@ -139,6 +141,9 @@ function Set-Text($element, [string]$text) {
     return $false
 }
 
+$submitLockTimeout = [Math]::Max(90, $TimeoutSeconds + 15)
+$submitLock = Enter-GuiSubmitLock -RepoRoot $RepoRoot -TimeoutSeconds $submitLockTimeout
+try {
 $win = Get-Cockpit
 $name = $win.Current.Name
 Write-Output ("cockpit: {0}" -f $name)
@@ -183,7 +188,7 @@ if ($Goal.Count -gt 0) {
 }
 
 # READONLY IS A DRY RUN, not just a field dump: it prints exactly what would go in.
-if ($ReadOnly) { exit 0 }
+if ($ReadOnly) { return }
 
 # WHICH BOX IS THE GOAL BOX. By AutomationId, which the cockpit now sets. Before it did,
 # the only distinguishing property was WIDTH -- 1008 pixels against the history search
@@ -425,4 +430,7 @@ if ($Goal.Count -gt 0) {
     # placed in the composer together, one per line; Cockpit splits them into independent add_goal
     # items and its durable handoff/ack path owns the run-ending race.
     Submit ($Goal -join "`n") -ExpectFleetGoal
+}
+} finally {
+    Exit-GuiSubmitLock $submitLock
 }
