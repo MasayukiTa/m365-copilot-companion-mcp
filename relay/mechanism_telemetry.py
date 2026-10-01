@@ -73,7 +73,11 @@ MECHANISMS = ("fanout", "refuter", "panel", "veto", "retry", "bestofn", "skill",
               "unlanded_calls",
               # Phase 1 of the per-goal effort policy: SHADOW rows only (what it would have
               # done). Registered so summarise() reads it; see relay/effort_policy.py.
-              "effort_policy")
+              "effort_policy",
+              # The first message of a fresh conversation was not absorbed (the reply is a
+              # greeting / ask-for-the-goal / empty-message / canned refusal) and was sent
+              # again. Registered so the redelivery RATE can be read from one place.
+              "first_message_not_absorbed")
 
 
 def patch_hash(text):
