@@ -107,3 +107,28 @@ def test_fresh_send_never_clicks_twice_while_waiting_for_its_user_turn_receipt(m
 
     driver.send("fresh goal", track_answer=False)
     assert button.clicks == 1, "fresh delivery receipt must terminate the send before any retry click"
+
+
+def test_fresh_receipt_mismatch_raises_nonretryable_ambiguity(monkeypatch):
+    import pytest
+    from relay.send_errors import FreshSubmitAmbiguous
+
+    page = _Page()
+    page.url = "https://m365.cloud.microsoft/chat/agent/test"
+    driver = relay.CopilotWebDriver(page)
+    composer = _Composer()
+    button = _Button()
+    monkeypatch.setattr(relay, "_page_network_available", lambda p: True)
+    monkeypatch.setattr(driver, "_page_alive", lambda: True)
+    monkeypatch.setattr(page, "locator", lambda selector: type("L", (), {"first": composer})(), raising=False)
+    monkeypatch.setattr(driver, "_send_button", lambda: button)
+    monkeypatch.setattr(driver, "_wait_send_armed", lambda timeout_s: True)
+    monkeypatch.setattr(driver, "_composer_text", lambda: "fresh goal")
+    monkeypatch.setattr(driver, "_stabilize_fresh_composer", lambda *a, **k: True)
+    monkeypatch.setattr(driver, "_visible_user_questions", lambda: [])
+    monkeypatch.setattr(driver, "_wait_fresh_user_receipt", lambda *a, **k: False)
+    monkeypatch.setattr(driver, "_snapshot_send_failure", lambda *a, **k: None)
+
+    with pytest.raises(FreshSubmitAmbiguous):
+        driver.send("fresh goal", track_answer=False)
+    assert button.clicks == 1
