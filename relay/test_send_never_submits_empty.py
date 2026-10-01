@@ -54,8 +54,12 @@ def test_the_text_is_verified_to_have_landed_before_the_send():
     # very code it was meant to protect -- a test that passes because it is looking at
     # comments is worse than no test.
     assert block.count("insert_text(one_line)") >= 2, "空だったときに再投入していない"
-    assert block.index("if self._composer_text():") > block.index("insert_text(one_line)"), \
+    exact = 'if self._normalise_visible_text(self._composer_text()) == one_line:'
+    assert exact in block, "非空だけでなく意図した全文との exact 一致を確認していない"
+    assert block.index(exact) > block.index("insert_text(one_line)"), \
         "投入する前に照合している"
+    assert 'self._stabilize_fresh_composer(composer, one_line)' in block, \
+        "fresh chat の hydration reset を跨ぐ連続安定確認がない"
 
 
 def test_the_reinsert_loop_is_bounded():
