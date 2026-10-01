@@ -183,10 +183,17 @@ def _recover_from_outcome(state_dir, jids):
     return ""
 
 
-def _recover_from_transcripts(state_dir, goal_text):
+def _recover_from_transcripts(state_dir, goal_text, require=(), whole=False):
     """Last assistant answer of the worker transcript whose first user turn holds this
-    child's goal text (the worker index in the file name is not recorded on the child)."""
-    needle = (goal_text or "").strip()[:120]
+    child's goal text (the worker index in the file name is not recorded on the child).
+
+    `require`: extra strings the first user turn must also hold (a merge prompt carries its own
+    heading, which tells it from the splitting worker that was handed the same goal text).
+    `whole`: match the entire goal text rather than its first 120 characters (sibling slices
+    share a long common prefix)."""
+    needle = (goal_text or "").strip()
+    if not whole:
+        needle = needle[:120]
     if not needle:
         return ""
     tdir = os.path.join(state_dir, "transcripts")
@@ -214,7 +221,7 @@ def _recover_from_transcripts(state_dir, goal_text):
                         continue
                     if r.get("role") == "user" and first_user is None:
                         first_user = str(r.get("text") or "")
-                        if needle not in first_user:
+                        if needle not in first_user or any(q not in first_user for q in require):
                             break
                     elif r.get("role") == "assistant" and first_user is not None:
                         t = str(r.get("text") or "").strip()
@@ -222,7 +229,8 @@ def _recover_from_transcripts(state_dir, goal_text):
                             last_asst = t
         except Exception:
             continue
-        if first_user is not None and needle in first_user and last_asst:
+        if (first_user is not None and needle in first_user and last_asst
+                and all(q in first_user for q in require)):
             return last_asst
     return ""
 
@@ -262,6 +270,33 @@ def recover_child_result(state_dir, child):
         except Exception:
             t = ""
         if t:
+            return t[:CHILD_RESULT_CAP], src
+    return "", ""
+
+
+#: The heading every merge prompt carries (relay/fanout.py aggregation_prompt).
+_MERGE_HEADING = "【分割実行の結果をまとめてください】"
+
+
+def recover_nested_merge_answer(state_dir, nested_cid, fam):
+    """(text, source) of a FINISHED nested merge's answer from durable sources, or ("", "").
+
+    Same order as recover_child_result, addressed to the merge worker (task id `<cid>-merge`):
+    its outcome file, its transcript (first user turn holds the family's goal AND the merge
+    heading, so the splitting worker's own transcript -- whose last turn is a split proposal --
+    is never taken for it), history.json by job id. A split proposal is never an answer."""
+    from relay import fanout
+    jids = [str(nested_cid) + "-merge"]
+    goal = str((fam or {}).get("goal") or "")
+    for src, fn in (("outcome_json", lambda: _recover_from_outcome(state_dir, jids)),
+                    ("transcript", lambda: _recover_from_transcripts(
+                        state_dir, goal, require=(_MERGE_HEADING,), whole=True)),
+                    ("history", lambda: _recover_from_history(state_dir, jids, ""))):
+        try:
+            t = fn()
+        except Exception:
+            t = ""
+        if t and not fanout.fanout_ready(t):
             return t[:CHILD_RESULT_CAP], src
     return "", ""
 
@@ -525,9 +560,11 @@ def _child_split_into_nested(child, cid, done_map, nested_slots):
 
 def seal_finished_nested_slots(state_dir, camps, scope, log=print):
     """A nested family whose merge FINISHED but whose parent slot has no `nested` result line
-    (the process died between the two writes) gets an explicit MISSING row, once: the answer
-    text is not recoverable from the ledger, and an invented one would be worse than a named gap.
-    Returns the rows written. In-scope families only; a finished parent is left alone."""
+    (the process died between the two writes) gets its slot filled, once: with the merge's
+    answer when it is recoverable from the merge worker's own durable traces
+    (recover_nested_merge_answer), else an explicit MISSING row -- an invented answer would be
+    worse than a named gap. Returns the rows written. In-scope families only; a finished
+    parent is left alone."""
     from relay import fanout
     wrote = []
     for cid, fam in sorted((camps or {}).items()):
@@ -540,15 +577,26 @@ def seal_finished_nested_slots(state_dir, camps, scope, log=print):
         if any(r.get("nested") and r.get("subtask_index") == pi
                for r in parent.get("child_results") or []):
             continue
-        row = fanout.nested_result_row(pc, pi, cid, "", merge_ok=False,
+        # The merge's answer is looked for before the slot is given up on: the process died
+        # between the merge ending and the slot row being written, and the answer is usually
+        # still in the merge worker's outcome file / transcript / history.
+        text, src = recover_nested_merge_answer(state_dir, cid, fam)
+        row = fanout.nested_result_row(pc, pi, cid, text, merge_ok=bool(text),
                                        missing=fam.get("nested_missing") or (),
                                        task_id="%s-%s" % (pc, pi))
-        row["sealed"] = "nested_merge_result_not_recorded"
+        if text:
+            row["recovered"], row["source"] = True, src
+        else:
+            row["sealed"] = "nested_merge_result_not_recorded"
         append_ledger_row(state_dir, row)
         parent.setdefault("child_results", []).append(row)
         wrote.append(row)
-        log("[resume] nested campaign %s finished but its slot %s of %s had no result: "
-            "marked MISSING" % (cid, pi, pc))
+        if text:
+            log("[resume] nested campaign %s finished but its slot %s of %s had no result: "
+                "answer recovered from %s" % (cid, pi, pc, src))
+        else:
+            log("[resume] nested campaign %s finished but its slot %s of %s had no result: "
+                "marked MISSING" % (cid, pi, pc))
     return wrote
 
 
