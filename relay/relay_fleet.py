@@ -4592,7 +4592,8 @@ class RelayWorker:
         # a call from these windows (tools/turn_context.py). Never allowed to break a turn.
         try:
             from tools import turn_context as _tc
-            _tc.record_open(self.name, self.jid, self.run_id, self.turn, self._turn_sent_at)
+            _tc.record_open(self.name, self.jid, self.run_id, self.turn, self._turn_sent_at,
+                            ident=_tc.fanout_identity(getattr(self, "task_envelope", None)))
         except Exception:
             pass
         # a send actually went through -> reset BOTH the generation-wait count and the
@@ -5522,7 +5523,8 @@ class RelayWorker:
             if not _resume and getattr(self, "_turn_sent_at", 0.0):
                 from tools import turn_context as _tc
                 _tc.record_close(self.name, self.jid, self.run_id, self.turn,
-                                 self._turn_sent_at, time.time())
+                                 self._turn_sent_at, time.time(),
+                                 ident=_tc.fanout_identity(getattr(self, "task_envelope", None)))
         except Exception:
             pass
         # LOCK-AMBIGUITY PROBE ANSWER. A LOCK_PROBE_QUESTION was sent as this worker's previous
