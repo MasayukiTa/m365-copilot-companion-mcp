@@ -2118,6 +2118,47 @@ FLEET_HEAP_RECYCLE_MB = float(os.environ.get("MCP_FLEET_HEAP_RECYCLE_MB", "500")
 #: would cost more turns than the disease.
 FLEET_HEAP_MIN_TURNS = int(os.environ.get("MCP_FLEET_HEAP_MIN_TURNS", "12"))
 
+#: A fresh conversation that hits the token limit on its FIRST reply, this many times in a row,
+#: cannot be helped by another recycle: the re-anchored goal makes the agent repeat the same
+#: oversized tool call each time (2026-10-01: up to max_recycles identical overflows).
+_FUTILE_RECYCLES = 2
+
+
+def _recycle_is_futile(worker, exhausted):
+    """Record one token-limit exhaustion on `worker`; True once the recycling is going nowhere.
+
+    CONSERVATIVE VARIANT. The fleet worker does not see tool calls, so "same tool, identical
+    arguments" cannot be read here. What can be read is the turn counter: an exhaustion on the
+    first reply after a recycle (turn advanced by exactly one) means the very first thing the
+    fresh conversation did overflowed it, and that happening _FUTILE_RECYCLES times consecutively
+    is the same symptom. Any recycle that got further than one turn resets the streak.
+    """
+    if not exhausted:
+        return False
+    turn = int(getattr(worker, "turn", 0) or 0)
+    last = getattr(worker, "_exhaust_turn", None)
+    streak = int(getattr(worker, "_exhaust_immediate", 0) or 0)
+    worker._exhaust_turn = turn
+    if last is not None and turn - last == 1:
+        streak += 1
+    else:
+        streak = 0
+    worker._exhaust_immediate = streak
+    return streak >= _FUTILE_RECYCLES
+
+
+def _goal_is_live(workers, text, exclude=None):
+    """Whether a worker for exactly this goal text is queued or running (not terminal)."""
+    text = (text or "").strip()
+    if not text:
+        return False
+    for w in workers:
+        if w is exclude or w.status in TERMINAL:
+            continue
+        if (getattr(w, "goal", "") or "").strip() == text:
+            return True
+    return False
+
 
 def _holds_slot(w):
     """Whether this worker is admitted and consuming the fleet's budget right now.
@@ -4432,6 +4473,10 @@ class RelayWorker:
                 return
             self.status, self.outcome = "stuck", "STUCK"
             self.reason = "fresh submit delivery ambiguous; not retried: %s" % (str(e),)
+            # "not retried" WAS PROSE ONLY. STUCK is in outcomes.RETRYABLE, so without this the
+            # runner's own retry and the cockpit's auto-retry both re-queued the goal (2026-10-01:
+            # one job ran as three concurrent copies). The row exports it as `retryable: false`.
+            self.retryable_override = False
             return
         except ConversationClosed as e:
             # The target tab/composer is gone (conversation ended). Retrying a dead
@@ -5576,6 +5621,14 @@ class RelayWorker:
         heavy = (not conversation_exhausted(resp)) and self._memory_pressure()
         if conversation_exhausted(resp) or heavy:
             self._recycles += 1
+            if _recycle_is_futile(self, conversation_exhausted(resp)):
+                self.status, self.outcome = "stuck", "STUCK"
+                self.retryable_override = False
+                self.reason = ("conversation recycle cannot make progress: the fresh conversation "
+                               "hit the token limit on its very first turn %d times in a row "
+                               "(the same oversized tool result, not tried again); stopped "
+                               "after %d recycles" % (_FUTILE_RECYCLES, self._recycles - 1))
+                return
             self._heap_recycle_turn = self.turn
             if self._recycles > self._max_recycles:
                 self.status, self.outcome = "stuck", "STUCK"
@@ -9078,8 +9131,12 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 # what a retry actually changes.
                 _retry_item = dict(getattr(_w, "goal_record", None) or {})
                 _retry_item.update({"text": _g, "checks": getattr(_w, "checks", None),
-                                    "cwd": getattr(_w, "cwd", None), "priority": True})
+                                    "cwd": getattr(_w, "cwd", None), "priority": True,
+                                    "retry": True})
                 add_box.append(_retry_item)
+                # Exported on the row (`retry_queued`) so the cockpit does not re-queue a worker
+                # the runner already re-queued.
+                _w.retry_queued = True
                 # THE STEP THAT WAS MISSING. `triggered` was recorded above and nothing ever
                 # recorded `executed`, so the funnel read "retry: 23 triggered, 0 executed --
                 # did not execute" while the log beside it said "-> re-queued (1/2)" twenty
@@ -9130,6 +9187,25 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         if add_box:
             while add_box:
                 item = add_box.pop(0)
+                # A RETRY OF A GOAL THAT IS ALREADY QUEUED OR RUNNING IS A DUPLICATE, not a
+                # retry. The runner's own re-queue and the cockpit's auto-retry each re-queued the
+                # same STUCK worker (2026-10-01: three concurrent copies of one job). Only items
+                # tagged retry=True are refused; a user's plain resubmit is never blocked.
+                if item.get("retry") and _goal_is_live(workers, item.get("text")):
+                    print("[fleet] refusing a duplicate retry: this goal is already live",
+                          flush=True)
+                    try:
+                        _mt.record("retry", run_id=run_id,
+                                   goal_hash=__import__("hashlib").sha256(
+                                       str(item.get("text") or "").encode("utf-8")
+                                   ).hexdigest()[:24],
+                                   configured=True, config_source="run",
+                                   eligible=False, triggered=False,
+                                   ineligible_reason="duplicate retry refused: the same goal is "
+                                                     "already queued or running in this run")
+                    except Exception:
+                        pass
+                    continue
                 # item may carry checks/cwd too; goal_fields reads them (priority ignored)
                 #
                 # A REJECTED INJECTION COSTS THE INJECTED GOAL AND NOTHING ELSE. `goal_fields`
@@ -9590,6 +9666,8 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
              "role": getattr(getattr(w, "task_envelope", None), "role", ""),
              "depth": getattr(getattr(w, "task_envelope", None), "depth", 0),
              "goal_hash": getattr(w, "original_goal_hash", ""),
+             "retryable": getattr(w, "retryable_override", None),
+             "retry_queued": bool(getattr(w, "retry_queued", False)),
              "fresh_replay_count": getattr(w, "fresh_replay_count", 0),
              "refusal_count": getattr(w, "refusal_count", 0),
              "refusal_history": list(getattr(w, "refusal_history", [])),
