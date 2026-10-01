@@ -102,6 +102,7 @@ _MEMORY_TURN_CHARS = _MEMORY_MAX_CHARS - 200
 # has no HTTP request. The audit runlog has never been written.
 from tools.runlog_ops import runlog_append_local as runlog_append  # operator D: audit
 from tools.runlog_ops import runlog_summarize
+from relay.send_errors import FreshSubmitAmbiguous
 
 class ConversationClosed(RuntimeError):
     """Raised by send() when the target tab/composer is already gone (the
@@ -1945,9 +1946,9 @@ class CopilotWebDriver:
                     attempt=attempt, phase="fresh_user_turn_receipt_mismatch",
                     allow_answer_content=track_answer,
                 )
-                raise RuntimeError(
-                    "send failed: fresh submit has no single matching user-turn receipt; "
-                    "refusing to retry an ambiguous first delivery"
+                raise FreshSubmitAmbiguous(
+                    "fresh submit has no single matching user-turn receipt; "
+                    "the user turn may already have landed, so automatic resend is forbidden"
                 )
 
             for i in range(48):                  # continuation turn, up to ~12s
