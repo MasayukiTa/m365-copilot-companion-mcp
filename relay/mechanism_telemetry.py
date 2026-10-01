@@ -77,7 +77,11 @@ MECHANISMS = ("fanout", "refuter", "panel", "veto", "retry", "bestofn", "skill",
               # The first message of a fresh conversation was not absorbed (the reply is a
               # greeting / ask-for-the-goal / empty-message / canned refusal) and was sent
               # again. Registered so the redelivery RATE can be read from one place.
-              "first_message_not_absorbed")
+              "first_message_not_absorbed",
+              # A split reply whose list numbers were lost in transit, parsed from the plain
+              # lines above SUBTASKS_READY (relay/fanout.py). One row per rescued split, so
+              # the rate of this path is readable rather than inferred.
+              "fanout_unnumbered_fallback")
 
 
 def patch_hash(text):
