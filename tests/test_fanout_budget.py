@@ -385,7 +385,7 @@ def test_the_cockpit_has_the_four_boxes_persisted_through_savekey_only():
         assert re.search(r'case "%s":' % key, src), key           # the timing switch names it
     # the timing switch says each_gate for all four (and nowhere else)
     m = re.search(r'case "fanout_max_total":\s*case "fanout_max_active":\s*case "fanout_max_turns":'
-                  r'\s*case "fanout_max_wall_min":\s*return "each_gate";', src)
+                  r'\s*case "fanout_max_wall_min":\s*case "effort_policy":\s*return "each_gate";', src)
     assert m
     # the boxes write nothing else: no direct file or constant access from the control
     body = re.search(r"UIElement FanoutBudgetControl\(\).*?\n    }\n", src, re.S).group(0)
