@@ -400,10 +400,14 @@ All P0 behavior regressions listed in the current stabilization ledger are now C
 
 The P0 closure recorded above still stands. The active follow-up branch is `fix/phase2-audit-followups-20260929` / PR #78. Remote head `183bb63` is green across CI, CodeQL, Secret scan, Workflow lint, PowerShell lint, Windows build, and install-path E2E.
 
-Since the 08:4x convergence checkpoint, the branch also carries the planned-restart supervisor-instance fix and exact yellow-path test, plus the explicit `unlock not required` classification fix. Locally, `f2a3ef8` merges current `origin/main`, including PR #91's fix that scopes interrupted-run resume to the interrupted run's own campaigns. This merge is not yet pushed at this checkpoint.
+Since the 08:4x convergence checkpoint, the branch also carries the planned-restart supervisor-instance fix and exact yellow-path test, plus the explicit `unlock not required` classification fix. Locally, `f2a3ef8` merged the previously cached `origin/main` ref containing PR #91's interrupted-run resume-scope fix. A subsequent explicit fetch showed remote `main` had already advanced to `ed16ac9` through PR #92, so `f2a3ef8` is not yet final main convergence.
 
 Operationally relevant current state:
 - no tracked dirty files before this ledger update;
 - unrelated untracked directories (`kanazawa-trip/`, `output_20260930/`, `reviews/`) remain untouched;
-- next gate is post-merge PR #78 CI/CodeQL/Windows validation, then remaining phase2 audit follow-ups;
+- next gate is current PR #78 CI/CodeQL/Windows validation, then convergence with fetched main `ed16ac9` and another full blocking-check pass before merge;
 - current `main` CI should be reviewed separately after this ledger sync, especially any failure not explained by the PR #78 branch.
+
+### 2026-10-01 10:2x JST correction -- fetched main was newer than cached origin/main
+
+After the checkpoint above, `git fetch origin main` updated the remote-tracking ref from PR #91's `3d97c39` to `ed16ac9` (PR #92). Main HEAD `ed16ac9` is green on CI, CodeQL, Secret scan, Workflow lint, and Windows build. Treat the earlier wording that called `f2a3ef8` a merge of current main as stale-local-ref wording; final PR #78 convergence still requires the newer main.
