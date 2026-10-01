@@ -113,3 +113,71 @@ def test_worker_does_not_probe_long_quoted_marker_when_reply_explicitly_says_not
     assert w._unlock_attempts == before
     assert w._lock_probe_pending is False
     assert w.job != RF.LOCK_PROBE_QUESTION
+
+
+def test_real_w5_backend_failure_does_not_become_unlock():
+    # 2026-10-01 r6abe3de4_a0_w5: tools were failing with a generic backend error. The worker
+    # explicitly said the literal lock marker was absent and unlock would not fix it, but merely
+    # quoting the phrase "locked client IP" made the long reply look ambiguous and triggered
+    # an unnecessary unlock cycle. This is negative lock evidence, not a lock request.
+    resp = (
+        "ツール実行系が現在すべて Tool did not respond with success を返しています。"
+        "「locked client IP」の文言は無いため解錠では解消しません。"
+        "STUCK: ツールゲートウェイの実行・読み取り系呼び出しが一時障害で応答せず、"
+        "解錠対象のエラー文言（locked client IP）ではなく、復旧後に再開します。"
+        + " analysis" * 60
+    )
+    assert len(resp) >= RF.LOCKED_DOMINANCE_MAX_CHARS
+    assert RF._explicit_unlock_not_required(resp) is True
+    assert RF._looks_locked(resp) is False
+    assert RF._looks_locked_ambiguous(resp) is False
+
+
+def test_real_backend_failure_negative_lock_wording_is_narrow():
+    # Do not turn generic mentions of a missing marker into a blanket bypass: a separate positive
+    # requirement must still win, preserving fail-closed behaviour.
+    resp = ("locked client IP の文言は無いように見えるが、write_file は拒否され、"
+            "unlock が必要です。")
+    assert RF._explicit_unlock_not_required(resp) is False
+
+
+def test_real_w5_decision_does_not_inject_unlock_for_backend_failure(monkeypatch):
+    monkeypatch.setattr(RF, "_unlock_password", lambda: "must-not-be-used")
+    monkeypatch.setattr(RF, "_exclusively_refused",
+                        lambda *a, **k: None if k.get("return_record") else False)
+    w = RF.RelayWorker("Audit the repository read-only", "w5-regression")
+    before = w._unlock_attempts
+    resp = (
+        "ツール実行系が現在すべて Tool did not respond with success を返しています。"
+        "「locked client IP」の文言は無いため解錠では解消しません。"
+        "STUCK: ツールゲートウェイの実行・読み取り系呼び出しが一時障害で応答せず、"
+        "解錠対象のエラー文言（locked client IP）ではなく、復旧後に再開します。"
+        + " analysis" * 60
+    )
+
+    w._decide(resp)
+
+    assert w._unlock_attempts == before
+    assert w._lock_probe_pending is False
+    assert w.job != RF.LOCK_PROBE_QUESTION
+    assert w.status == "ready"
+    assert w.outcome is None
+    assert "transient retry" in w.reason
+
+
+def test_short_bare_locked_client_ip_phrase_is_not_a_server_literal():
+    # The real server literal starts with "[locked client IP:". A short diagnostic sentence
+    # can mention those words while explicitly saying that marker is absent. The old bare marker
+    # made length alone sufficient and re-opened the 2026-07 prose false-positive class.
+    resp = ("The locked client IP message is absent; this is a generic tool gateway failure, "
+            "not a lock refusal.")
+    assert len(resp) < RF.LOCKED_DOMINANCE_MAX_CHARS
+    assert RF._looks_locked(resp) is False
+    assert RF._looks_locked_ambiguous(resp) is False
+
+
+def test_remote_ip_marker_is_the_bracketed_server_prefix_not_bare_prose():
+    assert RF.REMOTE_IP_REFUSAL == "[locked client ip:"
+    assert RF.REMOTE_IP_REFUSAL in RF.LOCKED_MARKERS
+    assert "locked client ip" not in RF.LOCKED_MARKERS
+    assert RF._looks_locked(REAL) is True

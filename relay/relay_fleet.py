@@ -805,6 +805,12 @@ def edge_recover_surface(port=None, open_url=""):
 # The loose "unlock(password=" phrasing is kept only as documentation of what NOT to use alone;
 # it is deliberately NOT part of LOCKED_MARKERS below.
 
+#: The exact variable-prefix start of tools/security.py's remote-IP refusal. Keep the opening
+#: bracket and colon: the old bare "locked client ip" marker also matched ordinary diagnostic
+#: prose such as "the locked client IP message is absent", re-opening the 2026-07 false-positive
+#: class even when the worker was explicitly describing a non-lock backend failure.
+REMOTE_IP_REFUSAL = "[locked client ip:"
+
 #: The exact prefix tools/security.py writes when it denies a caller that arrived with no HTTP
 #: request context. Pinned here because that module is frozen and cannot import from this one,
 #: and because a filter keyed on it is only as good as the literal staying identical -- a test
@@ -833,7 +839,7 @@ TOKEN_MISSING_REFUSAL = "[locked: no valid unlock token"
 # and covering both in
 # relay/test_every_refusal_the_server_can_speak_is_one_the_fleet_can_hear.py's source-sweep of
 # tools/security.py, turns "happens to work" into "is checked".
-LOCKED_MARKERS = ("locked client ip", NO_CONTEXT_REFUSAL.lower(), TOKEN_MISSING_REFUSAL.lower())
+LOCKED_MARKERS = (REMOTE_IP_REFUSAL, NO_CONTEXT_REFUSAL.lower(), TOKEN_MISSING_REFUSAL.lower())
 # A real lock error (see the three literal strings above) is ~90-330 chars. A security-review /
 # analytical response that merely mentions unlock() runs to many hundreds/thousands of chars.
 # Chosen well above the longest real error and well below a genuine multi-sentence review.
@@ -1134,6 +1140,12 @@ _UNLOCK_NOT_REQUIRED_RE = (
     # Japanese, including the real calendar/read-only replies preserved in the research corpus.
     re.compile(r"(?:unlock|解錠|ロック解除).{0,80}?(?:不要|必要(?:は|が)?(?:ない|ありません)|要りません)", re.I),
     re.compile(r"(?:不要|必要(?:は|が)?(?:ない|ありません)|要りません).{0,80}?(?:unlock|解錠|ロック解除)", re.I),
+    # Negative diagnostic wording from a real backend outage (r6abe3de4_a0_w5). The worker
+    # explicitly distinguished a generic tool-gateway failure from the server lock error while
+    # quoting the marker name in prose. Quoting the marker must not manufacture an unlock need.
+    re.compile(r"(?:locked client ip|lock marker).{0,40}?(?:文言|表示|エラー).{0,30}?(?:は|が)?(?:無い|ない|ありません|出ていない|見当たらない)", re.I),
+    re.compile(r"(?:unlock|解錠|ロック解除).{0,40}?(?:では|じゃ).{0,30}?(?:解消|改善|復旧|直).{0,20}?(?:しない|しません|できない|ならない)", re.I),
+    re.compile(r"(?:unlock|解錠|ロック解除)(?:対象)?(?:の)?(?:エラー|事象|問題|エラー文言)?[^。\n]{0,50}?(?:ではなく|ではない|じゃない)", re.I),
 )
 
 # Contradictory prose fails closed. These are deliberately narrower than the negative patterns;
