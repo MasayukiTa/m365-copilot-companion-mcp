@@ -75,5 +75,5 @@ def test_fresh_page_requires_submission_acknowledgement(monkeypatch):
     monkeypatch.setattr(driver, "_wait_fresh_user_receipt", lambda *a, **k: False)
 
     import pytest
-    with pytest.raises(RuntimeError, match="intended user turn was not the one visible"):
+    with pytest.raises(RuntimeError, match="no single matching user-turn receipt"):
         driver.send("RUN job_1 seq=1 worker=w", track_answer=False)

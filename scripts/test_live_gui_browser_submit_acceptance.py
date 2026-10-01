@@ -50,3 +50,12 @@ def test_fresh_idle_refuses_active_marker_and_accepts_clean_state(tmp_path):
     assert _fresh_idle_reason(state) == ""
     (state / "fleet_run_active.json").write_text("{}", encoding="utf-8")
     assert "fleet_run_active" in _fresh_idle_reason(state)
+
+
+def test_live_wait_requires_a_stable_question_snapshot_before_returning():
+    import inspect
+    from scripts.live_gui_browser_submit_acceptance import _wait_visible_questions
+    src = inspect.getsource(_wait_visible_questions)
+    assert "settle_s" in src
+    assert "stable_since" in src
+    assert "last_signature" in src
