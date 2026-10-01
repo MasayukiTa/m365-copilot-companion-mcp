@@ -8408,6 +8408,12 @@ def _campaigns_from_disk(transcript_dir):
                     "requeue_merge": verdict == "reissue"}
         if fam.get("depth"):
             out[cid]["depth"] = fam["depth"]
+        # a nested family keeps the parent slot it fills, so its merge still reaches that slot
+        if fam.get("parent_campaign_id"):
+            out[cid]["parent_campaign_id"] = fam["parent_campaign_id"]
+            out[cid]["parent_subtask_index"] = fam.get("parent_subtask_index")
+        if fam.get("nested_missing"):
+            out[cid]["missing"] = list(fam["nested_missing"])
     if out:
         print("[fanout] rehydrated %d unmerged campaign(s) from the ledger" % len(out),
               flush=True)
@@ -8578,16 +8584,50 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         except OSError:
             pass
 
-    def _note_merged(cid, agg_key=None):
+    def _note_merged(cid, agg_key=None, missing=None):
         """Record on disk that this family's merge was QUEUED (`merged`; compat), and with
         `agg_key` the resume key of the aggregator goal so a later run can find it DONE in
-        last_run_done.json. That the merge FINISHED is the separate `merge_done` line."""
+        last_run_done.json. That the merge FINISHED is the separate `merge_done` line.
+        `missing` (a NESTED family only) lists the slices the merge was queued without, so the
+        parent slot is marked MISSING even if this run dies before the merge finishes."""
         row = {"kind": "merged", "campaign_id": cid}
         if agg_key:
             row["agg_key"] = agg_key
+        if missing:
+            row["missing"] = list(missing)
         _note_marker(row)
 
     _noted_done = set()
+
+    def _note_nested_result(_cid, _w, merge_ok):
+        """A NESTED family's merge has ended: fill the parent slot it belongs to, once.
+
+        Writes a `child_result` addressed to the PARENT campaign and slot (the nested header's
+        parent_campaign_id / parent_subtask_index), carrying the merge's answer when it finished
+        DONE with every slice, and the explicit MISSING marker otherwise (a merge that ended
+        STUCK, or one queued with missing slices). The child's own split proposal is never the
+        slot's answer. A top-level family has no parent slot and nothing is written."""
+        _camp = campaigns.get(_cid) or {}
+        _pc, _pi = _camp.get("parent_campaign_id"), _camp.get("parent_subtask_index")
+        if not _pc or _pi is None:
+            return
+        _mark = (_pc, "nested", _pi)
+        if _mark in _noted_done:
+            return
+        _noted_done.add(_mark)
+        _parent = campaigns.get(_pc)
+        if _parent is not None and any(
+                _r.get("nested") and _r.get("subtask_index") == _pi
+                for _r in (_parent.get("child_results") or [])):
+            return                          # already on the ledger (rehydrated / earlier pass)
+        _row = fanout_mod.nested_result_row(
+            _pc, _pi, _cid,
+            (getattr(_w, "display_result", "") or getattr(_w, "last_response", "") or ""),
+            merge_ok=merge_ok, missing=_camp.get("missing") or (),
+            task_id="%s-%s" % (_pc, _pi))
+        _note_marker(_row)
+        if _parent is not None:
+            _parent.setdefault("child_results", []).append(_row)
 
     def _note_one_finished(_w):
         """Write the `merge_done` / `child_result` line for ONE worker that ended DONE, once.
@@ -8608,6 +8648,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 return
             _noted_done.add(_mark)
             _note_marker({"kind": "merge_done", "campaign_id": _cid})
+            _note_nested_result(_cid, _w, True)
         else:
             _idx = getattr(_w, "subtask_index", None)
             _mark = (_cid, "child", _idx)
@@ -8635,6 +8676,21 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         safety net for any path that did not."""
         for _w in workers:
             _note_one_finished(_w)
+            _note_nested_merge_failed(_w)
+
+    def _note_nested_merge_failed(_w):
+        """A NESTED family's merge ended without DONE (STUCK, cancelled ...): the parent slot is
+        marked MISSING, so the parent's merge names the gap instead of waiting forever or
+        counting an empty success. Anything that is not a finished-and-not-DONE aggregator of a
+        nested family is ignored (so a flat family writes nothing)."""
+        _env = getattr(_w, "task_envelope", None)
+        if getattr(_env, "role", "") != "aggregator" or getattr(_w, "status", "") not in TERMINAL:
+            return
+        from relay.outcomes import FINISHED as _FIN
+        _oc = getattr(_w, "outcome", None)
+        if _oc in (None, "DONE") or _oc not in _FIN or _oc == "FANOUT":
+            return
+        _note_nested_result(getattr(_env, "campaign_id", "") or "", _w, False)
 
     def _campaign_already_on_disk(cid):
         """Whether this campaign was split by an EARLIER run.
@@ -8690,6 +8746,14 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             return True
         return seen
 
+    def _link_parent_slot(cid, kids):
+        """A NESTED family remembers the parent campaign and slot it fills, so its merge can
+        answer that slot (nothing is added for a top-level family)."""
+        _pc = (kids[0] or {}).get("parent_campaign_id") or ""
+        if _pc and campaigns.get(cid) is not None:
+            campaigns[cid]["parent_campaign_id"] = _pc
+            campaigns[cid]["parent_subtask_index"] = (kids[0] or {}).get("parent_subtask_index")
+
     def _spawn_children(parent_goal, kids, parent_checks=None, parent_partial=""):
         """Queue a split parent's children and remember the family. Idempotent per campaign.
 
@@ -8726,6 +8790,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                               "partial": parent_partial or ""}
             if int((kids[0] or {}).get("depth") or 1) > 1:
                 campaigns[cid]["depth"] = int(kids[0]["depth"])
+            _link_parent_slot(cid, kids)
             print("[fanout] %s: already split in an earlier run; adopting, not re-queueing"
                   % cid, flush=True)
             return
@@ -8750,6 +8815,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                           "partial": parent_partial or ""}
         if int((kids[0] or {}).get("depth") or 1) > 1:
             campaigns[cid]["depth"] = int(kids[0]["depth"])   # the merge's depth (nested only)
+        _link_parent_slot(cid, kids)
         add_box.extend(kids)
         # WRITTEN DOWN, NOT ONLY QUEUED. add_box lives in memory: if the run dies here the
         # children vanish while the parent is already recorded finished, so the work would
@@ -8779,6 +8845,9 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                          "parent_task_id": (kids[0] or {}).get("parent_task_id"),
                          "parent_campaign_id": (kids[0] or {}).get("parent_campaign_id", ""),
                          "root_id": (kids[0] or {}).get("root_id", ""),
+                         # the parent slot a NESTED family fills (absent on a top-level one)
+                         **({"parent_subtask_index": kids[0]["parent_subtask_index"]}
+                            if (kids[0] or {}).get("parent_subtask_index") is not None else {}),
                          # the children's depth, written only for a nested split
                          **({"depth": kids[0]["depth"]} if int(
                              (kids[0] or {}).get("depth") or 1) > 1 else {})},
@@ -8906,11 +8975,29 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             _kids = [w for w in workers
                      if getattr(getattr(w, "task_envelope", None), "campaign_id", "") == _cid
                      and getattr(getattr(w, "task_envelope", None), "role", "") == "subtask"]
-            _recs = [{"finished": w.status in TERMINAL,
-                      "outcome": w.outcome,
-                      "subtask_index": getattr(w, "subtask_index", "?"),
-                      "result": (getattr(w, "display_result", "") or w.last_response or "")}
-                     for w in _kids]
+            # A SLOT WHOSE CHILD SPLIT AGAIN (outcome FANOUT) IS NOT FINISHED BY THAT OUTCOME.
+            # The child's own text is a split proposal and is never the slot's answer; the slot
+            # waits for its nested family's merge, whose answer (or an explicit MISSING marker)
+            # arrives as a `nested` child_result row addressed to this slot.
+            _nested_rows = {}
+            for _cr in (_camp.get("child_results") or []):
+                if _cr.get("nested"):
+                    _nested_rows[_cr.get("subtask_index")] = _cr
+            _recs = []
+            for w in _kids:
+                if str(w.outcome or "").upper() == "FANOUT":
+                    _ix = getattr(w, "subtask_index", "?")
+                    _kin = next((c for c, cm in campaigns.items()
+                                 if cm.get("parent_campaign_id") == _cid
+                                 and cm.get("parent_subtask_index") == _ix), None)
+                    _recs.append(fanout_mod.slot_record(_ix, _nested_rows.get(_ix),
+                                                        nested_cid=_kin))
+                    continue
+                _recs.append({"finished": w.status in TERMINAL,
+                              "outcome": w.outcome,
+                              "subtask_index": getattr(w, "subtask_index", "?"),
+                              "result": (getattr(w, "display_result", "")
+                                         or w.last_response or "")})
             # ANSWERS OF CHILDREN THAT FINISHED IN AN EARLIER PROCESS come from the ledger
             # (`child_result` lines), so a resumed family is not stuck waiting for workers
             # that will never exist again. A live worker for the same slice wins.
@@ -8920,6 +9007,9 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 if _ci in _live_idx:
                     continue
                 _live_idx.add(_ci)
+                if _cr.get("nested"):
+                    _recs.append(fanout_mod.slot_record(_ci, _cr))
+                    continue
                 _recs.append({"finished": True, "outcome": "DONE", "subtask_index": _ci,
                               "result": _cr.get("result") or ""})
             # Every child ADMITTED must be finished, and all of them must have been admitted:
@@ -8953,7 +9043,12 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                                                **({"depth": _camp["depth"]}
                                                   if _camp.get("depth") else {}))
             _camp["merged"] = True
-            _note_merged(_cid, resume_mod.goal_resume_key(_agg))
+            if _camp.get("parent_campaign_id"):
+                # a NESTED family: remember which slices this merge goes without, so the parent
+                # slot it fills is marked MISSING rather than complete
+                _camp["missing"] = fanout_mod.missing_slices(_recs)
+            _note_merged(_cid, resume_mod.goal_resume_key(_agg),
+                         missing=_camp.get("missing") if _camp.get("parent_campaign_id") else None)
             if _camp.get("requeue_merge"):
                 # A merge queued before a death that never finished is re-issued once; the
                 # cap (fleet_resume.rehydrate_decision) reads this line.
