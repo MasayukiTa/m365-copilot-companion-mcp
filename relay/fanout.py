@@ -675,7 +675,8 @@ def ready_to_aggregate(records):
 
 
 #: Ledger line kinds that mark state rather than describe a child. See campaigns_from_ledger.
-_LEDGER_MARKER_KINDS = ("merged", "merge_done", "merge_requeued", "child_result")
+_LEDGER_MARKER_KINDS = ("merged", "merge_done", "merge_requeued", "child_result",
+                        "child_requeued")
 
 
 def campaigns_from_ledger(lines):
@@ -732,6 +733,8 @@ def campaigns_from_ledger(lines):
                 fam["merge_requeued"] = int(fam.get("merge_requeued") or 0) + 1
             elif kind == "child_result":
                 fam.setdefault("child_results", []).append(rec)
+            elif kind == "child_requeued":
+                fam.setdefault("child_requeued", []).append(rec)
             continue
         if rec.get("kind") == "campaign":
             _prev = out.get(cid, {})
@@ -757,7 +760,8 @@ def campaigns_from_ledger(lines):
             if rec.get("depth"):
                 out[cid]["depth"] = rec["depth"]
             # Marker flags that arrived before the header survive it.
-            for _k in ("merge_done", "merge_requeued", "child_results", "agg_key"):
+            for _k in ("merge_done", "merge_requeued", "child_results", "agg_key",
+                       "child_requeued"):
                 if _k in _prev:
                     out[cid][_k] = _prev[_k]
             continue
