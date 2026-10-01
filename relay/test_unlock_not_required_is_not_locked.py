@@ -163,3 +163,21 @@ def test_real_w5_decision_does_not_inject_unlock_for_backend_failure(monkeypatch
     assert w.status == "ready"
     assert w.outcome is None
     assert "transient retry" in w.reason
+
+
+def test_short_bare_locked_client_ip_phrase_is_not_a_server_literal():
+    # The real server literal starts with "[locked client IP:". A short diagnostic sentence
+    # can mention those words while explicitly saying that marker is absent. The old bare marker
+    # made length alone sufficient and re-opened the 2026-07 prose false-positive class.
+    resp = ("The locked client IP message is absent; this is a generic tool gateway failure, "
+            "not a lock refusal.")
+    assert len(resp) < RF.LOCKED_DOMINANCE_MAX_CHARS
+    assert RF._looks_locked(resp) is False
+    assert RF._looks_locked_ambiguous(resp) is False
+
+
+def test_remote_ip_marker_is_the_bracketed_server_prefix_not_bare_prose():
+    assert RF.REMOTE_IP_REFUSAL == "[locked client ip:"
+    assert RF.REMOTE_IP_REFUSAL in RF.LOCKED_MARKERS
+    assert "locked client ip" not in RF.LOCKED_MARKERS
+    assert RF._looks_locked(REAL) is True
