@@ -183,11 +183,11 @@ def _recover_from_outcome(state_dir, jids):
     return ""
 
 
-def _recover_from_transcripts(state_dir, goal_text, require=(), whole=False):
+def _recover_from_transcripts(state_dir, goal_text, must_hold=(), whole=False):
     """Last assistant answer of the worker transcript whose first user turn holds this
     child's goal text (the worker index in the file name is not recorded on the child).
 
-    `require`: extra strings the first user turn must also hold (a merge prompt carries its own
+    `must_hold`: extra strings the first user turn must also hold (a merge prompt carries its own
     heading, which tells it from the splitting worker that was handed the same goal text).
     `whole`: match the entire goal text rather than its first 120 characters (sibling slices
     share a long common prefix)."""
@@ -221,7 +221,7 @@ def _recover_from_transcripts(state_dir, goal_text, require=(), whole=False):
                         continue
                     if r.get("role") == "user" and first_user is None:
                         first_user = str(r.get("text") or "")
-                        if needle not in first_user or any(q not in first_user for q in require):
+                        if needle not in first_user or any(q not in first_user for q in must_hold):
                             break
                     elif r.get("role") == "assistant" and first_user is not None:
                         t = str(r.get("text") or "").strip()
@@ -230,7 +230,7 @@ def _recover_from_transcripts(state_dir, goal_text, require=(), whole=False):
         except Exception:
             continue
         if (first_user is not None and needle in first_user and last_asst
-                and all(q in first_user for q in require)):
+                and all(q in first_user for q in must_hold)):
             return last_asst
     return ""
 
@@ -290,7 +290,7 @@ def recover_nested_merge_answer(state_dir, nested_cid, fam):
     goal = str((fam or {}).get("goal") or "")
     for src, fn in (("outcome_json", lambda: _recover_from_outcome(state_dir, jids)),
                     ("transcript", lambda: _recover_from_transcripts(
-                        state_dir, goal, require=(_MERGE_HEADING,), whole=True)),
+                        state_dir, goal, must_hold=(_MERGE_HEADING,), whole=True)),
                     ("history", lambda: _recover_from_history(state_dir, jids, ""))):
         try:
             t = fn()
