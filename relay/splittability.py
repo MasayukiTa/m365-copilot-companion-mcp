@@ -114,8 +114,11 @@ _CJK = re.compile(r"[぀-ヿ㐀-䶿一-鿿＀-￯]")
 #: Weight of one CJK character against one Latin character in the length rule.
 _CJK_WEIGHT = 2
 
+# 「それぞれ」 is deliberately NOT here: "一覧にして、それぞれのサイズも教えて" is a measured
+# single short lookup (test_short_single_lookups_are_not_split). It counts only alongside an
+# enumeration, which is already a signal by itself.
 _JA_INDEPENDENCE = re.compile(
-    r"それぞれ|別々|別個|互いに(?:無関係|独立)|相互に(?:無関係|独立)|独立して|独立した"
+    r"別々|別個|互いに(?:無関係|独立)|相互に(?:無関係|独立)|独立して|独立した"
     r"|バラバラに|個別に|並列で")
 
 #: One enumerated item per line: `1.` `1)` `1、` `（1）` `①` or a ・/•/●/- bullet.
