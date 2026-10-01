@@ -64,6 +64,9 @@ jobs:
       - name: Audit hermetic test manifest
         run: python scripts/check_ci_test_manifest.py
 
+      - name: Ledger entries are well formed
+        run: python scripts/ledger_compile.py --check
+
       # A unit test proves a function works; it does not prove anything calls it.
       # Three capabilities in one day were green and wired to nothing.
       - name: Integration evidence for new definitions
@@ -551,6 +554,7 @@ jobs:
             tests/test_fanout_default_on_agrees.py \
             tests/test_stuck_worker_retried_once.py \
             tests/test_task_tree.py \
+            tests/test_ledger_compile.py \
             tests/test_reaper_marks_interrupted.py \
             tests/test_interrupted_status_is_classified_everywhere.py \
             tests/test_idle_edge_release.py \
