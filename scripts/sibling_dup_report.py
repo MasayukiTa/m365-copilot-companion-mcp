@@ -8,7 +8,10 @@ anything that shares work between siblings. This script only measures; it change
 INPUTS (all read-only, all under one --fleet-dir, default the live .fleet):
   tool_events.jsonl  call/outcome rows written by tools/tool_ledger.py (tool, args digests, ts,
                      mono, task, worker, attr). task/worker are filled only under the
-                     attribution kinds in ATTRIBUTED_KINDS.
+                     attribution kinds in ATTRIBUTED_KINDS. Rows labelled from a coordinator
+                     turn window may also carry campaign_id, subtask_id, parent_task_id,
+                     root_id, role; those are used first, and rows without them (older
+                     ledgers) fall back to the status.json join.
   status.json        `workers`: campaign_id, role, outcome, jid, task_id, run_id, name.
   campaigns.jsonl    campaign headers, one row per subtask (task_id), and `merged` markers.
   transcripts/       counted only; outcomes come from status.json, not from transcripts.
@@ -183,6 +186,16 @@ class Roster:
             elif r.get("task_id"):
                 self.child_of.setdefault(str(r["task_id"]), (cid, str(r["task_id"])))
 
+    def resolve_call(self, call):
+        """(campaign, child) for a ledger row. The identity the coordinator wrote on the row
+        (campaign_id + subtask_id, role) wins; a row without it (older ledgers) falls back to the
+        task/worker join through status.json. A merge worker's calls are not sibling calls."""
+        cid, sub = call.get("campaign_id"), call.get("subtask_id")
+        if cid and sub:
+            role = str(call.get("role") or CHILD_ROLE).lower()
+            return (str(cid), str(sub)) if role == CHILD_ROLE else None
+        return self.resolve(call.get("task"), call.get("worker"))
+
     def resolve(self, task, worker):
         if task:
             hit = self.child_of.get(str(task))
@@ -212,7 +225,7 @@ def analyse(events, workers, camp_rows):
                                                             or call.get("worker")):
             buckets["unknown_attribution"] += 1
             continue
-        hit = roster.resolve(call.get("task"), call.get("worker"))
+        hit = roster.resolve_call(call)
         if hit is None:
             buckets["attributed_not_fanout"] += 1
             continue
