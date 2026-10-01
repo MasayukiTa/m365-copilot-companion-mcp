@@ -59,13 +59,17 @@ MAX_DEPTH = 1
 DEPTH_SETTING_KEY = "fanout_max_depth"
 DEPTH_SETTING_BOUNDS = (1, 3)
 
-#: Whether the merge of nested splits exists yet. A worker that ends FANOUT counts as finished,
-#: so its split proposal would be read by its parent's merge as that worker's ANSWER. Until a
-#: merge that waits for a child's own family and substitutes the family's merged result exists,
-#: a tree must not grow past one level whatever the setting says: `effective_max_depth()` caps
-#: at MAX_DEPTH while this is False. Unit tests monkeypatch it to exercise the deeper plumbing;
-#: nothing in production sets it.
+#: Whether nested splits are ENABLED. A worker that ends FANOUT counts as finished, so without
+#: the nested merge its split proposal would be read by its parent's merge as that worker's
+#: ANSWER. The nested merge now exists (a FANOUT slot waits for its own family's merge and takes
+#: that merge's answer, or an explicit MISSING marker; see nested_result_row), but the switch
+#: stays False until it has been verified live: `effective_max_depth()` caps at MAX_DEPTH while
+#: this is False. Tests monkeypatch it to exercise the deeper behaviour; nothing in production
+#: sets it (tests/test_hierarchical_merge.py fails if anything does).
 HIERARCHICAL_MERGE_READY = False
+
+#: The outcome a parent slot carries when its nested family did not deliver a real answer.
+SLOT_MISSING = "MISSING"
 
 #: A step shorter than this is a fragment ("2月", "続き") rather than an instruction that a
 #: fresh conversation -- which will not have seen the parent's reasoning -- could act on.
@@ -674,6 +678,56 @@ def ready_to_aggregate(records):
     return bool(records) and all(r.get("finished") for r in records)
 
 
+def nested_result_row(parent_cid, subtask_index, nested_cid, text, *, merge_ok=True,
+                      missing=(), task_id=None, cap=1200):
+    """The `child_result` ledger row that fills a PARENT slot from its nested family's merge.
+
+    A slot whose child split again is complete only when that family's merge has finished, and
+    its answer is the merge's answer -- never the child's own split proposal (the child ended
+    FANOUT). The outcome is DONE only for a merge that finished DONE, covered every slice and
+    produced real text; anything else is the explicit MISSING marker, so the parent's merge
+    (missing_slices / merge_acceptance_checks) names the slot instead of counting an empty
+    success. `nested` marks the row for the readers that treat it differently.
+    """
+    body = (text or "").strip()
+    gaps = sorted(missing or ())
+    ok = bool(merge_ok) and not gaps and bool(body) and not fanout_ready(body)
+    if fanout_ready(body):
+        body = ""                      # a split proposal is never a slot's answer
+    if gaps:
+        body = ("【下位グループの未完了サブタスク: %s】\n%s"
+                % (", ".join(str(g) for g in gaps), body)).strip()
+    row = {"kind": "child_result", "campaign_id": parent_cid, "subtask_index": subtask_index,
+           "outcome": "DONE" if ok else SLOT_MISSING, "task_id": task_id,
+           "result": body[:cap], "nested": nested_cid}
+    if gaps:
+        row["nested_missing"] = gaps
+    return row
+
+
+def slot_record(subtask_index, row=None, *, nested_cid=None):
+    """The merge record for a parent slot whose child ended FANOUT.
+
+    `row` is the nested family's `child_result` for the slot, when it has been written: the
+    record is then finished and carries the row's outcome and text (a split proposal is refused
+    here as well, whatever the row says). Without a row the slot is still WAITING on the nested
+    family (finished False) when `nested_cid` names one, and an explicit MISSING record when no
+    nested family exists at all -- never an empty success.
+    """
+    if row is not None:
+        text = row.get("result") or ""
+        outcome = str(row.get("outcome") or "DONE").upper()
+        if fanout_ready(text):
+            text, outcome = "", SLOT_MISSING
+        return {"finished": True, "outcome": outcome, "subtask_index": subtask_index,
+                "result": text}
+    if nested_cid:
+        return {"finished": False, "outcome": "FANOUT", "subtask_index": subtask_index,
+                "result": "", "waiting_on": nested_cid}
+    return {"finished": True, "outcome": SLOT_MISSING, "subtask_index": subtask_index,
+            "result": ""}
+
+
 #: Ledger line kinds that mark state rather than describe a child. See campaigns_from_ledger.
 _LEDGER_MARKER_KINDS = ("merged", "merge_done", "merge_requeued", "child_result",
                         "child_requeued")
@@ -727,6 +781,9 @@ def campaigns_from_ledger(lines):
                 fam["merged"] = True
                 if rec.get("agg_key"):
                     fam["agg_key"] = rec.get("agg_key")
+                if rec.get("missing"):
+                    # the slices this (nested) merge was queued without; see nested_result_row
+                    fam["nested_missing"] = list(rec.get("missing"))
             elif kind == "merge_done":
                 fam["merge_done"] = True
             elif kind == "merge_requeued":
@@ -759,9 +816,14 @@ def campaigns_from_ledger(lines):
             # The children's depth, written only for a nested split (absent = 1, the top level).
             if rec.get("depth"):
                 out[cid]["depth"] = rec["depth"]
+            # A NESTED family names the parent slot it fills (absent on a top-level one).
+            if rec.get("parent_campaign_id"):
+                out[cid]["parent_campaign_id"] = str(rec["parent_campaign_id"])
+                if rec.get("parent_subtask_index") is not None:
+                    out[cid]["parent_subtask_index"] = rec["parent_subtask_index"]
             # Marker flags that arrived before the header survive it.
             for _k in ("merge_done", "merge_requeued", "child_results", "agg_key",
-                       "child_requeued"):
+                       "child_requeued", "nested_missing"):
                 if _k in _prev:
                     out[cid][_k] = _prev[_k]
             continue
@@ -1118,4 +1180,5 @@ __all__ = ["SUBTASKS_READY", "SPLIT_JOB", "MAX_CHILDREN", "MIN_CHILDREN", "MAX_D
     "collapse_retries", "ready_to_aggregate", "aggregation_goal",
     "fanout_family_view", "HIERARCHICAL_MERGE_READY", "configured_max_depth",
     "effective_max_depth", "may_split_at", "depth_report",
+    "nested_result_row", "slot_record", "SLOT_MISSING",
 ]
