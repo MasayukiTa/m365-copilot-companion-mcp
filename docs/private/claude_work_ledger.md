@@ -173,3 +173,30 @@ Under `%USERPROFILE%\.claude\tools\<tool>\README.md`:
 - Root cause: PR #86 G2 (fleet_runner --resume -> fleet_resume.resume_children_goals) re-queued the unfinished children of EVERY campaign in .fleet/campaigns.jsonl lacking merge_done (63 old campaigns -> 545 degraded goals for a 2-goal run), reset last_run_done.json to {} on resume, and each snapshot embedded every plan (80KB-2.6MB).
 - Fix: fleet_resume.campaigns_of_run/interrupted_run_scope decide membership (new header stamp run_id+ts; else worker campaign id / parent-goal hash / lineage chain; nothing else, fail closed); snapshot embeds only scoped plans (cap 40x64, campaigns_scoped flag; unflagged old snapshots are not trusted); hard cap max(20, 4x goals) refuses with state pending (exit 6); resume no longer resets the done map. Sweep: relay_fleet._campaigns_from_disk left unscoped with reason in a comment; family_view/_campaign_already_on_disk are read-only/per-id.
 - Tests: tests/test_resume_scoped_to_interrupted_run.py (in ci.yml); existing phase2 tests now pass scope explicitly.
+
+## 2026-10-01 10:19 JST - phase2 audit follow-up / stabilization ledger checkpoint
+
+Current working branch: `fix/phase2-audit-followups-20260929` (PR #78). The remote PR head is `183bb63`; all reported checks on that head are green: CI, CodeQL, Secret scan, Workflow lint, PowerShell lint, Windows build, and install-path E2E. The local branch had merged the then-stale local `origin/main` ref as `f2a3ef8`, which included PR #91's interrupted-run resume scoping. After this checkpoint was written, an explicit `git fetch origin main` showed that remote `main` had already advanced further to `ed16ac9` via PR #92. Therefore `f2a3ef8` is not the current-main convergence point; the branch still needs the newer `ed16ac9` main before final integration.
+
+Stabilization work now present on this branch, in addition to the items already recorded above:
+- live Fleet submission path is repaired and accepted through the GUI AutomationId path; socket capture was moved off the Fleet sweep so expensive Playwright/CDP capture no longer blocks command draining;
+- silent socket turns recover after the measured 60 s no-progress boundary instead of remaining in the old long-wait path;
+- GUI submissions are serialized by the dedicated GUI submit lock, preventing foreground-window races and overlapping automated submitters;
+- legacy `.env` secrets are migrated during atomic edits while preserving quoted values;
+- planned server-restart health state is bound to the supervisor instance and its yellow-path poll is exercised exactly in test;
+- explicit replies that say unlock is not required are no longer misclassified as locked, while literal lock evidence and genuine unlock failure remain authoritative;
+- PR #91, now on main, scopes interrupted-run resume to campaigns belonging to the interrupted run, preventing old unfinished campaigns from being requeued into a new resume.
+
+Current validation state:
+- PR #78 remote head `183bb63`: all GitHub checks green;
+- main stabilization ledger records all previously enumerated P0 behavior regressions CLOSED with live/exact evidence;
+- local worktree has no tracked modifications at this checkpoint; only unrelated untracked directories `kanazawa-trip/`, `output_20260930/`, and `reviews/` exist and are intentionally untouched.
+
+Next work after this checkpoint:
+- PR #78 was pushed through this ledger checkpoint; before final integration, merge/rebase the newer fetched main `ed16ac9` (PR #92) and re-run the full blocking checks;
+- continue the phase2 audit follow-ups only after confirming the post-merge CI/CodeQL/Windows path remains green;
+- separately inspect current `main` CI failures if any remain; do not mix unrelated main-CI repairs into the Fleet stabilization commit unless the cause is shared.
+
+### 2026-10-01 10:2x JST correction -- fetched main was newer than cached origin/main
+
+After the checkpoint above, `git fetch origin main` updated the remote-tracking ref from PR #91's `3d97c39` to `ed16ac9` (PR #92). Main HEAD `ed16ac9` is green on CI, CodeQL, Secret scan, Workflow lint, and Windows build. Treat the earlier wording that called `f2a3ef8` a merge of current main as stale-local-ref wording; final PR #78 convergence still requires the newer main.
