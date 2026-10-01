@@ -107,6 +107,246 @@ def _child_done(child, fam, done_map):
     return False
 
 
+# --------------------------------------------------------------------------- child result recovery
+#
+# A child can be DONE in the done-map while its `child_result` ledger line was never written
+# (the line used to be written on a later sweep, and the coordinator can die in between).
+# Resume then skips the child as finished and the merge sees n-1 records forever. Everything
+# below recovers that text from durable sources, or says plainly that it cannot.
+
+#: Same cap the live writer applies to a child's answer (relay_fleet._note_child_done).
+CHILD_RESULT_CAP = 1200
+#: Sweeps a family may sit complete-by-done-map but short of records before the stall detector
+#: acts (relay_fleet._stall_check).
+MERGE_STALL_SWEEPS = 3
+#: How many transcript files one recovery scan may open (newest first).
+RECOVERY_TRANSCRIPT_SCAN = 300
+_TEXT_KEYS = ("answer", "text", "display_result", "last_response", "result_text", "summary",
+              "result")
+_SAFE_ID = re.compile(r"[A-Za-z0-9_\-]{1,80}")
+
+
+def append_ledger_row(state_dir, row):
+    """Append one marker line to campaigns.jsonl. Best-effort; True when written."""
+    try:
+        with open(os.path.join(state_dir, CAMPAIGNS_FILE), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+        return True
+    except OSError:
+        return False
+
+
+def _child_goal_text(child):
+    g = child.get("goal")
+    if isinstance(g, dict):
+        return str(g.get("text") or g.get("goal") or "")
+    return str(child.get("text") or "")
+
+
+def _child_jids(child):
+    out = []
+    g = child.get("goal")
+    for src in (g if isinstance(g, dict) else {}, child):
+        for k in ("jid", "task_id"):
+            v = str(src.get(k) or "").strip()
+            if v and _SAFE_ID.fullmatch(v) and v not in out:
+                out.append(v)
+    return out
+
+
+def _text_in(obj, depth=0):
+    """First non-empty answer-like string in a (possibly nested) dict."""
+    if isinstance(obj, str):
+        return obj.strip()
+    if not isinstance(obj, dict) or depth > 2:
+        return ""
+    for k in _TEXT_KEYS:
+        t = _text_in(obj.get(k), depth + 1)
+        if t:
+            return t
+    return ""
+
+
+def _recover_from_outcome(state_dir, jids):
+    for jid in jids:
+        path = os.path.join(state_dir, "tasks", "done", jid + ".outcome.json")
+        try:
+            with open(path, encoding="utf-8-sig") as fh:
+                d = json.load(fh)
+        except Exception:
+            continue
+        if not isinstance(d, dict) or str(d.get("status") or "").lower() not in ("done", "ok"):
+            continue
+        t = _text_in(d.get("result"))
+        if t:
+            return t
+    return ""
+
+
+def _recover_from_transcripts(state_dir, goal_text):
+    """Last assistant answer of the worker transcript whose first user turn holds this
+    child's goal text (the worker index in the file name is not recorded on the child)."""
+    needle = (goal_text or "").strip()[:120]
+    if not needle:
+        return ""
+    tdir = os.path.join(state_dir, "transcripts")
+    try:
+        names = [n for n in os.listdir(tdir) if n.endswith((".jsonl", ".jsonl.gz"))]
+        names.sort(key=lambda n: os.path.getmtime(os.path.join(tdir, n)), reverse=True)
+    except OSError:
+        return ""
+    for n in names[:RECOVERY_TRANSCRIPT_SCAN]:
+        path = os.path.join(tdir, n)
+        try:
+            if n.endswith(".gz"):
+                import gzip
+                fh = gzip.open(path, "rt", encoding="utf-8", errors="replace")
+            else:
+                fh = open(path, encoding="utf-8", errors="replace")
+            first_user, last_asst = None, ""
+            with fh:
+                for line in fh:
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue
+                    if not isinstance(r, dict):
+                        continue
+                    if r.get("role") == "user" and first_user is None:
+                        first_user = str(r.get("text") or "")
+                        if needle not in first_user:
+                            break
+                    elif r.get("role") == "assistant" and first_user is not None:
+                        t = str(r.get("text") or "").strip()
+                        if t:
+                            last_asst = t
+        except Exception:
+            continue
+        if first_user is not None and needle in first_user and last_asst:
+            return last_asst
+    return ""
+
+
+def _recover_from_history(state_dir, jids, goal_text):
+    try:
+        with open(os.path.join(state_dir, "history.json"), encoding="utf-8-sig") as fh:
+            rows = json.load(fh)
+    except Exception:
+        return ""
+    if not isinstance(rows, list):
+        return ""
+    needle = (goal_text or "").strip()[:120]
+    for r in reversed(rows):
+        if not isinstance(r, dict) or str(r.get("outcome") or "").upper() != "DONE":
+            continue
+        hit = (r.get("jid") and str(r.get("jid")) in jids) or \
+              (needle and needle in str(r.get("goal") or ""))
+        if hit:
+            t = _text_in({k: r.get(k) for k in ("display_result", "last_response", "last",
+                                                "result")})
+            if t:
+                return t
+    return ""
+
+
+def recover_child_result(state_dir, child):
+    """(text, source) of a finished child's answer from durable sources, in order: the task
+    outcome file, the worker transcript, history.json. ("", "") when none has it."""
+    jids = _child_jids(child)
+    text = _child_goal_text(child)
+    for src, fn in (("outcome_json", lambda: _recover_from_outcome(state_dir, jids)),
+                    ("transcript", lambda: _recover_from_transcripts(state_dir, text)),
+                    ("history", lambda: _recover_from_history(state_dir, jids, text))):
+        try:
+            t = fn()
+        except Exception:
+            t = ""
+        if t:
+            return t[:CHILD_RESULT_CAP], src
+    return "", ""
+
+
+def _child_in_done_map(child, done_map):
+    g = child.get("goal")
+    key = goal_resume_key(g) if isinstance(g, dict) else text_key(child.get("text") or "")
+    return done_map.get(key) == "DONE"
+
+
+def _has_result(fam, idx):
+    return any(r.get("subtask_index") == idx and str(r.get("outcome") or "").upper() == "DONE"
+               for r in fam.get("child_results") or [])
+
+
+def children_done_without_result(fam, done_map):
+    """Children the done-map calls DONE although no `child_result` line carries their answer."""
+    return [c for c in fam.get("children") or []
+            if _child_in_done_map(c, done_map) and not _has_result(fam, c.get("subtask_index"))]
+
+
+def _record_recovery(cid, idx, outcome, source, run_id=""):
+    try:
+        from relay import mechanism_telemetry as _mt
+        _mt.record("child_result_recovery", run_id=run_id, triggered=True,
+                   executed=(outcome == "recovered"),
+                   extra={"campaign_id": cid, "subtask_index": idx, "result": outcome,
+                          "source": source})
+    except Exception:
+        pass
+
+
+def recover_family_results(state_dir, cid, fam, done_map, log=print, run_id=""):
+    """Give every done-without-result child its `child_result` line, or re-queue it once.
+
+    Returns (recovered, requeue): `recovered` are the ledger rows written (also added to
+    fam["child_results"]); `requeue` are the children that could not be recovered and have not
+    been re-queued before (a `child_requeued` marker is written, so a second pass leaves them).
+    """
+    recovered, requeue = [], []
+    already = {r.get("subtask_index") for r in fam.get("child_requeued") or []}
+    for child in children_done_without_result(fam, done_map):
+        idx = child.get("subtask_index")
+        text, src = recover_child_result(state_dir, child)
+        if text:
+            row = {"kind": "child_result", "campaign_id": cid, "subtask_index": idx,
+                   "outcome": "DONE", "result": text, "recovered": True, "source": src,
+                   "task_id": child.get("task_id")}
+            append_ledger_row(state_dir, row)
+            fam.setdefault("child_results", []).append(row)
+            recovered.append(row)
+            _record_recovery(cid, idx, "recovered", src, run_id)
+            log("[resume] child %s of campaign %s: result recovered from %s" % (idx, cid, src))
+            continue
+        if idx in already:
+            _record_recovery(cid, idx, "unrecoverable_already_requeued", "", run_id)
+            continue
+        row = {"kind": "child_requeued", "campaign_id": cid, "subtask_index": idx,
+               "reason": "done_without_result"}
+        append_ledger_row(state_dir, row)
+        fam.setdefault("child_requeued", []).append(row)
+        requeue.append(child)
+        _record_recovery(cid, idx, "requeued", "", run_id)
+        log("[resume] child %s of campaign %s: DONE but no result anywhere -> re-queued once"
+            % (idx, cid))
+    return recovered, requeue
+
+
+def child_requeue_goal(cid, fam, child):
+    """The goal to queue again for a ledger child; (goal, degraded)."""
+    g = child.get("goal")
+    if isinstance(g, dict) and (g.get("text") or g.get("goal")):
+        return dict(g), False
+    text = child.get("text") or ""
+    if not text:
+        return None, False
+    goal = {"text": text, "campaign_id": cid, "task_id": child.get("task_id"),
+            "role": "subtask", "subtask_index": child.get("subtask_index"),
+            "subtask_of": fam.get("n") or None, "depth": 1}
+    if fam.get("cwd"):
+        goal["cwd"] = fam.get("cwd")
+    goal["degraded"] = True
+    return goal, True
+
+
 #: Hard ceiling on what one resume may queue: max(RESUME_CAP_FLOOR, RESUME_CAP_FACTOR x the
 #: interrupted run's own goal count). Membership scoping is the real fix; this is the net that
 #: turns any future membership mistake into a refusal instead of hundreds of queued goals.
@@ -275,8 +515,12 @@ def resume_children_goals(state_dir, done_map=None, log=print, scope=None):
             continue
         if fam.get("merge_done"):
             continue
+        # DONE in the done-map but no answer on the ledger: recover the answer from durable
+        # sources, else re-queue that child once (never leave it in limbo).
+        _requeue = {id(c) for c in recover_family_results(state_dir, cid, fam, done_map,
+                                                          log=log)[1]}
         for child in fam.get("children") or []:
-            if _child_done(child, fam, done_map):
+            if _child_done(child, fam, done_map) and id(child) not in _requeue:
                 continue
             g = child.get("goal")
             if isinstance(g, dict) and (g.get("text") or g.get("goal")):
