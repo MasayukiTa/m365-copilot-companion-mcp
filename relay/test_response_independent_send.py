@@ -68,7 +68,12 @@ def test_fresh_page_requires_submission_acknowledgement(monkeypatch):
     monkeypatch.setattr(driver, "_wait_send_armed", lambda timeout_s: True)
     monkeypatch.setattr(driver, "_send_button", lambda: None)
     monkeypatch.setattr(driver, "_composer_text", lambda: "")
+    # This test isolates the POST-submit receipt. Fresh-draft hydration stability has its own
+    # regression suite; pretend it succeeded so the send reaches the receipt boundary quickly.
+    monkeypatch.setattr(driver, "_stabilize_fresh_composer", lambda *a, **k: True)
+    monkeypatch.setattr(driver, "_visible_user_questions", lambda: [])
+    monkeypatch.setattr(driver, "_wait_fresh_user_receipt", lambda *a, **k: False)
 
     import pytest
-    with pytest.raises(RuntimeError, match="without a conversation or generation"):
+    with pytest.raises(RuntimeError, match="intended user turn was not the one visible"):
         driver.send("RUN job_1 seq=1 worker=w", track_answer=False)
