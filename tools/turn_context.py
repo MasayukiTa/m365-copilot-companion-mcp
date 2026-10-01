@@ -71,11 +71,6 @@ _LOCK = threading.Lock()
 _CACHE = {"key": None, "path": None, "windows": []}
 
 
-def _path():
-    """Resolved at call time so a test (and the isolation fixture in conftest) can move it."""
-    return CONTEXT_PATH
-
-
 def _proc():
     global _PROC
     if _PROC is None:
@@ -98,7 +93,7 @@ def _rotate_if_large(path):
 
 def _append(row):
     try:
-        path = _path()
+        path = CONTEXT_PATH
         row.update({"ts": round(time.time(), 3), "mono": round(time.monotonic(), 4),
                     "proc": _proc(), "pid": os.getpid()})
         line = json.dumps(row, ensure_ascii=False)
@@ -170,7 +165,7 @@ def _build(rows):
 
 def _windows():
     """Parsed windows, cached by the file's (mtime, size). [] when missing or unreadable."""
-    path = _path()
+    path = CONTEXT_PATH
     try:
         st = os.stat(path)
     except OSError:
