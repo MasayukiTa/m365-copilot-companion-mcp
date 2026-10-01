@@ -37,6 +37,7 @@ from .acceptance import (
     Check, MalformedCheck as AcceptanceError, normalize_checks, run_all_blocking,
 )
 from . import splittability as _splittability
+from .send_errors import FreshSubmitAmbiguous
 from .copilot_autopilot_relay import (
     CONTINUE_JOB, COPILOT_SELECTORS, ConversationClosed, CopilotWebDriver, FIX_JOB,
     GenerationInProgress, PROTOCOL, REFUTE_FIX_JOB, RETRY_JOB, VERIFY_FIX_JOB,
@@ -4422,6 +4423,16 @@ class RelayWorker:
             self.drv.send(self.job, gen_wait_s=2.0)
             if getattr(self, "socket", False):
                 note_admitted()
+        except FreshSubmitAmbiguous as e:
+            # NEVER transient-retry an ambiguous fresh delivery. The M365 user turn may already
+            # exist even though the DOM receipt was missing/mismatched; resending self.job can
+            # duplicate work. Salvage only from independently checkable workspace evidence, else
+            # stop this worker and surface the ambiguity to the operator.
+            if self._salvage_via_checks():
+                return
+            self.status, self.outcome = "stuck", "STUCK"
+            self.reason = "fresh submit delivery ambiguous; not retried: %s" % (str(e),)
+            return
         except ConversationClosed as e:
             # The target tab/composer is gone (conversation ended). Retrying a dead
             # target can never succeed -- terminal, skip the transient budget entirely
@@ -8280,7 +8291,7 @@ def _campaigns_from_disk(transcript_dir):
     # NOT SCOPED TO THE INTERRUPTED RUN, ON PURPOSE (swept with the resume-scope fix): this only
     # CARRIES families in memory; a family with no children in this run queues nothing. The one
     # thing it can queue is a re-issued merge, and that needs `merged` WITH an agg_key (written
-    # only by phase-2 code, so none of a legacy ledger), no DONE aggregator and merge_requeued
+    # only by the exactly-once resume code, so none of a legacy ledger), no DONE aggregator and merge_requeued
     # < 1: at most one merge per campaign, only for a family whose merge was already queued.
     # Scoping it would break the no-snapshot FleetContextLost path G3 exists for.
     for cid, fam in (fams or {}).items():

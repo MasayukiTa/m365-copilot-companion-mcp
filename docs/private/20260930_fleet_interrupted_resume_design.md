@@ -142,6 +142,6 @@ Measured/verified by reading code at dfa157e: D1, D2, D3 and every file:line abo
 4. Is `interrupted` shown as a warning color (proposed) rather than the muted "stopped" color?
 5. May the coordinator keep a 32 KB ring file and 64 KB fault file open in `.fleet` for the whole run?
 
-## Implemented in PR (phase 1)
+## Implemented in PR (non-destructive reap; first recovery step)
 
 Branch fix/reap-marks-interrupted-20260930: the reaper writes `interrupted`/`INTERRUPTED` (non-terminal, resumable) for unfinished workers only, leaves finished workers and the FANOUT parent untouched, keeps `cancelled` for a pending user stop, writes `.fleet/interrupted/<run_id>.json` (marker copy, worker states, campaign plan, death evidence) before any sidecar change, and consumes the live marker only afterwards; the vocabulary is mirrored in relay/outcomes.py, relay_fleet.py, fleet_runner.py, task_router.py and the cockpit C#. `scripts/win/resume_interrupted_fleet.py` reads the snapshot copy when the marker is gone. Not done: resume semantics G1-G3, the resume gate, free-space ring, faulthandler, cockpit interrupted filter chip, display_state.
