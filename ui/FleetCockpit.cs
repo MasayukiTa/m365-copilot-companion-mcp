@@ -7827,8 +7827,8 @@ class CockpitWindow : Window
                 return "live";
             case "rate_ceiling_rpm":
             case "job_approval_mode":
-            case "fanout_max_depth":
             case "fanout_write_scope":
+            case "fanout_max_depth":
             case "fanout_max_total":
             case "fanout_max_active":
             case "fanout_max_turns":
