@@ -44,7 +44,6 @@ import os
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_FLEET_DIR = os.path.join(REPO, ".fleet")
 
 #: Attribution kinds under which tool_events carry a trustworthy task/worker. `ambiguous` and
 #: missing attribution are deliberately absent: they go to the unknown bucket.
@@ -356,10 +355,14 @@ def render(result, summary, top=50, n_transcripts=0):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Read-only sibling duplication report.")
-    ap.add_argument("--fleet-dir", default=DEFAULT_FLEET_DIR)
+    ap.add_argument("--fleet-dir", default=None,
+                    help="directory holding the fleet records (default: the live one, read-only)")
     ap.add_argument("--top", type=int, default=50)
     args = ap.parse_args(argv)
-    events, workers, camps, n_tr = load_fleet(args.fleet_dir)
+    # Resolved here, not as a module constant: nothing in this script writes, and a module-level
+    # path to the live record directory would have to be classified by the isolation guard.
+    fleet_dir = args.fleet_dir or os.path.join(REPO, ".fleet")
+    events, workers, camps, n_tr = load_fleet(fleet_dir)
     result = analyse(events, workers, camps)
     summary = summarise(result)
     text = render(result, summary, top=args.top, n_transcripts=n_tr)
