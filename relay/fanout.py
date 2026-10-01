@@ -233,6 +233,86 @@ def last_numbered_run(resp):
     return runs[-1] if runs else []
 
 
+#: A list marker in any of the forms an agent (or the page that rendered its reply) leaves
+#: behind: bullets, `（1）`, `(1)`, `1)`, `1.`, full-width numerals, circled numbers.
+_LIST_MARK = re.compile(
+    r"^\s*(?:[-*•・●▪‣]+|[（(]\s*[0-9０-９]+\s*[)）]|[0-9０-９]+\s*[\.\)）、：．:]|[①-⑳])\s*")
+
+#: A line that introduces the list instead of being on it. Anchored to what a preamble says
+#: ("以下のサブタスクに分割します"), not to its position, because an item can also end in 「。」.
+_PREAMBLE = re.compile(
+    r"^(?:以下|次の|下記|それでは|はい[、,]|了解|承知|Here\b|Below\b|The following\b|Sure\b|OK\b)"
+    r"|分割(?:します|できます|可能|案)|に分割し|分割しました"
+    r"|split (?:it |this )?into|following (?:sub)?tasks|subtasks? (?:are|is)\b",
+    re.IGNORECASE)
+
+#: A reply that says there is nothing to split is not a list, whatever its line count.
+_DECLINE = re.compile(
+    r"分割(?:は|を|する必要は)?\s*(?:不要|しません|しない|できません|必要ありません|ありません)"
+    r"|このまま(?:進め|実行|続け)|単独で(?:実行|進め)"
+    r"|no need to split|not (?:needed|necessary) to split|no split|cannot be split"
+    r"|can't be split|don't split|NO_SPLIT", re.IGNORECASE)
+
+#: Longest single line accepted as one subtask on the unnumbered path. A line this long is a
+#: paragraph of prose, and a paragraph is not an instruction one conversation should own.
+_UNNUMBERED_MAX_CHARS = 600
+
+
+def unnumbered_run_before_sentinel(resp):
+    """The plain lines directly above `SUBTASKS_READY`, for a reply that has NO numbered list.
+
+    WHY THIS EXISTS. Measured live 2026-10-02 (runs r6abe7c13 and r6abe7d05): the Copilot
+    reply reached `subtasks_from` as four (and three) plain lines then `SUBTASKS_READY` --
+    the list numbers had been dropped on the way in. `last_numbered_run` found no run and
+    `extract_plan` had no header to fall back on, so a valid split was discarded and the
+    goal ran as ONE worker. Re-parsing the same text with `1.` `2.` prefixes gives the
+    children; the loss was the numbers, not the split.
+
+    CONSERVATIVE BY CONSTRUCTION. It only ever returns lines the agent actually wrote,
+    directly above the terminator, never a synthesised item:
+      * the sentinel must stand alone on its line;
+      * the run is the consecutive non-empty lines above it (blank lines between the run and
+        the sentinel are skipped, a blank line above the run ends it);
+      * a header (line ending in a colon), heading, fence, table row or over-long line ends
+        the run and is not part of it; leading preamble lines are dropped;
+      * a reply that declines to split yields nothing.
+    The caller still applies the same size, length and dependency rules as for a numbered list.
+    """
+    lines = (resp or "").splitlines()
+    idx = None
+    for i in range(len(lines) - 1, -1, -1):
+        if SUBTASKS_READY.upper() in lines[i].upper():
+            idx = i
+            break
+    if idx is None:
+        return []
+    rest = re.sub(re.escape(SUBTASKS_READY), "", lines[idx], flags=re.IGNORECASE)
+    if any(ch.isalnum() for ch in rest):
+        return []                      # the marker is inline in prose, not a terminator line
+    if _DECLINE.search("\n".join(lines)):
+        return []
+    j = idx - 1
+    while j >= 0 and not lines[j].strip():
+        j -= 1
+    run = []
+    while j >= 0 and lines[j].strip():
+        s = lines[j].strip()
+        if (s.endswith(":") or s.endswith("：") or s.startswith("#") or s.startswith("```")
+                or s.startswith("|") or len(s) > _UNNUMBERED_MAX_CHARS):
+            break
+        run.append(s)
+        j -= 1
+    run.reverse()
+    while run and _PREAMBLE.search(_LIST_MARK.sub("", run[0], count=1)):
+        run.pop(0)
+    out = []
+    for s in run:
+        body = _clean_step(_LIST_MARK.sub("", s, count=1))
+        if body:
+            out.append(body)
+    return out
+
+
 # A split is parallel work, not a dependency graph. The fleet already has a separate
 # `aggregation_goal()` that runs after every child finishes, so a planner-produced "child 5:
 # read children 1-4 and merge them" is both impossible to run in parallel and a duplicate
@@ -347,6 +427,13 @@ def subtasks_from(resp):
     does not.
     """
     steps = [s.strip() for s in (last_numbered_run(resp) or extract_plan(resp or ""))]
+    # NUMBERS STRIPPED IN TRANSIT. No numbered run and no header-led list, yet the reply ends in
+    # the terminator: take the plain lines above it (see `unnumbered_run_before_sentinel`).
+    # Only reached when the strict parses found nothing, so a numbered reply is untouched.
+    via_fallback = False
+    if not steps and fanout_ready(resp):
+        steps = [s.strip() for s in unnumbered_run_before_sentinel(resp)]
+        via_fallback = bool(steps)
     # THE TERMINATOR IS NOT A SUBTASK. `extract_plan`'s header-fallback stops at PLAN_READY --
     # the PLAN marker -- and has never known about this one, so on that path the literal
     # `SUBTASKS_READY` line came back as a step and would have been queued as a child whose
@@ -359,7 +446,19 @@ def subtasks_from(resp):
     steps = _drop_trailing_system_merge(steps)
     if len(steps) < MIN_CHILDREN or len(steps) > MAX_CHILDREN:
         return []
+    if via_fallback:
+        _record_unnumbered_fallback(len(steps))
     return steps
+
+
+def _record_unnumbered_fallback(n_steps):
+    """Make the rate of this recovery visible: one telemetry row per split it rescued."""
+    try:
+        from relay import mechanism_telemetry
+        mechanism_telemetry.record("fanout_unnumbered_fallback", triggered=True, executed=True,
+                                   extra={"steps": int(n_steps)})
+    except Exception:
+        pass
 
 
 def child_goals(parent_goal, steps, *, parent_task_id="", campaign_id="", depth=0,
