@@ -20,7 +20,6 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 import time
 
@@ -30,6 +29,7 @@ if str(REPO) not in sys.path:
 
 
 from relay.copilot_autopilot_relay import COPILOT_SELECTORS
+from tools.childproc import run as child_run, headless_creationflags
 
 
 def judge_question_texts(question_texts: list[str], marker: str) -> dict:
@@ -241,8 +241,9 @@ def main(argv: list[str] | None = None) -> int:
         "-Goal", goal, "-TimeoutSeconds", str(args.submit_timeout),
     ]
     started = time.time()
-    proc = subprocess.run(cmd, cwd=str(REPO), text=True, capture_output=True,
-                          timeout=max(args.submit_timeout + 30, 75))
+    proc = child_run(cmd, cwd=str(REPO),
+                     timeout=max(args.submit_timeout + 30, 75),
+                     creationflags=headless_creationflags())
     submit_text = (proc.stdout or "") + (proc.stderr or "")
     if proc.returncode != 0:
         print(json.dumps({"ok": False, "marker": marker, "phase": "cockpit_submit",
