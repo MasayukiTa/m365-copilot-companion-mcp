@@ -7807,11 +7807,11 @@ class CockpitWindow : Window
                 return "live";
             case "rate_ceiling_rpm":
             case "job_approval_mode":
-            case "effort_policy":
             case "fanout_max_total":
             case "fanout_max_active":
             case "fanout_max_turns":
             case "fanout_max_wall_min":
+            case "effort_policy":
                 return "each_gate";
             case "session_retention_days":
             case "session_max_mb":
