@@ -8717,7 +8717,10 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                          # WHICH RUN SPLIT IT, so a resume takes only the interrupted run's
                          # families instead of every unmerged one in a ledger that never
                          # shrinks. Additive: readers ignore unknown header keys.
-                         "run_id": run_id, "ts": round(time.time(), 1)},
+                         "run_id": run_id, "ts": round(time.time(), 1),
+                         "parent_task_id": (kids[0] or {}).get("parent_task_id"),
+                         "parent_campaign_id": (kids[0] or {}).get("parent_campaign_id", ""),
+                         "root_id": (kids[0] or {}).get("root_id", "")},
                         ensure_ascii=False) + "\n")
                     for k in kids:
                         fh.write(json.dumps(
@@ -9677,6 +9680,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
              "campaign_id": getattr(getattr(w, "task_envelope", None), "campaign_id", ""),
              "role": getattr(getattr(w, "task_envelope", None), "role", ""),
              "depth": getattr(getattr(w, "task_envelope", None), "depth", 0),
+             "root_id": (getattr(getattr(w, "task_envelope", None), "metadata", None) or {}).get("root_id", ""),
              "goal_hash": getattr(w, "original_goal_hash", ""),
              "retryable": getattr(w, "retryable_override", None),
              "retry_queued": bool(getattr(w, "retry_queued", False)),
