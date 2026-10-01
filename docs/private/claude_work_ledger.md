@@ -229,6 +229,11 @@ Status in plain terms:
 - Change: fanout.unnumbered_run_before_sentinel plus a fallback in subtasks_from, used only when the strict parses return nothing and the terminator stands alone on its line (consecutive plain lines above it; header, heading, over-long line, preamble and a decline are excluded; same 2..12 and dependency rules). Writes a `fanout_unnumbered_fallback` mechanism row. Numbered replies parse byte-identically (before/after test). splittability: Japanese multi-part signals (enumerations, ordinals, independence wording, 4+ sentences) give UNCERTAIN, and the 200-char rule counts a CJK character as two (English unchanged).
 - Tests: relay/test_an_unnumbered_split_reply_is_still_a_split.py (in ci.yml). Open: PR review/merge.
 
+## 2026-10-02 - read-only task tree module and report
+- Change (branch feat/task-tree-module-20261002): relay/task_tree.py derives a task tree (parent, root, depth, children, descendants, subtree turns, state, merge state) from existing status.json workers and campaigns.jsonl; scripts/tree_report.py prints a markdown report (tree size, depth, per-root descendants/turns, duplication by goal_hash/jid, merge failure rate, quota if present, explicit unknown bucket).
+- Behaviour unchanged: only files added; orphans and cycles are reported, never repaired or guessed.
+- Tests: tests/test_task_tree.py (in ci.yml). Open: PR review/merge.
+
 ## 2026-10-02 - task-tree identity on fan-out campaign records
 - Change (branch feat/campaign-tree-identity-20261002): child goals from fanout.child_goals now carry parent_campaign_id, parent_subtask_index and root_id (top-level parent: root is the split's own campaign id; deeper child inherits the parent's root). The campaigns.jsonl header also records parent_task_id, parent_campaign_id and root_id; status.json worker rows carry root_id when known (kept in the task envelope metadata, outside the goal hash).
 - Additive and record-only: no depth gate or MAX_DEPTH change, no recursion; old ledgers without the keys load as before.
