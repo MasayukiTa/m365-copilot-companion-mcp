@@ -229,6 +229,11 @@ Status in plain terms:
 - Change: fanout.unnumbered_run_before_sentinel plus a fallback in subtasks_from, used only when the strict parses return nothing and the terminator stands alone on its line (consecutive plain lines above it; header, heading, over-long line, preamble and a decline are excluded; same 2..12 and dependency rules). Writes a `fanout_unnumbered_fallback` mechanism row. Numbered replies parse byte-identically (before/after test). splittability: Japanese multi-part signals (enumerations, ordinals, independence wording, 4+ sentences) give UNCERTAIN, and the 200-char rule counts a CJK character as two (English unchanged).
 - Tests: relay/test_an_unnumbered_split_reply_is_still_a_split.py (in ci.yml). Open: PR review/merge.
 
+## 2026-10-02 - sibling duplication report (read-only script, branch feat/sibling-dup-report-20261002)
+- Added scripts/sibling_dup_report.py: measures, from .fleet/tool_events.jsonl, status.json workers and campaigns.jsonl, the duplicate-call rate across fan-out siblings (M1), duplicate time vs campaign wall-clock (M2), merge loss proxy (M3) and the qualifying-campaign denominator (M4). Verdict constants: 20 campaigns minimum; duplicate time < 5% AND merge loss from missing child information < 2 of 10 => LOW.
+- Live run (read-only): 38,349 ledger calls, 34,134 unattributed/ambiguous, 0 calls mappable to a fan-out child, 0 qualifying campaigns of 123 known: INSUFFICIENT (<20 campaigns). Campaign task ids and attributed task ids do not overlap in the current data.
+- Tests: scripts/test_sibling_dup_report.py (registered in ci.yml). Open: PR review/merge.
+
 ## 2026-10-02 - read-only task tree module and report
 - Change (branch feat/task-tree-module-20261002): relay/task_tree.py derives a task tree (parent, root, depth, children, descendants, subtree turns, state, merge state) from existing status.json workers and campaigns.jsonl; scripts/tree_report.py prints a markdown report (tree size, depth, per-root descendants/turns, duplication by goal_hash/jid, merge failure rate, quota if present, explicit unknown bucket).
 - Behaviour unchanged: only files added; orphans and cycles are reported, never repaired or guessed.
