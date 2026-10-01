@@ -67,6 +67,7 @@ _INV_RESET_KEEPS_NO_TOKEN = _invariants.register(
 # if one ever is again. mechanism_telemetry imports nothing but the standard library, so
 # there is no cycle to avoid by deferring it.
 from relay import mechanism_telemetry as _mt
+from relay import first_reply_check
 from relay import effort as effort_mod
 from relay import effort_policy as effort_policy_mod
 from .planner import PLAN_PROMPT, extract_plan, opening_turn, plan_ready
@@ -3515,6 +3516,13 @@ class RelayWorker:
             # exactly what the theme notes hold.
             self.job = (conversation_start_label(self.name) + PROTOCOL + composed_goal
                         + "\n\n" + fanout_mod.SPLIT_JOB)
+        # THE FIRST MESSAGE, KEPT, so that it can be delivered again if the agent shows it never
+        # acted on it (see _first_reply_gate). None for a worker that resumes an existing
+        # conversation: there the first message is long gone and is not ours to repeat.
+        self._first_message = None if self.resume_conv else self.job
+        self._first_absorbed = False
+        self._first_verdict = None
+        self._first_redeliveries = 0
         self.turn = 0
         self._turn_sent_at = 0.0
         self.no_progress = 0
@@ -4178,6 +4186,13 @@ class RelayWorker:
         forget WHICH task it is on. We re-state cwd + a one-line goal summary every time.
         Uses only fields already on the worker (self.cwd, self.goal); never raises."""
         try:
+            # UNTIL THE FIRST MESSAGE IS KNOWN TO HAVE LANDED THERE IS NO LEDGER TO POINT AT.
+            # The ledger says "full text: the first message of this conversation"; while the
+            # agent has shown nothing that acts on that message, the pointer names a message it
+            # may never have received.
+            _redo = self._first_message_redelivery("nudge")
+            if _redo:
+                return _redo
             # A COMPACT LEDGER, NEITHER THE FIRST LINE NOR THE WHOLE GOAL. A 160-character head
             # slice dropped a hard constraint that sat after character 200 and the worker
             # answered another question from turn 3 on (docs/private/20260930_goal_fidelity_design.md);
@@ -4202,6 +4217,94 @@ class RelayWorker:
             return anchor + nudge if anchor else nudge
         except Exception:
             return nudge
+
+    #: How many times the first message may be delivered again, in total, per worker.
+    FIRST_MESSAGE_MAX_REDELIVERIES = 2
+    FIRST_MESSAGE_LEAD_IN = "先ほどのメッセージが届いていなかったようです。もう一度送ります。\n\n"
+
+    def _first_message_redelivery(self, via, reason=""):
+        """The text that delivers the first message again, or "" when it should not be.
+
+        A conversation whose agent has not yet acted on the first message has no goal, and the
+        compact-ledger nudges assume it does. Delivering the ORIGINAL message again is not a
+        restatement of the goal in an ordinary nudge -- it is the first delivery, made again
+        because the first one demonstrably did not land. Bounded, counted, and recorded
+        (mechanism `first_message_not_absorbed`). Never raises."""
+        try:
+            first = getattr(self, "_first_message", None)
+            if not first or getattr(self, "_first_absorbed", True):
+                return ""
+            if via == "nudge" and getattr(self, "turn", 0) < 1:
+                return ""       # the first message has not even been sent yet
+            if getattr(self, "_first_redeliveries", 0) >= self.FIRST_MESSAGE_MAX_REDELIVERIES:
+                return ""
+            self._first_redeliveries = getattr(self, "_first_redeliveries", 0) + 1
+            try:
+                _mt.record("first_message_not_absorbed", run_id=getattr(self, "run_id", ""),
+                           instance=getattr(self, "name", ""), turn=getattr(self, "turn", None),
+                           configured=True, config_source="run",
+                           config_value={"max_redeliveries": self.FIRST_MESSAGE_MAX_REDELIVERIES},
+                           eligible=True, triggered=True, executed=True,
+                           extra={"via": via, "reason": reason or "no_reply_yet",
+                                  "redelivery": self._first_redeliveries})
+            except Exception:
+                pass
+            try:
+                self._tx.metric(getattr(self, "turn", 0), "first_message_redelivery",
+                                self._first_redeliveries, via=via, reason=reason or "no_reply_yet")
+            except Exception:
+                pass
+            return self.FIRST_MESSAGE_LEAD_IN + first
+        except Exception:
+            return ""
+
+    def _note_first_reply(self, resp):
+        """Judge the reply once, on arrival, and stop watching as soon as it PROVES the goal
+        landed. The verdict is acted on later, past the infrastructure handlers
+        (_first_reply_gate), so a sign-in wall or a throttle is never read as a greeting.
+        Never raises."""
+        try:
+            if not getattr(self, "_first_message", None) or getattr(self, "_first_absorbed", True):
+                return
+            ok, why = first_reply_check.first_reply_absorbed(resp, self.goal)
+            self._first_verdict = (ok, why)
+            if ok and why in first_reply_check.STRONG_ABSORBED_REASONS:
+                self._first_absorbed = True
+        except Exception:
+            pass
+
+    def _first_reply_gate(self, resp):
+        """True when this reply was the answer of an agent that has no goal and the worker was
+        re-armed (first message delivered again) or ended. False for everything else.
+
+        Reached only for a reply that no infrastructure handler took. Never silently continues
+        on a goal-less conversation: past the bound the worker ends with an explicit,
+        re-queueable outcome."""
+        try:
+            verdict = getattr(self, "_first_verdict", None)
+            self._first_verdict = None
+            if verdict is None or getattr(self, "_first_absorbed", True):
+                return False
+            ok, why = verdict
+            if ok:
+                if why not in ("platform_error", "empty_reply_not_judged"):
+                    self._first_absorbed = True
+                return False
+            redo = self._first_message_redelivery("reply", why)
+            if redo:
+                self.job = redo
+                self.status = "ready"
+                self.reason = ("最初のメッセージが受理されていない(%s) -> 同じ会話で再送 %d/%d"
+                               % (why, self._first_redeliveries,
+                                  self.FIRST_MESSAGE_MAX_REDELIVERIES))
+                return True
+            self.status, self.outcome = "stuck", "INFRA_STUCK"
+            self.reason = ("⚠ 最初のメッセージを%d回再送してもエージェントがゴールに着手しない(%s)。"
+                           "会話にゴールが届いていない=**タスク失敗でなく配送の失敗(INFRA)**。"
+                           "再投入対象。" % (self._first_redeliveries, why))
+            return True
+        except Exception:
+            return False
 
     def _ledger_job_id(self):
         """The id the ledger's pointer may name: the record's task id, else the transcript file."""
@@ -5379,6 +5482,7 @@ class RelayWorker:
         self.last_response = resp
         if not _resume:
             self._tx.assistant(self.turn, resp)    # persist the full Copilot reply for this turn
+            self._note_first_reply(resp)           # did the agent act on the first message?
         # HEAP PER TURN, RECORDED. The recycle threshold above is provisional and the only way
         # to replace it with a measured one is to know MB-per-turn on real work -- a worker's
         # turns carry OCR text and spreadsheet rows and are nothing like the bridge probe's
@@ -5989,6 +6093,11 @@ class RelayWorker:
                 self._apply_diagnosis(fresh_was_refusal=True, fresh_succeeded=False,
                                       fresh_was_transient_error=False)
                 return
+        # FIRST MESSAGE NOT ABSORBED. Past every infrastructure handler and the content-refusal
+        # recovery, a short greeting / ask-for-the-goal / empty-message reply on a conversation
+        # that never acted on its first message means that message did not land.
+        if not _resume and self._first_reply_gate(resp):
+            return
         norm = _norm_for_progress(resp)
         self.no_progress = self.no_progress + 1 if norm and norm == self.last_norm else 0
         self.last_norm = norm
