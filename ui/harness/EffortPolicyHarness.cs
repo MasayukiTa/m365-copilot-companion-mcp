@@ -57,6 +57,21 @@ static class EffortPolicyHarness
                     r["text"] = EffortPolicyView.BadgeText(Str(c, "level"), Str(c, "source"), ld, Bool(c, "ja"));
                     r["tip"] = EffortPolicyView.BadgeTip(Str(c, "level"), Str(c, "source"), ld, Bool(c, "ja"));
                 }
+                else if (op == "group_line")
+                {
+                    var gg = c["group"] as Dictionary<string, object>;
+                    r["text"] = GroupTreeView.Line(gg, Bool(c, "ja"));
+                    r["indent"] = GroupTreeView.IndentPx(gg);
+                }
+                else if (op == "group_extra")
+                {
+                    int lv;
+                    object gobj, robj;
+                    c.TryGetValue("group", out gobj); c.TryGetValue("root", out robj);
+                    r["text"] = GroupTreeView.ExtraText(robj as Dictionary<string, object>,
+                        gobj as Dictionary<string, object>, Bool(c, "ja"), out lv);
+                    r["level"] = lv;
+                }
                 else return 5;
                 results.Add(r);
             }
