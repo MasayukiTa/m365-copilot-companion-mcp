@@ -3,7 +3,7 @@
 
 Incident 2026-10-01: PR #86 G2 re-queued the unfinished children of every campaign in
 .fleet/campaigns.jsonl that lacked `merge_done`. The real ledger held 63 old campaigns (none
-merge_done, all older than phase 2): resuming a 2-goal run queued 545 degraded goals, reset
+merge_done, all written before the merge_done marker existed): resuming a 2-goal run queued 545 degraded goals, reset
 last_run_done.json to {} and embedded 2.6 MB of campaign plans in the snapshot.
 
 Hermetic: tmp_path state dirs, a synthetic ledger shaped like the real one (no real data).

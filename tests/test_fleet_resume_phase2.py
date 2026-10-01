@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Phase 2 of the interrupted-run resume design (docs/private/20260930_fleet_interrupted_resume_design.md).
+"""Interrupted-run recovery, exactly-once resume of fan-out campaigns; design: (docs/private/20260930_fleet_interrupted_resume_design.md).
 
 G1  a FANOUT parent is resume-done iff its campaign header is on disk
 G2  unfinished campaign children are re-queued at resume; child ledger lines carry the goal

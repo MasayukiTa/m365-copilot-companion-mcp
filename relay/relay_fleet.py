@@ -8264,7 +8264,7 @@ def _campaigns_from_disk(transcript_dir):
     # NOT SCOPED TO THE INTERRUPTED RUN, ON PURPOSE (swept with the resume-scope fix): this only
     # CARRIES families in memory; a family with no children in this run queues nothing. The one
     # thing it can queue is a re-issued merge, and that needs `merged` WITH an agg_key (written
-    # only by phase-2 code, so none of a legacy ledger), no DONE aggregator and merge_requeued
+    # only by the exactly-once resume code, so none of a legacy ledger), no DONE aggregator and merge_requeued
     # < 1: at most one merge per campaign, only for a family whose merge was already queued.
     # Scoping it would break the no-snapshot FleetContextLost path G3 exists for.
     for cid, fam in (fams or {}).items():
