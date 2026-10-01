@@ -970,10 +970,9 @@ def _operator_set_a_disk_floor() -> bool:
 #: run_relay_fleet(fanout=...), but autostart_fleet never passed it, so a goal that arrives
 #: from the tunnel could never be split -- the one path where a phone-sized instruction is
 #: most likely to be "a quarter of mail", which is exactly the size problem fan-out exists
-#: for. The flag's own help is the policy this honours: "Off by default -- a goal that fits
-#: should not pay for a split turn and a merge turn." So it is turned on per size, not always:
-#: a goal whose text is at least this many characters is long enough that a split/merge turn
-#: is worth its cost. 0 (or a non-positive value) disables the size heuristic entirely.
+#: for. Fan-out is ON by default: nothing is spent by saying yes (each goal is judged on its
+#: own), and only an explicit off (settings.txt fanout=off, FLEET_INTAKE_AUTOSTART_FANOUT=0, or
+#: this value <= 0) turns the capability off. The number is no longer a size gate.
 AUTOSTART_FANOUT_MIN_CHARS = int(
     os.environ.get("FLEET_INTAKE_AUTOSTART_FANOUT_MIN_CHARS", "600") or 600)
 
@@ -1317,8 +1316,11 @@ def autostart_fleet(goals, state_dir=None, now=None, launcher=None) -> dict:
     # run_relay_fleet(fanout=...); the worker gates the split turn itself (depth 0 only). The
     # missing link was this command line: without the flag an autostarted goal could never
     # split, however large. Added by goal size so a goal that fits pays nothing for it.
-    if _wants_fanout(goals):
-        cmd.append("--fanout")
+    # BOTH VALUES ARE SAID OUT LOUD (as the cockpit's own launches do). Saying only "--fanout"
+    # and omitting the flag for "no" was a silent inversion: fleet_runner's flag defaults to ON,
+    # so an operator's explicit fanout=off made _wants_fanout answer False, no flag was passed,
+    # and the coordinator fanned out anyway.
+    cmd.append("--fanout" if _wants_fanout(goals) else "--no-fanout")
     try:
         if launcher is not None:
             pid = launcher(cmd)

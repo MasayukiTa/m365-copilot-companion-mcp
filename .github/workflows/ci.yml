@@ -547,6 +547,7 @@ jobs:
             bridge/test_one_rule_for_the_active_session.py \
             bridge/test_conv_url_follows_the_turn.py \
             tests/test_retry_sets_agree.py \
+            tests/test_fanout_default_on_agrees.py \
             tests/test_stuck_worker_retried_once.py \
             tests/test_reaper_marks_interrupted.py \
             tests/test_interrupted_status_is_classified_everywhere.py \
