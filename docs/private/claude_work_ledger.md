@@ -224,3 +224,7 @@ Status in plain terms:
 - Change (branch fix/fanout-default-on-gui-only-20261001): registry default True (UNDECIDED removed); autostart names `--fanout` / `--no-fanout`; runner writes `fanout_run` {enabled, source} into status.json; cockpit gets a visible On/Off box (FanoutView in ui/EffortPolicy.cs, no build-list change) with "in effect" and "applies from next start" text.
 - Existing explicit `fanout=off` lines stay honoured; no migration (a frozen default cannot be told from a choice). Owner changes it in the new box.
 - Tests: tests/test_fanout_default_on_agrees.py (in ci.yml). Audit: docs/private/20261001_cli_only_settings_audit.md. Open: PR review/merge.
+## 2026-10-02 - sibling duplication report (read-only script, branch feat/sibling-dup-report-20261002)
+- Added scripts/sibling_dup_report.py: measures, from .fleet/tool_events.jsonl, status.json workers and campaigns.jsonl, the duplicate-call rate across fan-out siblings (M1), duplicate time vs campaign wall-clock (M2), merge loss proxy (M3) and the qualifying-campaign denominator (M4). Verdict constants: 20 campaigns minimum; duplicate time < 5% AND merge loss from missing child information < 2 of 10 => LOW.
+- Live run (read-only): 38,349 ledger calls, 34,134 unattributed/ambiguous, 0 calls mappable to a fan-out child, 0 qualifying campaigns of 123 known: INSUFFICIENT (<20 campaigns). Campaign task ids and attributed task ids do not overlap in the current data.
+- Tests: scripts/test_sibling_dup_report.py (registered in ci.yml). Open: PR review/merge.
