@@ -55,6 +55,18 @@ MIN_CHILDREN = 2
 #: number of conversations, and nothing here needs it yet.
 MAX_DEPTH = 1
 
+#: Hard bounds of the `fanout_max_depth` setting.
+DEPTH_SETTING_KEY = "fanout_max_depth"
+DEPTH_SETTING_BOUNDS = (1, 3)
+
+#: Whether the merge of nested splits exists yet. A worker that ends FANOUT counts as finished,
+#: so its split proposal would be read by its parent's merge as that worker's ANSWER. Until a
+#: merge that waits for a child's own family and substitutes the family's merged result exists,
+#: a tree must not grow past one level whatever the setting says: `effective_max_depth()` caps
+#: at MAX_DEPTH while this is False. Unit tests monkeypatch it to exercise the deeper plumbing;
+#: nothing in production sets it.
+HIERARCHICAL_MERGE_READY = False
+
 #: A step shorter than this is a fragment ("2月", "続き") rather than an instruction that a
 #: fresh conversation -- which will not have seen the parent's reasoning -- could act on.
 MIN_STEP_CHARS = 8
@@ -461,6 +473,74 @@ def _record_unnumbered_fallback(n_steps):
         pass
 
 
+def configured_max_depth():
+    """The `fanout_max_depth` setting, read from settings.txt on every call (each_gate).
+
+    1..3, default 1; an absent or unparsable value is 1. Never raises. This is what the
+    operator asked for, not what is in force: see effective_max_depth().
+    """
+    lo, hi = DEPTH_SETTING_BOUNDS
+    try:
+        from relay import fleet_runner as fr
+        v = fr._settings_int(DEPTH_SETTING_KEY, None)
+    except Exception:
+        return lo
+    if v is None:
+        return lo
+    return max(lo, min(hi, int(v)))
+
+
+def effective_max_depth():
+    """The deepest level that may still split into children, in force right now.
+
+    The configured depth, capped at MAX_DEPTH (1) until HIERARCHICAL_MERGE_READY. A worker at
+    depth d may split exactly when d < effective_max_depth().
+    """
+    configured = configured_max_depth()
+    return configured if HIERARCHICAL_MERGE_READY else min(configured, MAX_DEPTH)
+
+
+def may_split_at(depth):
+    """May a worker at `depth` split into children (a depth below the effective maximum)?"""
+    try:
+        return int(depth or 0) < effective_max_depth()
+    except (TypeError, ValueError):
+        return False
+
+
+def depth_report():
+    """The additive status.json block: what was asked for versus what is in force."""
+    configured = configured_max_depth()
+    effective = effective_max_depth()
+    return {"configured": configured, "effective": effective,
+            "reason": ("" if effective == configured
+                       else "hierarchical merge not enabled yet")}
+
+
+_PARENT_SCOPE_HEAD = "【この会話が担当する範囲"
+_PARENT_CONTEXT_HEAD = "【上位の会話の担当範囲(参考・この会話の担当ではありません)】"
+_SCOPE_STEP_END = "\n\n上の範囲だけを担当してください。"
+
+
+def _own_scope_step(text):
+    """The step of the LAST scope block in `text` ("" when there is none)."""
+    at = text.rfind(_PARENT_SCOPE_HEAD)
+    if at < 0:
+        return ""
+    close = text.find("】\n", at)
+    if close < 0:
+        return ""
+    start = close + 2
+    end = text.find(_SCOPE_STEP_END, start)
+    return text[start:end if end >= 0 else len(text)].strip()
+
+
+def _base_goal_of(text):
+    """`text` up to its first scope or context block: the goal the whole tree was given."""
+    cuts = [i for i in (text.find(_PARENT_SCOPE_HEAD), text.find(_PARENT_CONTEXT_HEAD)) if i >= 0]
+    return text[:min(cuts)].rstrip() if cuts else text
+
+
 def child_goals(parent_goal, steps, *, parent_task_id="", campaign_id="", depth=0,
                 cwd=None, parent_level=None, run_id="",
                 parent_campaign_id="", parent_subtask_index=None, root_id=""):
@@ -491,9 +571,18 @@ def child_goals(parent_goal, steps, *, parent_task_id="", campaign_id="", depth=
     three. The parent's instructions are the specification; the step says which part of it
     this conversation owns.
     """
-    if depth >= MAX_DEPTH:
+    if depth >= effective_max_depth():
         return []
     cid = campaign_id or campaign_id_for(parent_goal, parent_task_id=parent_task_id)
+    # A GRANDCHILD CARRIES ITS OWN STEP AND ONLY THE IMMEDIATE PARENT'S SCOPE, as reference. The
+    # parent's text already holds its own scope block (and, below depth 2, an older context
+    # block); nesting another block on top would hand a grandchild every ancestor's scope, and
+    # the ledger and anchor would show the wrong one. Depth 0 is unchanged.
+    goal_text = parent_goal
+    if depth > 0:
+        _ctx = _own_scope_step(parent_goal)
+        if _ctx:
+            goal_text = "%s\n\n%s\n%s" % (_base_goal_of(parent_goal), _PARENT_CONTEXT_HEAD, _ctx)
     out = []
     for i, step in enumerate(steps, 1):
         # THE % BINDS TIGHTER THAN THE +, so the format has to be closed before the constant
@@ -505,7 +594,7 @@ def child_goals(parent_goal, steps, *, parent_task_id="", campaign_id="", depth=
              "【この会話が担当する範囲 — 全体の %d/%d】\n%s\n\n"
              "上の範囲だけを担当してください。他の範囲は別の会話が並行して担当しているので、"
              "手を出さないこと。担当範囲を完了したら、何を何件取得したかを明記してください。"
-             % (parent_goal, i, len(steps), step))
+             % (goal_text, i, len(steps), step))
             + CLOSING_INSTRUCTION
         )
         out.append({
@@ -664,6 +753,9 @@ def campaigns_from_ledger(lines):
                         "run_ids": list(_prev.get("run_ids") or [])
                         + ([str(rec["run_id"])] if rec.get("run_id") else []),
                         "start_ts": rec.get("ts") or _prev.get("start_ts")}
+            # The children's depth, written only for a nested split (absent = 1, the top level).
+            if rec.get("depth"):
+                out[cid]["depth"] = rec["depth"]
             # Marker flags that arrived before the header survive it.
             for _k in ("merge_done", "merge_requeued", "child_results", "agg_key"):
                 if _k in _prev:
@@ -742,8 +834,11 @@ def merge_acceptance_checks(records):
 
 def aggregation_goal(parent_goal, records, *, campaign_id="", parent_task_id="",
                      limit_each=1200, cwd=None, parent_checks=None, parent_partial="",
-                     parent_level=None, run_id=""):
+                     parent_level=None, run_id="", depth=None):
     """The goal item that merges a finished campaign.
+
+    `depth` is the depth of the merge worker: the splitting worker's depth plus one, i.e. the
+    depth its children were given. None keeps MAX_DEPTH, the value for a top-level split.
 
     A goal rather than a turn on the parent, because a parent parked waiting for its own
     children holds an admission slot while it waits -- and with a concurrency cap smaller
@@ -760,7 +855,7 @@ def aggregation_goal(parent_goal, records, *, campaign_id="", parent_task_id="",
         "task_id": "%s-merge" % cid,
         "role": "aggregator",
         "parent_task_id": parent_task_id or cid,
-        "depth": MAX_DEPTH,          # never splits again
+        "depth": MAX_DEPTH if depth is None else int(depth),   # never splits again
         "priority": True,            # the campaign is finished; do not queue behind new work
     }
     # THE SAME WORKING DIRECTORY THE CHILDREN HAD. child_goals passes cwd down; this did
@@ -1017,5 +1112,6 @@ __all__ = ["SUBTASKS_READY", "SPLIT_JOB", "MAX_CHILDREN", "MIN_CHILDREN", "MAX_D
     "NO_SPLIT_MARKER", "declined_split", "MIDRUN_SPLIT_JOB", "midrun_split_job",
     "missing_slices", "merge_acceptance_checks", "campaigns_from_ledger",
     "collapse_retries", "ready_to_aggregate", "aggregation_goal",
-    "fanout_family_view",
+    "fanout_family_view", "HIERARCHICAL_MERGE_READY", "configured_max_depth",
+    "effective_max_depth", "may_split_at", "depth_report",
 ]
