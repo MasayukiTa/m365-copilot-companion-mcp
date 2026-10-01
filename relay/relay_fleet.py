@@ -9042,13 +9042,12 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                                                run_id=run_id,
                                                **({"depth": _camp["depth"]}
                                                   if _camp.get("depth") else {}))
-            _camp["merged"] = True
             if _camp.get("parent_campaign_id"):
                 # a NESTED family: remember which slices this merge goes without, so the parent
                 # slot it fills is marked MISSING rather than complete
                 _camp["missing"] = fanout_mod.missing_slices(_recs)
-            _note_merged(_cid, resume_mod.goal_resume_key(_agg),
-                         missing=_camp.get("missing") if _camp.get("parent_campaign_id") else None)
+            _camp["merged"] = True
+            _note_merged(_cid, resume_mod.goal_resume_key(_agg), missing=_camp.get("missing"))
             if _camp.get("requeue_merge"):
                 # A merge queued before a death that never finished is re-issued once; the
                 # cap (fleet_resume.rehydrate_decision) reads this line.
