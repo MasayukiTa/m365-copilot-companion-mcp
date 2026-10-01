@@ -1671,6 +1671,19 @@ def _initial_job_with_unlock(goal: str, plan_mode: bool = False):
     return opening_turn(goal, PROTOCOL), False
 
 
+def build_reactive_unlock_turn(resume_text: str) -> str:
+    """Return the existing system-authored reactive recovery turn, or empty if unavailable.
+
+    This is the same composition `_inject_unlock` already uses after a genuine refusal. Side
+    sessions call this only after their own non-decisive reply reports that authorization blocked
+    the work; it is intentionally NOT an opening-turn helper.
+    """
+    material = _unlock_password()
+    if not material:
+        return ""
+    return PROTOCOL + (UNLOCK_PREFIX % material) + str(resume_text or "")
+
+
 def _redact_unlock_password(text: str) -> str:
     """Keep local secrets out of the fleet transcript files.
 

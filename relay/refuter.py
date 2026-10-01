@@ -213,12 +213,11 @@ def build_refuter_prompt(goal: str, final_response: str, lens: str = "",
 
 
 def aggregate_panel(results, min_refute=None):
-    """Aggregate a panel of (lens, kind, reason) verdicts into one (kind, reason).
+    """Aggregate a panel without renaming "not reviewed" to "reviewed and upheld".
 
-    REFUTED only when at least `min_refute` reviewers refute (default: strict majority),
-    so a lone over-eager reviewer can't block, but a real defect that several lenses see
-    does. The combined reason names which lenses objected. Anything short of the threshold
-    is UPHELD (we never trap the loop on a minority/ambiguous objection).
+    REFUTED still needs the configured threshold. A genuine UPHELD still preserves the
+    historical non-blocking result when that threshold is not met. If nobody actually
+    upheld the work and every reviewer was UNCLEAR/INCONCLUSIVE, preserve that uncertainty.
     """
     n = len(results)
     if n == 0:
@@ -227,9 +226,14 @@ def aggregate_panel(results, min_refute=None):
     if min_refute is None:
         min_refute = (n // 2) + 1
     if len(refuted) >= min_refute:
-        reason = " / ".join("[%s] %s" % (l, r) for (l, r) in refuted)
-        return ("REFUTED", reason)
-    return ("UPHELD", "")
+        return ("REFUTED", " / ".join("[%s] %s" % (l, r) for (l, r) in refuted))
+    if any(k == "UPHELD" for (_l, k, _r) in results):
+        return ("UPHELD", "")
+    unresolved = ["[%s] %s" % (l, (r or k))
+                  for (l, k, r) in results if k in ("UNCLEAR", "INCONCLUSIVE")]
+    if unresolved:
+        return ("UNCLEAR", " / ".join(unresolved))
+    return ("UNCLEAR", "panel produced no affirmative verdict")
 
 
 #: Lenses whose objection cannot be outvoted, under the aggregation this module does NOT yet
@@ -337,6 +341,57 @@ def parse_verdict(text: str):
     return ("UNCLEAR", "the reply carries no verdict marker")
 
 
+_REVIEW_LOCK_BLOCK_MARKERS = (
+    "[locked:", "no valid unlock token", "session not unlocked", "call unlock(",
+    "未解錠", "解錠が必要", "解錠でき", "ロックされ", "ロックで拒否",
+    "locked by", "was locked", "is locked",
+)
+
+
+def review_verdict_was_lock_blocked(kind: str, reason: str, response: str = "") -> bool:
+    """A non-decisive review explicitly says authorization blocked evidence gathering."""
+    if str(kind or "").upper() not in ("UNCLEAR", "INCONCLUSIVE"):
+        return False
+    text = (str(reason or "") + "\n" + str(response or "")).lower()
+    return any(marker.lower() in text for marker in _REVIEW_LOCK_BLOCK_MARKERS)
+
+
+_REFUTER_RECOVERY_RESUME = (
+    "これは独立レビューのシステム回復手順です。回復後は同じ会話で直前に拒否された確認を再試行し、"
+    "元の独立レビューを最後まで続けてください。最終行は REFUTED: <理由> / UPHELD / "
+    "INCONCLUSIVE: <不足証拠> のいずれかにしてください。"
+)
+
+
+def _blocking_recover_locked_review(drv, verdict, *, timeout_s=600):
+    """Reactive recovery for the blocking refuter path; never used on opening turn 1."""
+    kind, reason = verdict
+    if not review_verdict_was_lock_blocked(kind, reason):
+        return verdict
+    from .relay_fleet import MAX_UNLOCK_ATTEMPTS, build_reactive_unlock_turn
+    attempts = 0
+    while review_verdict_was_lock_blocked(kind, reason):
+        if attempts >= MAX_UNLOCK_ATTEMPTS:
+            return ("UNCLEAR", HARNESS_REASON_PREFIX +
+                    "refuter remained locked after %d reactive recovery attempts" % attempts)
+        turn = build_reactive_unlock_turn(_REFUTER_RECOVERY_RESUME)
+        if not turn:
+            return ("UNCLEAR", HARNESS_REASON_PREFIX +
+                    "refuter was locked and local unlock recovery material is unavailable")
+        attempts += 1
+        try:
+            drv.send(turn)
+            if not drv.wait_for_idle(timeout_s=timeout_s):
+                return ("UNCLEAR", HARNESS_REASON_PREFIX +
+                        "refuter recovery did not settle within %ds" % int(timeout_s))
+            raw = drv.read_last_response()
+            kind, reason = parse_verdict(raw)
+        except Exception as exc:
+            return ("UNCLEAR", HARNESS_REASON_PREFIX +
+                    "refuter recovery raised %s" % type(exc).__name__)
+    return (kind, reason)
+
+
 def agent_base_url(conversation_url: str) -> str:
     """The bare agent URL (a fresh chat) from a conversation URL -- navigating here starts
     an INDEPENDENT conversation, which is what makes the refuter a separate skeptic rather
@@ -375,12 +430,16 @@ def run_refuter(context, conversation_url: str, goal: str, final_response: str,
         drv.send(build_refuter_prompt(goal, final_response, lens=lens,
                                       unverifiable=unverifiable))
         ok = drv.wait_for_idle(timeout_s=timeout_s)
-        verdict = (parse_verdict(drv.read_last_response()) if ok else
+        raw = drv.read_last_response() if ok else ""
+        verdict = (parse_verdict(raw) if ok else
                    ("UNCLEAR", "harness: the reviewer did not settle within %ds" % timeout_s))
+        if ok and review_verdict_was_lock_blocked(verdict[0], verdict[1], raw):
+            verdict = _blocking_recover_locked_review(drv, verdict, timeout_s=timeout_s)
         # the reviewer often answers a preamble first ("I'll check the files") -- nudge it
         # to actually emit the verdict, like the implementer needs a CONTINUE.
         nudges = 0
-        while verdict[0] == "UNCLEAR" and nudges < max_nudges:
+        while (verdict[0] == "UNCLEAR" and not unclear_is_harness_fault(verdict[1])
+               and nudges < max_nudges):
             nudges += 1
             drv.send(_next_refuter_nudge(nudges))
             if not drv.wait_for_idle(timeout_s=timeout_s):
@@ -459,6 +518,7 @@ class RefuterSession:
         self._done = None          # verdict tuple once finished
         self._network_reopens = 0
         self.max_network_reopens = max_network_reopens
+        self._unlock_attempts = 0
         #: True while this review runs over a socket rather than a side page. It passes no RAM
         #: gate, which is what stops a review being SKIPPED on a busy box -- and a skipped
         #: review means the candidate is accepted unreviewed, which is not a smaller review.
@@ -711,6 +771,10 @@ class RefuterSession:
                 if getattr(self.drv, "_is_stale_repeat", lambda _t: False)(t):
                     return None
                 verdict = parse_verdict(t)
+                if review_verdict_was_lock_blocked(verdict[0], verdict[1], t):
+                    if self._recover_locked_review(verdict[0], verdict[1], t):
+                        return None
+                    return self._done
                 if verdict[0] == "UNCLEAR" and self._nudges_used < self.max_nudges:
                     # WAIT BEFORE NUDGING, because the measured failure was committing two
                     # seconds early and then asking again. `has_marker` doubles the settle
@@ -751,6 +815,10 @@ class RefuterSession:
                     if getattr(self.drv, "_is_stale_repeat", lambda _t: False)(t):
                         return None
                     verdict = parse_verdict(t)
+                    if review_verdict_was_lock_blocked(verdict[0], verdict[1], t):
+                        if self._recover_locked_review(verdict[0], verdict[1], t):
+                            return None
+                        return self._done
                     # preamble-only answer ("I'll check...") -> nudge for the verdict
                     if verdict[0] == "UNCLEAR" and self._nudges_used < self.max_nudges:
                         self._nudge()
@@ -766,6 +834,40 @@ class RefuterSession:
         except Exception:
             self._finish(("UNCLEAR", HARNESS_REASON_PREFIX + "reading the reviewer's reply raised"))
             return self._done
+
+    def _recover_locked_review(self, kind, reason, response=""):
+        """Reactively recover a lock-blocked review in this same independent session."""
+        if not review_verdict_was_lock_blocked(kind, reason, response):
+            return False
+        import time
+        from .relay_fleet import MAX_UNLOCK_ATTEMPTS, build_reactive_unlock_turn
+        if self._unlock_attempts >= MAX_UNLOCK_ATTEMPTS:
+            self._finish(("UNCLEAR", HARNESS_REASON_PREFIX +
+                          "refuter remained locked after %d reactive recovery attempts" %
+                          self._unlock_attempts))
+            return False
+        turn = build_reactive_unlock_turn(_REFUTER_RECOVERY_RESUME)
+        if not turn:
+            self._finish(("UNCLEAR", HARNESS_REASON_PREFIX +
+                          "refuter was locked and local unlock recovery material is unavailable"))
+            return False
+        try:
+            self._unlock_attempts += 1
+            self._count_before = self.drv._answers().count()
+            try:
+                self.drv._count_before = self._count_before
+            except Exception:
+                pass
+            self.drv.send(turn)
+            self._t_send = time.time()
+            self._last, self._stable_since = None, None
+            self._settle_state = _settle.SettleState()
+            self._marker_waits = 0
+            return True
+        except Exception as exc:
+            self._finish(("UNCLEAR", HARNESS_REASON_PREFIX +
+                          "refuter recovery raised %s" % type(exc).__name__))
+            return False
 
     def _nudge(self):
         import time
