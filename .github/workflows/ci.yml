@@ -552,6 +552,7 @@ jobs:
             bridge/test_conv_url_follows_the_turn.py \
             tests/test_retry_sets_agree.py \
             tests/test_fanout_default_on_agrees.py \
+            tests/test_fanout_budget.py \
             tests/test_stuck_worker_retried_once.py \
             tests/test_task_tree.py \
             tests/test_ledger_compile.py \

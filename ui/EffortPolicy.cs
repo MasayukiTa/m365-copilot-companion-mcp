@@ -199,3 +199,113 @@ public static class FanoutView
         return ja ? "選択は次回起動から反映" : "selection applies from next start";
     }
 }
+
+// The per-tree fan-out budget's words, bounds and parsing, WPF-free (same file as FanoutView so
+// the shipped build list does not change). The Python side decides (relay/fanout_budget.py reads
+// the four keys at every split and relay/fleet_runner.py exports the limits in force as
+// status.json "fanout_budget"); this only parses setting lines, clamps what the operator types
+// and words the report. Index order is the order of Keys everywhere.
+public static class FanoutBudgetView
+{
+    //: settings.txt key names; must equal tools/settings_keys.py (tests/test_fanout_budget.py).
+    public static readonly string[] Keys =
+        { "fanout_max_total", "fanout_max_active", "fanout_max_turns", "fanout_max_wall_min" };
+
+    //: Absent-key defaults; must equal the registry defaults.
+    public static readonly int[] Defaults = { 24, 3, 400, 120 };
+
+    //: Bounds; must equal relay/fanout_budget.py BOUNDS.
+    public static readonly int[] Lows = { 2, 1, 1, 1 };
+    public static readonly int[] Highs = { 1000, 100, 1000000, 10080 };
+
+    //: Keys of the limits object the runner exports, in the same order.
+    public static readonly string[] ReportKeys = { "total", "active", "turns", "wall_min" };
+
+    public static int Clamp(int idx, int v)
+    {
+        return Math.Max(Lows[idx], Math.Min(Highs[idx], v));
+    }
+
+    /// <summary>The clamped value of one settings.txt line for key `idx`, or null when the line
+    /// is not that key (`fanout_max_total` does not match `fanout_max_totals`) or the value is
+    /// not a whole number (the caller KEEPS its current value, as Python falls back to default).</summary>
+    public static int? ParseLine(int idx, string line)
+    {
+        if (line == null) return null;
+        string ln = line.TrimStart('﻿').Trim();
+        string key = Keys[idx];
+        if (!ln.StartsWith(key + "=", StringComparison.Ordinal)) return null;
+        int v;
+        if (!int.TryParse(ln.Substring(key.Length + 1).Trim(), System.Globalization.NumberStyles.Integer,
+                          System.Globalization.CultureInfo.InvariantCulture, out v)) return null;
+        return Clamp(idx, v);
+    }
+
+    /// <summary>What the operator typed, clamped; false when it is not a whole number.</summary>
+    public static bool TryParseInput(int idx, string text, out int value)
+    {
+        value = 0;
+        int v;
+        if (text == null || !int.TryParse(text.Trim(), System.Globalization.NumberStyles.Integer,
+                                          System.Globalization.CultureInfo.InvariantCulture, out v)) return false;
+        value = Clamp(idx, v);
+        return true;
+    }
+
+    public static string GroupLabel(bool ja) { return ja ? "分割の上限" : "Fan-out budget"; }
+
+    public static string ShortLabel(int idx, bool ja)
+    {
+        switch (idx)
+        {
+            case 0: return ja ? "総数" : "total";
+            case 1: return ja ? "同時" : "active";
+            case 2: return ja ? "ターン" : "turns";
+            case 3: return ja ? "分" : "min";
+        }
+        return "";
+    }
+
+    public static string Help(int idx, bool ja)
+    {
+        switch (idx)
+        {
+            case 0: return ja ? "1つの分割ツリーが持てるワーカー総数(統合用に1つ確保)"
+                              : "Most workers one fan-out tree may hold (one slot is kept for the merge)";
+            case 1: return ja ? "ツリーがさらに分割を求めるとき、同時に動いていてよいワーカー数"
+                              : "Most of a tree's workers that may be running when it asks to split more";
+            case 2: return ja ? "ツリー全体で使えるターン数の上限" : "Most conversation turns one tree may use";
+            case 3: return ja ? "ツリーの最初の分割からの経過分数の上限" : "Most minutes since a tree's first split";
+        }
+        return "";
+    }
+
+    //: Wording of WHEN a change lands, matching tools/settings_keys.py (each_gate).
+    public static string TakeEffectTip(bool ja)
+    {
+        return ja ? "次の分割判断から有効。再起動不要。分割済みのツリーは変わりません。"
+                  : "Applies to the next split decision, no restart. Trees already split keep going.";
+    }
+
+    /// <summary>The limits the coordinator reports it applies (status.json "fanout_budget"),
+    /// as total/active/turns/wall_min; null when it reported nothing usable (old runner).</summary>
+    public static string Describe(int[] limits, bool ja)
+    {
+        if (limits == null || limits.Length != 4) return null;
+        return (ja ? "稼働中: 総数 " : "In effect: total ") + limits[0]
+             + (ja ? " / 同時 " : " / active ") + limits[1]
+             + (ja ? " / ターン " : " / turns ") + limits[2]
+             + (ja ? " / " : " / ") + limits[3] + (ja ? "分" : " min");
+    }
+
+    /// <summary>The note shown when what the runner applies differs from the boxes (the boxes
+    /// persist at once; the runner reads them at its next split); null when they agree.</summary>
+    public static string PendingText(int[] limits, int[] selected, bool ja)
+    {
+        if (limits == null || selected == null || limits.Length != 4 || selected.Length != 4) return null;
+        for (int i = 0; i < 4; i++)
+            if (limits[i] != selected[i])
+                return ja ? "選択は次の分割から反映" : "selection applies from the next split";
+        return null;
+    }
+}

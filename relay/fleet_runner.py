@@ -1356,6 +1356,22 @@ def _tree_worker_fields(w):
         return {}
 
 
+def _tree_budget_block(worker_rows):
+    """`fanout_budget` (the limits in force) and `tree_budget` (per-root usage), additive.
+
+    The production caller of relay.fanout_budget.usage_from_status. Rows are the snapshot's own
+    worker rows (they carry root_id). The campaign ledger is read only when some worker belongs
+    to a tree; {} on any failure.
+    """
+    try:
+        from relay import fanout_budget as _fb
+        if not any(isinstance(r, dict) and r.get("root_id") for r in worker_rows):
+            return {"fanout_budget": _fb.limits_from_settings(), "tree_budget": {}}
+        return _fb.status_block(worker_rows, _campaign_lines())
+    except Exception:
+        return {}
+
+
 def _pending_gates(started=0.0):
     """Scan .companion_gates/ for unanswered HITL gates and return a list of dicts.
 
@@ -1822,6 +1838,7 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
     for _w in _snap["workers"]:
         _w["fanout"] = _fv.get(_w["name"], {"kind": "solo", "campaign_id": _w.get("campaign_id", ""), "label": ""})
     _attach_split_groups(_snap)
+    _snap.update(_tree_budget_block(_snap["workers"]))
     return _snap
 
 

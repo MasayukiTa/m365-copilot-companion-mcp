@@ -96,6 +96,13 @@ def _reader_effort_policy():
     return mode()
 
 
+def _fanout_limit_reader(field):
+    def _read():
+        from relay.fanout_budget import limits_from_settings
+        return limits_from_settings()[field]
+    return _read
+
+
 #: The reader whose return value an operator would see change, per key that claims to follow
 #: the file. A registry rather than a literal parameter list: a key declared live with no
 #: entry here FAILS the next test instead of quietly not being checked, which is how the
@@ -106,6 +113,10 @@ _LIVE_READERS = {
     "maxtabs": (_reader_maxtabs, "2", "7"),
     "rate_ceiling_rpm": (_reader_rate, "40", "90"),
     "effort_policy": (_reader_effort_policy, "shadow", "on"),
+    "fanout_max_total": (_fanout_limit_reader("total"), "10", "30"),
+    "fanout_max_active": (_fanout_limit_reader("active"), "2", "6"),
+    "fanout_max_turns": (_fanout_limit_reader("turns"), "100", "500"),
+    "fanout_max_wall_min": (_fanout_limit_reader("wall_min"), "30", "90"),
 }
 
 
