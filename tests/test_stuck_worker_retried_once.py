@@ -148,7 +148,7 @@ def test_non_exhausted_replies_never_count():
 def test_futile_recycle_ends_non_retryable_with_a_reason():
     src = _read("relay", "relay_fleet.py")
     block = _method(src, "if _recycle_is_futile(self, conversation_exhausted(resp)):",
-                    "self._heap_recycle_turn = self.turn")
+                    "if self._recycles > self._max_recycles:")
     assert 'self.status, self.outcome = "stuck", "STUCK"' in block
     assert "self.retryable_override = False" in block
     assert "cannot make progress" in block

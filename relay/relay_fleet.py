@@ -5621,6 +5621,7 @@ class RelayWorker:
         heavy = (not conversation_exhausted(resp)) and self._memory_pressure()
         if conversation_exhausted(resp) or heavy:
             self._recycles += 1
+            self._heap_recycle_turn = self.turn
             if _recycle_is_futile(self, conversation_exhausted(resp)):
                 self.status, self.outcome = "stuck", "STUCK"
                 self.retryable_override = False
@@ -5629,7 +5630,6 @@ class RelayWorker:
                                "(the same oversized tool result, not tried again); stopped "
                                "after %d recycles" % (_FUTILE_RECYCLES, self._recycles - 1))
                 return
-            self._heap_recycle_turn = self.turn
             if self._recycles > self._max_recycles:
                 self.status, self.outcome = "stuck", "STUCK"
                 self.reason = (f"conversation recycled too often; exceeded "
