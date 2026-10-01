@@ -395,3 +395,15 @@ This item is CLOSED. Reopen only if a reply that explicitly says unlock is unnec
 ### 2026-10-01 08:4x JST P0 stabilization convergence checkpoint
 
 All P0 behavior regressions listed in the current stabilization ledger are now CLOSED with the required live/exact evidence: left-panel details+timeline, foreground console suppression, long-wait recovery, live task reflection/async capture, unlock/no-tool false-positive handling, and truthful planned-restart server health. The resume queue now advances to **INTEGRATION**: validate the current branch head through blocking CI / Windows build / install path / CodeQL / Secret scan / PowerShell lint / Workflow lint, then merge/converge through the existing branch plan and verify post-merge `main`. Do not resume unrelated durable-runtime/C2C feature expansion before this integration gate is green.
+
+### 2026-10-01 10:19 JST post-P0 convergence / PR #78 checkpoint
+
+The P0 closure recorded above still stands. The active follow-up branch is `fix/phase2-audit-followups-20260929` / PR #78. Remote head `183bb63` is green across CI, CodeQL, Secret scan, Workflow lint, PowerShell lint, Windows build, and install-path E2E.
+
+Since the 08:4x convergence checkpoint, the branch also carries the planned-restart supervisor-instance fix and exact yellow-path test, plus the explicit `unlock not required` classification fix. Locally, `f2a3ef8` merges current `origin/main`, including PR #91's fix that scopes interrupted-run resume to the interrupted run's own campaigns. This merge is not yet pushed at this checkpoint.
+
+Operationally relevant current state:
+- no tracked dirty files before this ledger update;
+- unrelated untracked directories (`kanazawa-trip/`, `output_20260930/`, `reviews/`) remain untouched;
+- next gate is post-merge PR #78 CI/CodeQL/Windows validation, then remaining phase2 audit follow-ups;
+- current `main` CI should be reviewed separately after this ledger sync, especially any failure not explained by the PR #78 branch.
