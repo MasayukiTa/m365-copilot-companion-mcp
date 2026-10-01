@@ -821,7 +821,7 @@ class CockpitWindow : Window
     // ON, matching relay.fleet_runner's own default since 2026-09-13. Every goal is still
     // judged separately (offline triage, then the agent, which may answer NO_SPLIT), so a goal
     // that fits costs nothing; this only decides whether the question is ever asked.
-    bool _fanout = true;       // -> settings.txt fanout=
+    bool _fanout = true;       // -> settings.txt fanout= ; absent key = ON (FanoutView.DefaultOn)
     string _approval = "run";  // approval mode run|plan|auto -> settings.txt approval=
     string _runtimeMode = "fleet"; // next launch: fleet | durable -> settings.txt runtime=
     bool _durableEnqueuePending = false; // one durable campaign intake process at a time
@@ -1851,8 +1851,8 @@ class CockpitWindow : Window
                 }
                 else if (ln.StartsWith("fanout="))
                 {
-                    string fx = ln.Substring(7).Trim().ToLower();
-                    _fanout = (fx == "on" || fx == "1" || fx == "true");
+                    bool? fxv = FanoutView.ParseSetting(ln);   // same reading as Python's settings_fanout
+                    if (fxv.HasValue) _fanout = fxv.Value;
                 }
                 else if (ln.StartsWith("runtime="))
                 {
@@ -1978,6 +1978,7 @@ class CockpitWindow : Window
 
         ctrls.Children.Add(EffortControl());
         ctrls.Children.Add(EffortPolicyControl());
+        ctrls.Children.Add(FanoutControl());
         ctrls.Children.Add(ApprovalControl());
         ctrls.Children.Add(ApprovalCenterControl());
         ctrls.Children.Add(FleetControls());
@@ -5679,6 +5680,7 @@ class CockpitWindow : Window
             {
                 _fanout = (v == "on");
                 SaveKey("fanout", _fanout ? "on" : "off");
+                PaintFanout();
                 if (_startNote != null)
                     _startNote.Text = _lang == 0
                         ? (_fanout ? "分割実行 ON — 長い依頼を独立したサブタスクに分けて並列実行し、結果を統合します。"
@@ -7565,6 +7567,8 @@ class CockpitWindow : Window
     TextBlock _effortLbl;
     ComboBox _effortPolicyBox;
     TextBlock _effortPolicyLbl, _effortPolicyNow, _effortPolicyWarn;
+    ComboBox _fanoutBox;
+    TextBlock _fanoutLbl, _fanoutNow, _fanoutPending;
     TextBlock _approvalLbl;
     Button _pauseBtn, _stopBtn;
     System.Windows.Shapes.Path _pauseIcon, _stopIcon;   // drawn geometry (no font glyph needed)
@@ -9120,6 +9124,84 @@ class CockpitWindow : Window
         _effortPolicyWarn.Text = warn ?? "";
         _effortPolicyWarn.Foreground = Theme.Br(Theme.Warning(_dark));
         _effortPolicyWarn.Visibility = warn != null ? Visibility.Visible : Visibility.Collapsed;
+    }
+    // Fan-out selector (on|off), the visible GUI path for what used to be reachable only by typing
+    // /fanout. Persists fanout= to settings.txt (SaveKey), which every coordinator start reads
+    // (sweep_start). Absent key = ON. What the coordinator was REALLY started with comes from
+    // status.json "fanout_run" (PaintFanoutInEffect); its words live in FanoutView (EffortPolicy.cs).
+    UIElement FanoutControl()
+    {
+        var wrap = new StackPanel(); wrap.Orientation = Orientation.Horizontal;
+        wrap.VerticalAlignment = VerticalAlignment.Center; wrap.Margin = new Thickness(0, 0, 12, 0);
+
+        _fanoutLbl = new TextBlock(); _fanoutLbl.VerticalAlignment = VerticalAlignment.Center;
+        _fanoutLbl.FontSize = 12; _fanoutLbl.Margin = new Thickness(0, 0, 8, 0);
+        wrap.Children.Add(_fanoutLbl);
+
+        _fanoutBox = new ComboBox();
+        _fanoutBox.ToolTip = FanoutView.Help(_lang == 0) + "\n" + FanoutView.TakeEffectTip(_lang == 0);
+        _fanoutBox.Cursor = Cursors.Hand; _fanoutBox.FontSize = 12;
+        _fanoutBox.FontWeight = FontWeights.SemiBold; _fanoutBox.MinWidth = 64;
+        _fanoutBox.Padding = new Thickness(8, 2, 4, 2);
+        _fanoutBox.VerticalAlignment = VerticalAlignment.Center;
+        var foHelp = new Dictionary<string, string>();
+        foreach (string m in FanoutView.Modes) foHelp[m] = FanoutView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_fanoutBox, FanoutView.Modes, foHelp, FanoutView.Token(_fanout));
+        _fanoutBox.DropDownOpened += delegate { CloseHeaderPopups("effort"); };
+        _fanoutBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_fanoutBox);
+            if ((sel != "on" && sel != "off") || sel == FanoutView.Token(_fanout)) return;
+            _fanout = (sel == "on");
+            SaveKey("fanout", _fanout ? "on" : "off");
+            PaintFanoutInEffect(_lastRoot);
+        };
+        wrap.Children.Add(_fanoutBox);
+
+        _fanoutNow = new TextBlock(); _fanoutNow.VerticalAlignment = VerticalAlignment.Center;
+        _fanoutNow.FontSize = 11.5; _fanoutNow.Margin = new Thickness(8, 0, 0, 0);
+        wrap.Children.Add(_fanoutNow);
+        _fanoutPending = new TextBlock(); _fanoutPending.VerticalAlignment = VerticalAlignment.Center;
+        _fanoutPending.FontSize = 11.5; _fanoutPending.FontWeight = FontWeights.SemiBold;
+        _fanoutPending.Margin = new Thickness(8, 0, 0, 0);
+        _fanoutPending.Visibility = Visibility.Collapsed;
+        wrap.Children.Add(_fanoutPending);
+
+        PaintFanout();
+        return wrap;
+    }
+    void PaintFanout()
+    {
+        if (_fanoutLbl != null) { _fanoutLbl.Text = FanoutView.Label(_lang == 0); _fanoutLbl.Foreground = Muted; }
+        if (_fanoutBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_fanoutBox), FanoutView.Token(_fanout))) ComboSelectVal(_fanoutBox, FanoutView.Token(_fanout));
+        _fanoutBox.Background = BtnBg; _fanoutBox.Foreground = Fg; _fanoutBox.BorderBrush = Border;
+        StyleFlatCombo(_fanoutBox);
+        PaintFanoutInEffect(_lastRoot);
+    }
+    // What the COORDINATOR says it was started with (status.json "fanout_run"), beside the combo.
+    // No report (old runner, no run yet) -> nothing shown, never a guess from the combo.
+    void PaintFanoutInEffect(Dictionary<string, object> root)
+    {
+        if (_fanoutNow == null || _fanoutPending == null) return;
+        bool ja = _lang == 0;
+        string now = null, pend = null;
+        Dictionary<string, object> fr = root != null ? Obj(root, "fanout_run") : null;
+        if (fr != null)
+        {
+            object ev;
+            bool has = fr.TryGetValue("enabled", out ev) && ev is bool;
+            bool enabled = has && (bool)ev;
+            now = FanoutView.Describe(has, enabled, S(fr, "source"), ja);
+            pend = FanoutView.PendingText(has, enabled, _fanout, ja);
+        }
+        _fanoutNow.Text = now ?? "";
+        _fanoutNow.Foreground = Muted;
+        _fanoutNow.Visibility = now != null ? Visibility.Visible : Visibility.Collapsed;
+        _fanoutPending.Text = pend ?? "";
+        _fanoutPending.Foreground = Theme.Br(Theme.Warning(_dark));
+        _fanoutPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
     }
     void PaintEffort()
     {
@@ -10889,6 +10971,7 @@ class CockpitWindow : Window
         UpdateAutoEnabled();
         PaintEffort();
         PaintEffortPolicy();
+        PaintFanout();
         PaintApproval();
         PaintApprovalCenterButton(PendingGates(ReadStatus()).Count);
         PaintPause();
@@ -10961,6 +11044,7 @@ class CockpitWindow : Window
         PaintAutoToggle();
         PaintEffort();
         PaintEffortPolicy();
+        PaintFanout();
         PaintApproval();
         PaintApprovalCenterButton(PendingGates(ReadStatus()).Count);
         PaintPause();
@@ -11836,6 +11920,7 @@ class CockpitWindow : Window
     {
         _lastRoot = root;               // cache for single-card toggles
         PaintEffortPolicyInEffect(root);   // what the runner reports is in effect (effort policy)
+        PaintFanoutInEffect(root);         // what the coordinator was started with (fan-out)
         // Preserve scroll position across the rebuild. Without this, every worker update
         // (status/turn change) reset the list and snapped the view back to the TOP -- which is
         // exactly why scrolling "didn't work" while tasks were live: the user scrolled down, a
