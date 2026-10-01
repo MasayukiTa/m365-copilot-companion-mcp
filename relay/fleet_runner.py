@@ -1759,6 +1759,10 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
             "depth": getattr(getattr(w, "task_envelope", None), "depth", 0),
             "subtask_index": getattr(w, "subtask_index", None),
             "goal_hash": getattr(w, "original_goal_hash", ""),
+            # None = outcome-wide rule; False = this worker's end is not safe to re-run
+            # (the cockpit's retry predicate honours it). retry_queued = runner re-queued it.
+            "retryable": getattr(w, "retryable_override", None),
+            "retry_queued": bool(getattr(w, "retry_queued", False)),
             "fresh_replay_count": getattr(w, "fresh_replay_count", 0),
             "refusal_count": getattr(w, "refusal_count", 0),
             "refusal_history": list(getattr(w, "refusal_history", [])),
@@ -4651,6 +4655,8 @@ def main():
             "role": r.get("role", ""),
             "depth": r.get("depth", 0),
             "goal_hash": r.get("goal_hash", ""),
+            "retryable": r.get("retryable"),
+            "retry_queued": bool(r.get("retry_queued", False)),
             "fresh_replay_count": r.get("fresh_replay_count", 0),
             "refusal_count": r.get("refusal_count", 0),
             "refusal_history": r.get("refusal_history", []),
