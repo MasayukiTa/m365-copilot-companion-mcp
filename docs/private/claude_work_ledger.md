@@ -224,3 +224,7 @@ Status in plain terms:
 - Change (branch fix/fanout-default-on-gui-only-20261001): registry default True (UNDECIDED removed); autostart names `--fanout` / `--no-fanout`; runner writes `fanout_run` {enabled, source} into status.json; cockpit gets a visible On/Off box (FanoutView in ui/EffortPolicy.cs, no build-list change) with "in effect" and "applies from next start" text.
 - Existing explicit `fanout=off` lines stay honoured; no migration (a frozen default cannot be told from a choice). Owner changes it in the new box.
 - Tests: tests/test_fanout_default_on_agrees.py (in ci.yml). Audit: docs/private/20261001_cli_only_settings_audit.md. Open: PR review/merge.
+## 2026-10-02 - task-tree identity on fan-out campaign records
+- Change (branch feat/campaign-tree-identity-20261002): child goals from fanout.child_goals now carry parent_campaign_id, parent_subtask_index and root_id (top-level parent: root is the split's own campaign id; deeper child inherits the parent's root). The campaigns.jsonl header also records parent_task_id, parent_campaign_id and root_id; status.json worker rows carry root_id when known (kept in the task envelope metadata, outside the goal hash).
+- Additive and record-only: no depth gate or MAX_DEPTH change, no recursion; old ledgers without the keys load as before.
+- Tests: relay/test_campaign_tree_identity.py (in ci.yml). Open: PR review/merge.
