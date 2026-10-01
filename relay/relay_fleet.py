@@ -48,6 +48,7 @@ from .copilot_autopilot_relay import (
 )
 from relay import settle as _settle
 from relay import fanout as fanout_mod
+from relay import fanout_budget as fanout_budget_mod
 from relay import fleet_resume as resume_mod
 from relay.control_markers import CLOSING_INSTRUCTION
 from relay import invariants as _invariants
@@ -6423,6 +6424,14 @@ class RelayWorker:
             if fanout_mod.fanout_ready(resp):
                 self._fanout_done = True
                 steps = fanout_mod.subtasks_from(resp)
+                # PER-TREE BUDGET: how many children this root may add. A refused grant empties
+                # `steps`, which takes the existing "run it here" branch below; a partial grant
+                # folds the tail into the last kept step. Unchanged at default limits.
+                self._budget_refusal = ""
+                _grant_fn = getattr(self._spawn_fn, "grant", None)
+                if steps and _grant_fn is not None:
+                    steps, self._budget_refusal = _grant_fn(
+                        self.goal, steps, getattr(self.task_envelope, "task_id", "") or "")
                 kids = (fanout_mod.child_goals(
                     self.goal, steps,
                     parent_task_id=getattr(self.task_envelope, "task_id", "") or "",
@@ -6466,7 +6475,9 @@ class RelayWorker:
                     "分割は行いません。上記の目標をこの会話で直接実行してください。"
                     + CLOSING_INSTRUCTION)
                 self.status = "ready"
-                self.reason = "分割案が使えなかったため単独実行に切り替え"
+                self.reason = ("分割予算の上限のため単独実行に切り替え (%s)" % self._budget_refusal
+                               if getattr(self, "_budget_refusal", "") and not steps
+                               else "分割案が使えなかったため単独実行に切り替え")
                 return
             # Still writing the split. Ask for the marker rather than for the work: without
             # it there is nothing to tell a finished list from a half-written one.
@@ -8745,6 +8756,33 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         except Exception:
             pass
         print("[fanout] %s -> %d subtask(s)" % (cid, len(kids)), flush=True)
+
+    def _grant_children(parent_goal, steps, parent_task_id=""):
+        """The per-tree budget for a split about to happen: (steps_to_use, refusal_reason).
+
+        Called by the worker before it builds the children. A family that already exists
+        (this run or an earlier one) is adopted by _spawn_children and queues nothing, so it
+        is not charged. Anything else asks relay/fanout_budget.py; usage that cannot be read
+        refuses the split (the worker then runs the goal itself) and says so.
+        """
+        cid = fanout_mod.campaign_id_for(parent_goal, parent_task_id=parent_task_id)
+        if cid in campaigns or _campaign_already_on_disk(cid):
+            return steps, ""
+        try:
+            rows = fanout_budget_mod.read_campaign_rows(
+                os.path.join(os.path.dirname(transcript_dir), "campaigns.jsonl")
+                if transcript_dir else "")
+            use, why = fanout_budget_mod.apply_budget(
+                steps, cid, fanout_budget_mod.rows_from_workers(workers), rows,
+                fanout_budget_mod.limits_from_settings(), min_children=fanout_mod.MIN_CHILDREN)
+        except Exception as exc:
+            use, why = [], "budget check failed: %s" % exc
+        if len(use) != len(steps) or why:
+            print("[fanout] %s: budget %s (%d -> %d subtask(s))"
+                  % (cid, why or "trimmed", len(steps), len(use)), flush=True)
+        return use, why
+
+    _spawn_children.grant = _grant_children
 
     def _queue_ready_merges():
         """Queue the merge for every family whose children have all finished. Count queued.

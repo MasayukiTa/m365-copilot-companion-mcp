@@ -822,6 +822,11 @@ class CockpitWindow : Window
     // judged separately (offline triage, then the agent, which may answer NO_SPLIT), so a goal
     // that fits costs nothing; this only decides whether the question is ever asked.
     bool _fanout = true;       // -> settings.txt fanout= ; absent key = ON (FanoutView.DefaultOn)
+    // per-tree fan-out budget -> settings.txt fanout_max_total / _active / _turns / _wall_min
+    int[] _fbVals = (int[])FanoutBudgetView.Defaults.Clone();
+    TextBox[] _fbBox = new TextBox[4];
+    TextBlock _fbLbl, _fbNow, _fbPending;
+    TextBlock[] _fbCap = new TextBlock[4];
     string _approval = "run";  // approval mode run|plan|auto -> settings.txt approval=
     string _runtimeMode = "fleet"; // next launch: fleet | durable -> settings.txt runtime=
     bool _durableEnqueuePending = false; // one durable campaign intake process at a time
@@ -1854,6 +1859,14 @@ class CockpitWindow : Window
                     bool? fxv = FanoutView.ParseSetting(ln);   // same reading as Python's settings_fanout
                     if (fxv.HasValue) _fanout = fxv.Value;
                 }
+                else if (ln.StartsWith("fanout_max_"))
+                {
+                    for (int fbi = 0; fbi < FanoutBudgetView.Keys.Length; fbi++)
+                    {
+                        int? fbv = FanoutBudgetView.ParseLine(fbi, ln);   // clamped; junk keeps the value
+                        if (fbv.HasValue) _fbVals[fbi] = fbv.Value;
+                    }
+                }
                 else if (ln.StartsWith("runtime="))
                 {
                     string rt = ln.Substring(8).Trim().ToLower();
@@ -1979,6 +1992,7 @@ class CockpitWindow : Window
         ctrls.Children.Add(EffortControl());
         ctrls.Children.Add(EffortPolicyControl());
         ctrls.Children.Add(FanoutControl());
+        ctrls.Children.Add(FanoutBudgetControl());
         ctrls.Children.Add(ApprovalControl());
         ctrls.Children.Add(ApprovalCenterControl());
         ctrls.Children.Add(FleetControls());
@@ -7793,6 +7807,10 @@ class CockpitWindow : Window
                 return "live";
             case "rate_ceiling_rpm":
             case "job_approval_mode":
+            case "fanout_max_total":
+            case "fanout_max_active":
+            case "fanout_max_turns":
+            case "fanout_max_wall_min":
             case "effort_policy":
                 return "each_gate";
             case "session_retention_days":
@@ -9179,6 +9197,7 @@ class CockpitWindow : Window
         _fanoutBox.Background = BtnBg; _fanoutBox.Foreground = Fg; _fanoutBox.BorderBrush = Border;
         StyleFlatCombo(_fanoutBox);
         PaintFanoutInEffect(_lastRoot);
+        PaintFanoutBudget();
     }
     // What the COORDINATOR says it was started with (status.json "fanout_run"), beside the combo.
     // No report (old runner, no run yet) -> nothing shown, never a guess from the combo.
@@ -9202,6 +9221,128 @@ class CockpitWindow : Window
         _fanoutPending.Text = pend ?? "";
         _fanoutPending.Foreground = Theme.Br(Theme.Warning(_dark));
         _fanoutPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
+    }
+    // Per-tree fan-out budget: four numeric boxes (total / active / turns / minutes) beside the
+    // fan-out selector. Each persists through SaveKey only, when the operator commits (Enter or
+    // leaving the box); the runner re-reads the keys at every split (each_gate). What the
+    // COORDINATOR applies comes from status.json "fanout_budget" (PaintFanoutBudgetInEffect);
+    // the words, bounds and parsing live in FanoutBudgetView (EffortPolicy.cs).
+    UIElement FanoutBudgetControl()
+    {
+        var wrap = new StackPanel(); wrap.Orientation = Orientation.Horizontal;
+        wrap.VerticalAlignment = VerticalAlignment.Center; wrap.Margin = new Thickness(0, 0, 12, 0);
+
+        _fbLbl = new TextBlock(); _fbLbl.VerticalAlignment = VerticalAlignment.Center;
+        _fbLbl.FontSize = 12; _fbLbl.Margin = new Thickness(0, 0, 8, 0);
+        wrap.Children.Add(_fbLbl);
+
+        for (int i = 0; i < 4; i++)
+        {
+            int idx = i;
+            _fbCap[i] = new TextBlock(); _fbCap[i].VerticalAlignment = VerticalAlignment.Center;
+            _fbCap[i].FontSize = 11.5; _fbCap[i].Margin = new Thickness(i == 0 ? 0 : 8, 0, 3, 0);
+            wrap.Children.Add(_fbCap[i]);
+
+            var tb = new TextBox();
+            tb.Width = 52; tb.FontSize = 12; tb.Padding = new Thickness(4, 2, 4, 2);
+            tb.VerticalAlignment = VerticalAlignment.Center;
+            tb.HorizontalContentAlignment = HorizontalAlignment.Right;
+            tb.MaxLength = 7;
+            tb.Text = _fbVals[i].ToString();
+            tb.LostFocus += delegate { CommitFanoutBudget(idx); };
+            tb.KeyDown += delegate(object s, KeyEventArgs e)
+            {
+                if (e.Key == Key.Enter) { CommitFanoutBudget(idx); e.Handled = true; }
+            };
+            _fbBox[i] = tb;
+            wrap.Children.Add(tb);
+        }
+
+        _fbNow = new TextBlock(); _fbNow.VerticalAlignment = VerticalAlignment.Center;
+        _fbNow.FontSize = 11.5; _fbNow.Margin = new Thickness(8, 0, 0, 0);
+        wrap.Children.Add(_fbNow);
+        _fbPending = new TextBlock(); _fbPending.VerticalAlignment = VerticalAlignment.Center;
+        _fbPending.FontSize = 11.5; _fbPending.FontWeight = FontWeights.SemiBold;
+        _fbPending.Margin = new Thickness(8, 0, 0, 0);
+        _fbPending.Visibility = Visibility.Collapsed;
+        wrap.Children.Add(_fbPending);
+
+        PaintFanoutBudget();
+        return wrap;
+    }
+    // Commit one box: a non-number reverts to the held value, a number is clamped to the key's
+    // bounds, and an UNCHANGED value is not written (so leaving a box never rewrites the file).
+    void CommitFanoutBudget(int idx)
+    {
+        TextBox tb = _fbBox[idx];
+        if (tb == null) return;
+        int v;
+        if (!FanoutBudgetView.TryParseInput(idx, tb.Text, out v)) { tb.Text = _fbVals[idx].ToString(); return; }
+        tb.Text = v.ToString();
+        if (v == _fbVals[idx]) return;
+        _fbVals[idx] = v;
+        SaveFanoutBudgetKey(idx, v);
+        PaintFanoutBudgetInEffect(_lastRoot);
+    }
+    void SaveFanoutBudgetKey(int idx, int v)
+    {
+        string s = v.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        switch (idx)
+        {
+            case 0: SaveKey("fanout_max_total", s); break;
+            case 1: SaveKey("fanout_max_active", s); break;
+            case 2: SaveKey("fanout_max_turns", s); break;
+            case 3: SaveKey("fanout_max_wall_min", s); break;
+        }
+    }
+    void PaintFanoutBudget()
+    {
+        bool ja = _lang == 0;
+        if (_fbLbl != null) { _fbLbl.Text = FanoutBudgetView.GroupLabel(ja); _fbLbl.Foreground = Muted; }
+        for (int i = 0; i < 4; i++)
+        {
+            if (_fbCap[i] != null)
+            {
+                _fbCap[i].Text = FanoutBudgetView.ShortLabel(i, ja); _fbCap[i].Foreground = Muted;
+            }
+            TextBox tb = _fbBox[i];
+            if (tb == null) continue;
+            tb.ToolTip = FanoutBudgetView.Help(i, ja) + "\n" + FanoutBudgetView.TakeEffectTip(ja);
+            // assign only when different and not being typed in, so a repaint never fights the operator
+            if (!tb.IsKeyboardFocused && tb.Text != _fbVals[i].ToString()) tb.Text = _fbVals[i].ToString();
+            tb.Background = BtnBg; tb.Foreground = Fg; tb.BorderBrush = Border;
+        }
+        PaintFanoutBudgetInEffect(_lastRoot);
+    }
+    // What the COORDINATOR says it applies (status.json "fanout_budget"), beside the boxes. No
+    // report (old runner, no run yet) -> nothing shown, never a guess from the boxes.
+    void PaintFanoutBudgetInEffect(Dictionary<string, object> root)
+    {
+        if (_fbNow == null || _fbPending == null) return;
+        bool ja = _lang == 0;
+        string now = null, pend = null;
+        Dictionary<string, object> fb = root != null ? Obj(root, "fanout_budget") : null;
+        if (fb != null)
+        {
+            bool ok = true;
+            int[] lim = new int[4];
+            for (int i = 0; i < 4; i++)
+            {
+                if (!fb.ContainsKey(FanoutBudgetView.ReportKeys[i]) || fb[FanoutBudgetView.ReportKeys[i]] == null) { ok = false; break; }
+                lim[i] = I(fb, FanoutBudgetView.ReportKeys[i]);
+            }
+            if (ok)
+            {
+                now = FanoutBudgetView.Describe(lim, ja);
+                pend = FanoutBudgetView.PendingText(lim, _fbVals, ja);
+            }
+        }
+        _fbNow.Text = now ?? "";
+        _fbNow.Foreground = Muted;
+        _fbNow.Visibility = now != null ? Visibility.Visible : Visibility.Collapsed;
+        _fbPending.Text = pend ?? "";
+        _fbPending.Foreground = Theme.Br(Theme.Warning(_dark));
+        _fbPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
     }
     void PaintEffort()
     {
@@ -11921,6 +12062,7 @@ class CockpitWindow : Window
         _lastRoot = root;               // cache for single-card toggles
         PaintEffortPolicyInEffect(root);   // what the runner reports is in effect (effort policy)
         PaintFanoutInEffect(root);         // what the coordinator was started with (fan-out)
+        PaintFanoutBudgetInEffect(root);   // the per-tree limits the coordinator applies
         // Preserve scroll position across the rebuild. Without this, every worker update
         // (status/turn change) reset the list and snapped the view back to the TOP -- which is
         // exactly why scrolling "didn't work" while tasks were live: the user scrolled down, a
