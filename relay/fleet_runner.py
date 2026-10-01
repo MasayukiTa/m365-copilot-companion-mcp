@@ -1320,6 +1320,24 @@ def _effort_policy_block():
         return {}
 
 
+#: What THIS coordinator was started with for fan-out: {"enabled": bool, "source": "flag"|"default"}.
+#: Set once after argument parsing. status.json carries it so the cockpit shows what is really in
+#: effect (including "started with --no-fanout"), not what its own switch currently says.
+_RUN_FANOUT = {}
+
+
+def _record_run_fanout(enabled, argv=None):
+    """Remember the coordinator's resolved fan-out flag; `source` says whether argv named it."""
+    named = any(a in ("--fanout", "--no-fanout") for a in (sys.argv[1:] if argv is None else argv))
+    _RUN_FANOUT.clear()
+    _RUN_FANOUT.update({"enabled": bool(enabled), "source": "flag" if named else "default"})
+
+
+def _fanout_run_block():
+    """{"fanout_run": {enabled, source}} for the snapshot, or {} before the flag is known."""
+    return {"fanout_run": dict(_RUN_FANOUT)} if _RUN_FANOUT else {}
+
+
 def _effort_worker_fields(w):
     """Per-worker effort badge fields (see effort_policy.status_fields); {} on any failure."""
     try:
@@ -1785,6 +1803,8 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         # What the effort policy is REALLY set to (env > settings > off) so the cockpit shows
         # the truth, not its own combo. Additive; absent if it cannot be resolved.
         **_effort_policy_block(),
+        # What this coordinator was started with for fan-out (additive; absent until known).
+        **_fanout_run_block(),
     }
     # Derived fan-out family markers (parent / child / aggregator / stalled) so the
     # cockpit can render the split-and-merge structure the lineage already implies.
@@ -3516,6 +3536,7 @@ def main():
     ap.add_argument("--state-dir", default=os.path.join(_repo_root(), ".fleet"),
                     help="where to write the live status.json the cockpit reads")
     args = ap.parse_args()
+    _record_run_fanout(args.fanout)
 
     # FINAL EXCLUSION LAYER: one state dir may have exactly one coordinator. Do this before
     # coordinator logs, queue receipts, retention, resume expansion, or any durable run-state
