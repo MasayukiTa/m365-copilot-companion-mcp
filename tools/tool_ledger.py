@@ -451,17 +451,70 @@ def result_is_secret(call_id: str, tool: str = "") -> bool:
     return name in SECRET_RESULT_TOOLS
 
 
-def _identity_for(tool: str, arguments, session: str, task: str, worker: str):
-    """(task, worker, how) for a call. `how` is "explicit", "session" or "" (not attributable).
+#: session fingerprint -> (task, worker, bound_at). Set ONLY by an unambiguous turn-window match
+#: (exactly one worker in flight), so a later call on that session that lands in an overlap of
+#: several windows can reuse it. Expires, and is only reused when its worker is among the
+#: overlapping candidates -- a session that moved to another worker must not carry the old label.
+_WINDOW_BINDING = {}
+_WINDOW_BINDING_MAX = 1024
 
-    Explicit values win. Otherwise the identity a worker declared through the turn-loop protocol
-    on the same MCP session is used. Never raises.
+
+def _window_identity(session: str, ts: float):
+    """(task, worker, how) from the coordinator's turn windows (tools/turn_context.py).
+
+    how: "window" (one worker in flight), "session-window" (several, but this session was bound
+    earlier by an unambiguous match to one of them), "ambiguous" (several, no usable binding:
+    task and worker stay EMPTY), or "" (no window matched / no file). Never raises.
+    """
+    try:
+        from tools import turn_context
+        cands = turn_context.candidates(float(ts))
+        if not cands:
+            return "", "", ""
+        now = time.time()
+        if len(cands) == 1:
+            worker, task = cands[0]
+            if session:
+                with _LOCK:
+                    if len(_WINDOW_BINDING) >= _WINDOW_BINDING_MAX:
+                        _WINDOW_BINDING.clear()
+                    _WINDOW_BINDING[session] = (task, worker, now)
+            return task, worker, "window"
+        if session:
+            with _LOCK:
+                bound = _WINDOW_BINDING.get(session)
+            if bound and now - bound[2] <= turn_context.MAX_OPEN_S \
+                    and any(w == bound[1] for w, _t in cands):
+                return bound[0], bound[1], "session-window"
+        return "", "", "ambiguous"
+    except Exception:
+        return "", "", ""
+
+
+def _identity_for(tool: str, arguments, session: str, task: str, worker: str, ts: float = None):
+    """(task, worker, how) for a call. `how` is "explicit", "session", "window",
+    "session-window", "ambiguous" or "" (not attributable).
+
+    Explicit values win. Then the identity a worker declared through the turn-loop protocol on
+    the same MCP session. Then the coordinator's own record of whose turn was in flight at `ts`
+    (see tools/turn_context.py for the clock basis and the overlap rule). Never raises.
     """
     try:
         if task or worker:
             return task, worker, "explicit"
+        got = _declared_identity(tool, arguments, session)
+        if got:
+            return got
+        return _window_identity(session, ts if ts is not None else time.time())
+    except Exception:
+        return "", "", ""
+
+
+def _declared_identity(tool: str, arguments, session: str):
+    """The turn-loop declaration path: (task, worker, "session") or None. Never raises."""
+    try:
         if not session:
-            return "", "", ""
+            return None
         args = arguments if isinstance(arguments, dict) else {}
         if tool in _LOOP_DECLARING and args.get("job_id"):
             with _LOCK:
@@ -478,14 +531,14 @@ def _identity_for(tool: str, arguments, session: str, task: str, worker: str):
             if got:
                 return got[0], got[1], "session"
             job = str(args.get("job_id") or "")
-            return (job, "", "session") if job else ("", "", "")
+            return (job, "", "session") if job else None
         with _LOCK:
             got = _SESSION_IDENTITY.get(session)
         if got:
             return got[0], got[1], "session"
     except Exception:
         pass
-    return "", "", ""
+    return None
 
 
 def record_call(tool: str, arguments=None, *, task: str = "", worker: str = "",
@@ -510,13 +563,14 @@ def record_call(tool: str, arguments=None, *, task: str = "", worker: str = "",
         _sess = session_fingerprint()
     except Exception:
         _sess = ""
-    task, worker, _how = _identity_for(tool, arguments, _sess, task, worker)
+    _ts = float(ts if ts is not None else time.time())
+    task, worker, _how = _identity_for(tool, arguments, _sess, task, worker, _ts)
     _mono = time.monotonic()
     row = {
         "schema": SCHEMA_VERSION,
         "event": "call",
         "id": cid,
-        "ts": float(ts if ts is not None else time.time()),
+        "ts": _ts,
         "mono": round(_mono, 4),
         "proc": _PROC,
         "tool": str(tool or "")[:120],

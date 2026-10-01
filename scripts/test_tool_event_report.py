@@ -40,6 +40,21 @@ def test_report_counts_durations_gaps_and_fill_rates():
     assert a["per_task"]["j1"]["failed"] == 1
 
 
+def test_fill_rate_is_reported_by_attribution_kind():
+    rows = []
+    rows += _pair(1, "a", 100.0, 1.0, task="j", worker="w", attr="explicit")
+    rows += _pair(2, "a", 110.0, 1.0, task="j", worker="w", attr="window")
+    rows += _pair(3, "a", 120.0, 1.0, task="j", worker="w", attr="session-window")
+    rows += _pair(4, "a", 130.0, 1.0, attr="ambiguous")
+    rows += _pair(5, "a", 140.0, 1.0, task="j", worker="w", attr="session")
+    rows += _pair(6, "a", 150.0, 1.0)
+    a = R.analyse(rows)
+    assert a["attr_kinds"] == {"explicit": 1, "session": 1, "window": 1, "session-window": 1,
+                               "ambiguous": 1, "none": 1}
+    text = R.render(a)
+    assert "attribution by kind" in text and "ambiguous 1" in text and "none 1" in text
+
+
 def test_gap_falls_back_to_wall_clock_across_processes():
     rows = _pair(1, "a", 100.0, 1.0, proc="p1") + _pair(2, "b", 105.0, 1.0, proc="p2")
     rows[2]["mono"] = 5.0            # a different process's monotonic clock is not comparable

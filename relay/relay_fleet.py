@@ -4515,6 +4515,15 @@ class RelayWorker:
             _tw.open_turn(self.name, self._turn_sent_at)
         except Exception:
             pass
+        # THE SAME FACT, WRITTEN WHERE THE MCP SERVER CAN READ IT. turn_windows above lives in
+        # this process; the server that writes the tool ledger is another one, and workers never
+        # declare which job they are on, so every ledger row was unattributed. The server labels
+        # a call from these windows (tools/turn_context.py). Never allowed to break a turn.
+        try:
+            from tools import turn_context as _tc
+            _tc.record_open(self.name, self.jid, self.run_id, self.turn, self._turn_sent_at)
+        except Exception:
+            pass
         # a send actually went through -> reset BOTH the generation-wait count and the
         # wall-clock streak stamp so the next slow turn gets a fresh full patience budget.
         self.gen_waits = 0
@@ -5436,6 +5445,13 @@ class RelayWorker:
         try:
             from relay import turn_windows as _tw
             _tw.close_turn(self.name)
+        except Exception:
+            pass
+        try:
+            if not _resume and getattr(self, "_turn_sent_at", 0.0):
+                from tools import turn_context as _tc
+                _tc.record_close(self.name, self.jid, self.run_id, self.turn,
+                                 self._turn_sent_at, time.time())
         except Exception:
             pass
         # LOCK-AMBIGUITY PROBE ANSWER. A LOCK_PROBE_QUESTION was sent as this worker's previous

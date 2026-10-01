@@ -35,6 +35,13 @@ if REPO not in sys.path:
 #: Gateway-internal lookups written by main.py's _log_discovery: catalogue, signature, refused.
 DISCOVERY_PREFIX = "call_tool."
 
+#: How a row's task/worker was obtained (the ledger's `attr` field); rows without it are "none".
+#: explicit = the caller passed it; session = the worker declared it via the turn-loop protocol;
+#: window = exactly one worker's turn was in flight (coordinator's turn_context);
+#: session-window = several were, but this MCP session was bound earlier by a `window` match;
+#: ambiguous = several were and nothing disambiguates: task/worker are deliberately EMPTY.
+ATTR_KINDS = ("explicit", "session", "window", "session-window", "ambiguous")
+
 
 def percentile(values, q):
     """Nearest-rank percentile of a list of numbers, or None when empty."""
@@ -106,6 +113,7 @@ def analyse(rows, top=20):
     pairs = pair_events(rows)
     per_tool, per_task = {}, {}
     n_task = n_worker = n_session_attr = orphans = legacy = discovery = 0
+    attr_kinds = dict.fromkeys(ATTR_KINDS + ("none",), 0)
     for call, outcome in pairs:
         tool = str(call.get("tool") or "")
         dur = duration_of(call, outcome)
@@ -117,6 +125,8 @@ def analyse(rows, top=20):
         if tool.startswith(DISCOVERY_PREFIX):
             discovery += 1
         task = str(call.get("task") or "")
+        kind = call.get("attr") if call.get("attr") in ATTR_KINDS else "none"
+        attr_kinds[kind] += 1
         if task:
             n_task += 1
             if call.get("attr") == "session":
@@ -134,7 +144,7 @@ def analyse(rows, top=20):
     total = len(pairs)
     return {
         "calls": total, "orphans": orphans, "legacy": legacy, "discovery": discovery,
-        "task_filled": n_task, "worker_filled": n_worker, "session_attributed": n_session_attr,
+        "attr_kinds": attr_kinds, "task_filled": n_task, "worker_filled": n_worker, "session_attributed": n_session_attr,
         "per_tool": per_tool, "per_task": per_task, "gaps": gaps(pairs), "top": top,
     }
 
@@ -153,6 +163,8 @@ def render(a):
     lines.append("- task filled: %d (%s), of which from the worker's own session declaration: %d"
                  % (a["task_filled"], share(a["task_filled"]), a["session_attributed"]))
     lines.append("- worker filled: %d (%s)" % (a["worker_filled"], share(a["worker_filled"])))
+    lines.append("- attribution by kind: " + ", ".join(
+        "%s %d (%s)" % (k, v, share(v)) for k, v in a["attr_kinds"].items()))
     lines.append("- inter-call gap p50/p95 (s): %s / %s over %d gaps"
                  % (_fmt(percentile(a["gaps"], 50)), _fmt(percentile(a["gaps"], 95)),
                     len(a["gaps"])))
