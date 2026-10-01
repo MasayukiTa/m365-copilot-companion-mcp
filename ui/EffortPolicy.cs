@@ -385,3 +385,147 @@ public static class FanoutDepthView
         return ja ? "選択は次の分割から反映" : "selection applies from the next split";
     }
 }
+
+// The split-group line on a fan-out parent card, WPF-free (same file as FanoutView). Reads one
+// entry of status.json "groups" (relay/family_view.py) and, for a root group, the usage of its
+// tree (status.json "tree_budget") and the depth report ("fanout_depth"). Every nesting field is
+// optional: a group without them is worded exactly as a flat group always was. OWNER RULES: the
+// goal text is never shown (only counts and labels); one short line; no popup.
+public static class GroupTreeView
+{
+    static string Str(Dictionary<string, object> d, string k)
+    {
+        object v;
+        return (d != null && d.TryGetValue(k, out v) && v != null) ? v.ToString() : "";
+    }
+
+    static Dictionary<string, object> Obj(Dictionary<string, object> d, string k)
+    {
+        object v;
+        return (d != null && d.TryGetValue(k, out v)) ? v as Dictionary<string, object> : null;
+    }
+
+    static double Num(Dictionary<string, object> d, string k, double dflt)
+    {
+        object v;
+        if (d == null || !d.TryGetValue(k, out v) || v == null) return dflt;
+        try { return Convert.ToDouble(v, System.Globalization.CultureInfo.InvariantCulture); }
+        catch (Exception) { return dflt; }
+    }
+
+    static int Int(Dictionary<string, object> d, string k) { return (int)Num(d, k, 0); }
+
+    static string Count(Dictionary<string, object> ch, string key, string label)
+    {
+        int n = Int(ch, key);
+        return n > 0 ? label + " " + n : "";
+    }
+
+    /// <summary>Nesting depth of the group, 0 for a root or a flat group (field absent).</summary>
+    public static int Depth(Dictionary<string, object> g)
+    {
+        return Math.Max(0, Math.Min(6, Int(g, "depth")));
+    }
+
+    /// <summary>Left indent in pixels for a nested group's line.</summary>
+    public static int IndentPx(Dictionary<string, object> g) { return Depth(g) * 14; }
+
+    public static string MergeWords(Dictionary<string, object> g, bool ja)
+    {
+        string st = Str(g, "merge_state");
+        if (st == "waiting_on_subgroups") return ja ? "下位グループの統合待ち" : "waiting on sub-groups";
+        if (st == "unknown") return ja ? "不明" : "unknown";
+        return Str(g, "merge_label");
+    }
+
+    /// <summary>One line: split group, children counts, merge state, then (only when the group
+    /// carries them) sub-group count and a missing-parent note. A flat group's text is the same
+    /// as before nesting existed.</summary>
+    public static string Line(Dictionary<string, object> g, bool ja)
+    {
+        if (g == null) return "";
+        var ch = Obj(g, "children") ?? new Dictionary<string, object>();
+        var parts = new List<string>();
+        string[] counts = {
+            Count(ch, "queued", ja ? "待機" : "queued"),
+            Count(ch, "running", ja ? "実行中" : "running"),
+            Count(ch, "done", ja ? "完了" : "done"),
+            Count(ch, "failed", ja ? "失敗" : "failed"),
+            Count(ch, "interrupted", ja ? "中断" : "interrupted") };
+        foreach (string p in counts) if (p.Length > 0) parts.Add(p);
+        string head = (ja ? "分割グループ 子" : "Split group, ") + Int(g, "children_total")
+                      + (ja ? "件" : " parts");
+        string body = parts.Count > 0 ? ": " + string.Join(" · ", parts.ToArray()) : "";
+        string ml = MergeWords(g, ja);
+        string s = head + body + (ml.Length > 0 ? (ja ? " / 統合: " : " / merge: ") + ml : "");
+        object ids;
+        int subs = 0;
+        if (g.TryGetValue("child_group_ids", out ids) && ids is object[]) subs = ((object[])ids).Length;
+        subs += Int(g, "child_group_ids_truncated");
+        int desc = Int(g, "descendant_count");
+        if (subs > 0 || desc > 0)
+        {
+            if (subs < 1) subs = desc;
+            s += ja ? " / 下位グループ " + subs + "件" + (desc > subs ? " (全部で " + desc + "件)" : "")
+                    : " / sub-groups: " + subs + (desc > subs ? " (" + desc + " in all)" : "");
+        }
+        object orph;
+        if (g.TryGetValue("orphan", out orph) && orph is bool && (bool)orph)
+            s += ja ? " / 親グループが見つかりません" : " / parent group not found";
+        return s;
+    }
+
+    /// <summary>Usage of the root group's tree: used/limit for total, active, turns, minutes.
+    /// Only for a root group (depth 0) whose root has an entry in tree_budget; null otherwise.
+    /// level: 0 normal, 1 at 80% or more of any limit, 2 at 100% or more.</summary>
+    public static string BudgetText(Dictionary<string, object> statusRoot, Dictionary<string, object> g,
+                                    bool ja, out int level)
+    {
+        level = 0;
+        if (g == null || Depth(g) != 0) return null;
+        var tb = Obj(statusRoot, "tree_budget");
+        var e = tb != null ? Obj(tb, Str(g, "root_id").Length > 0 ? Str(g, "root_id") : Str(g, "campaign_id")) : null;
+        if (e == null) return null;
+        var lim = Obj(e, "limits") ?? Obj(statusRoot, "fanout_budget");
+        var parts = new List<string>();
+        for (int i = 0; i < FanoutBudgetView.ReportKeys.Length; i++)
+        {
+            string k = FanoutBudgetView.ReportKeys[i];
+            if (e == null || !e.ContainsKey(k) || e[k] == null) continue;
+            double used = Num(e, k, 0);
+            double max = Num(lim, k, 0);
+            string s = FanoutBudgetView.ShortLabel(i, ja) + " " + (long)used;
+            if (max > 0)
+            {
+                s += "/" + (long)max;
+                if (used * 100 >= max * 100) level = 2;
+                else if (used * 100 >= max * 80 && level < 1) level = 1;
+            }
+            parts.Add(s);
+        }
+        if (parts.Count == 0) return null;
+        return (ja ? "使用量 " : "usage ") + string.Join(" · ", parts.ToArray());
+    }
+
+    /// <summary>The note when the coordinator applies a split depth below the configured one.</summary>
+    public static string DepthNote(Dictionary<string, object> statusRoot, bool ja)
+    {
+        var fd = Obj(statusRoot, "fanout_depth");
+        if (fd == null || !fd.ContainsKey("configured") || !fd.ContainsKey("effective")) return null;
+        int conf = Int(fd, "configured"), eff = Int(fd, "effective");
+        if (eff >= conf) return null;
+        return ja ? "深さは " + eff + " までに制限中: 階層統合は未有効"
+                  : "depth capped at " + eff + ": hierarchical merge not enabled";
+    }
+
+    /// <summary>The second, collapsible line under a root group: usage + depth note. null when
+    /// neither is reported (a flat status.json shows nothing extra).</summary>
+    public static string ExtraText(Dictionary<string, object> statusRoot, Dictionary<string, object> g,
+                                   bool ja, out int level)
+    {
+        string b = BudgetText(statusRoot, g, ja, out level);
+        string n = (g != null && Depth(g) == 0) ? DepthNote(statusRoot, ja) : null;
+        if (b == null) return n;
+        return n == null ? b : b + " / " + n;
+    }
+}
