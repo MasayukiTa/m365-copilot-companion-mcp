@@ -105,7 +105,11 @@ def test_sixty_old_campaigns_and_one_of_this_run_queue_only_this_runs_children(t
 
 
 def test_done_children_of_this_run_are_still_skipped(tmp_path):
-    _write(tmp_path, _old_ledger(5) + _family(PARENT, n=3, stamp=RUN))
+    # A child counts as finished when its answer is on the ledger too: DONE in the done-map
+    # without any answer is recovered or re-queued once (tests/test_child_result_durable.py).
+    _write(tmp_path, _old_ledger(5) + _family(PARENT, n=3, stamp=RUN)
+           + [{"kind": "child_result", "campaign_id": _cid(PARENT), "subtask_index": 2,
+               "outcome": "DONE", "result": "r"}])
     _snapshot(tmp_path, [_worker(PARENT)])
     done = {fr.goal_resume_key(_child(_cid(PARENT), 2)["goal"]): "DONE"}
     goals, _, _ = _resume(tmp_path, done)
