@@ -2402,6 +2402,36 @@ def run_relay(
         t_send = time.time()
         try:
             driver.send(job)
+        except FreshSubmitAmbiguous as e:
+            # A fresh submit may already have landed even though its USER-turn receipt could
+            # not be proven. Treating that ambiguity like a transient transport failure and
+            # re-sending the same logical job can duplicate real work. This single-conversation
+            # loop used to do exactly that through the generic Exception branch below.
+            #
+            # The ONLY safe salvage is independent acceptance evidence from the target
+            # workspace. If those checks already pass, no resend is needed; otherwise stop and
+            # make the ambiguous delivery visible to the operator. Never rotate/retry here.
+            _amb_passed = False
+            _amb_detail = ""
+            if checks_norm:
+                try:
+                    _amb_passed, _amb_detail = run_all_blocking(checks_norm, cwd=cwd)
+                except Exception as _amb_exc:
+                    _amb_passed = False
+                    _amb_detail = "acceptance check error: %s" % type(_amb_exc).__name__
+            runlog_append(run_id, {
+                "turn": turn, "event": "fresh_submit_ambiguous",
+                "acceptance_checked": bool(checks_norm),
+                "acceptance_passed": bool(_amb_passed),
+                "detail": (_amb_detail or "")[:400],
+            })
+            if _amb_passed:
+                outcome = "DONE"
+                reason = "fresh submit delivery ambiguous; independent acceptance checks already pass"
+            else:
+                outcome = "STUCK"
+                reason = "fresh submit delivery ambiguous; automatic resend forbidden: %s" % str(e)
+            break
         except ConversationClosed as e:
             # The target tab/composer is gone (conversation ended). Retrying a dead
             # target can NEVER succeed, so this is terminal -- skip the transient-retry

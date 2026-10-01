@@ -31,3 +31,42 @@ def test_local_loop_never_rotates_or_retries_an_ambiguous_fresh_submit():
     assert "_rotate" not in amb_block
     assert "mark_waiting_runtime" in amb_block
     assert "delivery ambiguous" in amb_block.lower()
+
+
+class _AmbiguousRelayDriver:
+    def __init__(self):
+        self.sent = []
+
+    def send(self, text):
+        from relay.send_errors import FreshSubmitAmbiguous
+        self.sent.append(text)
+        raise FreshSubmitAmbiguous("fresh receipt ambiguous")
+
+
+def test_single_relay_never_retries_an_ambiguous_fresh_submit():
+    from relay.copilot_autopilot_relay import run_relay
+    driver = _AmbiguousRelayDriver()
+    notes = []
+    outcome = run_relay(
+        driver, goal="ambiguous goal", run_id="test_single_ambiguous",
+        notify=lambda title, body: notes.append((title, body)), sleep_s=0,
+        max_transient=1,
+    )
+    assert outcome == "STUCK"
+    assert len(driver.sent) == 1, "receipt ambiguity must never become transient resend"
+    assert len(notes) == 1
+    assert "ambiguous" in notes[0][1].lower()
+
+
+def test_single_relay_may_salvage_ambiguous_submit_only_from_acceptance(tmp_path):
+    import sys
+    from relay.copilot_autopilot_relay import run_relay
+    driver = _AmbiguousRelayDriver()
+    check = {"type": "shell", "argv": [sys.executable, "-c", "print('ok')"]}
+    outcome = run_relay(
+        driver, goal="ambiguous but already satisfied", run_id="test_single_ambiguous_salvage",
+        notify=lambda *a: None, sleep_s=0, checks=check, cwd=str(tmp_path),
+        max_transient=1,
+    )
+    assert outcome == "DONE"
+    assert len(driver.sent) == 1
