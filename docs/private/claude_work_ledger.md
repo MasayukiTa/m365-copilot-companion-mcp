@@ -201,6 +201,10 @@ Next work after this checkpoint:
 
 After the checkpoint above, `git fetch origin main` updated the remote-tracking ref from PR #91's `3d97c39` to `ed16ac9` (PR #92). Main HEAD `ed16ac9` is green on CI, CodeQL, Secret scan, Workflow lint, and Windows build. Treat the earlier wording that called `f2a3ef8` a merge of current main as stale-local-ref wording; final PR #78 convergence still requires the newer main.
 
+### 2026-10-01 -- tool-call attribution moved to the coordinator (branch fix/tool-event-attribution-from-coordinator-20261001)
+
+Root cause read from the code: PR #92 attributed a tool call only when the worker's own MCP session called claim_turn / heartbeat / read_job_context with job_id; real Copilot workers never do (about 1 claim_turn in 5,718 calls, fill 0.0% of 37,156 rows). Fix: relay_fleet writes `.fleet/turn_context.jsonl` (open row at the send, close row at the reply; worker, job, run, turn, t_send, t_done, wall ts, mono, proc, pid; writer rotates at 8 MB, retention cap_jsonl also covers it). tools/tool_ledger.py labels an unlabelled call from those windows by wall-clock epoch time with 1.5 s slack at each edge: one worker in flight -> attr=window; several but the MCP session was bound earlier by an unambiguous match -> session-window; several and no binding -> task/worker left empty, attr=ambiguous. Explicit and turn-loop-declared identities still win. scripts/tool_event_report.py now reports fill by attr kind. The MCP server and the coordinator must both be restarted to pick this up. Large fleets will stay mostly ambiguous (see relay/turn_windows.py measurement); that is reported, not guessed.
+
 ## 2026-10-01 - correction: what the recovery work does and does not cover
 
 Earlier entries and chat reports called the interrupted-run recovery work (non-destructive reap, exactly-once resume) a finished "phase" or "stage done". That wording was wrong in two ways. It is one item (duplicate suppression across retry/resume) of a larger recursive fan-out effort that is not built: there is no task-node identity and there are no grandchildren. And "done" meant "code merged", not "exit criteria met".

@@ -112,6 +112,10 @@ LIVE_RECORD_REDIRECTS = {
     # Written on the hot path of EVERY tool call, so a test that reaches the gateway fills the
     # operator's evidence ledger with calls that were never made in earnest.
     "tools.tool_ledger": {"LEDGER_PATH": "tool_events.jsonl"},
+    # Written by the coordinator at every turn start/end and READ by the ledger writer to label
+    # calls; a test that drives a turn would otherwise add windows to the operator's file, and a
+    # test that reads it would attribute calls to whatever the fleet was doing that minute.
+    "tools.turn_context": {"CONTEXT_PATH": "turn_context.jsonl"},
     # THE EVIDENCE FOR A POLICY DECISION, WRITTEN BY THE TESTS ABOUT IT. fleet_toolset.check()
     # appends a row for every call it would refuse, and the module's own prose cites that log
     # as the measurement justifying its default of `enforce`. Its tests call check() directly
