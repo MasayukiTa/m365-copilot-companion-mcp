@@ -213,3 +213,8 @@ Status in plain terms:
 - Done and verified live for 2 goals: non-destructive reap, interrupted snapshot, exactly-once merge on resume.
 - Still open: resume of the whole fan-out family, supervisor auto-resume (currently off), stage-2 outcome comparison, the stage-1 on-screen check, and tool-event attribution.
 - Existing entries above are left as written; read "stage done" there as "code merged".
+
+## 2026-10-01 15:00 JST - one STUCK worker no longer becomes several copies
+- Cause (2026-10-01, one job ran 3 concurrent copies): the ambiguous-fresh-submit end was STUCK with prose "not retried" but no `retryable_override`, so the runner and the cockpit (both keyed on the outcome string) re-queued it; the cockpit also re-queued the same terminal worker every tick (budget keyed by goal text only).
+- Fix (branch fix/stuck-worker-retried-once-20261001): (1) ambiguous submit sets retryable_override=False, status rows export `retryable` and `retry_queued`, cockpit IsRetryableWorker honours `retryable:false`; (2) cockpit remembers re-queued workers (jid or name+run_id), skips ones the runner already re-queued or whose goal is live; (3) runner add_goal refuses a retry-tagged goal already queued/running (mechanism row); (4) a recycle that overflows on its first reply twice in a row ends non-retryable instead of repeating up to 8 times (conservative variant: tool-call identity is not visible to the worker, so it keys on first-turn overflow).
+- Tests: tests/test_stuck_worker_retried_once.py (in ci.yml). Open: PR review/merge.

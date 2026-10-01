@@ -1054,6 +1054,7 @@ class CockpitWindow : Window
     bool _autoRetry = true;
     int _autoRetryMax = 2;
     Dictionary<string, int> _autoRetryCount = new Dictionary<string, int>();
+    HashSet<string> _autoRetriedWorkers = new HashSet<string>();   // RetryWorkerKey of workers already re-queued
 
     // Conversation retention. OWNER DECISION 2026-09-24: _retDays now DEFAULTS TO 90, not 0.
     // The store exists because history was disappearing, and a policy that started deleting
@@ -11215,6 +11216,11 @@ class CockpitWindow : Window
             int n = 0;
             if (_autoRetryCount.ContainsKey(goal)) n = _autoRetryCount[goal];
             if (n >= _autoRetryMax) continue;          // budget spent -> never loop
+            // ONE RE-QUEUE PER WORKER. The terminal worker stays terminal, so without this every
+            // tick re-queued the same STUCK worker until the per-goal budget ran out (2026-10-01:
+            // two extra copies on top of the runner's own retry).
+            if (RetryAlreadyCovered(root, w)) continue;
+            _autoRetriedWorkers.Add(RetryWorkerKey(w));
             _autoRetryCount[goal] = n + 1;             // count BEFORE re-queue (idempotent per tick)
             RetryGoal(w);
         }
@@ -13346,9 +13352,44 @@ class CockpitWindow : Window
 
     static bool IsRetryableWorker(Dictionary<string, object> w)
     {
-        return w != null
-            && !IsLocalLoopControlGoal(S(w, "goal"))
+        if (w == null) return false;
+        // The worker's own verdict beats the outcome-wide rule: `retryable: false` is written when
+        // re-running could duplicate work (e.g. an ambiguous fresh submit, outcome STUCK).
+        object rv;
+        if (w.TryGetValue("retryable", out rv) && rv is bool && !(bool)rv) return false;
+        return !IsLocalLoopControlGoal(S(w, "goal"))
             && IsRetryableOutcome(S(w, "outcome"));
+    }
+
+    // One key per worker instance (jid when the runner minted one, else name + run_id), so a
+    // terminal STUCK worker is re-queued at most once per cockpit session.
+    static string RetryWorkerKey(Dictionary<string, object> w)
+    {
+        string jid = S(w, "jid");
+        if (!string.IsNullOrEmpty(jid)) return "jid:" + jid;
+        return "w:" + S(w, "name") + "|" + S(w, "run_id");
+    }
+
+    // True when this terminal worker has already been re-queued (by us, or by the runner), or an
+    // identical goal is queued/running now -- i.e. another copy exists and must not be added.
+    bool RetryAlreadyCovered(Dictionary<string, object> root, Dictionary<string, object> w)
+    {
+        if (_autoRetriedWorkers.Contains(RetryWorkerKey(w))) return true;
+        object rq;
+        if (w.TryGetValue("retry_queued", out rq) && rq is bool && (bool)rq) return true;
+        string goal = S(w, "goal");
+        object wo;
+        if (root != null && root.TryGetValue("workers", out wo) && wo is object[])
+        {
+            foreach (object o in (object[])wo)
+            {
+                var x = o as Dictionary<string, object>;
+                if (x == null || object.ReferenceEquals(x, w)) continue;
+                if (IsTerminalWorker(x)) continue;
+                if (S(x, "goal") == goal) return true;
+            }
+        }
+        return false;
     }
 
     // P0: an INFRA_STUCK worker is NOT a task failure — the engine parked it because the infra
@@ -15230,6 +15271,7 @@ class CockpitWindow : Window
         item["checks"] = checks;
         item["cwd"] = S(w, "cwd");
         item["priority"] = true;
+        item["retry"] = true;   // the runner refuses a retry whose goal is already live
         return item;
     }
 
@@ -15289,6 +15331,8 @@ class CockpitWindow : Window
             // mean "everything that is not DONE", which swept up fan-out parents and threw
             // away the merged answers they carried.
             if (!IsRetryableWorker(w)) continue;
+            // Already re-queued once (by us or by the runner): never a second copy of this worker.
+            if (RetryAlreadyCovered(null, w)) continue;
             string g = S(w, "goal");
             // Same counter, same key (goal text), same ceiling as AutoRetryScan, so the auto
             // and manual paths cannot each spend a full allowance on the same goal.
@@ -15299,6 +15343,7 @@ class CockpitWindow : Window
                 if (used >= _autoRetryMax) { skippedAtCap++; continue; }
                 _autoRetryCount[g] = used + 1;   // count BEFORE queueing, as AutoRetryScan does
             }
+            _autoRetriedWorkers.Add(RetryWorkerKey(w));
             adds.Add(RetryEntry(w));
             if (!string.IsNullOrEmpty(g)) goalTexts.Add(g);
             n++;
