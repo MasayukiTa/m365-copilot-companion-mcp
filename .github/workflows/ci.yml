@@ -201,6 +201,7 @@ jobs:
             relay/test_family_view_nesting.py \
             relay/test_campaign_tree_identity.py \
             relay/test_recursive_fanout_depth.py \
+            relay/test_write_scope.py \
             relay/test_verification_survives_the_archive.py \
             relay/test_fleet_autostart.py \
             relay/test_refute_resend.py \
@@ -554,6 +555,7 @@ jobs:
             bridge/test_conv_url_follows_the_turn.py \
             tests/test_retry_sets_agree.py \
             tests/test_fanout_default_on_agrees.py \
+            tests/test_fanout_write_scope_agrees.py \
             tests/test_fanout_budget.py \
             tests/test_stuck_worker_retried_once.py \
             tests/test_task_tree.py \
@@ -592,6 +594,7 @@ jobs:
             tests/test_fleet_resume_phase2.py \
             tests/test_child_result_durable.py \
             tests/test_hierarchical_merge.py \
+            tests/test_hierarchical_merge_adversarial.py \
             tests/test_flat_merge_exactly_once.py \
             tests/test_resume_scoped_to_interrupted_run.py \
             tests/test_a_matched_skill_is_checked_before_it_is_followed.py \
