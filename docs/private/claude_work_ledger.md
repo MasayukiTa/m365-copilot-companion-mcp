@@ -229,6 +229,11 @@ Status in plain terms:
 - Live run (read-only): 38,349 ledger calls, 34,134 unattributed/ambiguous, 0 calls mappable to a fan-out child, 0 qualifying campaigns of 123 known: INSUFFICIENT (<20 campaigns). Campaign task ids and attributed task ids do not overlap in the current data.
 - Tests: scripts/test_sibling_dup_report.py (registered in ci.yml). Open: PR review/merge.
 
+## 2026-10-02 - read-only task tree module and report
+- Change (branch feat/task-tree-module-20261002): relay/task_tree.py derives a task tree (parent, root, depth, children, descendants, subtree turns, state, merge state) from existing status.json workers and campaigns.jsonl; scripts/tree_report.py prints a markdown report (tree size, depth, per-root descendants/turns, duplication by goal_hash/jid, merge failure rate, quota if present, explicit unknown bucket).
+- Behaviour unchanged: only files added; orphans and cycles are reported, never repaired or guessed.
+- Tests: tests/test_task_tree.py (in ci.yml). Open: PR review/merge.
+
 ## 2026-10-02 - task-tree identity on fan-out campaign records
 - Change (branch feat/campaign-tree-identity-20261002): child goals from fanout.child_goals now carry parent_campaign_id, parent_subtask_index and root_id (top-level parent: root is the split's own campaign id; deeper child inherits the parent's root). The campaigns.jsonl header also records parent_task_id, parent_campaign_id and root_id; status.json worker rows carry root_id when known (kept in the task envelope metadata, outside the goal hash).
 - Additive and record-only: no depth gate or MAX_DEPTH change, no recursion; old ledgers without the keys load as before.
