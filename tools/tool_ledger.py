@@ -581,6 +581,20 @@ def record_call(tool: str, arguments=None, *, task: str = "", worker: str = "",
     }
     if _how:
         row["attr"] = _how
+    if _how in ("window", "session-window") and worker:
+        # Additive fan-out identity from the same window (campaign_id, subtask_id, parent_task_id,
+        # root_id, role) so a join with the campaign records needs no id translation. Never
+        # touches task/worker; absent for non-fan-out workers and for old window rows.
+        try:
+            from tools import turn_context
+            _id = turn_context.identity_of(worker, _ts)
+            for _k, _dst in (("campaign_id", "campaign_id"), ("task_id", "subtask_id"),
+                             ("parent_task_id", "parent_task_id"), ("root_id", "root_id"),
+                             ("role", "role")):
+                if _id.get(_k):
+                    row[_dst] = _id[_k]
+        except Exception:
+            pass
     if _sess:
         row["session"] = _sess
     with _LOCK:
