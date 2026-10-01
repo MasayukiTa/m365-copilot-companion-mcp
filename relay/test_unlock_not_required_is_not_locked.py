@@ -139,3 +139,27 @@ def test_real_backend_failure_negative_lock_wording_is_narrow():
     resp = ("locked client IP の文言は無いように見えるが、write_file は拒否され、"
             "unlock が必要です。")
     assert RF._explicit_unlock_not_required(resp) is False
+
+
+def test_real_w5_decision_does_not_inject_unlock_for_backend_failure(monkeypatch):
+    monkeypatch.setattr(RF, "_unlock_password", lambda: "must-not-be-used")
+    monkeypatch.setattr(RF, "_exclusively_refused",
+                        lambda *a, **k: None if k.get("return_record") else False)
+    w = RF.RelayWorker("Audit the repository read-only", "w5-regression")
+    before = w._unlock_attempts
+    resp = (
+        "ツール実行系が現在すべて Tool did not respond with success を返しています。"
+        "「locked client IP」の文言は無いため解錠では解消しません。"
+        "STUCK: ツールゲートウェイの実行・読み取り系呼び出しが一時障害で応答せず、"
+        "解錠対象のエラー文言（locked client IP）ではなく、復旧後に再開します。"
+        + " analysis" * 60
+    )
+
+    w._decide(resp)
+
+    assert w._unlock_attempts == before
+    assert w._lock_probe_pending is False
+    assert w.job != RF.LOCK_PROBE_QUESTION
+    assert w.status == "ready"
+    assert w.outcome is None
+    assert "transient retry" in w.reason
