@@ -548,7 +548,13 @@ def campaigns_from_ledger(lines):
                         # nothing verifies -- silently, and only on the crash path.
                         "checks": rec.get("checks") or [],
                         "partial": rec.get("partial") or "",
-                        "children": out.get(cid, {}).get("children", [])}
+                        "children": out.get(cid, {}).get("children", []),
+                        # WHICH RUN SPLIT THIS FAMILY (additive; absent on old headers). A
+                        # header can repeat, so every stamp seen is kept. Resume uses it to
+                        # take only the interrupted run's families, never the whole ledger.
+                        "run_ids": list(_prev.get("run_ids") or [])
+                        + ([str(rec["run_id"])] if rec.get("run_id") else []),
+                        "start_ts": rec.get("ts") or _prev.get("start_ts")}
             # Marker flags that arrived before the header survive it.
             for _k in ("merge_done", "merge_requeued", "child_results", "agg_key"):
                 if _k in _prev:
