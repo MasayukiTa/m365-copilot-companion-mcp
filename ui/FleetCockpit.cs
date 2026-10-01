@@ -1117,6 +1117,8 @@ class CockpitWindow : Window
         public string Reason = "";
         public double Started = 0;
         public double Expires = 0;
+        public int SupervisorPid = 0;
+        public double SupervisorStarted = 0;
     }
     // Old supervisors wrote only `started`; preserve that format for one deployment generation.
     // New supervisors write their own policy-derived expiry. The hard cap is only corruption /
@@ -1138,6 +1140,12 @@ class CockpitWindow : Window
         return a;
     }
     readonly object _healthLock = new object();
+    // EXACT HEALTH-POLL SELFTEST SEAMS. Null in every normal process. They exist so a temp
+    // harness can execute PollHealthOnce() itself against an unreachable synthetic server and a
+    // temp transition marker without stopping the production MCP server. Both uses are gated by
+    // WindowSelfTest.Active below; normal cockpit behaviour cannot redirect either source.
+    string _serverTransitionPathForSelfTest = null;
+    Func<string, int, string> _serverHealthBodyForSelfTest = null;
     // The last /health body, captured by the Server dot's poll so dot 5 can read the FLEET
     // tool path from it without a second HTTP round trip. Empty until the first successful
     // poll, and empty must read as "no evidence" everywhere it is used.
@@ -2701,11 +2709,13 @@ class CockpitWindow : Window
     {
         try
         {
-            string path = Path.Combine(RepoRootForSettings(), ".fleet", "server_transition.json");
+            string path = (WindowSelfTest.Active && !string.IsNullOrEmpty(_serverTransitionPathForSelfTest))
+                ? _serverTransitionPathForSelfTest
+                : Path.Combine(RepoRootForSettings(), ".fleet", "server_transition.json");
             if (!File.Exists(path)) return null;
             var raw = _js.DeserializeObject(File.ReadAllText(path, Encoding.UTF8)) as Dictionary<string, object>;
             if (raw == null) return null;
-            object stateObj, reasonObj, startedObj, expiresObj;
+            object stateObj, reasonObj, startedObj, expiresObj, supervisorPidObj, supervisorStartedObj;
             if (!raw.TryGetValue("state", out stateObj) || stateObj == null) return null;
             string state = Convert.ToString(stateObj).Trim().ToLowerInvariant();
             if (state != "planned_restart") return null;
@@ -2723,16 +2733,66 @@ class CockpitWindow : Window
             double effectiveExpiry = Math.Min(expires, started + SERVER_TRANSITION_HARD_MAX_AGE_S);
             if (nowUnix > effectiveExpiry) return null;
 
+            // OWNERSHIP IS PART OF FRESHNESS. A PID alone is unsafe on Windows because it can be
+            // reused after the supervisor dies. New markers therefore name both PID and process
+            // birth. If either is missing/unreadable/mismatched, fail closed: an unverifiable
+            // marker is never permission to soften a real server outage from red to yellow.
+            if (!raw.TryGetValue("supervisor_pid", out supervisorPidObj) || supervisorPidObj == null) return null;
+            if (!raw.TryGetValue("supervisor_started", out supervisorStartedObj) || supervisorStartedObj == null) return null;
+            int supervisorPid = Convert.ToInt32(supervisorPidObj, System.Globalization.CultureInfo.InvariantCulture);
+            double supervisorStarted = Convert.ToDouble(supervisorStartedObj, System.Globalization.CultureInfo.InvariantCulture);
+            if (supervisorPid <= 0 || supervisorStarted <= 0.0) return null;
+            try
+            {
+                var supervisorProcess = System.Diagnostics.Process.GetProcessById(supervisorPid);
+                if (supervisorProcess.HasExited) return null;
+                double processStarted = new DateTimeOffset(supervisorProcess.StartTime.ToUniversalTime()).ToUnixTimeSeconds();
+                if (Math.Abs(processStarted - supervisorStarted) > 2.0) return null;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+
             string reason = "planned restart";
             if (raw.TryGetValue("reason", out reasonObj) && reasonObj != null)
                 reason = Convert.ToString(reasonObj).Trim();
             if (string.IsNullOrEmpty(reason)) reason = "planned restart";
-            return new PlannedServerTransition { State = state, Reason = reason, Started = started, Expires = expires };
+            return new PlannedServerTransition { State = state, Reason = reason, Started = started, Expires = expires, SupervisorPid = supervisorPid, SupervisorStarted = supervisorStarted };
         }
         catch (Exception)
         {
             // An unreadable transition is not permission to soften a red health signal.
             return null;
+        }
+    }
+
+    // Execute the REAL server segment of PollHealthOnce in a --selftest process. This is not a
+    // second implementation: it only supplies the two external inputs (HTTP body + marker path),
+    // calls PollHealthOnce below, and returns the dot state it actually wrote. Production callers
+    // cannot use it because WindowSelfTest.Active is false.
+    internal string SelfTestServerHealthPoll(string transitionPath, bool reachable)
+    {
+        if (!WindowSelfTest.Active)
+            throw new InvalidOperationException("server health selftest seam is available only under --selftest");
+        string oldPath = _serverTransitionPathForSelfTest;
+        Func<string, int, string> oldBody = _serverHealthBodyForSelfTest;
+        try
+        {
+            _serverTransitionPathForSelfTest = transitionPath;
+            _serverHealthBodyForSelfTest = delegate(string url, int timeoutMs)
+            {
+                if (!reachable) return null;
+                return "{\"status\":\"ok\",\"auth_fail_10m\":0,\"server_code\":\"current\"}";
+            };
+            PollHealthOnce();
+            lock (_healthLock)
+                return _health[0].State.ToString() + "|" + (_health[0].Detail ?? "");
+        }
+        finally
+        {
+            _serverTransitionPathForSelfTest = oldPath;
+            _serverHealthBodyForSelfTest = oldBody;
         }
     }
 
@@ -2752,7 +2812,9 @@ class CockpitWindow : Window
         // So: unreachable stays Red, and a reachable server that is REPORTING A PROBLEM about
         // itself goes Amber rather than Green. Amber, not Red, because the server process is
         // genuinely up -- the distinction matters for what a person does next.
-        string srvBody = HttpBody("http://127.0.0.1:8000/health", 3500);
+        string srvBody = (WindowSelfTest.Active && _serverHealthBodyForSelfTest != null)
+            ? _serverHealthBodyForSelfTest("http://127.0.0.1:8000/health", 3500)
+            : HttpBody("http://127.0.0.1:8000/health", 3500);
         bool srvOk = srvBody != null;
         if (srvOk) { _lastHealthBody = srvBody; _lastHealthBodyAt = NowUnix(); }
         string authFails = HealthField(srvBody, "auth_fail_10m");
@@ -2806,6 +2868,8 @@ class CockpitWindow : Window
             SetDot(0, HealthState.Green, T("hs_srv_detail_stale_recent"), now);
         else
             SetDot(0, HealthState.Green, T("hs_srv_detail_ok"), now);
+
+        if (WindowSelfTest.Active && _serverHealthBodyForSelfTest != null) return;
 
         // 1) Tunnel: read MCP_TUNNEL_URL from ..\.env; GET <url>/health == 200. Gray if none.
         //
@@ -5468,6 +5532,7 @@ class CockpitWindow : Window
         _folderBtn.Click += delegate { FolderToGoals(); };
         btns.Children.Add(_folderBtn);
         _startBtn = new Button();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_startBtn, "startButton");
         _startBtn.Cursor = Cursors.Hand; _startBtn.BorderThickness = new Thickness(0);
         _startBtn.Height = Theme.BtnH; _startBtn.MinWidth = 132; _startBtn.FontWeight = FontWeights.SemiBold;
         _startBtn.Margin = new Thickness(8, 0, 0, 0); _startBtn.Padding = new Thickness(16, 0, 16, 0);

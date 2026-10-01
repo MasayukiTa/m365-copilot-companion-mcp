@@ -24,7 +24,6 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
 import os
 import re
 import sys
@@ -32,6 +31,8 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 _KEY_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=")
 
@@ -63,47 +64,94 @@ def newline_of(text: str) -> str:
     return "\r\n" if "\r\n" in text else "\n"
 
 
-def _plaintext_auth_assignments(text: str):
-    """Return active legacy secret assignments as key -> Counter(value-text).
+def _protect_secret(value: str) -> str:
+    """Protect one legacy value for migration without making secret_store an eager dependency.
 
-    Values are never logged or surfaced; the counters exist only to decide whether a proposed
-    rewrite would persist MORE plaintext secret material than is already on disk.
+    Import lazily so ordinary env-file reads/edits with no legacy secret remain stdlib-only on
+    every platform. When migration is actually needed, Windows DPAPI is required; failure is a
+    refusal, never permission to rewrite the plaintext.
     """
-    out = {key: Counter() for key in _PLAINTEXT_SECRET_KEYS}
-    for line in text.splitlines():
-        m = _KEY_RE.match(line)
-        if not m:
-            continue
-        key = m.group(1)
-        if key in out:
-            out[key][line[m.end():]] += 1
-    return out
+    from tools.secret_store import protect_secret
+    return protect_secret(value)
 
 
-def _assert_no_plaintext_auth_escalation(path: Path, text: str) -> None:
-    """Reject only NEW/CHANGED/DUPLICATED legacy plaintext auth assignments.
+def _active_assignment_key(line: str):
+    m = _KEY_RE.match(line)
+    return (m.group(1), m) if m else (None, None)
 
-    New-PC migration left some installations with readable legacy MCP_API_KEY / unlock lines.
-    Blocking EVERY unrelated .env edit while those lines existed made quickstart unable to
-    change an unrelated flag, even though it did not touch the secret at all.  That is not a
-    security boundary; it is a migration deadlock.
 
-    The generic writer still may not create or mutate a legacy plaintext secret.  A proposed
-    file may retain at most the exact legacy value occurrences already present in the old file.
-    Removing some/all legacy assignments is allowed and is the direction migration should move.
+def _assert_no_plaintext_auth_persistence(text: str) -> None:
+    """Final sink invariant: no active legacy auth secret may be written at all.
+
+    This is deliberately stricter than the edit layer. `set_key` / `unset_key` migrate an
+    existing legacy secret to DPAPI before they call this primitive. Keeping the invariant here
+    means an interrupted temp-file write can never leave another plaintext copy behind.
     """
-    old = _plaintext_auth_assignments(read_text(Path(path)))
-    new = _plaintext_auth_assignments(text)
     bad = []
-    for key in _PLAINTEXT_SECRET_KEYS:
-        for value, count in new[key].items():
-            if count > old[key][value]:
-                bad.append(key)
-                break
+    for line in text.splitlines():
+        key, _m = _active_assignment_key(line)
+        if key in _PLAINTEXT_SECRET_KEYS:
+            bad.append(key)
     if bad:
         raise ValueError(
-            "refusing to persist new or changed legacy plaintext auth secret key(s): %s"
+            "refusing to persist legacy plaintext auth secret key(s): %s"
             % ", ".join(sorted(set(bad))))
+
+
+def _migrate_legacy_plaintext_auth(text: str) -> str:
+    """Replace legacy plaintext auth assignments with DPAPI-protected assignments.
+
+    This is an EDIT-layer migration, not part of the generic sink. A caller that merely wants to
+    toggle an unrelated setting therefore no longer deadlocks on an old install, but the bytes
+    handed to `atomic_write_text` are already free of plaintext secrets. Duplicate plaintext
+    assignments are refused as ambiguous. If a protected assignment already exists, the legacy
+    plaintext value wins (the readers historically prefer plaintext) and the stale protected
+    assignment is replaced, not retained beside it.
+    """
+    lines = text.splitlines()
+    found = {}
+    for line in lines:
+        key, m = _active_assignment_key(line)
+        if key not in _PLAINTEXT_SECRET_KEYS:
+            continue
+        if key in found:
+            raise ValueError("cannot protect legacy plaintext auth: duplicate assignment for %s" % key)
+        value = line[m.end():].strip()
+        # Match bootstrap.py's legacy migration semantics: dotenv-style matching outer quotes
+        # are syntax, not part of the logical secret value. Do not otherwise reinterpret it.
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        found[key] = value
+    if not found:
+        return text
+
+    protected = {}
+    try:
+        for key, value in found.items():
+            protected[key] = _protect_secret(value)
+    except Exception as exc:
+        # Never include the secret or the exception message: either can contain secret material.
+        raise ValueError("cannot protect legacy plaintext auth with DPAPI (%s)" % type(exc).__name__)
+
+    migrated_protected_keys = {_PLAINTEXT_SECRET_KEYS[key] for key in found}
+    out = []
+    emitted = set()
+    for line in lines:
+        key, _m = _active_assignment_key(line)
+        if key in found:
+            if key not in emitted:
+                out.append("%s=%s" % (_PLAINTEXT_SECRET_KEYS[key], protected[key]))
+                emitted.add(key)
+            continue
+        if key in migrated_protected_keys:
+            # A protected value for the same logical secret is superseded by the legacy value
+            # this install was actually using; keep exactly one protected assignment.
+            continue
+        out.append(line)
+
+    nl = newline_of(text) if text else "\n"
+    trailing = text.endswith(("\n", "\r"))
+    return nl.join(out) + (nl if trailing else "")
 
 
 def atomic_write_text(path: Path, text: str, attempts: int = 10) -> None:
@@ -116,7 +164,7 @@ def atomic_write_text(path: Path, text: str, attempts: int = 10) -> None:
     an error. The temporary file is removed on every failure path so none is left behind.
     """
     path = Path(path)
-    _assert_no_plaintext_auth_escalation(path, text)
+    _assert_no_plaintext_auth_persistence(text)
     tmp = path.with_name("%s.tmp-%d" % (path.name, os.getpid()))
     data = text.encode("utf-8")
     try:
@@ -144,6 +192,18 @@ def atomic_write_text(path: Path, text: str, attempts: int = 10) -> None:
                 tmp.unlink()
         except OSError:
             pass
+
+
+def atomic_edit_text(path: Path, text: str, attempts: int = 10) -> None:
+    """Atomically rewrite an EXISTING .env-derived candidate, migrating legacy auth first.
+
+    ``atomic_write_text`` is the final sink and deliberately refuses every active plaintext auth
+    alias.  Callers that read an existing .env, change unrelated settings, and write the result
+    must use this edit-layer helper so old installs are migrated to DPAPI instead of deadlocking
+    on the stricter sink.  Fresh-file and already-protected writers may keep using the sink
+    directly.
+    """
+    atomic_write_text(path, _migrate_legacy_plaintext_auth(text), attempts=attempts)
 
 
 def active_keys(text: str) -> set:
@@ -210,7 +270,8 @@ def set_key(path: Path, key: str, value: str) -> None:
         out.append(line)
     if not done:
         out.append("%s=%s" % (key, value))
-    atomic_write_text(path, nl.join(out) + nl)
+    candidate = nl.join(out) + nl
+    atomic_edit_text(path, candidate)
 
 
 def unset_key(path: Path, key: str) -> bool:
@@ -228,7 +289,8 @@ def unset_key(path: Path, key: str) -> bool:
             continue
         kept.append(line)
     if removed:
-        atomic_write_text(path, nl.join(kept) + nl)
+        candidate = nl.join(kept) + nl
+        atomic_edit_text(path, candidate)
     return removed
 
 

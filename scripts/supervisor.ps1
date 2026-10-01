@@ -171,6 +171,18 @@ if (-not $createdNew) {
     return
 }
 
+# Bind planned-restart telemetry to THIS supervisor instance, not merely its reusable PID.
+# Windows can recycle a PID after this process dies; a stale marker must not keep a real outage
+# amber just because an unrelated process later receives the same number.
+try {
+    $selfProc = Get-Process -Id $PID -ErrorAction Stop
+    $SupervisorStartedUnix = [DateTimeOffset]::new($selfProc.StartTime.ToUniversalTime()).ToUnixTimeSeconds()
+} catch {
+    # Ownership evidence is mandatory for new markers. If process birth cannot be measured,
+    # leave zero so the reader fails closed instead of trusting an unverifiable marker.
+    $SupervisorStartedUnix = 0
+}
+
 function Write-Log($msg) {
     "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $msg" | Out-File -FilePath $Log -Append -Encoding utf8
 }
@@ -198,6 +210,7 @@ function Write-ServerTransition([string]$Reason) {
             started = $now
             expires = $now + $transitionBudgetSeconds
             supervisor_pid = $PID
+            supervisor_started = $SupervisorStartedUnix
         } | ConvertTo-Json -Compress
         [IO.File]::WriteAllText($tmp, $body, (New-Object Text.UTF8Encoding($false)))
         Move-Item -LiteralPath $tmp -Destination $ServerTransitionPath -Force
