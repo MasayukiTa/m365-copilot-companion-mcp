@@ -37,6 +37,26 @@ plain-text form). Every key is always present; unknown/absent data is "" / 0 / [
       "warnings": []                             # e.g. "interrupted child"
     }
 
+NESTING (additive; every key above is unchanged). A child slot that fans out again hangs a
+nested group under it; the link comes from the recorded tree identity (campaign header
+parent_task_id / parent_campaign_id / root_id and the worker rows' parent_task_id, read through
+relay.task_tree). Each group also carries:
+
+      "parent_group_id":  None,   # campaign_id of the enclosing group; None for a root group
+      "root_id":          "cmp1", # the topmost group (a recorded root_id for an orphan)
+      "depth":            0,      # 0 = root group (a flat fleet: every group is 0)
+      "child_group_ids":  [],     # nested groups, sorted, clipped at MAX_CHILD_IDS (then
+                                  #   "child_group_ids_truncated": <n clipped> is added)
+      "descendant_count": 0,      # nested groups below this one (exact, not clipped)
+      "descendant_turns": 0,      # sum of worker `turn` over those nested groups
+      "orphan":           False   # a parent was recorded but is not in the data (reported, never
+                                  #   attached to a guess); loops / chains deeper than
+                                  #   MAX_DEPTH are cut the same way
+
+`merge_state` additionally takes "waiting_on_subgroups" (a nested group under one of its slots is
+not merged yet) and "unknown" (a slot reports FANOUT but no nested group is found for it, or a
+nested group is itself unknown): derived, never guessed. Both only replace pending/ready.
+
 display_state (parent rows only; children/solo rows get none): awaiting_children (children
 still queued/running: shown 待機中 so it does not look finished), ready_to_merge (all children
 done, merge not started), merging, done (merged), merge_failed, interrupted (an unfinished
@@ -58,6 +78,9 @@ CONSTRAINT_CAP = 120
 MAX_CONSTRAINTS = 5
 MAX_TOKENS = 8
 TOKEN_CAP = 30
+MAX_DEPTH = 16            # deeper chains are cut: the over-deep group is reported as an orphan
+MAX_CHILD_IDS = 50        # child_group_ids is clipped here; descendant_count stays exact
+MAX_TREE_ROWS = 20000     # rows handed to relay.task_tree
 
 _FAILED = {"stuck", "maxturns", "error", "cancelled", "content_refused"}
 _QUEUED = {"", "pending", "queued"}
@@ -76,6 +99,8 @@ MERGE_LABELS = {
     "merging": "統合中",
     "merged": "統合済み",
     "failed": "統合失敗",
+    "waiting_on_subgroups": "下位グループの統合待ち",
+    "unknown": "不明",
 }
 
 # Tokens a ledger line can carry: quoted names, ISO/slash dates, times, amounts/counts.
@@ -162,9 +187,10 @@ def _display_state(parent, counts, merge):
     return "awaiting_children"
 
 
-def build_groups(workers, campaign_lines=None, ledger_fn=None):
-    """One summary dict (see module docstring) per split group. Never raises on bad rows."""
-    ws = [w for w in (workers or []) if isinstance(w, dict)]
+def build_flat_groups(workers, campaign_lines=None, ledger_fn=None):
+    """One summary dict per split group, grouped FLAT by campaign id (no tree keys).
+    Never raises on bad rows. `build_groups` adds the nesting on top of this."""
+    ws =[w for w in (workers or []) if isinstance(w, dict)]
     try:
         camps = campaigns_from_ledger(campaign_lines or [])
     except Exception:
@@ -225,6 +251,152 @@ def build_groups(workers, campaign_lines=None, ledger_fn=None):
     return sorted(out, key=lambda g: g["group_id"])
 
 
+def _as_int(v):
+    try:
+        return max(int(v), 0)
+    except Exception:
+        return 0
+
+
+def _headers(campaign_lines):
+    """{campaign_id: {parent_task_id, parent_campaign_id, root_id}} from campaign header lines."""
+    out = {}
+    for line in campaign_lines or []:
+        line = (line or "").strip() if isinstance(line, str) else ""
+        if not line.startswith("{"):
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(rec, dict) and rec.get("kind") == "campaign" and rec.get("campaign_id"):
+            out[str(rec["campaign_id"])] = {
+                "parent_task_id": str(rec.get("parent_task_id") or ""),
+                "parent_campaign_id": str(rec.get("parent_campaign_id") or ""),
+                "root_id": str(rec.get("root_id") or "")}
+    return out
+
+
+def _link_parents(groups, ws, heads):
+    """{cid: (parent_cid or None, slot_task_id or "", orphan)} using the recorded tree identity.
+
+    A group's splitting parent P is the header's parent_task_id (or the common parent_task_id of
+    its children). If P is a row of another campaign, P is the slot it hangs from there. If P is
+    the group's own parent row, that row's own parent_task_id names the slot. A recorded parent
+    that cannot be found is an ORPHAN: reported, never attached to a guess."""
+    try:
+        from relay.task_tree import build_tree
+        nodes = build_tree(ws, [], max_nodes=MAX_TREE_ROWS).get("nodes") or {}
+    except Exception:
+        nodes = {}
+    by_cid = {}
+    for w in ws:
+        cid = str(w.get("campaign_id") or "")
+        if cid:
+            by_cid.setdefault(cid, []).append(w)
+    links = {}
+    for cid in groups:
+        h = heads.get(cid) or {}
+        mem = by_cid.get(cid, [])
+        kid_p = {str(w.get("parent_task_id")) for w in mem
+                 if str(w.get("role") or "").lower() in ("subtask", "aggregator")
+                 and w.get("parent_task_id") not in (None, "")}
+        ptid = h.get("parent_task_id") or (next(iter(kid_p)) if len(kid_p) == 1 else "")
+        pcid = h.get("parent_campaign_id") or ""
+        P = nodes.get(ptid) if ptid else None
+        pc, slot, recorded = None, "", bool(pcid)
+        if P and P.get("anomaly") not in ("cycle", "under_cycle"):
+            if P["campaign_id"] and P["campaign_id"] != cid:
+                pc, slot = P["campaign_id"], P["id"]
+            elif P["parent_id"]:
+                recorded = True
+                Q = nodes.get(P["parent_id"])
+                if Q and Q["campaign_id"] and Q["campaign_id"] != cid:
+                    pc, slot = Q["campaign_id"], Q["id"]
+        if pc is None and pcid in groups and pcid != cid:
+            pc = pcid
+        if pc is not None and pc not in groups:
+            pc, slot = None, ""
+        links[cid] = (pc, slot, pc is None and recorded)
+    # Cut loops and over-deep chains: those groups are reported as orphans.
+    for cid in list(links):
+        seen, cur = [], cid
+        while cur is not None and cur not in seen and len(seen) <= MAX_DEPTH:
+            seen.append(cur)
+            cur = links[cur][0]
+        if cur is not None:
+            links[cid] = (None, "", True)
+    return links
+
+
+def build_groups(workers, campaign_lines=None, ledger_fn=None):
+    """`build_flat_groups` plus the nesting keys (see module docstring). A flat fleet keeps every
+    existing key byte-identical and gets neutral values for the new ones."""
+    ws = [w for w in (workers or []) if isinstance(w, dict)]
+    flat = build_flat_groups(ws, campaign_lines, ledger_fn)
+    gmap = {g["group_id"]: g for g in flat}
+    try:
+        links = _link_parents(gmap, ws, _headers(campaign_lines))
+    except Exception:
+        links = {cid: (None, "", False) for cid in gmap}
+    children = {cid: [] for cid in gmap}
+    for cid, (pc, _slot, _o) in links.items():
+        if pc is not None:
+            children[pc].append(cid)
+    turns, fan_slots = {}, {}
+    for w in ws:
+        cid = str(w.get("campaign_id") or "")
+        if cid in gmap:
+            turns[cid] = turns.get(cid, 0) + _as_int(w.get("turn"))
+            if (str(w.get("role") or "").lower() == "subtask"
+                    and str(w.get("outcome") or "").upper() == "FANOUT"):
+                fan_slots.setdefault(cid, []).append(str(w.get("task_id") or ""))
+    depth, root = {}, {}
+    for cid in sorted(gmap):
+        chain, cur = [], cid
+        while cur is not None:
+            chain.append(cur)
+            cur = links[cur][0]
+        top = chain[-1]
+        recorded_root = ""
+        if links[top][2]:          # orphan: keep the root the data itself recorded, if any
+            recorded_root = next((str(w.get("root_id")) for w in ws
+                                  if str(w.get("campaign_id") or "") == top and w.get("root_id")), "")
+        for i, c in enumerate(reversed(chain)):
+            depth[c], root[c] = i, recorded_root or top
+    # Bottom-up so a parent sees its children's FINAL merge state.
+    desc, dturns = {}, {}
+    for cid in sorted(gmap, key=lambda c: (-depth[c], c)):
+        desc[cid] = sum(1 + desc[c] for c in children[cid])
+        dturns[cid] = sum(turns.get(c, 0) + dturns[c] for c in children[cid])
+        g = gmap[cid]
+        waiting = unknown = False
+        for c in children[cid]:
+            cm = gmap[c]["merge_state"]
+            waiting = waiting or cm != "merged"
+            unknown = unknown or cm == "unknown"
+            if cm == "failed":
+                g["warnings"].append("統合に失敗したサブグループがあります: " + c)
+        slots = {links[c][1] for c in children[cid]}
+        # a fan-out slot with no group under it: not known, not guessed
+        if any(t not in slots for t in fan_slots.get(cid, ())):
+            unknown = True
+        if g["merge_state"] in ("pending", "ready") and (waiting or unknown):
+            g["merge_state"] = "unknown" if unknown else "waiting_on_subgroups"
+            g["merge_label"] = MERGE_LABELS[g["merge_state"]]
+            if g["parent"]["display_state"] in ("ready_to_merge", "awaiting_children"):
+                g["parent"]["display_state"] = "awaiting_children"
+                g["parent"]["display_label"] = DISPLAY_LABELS["awaiting_children"]
+    for cid, g in gmap.items():
+        kids = sorted(children[cid])
+        g.update({"parent_group_id": links[cid][0], "root_id": root[cid], "depth": depth[cid],
+                  "child_group_ids": kids[:MAX_CHILD_IDS], "descendant_count": desc[cid],
+                  "descendant_turns": dturns[cid], "orphan": bool(links[cid][2])})
+        if len(kids) > MAX_CHILD_IDS:
+            g["child_group_ids_truncated"] = len(kids) - MAX_CHILD_IDS
+    return flat
+
+
 def annotate_display_state(workers, campaign_lines=None):
     """Copies of `workers` where each fan-out PARENT gains `display_state` (derived only).
     status / outcome are never modified; other rows are returned unchanged."""
@@ -242,21 +414,51 @@ def annotate_display_state(workers, campaign_lines=None):
 def render_text(groups):
     """Plain, ledger-style text (no goal body): one block per group."""
     lines = []
-    for g in groups or []:
+    for g in _tree_order(groups or []):
         p, c = g["parent"], g["children"]
-        lines.append("%s  親: %s" % (g["label"], p["display_label"] or p["status"] or "-"))
-        lines.append("  子 %d 件: 待機 %d / 実行中 %d / 完了 %d / 失敗 %d / 中断 %d" % (
-            g["children_total"], c["queued"], c["running"], c["done"], c["failed"],
-            c["interrupted"]))
-        lines.append("  統合: %s" % (g["merge_label"] or "-"))
+        pad = "    " * min(int(g.get("depth") or 0), MAX_DEPTH)
+        block = ["%s  親: %s" % (g["label"], p["display_label"] or p["status"] or "-"),
+                 "  子 %d 件: 待機 %d / 実行中 %d / 完了 %d / 失敗 %d / 中断 %d" % (
+                     g["children_total"], c["queued"], c["running"], c["done"], c["failed"],
+                     c["interrupted"]),
+                 "  統合: %s" % (g["merge_label"] or "-")]
+        if g.get("parent_group_id"):
+            block.append("  親グループ: %s" % g["parent_group_id"])
+        if g.get("descendant_count"):
+            block.append("  下位グループ %d 件 (計 %d ターン)" % (
+                g["descendant_count"], g.get("descendant_turns") or 0))
         lg = g["ledger"]
         if lg["task"]:
-            lines.append("  タスク: " + lg["task"])
+            block.append("  タスク: " + lg["task"])
         if lg["constraint_count"]:
-            lines.append("  固定条件 %d 件: %s" % (lg["constraint_count"],
+            block.append("  固定条件 %d 件: %s" % (lg["constraint_count"],
                                                ", ".join(lg["tokens"]) or "(語なし)"))
-        lines.extend("  ! " + x for x in g["warnings"])
+        block.extend("  ! " + x for x in g["warnings"])
+        lines.extend(pad + b for b in block)
     return "\n".join(lines)
+
+
+def _tree_order(groups):
+    """Groups in depth-first tree order (children under their parent); a flat list is unchanged.
+    Groups whose parent is not in the list are treated as roots."""
+    ids = {g["group_id"] for g in groups}
+    kids = {}
+    for g in groups:
+        pid = g.get("parent_group_id")
+        if pid and pid in ids and pid != g["group_id"]:
+            kids.setdefault(pid, []).append(g)
+    out, seen = [], set()
+    stack = [g for g in reversed(groups)
+             if not (g.get("parent_group_id") in ids and g.get("parent_group_id") != g["group_id"])]
+    while stack:
+        g = stack.pop()
+        if g["group_id"] in seen:
+            continue
+        seen.add(g["group_id"])
+        out.append(g)
+        stack.extend(reversed(kids.get(g["group_id"], [])))
+    out.extend(g for g in groups if g["group_id"] not in seen)   # anything a loop hid
+    return out
 
 
 def read_fleet_dir(fleet_dir):
@@ -286,7 +488,7 @@ def main(argv=None):
     return 0
 
 
-__all__ = ["build_groups", "annotate_display_state", "render_text", "read_fleet_dir",
+__all__ = ["build_groups", "build_flat_groups","annotate_display_state", "render_text", "read_fleet_dir",
            "parse_ledger", "DISPLAY_LABELS", "MERGE_LABELS"]
 
 
