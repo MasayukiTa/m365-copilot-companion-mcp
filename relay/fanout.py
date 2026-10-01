@@ -462,8 +462,15 @@ def _record_unnumbered_fallback(n_steps):
 
 
 def child_goals(parent_goal, steps, *, parent_task_id="", campaign_id="", depth=0,
-                cwd=None, parent_level=None, run_id=""):
+                cwd=None, parent_level=None, run_id="",
+                parent_campaign_id="", parent_subtask_index=None, root_id=""):
     """Turn the accepted steps into goal items the fleet can admit.
+
+    TASK-TREE IDENTITY (additive, record-only). Each child also carries `parent_campaign_id`
+    (the campaign the parent itself belongs to; "" for a top-level parent), `parent_subtask_index`
+    (the parent's own position in its parent's split; None for a top-level parent) and `root_id`
+    (the id of the tree's root campaign). A top-level parent's root is this split's own campaign
+    id; a child inherits the root of the parent it was split from. Nothing branches on these.
 
     NO `checks` PARAMETER, AND ITS REMOVAL IS THE POINT. It used to take the parent's
     acceptance checks and put the SAME object on every child -- measured 2026-09-13, three
@@ -511,6 +518,9 @@ def child_goals(parent_goal, steps, *, parent_task_id="", campaign_id="", depth=
             "depth": depth + 1,
             "subtask_index": i,
             "subtask_of": len(steps),
+            "parent_campaign_id": parent_campaign_id or "",
+            "parent_subtask_index": parent_subtask_index,
+            "root_id": root_id or (parent_campaign_id if depth > 0 and parent_campaign_id else cid),
         })
     # EFFORT POLICY (phase 2). Additive: with the policy off, or no parent level, `out` is
     # exactly what it was. `on` adds metadata["effort"] one step below the parent's level.
