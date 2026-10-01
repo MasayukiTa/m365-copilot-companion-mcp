@@ -1347,6 +1347,15 @@ def _effort_worker_fields(w):
         return {}
 
 
+def _tree_worker_fields(w):
+    """Task-tree root id for a worker row (additive); {} when the worker has none."""
+    try:
+        rid = (getattr(getattr(w, "task_envelope", None), "metadata", None) or {}).get("root_id")
+        return {"root_id": str(rid)} if rid else {}
+    except Exception:
+        return {}
+
+
 def _pending_gates(started=0.0):
     """Scan .companion_gates/ for unanswered HITL gates and return a list of dicts.
 
@@ -1791,6 +1800,7 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
             # Effort-policy badge data (additive; absent when the policy is off). Status,
             # outcome and pill above are untouched: this is display only, and shadow is record-only.
             **_effort_worker_fields(w),
+            **_tree_worker_fields(w),
         } for w in workers],
         # Pending HITL gates from the autonomy contract gate (contract_gate.py).
         # Each entry: {"token": str, "question": str, "context": str, "ts": float, "path": str}
@@ -4675,6 +4685,7 @@ def main():
             "campaign_id": r.get("campaign_id", ""),
             "role": r.get("role", ""),
             "depth": r.get("depth", 0),
+            **({"root_id": r["root_id"]} if r.get("root_id") else {}),
             "goal_hash": r.get("goal_hash", ""),
             "retryable": r.get("retryable"),
             "retry_queued": bool(r.get("retry_queued", False)),
