@@ -96,6 +96,11 @@ def _reader_effort_policy():
     return mode()
 
 
+def _reader_fanout_depth():
+    from relay.fanout import configured_max_depth
+    return configured_max_depth()
+
+
 def _fanout_limit_reader(field):
     def _read():
         from relay.fanout_budget import limits_from_settings
@@ -113,6 +118,7 @@ _LIVE_READERS = {
     "maxtabs": (_reader_maxtabs, "2", "7"),
     "rate_ceiling_rpm": (_reader_rate, "40", "90"),
     "effort_policy": (_reader_effort_policy, "shadow", "on"),
+    "fanout_max_depth": (_reader_fanout_depth, "2", "3"),
     "fanout_max_total": (_fanout_limit_reader("total"), "10", "30"),
     "fanout_max_active": (_fanout_limit_reader("active"), "2", "6"),
     "fanout_max_turns": (_fanout_limit_reader("turns"), "100", "500"),

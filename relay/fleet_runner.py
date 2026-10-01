@@ -1372,6 +1372,18 @@ def _tree_budget_block(worker_rows):
         return {}
 
 
+def _fanout_depth_block():
+    """`fanout_depth`: the split depth asked for and the one in force, additive.
+
+    The production caller of relay.fanout.effective_max_depth. {} on any failure.
+    """
+    try:
+        from relay import fanout as _fo
+        return {"fanout_depth": _fo.depth_report()}
+    except Exception:
+        return {}
+
+
 def _pending_gates(started=0.0):
     """Scan .companion_gates/ for unanswered HITL gates and return a list of dicts.
 
@@ -1839,6 +1851,7 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         _w["fanout"] = _fv.get(_w["name"], {"kind": "solo", "campaign_id": _w.get("campaign_id", ""), "label": ""})
     _attach_split_groups(_snap)
     _snap.update(_tree_budget_block(_snap["workers"]))
+    _snap.update(_fanout_depth_block())
     return _snap
 
 

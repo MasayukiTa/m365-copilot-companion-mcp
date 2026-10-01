@@ -288,7 +288,8 @@ def resume_children_goals(state_dir, done_map=None, log=print, scope=None):
                 goal = {"text": text, "campaign_id": cid,
                         "task_id": child.get("task_id"), "role": "subtask",
                         "subtask_index": child.get("subtask_index"),
-                        "subtask_of": fam.get("n") or None, "depth": 1}
+                        "subtask_of": fam.get("n") or None,
+                        "depth": int(fam.get("depth") or 1)}   # the header's, 1 when absent
                 if fam.get("cwd"):
                     goal["cwd"] = fam.get("cwd")
                 goal["degraded"] = True

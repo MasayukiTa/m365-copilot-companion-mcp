@@ -155,6 +155,12 @@ KEYS = OrderedDict([
        "relay/fanout_budget.py:limits_from_settings (every split decision)",
        "Minutes since a tree's root split before it may not split again."),
 
+    _k("fanout_max_depth", EACH_GATE, 1,
+       "relay/fanout.py:configured_max_depth (every split decision)",
+       "How many levels deep a fan-out tree may split (1..3). 1 means only the top-level goal "
+       "splits. The value reported as in effect (status.json fanout_depth) can be lower than "
+       "the setting while the merge of nested splits is not enabled."),
+
     _k("autoretry", SWEEP_START, 1,
        "relay/fleet_runner.py:settings_autoretry (once, before the sweep)",
        "Takes effect on the NEXT run."),

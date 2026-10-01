@@ -827,6 +827,10 @@ class CockpitWindow : Window
     TextBox[] _fbBox = new TextBox[4];
     TextBlock _fbLbl, _fbNow, _fbPending;
     TextBlock[] _fbCap = new TextBlock[4];
+    // split depth 1|2|3 -> settings.txt fanout_max_depth ; absent key = 1 (FanoutDepthView.Default)
+    int _fdVal = FanoutDepthView.Default;
+    ComboBox _fdBox;
+    TextBlock _fdLbl, _fdNow, _fdPending;
     string _approval = "run";  // approval mode run|plan|auto -> settings.txt approval=
     string _runtimeMode = "fleet"; // next launch: fleet | durable -> settings.txt runtime=
     bool _durableEnqueuePending = false; // one durable campaign intake process at a time
@@ -1859,6 +1863,11 @@ class CockpitWindow : Window
                     bool? fxv = FanoutView.ParseSetting(ln);   // same reading as Python's settings_fanout
                     if (fxv.HasValue) _fanout = fxv.Value;
                 }
+                else if (ln.StartsWith("fanout_max_depth="))
+                {
+                    int? fdv = FanoutDepthView.ParseLine(ln);   // clamped; junk keeps the value
+                    if (fdv.HasValue) _fdVal = fdv.Value;
+                }
                 else if (ln.StartsWith("fanout_max_"))
                 {
                     for (int fbi = 0; fbi < FanoutBudgetView.Keys.Length; fbi++)
@@ -1992,6 +2001,7 @@ class CockpitWindow : Window
         ctrls.Children.Add(EffortControl());
         ctrls.Children.Add(EffortPolicyControl());
         ctrls.Children.Add(FanoutControl());
+        ctrls.Children.Add(FanoutDepthControl());
         ctrls.Children.Add(FanoutBudgetControl());
         ctrls.Children.Add(ApprovalControl());
         ctrls.Children.Add(ApprovalCenterControl());
@@ -7807,6 +7817,7 @@ class CockpitWindow : Window
                 return "live";
             case "rate_ceiling_rpm":
             case "job_approval_mode":
+            case "fanout_max_depth":
             case "fanout_max_total":
             case "fanout_max_active":
             case "fanout_max_turns":
@@ -9198,6 +9209,7 @@ class CockpitWindow : Window
         StyleFlatCombo(_fanoutBox);
         PaintFanoutInEffect(_lastRoot);
         PaintFanoutBudget();
+        PaintFanoutDepth();
     }
     // What the COORDINATOR says it was started with (status.json "fanout_run"), beside the combo.
     // No report (old runner, no run yet) -> nothing shown, never a guess from the combo.
@@ -9343,6 +9355,85 @@ class CockpitWindow : Window
         _fbPending.Text = pend ?? "";
         _fbPending.Foreground = Theme.Br(Theme.Warning(_dark));
         _fbPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
+    }
+    // Split depth (1|2|3), beside the fan-out selector. Persists through SaveKey only; the runner
+    // re-reads the key at every split (each_gate). What is IN EFFECT comes from status.json
+    // "fanout_depth" (configured + effective), so the screen never claims a depth the coordinator
+    // is not applying; the words and parsing live in FanoutDepthView (EffortPolicy.cs).
+    UIElement FanoutDepthControl()
+    {
+        var wrap = new StackPanel(); wrap.Orientation = Orientation.Horizontal;
+        wrap.VerticalAlignment = VerticalAlignment.Center; wrap.Margin = new Thickness(0, 0, 12, 0);
+
+        _fdLbl = new TextBlock(); _fdLbl.VerticalAlignment = VerticalAlignment.Center;
+        _fdLbl.FontSize = 12; _fdLbl.Margin = new Thickness(0, 0, 8, 0);
+        wrap.Children.Add(_fdLbl);
+
+        _fdBox = new ComboBox();
+        _fdBox.ToolTip = FanoutDepthView.Help(_lang == 0) + "\n" + FanoutDepthView.TakeEffectTip(_lang == 0);
+        _fdBox.Cursor = Cursors.Hand; _fdBox.FontSize = 12;
+        _fdBox.FontWeight = FontWeights.SemiBold; _fdBox.MinWidth = 64;
+        _fdBox.Padding = new Thickness(8, 2, 4, 2);
+        _fdBox.VerticalAlignment = VerticalAlignment.Center;
+        var fdHelp = new Dictionary<string, string>();
+        foreach (string m in FanoutDepthView.Modes) fdHelp[m] = FanoutDepthView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_fdBox, FanoutDepthView.Modes, fdHelp, _fdVal.ToString());
+        _fdBox.DropDownOpened += delegate { CloseHeaderPopups("effort"); };
+        _fdBox.SelectionChanged += delegate
+        {
+            int sel;
+            if (!int.TryParse(ComboVal(_fdBox), out sel)) return;
+            sel = FanoutDepthView.Clamp(sel);
+            if (sel == _fdVal) return;   // unchanged -> no write, no re-fire
+            _fdVal = sel;
+            SaveKey("fanout_max_depth", sel.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            PaintFanoutDepthInEffect(_lastRoot);
+        };
+        wrap.Children.Add(_fdBox);
+
+        _fdNow = new TextBlock(); _fdNow.VerticalAlignment = VerticalAlignment.Center;
+        _fdNow.FontSize = 11.5; _fdNow.Margin = new Thickness(8, 0, 0, 0);
+        wrap.Children.Add(_fdNow);
+        _fdPending = new TextBlock(); _fdPending.VerticalAlignment = VerticalAlignment.Center;
+        _fdPending.FontSize = 11.5; _fdPending.FontWeight = FontWeights.SemiBold;
+        _fdPending.Margin = new Thickness(8, 0, 0, 0);
+        _fdPending.Visibility = Visibility.Collapsed;
+        wrap.Children.Add(_fdPending);
+
+        PaintFanoutDepth();
+        return wrap;
+    }
+    void PaintFanoutDepth()
+    {
+        if (_fdLbl != null) { _fdLbl.Text = FanoutDepthView.Label(_lang == 0); _fdLbl.Foreground = Muted; }
+        if (_fdBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_fdBox), _fdVal.ToString())) ComboSelectVal(_fdBox, _fdVal.ToString());
+        _fdBox.Background = BtnBg; _fdBox.Foreground = Fg; _fdBox.BorderBrush = Border;
+        StyleFlatCombo(_fdBox);
+        PaintFanoutDepthInEffect(_lastRoot);
+    }
+    // What the COORDINATOR says it applies (status.json "fanout_depth"). No report (old runner,
+    // no run yet) -> nothing shown, never a guess from the selection.
+    void PaintFanoutDepthInEffect(Dictionary<string, object> root)
+    {
+        if (_fdNow == null || _fdPending == null) return;
+        bool ja = _lang == 0;
+        string now = null, pend = null;
+        Dictionary<string, object> fd = root != null ? Obj(root, "fanout_depth") : null;
+        if (fd != null && fd.ContainsKey("configured") && fd["configured"] != null
+            && fd.ContainsKey("effective") && fd["effective"] != null)
+        {
+            int conf = I(fd, "configured"), eff = I(fd, "effective");
+            now = FanoutDepthView.Describe(conf, eff, S(fd, "reason"), ja);
+            pend = FanoutDepthView.PendingText(conf, _fdVal, ja);
+        }
+        _fdNow.Text = now ?? "";
+        _fdNow.Foreground = Muted;
+        _fdNow.Visibility = now != null ? Visibility.Visible : Visibility.Collapsed;
+        _fdPending.Text = pend ?? "";
+        _fdPending.Foreground = Theme.Br(Theme.Warning(_dark));
+        _fdPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
     }
     void PaintEffort()
     {
@@ -12063,6 +12154,7 @@ class CockpitWindow : Window
         PaintEffortPolicyInEffect(root);   // what the runner reports is in effect (effort policy)
         PaintFanoutInEffect(root);         // what the coordinator was started with (fan-out)
         PaintFanoutBudgetInEffect(root);   // the per-tree limits the coordinator applies
+        PaintFanoutDepthInEffect(root);    // the split depth the coordinator applies
         // Preserve scroll position across the rebuild. Without this, every worker update
         // (status/turn change) reset the list and snapped the view back to the TOP -- which is
         // exactly why scrolling "didn't work" while tasks were live: the user scrolled down, a
