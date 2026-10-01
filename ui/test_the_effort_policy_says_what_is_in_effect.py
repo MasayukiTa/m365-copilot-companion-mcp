@@ -223,3 +223,119 @@ def test_swapping_env_and_settings_words_is_caught(tmp_path):
     exe = _build(mdir, mpath)
     assert _failures(exe, mdir), "the swapped wording passed every case"
     shutil.rmtree(str(mdir), ignore_errors=True)
+
+
+# -- split-group line: nesting, usage, depth cap (GroupTreeView in the same shipped file) --------
+
+def _g(**kw):
+    g = {"campaign_id": "cmp1", "children_total": 3,
+         "children": {"queued": 0, "running": 1, "done": 2, "failed": 0, "interrupted": 0},
+         "merge_state": "pending", "merge_label": "子の完了待ち",
+         "ledger": {"task": "THE LONG GOAL SENTENCE", "constraints": ["c1"], "tokens": ["t1"]}}
+    g.update(kw)
+    return g
+
+
+def _tb(used, lim=None, rid="cmp1"):
+    lim = lim or {"total": 24, "active": 3, "turns": 400, "wall_min": 120}
+    return {"tree_budget": {rid: dict(used, limits=lim)}}
+
+
+FLAT_JA = "分割グループ 子3件: 実行中 1 · 完了 2 / 統合: 子の完了待ち"
+FLAT_EN = "Split group, 3 parts: running 1 · done 2 / merge: 子の完了待ち"
+NESTED = dict(depth=0, root_id="cmp1", parent_group_id=None, child_group_ids=["cmp2"],
+              descendant_count=2, descendant_turns=9, orphan=False)
+USE = {"total": 5, "active": 1, "turns": 40, "wall_min": 12}
+
+
+def _gl(g, ja=True):
+    return dict(_c("group_line", group=g, ja=ja))
+
+
+def _ge(root, g, ja=True):
+    return dict(_c("group_extra", root=root, group=g, ja=ja))
+
+
+def _run_cases(tmp_path, cases):
+    return _run(_build(tmp_path, SHIPPED), cases, tmp_path)
+
+
+@pytestmark_nt
+def test_a_flat_group_reads_exactly_as_before(tmp_path):
+    flat = _g()
+    r = _run_cases(tmp_path, [_gl(flat), _gl(flat, False), _ge({"groups": [flat]}, flat),
+                              _ge({"groups": [flat], "tree_budget": {}}, flat)])
+    assert r[0]["text"] == FLAT_JA and r[0]["indent"] == 0
+    assert r[1]["text"] == FLAT_EN
+    assert r[2]["text"] is None and r[3]["text"] is None      # nothing extra on a flat status.json
+    assert "LONG GOAL" not in json.dumps(r, ensure_ascii=False)
+
+
+@pytestmark_nt
+def test_a_nested_group_is_indented_and_counts_its_sub_groups(tmp_path):
+    inner = _g(depth=1, root_id="cmp1", parent_group_id="cmp1", child_group_ids=[],
+               descendant_count=0, orphan=False)
+    outer = _g(merge_state="waiting_on_subgroups", merge_label="下位グループの統合待ち", **NESTED)
+    r = _run_cases(tmp_path, [_gl(outer), _gl(outer, False), _gl(inner)])
+    assert r[0]["text"] == ("分割グループ 子3件: 実行中 1 · 完了 2 / 統合: 下位グループの統合待ち"
+                            " / 下位グループ 1件 (全部で 2件)")
+    assert r[1]["text"] == ("Split group, 3 parts: running 1 · done 2 / merge: waiting on sub-groups"
+                            " / sub-groups: 1 (2 in all)")
+    assert r[0]["indent"] == 0 and r[2]["indent"] == 14
+    assert r[2]["text"] == FLAT_JA                              # a leaf group has no sub-group text
+
+
+@pytestmark_nt
+def test_an_orphan_and_an_unknown_merge_are_said_plainly(tmp_path):
+    orphan = _g(depth=0, root_id="zzz", orphan=True, merge_state="unknown", merge_label="不明")
+    r = _run_cases(tmp_path, [_gl(orphan), _gl(orphan, False)])
+    assert r[0]["text"] == FLAT_JA.replace("子の完了待ち", "不明") + " / 親グループが見つかりません"
+    assert r[1]["text"].endswith("merge: unknown / parent group not found")
+
+
+@pytestmark_nt
+def test_the_usage_line_colours_at_80_and_100_percent(tmp_path):
+    g = _g(**NESTED)
+    lim = {"total": 20, "active": 10, "turns": 100, "wall_min": 100}
+    cases = [_ge(_tb(USE, lim), g),
+             _ge(_tb(dict(USE, total=10, turns=50), lim), g),       # 50%
+             _ge(_tb(dict(USE, total=17), lim), g),                 # 85%
+             _ge(_tb(dict(USE, total=20), lim), g),                 # 100%
+             _ge(_tb(dict(USE, turns=250), lim), g),                # over
+             _ge(_tb(USE, lim), g, False)]
+    r = _run_cases(tmp_path, cases)
+    assert [x["level"] for x in r[:5]] == [0, 0, 1, 2, 2]
+    assert r[0]["text"] == "使用量 総数 5/20 · 同時 1/10 · ターン 40/100 · 分 12/100"
+    assert r[5]["text"] == "usage total 5/20 · active 1/10 · turns 40/100 · min 12/100"
+
+
+@pytestmark_nt
+def test_the_usage_line_belongs_to_the_root_group_only(tmp_path):
+    inner = _g(depth=1, root_id="cmp1", parent_group_id="cmp1")
+    r = _run_cases(tmp_path, [_ge(_tb(USE), inner), _ge(_tb(USE, rid="other"), _g(**NESTED))])
+    assert r[0]["text"] is None and r[1]["text"] is None
+
+
+@pytestmark_nt
+def test_a_capped_depth_is_noted_and_an_uncapped_one_is_not(tmp_path):
+    g = _g(**NESTED)
+    capped = {"fanout_depth": {"configured": 3, "effective": 1, "reason": "x"}}
+    ok = {"fanout_depth": {"configured": 2, "effective": 2, "reason": ""}}
+    both = dict(capped, **_tb(USE))
+    r = _run_cases(tmp_path, [_ge(capped, g), _ge(capped, g, False), _ge(ok, g), _ge(both, g),
+                              _ge({"fanout_depth": {"configured": 3}}, g)])
+    assert r[0]["text"] == "深さは 1 までに制限中: 階層統合は未有効"
+    assert r[1]["text"] == "depth capped at 1: hierarchical merge not enabled"
+    assert r[2]["text"] is None and r[4]["text"] is None        # equal / missing field
+    assert r[3]["text"].startswith("使用量 総数 5/24") and r[3]["text"].endswith("階層統合は未有効")
+
+
+def test_the_cockpit_draws_the_group_line_from_the_view_and_never_the_goal():
+    src = _cockpit()
+    m = re.search(r"UIElement BuildGroupLine\(.*?\n    }\n", src, re.S)
+    assert m
+    body = m.group(0)
+    assert "GroupTreeView.IndentPx(g)" in body and "GroupExtraText(w, out xLevel)" in body
+    assert 'S(led, "task")' in body                              # the capped ledger, as before
+    assert 'S(w, "goal")' not in body and "GroupTreeView.Line(" in src
+    assert "ShowScaleToast" not in body and "MessageBox" not in body
