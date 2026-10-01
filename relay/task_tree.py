@@ -38,7 +38,8 @@ Pure. The only I/O lives in `relay.family_view.read_fleet_dir`.
 """
 from __future__ import annotations
 
-from relay.family_view import _child_state, build_groups
+from relay.family_view import _child_state
+from relay.family_view import build_flat_groups as build_groups  # flat: no recursion into the tree
 
 MAX_NODES = 20000
 MAX_LINES = 200000
