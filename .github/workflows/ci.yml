@@ -549,6 +549,7 @@ jobs:
             tests/test_retry_sets_agree.py \
             tests/test_fanout_default_on_agrees.py \
             tests/test_stuck_worker_retried_once.py \
+            tests/test_task_tree.py \
             tests/test_reaper_marks_interrupted.py \
             tests/test_interrupted_status_is_classified_everywhere.py \
             tests/test_idle_edge_release.py \
