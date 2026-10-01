@@ -133,6 +133,28 @@ KEYS = OrderedDict([
        "evaluation) with no restart; decisions already made stand. An MCP_EFFORT_POLICY "
        "environment variable beats this setting and is reported as a conflict."),
 
+    # Per-tree fan-out budget (relay/fanout_budget.py). Read at each split decision; a tree
+    # already running keeps going, and the next split uses the new values.
+    _k("fanout_max_total", EACH_GATE, 24,
+       "relay/fanout_budget.py:limits_from_settings (every split decision)",
+       "Most workers one fan-out tree may hold, children and merge together (one slot is kept "
+       "for the merge). Re-read at each split; a split that would exceed it is trimmed or run "
+       "in one conversation. Default 24 changes nothing: one split makes at most 12 children."),
+
+    _k("fanout_max_active", EACH_GATE, 3,
+       "relay/fanout_budget.py:limits_from_settings (every split decision)",
+       "Most workers of one tree that may be running when it asks for more. Absent means the "
+       "operator's maxtabs (default 3, the fleet's own concurrency cap), so it never lowers "
+       "what the fleet already runs at."),
+
+    _k("fanout_max_turns", EACH_GATE, 400,
+       "relay/fanout_budget.py:limits_from_settings (every split decision)",
+       "Total conversation turns one tree may have used before it may not split again."),
+
+    _k("fanout_max_wall_min", EACH_GATE, 120,
+       "relay/fanout_budget.py:limits_from_settings (every split decision)",
+       "Minutes since a tree's root split before it may not split again."),
+
     _k("autoretry", SWEEP_START, 1,
        "relay/fleet_runner.py:settings_autoretry (once, before the sweep)",
        "Takes effect on the NEXT run."),
