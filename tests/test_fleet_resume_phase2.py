@@ -144,7 +144,11 @@ def test_the_two_key_functions_agree():
 
 def test_unfinished_children_are_requeued_and_done_ones_are_not(tmp_path):
     cid = "cKIDS"
-    _rows(tmp_path, [_header(cid), _child(cid, 1), _child(cid, 2), _child(cid, 3)])
+    # DONE in the done-map AND its answer on the ledger (a DONE child with no answer anywhere is
+    # recovered or re-queued once: tests/test_child_result_durable.py).
+    _rows(tmp_path, [_header(cid), _child(cid, 1), _child(cid, 2), _child(cid, 3),
+                     {"kind": "child_result", "campaign_id": cid, "subtask_index": 1,
+                      "outcome": "DONE", "result": "r"}])
     done = {fr.goal_resume_key({"text": "child 1 of cKIDS"}): "DONE"}
     goals, degraded = fr.resume_children_goals(str(tmp_path), done, log=lambda m: None, scope={"cKIDS"})
     assert [g["subtask_index"] for g in goals] == [2, 3] and degraded == 0
