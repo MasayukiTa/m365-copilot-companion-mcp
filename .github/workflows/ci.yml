@@ -161,6 +161,7 @@ jobs:
             scripts/test_the_identity_guard_speaks_before_the_push.py \
             scripts/test_run_script_style_tests.py \
             scripts/test_submit_via_ui_roundtrip.py \
+            scripts/test_live_gui_browser_submit_acceptance.py \
             scripts/test_gui_submitter_has_no_nested_console.py \
             scripts/test_gui_submit_lock.py \
             tests/test_scroll_transcript.py \
@@ -478,6 +479,8 @@ jobs:
             relay/test_reply_settle.py \
             relay/test_skill_invalid_reporting.py \
             relay/test_response_independent_send.py \
+            relay/test_fresh_composer_submission.py \
+            relay/test_fresh_submit_ambiguity_is_not_retried.py \
             relay/test_send_never_submits_empty.py \
             relay/test_fleet_settle.py \
             relay/test_refuter_settle.py \

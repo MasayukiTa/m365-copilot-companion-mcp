@@ -676,7 +676,7 @@ The stale `.github/workflows/ci.yml` comment now says `nine files`, matching `sc
 
 ## Remaining observations / accepted limits
 
-- R5-NOTE-1 remains an environment-level observation: Playwright DOM submission behavior is not fully reproducible in the hermetic Linux suite. Existing logic is covered by pure/seam tests and live use, but this is not claimed as a browser-E2E proof.
+- R5-NOTE-1 is resolved below by a live Windows/Playwright acceptance and a production fix. The hermetic Linux suite still does not pretend to emulate M365 itself; instead it pins the deterministic verdict/stability logic while the live harness exercises the actual browser boundary.
 - SEC-ISSUE-1 remains intentionally documented: XFF/IP identity is still caller-supplied in this deployment, while the default-on unlock token requirement prevents IP-only authorization in current operation. No claim is made that the IP oracle itself is fixed.
 - S7-ISSUE-1 remains an architectural boundary: a same-user process with arbitrary code execution is outside what same-user file/tool gates can cryptographically exclude. The repository continues to describe this as narrowing/defence-in-depth, not closure.
 
@@ -688,3 +688,39 @@ The stale `.github/workflows/ci.yml` comment now says `nine files`, matching `sc
 A live residue (`.tmp.<supervisor_pid>` at repository root) exposed a runtime-only initialization-order bug that the earlier source-presence tests did not catch. `ServerTransitionPath` was computed from `$FleetDir` near the top of `scripts/supervisor.ps1`, but `$FleetDir` itself was not assigned until roughly 1,200 lines later. The long-running supervisor therefore attempted to publish a planned-restart marker through an empty path; `Write-ServerTransition` wrote a root `.tmp.<pid>` file and its fail-open catch intentionally hid the telemetry failure while allowing the stale-code restart itself to proceed.
 
 Resolution: `ServerTransitionPath` is now derived directly from `$Root/.fleet`, where `$Root` is initialized before the transition helper is defined. A regression test asserts the initialization order and forbids the early path assignment from depending on `$FleetDir`. This preserves the intended rule that health telemetry can never block a restart while making the yellow planned-restart signal actually publishable in the live supervisor.
+
+# 2026-10-01 R5 live browser follow-up
+
+## R5-NOTE-1 -- resolved; live acceptance found and fixed a real fresh-chat empty-send race
+
+The missing browser-E2E proof was not merely a documentation gap. A live run through the visible Fleet Cockpit into the real M365 Copilot page reproduced an actual defect. With marker `R5LIVE-20261001-1203F`, the first visible `data-testid="chatQuestion"` was only `You said:` with no body. Copilot consequently answered with its generic greeting / request for a goal. The newer first-message-not-absorbed recovery correctly detected `asks_for_goal` and resent the full task in the same conversation, so the overall job recovered, but the original fresh submit was still objectively empty.
+
+The fresh M365 composer is a Lexical editor (`data-lexical-editor="true"`). Live timing probes showed that immediately after input the visible DOM and Lexical `EditorState.toJSON()` could both contain the complete intended text, then fresh-page hydration could reset the editor to empty shortly afterward. The old guard accepted the transient populated state and could click Send before that reset completed. Merely changing `insert_text` to `fill`, `press_sequentially`, or `keyboard.type` did not fix it: all three could still create a real empty user bubble.
+
+Resolution in `relay/copilot_autopilot_relay.py`:
+- continuation turns keep their existing fast path; only a fresh conversation pays the extra guard;
+- the fresh composer must contain the exact normalized intended one-line payload continuously for 2 seconds; if hydration wipes it, the identical text is reinserted and the stability clock restarts;
+- fresh-send success is no longer inferred from URL transition or the Stop/generating control alone; `send()` now requires a visible `data-testid="chatQuestion"` receipt containing the complete intended user payload, with exactly one new user turn at that receipt boundary;
+- an empty or mismatched first user bubble is therefore not returned as success even if a later semantic resend could recover the job.
+
+Measured live validation after the fix:
+- an isolated production `CopilotWebDriver.send()` call on a fresh real M365 page returned with `question_count=1`, `marker_count=1`, `empty_count=0`, and `exact intended hits=1`;
+- a full Cockpit -> Fleet -> M365 run (`R5LIVE-20261001-1220G`) completed on turn 1 with the marker-bearing user task and marker-bearing `DONE` reply; the prior `asks_for_goal -> resend` reason did not occur;
+- the pre-fix comparison was captured in the same environment and showed the empty first `chatQuestion` followed by the recovery resend.
+
+Repeatable evidence now lives in `scripts/live_gui_browser_submit_acceptance.py`. It is deliberately a live Windows acceptance rather than a fake CI browser test: it uses `scripts/win/submit_via_ui.ps1`, waits for the matching Fleet worker/conversation, connects to the real companion Edge over CDP, and inspects visible M365 `chatQuestion` nodes. `scripts/test_live_gui_browser_submit_acceptance.py` keeps its fail-closed verdict and fresh-idle rules hermetic in CI. `relay/test_fresh_composer_submission.py` pins the hydration-reset reinsertion and user-turn receipt semantics without claiming to emulate Microsoft's SPA.
+
+## 2026-10-01 independent read-only review follow-up
+
+A separate local CopilotAgent review was submitted through the visible Cockpit path after the first R5 fix. Its claimed blocker that the new logic had no tests was a search-scope error (the regressions already existed under `relay/` and `scripts/` and were registered in CI), but two medium findings were valid and were fixed before merge:
+
+- Fresh duplicate ambiguity: the prior post-click code still entered the legacy 12-second composer-clear loop. If attempt 1 had landed but the composer remained visually non-empty, that loop could eventually allow another submit action. Fresh conversations now perform exactly one click/Enter submit action per `send()` call and then wait only for the visible user-turn receipt. Missing or mismatched receipt is ambiguous and fails closed; it is never blindly re-clicked. Continuation turns retain the legacy settle/re-click behavior.
+- Live acceptance settle: the harness used to return as soon as the marker first appeared. It now requires the normalized list of visible user turns to remain unchanged for 2 seconds before judging it, so an immediate follow-on duplicate/recovery turn is included in the verdict rather than racing after it. The harness also reuses production `COPILOT_SELECTORS` instead of duplicating the M365 selectors.
+
+The follow-up has deterministic regressions, including a behavior test whose composer deliberately never clears while the user-turn receipt succeeds; it asserts the fresh Send button is clicked exactly once. After these changes the production `CopilotWebDriver.send()` live acceptance was repeated on another fresh real M365 page and again returned `question_count=1`, `marker_count=1`, `empty_count=0`, `exact intended hits=1`.
+
+### Cross-call retry boundary -- also closed before merge
+
+A further caller-level audit found that stopping re-clicks inside `CopilotWebDriver.send()` was not sufficient by itself. `RelayWorker` previously caught every remaining send exception as a transient and called `_retry_transient()`, so a fresh-delivery receipt ambiguity could still resend the same logical job on a later fleet sweep. `LOCAL_LOOP` likewise treated every send exception as retryable and could rotate to a replacement conversation. Both behaviors are unsafe when the first user turn may already exist.
+
+The boundary is now explicit in lightweight `relay.send_errors.FreshSubmitAmbiguous`. The browser driver raises that type only after a fresh submit action when no single matching user-turn receipt can be proven. Fleet catches it before the generic transient branch: it may salvage only from independent acceptance evidence, otherwise the worker becomes `STUCK` with an ambiguity reason and is not resent. LOCAL_LOOP records `UI_TRIGGER_AMBIGUOUS`, moves the campaign to `WAITING_RUNTIME`, and neither calls `retry_uncommitted_turn` nor rotates the browser conversation. Ordinary RuntimeError/CDP/network send failures retain their existing retry behavior. Regressions cover the driver exception type, Fleet catch ordering/no transient retry, and a behavioral LOCAL_LOOP test proving zero rotations and no `UI_TRIGGER_FAILED` event for the ambiguous case.
