@@ -386,6 +386,74 @@ public static class FanoutDepthView
     }
 }
 
+// The sibling write-scope selector's words and parsing, WPF-free (same file as FanoutView). The
+// Python side decides: relay/write_scope.py reads `fanout_write_scope` at every sweep and, in
+// shadow, records overlapping writes among siblings of one fan-out campaign; relay/fleet_runner.py
+// exports {mode, overlaps_seen} as status.json "fanout_write_scope". SHADOW ONLY: there is no
+// enforcing value, so nothing is ever blocked and no prompt or output changes.
+public static class WriteScopeView
+{
+    //: must equal tools/settings_keys.py and relay/write_scope.py KEY / MODES.
+    public const string Key = "fanout_write_scope";
+    public const string Default = "off";
+
+    public static readonly string[] Modes = { "off", "shadow" };
+
+    public static bool IsMode(string v) { return v == "off" || v == "shadow"; }
+
+    /// <summary>The mode named by one fanout_write_scope= line; null when the line is not that
+    /// key or the value is not off|shadow (the caller keeps its value, off). A byte order mark
+    /// is tolerated and the value is case-insensitive, as in Python.</summary>
+    public static string ParseLine(string line)
+    {
+        if (line == null) return null;
+        string ln = line.TrimStart('\uFEFF').Trim();
+        if (!ln.StartsWith(Key + "=", StringComparison.Ordinal)) return null;
+        string v = ln.Substring(Key.Length + 1).Trim().ToLowerInvariant();
+        return IsMode(v) ? v : null;
+    }
+
+    public static string Label(bool ja) { return ja ? "兄弟の書込み範囲" : "Sibling write scope"; }
+
+    public static string ModeLabel(string mode, bool ja)
+    {
+        if (mode == "off") return ja ? "オフ" : "Off";
+        if (mode == "shadow") return ja ? "シャドウ(記録のみ)" : "Shadow (record only)";
+        return mode ?? "";
+    }
+
+    public static string Help(bool ja)
+    {
+        return ja ? "記録のみ: 何もブロックしません。同じ分割の兄弟が同じファイルへ書いたとき、または他の兄弟の担当に書いたときに記録します。"
+                  : "Record only: nothing is blocked. Records when two siblings of one split write the same file, or one writes into a path another sibling's step names.";
+    }
+
+    public static string TakeEffectTip(bool ja)
+    {
+        return ja ? "次の巡回から有効。再起動不要。"
+                  : "Applies from the next sweep, no restart.";
+    }
+
+    /// <summary>What the coordinator reports (mode / overlaps seen); null when the mode is not
+    /// usable (old runner): the cockpit then shows nothing rather than guessing.</summary>
+    public static string Describe(string mode, int overlapsSeen, bool ja)
+    {
+        if (!IsMode(mode)) return null;
+        string head = (ja ? "稼働中: " : "In effect: ") + (mode == "shadow" ? (ja ? "シャドウ(記録のみ)" : "shadow (record only)") : (ja ? "オフ" : "off"));
+        if (mode == "shadow")
+            head += ja ? " / 検出 " + overlapsSeen + " 件" : " / " + overlapsSeen + " overlap(s) seen";
+        return head;
+    }
+
+    /// <summary>The note shown when the mode the runner reports differs from the selection (the
+    /// runner re-reads the key at its next sweep); null when they agree.</summary>
+    public static string PendingText(string reported, string selected, bool ja)
+    {
+        if (!IsMode(reported) || reported == selected) return null;
+        return ja ? "選択は次の巡回から反映" : "selection applies from the next sweep";
+    }
+}
+
 // The split-group line on a fan-out parent card, WPF-free (same file as FanoutView). Reads one
 // entry of status.json "groups" (relay/family_view.py) and, for a root group, the usage of its
 // tree (status.json "tree_budget") and the depth report ("fanout_depth"). Every nesting field is

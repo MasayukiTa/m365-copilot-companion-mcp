@@ -86,7 +86,10 @@ MECHANISMS = ("fanout", "refuter", "panel", "veto", "retry", "bestofn", "skill",
               # from a durable source or re-queued once, and the merge-queue stall detector
               # that notices a family waiting forever on such a child.
               "child_result_recovery",
-              "merge_stalled_missing_child_result")
+              "merge_stalled_missing_child_result",
+              # Two siblings of one campaign wrote the same path, or one wrote a path another's
+              # step names. SHADOW only (relay/write_scope.py): recorded, never acted on.
+              "scope_overlap")
 
 
 def patch_hash(text):

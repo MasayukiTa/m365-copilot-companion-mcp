@@ -133,6 +133,16 @@ KEYS = OrderedDict([
        "evaluation) with no restart; decisions already made stand. An MCP_EFFORT_POLICY "
        "environment variable beats this setting and is reported as a conflict."),
 
+    # Sibling write scope (relay/write_scope.py). SHADOW ONLY: it records overlapping writes
+    # among siblings of one campaign and changes nothing. There is deliberately no `on` value;
+    # enforcing a write scope would go through the folder policy (frozen) and needs a separate
+    # approval before such a value may exist.
+    _k("fanout_write_scope", EACH_GATE, "off",
+       "relay/write_scope.py:mode (every coordinator sweep, mtime-cached)",
+       "off|shadow. Re-read at every sweep with no restart. shadow records a scope_overlap "
+       "row when two siblings write one path or one writes a path another's step names; "
+       "nothing is blocked and no prompt or output changes."),
+
     # Per-tree fan-out budget (relay/fanout_budget.py). Read at each split decision; a tree
     # already running keeps going, and the next split uses the new values.
     _k("fanout_max_total", EACH_GATE, 24,

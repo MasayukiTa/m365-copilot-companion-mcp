@@ -831,6 +831,10 @@ class CockpitWindow : Window
     int _fdVal = FanoutDepthView.Default;
     ComboBox _fdBox;
     TextBlock _fdLbl, _fdNow, _fdPending;
+    // sibling write scope off|shadow -> settings.txt fanout_write_scope ; absent key = off (WriteScopeView.Default)
+    string _wsVal = WriteScopeView.Default;
+    ComboBox _wsBox;
+    TextBlock _wsLbl, _wsNow, _wsPending;
     string _approval = "run";  // approval mode run|plan|auto -> settings.txt approval=
     string _runtimeMode = "fleet"; // next launch: fleet | durable -> settings.txt runtime=
     bool _durableEnqueuePending = false; // one durable campaign intake process at a time
@@ -1863,6 +1867,11 @@ class CockpitWindow : Window
                     bool? fxv = FanoutView.ParseSetting(ln);   // same reading as Python's settings_fanout
                     if (fxv.HasValue) _fanout = fxv.Value;
                 }
+                else if (ln.StartsWith("fanout_write_scope="))
+                {
+                    string wsv = WriteScopeView.ParseLine(ln);   // off|shadow only; junk keeps the value
+                    if (wsv != null) _wsVal = wsv;
+                }
                 else if (ln.StartsWith("fanout_max_depth="))
                 {
                     int? fdv = FanoutDepthView.ParseLine(ln);   // clamped; junk keeps the value
@@ -2002,6 +2011,7 @@ class CockpitWindow : Window
         ctrls.Children.Add(EffortPolicyControl());
         ctrls.Children.Add(FanoutControl());
         ctrls.Children.Add(FanoutDepthControl());
+        ctrls.Children.Add(WriteScopeControl());
         ctrls.Children.Add(FanoutBudgetControl());
         ctrls.Children.Add(ApprovalControl());
         ctrls.Children.Add(ApprovalCenterControl());
@@ -7817,6 +7827,7 @@ class CockpitWindow : Window
                 return "live";
             case "rate_ceiling_rpm":
             case "job_approval_mode":
+            case "fanout_write_scope":
             case "fanout_max_depth":
             case "fanout_max_total":
             case "fanout_max_active":
@@ -9210,6 +9221,7 @@ class CockpitWindow : Window
         PaintFanoutInEffect(_lastRoot);
         PaintFanoutBudget();
         PaintFanoutDepth();
+        PaintWriteScope();
     }
     // What the COORDINATOR says it was started with (status.json "fanout_run"), beside the combo.
     // No report (old runner, no run yet) -> nothing shown, never a guess from the combo.
@@ -9434,6 +9446,83 @@ class CockpitWindow : Window
         _fdPending.Text = pend ?? "";
         _fdPending.Foreground = Theme.Br(Theme.Warning(_dark));
         _fdPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
+    }
+    // Sibling write scope (off|shadow), beside the split depth. Persists through SaveKey only; the
+    // coordinator re-reads the key at every sweep (each_gate). SHADOW ONLY: it records overlapping
+    // sibling writes and blocks nothing, and there is no enforcing option. What is IN EFFECT comes
+    // from status.json "fanout_write_scope"; the words and parsing live in WriteScopeView.
+    UIElement WriteScopeControl()
+    {
+        var wrap = new StackPanel(); wrap.Orientation = Orientation.Horizontal;
+        wrap.VerticalAlignment = VerticalAlignment.Center; wrap.Margin = new Thickness(0, 0, 12, 0);
+
+        _wsLbl = new TextBlock(); _wsLbl.VerticalAlignment = VerticalAlignment.Center;
+        _wsLbl.FontSize = 12; _wsLbl.Margin = new Thickness(0, 0, 8, 0);
+        wrap.Children.Add(_wsLbl);
+
+        _wsBox = new ComboBox();
+        _wsBox.ToolTip = WriteScopeView.Help(_lang == 0) + "\n" + WriteScopeView.TakeEffectTip(_lang == 0);
+        _wsBox.Cursor = Cursors.Hand; _wsBox.FontSize = 12;
+        _wsBox.FontWeight = FontWeights.SemiBold; _wsBox.MinWidth = 78;
+        _wsBox.Padding = new Thickness(8, 2, 4, 2);
+        _wsBox.VerticalAlignment = VerticalAlignment.Center;
+        var wsHelp = new Dictionary<string, string>();
+        foreach (string m in WriteScopeView.Modes) wsHelp[m] = WriteScopeView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_wsBox, WriteScopeView.Modes, wsHelp, _wsVal);
+        _wsBox.DropDownOpened += delegate { CloseHeaderPopups("effort"); };
+        _wsBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_wsBox);
+            if (!WriteScopeView.IsMode(sel) || sel == _wsVal) return;   // unchanged -> no write, no re-fire
+            _wsVal = sel;
+            SaveKey(WriteScopeView.Key, _wsVal);
+            PaintWriteScopeInEffect(_lastRoot);
+        };
+        wrap.Children.Add(_wsBox);
+
+        _wsNow = new TextBlock(); _wsNow.VerticalAlignment = VerticalAlignment.Center;
+        _wsNow.FontSize = 11.5; _wsNow.Margin = new Thickness(8, 0, 0, 0);
+        wrap.Children.Add(_wsNow);
+        _wsPending = new TextBlock(); _wsPending.VerticalAlignment = VerticalAlignment.Center;
+        _wsPending.FontSize = 11.5; _wsPending.FontWeight = FontWeights.SemiBold;
+        _wsPending.Margin = new Thickness(8, 0, 0, 0);
+        _wsPending.Visibility = Visibility.Collapsed;
+        wrap.Children.Add(_wsPending);
+
+        PaintWriteScope();
+        return wrap;
+    }
+    void PaintWriteScope()
+    {
+        if (_wsLbl != null) { _wsLbl.Text = WriteScopeView.Label(_lang == 0); _wsLbl.Foreground = Muted; }
+        if (_wsBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_wsBox), _wsVal)) ComboSelectVal(_wsBox, _wsVal);
+        _wsBox.ToolTip = WriteScopeView.Help(_lang == 0) + "\n" + WriteScopeView.TakeEffectTip(_lang == 0);
+        _wsBox.Background = BtnBg; _wsBox.Foreground = Fg; _wsBox.BorderBrush = Border;
+        StyleFlatCombo(_wsBox);
+        PaintWriteScopeInEffect(_lastRoot);
+    }
+    // What the COORDINATOR says it applies (status.json "fanout_write_scope"). No report (old
+    // runner, no run yet) -> nothing shown, never a guess from the selection.
+    void PaintWriteScopeInEffect(Dictionary<string, object> root)
+    {
+        if (_wsNow == null || _wsPending == null) return;
+        bool ja = _lang == 0;
+        string now = null, pend = null;
+        Dictionary<string, object> ws = root != null ? Obj(root, "fanout_write_scope") : null;
+        if (ws != null && ws.ContainsKey("mode") && ws["mode"] != null)
+        {
+            string rep = S(ws, "mode");
+            now = WriteScopeView.Describe(rep, ws.ContainsKey("overlaps_seen") && ws["overlaps_seen"] != null ? I(ws, "overlaps_seen") : 0, ja);
+            pend = WriteScopeView.PendingText(rep, _wsVal, ja);
+        }
+        _wsNow.Text = now ?? "";
+        _wsNow.Foreground = Muted;
+        _wsNow.Visibility = now != null ? Visibility.Visible : Visibility.Collapsed;
+        _wsPending.Text = pend ?? "";
+        _wsPending.Foreground = Theme.Br(Theme.Warning(_dark));
+        _wsPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
     }
     void PaintEffort()
     {
@@ -12155,6 +12244,7 @@ class CockpitWindow : Window
         PaintFanoutInEffect(root);         // what the coordinator was started with (fan-out)
         PaintFanoutBudgetInEffect(root);   // the per-tree limits the coordinator applies
         PaintFanoutDepthInEffect(root);    // the split depth the coordinator applies
+        PaintWriteScopeInEffect(root);     // the sibling write-scope mode the coordinator applies
         // Preserve scroll position across the rebuild. Without this, every worker update
         // (status/turn change) reset the list and snapped the view back to the TOP -- which is
         // exactly why scrolling "didn't work" while tasks were live: the user scrolled down, a
