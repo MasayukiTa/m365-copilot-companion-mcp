@@ -56,10 +56,6 @@ UI_ONLY = "ui_only"            # never read outside the GUI
 
 EFFECTS = (LIVE, EACH_GATE, SWEEP_START, BRIDGE_START, UI_ONLY)
 
-#: Sentinel for "absent means undecided", which is not the same as "absent means this value".
-#: `fanout` is the only key with it: unset does not mean off, it means the length heuristic in
-#: relay/task_router.py decides, and writing a boolean here would state something false.
-UNDECIDED = object()
 
 
 class Key(object):
@@ -147,11 +143,11 @@ KEYS = OrderedDict([
        "0 means off and only the file can say it, because the panel expresses off "
        "with the autoretry toggle instead."),
 
-    _k("fanout", SWEEP_START, UNDECIDED,
+    _k("fanout", SWEEP_START, True,
        "relay/task_router.py:_wants_fanout (once per autostart goal)",
-       "Governs goals that arrive through autostart only; a run launched from the cockpit "
-       "carries the checkbox as a flag instead. Unset means UNDECIDED -- a length heuristic "
-       "decides, it does not mean off."),
+       "Governs every coordinator start (autostart and the cockpit's own launches). Unset "
+       "means ON: only an explicit fanout=off turns it off. Each goal is still judged "
+       "separately, so a goal that fits costs nothing."),
 
     _k("fleet_log_days", SWEEP_START, 14.0,
        "relay/fleet_retention.py:apply (once, at coordinator start)",
