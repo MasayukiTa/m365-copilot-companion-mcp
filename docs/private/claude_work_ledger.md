@@ -200,3 +200,12 @@ Next work after this checkpoint:
 ### 2026-10-01 10:2x JST correction -- fetched main was newer than cached origin/main
 
 After the checkpoint above, `git fetch origin main` updated the remote-tracking ref from PR #91's `3d97c39` to `ed16ac9` (PR #92). Main HEAD `ed16ac9` is green on CI, CodeQL, Secret scan, Workflow lint, and Windows build. Treat the earlier wording that called `f2a3ef8` a merge of current main as stale-local-ref wording; final PR #78 convergence still requires the newer main.
+
+## 2026-10-01 - correction: what the recovery work does and does not cover
+
+Earlier entries and chat reports called the interrupted-run recovery work (non-destructive reap, exactly-once resume) a finished "phase" or "stage done". That wording was wrong in two ways. It is one item (duplicate suppression across retry/resume) of a larger recursive fan-out effort that is not built: there is no task-node identity and there are no grandchildren. And "done" meant "code merged", not "exit criteria met".
+
+Status in plain terms:
+- Done and verified live for 2 goals: non-destructive reap, interrupted snapshot, exactly-once merge on resume.
+- Still open: resume of the whole fan-out family, supervisor auto-resume (currently off), stage-2 outcome comparison, the stage-1 on-screen check, and tool-event attribution.
+- Existing entries above are left as written; read "stage done" there as "code merged".
