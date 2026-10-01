@@ -65,7 +65,13 @@ def _incident(tmp_path, *, with_stop=False):
         f.write("last line\n")
     with open(os.path.join(d, "campaigns.jsonl"), "w", encoding="utf-8") as f:
         f.write(json.dumps({"kind": "campaign", "campaign_id": "c1", "goal": "big goal",
-                            "n": 7, "cwd": "X"}) + "\n")
+                            "n": 7, "cwd": "X",
+                            "run_id": "r1a2b_a1", "ts": 1.0}) + "\n")
+        # a campaign of some OLDER run (legacy, no stamp) must not reach this run's snapshot
+        f.write(json.dumps({"kind": "campaign", "campaign_id": "cOLD", "goal": "old goal",
+                            "n": 1, "cwd": "X"}) + "\n")
+        f.write(json.dumps({"campaign_id": "cOLD", "task_id": "o0", "subtask_index": 0,
+                            "text": "old sub"}) + "\n")
         for i in range(7):
             f.write(json.dumps({"campaign_id": "c1", "task_id": "t%d" % i,
                                 "subtask_index": i, "text": "sub %d" % i}) + "\n")
@@ -301,3 +307,19 @@ def test_interrupted_is_not_a_terminal_or_finished_or_retryable_state():
     assert outcomes.scoring_of("INTERRUPTED", 5) == "fail"
     assert outcomes.scoring_of("INTERRUPTED", 0) == "excluded"
     assert outcomes.scoring_of("INTERRUPTED") == "fail"
+
+
+def test_reaper_keeps_legacy_campaign_carried_by_a_worker_and_drops_unrelated(tmp_path):
+    """Through the reaper entry point: an unstamped (legacy) header IS this run's when one of
+    its workers carries the campaign id; an unstamped header nobody in the run names is not."""
+    d = _incident(tmp_path)
+    st = _r(os.path.join(d, "status.json"))
+    st["workers"][3]["campaign_id"] = "cLEG"
+    _w(os.path.join(d, "status.json"), st)
+    with open(os.path.join(d, "campaigns.jsonl"), "a", encoding="utf-8") as f:
+        f.write(json.dumps({"kind": "campaign", "campaign_id": "cLEG", "goal": "legacy goal",
+                            "n": 1, "cwd": "X"}) + "\n")
+        f.write(json.dumps({"campaign_id": "cLEG", "task_id": "l0", "subtask_index": 0,
+                            "text": "leg sub"}) + "\n")
+    snap = _r(reap_stale_run(d, alive=DEAD)["snapshot"])
+    assert sorted(p["campaign_id"] for p in snap["campaigns"]) == ["c1", "cLEG"]

@@ -267,26 +267,49 @@ def _finalize_history(entries, *, stopped: bool = False) -> int:
     return changed
 
 
-def _campaign_plans(fleet_dir: str) -> list:
-    """The fan-out plan(s) on record, from campaigns.jsonl (header + child keys only)."""
+def _campaign_plans(fleet_dir: str, status=None, run_id: str = "", marker=None) -> list:
+    """The fan-out plan(s) of THIS run, from campaigns.jsonl (header + child keys only).
+
+    The ledger holds every campaign ever split (63 campaigns / 2.6 MB measured), so embedding
+    all of them made each snapshot huge and made "every unfinished campaign" look like work of
+    the interrupted run. Only families that belong to the run are kept
+    (fleet_resume.campaigns_of_run: stamp, worker campaign id, parent goal, or the lineage it
+    resumed), at most SNAPSHOT_MAX_CAMPAIGNS of them with SNAPSHOT_MAX_CHILDREN child keys each.
+    No evidence -> no plans.
+    """
     try:
         path = os.path.join(fleet_dir, "campaigns.jsonl")
         if not os.path.isfile(path):
             return []
+        from relay import fleet_resume as fr
         with open(path, encoding="utf-8-sig", errors="replace") as fh:
             lines = fh.read().splitlines()
         from relay.fanout import campaigns_from_ledger
+        fams = campaigns_from_ledger(lines)
+        run_ids, cids, texts = fr.run_identity(run_id, (status or {}).get("workers"))
+        try:
+            with open(os.path.join(fleet_dir, "last_run_goals.json"), encoding="utf-8-sig") as fh:
+                texts += [str(e.get("text")) for e in (json.load(fh).get("goals") or [])
+                          if isinstance(e, dict) and e.get("text")]
+        except Exception:
+            pass
+        prior = fr.lineage_campaign_ids(
+            fleet_dir, (marker or {}).get("resume_lineage") if isinstance(marker, dict) else None)
+        mine = fr.campaigns_of_run(fams, run_ids, cids, texts, prior)
         plans = []
-        for cid, fam in campaigns_from_ledger(lines).items():
+        for cid in sorted(mine)[:fr.SNAPSHOT_MAX_CAMPAIGNS]:
+            fam = fams[cid]
+            kids = [c for c in fam.get("children", []) if isinstance(c, dict)]
             plans.append({
                 "campaign_id": cid,
                 "goal": str(fam.get("goal") or "")[:400],
                 "n": fam.get("n"),
                 "cwd": fam.get("cwd"),
                 "merged": bool(fam.get("merged")),
+                "run_ids": list(fam.get("run_ids") or [])[:4],
                 "children": [{"task_id": c.get("task_id"),
                               "subtask_index": c.get("subtask_index")}
-                             for c in fam.get("children", []) if isinstance(c, dict)],
+                             for c in kids[:fr.SNAPSHOT_MAX_CHILDREN]],
             })
         return plans
     except Exception:
@@ -315,7 +338,7 @@ def _snapshot_payload(status: dict, marker, evidence: dict, run_id: str,
             continue
         workers.append({k: w.get(k) for k in (
             "name", "status", "outcome", "run_id", "jid", "campaign", "role",
-            "subtask_index", "turns", "closed", "goal") if k in w})
+            "subtask_index", "turns", "closed", "goal", "campaign_id") if k in w})
     # A RUN THAT DESCENDS FROM AN EARLIER RESUME keeps that resume's count, so the loop guard
     # (fleet_resume.resume_gate) counts a crash loop across the new run ids a resume creates.
     resume = {"count": 0, "history": []}
@@ -336,7 +359,10 @@ def _snapshot_payload(status: dict, marker, evidence: dict, run_id: str,
         "marker": marker if isinstance(marker, dict) else None,
         "interrupted": evidence,
         "workers": workers,
-        "campaigns": _campaign_plans(fleet_dir),
+        "campaigns": _campaign_plans(fleet_dir, status, run_id, marker),
+        # the list above is THIS run's families only (see _campaign_plans); resume trusts it
+        # only when this flag is present, because older snapshots embedded the whole ledger.
+        "campaigns_scoped": True,
     }
 
 
