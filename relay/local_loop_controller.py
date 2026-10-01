@@ -1279,6 +1279,8 @@ def main(argv=None):
     ap.add_argument("--drain-campaign", action="store_true", help="materialize and launch queued campaign jobs, then exit")
     ap.add_argument("--resume-runtime", action="store_true",
                     help="explicitly resume an existing WAITING_RUNTIME job after its runtime condition is repaired")
+    ap.add_argument("--operator-steer-job-id", help="queue one local-operator update into an existing durable job")
+    ap.add_argument("--operator-steer-file", help="UTF-8 file containing the operator update; deleted only after durable queue success")
     ap.add_argument("--cwd", help="optional local workspace boundary for an ad-hoc goal job")
     ap.add_argument("--max-turns", type=int, default=1000, help="maximum durable turns for --goal")
     ap.add_argument("--read-only", action="store_true", help="mark an ad-hoc --goal job read-only")
@@ -1304,9 +1306,12 @@ def main(argv=None):
     goal_sources = sum(bool(value) for value in (args.job_file, args.goal, args.goal_file))
     if goal_sources > 1:
         ap.error("use exactly one of --job-file, --goal or --goal-file")
-    special_modes = int(bool(args.enqueue_goals_file)) + int(bool(args.drain_campaign))
+    steer_mode = bool(args.operator_steer_job_id or args.operator_steer_file)
+    if steer_mode and not (args.operator_steer_job_id and args.operator_steer_file):
+        ap.error("--operator-steer-job-id and --operator-steer-file must be used together")
+    special_modes = int(bool(args.enqueue_goals_file)) + int(bool(args.drain_campaign)) + int(steer_mode)
     if special_modes > 1 or (special_modes and (goal_sources or args.job_id or args.resume_runtime)):
-        ap.error("campaign enqueue/drain modes cannot be combined with a controller job")
+        ap.error("campaign/steer special modes cannot be combined with a controller job")
     if args.resume_runtime and (goal_sources or not args.job_id):
         ap.error("--resume-runtime requires an existing --job-id and cannot create a new job")
 
@@ -1328,6 +1333,31 @@ def main(argv=None):
         result = _drain_campaign(store, args.state_dir, args)
         print(json.dumps(result, ensure_ascii=False), flush=True)
         return 0 if result.get("ok") else 2
+    if steer_mode:
+        steer_path = Path(args.operator_steer_file)
+        try:
+            text = _read_goal_file(steer_path)
+            result = store.queue_operator_steer(args.operator_steer_job_id, text)
+            _project_job_snapshot(
+                store, args.operator_steer_job_id, Path(args.state_dir) / "status.json",
+            )
+        except (OSError, ValueError, JobStoreError) as exc:
+            detail = exc.as_dict() if isinstance(exc, JobStoreError) else {
+                "ok": False, "error": type(exc).__name__, "detail": str(exc),
+            }
+            print(json.dumps(detail, ensure_ascii=False), flush=True)
+            return 2
+        try:
+            steer_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            # SQLite is already authoritative. Reporting failure here would make the Cockpit
+            # restore/re-send the same operator update and duplicate it. Cleanup is housekeeping.
+            result = dict(result)
+            result["warning"] = f"steer file cleanup failed: {exc}"
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+        return 0
     if not args.agent_url:
         ap.error("--agent-url or MCP_FLEET_AGENT_URL/MCP_IMPL_AGENT_URL is required")
     job_id = args.job_id
