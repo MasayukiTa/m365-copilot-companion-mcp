@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """Ledger entries live in one file each and compile deterministically (no shared tail)."""
-import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 import ledger_compile as lc  # noqa: E402
+from tools import childproc  # noqa: E402
 
 
 def _entry(d, name, title):
@@ -43,6 +44,5 @@ def test_repository_entries_are_valid_and_baseline_is_untouched_by_compile():
 
 
 def test_cli_check_runs():
-    r = subprocess.run([sys.executable, str(ROOT / "scripts" / "ledger_compile.py"), "--check"],
-                       capture_output=True, text=True)
+    r = childproc.run([sys.executable, str(ROOT / "scripts" / "ledger_compile.py"), "--check"])
     assert r.returncode == 0, r.stderr
