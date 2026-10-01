@@ -8611,15 +8611,30 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         _pc, _pi = _camp.get("parent_campaign_id"), _camp.get("parent_subtask_index")
         if not _pc or _pi is None:
             return
-        _mark = (_pc, "nested", _pi)
+        # The slot row is written once per OUTCOME CLASS: one MISSING marker, and -- when a merge
+        # that first failed is retried and finishes DONE -- one DONE row that supersedes it (the
+        # readers take the last `nested` row of a slot). A DONE row is never superseded.
+        _mark = (_pc, "nested", _pi, "DONE" if merge_ok else "MISSING")
         if _mark in _noted_done:
             return
         _noted_done.add(_mark)
         _parent = campaigns.get(_pc)
-        if _parent is not None and any(
-                _r.get("nested") and _r.get("subtask_index") == _pi
-                for _r in (_parent.get("child_results") or [])):
-            return                          # already on the ledger (rehydrated / earlier pass)
+        if _parent is not None:
+            _have = list(_parent.get("child_results") or [])
+        else:
+            # the parent family left memory (its own merge is done): the ledger is the record
+            _have = []
+            try:
+                _pfam = resume_mod.read_campaigns(os.path.dirname(transcript_dir)).get(_pc) \
+                    if transcript_dir else None
+                _have = list((_pfam or {}).get("child_results") or [])
+            except Exception:
+                _have = []
+        _have = [_r for _r in _have if _r.get("nested") and _r.get("subtask_index") == _pi]
+        if _have:
+            if str(_have[-1].get("outcome") or "").upper() == "DONE" or not merge_ok:
+                return                      # already on the ledger (rehydrated / earlier pass)
+            # MISSING on the ledger and the merge now finished DONE: supersede it, once
         _row = fanout_mod.nested_result_row(
             _pc, _pi, _cid,
             (getattr(_w, "display_result", "") or getattr(_w, "last_response", "") or ""),
@@ -8754,6 +8769,25 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             campaigns[cid]["parent_campaign_id"] = _pc
             campaigns[cid]["parent_subtask_index"] = (kids[0] or {}).get("parent_subtask_index")
 
+    def _nested_family_for_slot(kids):
+        """The id of a nested family already filling the parent slot these `kids` would fill
+        (same parent_campaign_id + parent_subtask_index), in memory or on the ledger; None for
+        a top-level split or a free slot. Never raises."""
+        _pc = (kids[0] or {}).get("parent_campaign_id") or ""
+        _pi = (kids[0] or {}).get("parent_subtask_index")
+        if not _pc or _pi is None:
+            return None
+        for _c, _cm in campaigns.items():
+            if _cm.get("parent_campaign_id") == _pc and _cm.get("parent_subtask_index") == _pi:
+                return _c
+        if not transcript_dir:
+            return None
+        try:
+            return resume_mod.nested_slot_map(
+                resume_mod.read_campaigns(os.path.dirname(transcript_dir))).get((_pc, _pi))
+        except Exception:
+            return None
+
     def _spawn_children(parent_goal, kids, parent_checks=None, parent_partial=""):
         """Queue a split parent's children and remember the family. Idempotent per campaign.
 
@@ -8777,6 +8811,15 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             # that exists.
             print("[fanout] %s: already split in this run (%d children); not re-queueing"
                   % (cid, campaigns[cid].get("n", 0)), flush=True)
+            return
+        _twin = _nested_family_for_slot(kids)
+        if _twin and _twin != cid:
+            # A RETRY OF A CHILD THAT ALREADY SPLIT. The nested id hashes the splitting task's id,
+            # so a retry (new task id) would mint a SECOND nested family for the same parent slot
+            # and orphan the first. A parent slot is filled by one nested family: the first.
+            print("[fanout] %s: slot %s of %s already split into %s; not splitting again"
+                  % (cid, kids[0].get("parent_subtask_index"),
+                     kids[0].get("parent_campaign_id"), _twin), flush=True)
             return
         if _campaign_already_on_disk(cid):
             # ALREADY SPLIT IN AN EARLIER RUN. The ledger outlives the process, and a resumed
