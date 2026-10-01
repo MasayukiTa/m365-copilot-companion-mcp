@@ -228,3 +228,8 @@ Status in plain terms:
 - Added scripts/sibling_dup_report.py: measures, from .fleet/tool_events.jsonl, status.json workers and campaigns.jsonl, the duplicate-call rate across fan-out siblings (M1), duplicate time vs campaign wall-clock (M2), merge loss proxy (M3) and the qualifying-campaign denominator (M4). Verdict constants: 20 campaigns minimum; duplicate time < 5% AND merge loss from missing child information < 2 of 10 => LOW.
 - Live run (read-only): 38,349 ledger calls, 34,134 unattributed/ambiguous, 0 calls mappable to a fan-out child, 0 qualifying campaigns of 123 known: INSUFFICIENT (<20 campaigns). Campaign task ids and attributed task ids do not overlap in the current data.
 - Tests: scripts/test_sibling_dup_report.py (registered in ci.yml). Open: PR review/merge.
+
+## 2026-10-02 - task-tree identity on fan-out campaign records
+- Change (branch feat/campaign-tree-identity-20261002): child goals from fanout.child_goals now carry parent_campaign_id, parent_subtask_index and root_id (top-level parent: root is the split's own campaign id; deeper child inherits the parent's root). The campaigns.jsonl header also records parent_task_id, parent_campaign_id and root_id; status.json worker rows carry root_id when known (kept in the task envelope metadata, outside the goal hash).
+- Additive and record-only: no depth gate or MAX_DEPTH change, no recursion; old ledgers without the keys load as before.
+- Tests: relay/test_campaign_tree_identity.py (in ci.yml). Open: PR review/merge.
