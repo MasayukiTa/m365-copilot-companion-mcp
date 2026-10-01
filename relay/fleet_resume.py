@@ -417,6 +417,16 @@ def campaigns_of_run(fams, run_ids=(), worker_cids=(), goal_texts=(), prior_cids
                 out.add(cid)
         elif cid in parents:
             out.add(cid)
+    # A NESTED family belongs to the run its parent campaign belongs to, whichever run stamped
+    # its header (a resumed run may have been the one that split it): follow parent_campaign_id
+    # down the tree until nothing more is added.
+    grew = True
+    while grew:
+        grew = False
+        for cid, fam in (fams or {}).items():
+            if cid not in out and fam.get("parent_campaign_id") in out:
+                out.add(cid)
+                grew = True
     return out
 
 
@@ -493,6 +503,55 @@ def interrupted_run_scope(state_dir, lineage=None):
     return campaigns_of_run(read_campaigns(state_dir), run_ids, cids, texts, prior), origin
 
 
+def nested_slot_map(camps):
+    """{(parent_campaign_id, parent_subtask_index): nested_campaign_id} for every nested family
+    on the ledger (a family whose header names the parent slot it fills)."""
+    out = {}
+    for cid, fam in (camps or {}).items():
+        pc = fam.get("parent_campaign_id")
+        if pc and fam.get("parent_subtask_index") is not None:
+            out[(pc, fam.get("parent_subtask_index"))] = cid
+    return out
+
+
+def _child_split_into_nested(child, cid, done_map, nested_slots):
+    """Did this child end FANOUT with its nested family on the ledger? Such a child must NOT be
+    re-queued (it would split a second time): its slot is the nested family's to fill."""
+    g = child.get("goal")
+    key = goal_resume_key(g) if isinstance(g, dict) else text_key(child.get("text") or "")
+    return (str(done_map.get(key) or "").upper() == "FANOUT"
+            and (cid, child.get("subtask_index")) in nested_slots)
+
+
+def seal_finished_nested_slots(state_dir, camps, scope, log=print):
+    """A nested family whose merge FINISHED but whose parent slot has no `nested` result line
+    (the process died between the two writes) gets an explicit MISSING row, once: the answer
+    text is not recoverable from the ledger, and an invented one would be worse than a named gap.
+    Returns the rows written. In-scope families only; a finished parent is left alone."""
+    from relay import fanout
+    wrote = []
+    for cid, fam in sorted((camps or {}).items()):
+        pc, pi = fam.get("parent_campaign_id"), fam.get("parent_subtask_index")
+        if cid not in scope or not pc or pi is None or not fam.get("merge_done"):
+            continue
+        parent = (camps or {}).get(pc)
+        if parent is None or parent.get("merge_done"):
+            continue
+        if any(r.get("nested") and r.get("subtask_index") == pi
+               for r in parent.get("child_results") or []):
+            continue
+        row = fanout.nested_result_row(pc, pi, cid, "", merge_ok=False,
+                                       missing=fam.get("nested_missing") or (),
+                                       task_id="%s-%s" % (pc, pi))
+        row["sealed"] = "nested_merge_result_not_recorded"
+        append_ledger_row(state_dir, row)
+        parent.setdefault("child_results", []).append(row)
+        wrote.append(row)
+        log("[resume] nested campaign %s finished but its slot %s of %s had no result: "
+            "marked MISSING" % (cid, pi, pc))
+    return wrote
+
+
 def resume_children_goals(state_dir, done_map=None, log=print, scope=None):
     """G2: goals to re-queue for campaign children that are not DONE.
 
@@ -509,6 +568,8 @@ def resume_children_goals(state_dir, done_map=None, log=print, scope=None):
     scope = set(scope)
     goals, degraded, skipped = [], 0, 0
     camps = read_campaigns(state_dir)
+    nested_slots = nested_slot_map(camps)
+    seal_finished_nested_slots(state_dir, camps, scope, log=log)
     for cid, fam in sorted(camps.items()):
         if cid not in scope:
             skipped += 1
@@ -522,6 +583,8 @@ def resume_children_goals(state_dir, done_map=None, log=print, scope=None):
         for child in fam.get("children") or []:
             if _child_done(child, fam, done_map) and id(child) not in _requeue:
                 continue
+            if _child_split_into_nested(child, cid, done_map, nested_slots):
+                continue            # it split: its slot is filled by the nested family's merge
             g = child.get("goal")
             if isinstance(g, dict) and (g.get("text") or g.get("goal")):
                 goal = dict(g)
