@@ -264,7 +264,8 @@ def trim_steps(steps, granted):
     return head
 
 
-def apply_budget(steps, root_id, workers, campaigns, limits, min_children=2, now=None):
+def apply_budget(steps, root_id, workers, campaigns, limits, min_children=2, now=None,
+                 self_active=0):
     """The split decision: (steps_to_use, reason). `steps_to_use` is [] for "do not split".
 
     Pure over its inputs. A partial grant below `min_children` is a refusal, because one child
@@ -273,7 +274,7 @@ def apply_budget(steps, root_id, workers, campaigns, limits, min_children=2, now
     if not steps:
         return steps, ""
     usage = usage_from_status(workers, campaigns, now=now)
-    granted, why = grant(root_id, len(steps), usage, limits)
+    granted, why = grant(root_id, len(steps), usage, limits, self_active=self_active)
     if granted < min_children:
         return [], why or "fewer than %d children granted" % min_children
     return trim_steps(steps, granted), why

@@ -309,3 +309,79 @@ public static class FanoutBudgetView
         return null;
     }
 }
+
+// The split-depth selector's words and parsing, WPF-free (same file as FanoutView). The Python
+// side decides: relay/fanout.py reads `fanout_max_depth` at every split and caps it while the
+// merge of nested splits is not enabled; relay/fleet_runner.py exports both the configured and
+// the effective depth as status.json "fanout_depth". The screen words the REPORT, so it never
+// claims a depth the coordinator is not applying.
+public static class FanoutDepthView
+{
+    //: must equal tools/settings_keys.py and relay/fanout.py DEPTH_SETTING_KEY / BOUNDS.
+    public const string Key = "fanout_max_depth";
+    public const int Default = 1;
+    public const int Low = 1;
+    public const int High = 3;
+
+    public static readonly string[] Modes = { "1", "2", "3" };
+
+    public static int Clamp(int v) { return Math.Max(Low, Math.Min(High, v)); }
+
+    /// <summary>The clamped value of one fanout_max_depth= line; null when the line is not that
+    /// key or the value is not a whole number (the caller keeps its current value).</summary>
+    public static int? ParseLine(string line)
+    {
+        if (line == null) return null;
+        string ln = line.TrimStart('﻿').Trim();
+        if (!ln.StartsWith(Key + "=", StringComparison.Ordinal)) return null;
+        int v;
+        if (!int.TryParse(ln.Substring(Key.Length + 1).Trim(), System.Globalization.NumberStyles.Integer,
+                          System.Globalization.CultureInfo.InvariantCulture, out v)) return null;
+        return Clamp(v);
+    }
+
+    public static string Label(bool ja) { return ja ? "分割の深さ" : "Split depth"; }
+
+    public static string ModeLabel(string mode, bool ja)
+    {
+        if (mode == "1") return ja ? "1(最上位のみ)" : "1 (top level only)";
+        if (mode == "2") return ja ? "2(子も分割可)" : "2 (children may split)";
+        if (mode == "3") return ja ? "3(孫も分割可)" : "3 (grandchildren may split)";
+        return mode ?? "";
+    }
+
+    public static string Help(bool ja)
+    {
+        return ja ? "分割がさらに分割できる段数の上限。1=最上位の依頼だけが分割されます。統合の準備が整うまで、実際に使われる深さは下の「稼働中」表示のとおりです。"
+                  : "How many levels deep a split may nest. 1 = only the top-level goal splits. Until nested merging is enabled, the depth actually used is the one shown as in effect.";
+    }
+
+    public static string TakeEffectTip(bool ja)
+    {
+        return ja ? "次の分割判断から有効。再起動不要。分割済みのツリーは変わりません。"
+                  : "Applies to the next split decision, no restart. Trees already split keep going.";
+    }
+
+    /// <summary>What the coordinator reports (configured / effective); null when it reported
+    /// nothing usable. Says plainly when the effective depth is below the configured one.</summary>
+    public static string Describe(int configured, int effective, string reason, bool ja)
+    {
+        string s = (ja ? "稼働中: 深さ " : "In effect: depth ") + effective;
+        if (effective < configured)
+        {
+            s += ja ? " (設定 " + configured + " はまだ有効ではありません" : " (setting " + configured + " is not active";
+            if (!string.IsNullOrEmpty(reason))
+                s += ja ? ": 入れ子の統合が未対応" : ": " + reason;
+            s += ")";
+        }
+        return s;
+    }
+
+    /// <summary>The note shown when the configured depth the runner reports differs from the
+    /// selection (the runner reads the key at its next split); null when they agree.</summary>
+    public static string PendingText(int configured, int selected, bool ja)
+    {
+        if (configured == selected) return null;
+        return ja ? "選択は次の分割から反映" : "selection applies from the next split";
+    }
+}

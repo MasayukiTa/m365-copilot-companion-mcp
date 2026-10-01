@@ -983,7 +983,7 @@ def _clip(text: str, cap: int) -> str:
 def _split_scope_block(text: str):
     """(scope block, the rest) for a fan-out child's goal, or ("", text). The block is the
     '担当範囲 N/M' header, its step, and the 'do not touch the other parts' line."""
-    start = text.find(_SCOPE_START)
+    start = text.rfind(_SCOPE_START)   # the LAST block is this conversation's own
     if start < 0:
         return "", text
     dont = text.find(_SCOPE_DONT_TOUCH, start)
@@ -3514,7 +3514,9 @@ class RelayWorker:
         # permission" rule tools/command_judge.py states for JudgeUnavailable -- so any
         # exception here falls back to NOT wanting to split, never to the old length-only
         # permissiveness.
-        _depth0 = int(getattr(self.task_envelope, "depth", 0) or 0) == 0
+        # (depth below the configured maximum, read now; a merge worker never splits)
+        _depth0 = (fanout_mod.may_split_at(getattr(self.task_envelope, "depth", 0))
+                   and getattr(self.task_envelope, "role", "") != "aggregator")
         _goal_splittable = False
         # WHY THE VERDICT IS KEPT RATHER THAN RECORDED HERE: `self.run_id` is assigned further
         # down this constructor, so a telemetry call beside the judgement would raise
@@ -6428,14 +6430,26 @@ class RelayWorker:
                 # `steps`, which takes the existing "run it here" branch below; a partial grant
                 # folds the tail into the last kept step. Unchanged at default limits.
                 self._budget_refusal = ""
+                # A NESTED SPLIT (depth > 0) names its place in the tree: its own depth, the
+                # campaign and slice it belongs to, and the tree's root, which is what the
+                # budget is charged against. Nothing is added for a top-level split.
+                _env = self.task_envelope
+                _tree = {}
+                if int(getattr(_env, "depth", 0) or 0) > 0:
+                    _tree = {"depth": int(_env.depth),
+                             "parent_campaign_id": _env.campaign_id or "",
+                             "parent_subtask_index": self.subtask_index,
+                             "root_id": ((_env.metadata or {}).get("root_id")
+                                         or _env.campaign_id or "")}
                 _grant_fn = getattr(self._spawn_fn, "grant", None)
                 if steps and _grant_fn is not None:
                     steps, self._budget_refusal = _grant_fn(
-                        self.goal, steps, getattr(self.task_envelope, "task_id", "") or "")
+                        self.goal, steps, getattr(self.task_envelope, "task_id", "") or "",
+                        **({"root_id": _tree["root_id"]} if _tree else {}))
                 kids = (fanout_mod.child_goals(
                     self.goal, steps,
                     parent_task_id=getattr(self.task_envelope, "task_id", "") or "",
-                    cwd=getattr(self, "cwd", None),
+                    cwd=getattr(self, "cwd", None), **_tree,
                     parent_level=(effort_policy_mod.worker_level(self)
                                   if effort_policy_mod.mode() != "off" else None),
                     run_id=getattr(self, "run_id", "") or "") if steps else [])
@@ -6644,9 +6658,10 @@ class RelayWorker:
         """
         if self._midrun_split_asked or self._fanout_done:
             return False
-        if not getattr(self, "_fanout_capable", False):
-            # Either the run is not fan-out-capable, or this worker IS a child. A child that
-            # splits makes grandchildren, and MAX_DEPTH forbids that for good reason.
+        if not getattr(self, "_fanout_capable", False) or not fanout_mod.may_split_at(
+                getattr(self.task_envelope, "depth", 0)):
+            # Either the run is not fan-out-capable, or this worker is already as deep as the
+            # tree may go (the depth setting is read now, not when the worker was built).
             return False
         self._midrun_split_asked = True
         # The __init__ verdict is deliberately overridden: it was made before the work began,
@@ -8382,6 +8397,8 @@ def _campaigns_from_disk(transcript_dir):
                     "partial": fam.get("partial") or "",
                     "child_results": list(fam.get("child_results") or []),
                     "requeue_merge": verdict == "reissue"}
+        if fam.get("depth"):
+            out[cid]["depth"] = fam["depth"]
     if out:
         print("[fanout] rehydrated %d unmerged campaign(s) from the ledger" % len(out),
               flush=True)
@@ -8681,6 +8698,8 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                               "cwd": (kids[0] or {}).get("cwd"),
                               "checks": list(parent_checks or []),
                               "partial": parent_partial or ""}
+            if int((kids[0] or {}).get("depth") or 1) > 1:
+                campaigns[cid]["depth"] = int(kids[0]["depth"])
             print("[fanout] %s: already split in an earlier run; adopting, not re-queueing"
                   % cid, flush=True)
             return
@@ -8703,6 +8722,8 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                           # mid-run. Empty for a turn-1 split. Without it the rescue throws
                           # away the work it was rescuing.
                           "partial": parent_partial or ""}
+        if int((kids[0] or {}).get("depth") or 1) > 1:
+            campaigns[cid]["depth"] = int(kids[0]["depth"])   # the merge's depth (nested only)
         add_box.extend(kids)
         # WRITTEN DOWN, NOT ONLY QUEUED. add_box lives in memory: if the run dies here the
         # children vanish while the parent is already recorded finished, so the work would
@@ -8731,7 +8752,10 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                          "run_id": run_id, "ts": round(time.time(), 1),
                          "parent_task_id": (kids[0] or {}).get("parent_task_id"),
                          "parent_campaign_id": (kids[0] or {}).get("parent_campaign_id", ""),
-                         "root_id": (kids[0] or {}).get("root_id", "")},
+                         "root_id": (kids[0] or {}).get("root_id", ""),
+                         # the children's depth, written only for a nested split
+                         **({"depth": kids[0]["depth"]} if int(
+                             (kids[0] or {}).get("depth") or 1) > 1 else {})},
                         ensure_ascii=False) + "\n")
                     for k in kids:
                         fh.write(json.dumps(
@@ -8757,7 +8781,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             pass
         print("[fanout] %s -> %d subtask(s)" % (cid, len(kids)), flush=True)
 
-    def _grant_children(parent_goal, steps, parent_task_id=""):
+    def _grant_children(parent_goal, steps, parent_task_id="", root_id=""):
         """The per-tree budget for a split about to happen: (steps_to_use, refusal_reason).
 
         Called by the worker before it builds the children. A family that already exists
@@ -8772,9 +8796,12 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             rows = fanout_budget_mod.read_campaign_rows(
                 os.path.join(os.path.dirname(transcript_dir), "campaigns.jsonl")
                 if transcript_dir else "")
+            # A nested split is charged to the tree's root (and is itself one of its active
+            # workers); a top-level split is its own root.
             use, why = fanout_budget_mod.apply_budget(
-                steps, cid, fanout_budget_mod.rows_from_workers(workers), rows,
-                fanout_budget_mod.limits_from_settings(), min_children=fanout_mod.MIN_CHILDREN)
+                steps, root_id or cid, fanout_budget_mod.rows_from_workers(workers), rows,
+                fanout_budget_mod.limits_from_settings(), min_children=fanout_mod.MIN_CHILDREN,
+                **({"self_active": 1} if root_id else {}))
         except Exception as exc:
             use, why = [], "budget check failed: %s" % exc
         if len(use) != len(steps) or why:
@@ -8838,7 +8865,9 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                                                parent_checks=_camp.get("checks"),
                                                parent_partial=_camp.get("partial"),
                                                parent_level=_camp.get("parent_level"),
-                                               run_id=run_id)
+                                               run_id=run_id,
+                                               **({"depth": _camp["depth"]}
+                                                  if _camp.get("depth") else {}))
             _camp["merged"] = True
             _note_merged(_cid, resume_mod.goal_resume_key(_agg))
             if _camp.get("requeue_merge"):

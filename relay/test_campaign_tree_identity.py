@@ -108,7 +108,8 @@ def test_root_id_depth0_is_own_campaign_and_depth1_inherits(monkeypatch):
     # synthetic depth-1 parent at function level; the runtime gate itself is untouched
     assert fo.MAX_DEPTH == 1
     assert fo.child_goals(GOAL, STEPS, parent_task_id="x", depth=1) == []
-    monkeypatch.setattr(fo, "MAX_DEPTH", 2)
+    monkeypatch.setattr(fo, "HIERARCHICAL_MERGE_READY", True)
+    monkeypatch.setattr(fo, "configured_max_depth", lambda: 2)
     deep = fo.child_goals("slice goal", STEPS, parent_task_id=top[1]["task_id"], depth=1,
                           parent_campaign_id=cid, parent_subtask_index=2, root_id=cid)
     assert all(k["root_id"] == cid and k["parent_campaign_id"] == cid
