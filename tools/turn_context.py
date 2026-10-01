@@ -106,25 +106,56 @@ def _append(row):
         pass
 
 
-def record_open(worker, job, run, turn, t_send):
+#: Optional fan-out identity carried on a row, additive: old rows lack these and old readers
+#: ignore them. Campaign task ids ('<cid>-<i>') live in a different id space from the job id,
+#: so the join needs them written down at the source rather than translated later.
+IDENT_KEYS = ("campaign_id", "task_id", "parent_task_id", "root_id", "role")
+
+
+def fanout_identity(envelope):
+    """{campaign_id, task_id, parent_task_id, root_id, role} of a task envelope, empty values
+    omitted. {} for a worker that is not a fan-out child. Never raises."""
+    try:
+        if envelope is None:
+            return {}
+        meta = getattr(envelope, "metadata", None) or {}
+        raw = {"campaign_id": getattr(envelope, "campaign_id", ""),
+               "task_id": getattr(envelope, "task_id", ""),
+               "parent_task_id": getattr(envelope, "parent_task_id", ""),
+               "root_id": meta.get("root_id", "") if isinstance(meta, dict) else "",
+               "role": getattr(envelope, "role", "")}
+        return {k: str(v)[:120] for k, v in raw.items() if v}
+    except Exception:
+        return {}
+
+
+def _ident(ident):
+    if not isinstance(ident, dict):
+        return {}
+    return {k: str(ident[k])[:120] for k in IDENT_KEYS if ident.get(k)}
+
+
+def record_open(worker, job, run, turn, t_send, ident=None):
     """The coordinator sent turn `turn` to `worker` at wall-clock `t_send`. Never raises."""
     if not worker:
         return
     try:
         _append({"event": "open", "worker": str(worker)[:64], "job": str(job or "")[:120],
-                 "run": str(run or "")[:120], "turn": turn, "t_send": round(float(t_send), 3)})
+                 "run": str(run or "")[:120], "turn": turn, "t_send": round(float(t_send), 3),
+                 **_ident(ident)})
     except Exception:
         pass
 
 
-def record_close(worker, job, run, turn, t_send, t_done):
+def record_close(worker, job, run, turn, t_send, t_done, ident=None):
     """The reply to that turn came back at wall-clock `t_done`. Never raises."""
     if not worker:
         return
     try:
         _append({"event": "close", "worker": str(worker)[:64], "job": str(job or "")[:120],
                  "run": str(run or "")[:120], "turn": turn,
-                 "t_send": round(float(t_send), 3), "t_done": round(float(t_done), 3)})
+                 "t_send": round(float(t_send), 3), "t_done": round(float(t_done), 3),
+                 **_ident(ident)})
     except Exception:
         pass
 
@@ -144,7 +175,8 @@ def _build(rows):
                 if prev is not None and prev["end"] is None:
                     prev["end"] = start     # a new send supersedes a turn that never closed
                 win = {"worker": w, "job": str(r.get("job") or ""), "run": str(r.get("run") or ""),
-                       "turn": r.get("turn"), "start": start, "end": None}
+                       "turn": r.get("turn"), "start": start, "end": None,
+                       "ident": _ident(r)}
                 last[w] = win
                 out.append(win)
             elif r.get("event") == "close":
@@ -155,7 +187,7 @@ def _build(rows):
                 else:   # its open row fell off the tail (or was never written)
                     win = {"worker": w, "job": str(r.get("job") or ""),
                            "run": str(r.get("run") or ""), "turn": r.get("turn"),
-                           "start": start, "end": end}
+                           "start": start, "end": end, "ident": _ident(r)}
                     last[w] = win
                     out.append(win)
         except (KeyError, TypeError, ValueError):
@@ -207,3 +239,24 @@ def candidates(ts):
     except Exception:
         return []
     return sorted(found.items())
+
+
+def identity_of(worker, ts):
+    """Fan-out identity dict of `worker`'s window containing `ts`, or {}.
+
+    {} when no such window carries one, and also when the worker's matching windows (touching
+    turns share the slack) disagree: an identity is never picked between two. Never raises.
+    """
+    try:
+        found = []
+        for win in _windows():
+            if win["worker"] != worker:
+                continue
+            hi = (win["end"] if win["end"] is not None else win["start"] + MAX_OPEN_S) + SLACK_S
+            if win["start"] - SLACK_S <= ts <= hi:
+                found.append(win.get("ident") or {})
+        if found and all(f == found[0] for f in found):
+            return dict(found[0])
+    except Exception:
+        pass
+    return {}
