@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from relay.local_job_store import LocalJobStore
+from relay.send_errors import FreshSubmitAmbiguous
 from relay.local_loop_controller import (
     LocalLoopController,
     _AUTH_ACTION_SELECTOR,
@@ -88,6 +89,11 @@ class FinishedWithoutCommitDriver(NoCommitDriver):
 class SendFailureDriver(NoCommitDriver):
     def send(self, text, track_answer=True):
         raise RuntimeError("composer cleared without a conversation receipt")
+
+
+class AmbiguousSendDriver(NoCommitDriver):
+    def send(self, text, track_answer=True):
+        raise FreshSubmitAmbiguous("fresh user-turn receipt ambiguous")
 
 
 class RetryAbortThenCommitDriver(CommitOnSendDriver):
@@ -346,6 +352,25 @@ def test_send_failure_rotates_instead_of_terminating_controller(tmp_path):
         event["event"] == "UI_TRIGGER_FAILED"
         for event in store.get_job_status("job_1", event_limit=30)["events"]
     )
+
+
+def test_ambiguous_fresh_send_pauses_without_rotate_or_retry(tmp_path):
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    store.create_job(_job())
+    driver = AmbiguousSendDriver(store, [])
+    rotations = []
+    controller = LocalLoopController(
+        store, "job_1", driver, rotate_after_turns=0, poll_seconds=.01,
+        rotate_driver=lambda old, reason: rotations.append(reason) or old,
+    )
+
+    assert controller.run() == "WAITING_RUNTIME"
+    assert rotations == []
+    status = store.get_job_status("job_1", event_limit=30)
+    assert status["status"] == "WAITING_RUNTIME"
+    events = [e["event"] for e in status["events"]]
+    assert "UI_TRIGGER_AMBIGUOUS" in events
+    assert "UI_TRIGGER_FAILED" not in events
 
 
 def test_retry_attempt_does_not_consume_logical_turn_budget(tmp_path):
