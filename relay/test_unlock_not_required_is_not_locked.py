@@ -113,3 +113,29 @@ def test_worker_does_not_probe_long_quoted_marker_when_reply_explicitly_says_not
     assert w._unlock_attempts == before
     assert w._lock_probe_pending is False
     assert w.job != RF.LOCK_PROBE_QUESTION
+
+
+def test_real_w5_backend_failure_does_not_become_unlock():
+    # 2026-10-01 r6abe3de4_a0_w5: tools were failing with a generic backend error. The worker
+    # explicitly said the literal lock marker was absent and unlock would not fix it, but merely
+    # quoting the phrase "locked client IP" made the long reply look ambiguous and triggered
+    # an unnecessary unlock cycle. This is negative lock evidence, not a lock request.
+    resp = (
+        "ツール実行系が現在すべて Tool did not respond with success を返しています。"
+        "「locked client IP」の文言は無いため解錠では解消しません。"
+        "STUCK: ツールゲートウェイの実行・読み取り系呼び出しが一時障害で応答せず、"
+        "解錠対象のエラー文言（locked client IP）ではなく、復旧後に再開します。"
+        + " analysis" * 60
+    )
+    assert len(resp) >= RF.LOCKED_DOMINANCE_MAX_CHARS
+    assert RF._explicit_unlock_not_required(resp) is True
+    assert RF._looks_locked(resp) is False
+    assert RF._looks_locked_ambiguous(resp) is False
+
+
+def test_real_backend_failure_negative_lock_wording_is_narrow():
+    # Do not turn generic mentions of a missing marker into a blanket bypass: a separate positive
+    # requirement must still win, preserving fail-closed behaviour.
+    resp = ("locked client IP の文言は無いように見えるが、write_file は拒否され、"
+            "unlock が必要です。")
+    assert RF._explicit_unlock_not_required(resp) is False

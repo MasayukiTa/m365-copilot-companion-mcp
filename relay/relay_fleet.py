@@ -1134,6 +1134,12 @@ _UNLOCK_NOT_REQUIRED_RE = (
     # Japanese, including the real calendar/read-only replies preserved in the research corpus.
     re.compile(r"(?:unlock|解錠|ロック解除).{0,80}?(?:不要|必要(?:は|が)?(?:ない|ありません)|要りません)", re.I),
     re.compile(r"(?:不要|必要(?:は|が)?(?:ない|ありません)|要りません).{0,80}?(?:unlock|解錠|ロック解除)", re.I),
+    # Negative diagnostic wording from a real backend outage (r6abe3de4_a0_w5). The worker
+    # explicitly distinguished a generic tool-gateway failure from the server lock error while
+    # quoting the marker name in prose. Quoting the marker must not manufacture an unlock need.
+    re.compile(r"(?:locked client ip|lock marker).{0,40}?(?:文言|表示|エラー).{0,30}?(?:は|が)?(?:無い|ない|ありません|出ていない|見当たらない)", re.I),
+    re.compile(r"(?:unlock|解錠|ロック解除).{0,40}?(?:では|じゃ).{0,30}?(?:解消|改善|復旧|直).{0,20}?(?:しない|しません|できない|ならない)", re.I),
+    re.compile(r"(?:unlock|解錠|ロック解除)(?:対象)?(?:の)?(?:エラー|事象|問題|エラー文言)?[^。\n]{0,50}?(?:ではなく|ではない|じゃない)", re.I),
 )
 
 # Contradictory prose fails closed. These are deliberately narrower than the negative patterns;
