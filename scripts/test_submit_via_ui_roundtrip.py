@@ -57,3 +57,36 @@ def test_header_no_longer_claims_active_bottom_composer_is_steer():
     head = "\n".join(SRC.splitlines()[:25])
     assert "CTRL+ENTER STEERS WHILE A RUN IS ACTIVE" not in head
     assert "bottom composer adds tasks" in head.lower()
+
+
+
+def test_automated_gui_submissions_are_serialized_across_processes():
+    assert ". (Join-Path $PSScriptRoot 'gui_submit_lock.ps1')" in SRC
+    lock_i = SRC.index("$submitLock = Enter-GuiSubmitLock")
+    cockpit_i = SRC.index("$win = Get-Cockpit")
+    finally_i = SRC.index("} finally {", cockpit_i)
+    release_i = SRC.index("Exit-GuiSubmitLock $submitLock", finally_i)
+    assert lock_i < cockpit_i < finally_i < release_i
+    assert "$submitLockTimeout = [Math]::Max(90, $TimeoutSeconds + 15)" in SRC
+
+
+def test_readonly_probe_returns_to_inprocess_caller_instead_of_exiting_parent_shell():
+    assert "if ($ReadOnly) { return }" in SRC
+    assert "if ($ReadOnly) { exit 0 }" not in SRC
+
+
+def test_start_add_button_uses_stable_automation_identity_before_localized_name_fallback():
+    i = SRC.index("function Submit([string]$text")
+    block = SRC[i:SRC.index("# FAIL CLOSED ON COMPOSER CORRUPTION", i)]
+    id_i = block.index("AutomationIdProperty, 'startButton'")
+    fallback_i = block.index('$wanted = @(')
+    invoke_i = block.index("$ip = $null")
+    assert id_i < fallback_i < invoke_i
+    assert "start button: found by AutomationId" in block
+
+
+def test_cockpit_source_assigns_start_button_automation_id():
+    cockpit = Path(__file__).resolve().parents[1].joinpath("ui", "FleetCockpit.cs").read_text(
+        encoding="utf-8-sig", errors="replace"
+    )
+    assert 'SetAutomationId(_startBtn, "startButton")' in cockpit

@@ -476,6 +476,10 @@ def ready_to_aggregate(records):
     return bool(records) and all(r.get("finished") for r in records)
 
 
+#: Ledger line kinds that mark state rather than describe a child. See campaigns_from_ledger.
+_LEDGER_MARKER_KINDS = ("merged", "merge_done", "merge_requeued", "child_result")
+
+
 def campaigns_from_ledger(lines):
     """Rebuild {campaign_id: {goal, n, cwd, checks, partial, merged, children}} from the ledger.
 
@@ -508,15 +512,31 @@ def campaigns_from_ledger(lines):
         cid = rec.get("campaign_id")
         if not cid:
             continue
-        if rec.get("kind") == "merged":
-            # ALREADY ASSEMBLED. Written when the merge is queued, because `merged` used to
-            # live only in memory -- so a run rebuilt from this file would queue the merge
-            # again for every campaign it had ever finished, and the operator would get the
-            # same combined answer a second time with no way to tell which was current.
-            out.setdefault(cid, {"goal": "", "n": 0, "cwd": None, "checks": [],
-                                 "partial": "", "children": []})["merged"] = True
+        kind = rec.get("kind")
+        if kind in _LEDGER_MARKER_KINDS:
+            # Marker lines (merge queued / merge finished / merge re-issued / a child's
+            # finished answer). They carry a campaign id but are NOT children: an old reader
+            # counted every unknown line with an id as a child, which is why this reader must
+            # know these kinds before any writer emits them.
+            fam = out.setdefault(cid, {"goal": "", "n": 0, "cwd": None, "checks": [],
+                                       "partial": "", "children": []})
+            if kind == "merged":
+                # ALREADY ASSEMBLED -- more precisely, the merge was QUEUED. Written when the
+                # merge is queued, because `merged` used to live only in memory -- so a run
+                # rebuilt from this file would queue the merge again for every campaign it
+                # had ever finished. Whether it FINISHED is `merge_done`.
+                fam["merged"] = True
+                if rec.get("agg_key"):
+                    fam["agg_key"] = rec.get("agg_key")
+            elif kind == "merge_done":
+                fam["merge_done"] = True
+            elif kind == "merge_requeued":
+                fam["merge_requeued"] = int(fam.get("merge_requeued") or 0) + 1
+            elif kind == "child_result":
+                fam.setdefault("child_results", []).append(rec)
             continue
         if rec.get("kind") == "campaign":
+            _prev = out.get(cid, {})
             out[cid] = {"goal": rec.get("goal") or "",
                         "n": int(rec.get("n") or 0),
                         "cwd": rec.get("cwd"),
@@ -528,7 +548,17 @@ def campaigns_from_ledger(lines):
                         # nothing verifies -- silently, and only on the crash path.
                         "checks": rec.get("checks") or [],
                         "partial": rec.get("partial") or "",
-                        "children": out.get(cid, {}).get("children", [])}
+                        "children": out.get(cid, {}).get("children", []),
+                        # WHICH RUN SPLIT THIS FAMILY (additive; absent on old headers). A
+                        # header can repeat, so every stamp seen is kept. Resume uses it to
+                        # take only the interrupted run's families, never the whole ledger.
+                        "run_ids": list(_prev.get("run_ids") or [])
+                        + ([str(rec["run_id"])] if rec.get("run_id") else []),
+                        "start_ts": rec.get("ts") or _prev.get("start_ts")}
+            # Marker flags that arrived before the header survive it.
+            for _k in ("merge_done", "merge_requeued", "child_results", "agg_key"):
+                if _k in _prev:
+                    out[cid][_k] = _prev[_k]
             continue
         entry = out.setdefault(cid, {"goal": "", "n": 0, "cwd": None, "checks": [],
                                      "partial": "", "merged": False, "children": []})

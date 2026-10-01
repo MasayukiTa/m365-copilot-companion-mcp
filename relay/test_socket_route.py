@@ -1931,3 +1931,24 @@ def test_the_incident_clock_goes_with_the_route(monkeypatch):
     monkeypatch.setattr(rf, "_LAST_ROUTE_FAULT", [12345.0])
     rf.reset_socket_route()
     assert rf._LAST_ROUTE_FAULT[0] == 0.0
+
+
+def test_socket_meaningful_idle_default_is_sixty_seconds():
+    import relay.relay_fleet as rf
+    assert rf.SOCKET_MEANINGFUL_IDLE_DEFAULT_S == 60.0
+
+
+def test_waiting_socket_sixty_second_default_boundary(monkeypatch):
+    import relay.relay_fleet as rf
+    monkeypatch.setattr(rf, "SOCKET_MEANINGFUL_IDLE_S", 60.0)
+
+    healthy_margin = _waiting_socket_worker(59.0)
+    assert healthy_margin.poll() is False
+    assert not healthy_margin.drv.failed
+    assert healthy_margin.status == "waiting"
+
+    stalled = _waiting_socket_worker(60.1)
+    assert stalled.poll() is False
+    assert "no meaningful progress" in stalled.drv.failed
+    assert "limit 60s" in stalled.reason
+    assert stalled.status == "ready"

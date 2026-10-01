@@ -498,6 +498,13 @@ def sibling_adjust(goal, *, run_id="", instance="", record=None, log=None, env=N
         return goal
 
 
+def goal_dict(worker):
+    """The worker's goal as a dict ({} when unknowable). worker.goal is the goal TEXT; the
+    dict that carries effort and metadata is worker.goal_record. The ONE place that reads it."""
+    rec = getattr(worker, "goal_record", None)
+    return rec if isinstance(rec, dict) else {}
+
+
 def worker_level(worker):
     """The ladder level a worker is running at (from the knobs it was given), else None."""
     try:
@@ -602,6 +609,7 @@ def _shadow_state(worker, level, floor):
         st = {"state": EffortState(level=level, floor=floor), "streak": {},
               "seen_verdict": None, "seen_verify": 0, "seen_fresh": 0}
         worker._effort_shadow = st
+        worker.effort_state = st["state"]     # read by status_fields (the cockpit badge)
     return st
 
 
@@ -645,6 +653,39 @@ def build_signals(worker, ctx, cfg):
         budget_pressure=bool(budget and turn >= cfg.budget_pressure_frac * budget))
 
 
+def status_fields(worker, env=None):
+    """Additive per-worker fields for status.json; {} when the policy is off or unknowable.
+
+    effort_level is the level the worker REALLY runs at (from its knobs); effort_source is why
+    (EffortState.source once the shadow state exists, else what the goal's metadata says).
+    effort_last_switch is the last virtual switch and is ALWAYS record_only: live switching
+    changes nothing. Absent key = the cockpit shows no badge. Never raises.
+    """
+    try:
+        if mode(env) == "off":
+            return {}
+        level = worker_level(worker)
+        if level is None:
+            return {}
+        out = {"effort_level": level}
+        goal = goal_dict(worker)
+        src = _meta(goal).get("effort_source")
+        base = (src if src in ("parent", "sibling") else
+                "goal" if effort_mod.goal_effort(goal) in LADDER else "run")
+        state = getattr(worker, "effort_state", None)
+        # An unswitched state still says "run"; the goal knows better. Only a (virtual)
+        # switch changes the source the policy itself would report.
+        out["effort_source"] = (state.source if state is not None and getattr(state, "source", "")
+                                in ("policy", "escalation") else base)
+        if state is not None and getattr(state, "history", None):
+            t, a, b, why = state.history[-1]
+            out["effort_last_switch"] = {"turn": int(t), "from": a, "to": b,
+                                         "reason": str(why), "record_only": True}
+        return out
+    except Exception:
+        return {}
+
+
 def shadow_tick(worker, *, record=None, log=None, env=None):
     """Called once per decided turn. Records what the policy would do; changes nothing.
 
@@ -660,10 +701,12 @@ def shadow_tick(worker, *, record=None, log=None, env=None):
                  "max_research": getattr(worker, "max_research", None),
                  "review_lenses": getattr(worker, "review_lenses", None)}
         run_level = level_of_knobs(knobs)
-        goal = getattr(worker, "goal", None)
-        explicit = effort_mod.goal_effort(goal if isinstance(goal, dict) else {})
-        floor = explicit if explicit in LADDER else "min"
-        ctx = _shadow_state(worker, run_level if run_level in LADDER else "auto", floor)
+        # Same precedence as initial_level (explicit goal effort > run level), read from the
+        # goal DICT through the one accessor.
+        level0, _src0 = initial_level(goal_dict(worker),
+                                      run_level if run_level in LADDER else "auto")
+        floor = level0 if _src0 == "goal" else "min"
+        ctx = _shadow_state(worker, level0, floor)
         sig = build_signals(worker, ctx["streak"], cfg)
         state = ctx["state"]
         before = state.level

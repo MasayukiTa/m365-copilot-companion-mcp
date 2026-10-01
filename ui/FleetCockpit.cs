@@ -813,6 +813,7 @@ class CockpitWindow : Window
                                // The free RAM the autoscale keeps for the user (RAM analog of the disk
                                // floor). Persisted via SaveKey AND pushed live via {"set_ram_floor_mb":N}.
     string _effort = "auto";   // effort mode min|max|ultra|auto -> settings.txt effort= (NEW)
+    string _effortPolicy = "off";   // effort policy off|shadow|on -> settings.txt effort_policy= (EffortPolicy.cs)
     // Split a goal into independent sub-goals, run them in parallel, and merge the answers.
     // For work whose SIZE is the problem: a goal that cannot fit in one conversation fails at
     // the conversation, not at the work. Off by default -- a goal that fits should not pay for
@@ -1116,6 +1117,8 @@ class CockpitWindow : Window
         public string Reason = "";
         public double Started = 0;
         public double Expires = 0;
+        public int SupervisorPid = 0;
+        public double SupervisorStarted = 0;
     }
     // Old supervisors wrote only `started`; preserve that format for one deployment generation.
     // New supervisors write their own policy-derived expiry. The hard cap is only corruption /
@@ -1137,6 +1140,12 @@ class CockpitWindow : Window
         return a;
     }
     readonly object _healthLock = new object();
+    // EXACT HEALTH-POLL SELFTEST SEAMS. Null in every normal process. They exist so a temp
+    // harness can execute PollHealthOnce() itself against an unreachable synthetic server and a
+    // temp transition marker without stopping the production MCP server. Both uses are gated by
+    // WindowSelfTest.Active below; normal cockpit behaviour cannot redirect either source.
+    string _serverTransitionPathForSelfTest = null;
+    Func<string, int, string> _serverHealthBodyForSelfTest = null;
     // The last /health body, captured by the Server dot's poll so dot 5 can read the FLEET
     // tool path from it without a second HTTP round trip. Empty until the first successful
     // poll, and empty must read as "no evidence" everywhere it is used.
@@ -1468,6 +1477,7 @@ class CockpitWindow : Window
         if (k == "flt_active") return ja ? "実行中" : "Active";
         if (k == "flt_needs") return ja ? "承認待ち" : "Needs input";
         if (k == "flt_done") return ja ? "完了" : "Done";
+        if (k == "flt_intr") return ja ? "中断" : "Interrupted";
         // legacy key kept for safety (no longer rendered)
         // Feature C: retry
         if (k == "retry") return ja ? "再試行" : "Retry";
@@ -1484,6 +1494,7 @@ class CockpitWindow : Window
         if (k == "rate") return ja ? "件/時" : "/h";
         // Effort selector + fleet-wide pause/stop (NEW)
         if (k == "effort") return ja ? "推論" : "Reasoning";
+        if (k == "effort_policy") return ja ? "推論方針" : "Effort policy";
         if (k == "approval") return ja ? "承認" : "Approval";
         if (k == "run_mode") return ja ? "実行方式" : "Run mode";
         if (k == "pause") return ja ? "一時停止" : "Pause";
@@ -1822,6 +1833,11 @@ class CockpitWindow : Window
                                         System.Globalization.CultureInfo.InvariantCulture, out ut))
                     { _scaleTarget = Math.Max(0.8, Math.Min(3.0, ut)); _scaleTargetLoaded = true; }
                 }
+                else if (ln.StartsWith(EffortPolicyView.Key + "="))
+                {
+                    string epm = EffortPolicyView.ParseMode(ln);
+                    if (epm != null) _effortPolicy = epm;
+                }
                 else if (ln.StartsWith("effort="))
                 {
                     string ef = ln.Substring(7).Trim();
@@ -1960,6 +1976,7 @@ class CockpitWindow : Window
         ctrls.Children.Add(_workerChipBorder);
 
         ctrls.Children.Add(EffortControl());
+        ctrls.Children.Add(EffortPolicyControl());
         ctrls.Children.Add(ApprovalControl());
         ctrls.Children.Add(ApprovalCenterControl());
         ctrls.Children.Add(FleetControls());
@@ -2692,11 +2709,13 @@ class CockpitWindow : Window
     {
         try
         {
-            string path = Path.Combine(RepoRootForSettings(), ".fleet", "server_transition.json");
+            string path = (WindowSelfTest.Active && !string.IsNullOrEmpty(_serverTransitionPathForSelfTest))
+                ? _serverTransitionPathForSelfTest
+                : Path.Combine(RepoRootForSettings(), ".fleet", "server_transition.json");
             if (!File.Exists(path)) return null;
             var raw = _js.DeserializeObject(File.ReadAllText(path, Encoding.UTF8)) as Dictionary<string, object>;
             if (raw == null) return null;
-            object stateObj, reasonObj, startedObj, expiresObj;
+            object stateObj, reasonObj, startedObj, expiresObj, supervisorPidObj, supervisorStartedObj;
             if (!raw.TryGetValue("state", out stateObj) || stateObj == null) return null;
             string state = Convert.ToString(stateObj).Trim().ToLowerInvariant();
             if (state != "planned_restart") return null;
@@ -2714,16 +2733,66 @@ class CockpitWindow : Window
             double effectiveExpiry = Math.Min(expires, started + SERVER_TRANSITION_HARD_MAX_AGE_S);
             if (nowUnix > effectiveExpiry) return null;
 
+            // OWNERSHIP IS PART OF FRESHNESS. A PID alone is unsafe on Windows because it can be
+            // reused after the supervisor dies. New markers therefore name both PID and process
+            // birth. If either is missing/unreadable/mismatched, fail closed: an unverifiable
+            // marker is never permission to soften a real server outage from red to yellow.
+            if (!raw.TryGetValue("supervisor_pid", out supervisorPidObj) || supervisorPidObj == null) return null;
+            if (!raw.TryGetValue("supervisor_started", out supervisorStartedObj) || supervisorStartedObj == null) return null;
+            int supervisorPid = Convert.ToInt32(supervisorPidObj, System.Globalization.CultureInfo.InvariantCulture);
+            double supervisorStarted = Convert.ToDouble(supervisorStartedObj, System.Globalization.CultureInfo.InvariantCulture);
+            if (supervisorPid <= 0 || supervisorStarted <= 0.0) return null;
+            try
+            {
+                var supervisorProcess = System.Diagnostics.Process.GetProcessById(supervisorPid);
+                if (supervisorProcess.HasExited) return null;
+                double processStarted = new DateTimeOffset(supervisorProcess.StartTime.ToUniversalTime()).ToUnixTimeSeconds();
+                if (Math.Abs(processStarted - supervisorStarted) > 2.0) return null;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+
             string reason = "planned restart";
             if (raw.TryGetValue("reason", out reasonObj) && reasonObj != null)
                 reason = Convert.ToString(reasonObj).Trim();
             if (string.IsNullOrEmpty(reason)) reason = "planned restart";
-            return new PlannedServerTransition { State = state, Reason = reason, Started = started, Expires = expires };
+            return new PlannedServerTransition { State = state, Reason = reason, Started = started, Expires = expires, SupervisorPid = supervisorPid, SupervisorStarted = supervisorStarted };
         }
         catch (Exception)
         {
             // An unreadable transition is not permission to soften a red health signal.
             return null;
+        }
+    }
+
+    // Execute the REAL server segment of PollHealthOnce in a --selftest process. This is not a
+    // second implementation: it only supplies the two external inputs (HTTP body + marker path),
+    // calls PollHealthOnce below, and returns the dot state it actually wrote. Production callers
+    // cannot use it because WindowSelfTest.Active is false.
+    internal string SelfTestServerHealthPoll(string transitionPath, bool reachable)
+    {
+        if (!WindowSelfTest.Active)
+            throw new InvalidOperationException("server health selftest seam is available only under --selftest");
+        string oldPath = _serverTransitionPathForSelfTest;
+        Func<string, int, string> oldBody = _serverHealthBodyForSelfTest;
+        try
+        {
+            _serverTransitionPathForSelfTest = transitionPath;
+            _serverHealthBodyForSelfTest = delegate(string url, int timeoutMs)
+            {
+                if (!reachable) return null;
+                return "{\"status\":\"ok\",\"auth_fail_10m\":0,\"server_code\":\"current\"}";
+            };
+            PollHealthOnce();
+            lock (_healthLock)
+                return _health[0].State.ToString() + "|" + (_health[0].Detail ?? "");
+        }
+        finally
+        {
+            _serverTransitionPathForSelfTest = oldPath;
+            _serverHealthBodyForSelfTest = oldBody;
         }
     }
 
@@ -2743,7 +2812,9 @@ class CockpitWindow : Window
         // So: unreachable stays Red, and a reachable server that is REPORTING A PROBLEM about
         // itself goes Amber rather than Green. Amber, not Red, because the server process is
         // genuinely up -- the distinction matters for what a person does next.
-        string srvBody = HttpBody("http://127.0.0.1:8000/health", 3500);
+        string srvBody = (WindowSelfTest.Active && _serverHealthBodyForSelfTest != null)
+            ? _serverHealthBodyForSelfTest("http://127.0.0.1:8000/health", 3500)
+            : HttpBody("http://127.0.0.1:8000/health", 3500);
         bool srvOk = srvBody != null;
         if (srvOk) { _lastHealthBody = srvBody; _lastHealthBodyAt = NowUnix(); }
         string authFails = HealthField(srvBody, "auth_fail_10m");
@@ -2797,6 +2868,8 @@ class CockpitWindow : Window
             SetDot(0, HealthState.Green, T("hs_srv_detail_stale_recent"), now);
         else
             SetDot(0, HealthState.Green, T("hs_srv_detail_ok"), now);
+
+        if (WindowSelfTest.Active && _serverHealthBodyForSelfTest != null) return;
 
         // 1) Tunnel: read MCP_TUNNEL_URL from ..\.env; GET <url>/health == 200. Gray if none.
         //
@@ -5459,6 +5532,7 @@ class CockpitWindow : Window
         _folderBtn.Click += delegate { FolderToGoals(); };
         btns.Children.Add(_folderBtn);
         _startBtn = new Button();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_startBtn, "startButton");
         _startBtn.Cursor = Cursors.Hand; _startBtn.BorderThickness = new Thickness(0);
         _startBtn.Height = Theme.BtnH; _startBtn.MinWidth = 132; _startBtn.FontWeight = FontWeights.SemiBold;
         _startBtn.Margin = new Thickness(8, 0, 0, 0); _startBtn.Padding = new Thickness(16, 0, 16, 0);
@@ -7351,6 +7425,21 @@ class CockpitWindow : Window
         effortVal.VerticalAlignment = VerticalAlignment.Center;
         effortVal.Margin = new Thickness(4, 0, 24, 0);
         effortRow.Children.Add(effortVal);
+        // read-only mirror of the header effort-policy combo (the header dropdown is authoritative)
+        var epLbl = new TextBlock();
+        epLbl.Text = T("effort_policy") + ": ";
+        epLbl.FontSize = 12;
+        epLbl.Foreground = Theme.Br(Theme.Muted(_dark));
+        epLbl.VerticalAlignment = VerticalAlignment.Center;
+        effortRow.Children.Add(epLbl);
+        var epVal = new TextBlock();
+        epVal.Text = _effortPolicy;
+        epVal.FontSize = 12;
+        epVal.FontWeight = FontWeights.SemiBold;
+        epVal.Foreground = Theme.Br(Theme.Text(_dark));
+        epVal.VerticalAlignment = VerticalAlignment.Center;
+        epVal.Margin = new Thickness(4, 0, 24, 0);
+        effortRow.Children.Add(epVal);
         var approvalLbl = new TextBlock();
         approvalLbl.Text = (ja ? "実行方式 / Run mode: " : "Run mode: ");
         approvalLbl.FontSize = 12;
@@ -7473,6 +7562,8 @@ class CockpitWindow : Window
     ComboBox _effortBox;
     ComboBox _approvalBox;
     TextBlock _effortLbl;
+    ComboBox _effortPolicyBox;
+    TextBlock _effortPolicyLbl, _effortPolicyNow, _effortPolicyWarn;
     TextBlock _approvalLbl;
     Button _pauseBtn, _stopBtn;
     System.Windows.Shapes.Path _pauseIcon, _stopIcon;   // drawn geometry (no font glyph needed)
@@ -7697,6 +7788,7 @@ class CockpitWindow : Window
                 return "live";
             case "rate_ceiling_rpm":
             case "job_approval_mode":
+            case "effort_policy":
                 return "each_gate";
             case "session_retention_days":
             case "session_max_mb":
@@ -8948,6 +9040,85 @@ class CockpitWindow : Window
 
         PaintEffort();
         return wrap;
+    }
+    // Effort policy selector (off|shadow|on). Persists effort_policy= to settings.txt, which
+    // relay/effort_policy.py re-reads at every decision (each_gate). This control never passes
+    // MCP_EFFORT_POLICY itself; what is REALLY in effect is what the runner reports in
+    // status.json (see PaintEffortPolicyInEffect), and an inherited env override is shown as a
+    // conflict. All wording/parsing lives in the WPF-free EffortPolicy.cs.
+    UIElement EffortPolicyControl()
+    {
+        var wrap = new StackPanel(); wrap.Orientation = Orientation.Horizontal;
+        wrap.VerticalAlignment = VerticalAlignment.Center; wrap.Margin = new Thickness(0, 0, 12, 0);
+
+        _effortPolicyLbl = new TextBlock(); _effortPolicyLbl.VerticalAlignment = VerticalAlignment.Center;
+        _effortPolicyLbl.FontSize = 12; _effortPolicyLbl.Margin = new Thickness(0, 0, 8, 0);
+        wrap.Children.Add(_effortPolicyLbl);
+
+        _effortPolicyBox = new ComboBox();
+        _effortPolicyBox.ToolTip = EffortPolicyView.Help(_lang == 0) + "\n" + EffortPolicyView.TakeEffectTip(_lang == 0);
+        _effortPolicyBox.Cursor = Cursors.Hand; _effortPolicyBox.FontSize = 12;
+        _effortPolicyBox.FontWeight = FontWeights.SemiBold; _effortPolicyBox.MinWidth = 78;
+        _effortPolicyBox.Padding = new Thickness(8, 2, 4, 2);
+        _effortPolicyBox.VerticalAlignment = VerticalAlignment.Center;
+        var epHelp = new Dictionary<string, string>();
+        foreach (string m in EffortPolicyView.Modes) epHelp[m] = EffortPolicyView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_effortPolicyBox, EffortPolicyView.Modes, epHelp, _effortPolicy);
+        _effortPolicyBox.DropDownOpened += delegate { CloseHeaderPopups("effort"); };
+        _effortPolicyBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_effortPolicyBox);
+            if (!EffortPolicyView.IsMode(sel) || sel == _effortPolicy) return;
+            _effortPolicy = sel;
+            SaveKey(EffortPolicyView.Key, _effortPolicy);
+            PaintEffortPolicyInEffect(_lastRoot);
+        };
+        wrap.Children.Add(_effortPolicyBox);
+
+        _effortPolicyNow = new TextBlock(); _effortPolicyNow.VerticalAlignment = VerticalAlignment.Center;
+        _effortPolicyNow.FontSize = 11.5; _effortPolicyNow.Margin = new Thickness(8, 0, 0, 0);
+        wrap.Children.Add(_effortPolicyNow);
+        _effortPolicyWarn = new TextBlock(); _effortPolicyWarn.VerticalAlignment = VerticalAlignment.Center;
+        _effortPolicyWarn.FontSize = 11.5; _effortPolicyWarn.FontWeight = FontWeights.SemiBold;
+        _effortPolicyWarn.Margin = new Thickness(8, 0, 0, 0);
+        _effortPolicyWarn.Visibility = Visibility.Collapsed;
+        wrap.Children.Add(_effortPolicyWarn);
+
+        PaintEffortPolicy();
+        return wrap;
+    }
+    void PaintEffortPolicy()
+    {
+        if (_effortPolicyLbl != null) { _effortPolicyLbl.Text = T("effort_policy"); _effortPolicyLbl.Foreground = Muted; }
+        if (_effortPolicyBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_effortPolicyBox), _effortPolicy)) ComboSelectVal(_effortPolicyBox, _effortPolicy);
+        _effortPolicyBox.Background = BtnBg; _effortPolicyBox.Foreground = Fg; _effortPolicyBox.BorderBrush = Border;
+        StyleFlatCombo(_effortPolicyBox);
+        PaintEffortPolicyInEffect(_lastRoot);
+    }
+    // What the RUNNER says is in effect (status.json "effort_policy"), beside the combo. No
+    // report (old runner, no run yet) -> nothing shown, never a guess from the combo.
+    void PaintEffortPolicyInEffect(Dictionary<string, object> root)
+    {
+        if (_effortPolicyNow == null || _effortPolicyWarn == null) return;
+        bool ja = _lang == 0;
+        string now = null, warn = null;
+        Dictionary<string, object> ep = root != null ? Obj(root, "effort_policy") : null;
+        if (ep != null)
+        {
+            string mode = S(ep, "mode");
+            object cf;
+            bool conflict = ep.TryGetValue("conflict", out cf) && cf is bool && (bool)cf;
+            now = EffortPolicyView.Describe(mode, S(ep, "source"), conflict, ja);
+            warn = EffortPolicyView.ConflictText(mode, _effortPolicy, conflict, ja);
+        }
+        _effortPolicyNow.Text = now ?? "";
+        _effortPolicyNow.Foreground = Muted;
+        _effortPolicyNow.Visibility = now != null ? Visibility.Visible : Visibility.Collapsed;
+        _effortPolicyWarn.Text = warn ?? "";
+        _effortPolicyWarn.Foreground = Theme.Br(Theme.Warning(_dark));
+        _effortPolicyWarn.Visibility = warn != null ? Visibility.Visible : Visibility.Collapsed;
     }
     void PaintEffort()
     {
@@ -10716,6 +10887,7 @@ class CockpitWindow : Window
         PaintAutoToggle();
         UpdateAutoEnabled();
         PaintEffort();
+        PaintEffortPolicy();
         PaintApproval();
         PaintApprovalCenterButton(PendingGates(ReadStatus()).Count);
         PaintPause();
@@ -10787,6 +10959,7 @@ class CockpitWindow : Window
         if (_autoValue != null) _autoValue.Text = _autoMax.ToString();
         PaintAutoToggle();
         PaintEffort();
+        PaintEffortPolicy();
         PaintApproval();
         PaintApprovalCenterButton(PendingGates(ReadStatus()).Count);
         PaintPause();
@@ -11656,6 +11829,7 @@ class CockpitWindow : Window
     void RenderCards(Dictionary<string, object> root)
     {
         _lastRoot = root;               // cache for single-card toggles
+        PaintEffortPolicyInEffect(root);   // what the runner reports is in effect (effort policy)
         // Preserve scroll position across the rebuild. Without this, every worker update
         // (status/turn change) reset the list and snapped the view back to the TOP -- which is
         // exactly why scrolling "didn't work" while tasks were live: the user scrolled down, a
@@ -11724,7 +11898,7 @@ class CockpitWindow : Window
         string g = (_dark ? "D" : "L") + _lang.ToString();
         string sig = "T|" + g + "|" + _toolbarShown.Count + "/" + _toolbarAll.Count
                      + "|all" + tc[0] + ":act" + tc[1] + ":need" + tc[2] + ":done" + tc[3]
-                     + ":max" + tc[5] + ":bad" + tc[6] + ":hid" + tc[7]
+                     + ":max" + tc[5] + ":bad" + tc[6] + ":hid" + tc[7] + ":int" + tc[8]
                      + "|ar" + (_autoRetry ? 1 : 0) + ":" + _autoRetryMax + "|f" + _cardFilter;
         _pinnedToolbarHost.Visibility = Visibility.Visible;
         if (sig == _pinnedToolbarSig && _pinnedToolbarHost.Child != null) return;   // unchanged -> keep as-is
@@ -11765,6 +11939,8 @@ class CockpitWindow : Window
             if (_cardFilter == 2 && st != "awaiting") continue;
             // Tab 3 = Done: outcome == DONE
             if (_cardFilter == 3 && oc != "DONE") continue;
+            // Tab 4 = Interrupted (coordinator died, resumable); the tab only exists while one is on the board
+            if (_cardFilter == 4 && !IsInterruptedWorker(w)) continue;
             shown.Add(w);
         }
         // THE LIST'S ORDER, decided in one place (SubmittedTasks.Compose, executed by
@@ -11992,7 +12168,7 @@ class CockpitWindow : Window
                 int[] tc0 = ToolbarCounts(_toolbarAll);
                 return "T|" + g + "|" + _toolbarShown.Count + "/" + _toolbarAll.Count
                        + "|all" + tc0[0] + ":act" + tc0[1] + ":need" + tc0[2] + ":done" + tc0[3]
-                       + ":max" + tc0[5] + ":bad" + tc0[6] + ":hid" + tc0[7]
+                       + ":max" + tc0[5] + ":bad" + tc0[6] + ":hid" + tc0[7] + ":int" + tc0[8]
                        + "|ar" + (_autoRetry ? 1 : 0) + ":" + _autoRetryMax + "|f" + _cardFilter;
             case 2: return "HH|" + g;                          // history header (static chrome; search box preserved across renders)
             case 7:                                            // date-group subheader: keyed on its label
@@ -12041,6 +12217,10 @@ class CockpitWindow : Window
                   .Append(':').Append(StableShortHash(S(w, "conv_title")));
                 // TASK 3 (Bucket C): track next_step + self_confidence so the collapsed row re-renders.
                 sb.Append('|').Append(S(w, "next_step").Length).Append(':').Append(S(w, "self_confidence"));
+                // effort badge fields: re-render when the level/source/last switch change
+                sb.Append("|ef:").Append(S(w, "effort_level")).Append(S(w, "effort_source"))
+                  .Append(StableShortHash(S(Obj(w, "effort_last_switch") ?? new Dictionary<string, object>(), "reason")))
+                  .Append(S(Obj(w, "effort_last_switch") ?? new Dictionary<string, object>(), "turn"));
                 var ex = Obj(w, "execution");
                 if (ex != null)
                     sb.Append("|exec:").Append(S(ex, "state"))
@@ -12067,6 +12247,7 @@ class CockpitWindow : Window
                 bool hasDraft = _steerDraft.TryGetValue(nm, out draftSt) && !string.IsNullOrEmpty(draftSt);
                 bool hasFocus = _steerFocusWorker == nm;
                 sb.Append('|').Append(hasDraft ? "d1" : "d0").Append(hasFocus ? "f1" : "f0");
+                sb.Append("|grp:").Append(StableShortHash(GroupLineText(w) + "|" + S(w, "display_label")));
                 return sb.ToString();
         }
     }
@@ -12492,7 +12673,7 @@ class CockpitWindow : Window
     int[] ToolbarCounts(List<Dictionary<string, object>> all)
     {
         int cntAll = 0, cntActive = 0, cntNeeds = 0, cntDone = 0;
-        int doneN = 0, maxN = 0, badN = 0, hiddenTerminal = 0;
+        int doneN = 0, maxN = 0, badN = 0, hiddenTerminal = 0, intN = 0;
         string startedRootTb = _lastRoot != null ? S(_lastRoot, "started") : "";
         if (all != null)
         {
@@ -12515,10 +12696,11 @@ class CockpitWindow : Window
                 else if (oc == "STUCK" || oc == "ERROR" || oc == "CANCELLED"
                          || oc == "EVIDENCE_CONTRADICTED") badN++;
                 if (st == "awaiting") cntNeeds++;
+                if (IsInterruptedWorker(w)) intN++;   // own counter: resumable, not a failure of the goal
                 if (!IsTerminalWorker(w) && !IsInterruptedWorker(w) && st != "pending") cntActive++;
             }
         }
-        return new int[] { cntAll, cntActive, cntNeeds, cntDone, doneN, maxN, badN, hiddenTerminal };
+        return new int[] { cntAll, cntActive, cntNeeds, cntDone, doneN, maxN, badN, hiddenTerminal, intN };
     }
 
     UIElement BuildCardToolbar(List<Dictionary<string, object>> all,
@@ -12532,7 +12714,7 @@ class CockpitWindow : Window
         // the render and RowSig can never diverge.
         int[] tc = ToolbarCounts(all);
         int cntAll = tc[0], cntActive = tc[1], cntNeeds = tc[2], cntDone = tc[3];
-        int doneN = tc[4], maxN = tc[5], badN = tc[6];
+        int doneN = tc[4], maxN = tc[5], badN = tc[6], cntIntr = tc[8];
 
         var bar = new Border();
         bar.BorderThickness = new Thickness(1); bar.BorderBrush = Border;
@@ -12616,7 +12798,13 @@ class CockpitWindow : Window
         segRow.Children.Add(SegDivider());
         segRow.Children.Add(SegFilterButton(needsLabel, 2, true, cntNeeds, false, false));
         segRow.Children.Add(SegDivider());
-        segRow.Children.Add(SegFilterButton(doneLabel, 3, false, 0, false, true));
+        bool showIntr = cntIntr > 0 || _cardFilter == 4;
+        segRow.Children.Add(SegFilterButton(doneLabel, 3, false, 0, false, !showIntr));
+        if (showIntr)
+        {
+            segRow.Children.Add(SegDivider());
+            segRow.Children.Add(SegFilterButton(T("flt_intr") + " " + cntIntr, 4, false, 0, false, true));
+        }
 
         seg.Child = segRow;
         left.Children.Add(seg);
@@ -13220,6 +13408,90 @@ class CockpitWindow : Window
         catch (Exception) { ShowScaleToast(T("copy_result_fail")); }
     }
 
+    // ── Split group (分割グループ) line on a fan-out parent card ─────────────────────────────
+    // `groups` in status.json is written by relay/family_view.py (contract in its docstring).
+    // OWNER RULES: never the long goal text -- only the capped `ledger` strings it carries;
+    // plain Japanese wording; one small line, no popup, no toast. Read-only.
+    Dictionary<string, object> GroupOfParent(Dictionary<string, object> w)
+    {
+        if (w == null || _lastRoot == null) return null;
+        object go;
+        if (!_lastRoot.TryGetValue("groups", out go) || !(go is object[])) return null;
+        string nm = S(w, "name");
+        if (nm.Length == 0) return null;
+        foreach (object o in (object[])go)
+        {
+            var g = o as Dictionary<string, object>;
+            var par = g != null ? Obj(g, "parent") : null;
+            if (par != null && S(par, "name") == nm) return g;
+        }
+        return null;
+    }
+
+    static string GroupCount(Dictionary<string, object> ch, string key, string label)
+    {
+        int n = I(ch, key);
+        return n > 0 ? label + " " + n : "";
+    }
+
+    // One line: 分割グループ 子N件: 待機 a · 実行中 b · 完了 c · 失敗 d · 中断 e / 統合: <label>
+    string GroupLineText(Dictionary<string, object> w)
+    {
+        var g = GroupOfParent(w);
+        if (g == null) return "";
+        bool ja = _lang == 0;
+        var ch = Obj(g, "children") ?? new Dictionary<string, object>();
+        var parts = new List<string>();
+        string[] counts = {
+            GroupCount(ch, "queued", ja ? "待機" : "queued"),
+            GroupCount(ch, "running", ja ? "実行中" : "running"),
+            GroupCount(ch, "done", ja ? "完了" : "done"),
+            GroupCount(ch, "failed", ja ? "失敗" : "failed"),
+            GroupCount(ch, "interrupted", ja ? "中断" : "interrupted") };
+        foreach (string p in counts) if (p.Length > 0) parts.Add(p);
+        string head = (ja ? "分割グループ 子" : "Split group, ") + I(g, "children_total")
+                      + (ja ? "件" : " parts");
+        string body = parts.Count > 0 ? ": " + string.Join(" · ", parts.ToArray()) : "";
+        string ml = S(g, "merge_label");
+        return head + body + (ml.Length > 0 ? (ja ? " / 統合: " : " / merge: ") + ml : "");
+    }
+
+    UIElement BuildGroupLine(Dictionary<string, object> w)
+    {
+        string text = GroupLineText(w);
+        if (text.Length == 0) return null;
+        var g = GroupOfParent(w);
+        var row = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(24, 3, 0, 0) };
+        row.MouseLeftButtonUp += delegate (object s2, MouseButtonEventArgs e2) { e2.Handled = true; };
+        row.Children.Add(new TextBlock {
+            Text = text, Foreground = Muted, FontSize = 12,
+            VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis,
+            TextWrapping = TextWrapping.NoWrap, MaxWidth = 560 });
+        // Constraint tokens (dates, quoted names, amounts) from the capped ledger: small chips.
+        var led = Obj(g, "ledger");
+        int shown = 0;
+        var tip = new List<string>();
+        if (led != null)
+        {
+            if (S(led, "task").Length > 0) tip.Add(S(led, "task"));
+            object co, to;
+            if (led.TryGetValue("constraints", out co) && co is object[])
+                foreach (object c in (object[])co) tip.Add("- " + (c != null ? c.ToString() : ""));
+            if (led.TryGetValue("tokens", out to) && to is object[])
+                foreach (object t in (object[])to)
+                {
+                    string ts = t != null ? t.ToString() : "";
+                    if (ts.Length == 0 || shown >= 4) continue;
+                    var chip = Pill(ts, "neutral");
+                    chip.Margin = new Thickness(8, 0, 0, 0);
+                    row.Children.Add(chip);
+                    shown++;
+                }
+        }
+        if (tip.Count > 0) row.ToolTip = string.Join("\n", tip.ToArray());
+        return row;
+    }
+
     Border Card(Dictionary<string, object> w)
     {
         string name = S(w, "name");
@@ -13260,6 +13532,16 @@ class CockpitWindow : Window
         bool isDone = status == "done" || string.Equals(S(w, "outcome"), "DONE", StringComparison.OrdinalIgnoreCase);
         string chipKind = internalControl ? "neutral"
             : (isDone ? "success" : (isInfra ? "warning" : Theme.StatusKind(status)));
+        // Fan-out PARENT: its real status is done/FANOUT on purpose, which reads as "finished"
+        // while its children still run. The coordinator-side derived display_label (waiting etc.)
+        // replaces the chip text only; status/outcome are untouched.
+        string parentLabel = internalControl ? "" : S(w, "display_label");
+        if (parentLabel.Length > 0)
+        {
+            string pds = S(w, "display_state");
+            chipKind = pds == "merge_failed" ? "danger"
+                     : (pds == "interrupted" ? "warning" : (pds == "done" ? "success" : "info"));
+        }
 
         // Pass A2-1 TASK 1: demote the collapsed row to a LEDGER ROW.
         // - No rounded corners, no card background fill, no full border.
@@ -13383,7 +13665,7 @@ class CockpitWindow : Window
         var chip = Pill(internalControl
             ? (_lang == 0 ? "内部制御" : "Internal control")
             : (isAgentSetupWait ? (_lang == 0 ? "エージェント設定待ち" : "Agent setup required")
-                : (isInfra ? T("infra_wait") : Theme.StatusLabel(status, _lang))), chipKind);
+                : (isInfra ? T("infra_wait") : (parentLabel.Length > 0 ? parentLabel : Theme.StatusLabel(status, _lang)))), chipKind);
         chip.Margin = new Thickness(2, 0, 5, 0);
         if (status == "interrupted" && !string.IsNullOrEmpty(reason)) chip.ToolTip = reason;
         DockPanel.SetDock(chip, Dock.Left); left.Children.Add(chip);
@@ -13391,6 +13673,9 @@ class CockpitWindow : Window
         // for the configured agent, WARNING-colored 既定Copilot badge for a plain /chat/ (default) url.
         var agentBadge = BuildAgentBadge(conv, convTitle);
         if (agentBadge != null) { DockPanel.SetDock(agentBadge, Dock.Left); left.Children.Add(agentBadge); }
+        // EFFORT BADGE: only when the runner sent effort_level (policy not off); absent = none.
+        var effBadge = BuildEffortBadge(w);
+        if (effBadge != null) { DockPanel.SetDock(effBadge, Dock.Left); left.Children.Add(effBadge); }
         string headline = !string.IsNullOrEmpty(goalSummary)
             ? goalSummary : CardTitle(convTitle, goal);
         var ht = new TextBlock {
@@ -13401,6 +13686,8 @@ class CockpitWindow : Window
         left.Children.Add(ht);
         Grid.SetColumn(left, 0); top.Children.Add(left);
         col.Children.Add(top);
+        UIElement groupLine = BuildGroupLine(w);
+        if (groupLine != null) col.Children.Add(groupLine);
 
         if (!isOpen)
         {
@@ -15140,6 +15427,20 @@ class CockpitWindow : Window
             ? (_lang == 0 ? "既定Copilotの会話（MCPコネクタ無し）。エージェントに接続し直してください。"
                           : "Default-Copilot conversation (no MCP connector). Reconnect to the agent.")
             : (_lang == 0 ? "この会話はエージェントに接続されています" : "This conversation is bound to the agent");
+        return b;
+    }
+
+    // Per-worker effort pill from the additive status.json fields (EffortPolicyView words it).
+    Border BuildEffortBadge(Dictionary<string, object> w)
+    {
+        bool ja = _lang == 0;
+        Dictionary<string, object> last = Obj(w, "effort_last_switch");
+        string level = S(w, "effort_level"), src = S(w, "effort_source");
+        string text = EffortPolicyView.BadgeText(level, src, last, ja);
+        if (text == null) return null;
+        var b = Pill(text, "neutral");
+        b.Margin = new Thickness(0, 0, 5, 0);
+        b.ToolTip = EffortPolicyView.BadgeTip(level, src, last, ja);
         return b;
     }
 

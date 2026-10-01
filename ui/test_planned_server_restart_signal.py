@@ -45,3 +45,28 @@ def test_transition_path_is_initialized_from_root_before_any_restart_can_publish
     line = SUP[path_i:SUP.index('\n', path_i)]
     assert '$Root' in line and '".fleet"' in line
     assert '$FleetDir' not in line
+
+
+def test_planned_transition_is_bound_to_the_live_supervisor_process_birth():
+    # A PID alone is not ownership: Windows can reuse it after the supervisor dies.
+    assert 'supervisor_pid = $PID' in SUP
+    assert 'supervisor_started = $SupervisorStartedUnix' in SUP
+    assert '$SupervisorStartedUnix' in SUP
+
+    i = UI.index('PlannedServerTransition ReadPlannedServerTransition()')
+    block = UI[i:i+5600]
+    assert 'supervisor_pid' in block
+    assert 'supervisor_started' in block
+    assert 'Process.GetProcessById' in block
+    assert 'StartTime.ToUniversalTime()' in block
+    assert 'return null' in block
+
+
+def test_dead_or_reused_supervisor_cannot_keep_an_outage_yellow_until_expiry():
+    i = UI.index('PlannedServerTransition ReadPlannedServerTransition()')
+    block = UI[i:i+5600]
+    # Ownership validation must occur before the successful PlannedServerTransition return.
+    owner_i = block.index('Process.GetProcessById')
+    return_i = block.index('return new PlannedServerTransition')
+    assert owner_i < return_i
+    assert 'Math.Abs(processStarted - supervisorStarted)' in block
