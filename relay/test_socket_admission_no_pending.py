@@ -22,7 +22,9 @@ class _Route:
     closed_reason = ""
     def open(self):
         return True
-    def needs_refresh(self):
+    def ready(self, agent_url=None):
+        return True
+    def needs_refresh(self, agent_url=None):
         return False
     def record(self, *a, **k):
         pass

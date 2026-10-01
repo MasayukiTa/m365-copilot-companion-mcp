@@ -51,9 +51,9 @@ Current convergence snapshot (2026-09-30): `origin/main` = `b235e01`; PR #67 rem
 This section is updated immediately when the user interrupts ongoing work. It is the resume authority after the interrupt is handled.
 
 1. ACTIVE -- STAB-002 latest UX requirement: the left 220px Spine must contain BOTH `内容詳細` and `実行タイムライン`. Keep the useful content-detail implementation; restore timeline in the same left frame using the historical/shared `phase_events` / `BuildTimelineEvents` contract. Expanded-card Timeline remains as detailed evidence.
-2. ACTIVE -- STAB-004: the 240s blind-wait defect is repaired to consult meaningful-idle at 90s, but 90s is only an intermediate ceiling. User requirement is to minimize waiting as far as safely possible. Measure what `generation_idle_s` actually means, distinguish healthy long computation from transport silence, then drive the safe recovery latency down to the smallest evidence-supported value without causing false reconnects or duplicate work.
+2. CLOSED -- STAB-004: the 240s blind-wait defect is repaired to consult meaningful-idle at 90s, but 90s is only an intermediate ceiling. User requirement is to minimize waiting as far as safely possible. Measure what `generation_idle_s` actually means, distinguish healthy long computation from transport silence, then drive the safe recovery latency down to the smallest evidence-supported value without causing false reconnects or duplicate work.
 3. ACTIVE -- STAB-003 foreground console regression: user reconfirmed shell/cmd still appears in foreground during CopilotAgent open/submit. Reproduce with process-tree/window-owner capture and remove the remaining visible-console spawn path; static `CreateNoWindow` evidence is not sufficient.
-4. ACTIVE -- unlock false-positive investigation: recent transcripts repeatedly contain responses equivalent to `no tool was executed, therefore unlock is unnecessary`; Fleet then sees unlock/lock marker words and promotes the response into lock suspicion / intervention. Distinguish an explicit `unlock not required` / read-only/no-tool response from an actual write/tool lock refusal before escalating to unlock probe or needs-attention.
+4. CLOSED / REAL-TRANSCRIPT REPLAY + WORKER-LEVEL VERIFIED (2026-10-01 08:xx JST) -- unlock false-positive investigation: explicit `unlock not required` / read-only responses are now negative lock evidence for the ambiguous paraphrase/fallback/probe paths. Literal server lock markers and exclusive server-attribution remain authoritative and still recover through unlock.
 5. INTEGRATION -- after the active items above are green, commit/push them on PR #67, verify current-head checks, merge to `main`, verify post-merge main, then reconcile superseded old branches/PRs.
 
 Resume rule: after any newly injected user instruction is handled, return automatically to the first still-ACTIVE item above. Do not wait for another user prompt.
@@ -114,7 +114,7 @@ Updated acceptance:
 - 2026-09-30 13:36 JST live visual acceptance completed against a real running Fleet (`running=true`, three workers present). A non-focus-stealing `PrintWindow` capture of the live 1080x760 FleetCockpit showed the left Spine rendering `内容詳細` first with the focused W0 task identity, `実行中 / Turn 3/40`, wait/reason context, and then `実行タイムライン` below it with a concrete `現在:` line plus timestamped launch/running events. This is the exact combined surface required by the latest user correction; STAB-002 is now CLOSED.
 
 ### STAB-003 -- foreground PowerShell / cmd window when CopilotAgent opens or work is submitted
-Status: REOPENED / LIVE REGRESSION CONFIRMED BY USER
+Status: CLOSED / LIVE POST-PATCH GUI SUBMISSION VERIFIED (2026-09-30 15:25 JST)
 
 User reports a PowerShell or Command Prompt window still comes to the foreground, likely around CopilotAgent opening/submission.
 
@@ -136,6 +136,7 @@ Validation:
 - new regression catches all four pre-fix nested launch sites and is registered in blocking CI;
 - still requires a live post-patch observation before this item can be called CLOSED.
 - 2026-09-30 additional repair-dispatcher hardening committed/pushed as `66cce14` (`fix(windows): keep repair child processes windowless`): `scripts/repair.ps1` no longer reparses fixed PowerShell repair commands through a fresh visible `powershell.exe`. PowerShell-backed registry entries now carry structured `Script + Args` metadata and run via one `ProcessStartInfo` launcher with `UseShellExecute=false`, `CreateNoWindow=true`, `WindowStyle=Hidden`, and redirected stdout/stderr; live doctor JSON invocation uses the same hidden launcher. Focused repair tests **12 passed**, PowerShell parser clean, CI manifest clean after staging, and a `-DryRun -MockJson` dispatcher run completed exit 0 without executing the repair. Branch workflows already reported Windows build / PowerShell lint / Workflow lint / CodeQL / Secret scan / install-path green; main latest CI also finished green. This narrows the remaining STAB-003 acceptance to an actual post-patch GUI-visible submission/open observation, not more source inspection.
+- 2026-09-30 15:24:55-15:25:40 JST live acceptance: a real `submit_via_ui.ps1 -Goal ...` invocation foregrounded the intended FleetCockpit and successfully started the task. In parallel, a separate `pythonw.exe` Win32 `EnumWindows` watcher sampled every **50ms for 45s** and recorded visibility transitions for `powershell.exe`, `pwsh.exe`, `cmd.exe`, `WindowsTerminal.exe`, `wt.exe`, `conhost.exe` and `OpenConsole.exe`. The watcher log contained **zero baseline-visible or became-visible shell windows**. This directly exercises the post-patch GUI-visible path and closes STAB-003 for the reproduced submit/open route; if the user sees a future recurrence, capture that exact event rather than reopening from static suspicion alone.
 
 Existing fixes do not close this item:
 - `73bf387` added repository windowless policy to several unattended PowerShell/fleet launches;
@@ -150,7 +151,7 @@ Acceptance:
 - regression test exercises a console-less parent / real launch shape, not only a source-string assertion.
 
 ### STAB-004 -- very long waiting / apparent no-progress periods
-Status: REOPENED / IN PROGRESS
+Status: CLOSED / POST-60S LIVE VERIFIED (2026-09-30 19:xx JST)
 
 Past Fleet fixes addressed several distinct causes (launch-time capacity clamp, reply-before-timeout, socket/retry behavior, duplicate coordinators). Current branch then added `47cf8f1` / `ccba912` class work around blind resend safety and failure visibility.
 
@@ -175,9 +176,11 @@ Acceptance:
 - 90s is not the final target: quantify healthy socket `generation_idle_s` and reduce the threshold / recovery loop to the smallest safe evidence-based latency.
 - 2026-09-30 current repair: removed the contradictory socket worker-count admission gate. Socket workers no longer sit PENDING behind the tab/RAM cap; request-rate pacing now occurs at the actual generative socket send, while tabs retain attach-time pacing. New `relay/test_socket_admission_no_pending.py` plus related socket/timeout/resend coverage: **170 passed, 2 skipped**; CI manifest now lists **716 pytest files**; `py_compile` and `git diff --check` clean. Committed/pushed as `b3d9ce5` (`fix(fleet): pace socket sends without pending workers`). This closes the synthetic admission regression, but live latency measurement is still required before STAB-004 closes.
 - 2026-09-30 15:16 JST live-evidence review: the 13:44 GUI/Fleet transcript `r6abc7f6c_a2_w0` shows turn 1 user send -> assistant reply in **22.3s**, then turn 2 produced no assistant reply and hit the generic timeout at **240.5s**. Separately, `socket_route.jsonl` records a 13:29 socket attempt falling back at **91s meaningful idle** (`limit 90s`). These are evidence that current long waits are transport-silence dominated, but they are not enough to lower the threshold safely because healthy tool/search progress gaps were not recorded. Next measurement step: record only first crossings of 5/10/20/30/45/60/90s `generation_idle_s` per socket turn, then submit a GUI-visible read-only task and measure healthy max-idle vs stalled recovery before changing the 90s limit. The diagnostic-only `socket_idle_probe` instrumentation is now implemented locally; full `relay/test_socket_route.py` is **121 passed**, related resend/timeout/settle/policy coverage is **85 passed, 2 skipped**, CI manifest reports **722 pytest files / OK**, `py_compile` and `git diff --check` are clean.
+- 2026-09-30 17:xx JST live GUI probe `r6abcab48_a0` supplied the missing threshold evidence. Across **10 socket turns / 22 first-crossing probe events**, the longest healthy continuous meaningful-idle gap was **46.165s** (`w3` turn 2), and that turn still completed `DONE` after **214.8s total**. Other healthy long turns took **120.6-124.2s total** while their continuous idle only crossed the 5s bucket, confirming that total response latency is not a stall signal when tool/search progress resets the idle clock. The one true no-reply stall (`w1` turn 2) crossed **60s and 90s continuously** before recovery. Therefore 45s is empirically unsafe, while 60s retains ~14s observed headroom and removes ~30s of the old 90s silent wait. Dedicated branch `fix/socket-idle-60s-20260930`, commit `92e1754`, lowers only the default to **60s**, preserves `MCP_FLEET_SOCKET_IDLE_S` override and keeps the 90s diagnostic bucket. Validation: `test_socket_route.py` **123 passed**; socket-adjacent **98 passed**; timeout/resend **59 passed, 2 skipped**; settle/retry/admission **142 passed**; transient script **17/17**; CI manifest **722 / OK**; `py_compile` and `git diff --check` clean. Status remains open until this patch is merged/deployed and one post-60s live task confirms early stalled-turn recovery without false recovery on a healthy long turn.
+- 2026-09-30 19:xx JST post-60s live acceptance: GUI/Fleet run `r6abcdee1_a0` exercised the deployed 60s contract. Two stalled socket turns crossed the diagnostic buckets through **60.097s / 60.102s** at `limit_s=60.0` and moved to the fallback route instead of waiting for the generic 240s turn timeout. Healthy socket workers did not false-recover: `w0` finished `DONE` directly on socket in 1 turn with no fallback (max observed continuous idle **10.663s**), while `w4` finished `DONE` directly on socket after 5 turns with no fallback (max observed continuous idle **11.094s** across instrumented turns). `w3` eventually became `STUCK` only after tab fallback and 15 turns due repeated-conclusion settling, which is a separate semantic path rather than a silent-wait timeout. Combined with the earlier healthy **46.165s** continuous-idle observation, 45s remains empirically unsafe and 60s is the smallest currently evidence-supported default. STAB-004 is CLOSED; reopen only on new live evidence of false 60s recovery or a >60s healthy continuous-idle interval.
 
 ### STAB-005 -- task entered/submitted but not reflected in Fleet UI
-Status: REOPENED / VERIFY CURRENT PATH
+Status: CLOSED / LIVE VERIFIED (2026-09-30 23:08 JST)
 
 Past fixes covered bottom-composer steer-vs-add confusion, live add durability, applied receipts, shutdown handoff, and GUI text verification. The user reports current regressions have increased, so historical green tests are not enough.
 
@@ -188,7 +191,7 @@ Acceptance:
 - closing-run and durable-runtime paths are included in live validation.
 
 ### STAB-006 -- server health red/yellow behavior must be truthful
-Status: PARTIALLY FIXED / LIVE RE-VERIFY
+Status: CLOSED / EXACT PRODUCTION HEALTH-POLL PATH VERIFIED (2026-10-01 08:4x JST)
 
 Relevant current branch work:
 - `7d59d47` planned server restart distinction;
@@ -201,6 +204,20 @@ Acceptance:
 - planned restart renders the intended transitional/yellow state rather than false red;
 - real server failure cannot be masked indefinitely by a stale marker;
 - marker path/expiry/ownership are visible in evidence.
+
+2026-10-01 continuation evidence / hardening:
+- a real supervisor-owned planned restart occurred at 07:42:16-07:42:19 JST: the supervisor logged `server is running stale code and nothing is in flight -- cycling it`, then `previous server pid=9304 ... planned: stale code cycle`, then launched the replacement; current `/health` reports `server_code=current`, `server_pid=23792`, `server_head=2dc86ba28fe4`, and `auth_fail_10m=0`;
+- Fleet was not running during this verification, so no user task was interrupted;
+- the normal transition budget is 240s (`StartupGraceSeconds=180` + `FailuresBeforeAction=4` * `IntervalSeconds=15`) with a 600s hard corruption/staleness cap on the reader;
+- remaining defect found: the marker contained `supervisor_pid` but the Cockpit did not validate it, so a dead supervisor could leave a real outage yellow until expiry and PID reuse could falsely preserve ownership;
+- repair: new markers also publish `supervisor_started` from the supervisor process birth. `ReadPlannedServerTransition()` now requires both PID and birth, verifies the live Windows process, and fails closed to no planned transition on missing/dead/reused/mismatched ownership;
+- focused transition tests: 6 passed; health/Cockpit related set: 24 passed; PowerShell parser: 0 errors; FleetCockpit/CopilotChat rebuild: success; `git diff --check`: clean.
+
+STAB-006 closure evidence (2026-10-01 08:4x JST): the remaining acceptance was completed through the ledger-approved **equivalent exact health-poll execution**, without stopping the production MCP server. A Windows C# harness compiles the shipping FleetCockpit source list and invokes the real `CockpitWindow.PollHealthOnce()` server-health branch under `--selftest`; the only injected inputs are the server HTTP result and a temporary `server_transition.json` path. With server-unreachable plus a fresh `planned_restart` marker owned by the live harness PID and matching process birth, the actual server dot became **Yellow** and retained the planned-restart reason. The same exact poll became **Red** when the marker was absent, named a dead PID, or reused the live PID with a mismatched birth time. Thus the owner/expiry checks do not mask a real outage, and planned supervisor-owned downtime is no longer falsely red. The production URL/path remain the defaults because both overrides are null and gated by `WindowSelfTest.Active`.
+
+Validation: exact-poll harness **5 passed**; related planned-restart/expiry/health/operability/window-construction set **32 passed**; both WPF binaries rebuilt successfully and FleetCockpit/CopilotChat were observed running from the rebuilt executables; `git diff --check` clean. Natural planned restarts were also observed at 07:42:16-07:42:19 and 08:30:08-08:30:12 JST, but their ~3-4s gaps were shorter than the ordinary 15s Cockpit cadence, which is why exact polling was required rather than manufacturing a longer production outage.
+
+STAB-006 is CLOSED. Reopen only if a future planned restart renders Red despite a live matching supervisor marker, or if a dead/stale/reused marker can soften a real outage to Yellow.
 
 ### STAB-007 -- finish current resend-policy work without losing the branch state
 Status: VALIDATED / COMMITTED / PUSHED (`cca3295`)
@@ -230,6 +247,13 @@ For the current follow-up branch, re-check all relevant GitHub runs after each a
 
 
 2026-09-30 pre-STAB-002 head `c2f2416`: PR #67 was CLEAN/MERGEABLE and CI, Windows build, Install path, CodeQL (Python + C#), Secret scan, PowerShell lint and Workflow lint were all SUCCESS. The STAB-002 patch below creates a new head and therefore requires a fresh check after push.
+2026-09-30 latest `main` head `38f4f77`: CI, Windows install smoke, CodeQL, Secret scan, PowerShell lint and Workflow lint completed **SUCCESS**. The latest historical main CI failure (`75c157d`, run 36670394581) was isolated to `test_ten_clicks_200ms_apart_start_one_bringup`: all functional invariants passed (`bringups=1`, nine losers / foreground requests, no leftovers) and only one hosted-Windows leaver measured **5.08s** against the 5.0s hard tail bound. The same Windows-only suite passed on later main runs including `38f4f77`, so no product/threshold change was made from that single 80ms tail; monitor for recurrence rather than weakening the gate pre-emptively.
+
+
+2026-10-01 current-head CI checkpoint:
+- current `main` heads through PR #90 are green for CI, CodeQL, Secret scan, Windows build, Workflow lint, and the other corresponding workflows reported by GitHub; no present main regression was reproduced;
+- PR #78 / branch head `e71a805` completed CI, Windows build, install path, CodeQL, Secret scan, PowerShell lint and Workflow lint successfully;
+- local branch then merged newer `origin/main` as `2dc86ba` and is ahead of its remote branch, so this new STAB-006 commit must be pushed and the checks re-read on the resulting current head before integration.
 
 ## P1 -- follow-up after P0 stability
 
@@ -273,3 +297,117 @@ These do not outrank the live P0 regressions above unless they become direct blo
 - 2026-09-30: STAB-004 socket admission/send-pacing repair completed and pushed as `b3d9ce5`; 170 related tests passed, 2 skipped, CI manifest 716/OK. Live latency measurement remains open.
 
 - 2026-09-30: STAB-002 combined Content details + Execution timeline implementation completed and pushed as `540ebdb`; 61 related UI tests green and both WPF binaries rebuilt/restarted. Live visual verification remains open.
+
+## 2026-09-30 19:xx JST continuation / CI integration checkpoint
+
+User instruction: continue current stabilization work and, when possible, inspect failures on `main` as well. Commit/push at meaningful boundaries so CI and code scanning actually run.
+
+Current evidence after refresh:
+- PR #67 is already MERGED; its merge-head checks were all green (CI, Windows build, install path, CodeQL Python/C#, Secret scan, PowerShell lint, Workflow lint).
+- Current branch `fix/phase2-audit-followups-20260929` later gained two post-merge commits: `a050a4a` (60s silent-socket recovery) and `eb6c03c` (serialized automated GUI submissions).
+- Those two commits have **zero GitHub check-runs** because the previous PR is closed and the workflow set does not create the full check matrix for this post-merge feature-branch push. This is not a green result; it is unvalidated remote state.
+- `origin/main` is currently 9 commits ahead while this branch is 2 commits ahead. The branch must first converge with current main, then the same branch (do not create another stabilization branch) must be submitted as a fresh PR so current-head CI/CodeQL/Windows/secret/lint checks run.
+- Latest inspected `main` workflow head is green. Historical main CI failures already recorded below were superseded by later green runs; do not weaken timing gates from a single hosted-runner tail unless recurrence is demonstrated.
+
+Resume point after integration hygiene: STAB-004 post-60s live validation is CLOSED. Continue with STAB-005 task-submission live re-verification, then STAB-006 server-health live re-verification, followed by main integration.
+
+### 2026-09-30 19:xx JST main convergence validation
+
+- merged current `origin/main` (`dfa157e`) into `fix/phase2-audit-followups-20260929` as `8cab371`; no conflicts; untracked `kanazawa-trip/` and `reviews/` were not staged or modified;
+- branch-vs-main product delta remains the intended post-PR#67 socket/GUI stabilization plus this private ledger checkpoint;
+- focused socket / timeout / resend / GUI-submit integration regression set: **184 passed, 2 skipped**;
+- CI manifest: **723 pytest files listed / OK**;
+- `git diff --check origin/main...HEAD`: clean;
+- next action: push this converged head and open a fresh PR from the SAME stabilization branch (PR #67 is already merged) so CI, Windows build, install path, CodeQL, Secret scan, PowerShell lint and Workflow lint run on the actual current head.
+
+### 2026-09-30 19:5x JST STAB-005 live-add latency finding
+
+A real GUI-visible A/B submission reproduced the current reflection-delay symptom without task loss. B (`STAB005B-20260930-195207056`) appeared first as the Cockpit optimistic submitted row while no B worker existed yet, then its exact `commands.d` JSON remained durable until the runner consumed it. The applied receipt was later written with `read=true, applied=true`, B became exact-goal worker `w1`, finished `DONE`, and the identical full goal reached `history.json`. This validates the non-loss path and the worker-before/after reconciliation contract.
+
+New P0 performance defect discovered from the same run: B took about **57s** from live command landing to applied receipt / worker creation. Transcript timing for A shows its worker object existed around 19:52:18 but its first user send did not occur until 19:53:19 (~60.9s). During that interval `status.updated` / `on_tick` / command drain did not advance. `_begin_send` rate pacing is already non-blocking; the synchronous pre-attach `route.refresh(context, agent_url)` in `run_relay_fleet` can call the Playwright-backed token/template capture on the single fleet sweep thread. Full capture is documented at ~35s and the measured stall here was ~61s. `capture_floor` does not sleep.
+
+Priority/acceptance change: STAB-005 is NOT closed merely because the optimistic row prevents disappearance. The runner must continue consuming live commands/status while socket token refresh/capture is in progress, or otherwise move the refresh cost off the command-draining critical path without violating Playwright thread ownership. Do not move a sync Playwright context to an arbitrary thread. Search existing independent-process/CDP/light-token mechanisms first and add a regression that command drain/status remains live across capture latency.
+
+Safety constraint from the current live state: the run that began with the controlled A/B validation now also contains user travel-planning workers (`w2`-`w7`). Do **not** stop/kill/restart this runner or use it for closing-run race tests. Continue source/test work non-destructively and defer destructive handoff validation until the user work finishes naturally.
+
+- 2026-09-30: STAB-005 source repair moved socket credential refresh/capture off the Fleet sweep into a windowless helper process (`relay/socket_capture_async.py`). While capture is in flight, command draining/status ticks continue and admission counts a worker as socket-only only when token+template are actually ready; otherwise it honestly budgets the ordinary tab path. `SocketRoute` now has per-agent capture revisions so a late async result cannot overwrite a newer Research/Refuter synchronous refresh, and route-close vs late-install is serialized. Focused validation so far: async capture 9 green, socket admission 3 green, socket route 123 green, targeted Research/Refuter/summary socket compatibility 8 green. Live A/B re-measurement remains required on a fresh run before STAB-005 closes.
+
+### 2026-09-30 22:4x JST async-capture pre-commit validation
+
+STAB-005 source repair is ready for a remote-check boundary. The blocking `route.refresh(context, agent_url)` call has been removed from the Fleet admission sweep. A windowless helper process now owns its own Playwright/CDP connection and returns only plain token/template data; the parent sweep only launches/polls that helper and continues command/status work. Admission treats a worker as socket-only only when `SocketRoute.ready(agent_url)` has a live token/template; otherwise it budgets the ordinary tab path. Per-agent capture revisions prevent late async results from overwriting newer synchronous Research/Refuter captures, and route-close/install are serialized.
+
+Pre-commit validation on the exact dirty tree:
+- `relay/test_socket_capture_async.py` + `relay/test_socket_admission_no_pending.py`: **12 passed**;
+- `relay/test_socket_route.py`: **123 passed**;
+- Research/Refuter/socket/timeout/resend compatibility slice: **113 passed, 2 skipped**;
+- transient retry script: **17/17**;
+- `py_compile` for async helper / route / fleet: green;
+- CI manifest: **724 listed / OK** before staging the new test; re-run after staging is mandatory;
+- `git diff --check`: clean.
+
+This is source/test validation only. STAB-005 remains REOPENED until a fresh GUI-visible A/B submission demonstrates that command receipt / status ticks remain live while an actual capture helper is in flight.
+
+### 2026-09-30 23:0x JST live Add-button identity regression and repair
+
+A real GUI live-add attempt reproduced a second STAB-005 surface failure independent of Fleet command durability. At 22:57:03 the cockpit correctly reported `run in flight: True`, but `scripts/win/submit_via_ui.ps1` could not find the live `Add` button because the composer had a stable AutomationId (`goalInput`) while the Start/Add button was identified only by localized display names. The task therefore never reached the runner.
+
+Repair:
+- FleetCockpit assigns `_startBtn` the stable AutomationId `startButton`;
+- GUI submitter resolves `startButton` first and keeps localized-name matching only as old-binary compatibility fallback;
+- focused submit/GUI-lock/no-nested-console tests: **14 passed**;
+- both WPF binaries rebuilt successfully.
+
+Live re-check after rebuild: a real GUI submission printed `start button: found by AutomationId`. A subsequent in-flight add (`STAB005F-20260930-230221586`) reported `run in flight: True`, was accepted through that AutomationId path, and produced `applied=true` ack at 23:02:33 (`ts=1790776953.880...`), about **11.93s** after submission start. This is materially below the earlier ~57s live-add stall. It does not yet close the async-capture overlap acceptance: the preceding async capture completed at `1790776938.147...`, roughly 3.8s before this live add began. A fresh A/B test must still place B inside the actual helper-in-flight window.
+
+
+### 2026-09-30 23:08 JST STAB-005 live acceptance
+
+Fresh GUI A/B validation closed the remaining live-command critical-path question. A (`STAB005A2-20260930-230730326`) started a fresh run through `submit_via_ui.ps1`. B (`STAB005B2-20260930-230745239`) was then submitted immediately through the same visible cockpit composer and reported `run in flight: True` plus `start button: found by AutomationId`. Immediately after B submission the real `relay.socket_capture_async --worker` process tree was still alive.
+
+Measured ordering:
+- B GUI submit start: 23:07:45.240 JST;
+- B durable `applied=true` ack: `ts=1790777284.1886287` / 23:08:04.191 wall time;
+- async capture success: `at=1790777288.65013` / 23:08:08.652 file time;
+- therefore the Fleet command drain durably applied B **4.462s before the capture helper completed**;
+- the run identity (`started=1790777264.61075`) remained the same, status reached `total=2, queued=0`, and B became real worker `w1` (observed `refuting`, turn 1).
+
+This directly disproves the old blocking behavior for the repaired path: the expensive Playwright/CDP capture can be in flight while the single Fleet sweep continues consuming and acknowledging live commands. Together with the exact-goal/ack/history durability fixes and the `startButton` AutomationId repair, STAB-005 is CLOSED. Reopen only on new live evidence of a command/status stall during async capture or a visible GUI submission that fails reconciliation.
+
+### 2026-10-01 08:xx JST unlock/no-tool false-positive closure
+
+The remaining resume-queue P0 around unlock semantics was reproduced directly. Before the repair, the real historical reply `unlockは予定の読み取りに不要なため実行していません。DONE` classified as locked whenever an unrelated fresh refusal record existed in the global window. A long security-review reply that merely quoted `[locked: no valid unlock token]` while explicitly saying the current read-only task required no unlock also entered the lock-probe path.
+
+Repair in `relay/relay_fleet.py`:
+- add `_explicit_unlock_not_required()` with narrow English/Japanese semantic patterns for `unlock/解錠/ロック解除` + `not required / not needed / unnecessary / 不要 / 必要ない`;
+- do **not** treat `did not execute unlock` alone as negative evidence, because a genuinely blocked worker says that when password/tool access is unavailable;
+- contradictory prose fails closed when a separate positive `unlock is required` statement exists;
+- literal short server lock markers and exclusive server refusal attribution are evaluated before the negative-prose guard and therefore remain authoritative;
+- the guard suppresses only ambiguous paraphrase/fallback classification and long-marker probe escalation.
+
+Validation:
+- new replay + worker-level regression: **18 passed**, including exact read-only/calendar wording preserved in the research transcript corpus;
+- existing lock evidence / long-marker probe / session attribution / unlock injection / recovery set: **92 passed**;
+- real lock paraphrase, literal `[locked ...]`, and failure-to-unlock cases remain classified as locked;
+- `git diff --check`: clean.
+
+This item is CLOSED. Reopen only if a reply that explicitly says unlock is unnecessary still enters unlock probe/injection, or if a real lock refusal is newly suppressed. The next unresolved P0 in this ledger is STAB-006's missing retained yellow-state sample during a natural planned server restart.
+
+### 2026-10-01 08:4x JST P0 stabilization convergence checkpoint
+
+All P0 behavior regressions listed in the current stabilization ledger are now CLOSED with the required live/exact evidence: left-panel details+timeline, foreground console suppression, long-wait recovery, live task reflection/async capture, unlock/no-tool false-positive handling, and truthful planned-restart server health. The resume queue now advances to **INTEGRATION**: validate the current branch head through blocking CI / Windows build / install path / CodeQL / Secret scan / PowerShell lint / Workflow lint, then merge/converge through the existing branch plan and verify post-merge `main`. Do not resume unrelated durable-runtime/C2C feature expansion before this integration gate is green.
+
+### 2026-10-01 10:19 JST post-P0 convergence / PR #78 checkpoint
+
+The P0 closure recorded above still stands. The active follow-up branch is `fix/phase2-audit-followups-20260929` / PR #78. Remote head `183bb63` is green across CI, CodeQL, Secret scan, Workflow lint, PowerShell lint, Windows build, and install-path E2E.
+
+Since the 08:4x convergence checkpoint, the branch also carries the planned-restart supervisor-instance fix and exact yellow-path test, plus the explicit `unlock not required` classification fix. Locally, `f2a3ef8` merged the previously cached `origin/main` ref containing PR #91's interrupted-run resume-scope fix. A subsequent explicit fetch showed remote `main` had already advanced to `ed16ac9` through PR #92, so `f2a3ef8` is not yet final main convergence.
+
+Operationally relevant current state:
+- no tracked dirty files before this ledger update;
+- unrelated untracked directories (`kanazawa-trip/`, `output_20260930/`, `reviews/`) remain untouched;
+- next gate is current PR #78 CI/CodeQL/Windows validation, then convergence with fetched main `ed16ac9` and another full blocking-check pass before merge;
+- current `main` CI should be reviewed separately after this ledger sync, especially any failure not explained by the PR #78 branch.
+
+### 2026-10-01 10:2x JST correction -- fetched main was newer than cached origin/main
+
+After the checkpoint above, `git fetch origin main` updated the remote-tracking ref from PR #91's `3d97c39` to `ed16ac9` (PR #92). Main HEAD `ed16ac9` is green on CI, CodeQL, Secret scan, Workflow lint, and Windows build. Treat the earlier wording that called `f2a3ef8` a merge of current main as stale-local-ref wording; final PR #78 convergence still requires the newer main.

@@ -102,6 +102,7 @@ _MEMORY_TURN_CHARS = _MEMORY_MAX_CHARS - 200
 # has no HTTP request. The audit runlog has never been written.
 from tools.runlog_ops import runlog_append_local as runlog_append  # operator D: audit
 from tools.runlog_ops import runlog_summarize
+from relay.send_errors import FreshSubmitAmbiguous
 
 class ConversationClosed(RuntimeError):
     """Raised by send() when the target tab/composer is already gone (the
@@ -173,6 +174,11 @@ COPILOT_SELECTORS = {
     # inner_text is the answer. NOTE: data-testid="chatOutput" was NOT reliable --
     # it can read back the user's own message, which broke STUCK detection.
     "assistant_msg": ".fai-CopilotMessage",
+    # User turn container. Captured live 2026-10-01 while closing R5-NOTE-1. Unlike
+    # chatOutput, chatQuestion is one container per visible USER turn and exposes an empty
+    # first-message defect directly ("You said:" with no body). Fresh sends use it as the
+    # response-independent delivery receipt.
+    "user_msg": '[data-testid="chatQuestion"]',
     "assistant_msg_fallback": '[data-testid="copilot-message-reply-div"]',
     # Within one .fai-CopilotMessage the block splits into a HEADER and a BODY:
     #   <div>                                            <- header, all chrome
@@ -1539,6 +1545,90 @@ class CopilotWebDriver:
             t = ""
         return t.replace("​", "").replace("‌", "").strip()
 
+    @staticmethod
+    def _normalise_visible_text(text: str) -> str:
+        """Normalize only representation noise, never semantic content."""
+        return " ".join(str(text or "").replace("\u200b", "").replace("\u200c", "").split())
+
+    def _stabilize_fresh_composer(self, composer, intended: str, *,
+                                  stable_s: float = 2.0, timeout_s: float = 10.0) -> bool:
+        """Require a fresh-chat draft to survive SPA hydration before Send.
+
+        Live proof 2026-10-01: a fresh M365 editor can display the full intended text and expose
+        it through Lexical, then ~100ms later reset to empty.  Send clicked inside that transient
+        window creates a real EMPTY user turn.  Waiting for *non-empty* is therefore insufficient.
+
+        We require the exact normalized text to remain continuously unchanged for ``stable_s``.
+        If hydration wipes it, re-focus, clear and atomically insert the same text again.  This
+        only runs for fresh conversations; continuation turns keep the old fast path.
+        """
+        wanted = self._normalise_visible_text(intended)
+        deadline = time.time() + max(0.1, float(timeout_s))
+        stable_since = None
+        while time.time() < deadline:
+            current = self._normalise_visible_text(self._composer_text())
+            if current == wanted:
+                if stable_since is None:
+                    stable_since = time.time()
+                if time.time() - stable_since >= max(0.0, float(stable_s)):
+                    return True
+                self.page.wait_for_timeout(100)
+                continue
+
+            # The fresh-page hydration reset won.  Re-enter the exact same draft, then start the
+            # continuous-stability clock again.  No Send/Enter occurs in this branch.
+            try:
+                composer.click(force=True, timeout=5000)
+            except Exception:
+                pass
+            self.page.keyboard.press("Control+a")
+            self.page.keyboard.press("Delete")
+            self.page.wait_for_timeout(100)
+            self.page.keyboard.insert_text(intended)
+            stable_since = None
+            self.page.wait_for_timeout(100)
+        return False
+
+    def _visible_user_questions(self) -> list[str]:
+        """Visible user-turn DOM, one entry per chatQuestion. Best-effort and read-only."""
+        try:
+            loc = self.page.locator(COPILOT_SELECTORS["user_msg"])
+            return [loc.nth(i).inner_text() or "" for i in range(loc.count())]
+        except Exception:
+            return []
+
+    def _wait_fresh_user_receipt(self, intended: str, before_count: int, *,
+                                 timeout_s: float | None = None,
+                                 mismatch_settle_s: float = 1.0) -> bool:
+        """Prove a fresh submit created exactly one intended, non-empty USER turn.
+
+        URL transition and a Stop/generating control prove *some* turn began, not that our draft
+        was the turn.  The R5 live audit observed a real ``You said:`` empty bubble followed by a
+        semantic resend.  This receipt refuses that as success, even if a later resend matches.
+        """
+        wanted = self._normalise_visible_text(intended)
+        deadline = time.time() + (self.SUBMIT_ACK_WAIT_S if timeout_s is None else timeout_s)
+        mismatch_since = None
+        while time.time() < deadline:
+            rows = self._visible_user_questions()
+            new_rows = rows[max(0, int(before_count)):]
+            if new_rows:
+                normalized = [self._normalise_visible_text(t) for t in new_rows]
+                matches = [wanted in t for t in normalized]
+                # Exactly one new turn, and that one contains the complete intended one-line
+                # payload.  Two new user turns means duplicate/recovery traffic happened before
+                # send() returned and cannot be accepted as a clean first delivery.
+                if len(new_rows) == 1 and matches[0] and normalized[0]:
+                    return True
+                if mismatch_since is None:
+                    mismatch_since = time.time()
+                elif time.time() - mismatch_since >= max(0.0, mismatch_settle_s):
+                    return False
+            else:
+                mismatch_since = None
+            self.page.wait_for_timeout(100)
+        return False
+
     def _wait_send_armed(self, timeout_s: float = 12.0) -> bool:
         """Wait until the Send button is present AND enabled.
 
@@ -1753,6 +1843,7 @@ class CopilotWebDriver:
         # genuinely NEW one (rather than re-reading the previous turn's answer).
         start_url = str(getattr(self.page, "url", "") or "")
         fresh_conversation = "/conversation/" not in start_url.lower()
+        user_count_before = len(self._visible_user_questions()) if fresh_conversation else 0
         if track_answer:
             try:
                 self._count_before = self._answers().count()
@@ -1799,10 +1890,16 @@ class CopilotWebDriver:
             # DOES arm, so nothing downstream notices. Comparing the composer against what
             # we meant to type is the only check that sees it.
             for _settle in range(8):
-                if self._composer_text():
+                if self._normalise_visible_text(self._composer_text()) == one_line:
                     break
                 self.page.wait_for_timeout(250)
                 self.page.keyboard.insert_text(one_line)
+            if fresh_conversation and not self._stabilize_fresh_composer(composer, one_line):
+                self._snapshot_send_failure(
+                    attempt=attempt, phase="fresh_composer_never_stabilized",
+                    allow_answer_content=track_answer,
+                )
+                continue
             _send_stage(_send_t0, "typed", attempt=attempt,
                         composer_len=len(self._composer_text() or ""))
             if self._wait_send_armed(timeout_s=12.0):
@@ -1833,33 +1930,31 @@ class CopilotWebDriver:
             # right after a fresh page). POLL for the composer to empty instead of one
             # fixed 800ms check -- the short check was the real cause of the false
             # "Send button never submitted" failures (and the retry then double-typed).
-            # Window is generous (12s) because under memory pressure the M365 SPA can take
-            # many seconds to clear the composer; a too-short window both falsely fails AND
-            # causes the retry to double-send. Re-click the Send button each second in case
-            # it re-armed without submitting (a load-induced no-op click).
+            # For continuation turns the legacy 12s composer/answer settle window remains below.
+            # Fresh turns deliberately bypass its re-click behavior and wait only for a visible
+            # user-turn receipt, because an ambiguous first submit must never be retried blindly.
             _send_stage(_send_t0, "clicked", attempt=attempt)
-            for i in range(48):                  # up to ~12s
+            if fresh_conversation:
+                # ONE SUBMIT ACTION PER fresh send(). After a click/Enter there is no safe basis
+                # for a second click merely because the composer is slow to clear: attempt 1 may
+                # already have landed. Wait only for the response-independent USER-turn receipt.
+                # This closes the duplicate window where attempt 2 could resend an already-landed
+                # first turn. A missing/mismatched receipt is ambiguous and therefore fail-closed.
+                if self._wait_fresh_user_receipt(one_line, user_count_before):
+                    return
+                self._snapshot_send_failure(
+                    attempt=attempt, phase="fresh_user_turn_receipt_mismatch",
+                    allow_answer_content=track_answer,
+                )
+                raise FreshSubmitAmbiguous(
+                    "fresh submit has no single matching user-turn receipt; "
+                    "the user turn may already have landed, so automatic resend is forbidden"
+                )
+
+            for i in range(48):                  # continuation turn, up to ~12s
                 self.page.wait_for_timeout(250)
                 if not self._composer_text():
-                    # On a fresh agent page the composer can be cleared by an SPA reset even
-                    # though no message was submitted.  Require a response-independent receipt:
-                    # a conversation URL, a live generation control, or a new response block.
-                    if not fresh_conversation:
-                        return
-                    ack_deadline = time.time() + self.SUBMIT_ACK_WAIT_S
-                    while time.time() < ack_deadline:
-                        current_url = str(getattr(self.page, "url", "") or "")
-                        if "/conversation/" in current_url.lower() or self._is_generating():
-                            return
-                        self.page.wait_for_timeout(250)
-                    self._snapshot_send_failure(
-                        attempt=attempt, phase="composer_cleared_without_turn_ack",
-                        allow_answer_content=track_answer,
-                    )
-                    raise RuntimeError(
-                        "send failed: composer cleared without a conversation or "
-                        "generation acknowledgement"
-                    )
+                    return
                 # STRONGER success signal: if a new answer block has appeared, the agent
                 # is already replying, so the send DID go through -- even if the composer
                 # is slow to visually clear under memory pressure. Without this, a laggy
@@ -2307,6 +2402,36 @@ def run_relay(
         t_send = time.time()
         try:
             driver.send(job)
+        except FreshSubmitAmbiguous as e:
+            # A fresh submit may already have landed even though its USER-turn receipt could
+            # not be proven. Treating that ambiguity like a transient transport failure and
+            # re-sending the same logical job can duplicate real work. This single-conversation
+            # loop used to do exactly that through the generic Exception branch below.
+            #
+            # The ONLY safe salvage is independent acceptance evidence from the target
+            # workspace. If those checks already pass, no resend is needed; otherwise stop and
+            # make the ambiguous delivery visible to the operator. Never rotate/retry here.
+            _amb_passed = False
+            _amb_detail = ""
+            if checks_norm:
+                try:
+                    _amb_passed, _amb_detail = run_all_blocking(checks_norm, cwd=cwd)
+                except Exception as _amb_exc:
+                    _amb_passed = False
+                    _amb_detail = "acceptance check error: %s" % type(_amb_exc).__name__
+            runlog_append(run_id, {
+                "turn": turn, "event": "fresh_submit_ambiguous",
+                "acceptance_checked": bool(checks_norm),
+                "acceptance_passed": bool(_amb_passed),
+                "detail": (_amb_detail or "")[:400],
+            })
+            if _amb_passed:
+                outcome = "DONE"
+                reason = "fresh submit delivery ambiguous; independent acceptance checks already pass"
+            else:
+                outcome = "STUCK"
+                reason = "fresh submit delivery ambiguous; automatic resend forbidden: %s" % str(e)
+            break
         except ConversationClosed as e:
             # The target tab/composer is gone (conversation ended). Retrying a dead
             # target can NEVER succeed, so this is terminal -- skip the transient-retry
