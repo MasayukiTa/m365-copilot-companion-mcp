@@ -17,3 +17,9 @@
 # launcher start_all_hidden.vbs runs as LF on the owner's machine. Forcing a conversion would
 # rewrite 60 files for no behavioural gain, and PowerShell cares about ENCODING (a BOM or
 # ASCII-only), not line endings. So they keep what they have.
+
+# The work ledger is append-only: every PR adds a dated entry at the END, so concurrent
+# PRs always touch the same last lines. merge=union keeps both sides' added lines instead of
+# reporting a conflict. Local merges only: GitHub's server-side merge ignores this attribute
+# (see docs/private/ledger.d/README.md for the per-entry-file route that works there too).
+docs/private/claude_work_ledger.md merge=union
