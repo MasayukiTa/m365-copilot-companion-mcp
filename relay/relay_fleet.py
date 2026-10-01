@@ -805,6 +805,12 @@ def edge_recover_surface(port=None, open_url=""):
 # The loose "unlock(password=" phrasing is kept only as documentation of what NOT to use alone;
 # it is deliberately NOT part of LOCKED_MARKERS below.
 
+#: The exact variable-prefix start of tools/security.py's remote-IP refusal. Keep the opening
+#: bracket and colon: the old bare "locked client ip" marker also matched ordinary diagnostic
+#: prose such as "the locked client IP message is absent", re-opening the 2026-07 false-positive
+#: class even when the worker was explicitly describing a non-lock backend failure.
+REMOTE_IP_REFUSAL = "[locked client ip:"
+
 #: The exact prefix tools/security.py writes when it denies a caller that arrived with no HTTP
 #: request context. Pinned here because that module is frozen and cannot import from this one,
 #: and because a filter keyed on it is only as good as the literal staying identical -- a test
@@ -833,7 +839,7 @@ TOKEN_MISSING_REFUSAL = "[locked: no valid unlock token"
 # and covering both in
 # relay/test_every_refusal_the_server_can_speak_is_one_the_fleet_can_hear.py's source-sweep of
 # tools/security.py, turns "happens to work" into "is checked".
-LOCKED_MARKERS = ("locked client ip", NO_CONTEXT_REFUSAL.lower(), TOKEN_MISSING_REFUSAL.lower())
+LOCKED_MARKERS = (REMOTE_IP_REFUSAL, NO_CONTEXT_REFUSAL.lower(), TOKEN_MISSING_REFUSAL.lower())
 # A real lock error (see the three literal strings above) is ~90-330 chars. A security-review /
 # analytical response that merely mentions unlock() runs to many hundreds/thousands of chars.
 # Chosen well above the longest real error and well below a genuine multi-sentence review.
