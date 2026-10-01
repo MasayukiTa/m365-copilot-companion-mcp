@@ -110,8 +110,11 @@ def test_cockpit_shows_the_split_group_line_and_parent_display_label():
     assert 'S(w, "display_label")' in src and 'S(w, "display_state")' in src
     assert 'parentLabel.Length > 0 ? parentLabel : Theme.StatusLabel(status, _lang)' in src
     # the one-line group summary: reads the `groups` the coordinator writes, plain wording
-    assert '"groups"' in src and 'Obj(g, "ledger")' in src and 'Obj(g, "children")' in src
-    assert '"分割グループ 子"' in src and '" / 統合: "' in src
+    assert '"groups"' in src and 'Obj(g, "ledger")' in src
+    # the words live in GroupTreeView (WPF-free, compiled by its own harness test)
+    view = _strip_comments(_read("ui/EffortPolicy.cs"))
+    assert 'Obj(g, "children")' in view and 'GroupTreeView.Line(' in src
+    assert '"分割グループ 子"' in view and '" / 統合: "' in view
     # never the long goal: the group line reads only the capped ledger keys, not a goal field
     j = src.index("UIElement BuildGroupLine")
     body = src[j:src.index("Border Card(Dictionary", j)]

@@ -12572,7 +12572,7 @@ class CockpitWindow : Window
                 bool hasDraft = _steerDraft.TryGetValue(nm, out draftSt) && !string.IsNullOrEmpty(draftSt);
                 bool hasFocus = _steerFocusWorker == nm;
                 sb.Append('|').Append(hasDraft ? "d1" : "d0").Append(hasFocus ? "f1" : "f0");
-                sb.Append("|grp:").Append(StableShortHash(GroupLineText(w) + "|" + S(w, "display_label")));
+                sb.Append("|grp:").Append(StableShortHash(GroupLineText(w) + GroupExtraSig(w) + "|" + S(w, "display_label")));
                 return sb.ToString();
         }
     }
@@ -13794,35 +13794,50 @@ class CockpitWindow : Window
         return n > 0 ? label + " " + n : "";
     }
 
-    // One line: 分割グループ 子N件: 待機 a · 実行中 b · 完了 c · 失敗 d · 中断 e / 統合: <label>
+    // One line: 分割グループ 子N件: 待機 a · 実行中 b · ... / 統合: <label> [/ 下位グループ n件]
+    // The words live in GroupTreeView (EffortPolicy.cs, tested by a compiled harness).
     string GroupLineText(Dictionary<string, object> w)
     {
-        var g = GroupOfParent(w);
-        if (g == null) return "";
-        bool ja = _lang == 0;
-        var ch = Obj(g, "children") ?? new Dictionary<string, object>();
-        var parts = new List<string>();
-        string[] counts = {
-            GroupCount(ch, "queued", ja ? "待機" : "queued"),
-            GroupCount(ch, "running", ja ? "実行中" : "running"),
-            GroupCount(ch, "done", ja ? "完了" : "done"),
-            GroupCount(ch, "failed", ja ? "失敗" : "failed"),
-            GroupCount(ch, "interrupted", ja ? "中断" : "interrupted") };
-        foreach (string p in counts) if (p.Length > 0) parts.Add(p);
-        string head = (ja ? "分割グループ 子" : "Split group, ") + I(g, "children_total")
-                      + (ja ? "件" : " parts");
-        string body = parts.Count > 0 ? ": " + string.Join(" · ", parts.ToArray()) : "";
-        string ml = S(g, "merge_label");
-        return head + body + (ml.Length > 0 ? (ja ? " / 統合: " : " / merge: ") + ml : "");
+        return GroupTreeView.Line(GroupOfParent(w), _lang == 0);
     }
+
+    // The second line of a root group: tree usage + the depth-cap note. "" when not reported.
+    string GroupExtraText(Dictionary<string, object> w, out int level)
+    {
+        level = 0;
+        var g = GroupOfParent(w);
+        if (g == null || _lastRoot == null) return "";
+        return GroupTreeView.ExtraText(_lastRoot, g, _lang == 0, out level) ?? "";
+    }
+
+    string GroupExtraSig(Dictionary<string, object> w)
+    {
+        int lv;
+        string x = GroupExtraText(w, out lv);
+        return x.Length == 0 ? "" : "|x" + lv + x;
+    }
+
+    // Cards whose usage line the person collapsed (click the group line). Not persisted.
+    readonly HashSet<string> _groupExtraHidden = new HashSet<string>();
 
     UIElement BuildGroupLine(Dictionary<string, object> w)
     {
         string text = GroupLineText(w);
         if (text.Length == 0) return null;
         var g = GroupOfParent(w);
-        var row = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(24, 3, 0, 0) };
-        row.MouseLeftButtonUp += delegate (object s2, MouseButtonEventArgs e2) { e2.Handled = true; };
+        var row = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(24 + GroupTreeView.IndentPx(g), 3, 0, 0) };
+        int xLevel;
+        string extra = GroupExtraText(w, out xLevel);
+        TextBlock extraTb = null;
+        string cardName = S(w, "name");
+        row.MouseLeftButtonUp += delegate (object s2, MouseButtonEventArgs e2)
+        {
+            e2.Handled = true;
+            if (extraTb == null) return;
+            bool hide = extraTb.Visibility == Visibility.Visible;
+            extraTb.Visibility = hide ? Visibility.Collapsed : Visibility.Visible;
+            if (hide) _groupExtraHidden.Add(cardName); else _groupExtraHidden.Remove(cardName);
+        };
         row.Children.Add(new TextBlock {
             Text = text, Foreground = Muted, FontSize = 12,
             VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis,
@@ -13849,7 +13864,17 @@ class CockpitWindow : Window
                 }
         }
         if (tip.Count > 0) row.ToolTip = string.Join("\n", tip.ToArray());
-        return row;
+        if (extra.Length == 0) return row;
+        extraTb = new TextBlock {
+            Text = extra, FontSize = 12, Margin = new Thickness(24 + GroupTreeView.IndentPx(g), 1, 0, 0),
+            Foreground = xLevel >= 2 ? Theme.Br(Theme.Danger(_dark))
+                         : xLevel == 1 ? Theme.Br(Theme.Warning(_dark)) : Muted,
+            TextTrimming = TextTrimming.CharacterEllipsis, TextWrapping = TextWrapping.NoWrap, MaxWidth = 560,
+            Visibility = _groupExtraHidden.Contains(cardName) ? Visibility.Collapsed : Visibility.Visible };
+        var both = new StackPanel { Orientation = Orientation.Vertical };
+        both.Children.Add(row);
+        both.Children.Add(extraTb);
+        return both;
     }
 
     Border Card(Dictionary<string, object> w)
