@@ -1372,6 +1372,25 @@ def _tree_budget_block(worker_rows):
         return {}
 
 
+def _write_scope_block():
+    """`fanout_write_scope`: {mode, overlaps_seen}, additive. The production caller of
+    relay.write_scope.status_block (and so of the mode reader). {} on any failure."""
+    try:
+        from relay import write_scope as _ws
+        return _ws.status_block()
+    except Exception:
+        return {}
+
+
+def _write_scope_tick(workers):
+    """Once per sweep: in shadow, record sibling write overlaps (never raises, never blocks)."""
+    try:
+        from relay import write_scope as _ws
+        _ws.shadow_tick(workers)
+    except Exception:
+        pass
+
+
 def _fanout_depth_block():
     """`fanout_depth`: the split depth asked for and the one in force, additive.
 
@@ -1852,6 +1871,7 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
     _attach_split_groups(_snap)
     _snap.update(_tree_budget_block(_snap["workers"]))
     _snap.update(_fanout_depth_block())
+    _snap.update(_write_scope_block())
     return _snap
 
 
@@ -4345,6 +4365,7 @@ def main():
         # only the still-unfinished goals. Cheap (in-memory scan + one atomic write).
         _update_done_map(args.state_dir, workers)
         _sample_free_space(args.state_dir, disk_box[0])
+        _write_scope_tick(workers)      # shadow: record overlapping sibling writes (off = no-op)
         try:
             _write_atomic(status_path, _snapshot(workers, started, len(goals), mc_box[0],
                                                  disk_floor_gb=disk_box[0], paused=pause_box[0],
