@@ -6896,6 +6896,15 @@ class RelayWorker:
         except Exception:
             pass
         self.outcome = outcome_override or self._claim_verdict()
+        # THE CHILD'S ANSWER IS MADE DURABLE HERE, not on a later sweep: a coordinator killed
+        # between the outcome and that sweep left the done-map saying DONE with no
+        # `child_result` line, and the family could then never merge. Never raises.
+        _cb = getattr(self, "on_settled_done", None)
+        if _cb is not None and self.outcome == "DONE":
+            try:
+                _cb(self)
+            except Exception:
+                pass
 
     def _tree_hash_now(self) -> str:
         """supervisor_verify.tree_hash over this worker's cwd, or "" when there is nothing to
@@ -8563,35 +8572,52 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
 
     _noted_done = set()
 
+    def _note_one_finished(_w):
+        """Write the `merge_done` / `child_result` line for ONE worker that ended DONE, once.
+
+        Called synchronously from the worker's _settle_done (so the line exists the moment the
+        outcome does -- a coordinator killed a second later still leaves the answer on disk)
+        and again from the sweep below as an idempotent safety net."""
+        if getattr(_w, "outcome", None) != "DONE":
+            return
+        _env = getattr(_w, "task_envelope", None)
+        _cid = getattr(_env, "campaign_id", "") or ""
+        _role = getattr(_env, "role", "") or ""
+        if not _cid or _role not in ("aggregator", "subtask"):
+            return
+        if _role == "aggregator":
+            _mark = (_cid, "merge_done")
+            if _mark in _noted_done:
+                return
+            _noted_done.add(_mark)
+            _note_marker({"kind": "merge_done", "campaign_id": _cid})
+        else:
+            _idx = getattr(_w, "subtask_index", None)
+            _mark = (_cid, "child", _idx)
+            if _mark in _noted_done:
+                return
+            # A line for this slice already on disk (rehydrated, or written by resume
+            # recovery) is not written a second time.
+            if any(_r.get("subtask_index") == _idx and
+                   str(_r.get("outcome") or "").upper() == "DONE"
+                   for _r in (campaigns.get(_cid, {}).get("child_results") or [])):
+                _noted_done.add(_mark)
+                return
+            _noted_done.add(_mark)
+            _note_marker({"kind": "child_result", "campaign_id": _cid,
+                          "subtask_index": _idx, "outcome": "DONE",
+                          "task_id": getattr(_env, "task_id", None),
+                          "result": ((getattr(_w, "display_result", "")
+                                      or getattr(_w, "last_response", "") or "")[:1200])})
+
     def _note_finished_workers():
         """G3 + G2 evidence: write `merge_done` when an aggregator worker ends DONE, and a
         `child_result` line when a subtask ends DONE (its answer, capped like the merge
         prompt caps it), once each. Read at resume so a merge can be rebuilt and a DONE child
-        is never run twice."""
+        is never run twice. The worker writes its own line at settle time; this sweep is the
+        safety net for any path that did not."""
         for _w in workers:
-            if getattr(_w, "outcome", None) != "DONE":
-                continue
-            _env = getattr(_w, "task_envelope", None)
-            _cid = getattr(_env, "campaign_id", "") or ""
-            _role = getattr(_env, "role", "") or ""
-            if not _cid or _role not in ("aggregator", "subtask"):
-                continue
-            if _role == "aggregator":
-                _mark = (_cid, "merge_done")
-                if _mark in _noted_done:
-                    continue
-                _noted_done.add(_mark)
-                _note_marker({"kind": "merge_done", "campaign_id": _cid})
-            else:
-                _idx = getattr(_w, "subtask_index", None)
-                _mark = (_cid, "child", _idx)
-                if _mark in _noted_done:
-                    continue
-                _noted_done.add(_mark)
-                _note_marker({"kind": "child_result", "campaign_id": _cid,
-                              "subtask_index": _idx, "outcome": "DONE",
-                              "result": ((getattr(_w, "display_result", "")
-                                          or getattr(_w, "last_response", "") or "")[:1200])})
+            _note_one_finished(_w)
 
     def _campaign_already_on_disk(cid):
         """Whether this campaign was split by an EARLIER run.
@@ -8784,6 +8810,57 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
 
     _spawn_children.grant = _grant_children
 
+    _stall_sweeps = {}
+    _stall_fired = set()
+
+    def _stall_check(_cid, _camp, _have_idx):
+        """Merge-queue stall detector. A family with fewer records than children, nothing still
+        running for it, where the done-map says every missing child is DONE, is waiting on
+        `child_result` lines that will never be written. After MERGE_STALL_SWEEPS such sweeps:
+        write the mechanism row, recover the answers from durable sources and re-queue (once)
+        those that cannot be recovered. Returns how many children were re-queued. Never raises;
+        never queues a merge (the normal path does, exactly once, when the records are whole).
+        A non-zero return means "work remains" to the sweep loop's condition."""
+        try:
+            if _cid in _stall_fired or not transcript_dir:
+                return 0
+            _sd = os.path.dirname(transcript_dir)
+            _fam = resume_mod.read_campaigns(_sd).get(_cid)
+            if not _fam:
+                return 0
+            _dm = resume_mod.read_done_map(_sd)
+            _missing = [c for c in (_fam.get("children") or [])
+                        if c.get("subtask_index") not in _have_idx]
+            if not _missing or not all(resume_mod._child_in_done_map(c, _dm) for c in _missing):
+                _stall_sweeps.pop(_cid, None)
+                return 0
+            _stall_sweeps[_cid] = _stall_sweeps.get(_cid, 0) + 1
+            if _stall_sweeps[_cid] < resume_mod.MERGE_STALL_SWEEPS:
+                return 1          # still counting: keeps the sweep loop alive for K passes
+            _stall_fired.add(_cid)
+            try:
+                _mt.record("merge_stalled_missing_child_result", run_id=run_id, triggered=True,
+                           executed=True,
+                           extra={"campaign_id": _cid, "n": _camp.get("n", 0),
+                                  "missing": [c.get("subtask_index") for c in _missing]})
+            except Exception:
+                pass
+            _fam["child_results"] = list(_camp.get("child_results") or [])
+            _rec, _req = resume_mod.recover_family_results(_sd, _cid, _fam, _dm,
+                                                           log=lambda m: print(m, flush=True),
+                                                           run_id=run_id)
+            _camp["child_results"] = list(_fam.get("child_results") or [])
+            _n = 0
+            for _c in _req:
+                _g, _ = resume_mod.child_requeue_goal(_cid, _fam, _c)
+                if _g:
+                    add_box.append(_g)
+                    _n += 1
+            # recovered answers make the family whole: the next pass merges it
+            return _n + len(_rec)
+        except Exception:
+            return 0
+
     def _queue_ready_merges():
         """Queue the merge for every family whose children have all finished. Count queued.
 
@@ -8821,14 +8898,21 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             # Every child ADMITTED must be finished, and all of them must have been admitted:
             # a family half of which is still queued is not a finished campaign, and merging
             # it would report a sweep that never ran as though it had.
+            _stalled = (len(_live_idx) < _camp.get("n", 0)
+                        and all(w.status in TERMINAL for w in _kids))
             if not fanout_mod.ready_to_aggregate(_recs):
+                if _stalled and not _kids:
+                    queued += _stall_check(_cid, _camp, _live_idx)
                 continue
             # Collapse a slice's failed attempt into the retry that finished it, THEN check
             # the family is complete -- a retry adds a record without adding a slice, so
             # counting raw records would let a family of eight look like nine.
             _recs = fanout_mod.collapse_retries(_recs)
             if len(_recs) < _camp.get("n", 0):
+                if _stalled:
+                    queued += _stall_check(_cid, _camp, _live_idx)
                 continue
+            _stall_sweeps.pop(_cid, None)
             # THE PARENT'S WORKING DIRECTORY GOES WITH IT. The children get it from
             # child_goals; the merge was starting wherever the fleet happened to be, while
             # being asked to write a combined file and report its path.
@@ -8889,7 +8973,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 else (min(effective_max_turns, UNVERIFIABLE_MAX_TURNS)
                       if effective_max_turns else UNVERIFIABLE_MAX_TURNS))
         effort_policy_mod.shadow_assign(goal_item, knobs, run_id=run_id, instance="w%d" % index)
-        return RelayWorker(goal_item, "w%d" % index, max_turns=_cap,
+        _nw = RelayWorker(goal_item, "w%d" % index, max_turns=_cap,
                            refuter=knobs["refuter"], max_refute=knobs["max_refute"],
                            plan_mode=plan_mode,
                            review_lenses=knobs["review_lenses"],
@@ -8901,6 +8985,9 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                            resilience_profile=resilience_profile,
                            max_fresh_replays=max_fresh_replays,
                            fanout=fanout, spawn_fn=_spawn_children)
+        # Durable at the moment of settling: see RelayWorker._settle_done.
+        _nw.on_settled_done = _note_one_finished
+        return _nw
 
     workers = [_worker_for(i, g) for i, g in enumerate(goals)]
     pending = list(workers)            # FIFO queue of not-yet-attached workers

@@ -81,7 +81,12 @@ MECHANISMS = ("fanout", "refuter", "panel", "veto", "retry", "bestofn", "skill",
               # A split reply whose list numbers were lost in transit, parsed from the plain
               # lines above SUBTASKS_READY (relay/fanout.py). One row per rescued split, so
               # the rate of this path is readable rather than inferred.
-              "fanout_unnumbered_fallback")
+              "fanout_unnumbered_fallback",
+              # A finished child whose answer was missing from the campaign ledger: recovered
+              # from a durable source or re-queued once, and the merge-queue stall detector
+              # that notices a family waiting forever on such a child.
+              "child_result_recovery",
+              "merge_stalled_missing_child_result")
 
 
 def patch_hash(text):
