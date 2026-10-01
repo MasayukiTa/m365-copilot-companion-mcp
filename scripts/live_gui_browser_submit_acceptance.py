@@ -29,6 +29,9 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 
+from relay.copilot_autopilot_relay import COPILOT_SELECTORS
+
+
 def judge_question_texts(question_texts: list[str], marker: str) -> dict:
     """Pure verdict for a *fresh* Copilot conversation's visible user-turn DOM."""
     texts = [str(t or "") for t in question_texts]
@@ -145,25 +148,44 @@ def _wait_page(contexts, conv_url: str, timeout_s: float):
     raise TimeoutError(f"M365 page for conversation {needle} did not appear within {timeout_s:.0f}s")
 
 
-def _wait_visible_questions(page, marker: str, timeout_s: float) -> tuple[list[str], dict]:
+def _wait_visible_questions(page, marker: str, timeout_s: float, settle_s: float = 2.0) -> tuple[list[str], dict]:
+    """Wait for marker visibility AND a stable user-turn list before judging duplicates.
+
+    Returning at the marker's first paint can miss a second user turn appended milliseconds later.
+    The acceptance therefore requires the normalized question snapshot to remain unchanged for a
+    short settle window. This is evidence collection only; it never sends or edits anything.
+    """
     deadline = time.time() + timeout_s
     last: list[str] = []
+    last_signature = None
+    stable_since = None
     while time.time() < deadline:
         try:
-            loc = page.locator('[data-testid="chatQuestion"]')
+            loc = page.locator(COPILOT_SELECTORS["user_msg"])
             last = [loc.nth(i).inner_text() for i in range(loc.count())]
             if any(marker in t for t in last):
-                composer = page.locator('#m365-chat-editor-target-element').first
-                composer_text = composer.inner_text() if composer.count() else ""
-                return last, {
-                    "assistant_count": page.locator('.fai-CopilotMessage').count(),
-                    "composer_len": len(composer_text or ""),
-                    "conversation_url": page.url,
-                }
+                signature = tuple(" ".join(str(t or "").split()) for t in last)
+                if signature != last_signature:
+                    last_signature = signature
+                    stable_since = time.time()
+                elif stable_since is not None and time.time() - stable_since >= max(0.0, settle_s):
+                    composer = page.locator(COPILOT_SELECTORS["composer"]).first
+                    composer_text = composer.inner_text() if composer.count() else ""
+                    return last, {
+                        "assistant_count": page.locator(COPILOT_SELECTORS["assistant_msg"]).count(),
+                        "composer_len": len(composer_text or ""),
+                        "conversation_url": page.url,
+                    }
+            else:
+                last_signature = None
+                stable_since = None
         except Exception:
             pass
         time.sleep(0.10)
-    raise TimeoutError(f"marker did not appear in visible chatQuestion DOM within {timeout_s:.0f}s; questions={len(last)}")
+    raise TimeoutError(
+        f"marker did not reach a stable visible user-turn snapshot within {timeout_s:.0f}s; "
+        f"questions={len(last)}"
+    )
 
 
 def _wait_terminal(state_dir: Path, marker: str, timeout_s: float) -> dict | None:

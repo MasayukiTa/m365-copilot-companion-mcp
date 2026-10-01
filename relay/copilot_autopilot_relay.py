@@ -1929,29 +1929,31 @@ class CopilotWebDriver:
             # right after a fresh page). POLL for the composer to empty instead of one
             # fixed 800ms check -- the short check was the real cause of the false
             # "Send button never submitted" failures (and the retry then double-typed).
-            # Window is generous (12s) because under memory pressure the M365 SPA can take
-            # many seconds to clear the composer; a too-short window both falsely fails AND
-            # causes the retry to double-send. Re-click the Send button each second in case
-            # it re-armed without submitting (a load-induced no-op click).
+            # For continuation turns the legacy 12s composer/answer settle window remains below.
+            # Fresh turns deliberately bypass its re-click behavior and wait only for a visible
+            # user-turn receipt, because an ambiguous first submit must never be retried blindly.
             _send_stage(_send_t0, "clicked", attempt=attempt)
-            for i in range(48):                  # up to ~12s
+            if fresh_conversation:
+                # ONE SUBMIT ACTION PER fresh send(). After a click/Enter there is no safe basis
+                # for a second click merely because the composer is slow to clear: attempt 1 may
+                # already have landed. Wait only for the response-independent USER-turn receipt.
+                # This closes the duplicate window where attempt 2 could resend an already-landed
+                # first turn. A missing/mismatched receipt is ambiguous and therefore fail-closed.
+                if self._wait_fresh_user_receipt(one_line, user_count_before):
+                    return
+                self._snapshot_send_failure(
+                    attempt=attempt, phase="fresh_user_turn_receipt_mismatch",
+                    allow_answer_content=track_answer,
+                )
+                raise RuntimeError(
+                    "send failed: fresh submit has no single matching user-turn receipt; "
+                    "refusing to retry an ambiguous first delivery"
+                )
+
+            for i in range(48):                  # continuation turn, up to ~12s
                 self.page.wait_for_timeout(250)
                 if not self._composer_text():
-                    # On a fresh agent page the composer can be cleared by an SPA reset even
-                    # though no message was submitted.  Require a response-independent receipt:
-                    # a conversation URL, a live generation control, or a new response block.
-                    if not fresh_conversation:
-                        return
-                    if self._wait_fresh_user_receipt(one_line, user_count_before):
-                        return
-                    self._snapshot_send_failure(
-                        attempt=attempt, phase="fresh_user_turn_receipt_mismatch",
-                        allow_answer_content=track_answer,
-                    )
-                    raise RuntimeError(
-                        "send failed: fresh composer cleared but the intended user turn was "
-                        "not the one visible in chatQuestion"
-                    )
+                    return
                 # STRONGER success signal: if a new answer block has appeared, the agent
                 # is already replying, so the send DID go through -- even if the composer
                 # is slow to visually clear under memory pressure. Without this, a laggy

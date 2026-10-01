@@ -72,6 +72,38 @@ def test_fresh_receipt_requires_one_new_marker_bearing_user_turn_not_url_or_gene
     assert 'user_count_before = len(self._visible_user_questions())' in send
     assert 'self._stabilize_fresh_composer(composer, one_line)' in send
     assert 'self._wait_fresh_user_receipt(one_line, user_count_before' in send
-    # Fresh success must not return merely because the URL changed or Stop/generating appeared.
-    fresh = send[send.index('if not fresh_conversation:'):]
-    assert 'if "/conversation/" in current_url.lower() or self._is_generating():\n                            return' not in fresh
+    # Fresh success must branch directly to its USER-turn receipt before the continuation
+    # retry/re-click loop; URL/generation alone is never a fresh success signal.
+    fresh_i = send.index('if fresh_conversation:', send.index('_send_stage(_send_t0, "clicked"'))
+    continuation_i = send.index('for i in range(48)', fresh_i)
+    fresh = send[fresh_i:continuation_i]
+    assert '_wait_fresh_user_receipt(one_line, user_count_before)' in fresh
+    assert '/conversation/' not in fresh and '_is_generating()' not in fresh
+
+
+class _Button:
+    def __init__(self):
+        self.clicks = 0
+    def click(self, **kwargs):
+        self.clicks += 1
+
+
+def test_fresh_send_never_clicks_twice_while_waiting_for_its_user_turn_receipt(monkeypatch):
+    page = _Page()
+    page.url = "https://m365.cloud.microsoft/chat/agent/test"
+    driver = relay.CopilotWebDriver(page)
+    composer = _Composer()
+    button = _Button()
+    monkeypatch.setattr(relay, "_page_network_available", lambda p: True)
+    monkeypatch.setattr(driver, "_page_alive", lambda: True)
+    monkeypatch.setattr(page, "locator", lambda selector: type("L", (), {"first": composer})(), raising=False)
+    monkeypatch.setattr(driver, "_send_button", lambda: button)
+    monkeypatch.setattr(driver, "_wait_send_armed", lambda timeout_s: True)
+    monkeypatch.setattr(driver, "_composer_text", lambda: "fresh goal")  # deliberately NEVER clears
+    monkeypatch.setattr(driver, "_stabilize_fresh_composer", lambda *a, **k: True)
+    monkeypatch.setattr(driver, "_visible_user_questions", lambda: [])
+    monkeypatch.setattr(driver, "_wait_fresh_user_receipt", lambda *a, **k: True)
+    monkeypatch.setattr(driver, "_snapshot_send_failure", lambda *a, **k: None)
+
+    driver.send("fresh goal", track_answer=False)
+    assert button.clicks == 1, "fresh delivery receipt must terminate the send before any retry click"
