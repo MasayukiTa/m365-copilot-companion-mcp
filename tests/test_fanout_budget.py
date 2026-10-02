@@ -379,7 +379,9 @@ def test_the_shipped_view_has_no_wpf():
 
 def test_the_cockpit_has_the_four_boxes_persisted_through_savekey_only():
     src = _read("ui", "FleetCockpit.cs")
-    assert "ctrls.Children.Add(FanoutBudgetControl());" in src
+    # lives in the gear popup (BuildSettingsPanel), NOT in the header
+    assert "col.Children.Add(FanoutBudgetControl());" in src
+    assert "ctrls.Children.Add(FanoutBudgetControl());" not in src
     for key in ("fanout_max_total", "fanout_max_active", "fanout_max_turns", "fanout_max_wall_min"):
         assert len(re.findall(r'SaveKey\("%s", s\)' % key, src)) == 1, key
         assert re.search(r'case "%s":' % key, src), key           # the timing switch names it

@@ -58,7 +58,9 @@ def test_no_layer_offers_an_enforcing_value():
 
 def test_the_cockpit_loads_persists_paints_and_does_not_refire():
     src = _read("ui", "FleetCockpit.cs")
-    assert "WriteScopeControl()" in src and "ctrls.Children.Add(WriteScopeControl());" in src
+    # lives in the gear popup (BuildSettingsPanel), NOT in the header
+    assert "WriteScopeControl()" in src and "col.Children.Add(WriteScopeControl());" in src
+    assert "ctrls.Children.Add(WriteScopeControl());" not in src
     assert "WriteScopeView.ParseLine(ln)" in src                    # settings load
     assert "SaveKey(WriteScopeView.Key, _wsVal)" in src             # persist, SaveKey only
     m = re.search(r"void PaintWriteScope\(\).*?\n    }\n", src, re.S)

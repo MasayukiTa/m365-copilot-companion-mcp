@@ -2016,13 +2016,10 @@ class CockpitWindow : Window
         PaintWorkerChipBorder(_workerChipBorder);
         ctrls.Children.Add(_workerChipBorder);
 
+        // HEADER CONTROL SET IS PINNED by relay/test_cockpit_header_controls.py. Do NOT add a
+        // control here: new settings belong in the gear popup (BuildSettingsPanel), in the
+        // "Fan-out" / "Effort" sections or a new section of their own.
         ctrls.Children.Add(EffortControl());
-        ctrls.Children.Add(EffortPolicyControl());
-        ctrls.Children.Add(FanoutControl());
-        ctrls.Children.Add(FanoutDepthControl());
-        ctrls.Children.Add(HierarchicalMergeControl());
-        ctrls.Children.Add(WriteScopeControl());
-        ctrls.Children.Add(FanoutBudgetControl());
         ctrls.Children.Add(ApprovalControl());
         ctrls.Children.Add(ApprovalCenterControl());
         ctrls.Children.Add(FleetControls());
@@ -8300,6 +8297,26 @@ class CockpitWindow : Window
         policyNote.Margin = new Thickness(0, 2, 0, 2);
         col.Children.Add(policyNote);
 
+        // ── Effort policy. The effort level itself stays in the header; the policy that may
+        // adjust it per worker (off|shadow|on) lives here, with the runner's "in effect" line.
+        col.Children.Add(SectionHeader(L("推論", "Effort")));
+        col.Children.Add(EffortPolicyControl());
+
+        // ── Fan-out / 分割: every fan-out control in ONE section. They used to sit in the cockpit
+        // header (one slice added one control each) and crowded it out; new fan-out settings
+        // go here, not in the header (relay/test_cockpit_header_controls.py pins the header).
+        col.Children.Add(SectionHeader(L("分割 / Fan-out", "Fan-out")));
+        col.Children.Add(FanoutControl());
+        col.Children.Add(FanoutDepthControl());
+        col.Children.Add(HierarchicalMergeControl());
+        col.Children.Add(WriteScopeControl());
+        col.Children.Add(FanoutBudgetControl());
+        // the controls' Paint* run on every build, but fill the "in effect" lines from the
+        // latest status.json too, so a freshly opened popup is never blank until the next tick
+        PaintEffortPolicyInEffect(_lastRoot); PaintFanoutInEffect(_lastRoot);
+        PaintFanoutBudgetInEffect(_lastRoot); PaintFanoutDepthInEffect(_lastRoot);
+        PaintHierarchicalMergeInEffect(_lastRoot); PaintWriteScopeInEffect(_lastRoot);
+
         // THE RE-UNLOCK CONTROL WAS REMOVED HERE, DELIBERATELY, AND MUST NOT COME BACK.
         //
         // It was a worker-name box and a "send re-unlock" button, for the case its own tooltip
@@ -9102,14 +9119,29 @@ class CockpitWindow : Window
     // MCP_EFFORT_POLICY itself; what is REALLY in effect is what the runner reports in
     // status.json (see PaintEffortPolicyInEffect), and an inherited env override is shown as a
     // conflict. All wording/parsing lives in the WPF-free EffortPolicy.cs.
+    // Layout shared by the combo rows that live in the gear popup (effort policy, fan-out, depth,
+    // hierarchical merge, write scope): label left / combo right, and the runner's "in effect" and
+    // "pending" lines wrapped underneath as the row's secondary text.
+    UIElement SettingsComboBlock(TextBlock lbl, ComboBox box, TextBlock now, TextBlock pending)
+    {
+        var wrap = new StackPanel(); wrap.Orientation = Orientation.Vertical;
+        wrap.Margin = new Thickness(0, 4, 0, 4);
+        var row = new DockPanel(); row.LastChildFill = false;
+        DockPanel.SetDock(box, Dock.Right); row.Children.Add(box);
+        lbl.Margin = new Thickness(0, 0, 8, 0);
+        DockPanel.SetDock(lbl, Dock.Left); row.Children.Add(lbl);
+        wrap.Children.Add(row);
+        foreach (TextBlock t in new[] { now, pending })
+        {
+            t.Margin = new Thickness(0, 2, 0, 0); t.MaxWidth = 300; t.TextWrapping = TextWrapping.Wrap;
+            wrap.Children.Add(t);
+        }
+        return wrap;
+    }
     UIElement EffortPolicyControl()
     {
-        var wrap = new StackPanel(); wrap.Orientation = Orientation.Horizontal;
-        wrap.VerticalAlignment = VerticalAlignment.Center; wrap.Margin = new Thickness(0, 0, 12, 0);
-
         _effortPolicyLbl = new TextBlock(); _effortPolicyLbl.VerticalAlignment = VerticalAlignment.Center;
-        _effortPolicyLbl.FontSize = 12; _effortPolicyLbl.Margin = new Thickness(0, 0, 8, 0);
-        wrap.Children.Add(_effortPolicyLbl);
+        _effortPolicyLbl.FontSize = 12;
 
         _effortPolicyBox = new ComboBox();
         _effortPolicyBox.ToolTip = EffortPolicyView.Help(_lang == 0) + "\n" + EffortPolicyView.TakeEffectTip(_lang == 0);
@@ -9120,7 +9152,7 @@ class CockpitWindow : Window
         var epHelp = new Dictionary<string, string>();
         foreach (string m in EffortPolicyView.Modes) epHelp[m] = EffortPolicyView.ModeLabel(m, _lang == 0);
         FillComboWithHelp(_effortPolicyBox, EffortPolicyView.Modes, epHelp, _effortPolicy);
-        _effortPolicyBox.DropDownOpened += delegate { CloseHeaderPopups("effort"); };
+        _effortPolicyBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
         _effortPolicyBox.SelectionChanged += delegate
         {
             string sel = ComboVal(_effortPolicyBox);
@@ -9129,17 +9161,14 @@ class CockpitWindow : Window
             SaveKey(EffortPolicyView.Key, _effortPolicy);
             PaintEffortPolicyInEffect(_lastRoot);
         };
-        wrap.Children.Add(_effortPolicyBox);
 
         _effortPolicyNow = new TextBlock(); _effortPolicyNow.VerticalAlignment = VerticalAlignment.Center;
-        _effortPolicyNow.FontSize = 11.5; _effortPolicyNow.Margin = new Thickness(8, 0, 0, 0);
-        wrap.Children.Add(_effortPolicyNow);
+        _effortPolicyNow.FontSize = 11.5;
         _effortPolicyWarn = new TextBlock(); _effortPolicyWarn.VerticalAlignment = VerticalAlignment.Center;
         _effortPolicyWarn.FontSize = 11.5; _effortPolicyWarn.FontWeight = FontWeights.SemiBold;
-        _effortPolicyWarn.Margin = new Thickness(8, 0, 0, 0);
         _effortPolicyWarn.Visibility = Visibility.Collapsed;
-        wrap.Children.Add(_effortPolicyWarn);
 
+        var wrap = SettingsComboBlock(_effortPolicyLbl, _effortPolicyBox, _effortPolicyNow, _effortPolicyWarn);
         PaintEffortPolicy();
         return wrap;
     }
@@ -9182,12 +9211,8 @@ class CockpitWindow : Window
     // status.json "fanout_run" (PaintFanoutInEffect); its words live in FanoutView (EffortPolicy.cs).
     UIElement FanoutControl()
     {
-        var wrap = new StackPanel(); wrap.Orientation = Orientation.Horizontal;
-        wrap.VerticalAlignment = VerticalAlignment.Center; wrap.Margin = new Thickness(0, 0, 12, 0);
-
         _fanoutLbl = new TextBlock(); _fanoutLbl.VerticalAlignment = VerticalAlignment.Center;
-        _fanoutLbl.FontSize = 12; _fanoutLbl.Margin = new Thickness(0, 0, 8, 0);
-        wrap.Children.Add(_fanoutLbl);
+        _fanoutLbl.FontSize = 12;
 
         _fanoutBox = new ComboBox();
         _fanoutBox.ToolTip = FanoutView.Help(_lang == 0) + "\n" + FanoutView.TakeEffectTip(_lang == 0);
@@ -9198,7 +9223,7 @@ class CockpitWindow : Window
         var foHelp = new Dictionary<string, string>();
         foreach (string m in FanoutView.Modes) foHelp[m] = FanoutView.ModeLabel(m, _lang == 0);
         FillComboWithHelp(_fanoutBox, FanoutView.Modes, foHelp, FanoutView.Token(_fanout));
-        _fanoutBox.DropDownOpened += delegate { CloseHeaderPopups("effort"); };
+        _fanoutBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
         _fanoutBox.SelectionChanged += delegate
         {
             string sel = ComboVal(_fanoutBox);
@@ -9207,17 +9232,14 @@ class CockpitWindow : Window
             SaveKey("fanout", _fanout ? "on" : "off");
             PaintFanoutInEffect(_lastRoot);
         };
-        wrap.Children.Add(_fanoutBox);
 
         _fanoutNow = new TextBlock(); _fanoutNow.VerticalAlignment = VerticalAlignment.Center;
-        _fanoutNow.FontSize = 11.5; _fanoutNow.Margin = new Thickness(8, 0, 0, 0);
-        wrap.Children.Add(_fanoutNow);
+        _fanoutNow.FontSize = 11.5;
         _fanoutPending = new TextBlock(); _fanoutPending.VerticalAlignment = VerticalAlignment.Center;
         _fanoutPending.FontSize = 11.5; _fanoutPending.FontWeight = FontWeights.SemiBold;
-        _fanoutPending.Margin = new Thickness(8, 0, 0, 0);
         _fanoutPending.Visibility = Visibility.Collapsed;
-        wrap.Children.Add(_fanoutPending);
 
+        var wrap = SettingsComboBlock(_fanoutLbl, _fanoutBox, _fanoutNow, _fanoutPending);
         PaintFanout();
         return wrap;
     }
@@ -9265,22 +9287,31 @@ class CockpitWindow : Window
     // the words, bounds and parsing live in FanoutBudgetView (EffortPolicy.cs).
     UIElement FanoutBudgetControl()
     {
-        var wrap = new StackPanel(); wrap.Orientation = Orientation.Horizontal;
-        wrap.VerticalAlignment = VerticalAlignment.Center; wrap.Margin = new Thickness(0, 0, 12, 0);
+        // popup layout: the group label, then ONE compact row of four cells (caption over box)
+        var wrap = new StackPanel(); wrap.Orientation = Orientation.Vertical;
+        wrap.Margin = new Thickness(0, 4, 0, 4);
 
         _fbLbl = new TextBlock(); _fbLbl.VerticalAlignment = VerticalAlignment.Center;
-        _fbLbl.FontSize = 12; _fbLbl.Margin = new Thickness(0, 0, 8, 0);
+        _fbLbl.FontSize = 12; _fbLbl.Margin = new Thickness(0, 0, 0, 2);
         wrap.Children.Add(_fbLbl);
+
+        var grid = new Grid();
+        for (int c = 0; c < 4; c++) grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        wrap.Children.Add(grid);
 
         for (int i = 0; i < 4; i++)
         {
             int idx = i;
+            var cell = new StackPanel(); cell.Orientation = Orientation.Vertical;
+            cell.Margin = new Thickness(i == 0 ? 0 : 6, 0, 0, 0);
+            Grid.SetColumn(cell, i); grid.Children.Add(cell);
+
             _fbCap[i] = new TextBlock(); _fbCap[i].VerticalAlignment = VerticalAlignment.Center;
-            _fbCap[i].FontSize = 11.5; _fbCap[i].Margin = new Thickness(i == 0 ? 0 : 8, 0, 3, 0);
-            wrap.Children.Add(_fbCap[i]);
+            _fbCap[i].FontSize = 11.5; _fbCap[i].Margin = new Thickness(0, 0, 0, 2);
+            cell.Children.Add(_fbCap[i]);
 
             var tb = new TextBox();
-            tb.Width = 52; tb.FontSize = 12; tb.Padding = new Thickness(4, 2, 4, 2);
+            tb.HorizontalAlignment = HorizontalAlignment.Stretch; tb.FontSize = 12; tb.Padding = new Thickness(4, 2, 4, 2);
             tb.VerticalAlignment = VerticalAlignment.Center;
             tb.HorizontalContentAlignment = HorizontalAlignment.Right;
             tb.MaxLength = 7;
@@ -9291,15 +9322,17 @@ class CockpitWindow : Window
                 if (e.Key == Key.Enter) { CommitFanoutBudget(idx); e.Handled = true; }
             };
             _fbBox[i] = tb;
-            wrap.Children.Add(tb);
+            cell.Children.Add(tb);
         }
 
         _fbNow = new TextBlock(); _fbNow.VerticalAlignment = VerticalAlignment.Center;
-        _fbNow.FontSize = 11.5; _fbNow.Margin = new Thickness(8, 0, 0, 0);
+        _fbNow.FontSize = 11.5; _fbNow.Margin = new Thickness(0, 2, 0, 0);
+        _fbNow.MaxWidth = 300; _fbNow.TextWrapping = TextWrapping.Wrap;
         wrap.Children.Add(_fbNow);
         _fbPending = new TextBlock(); _fbPending.VerticalAlignment = VerticalAlignment.Center;
         _fbPending.FontSize = 11.5; _fbPending.FontWeight = FontWeights.SemiBold;
-        _fbPending.Margin = new Thickness(8, 0, 0, 0);
+        _fbPending.Margin = new Thickness(0, 2, 0, 0);
+        _fbPending.MaxWidth = 300; _fbPending.TextWrapping = TextWrapping.Wrap;
         _fbPending.Visibility = Visibility.Collapsed;
         wrap.Children.Add(_fbPending);
 
@@ -9386,12 +9419,8 @@ class CockpitWindow : Window
     // is not applying; the words and parsing live in FanoutDepthView (EffortPolicy.cs).
     UIElement FanoutDepthControl()
     {
-        var wrap = new StackPanel(); wrap.Orientation = Orientation.Horizontal;
-        wrap.VerticalAlignment = VerticalAlignment.Center; wrap.Margin = new Thickness(0, 0, 12, 0);
-
         _fdLbl = new TextBlock(); _fdLbl.VerticalAlignment = VerticalAlignment.Center;
-        _fdLbl.FontSize = 12; _fdLbl.Margin = new Thickness(0, 0, 8, 0);
-        wrap.Children.Add(_fdLbl);
+        _fdLbl.FontSize = 12;
 
         _fdBox = new ComboBox();
         _fdBox.ToolTip = FanoutDepthView.Help(_lang == 0) + "\n" + FanoutDepthView.TakeEffectTip(_lang == 0);
@@ -9402,7 +9431,7 @@ class CockpitWindow : Window
         var fdHelp = new Dictionary<string, string>();
         foreach (string m in FanoutDepthView.Modes) fdHelp[m] = FanoutDepthView.ModeLabel(m, _lang == 0);
         FillComboWithHelp(_fdBox, FanoutDepthView.Modes, fdHelp, _fdVal.ToString());
-        _fdBox.DropDownOpened += delegate { CloseHeaderPopups("effort"); };
+        _fdBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
         _fdBox.SelectionChanged += delegate
         {
             int sel;
@@ -9413,17 +9442,14 @@ class CockpitWindow : Window
             SaveKey("fanout_max_depth", sel.ToString(System.Globalization.CultureInfo.InvariantCulture));
             PaintFanoutDepthInEffect(_lastRoot);
         };
-        wrap.Children.Add(_fdBox);
 
         _fdNow = new TextBlock(); _fdNow.VerticalAlignment = VerticalAlignment.Center;
-        _fdNow.FontSize = 11.5; _fdNow.Margin = new Thickness(8, 0, 0, 0);
-        wrap.Children.Add(_fdNow);
+        _fdNow.FontSize = 11.5;
         _fdPending = new TextBlock(); _fdPending.VerticalAlignment = VerticalAlignment.Center;
         _fdPending.FontSize = 11.5; _fdPending.FontWeight = FontWeights.SemiBold;
-        _fdPending.Margin = new Thickness(8, 0, 0, 0);
         _fdPending.Visibility = Visibility.Collapsed;
-        wrap.Children.Add(_fdPending);
 
+        var wrap = SettingsComboBlock(_fdLbl, _fdBox, _fdNow, _fdPending);
         PaintFanoutDepth();
         return wrap;
     }
@@ -9465,12 +9491,8 @@ class CockpitWindow : Window
     // words and parsing live in HierarchicalMergeView (EffortPolicy.cs).
     UIElement HierarchicalMergeControl()
     {
-        var wrap = new StackPanel(); wrap.Orientation = Orientation.Horizontal;
-        wrap.VerticalAlignment = VerticalAlignment.Center; wrap.Margin = new Thickness(0, 0, 12, 0);
-
         _hmLbl = new TextBlock(); _hmLbl.VerticalAlignment = VerticalAlignment.Center;
-        _hmLbl.FontSize = 12; _hmLbl.Margin = new Thickness(0, 0, 8, 0);
-        wrap.Children.Add(_hmLbl);
+        _hmLbl.FontSize = 12;
 
         _hmBox = new ComboBox();
         _hmBox.ToolTip = HierarchicalMergeView.Help(_lang == 0) + "\n" + HierarchicalMergeView.TakeEffectTip(_lang == 0);
@@ -9481,7 +9503,7 @@ class CockpitWindow : Window
         var hmHelp = new Dictionary<string, string>();
         foreach (string m in HierarchicalMergeView.Modes) hmHelp[m] = HierarchicalMergeView.ModeLabel(m, _lang == 0);
         FillComboWithHelp(_hmBox, HierarchicalMergeView.Modes, hmHelp, _hmVal);
-        _hmBox.DropDownOpened += delegate { CloseHeaderPopups("effort"); };
+        _hmBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
         _hmBox.SelectionChanged += delegate
         {
             string sel = ComboVal(_hmBox);
@@ -9490,17 +9512,14 @@ class CockpitWindow : Window
             SaveKey(HierarchicalMergeView.Key, _hmVal);
             PaintHierarchicalMergeInEffect(_lastRoot);
         };
-        wrap.Children.Add(_hmBox);
 
         _hmNow = new TextBlock(); _hmNow.VerticalAlignment = VerticalAlignment.Center;
-        _hmNow.FontSize = 11.5; _hmNow.Margin = new Thickness(8, 0, 0, 0);
-        wrap.Children.Add(_hmNow);
+        _hmNow.FontSize = 11.5;
         _hmPending = new TextBlock(); _hmPending.VerticalAlignment = VerticalAlignment.Center;
         _hmPending.FontSize = 11.5; _hmPending.FontWeight = FontWeights.SemiBold;
-        _hmPending.Margin = new Thickness(8, 0, 0, 0);
         _hmPending.Visibility = Visibility.Collapsed;
-        wrap.Children.Add(_hmPending);
 
+        var wrap = SettingsComboBlock(_hmLbl, _hmBox, _hmNow, _hmPending);
         PaintHierarchicalMerge();
         return wrap;
     }
@@ -9542,12 +9561,8 @@ class CockpitWindow : Window
     // from status.json "fanout_write_scope"; the words and parsing live in WriteScopeView.
     UIElement WriteScopeControl()
     {
-        var wrap = new StackPanel(); wrap.Orientation = Orientation.Horizontal;
-        wrap.VerticalAlignment = VerticalAlignment.Center; wrap.Margin = new Thickness(0, 0, 12, 0);
-
         _wsLbl = new TextBlock(); _wsLbl.VerticalAlignment = VerticalAlignment.Center;
-        _wsLbl.FontSize = 12; _wsLbl.Margin = new Thickness(0, 0, 8, 0);
-        wrap.Children.Add(_wsLbl);
+        _wsLbl.FontSize = 12;
 
         _wsBox = new ComboBox();
         _wsBox.ToolTip = WriteScopeView.Help(_lang == 0) + "\n" + WriteScopeView.TakeEffectTip(_lang == 0);
@@ -9558,7 +9573,7 @@ class CockpitWindow : Window
         var wsHelp = new Dictionary<string, string>();
         foreach (string m in WriteScopeView.Modes) wsHelp[m] = WriteScopeView.ModeLabel(m, _lang == 0);
         FillComboWithHelp(_wsBox, WriteScopeView.Modes, wsHelp, _wsVal);
-        _wsBox.DropDownOpened += delegate { CloseHeaderPopups("effort"); };
+        _wsBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
         _wsBox.SelectionChanged += delegate
         {
             string sel = ComboVal(_wsBox);
@@ -9567,17 +9582,14 @@ class CockpitWindow : Window
             SaveKey(WriteScopeView.Key, _wsVal);
             PaintWriteScopeInEffect(_lastRoot);
         };
-        wrap.Children.Add(_wsBox);
 
         _wsNow = new TextBlock(); _wsNow.VerticalAlignment = VerticalAlignment.Center;
-        _wsNow.FontSize = 11.5; _wsNow.Margin = new Thickness(8, 0, 0, 0);
-        wrap.Children.Add(_wsNow);
+        _wsNow.FontSize = 11.5;
         _wsPending = new TextBlock(); _wsPending.VerticalAlignment = VerticalAlignment.Center;
         _wsPending.FontSize = 11.5; _wsPending.FontWeight = FontWeights.SemiBold;
-        _wsPending.Margin = new Thickness(8, 0, 0, 0);
         _wsPending.Visibility = Visibility.Collapsed;
-        wrap.Children.Add(_wsPending);
 
+        var wrap = SettingsComboBlock(_wsLbl, _wsBox, _wsNow, _wsPending);
         PaintWriteScope();
         return wrap;
     }
@@ -11513,6 +11525,13 @@ class CockpitWindow : Window
                     bool d0 = _dark; int l0 = _lang; double s0 = _uiScale;
                     bool a0 = _uiAuto; double t0 = _scaleTarget;
                     LoadSettings();
+                    // The fan-out / effort-policy controls live in the gear popup, which may not
+                    // exist yet (every Paint* is null-safe) and is rebuilt on each open. Repaint
+                    // whatever is there so an external settings.txt edit shows without reopening.
+                    // Paint* only assigns when different, so SelectionChanged does not re-fire.
+                    PaintEffort();
+                    PaintEffortPolicy();
+                    PaintFanout();
                     if (d0 != _dark) { ApplyThemeBrushes(); PaintChrome(); _lastSig = ""; }
                     else if (l0 != _lang) { RebuildChrome(); }
                     // External ui_scale edit (e.g. the chat app zoomed / switched to auto): apply it live
