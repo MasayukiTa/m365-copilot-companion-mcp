@@ -21,6 +21,7 @@ if REPO not in sys.path:
 
 from relay import fanout as fo               # noqa: E402
 from relay import fleet_runner as FR         # noqa: E402
+from tools import childproc                  # noqa: E402
 from tools import settings_keys as SK        # noqa: E402
 
 KEY = "fanout_hierarchical_merge"
@@ -105,9 +106,7 @@ def test_the_default_is_off_everywhere_and_no_code_seeds_it_on():
     assert re.search(r'public const string Default = "off";', cs[cs.index("class HierarchicalMergeView"):])
     pat = re.compile(r"""["']fanout_hierarchical_merge\s*=\s*on""", re.I)
     bad = []
-    import subprocess
-    out = subprocess.run(["git", "ls-files"], cwd=REPO, stdout=subprocess.PIPE,
-                         universal_newlines=True, check=True).stdout
+    out = childproc.run(["git", "ls-files"], cwd=REPO, check=True).stdout
     for rel in out.splitlines():
         if not rel.endswith((".ps1", ".bat", ".cmd", ".cs", ".py", ".txt", ".example", ".template")):
             continue
