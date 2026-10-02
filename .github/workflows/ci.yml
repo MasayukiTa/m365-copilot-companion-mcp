@@ -557,6 +557,8 @@ jobs:
             tests/test_fanout_default_on_agrees.py \
             tests/test_fanout_write_scope_agrees.py \
             tests/test_fanout_budget.py \
+            tests/test_fanout_budget_large_ledger.py \
+            tests/test_campaigns_ledger_retention.py \
             tests/test_stuck_worker_retried_once.py \
             tests/test_task_tree.py \
             tests/test_ledger_compile.py \

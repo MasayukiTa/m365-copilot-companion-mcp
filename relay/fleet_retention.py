@@ -1032,6 +1032,33 @@ def conversations(fleet_dir, now=None, dry_run=False, keep_hours=None):
         os.replace(tmp, path)
     return max(0, before - (_size(path) if not dry_run else 0)), dropped
 
+#: campaigns.jsonl is NOT compacted here. Resume (relay/fleet_resume.py) and campaigns_from_ledger
+#: (relay/fanout.py) read it for unfinished families, and cap_jsonl's tail cut at 64 MB is the only
+#: bound. Moving finished families to campaigns.jsonl.1 is specified in
+#: tests/test_campaigns_ledger_retention.py and not built: it must prove a family is finished
+#: (merge_done) and referenced by no interrupted-run snapshot or live worker, and that proof is
+#: its own slice. Until then the ledger is READ in a way that does not depend on its size
+#: (relay/fanout_budget.py) and this warning makes the growth visible.
+CAMPAIGNS_WARN_MB = float(os.environ.get("MCP_FLEET_CAMPAIGNS_WARN_MB", "8"))
+
+
+def campaigns_ledger_warning(fleet_dir, dry_run=False, warn_mb=None):
+    """Write one `campaigns_ledger_large` mechanism row when campaigns.jsonl is past the warning
+    size. Returns the size in bytes when it warned, else 0. Never raises, never modifies the file."""
+    warn_mb = CAMPAIGNS_WARN_MB if warn_mb is None else warn_mb
+    size = _size(os.path.join(fleet_dir, "campaigns.jsonl"))
+    if size <= int(warn_mb * 1048576):
+        return 0
+    if not dry_run:
+        try:
+            from relay import mechanism_telemetry as _mt
+            _mt.record("campaigns_ledger_large", configured=True, eligible=True, triggered=True,
+                       extra={"bytes": size, "warn_mb": warn_mb})
+        except Exception:
+            pass
+    return size
+
+
 def apply(fleet_dir=None, now=None, dry_run=False):
     """Run every rule. Returns a report; never raises."""
     fleet_dir = fleet_dir or os.path.join(
@@ -1068,6 +1095,11 @@ def apply(fleet_dir=None, now=None, dry_run=False):
                               "freed_bytes": freed, "count": len(items)}
         rep["freed_bytes"] += freed
     rep["freed_mb"] = round(rep["freed_bytes"] / 1048576.0, 1)
+    try:
+        rep["campaigns_ledger_bytes_over_warning"] = campaigns_ledger_warning(
+            fleet_dir, dry_run=dry_run)
+    except Exception:
+        pass
     return rep
 
 
