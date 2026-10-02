@@ -101,6 +101,11 @@ def _reader_fanout_depth():
     return configured_max_depth()
 
 
+def _reader_hierarchical_merge():
+    from relay.fanout import hierarchical_merge_setting
+    return hierarchical_merge_setting()
+
+
 def _reader_write_scope():
     from relay.write_scope import mode
     return mode()
@@ -124,6 +129,7 @@ _LIVE_READERS = {
     "rate_ceiling_rpm": (_reader_rate, "40", "90"),
     "effort_policy": (_reader_effort_policy, "shadow", "on"),
     "fanout_max_depth": (_reader_fanout_depth, "2", "3"),
+    "fanout_hierarchical_merge": (_reader_hierarchical_merge, "on", "off"),
     "fanout_write_scope": (_reader_write_scope, "shadow", "off"),
     "fanout_max_total": (_fanout_limit_reader("total"), "10", "30"),
     "fanout_max_active": (_fanout_limit_reader("active"), "2", "6"),
