@@ -105,12 +105,15 @@ def test_the_setting_is_declared_and_clamped(monkeypatch):
 def test_the_report_says_why_the_effective_depth_is_lower(monkeypatch):
     _set_depth(monkeypatch, 3)
     assert fo.depth_report() == {"configured": 3, "effective": 1,
-                                 "reason": "hierarchical merge not enabled yet"}
+                                 "reason": "hierarchical merge setting is off",
+                                 "hierarchical_merge": "off"}
     _set_depth(monkeypatch, 1)
-    assert fo.depth_report() == {"configured": 1, "effective": 1, "reason": ""}
+    assert fo.depth_report() == {"configured": 1, "effective": 1, "reason": "",
+                                 "hierarchical_merge": "off"}
     monkeypatch.setattr(fo, "HIERARCHICAL_MERGE_READY", True)
     _set_depth(monkeypatch, 3)
-    assert fo.depth_report() == {"configured": 3, "effective": 3, "reason": ""}
+    assert fo.depth_report() == {"configured": 3, "effective": 3, "reason": "",
+                                 "hierarchical_merge": "on"}
 
 
 def test_the_snapshot_carries_the_report(monkeypatch):
