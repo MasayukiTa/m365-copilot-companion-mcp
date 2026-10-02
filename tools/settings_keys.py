@@ -171,6 +171,12 @@ KEYS = OrderedDict([
        "splits. The value reported as in effect (status.json fanout_depth) can be lower than "
        "the setting while the merge of nested splits is not enabled."),
 
+    _k("fanout_hierarchical_merge", EACH_GATE, "off",
+       "relay/fanout.py:hierarchical_merge_setting (every split decision)",
+       "off|on. on lets fanout_max_depth above 1 take effect; off caps the depth at 1 whatever "
+       "fanout_max_depth says. Keep it off until nested merging has been verified with small "
+       "goals. Re-read at each split with no restart; trees already split keep going."),
+
     _k("autoretry", SWEEP_START, 1,
        "relay/fleet_runner.py:settings_autoretry (once, before the sweep)",
        "Takes effect on the NEXT run."),

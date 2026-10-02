@@ -371,7 +371,7 @@ public static class FanoutDepthView
         {
             s += ja ? " (設定 " + configured + " はまだ有効ではありません" : " (setting " + configured + " is not active";
             if (!string.IsNullOrEmpty(reason))
-                s += ja ? ": 入れ子の統合が未対応" : ": " + reason;
+                s += ja ? ": 入れ子統合の設定がオフ" : ": " + reason;
             s += ")";
         }
         return s;
@@ -382,6 +382,70 @@ public static class FanoutDepthView
     public static string PendingText(int configured, int selected, bool ja)
     {
         if (configured == selected) return null;
+        return ja ? "選択は次の分割から反映" : "selection applies from the next split";
+    }
+}
+
+// The hierarchical-merge switch's words and parsing, WPF-free (same file as FanoutDepthView).
+// The Python side decides: relay/fanout.py reads `fanout_hierarchical_merge` at every split and,
+// only while it is on, lets `fanout_max_depth` above 1 take effect; relay/fleet_runner.py exports
+// the state in force as status.json "fanout_depth".hierarchical_merge. Default off.
+public static class HierarchicalMergeView
+{
+    //: must equal tools/settings_keys.py and relay/fanout.py HIERARCHICAL_SETTING_KEY / _DEFAULT
+    //: (tests/test_hierarchical_merge_setting.py compares them).
+    public const string Key = "fanout_hierarchical_merge";
+    public const string Default = "off";
+
+    public static readonly string[] Modes = { "off", "on" };
+
+    public static bool IsMode(string v) { return v == "off" || v == "on"; }
+
+    /// <summary>The mode named by one fanout_hierarchical_merge= line; null when the line is not
+    /// that key or the value is not off|on (the caller keeps its value, off). A byte order mark
+    /// is tolerated and the value is case-insensitive, as in Python.</summary>
+    public static string ParseLine(string line)
+    {
+        if (line == null) return null;
+        string ln = line.TrimStart('﻿').Trim();
+        if (!ln.StartsWith(Key + "=", StringComparison.Ordinal)) return null;
+        string v = ln.Substring(Key.Length + 1).Trim().ToLowerInvariant();
+        return IsMode(v) ? v : null;
+    }
+
+    public static string Label(bool ja) { return ja ? "入れ子の統合" : "Hierarchical merge"; }
+
+    public static string ModeLabel(string mode, bool ja)
+    {
+        if (mode == "off") return ja ? "オフ" : "Off";
+        if (mode == "on") return ja ? "オン" : "On";
+        return mode ?? "";
+    }
+
+    public static string Help(bool ja)
+    {
+        return ja ? "オン=分割の深さ2以上が有効になります。まず小さな依頼で確認してから使ってください。"
+                  : "On lets fan-out depth above 1 take effect; verify with small goals first.";
+    }
+
+    public static string TakeEffectTip(bool ja)
+    {
+        return ja ? "次の分割判断から有効。再起動不要。分割済みのツリーは変わりません。"
+                  : "Applies to the next split decision, no restart. Trees already split keep going.";
+    }
+
+    /// <summary>The state the coordinator reports; null when it reported nothing usable.</summary>
+    public static string Describe(string reported, bool ja)
+    {
+        if (!IsMode(reported)) return null;
+        return (ja ? "稼働中: " : "In effect: ") + ModeLabel(reported, ja);
+    }
+
+    /// <summary>The note shown when the state the runner reports differs from the selection (the
+    /// runner re-reads the key at its next split); null when they agree.</summary>
+    public static string PendingText(string reported, string selected, bool ja)
+    {
+        if (!IsMode(reported) || reported == selected) return null;
         return ja ? "選択は次の分割から反映" : "selection applies from the next split";
     }
 }
