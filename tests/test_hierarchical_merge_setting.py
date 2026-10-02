@@ -136,7 +136,9 @@ def test_the_cockpit_constants_equal_the_python_side():
 
 def test_the_cockpit_has_a_visible_control_saving_through_savekey_only():
     src = _read("ui", "FleetCockpit.cs")
-    assert "ctrls.Children.Add(HierarchicalMergeControl());" in src
+    # lives in the gear popup (BuildSettingsPanel), NOT in the header
+    assert "col.Children.Add(HierarchicalMergeControl());" in src
+    assert "ctrls.Children.Add(HierarchicalMergeControl());" not in src
     assert src.index("FanoutDepthControl());") < src.index("HierarchicalMergeControl());")
     assert len(re.findall(r"SaveKey\(HierarchicalMergeView\.Key, _hmVal\)", src)) == 1
     m = re.search(r"UIElement HierarchicalMergeControl\(\).*?\n    }\n", src, re.S)

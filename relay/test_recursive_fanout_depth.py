@@ -345,7 +345,9 @@ def test_the_cockpit_depth_constants_equal_the_python_side():
 
 def test_the_cockpit_depth_box_saves_through_savekey_only_and_does_not_refire():
     src = _read("ui", "FleetCockpit.cs")
-    assert "ctrls.Children.Add(FanoutDepthControl());" in src
+    # lives in the gear popup (BuildSettingsPanel), NOT in the header
+    assert "col.Children.Add(FanoutDepthControl());" in src
+    assert "ctrls.Children.Add(FanoutDepthControl());" not in src
     assert len(re.findall(r'SaveKey\("fanout_max_depth", ', src)) == 1
     assert re.search(r'case "fanout_max_depth":\s*case "fanout_max_total":', src)
     m = re.search(r"UIElement FanoutDepthControl\(\).*?\n    }\n", src, re.S)
