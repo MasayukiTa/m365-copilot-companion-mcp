@@ -3526,7 +3526,9 @@ class RelayWorker:
         self._split_reason = ""
         if fanout and _depth0:
             try:
-                _v = _splittability.judge(self.goal)
+                _v = _splittability.judge(
+                    self.goal, depth=int(getattr(self.task_envelope, "depth", 0) or 0),
+                    max_depth=fanout_mod.effective_max_depth())
                 # TRIAGE, NOT VERDICT. The offline rules decide whether one turn is worth
                 # spending on the question; the agent -- which can read the goal -- decides
                 # whether to split, and may answer NO_SPLIT. UNCERTAIN means the rules say
