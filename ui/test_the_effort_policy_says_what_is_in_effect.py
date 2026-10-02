@@ -76,7 +76,9 @@ def test_the_cockpit_loads_persists_and_does_not_refire():
     m = re.search(r"void PaintEffortPolicy\(\).*?\n    }\n", src, re.S)
     assert m and re.search(
         r"if \(!Equals\(ComboVal\(_effortPolicyBox\), _effortPolicy\)\) ComboSelectVal", m.group(0))
-    assert "EffortPolicyControl()" in src
+    # lives in the gear popup (BuildSettingsPanel), NOT in the header
+    assert "col.Children.Add(EffortPolicyControl());" in src
+    assert "ctrls.Children.Add(EffortPolicyControl());" not in src
 
 
 def test_the_timing_table_says_each_gate():
