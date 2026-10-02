@@ -1367,7 +1367,11 @@ def _tree_budget_block(worker_rows):
         from relay import fanout_budget as _fb
         if not any(isinstance(r, dict) and r.get("root_id") for r in worker_rows):
             return {"fanout_budget": _fb.limits_from_settings(), "tree_budget": {}}
-        return _fb.status_block(worker_rows, _campaign_lines())
+        # The same streaming reader the split decision uses: a ledger past 2 MB used to read
+        # as [] here and the export silently lost every tree's wall clock. None (unreadable
+        # or past the 50 MB CPU bound) exports {} = "not reported", never a comfortable zero.
+        return _fb.status_block(worker_rows, _fb.read_campaign_rows(
+            os.path.join(_ACTIVE_STATE_DIR, "campaigns.jsonl")) if _ACTIVE_STATE_DIR else [])
     except Exception:
         return {}
 

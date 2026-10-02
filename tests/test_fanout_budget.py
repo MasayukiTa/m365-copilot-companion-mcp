@@ -270,9 +270,11 @@ def test_a_partial_grant_trims_the_children_without_dropping_a_slice():
 
 # ---------------------------------------------------------------- status export
 
-def test_the_snapshot_exports_the_limits_and_per_root_usage(monkeypatch):
-    monkeypatch.setattr(FR, "_campaign_lines", lambda: [
-        '{"kind": "campaign", "campaign_id": "r1", "root_id": "r1", "n": 2, "ts": 1.0}'])
+def test_the_snapshot_exports_the_limits_and_per_root_usage(monkeypatch, tmp_path):
+    (tmp_path / "campaigns.jsonl").write_text(
+        '{"kind": "campaign", "campaign_id": "r1", "root_id": "r1", "n": 2, "ts": 1.0}\n',
+        encoding="utf-8")
+    monkeypatch.setattr(FR, "_ACTIVE_STATE_DIR", str(tmp_path))
     rows = [_row("r1", "working", 3), _row("r1", "done", 2), {"status": "done", "turn": 1}]
     blk = FR._tree_budget_block(rows)
     assert blk["fanout_budget"] == fb.limits_from_settings()
