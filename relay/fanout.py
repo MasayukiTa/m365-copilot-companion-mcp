@@ -62,11 +62,17 @@ DEPTH_SETTING_BOUNDS = (1, 3)
 #: Whether nested splits are ENABLED. A worker that ends FANOUT counts as finished, so without
 #: the nested merge its split proposal would be read by its parent's merge as that worker's
 #: ANSWER. The nested merge now exists (a FANOUT slot waits for its own family's merge and takes
-#: that merge's answer, or an explicit MISSING marker; see nested_result_row), but the switch
-#: stays False until it has been verified live: `effective_max_depth()` caps at MAX_DEPTH while
-#: this is False. Tests monkeypatch it to exercise the deeper behaviour; nothing in production
-#: sets it (tests/test_hierarchical_merge.py fails if anything does).
+#: that merge's answer, or an explicit MISSING marker; see nested_result_row). The operator's
+#: switch is the `fanout_hierarchical_merge` setting (GUI-controlled, default off): while it is
+#: off `effective_max_depth()` caps at MAX_DEPTH. This module constant is only a TEST HOOK that
+#: forces the deeper behaviour on; nothing in production sets it
+#: (tests/test_hierarchical_merge.py fails if anything does).
 HIERARCHICAL_MERGE_READY = False
+
+#: The GUI-controlled switch (tools/settings_keys.py) and its default. Production code must
+#: never make the default "on" (tests/test_hierarchical_merge_setting.py).
+HIERARCHICAL_SETTING_KEY = "fanout_hierarchical_merge"
+HIERARCHICAL_SETTING_DEFAULT = "off"
 
 #: The outcome a parent slot carries when its nested family did not deliver a real answer.
 SLOT_MISSING = "MISSING"
@@ -494,14 +500,36 @@ def configured_max_depth():
     return max(lo, min(hi, int(v)))
 
 
+def hierarchical_merge_setting():
+    """The `fanout_hierarchical_merge` setting: "on" or "off" (default "off").
+
+    Read from settings.txt on every call (each_gate). Only the exact value `on`
+    (case-insensitive) is on; an absent, empty or unrecognised value is off. Never raises.
+    """
+    try:
+        from relay import fleet_runner as fr
+        raw = fr._settings_text(HIERARCHICAL_SETTING_KEY)
+    except Exception:
+        return "off"
+    if raw is None:
+        return "off"
+    return "on" if raw.strip().lower() == "on" else "off"
+
+
+def hierarchical_merge_enabled():
+    """Are nested splits enabled right now: the setting is on (or the test hook is True)?"""
+    return bool(HIERARCHICAL_MERGE_READY) or hierarchical_merge_setting() == "on"
+
+
 def effective_max_depth():
     """The deepest level that may still split into children, in force right now.
 
-    The configured depth, capped at MAX_DEPTH (1) until HIERARCHICAL_MERGE_READY. A worker at
-    depth d may split exactly when d < effective_max_depth().
+    The configured depth when hierarchical merge is enabled (the `fanout_hierarchical_merge`
+    setting is on), otherwise capped at MAX_DEPTH (1). A worker at depth d may split exactly
+    when d < effective_max_depth().
     """
     configured = configured_max_depth()
-    return configured if HIERARCHICAL_MERGE_READY else min(configured, MAX_DEPTH)
+    return configured if hierarchical_merge_enabled() else min(configured, MAX_DEPTH)
 
 
 def may_split_at(depth):
@@ -518,7 +546,8 @@ def depth_report():
     effective = effective_max_depth()
     return {"configured": configured, "effective": effective,
             "reason": ("" if effective == configured
-                       else "hierarchical merge not enabled yet")}
+                       else "hierarchical merge setting is off"),
+            "hierarchical_merge": "on" if hierarchical_merge_enabled() else "off"}
 
 
 _PARENT_SCOPE_HEAD = "【この会話が担当する範囲"
@@ -1180,5 +1209,7 @@ __all__ = ["SUBTASKS_READY", "SPLIT_JOB", "MAX_CHILDREN", "MIN_CHILDREN", "MAX_D
     "collapse_retries", "ready_to_aggregate", "aggregation_goal",
     "fanout_family_view", "HIERARCHICAL_MERGE_READY", "configured_max_depth",
     "effective_max_depth", "may_split_at", "depth_report",
+    "hierarchical_merge_setting", "hierarchical_merge_enabled",
+    "HIERARCHICAL_SETTING_KEY", "HIERARCHICAL_SETTING_DEFAULT",
     "nested_result_row", "slot_record", "SLOT_MISSING",
 ]
