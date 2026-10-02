@@ -833,6 +833,10 @@ class CockpitWindow : Window
     TextBlock _fdLbl, _fdNow, _fdPending;
     // sibling write scope off|shadow -> settings.txt fanout_write_scope ; absent key = off (WriteScopeView.Default)
     string _wsVal = WriteScopeView.Default;
+    // hierarchical merge off|on -> settings.txt fanout_hierarchical_merge ; absent key = off
+    string _hmVal = HierarchicalMergeView.Default;
+    ComboBox _hmBox;
+    TextBlock _hmLbl, _hmNow, _hmPending;
     ComboBox _wsBox;
     TextBlock _wsLbl, _wsNow, _wsPending;
     string _approval = "run";  // approval mode run|plan|auto -> settings.txt approval=
@@ -1872,6 +1876,11 @@ class CockpitWindow : Window
                     string wsv = WriteScopeView.ParseLine(ln);   // off|shadow only; junk keeps the value
                     if (wsv != null) _wsVal = wsv;
                 }
+                else if (ln.StartsWith("fanout_hierarchical_merge="))
+                {
+                    string hmv = HierarchicalMergeView.ParseLine(ln);   // off|on only; junk keeps the value
+                    if (hmv != null) _hmVal = hmv;
+                }
                 else if (ln.StartsWith("fanout_max_depth="))
                 {
                     int? fdv = FanoutDepthView.ParseLine(ln);   // clamped; junk keeps the value
@@ -2011,6 +2020,7 @@ class CockpitWindow : Window
         ctrls.Children.Add(EffortPolicyControl());
         ctrls.Children.Add(FanoutControl());
         ctrls.Children.Add(FanoutDepthControl());
+        ctrls.Children.Add(HierarchicalMergeControl());
         ctrls.Children.Add(WriteScopeControl());
         ctrls.Children.Add(FanoutBudgetControl());
         ctrls.Children.Add(ApprovalControl());
@@ -7825,6 +7835,7 @@ class CockpitWindow : Window
             case "ram_floor_mb":
             case "maxtabs":
                 return "live";
+            case "fanout_hierarchical_merge":
             case "rate_ceiling_rpm":
             case "job_approval_mode":
             case "fanout_write_scope":
@@ -9221,6 +9232,7 @@ class CockpitWindow : Window
         PaintFanoutInEffect(_lastRoot);
         PaintFanoutBudget();
         PaintFanoutDepth();
+        PaintHierarchicalMerge();
         PaintWriteScope();
     }
     // What the COORDINATOR says it was started with (status.json "fanout_run"), beside the combo.
@@ -9446,6 +9458,83 @@ class CockpitWindow : Window
         _fdPending.Text = pend ?? "";
         _fdPending.Foreground = Theme.Br(Theme.Warning(_dark));
         _fdPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
+    }
+    // Hierarchical merge (off|on), beside the split depth. Persists through SaveKey only; the
+    // runner re-reads the key at every split (each_gate). On lets a split depth above 1 take
+    // effect; what is IN EFFECT comes from status.json "fanout_depth".hierarchical_merge. The
+    // words and parsing live in HierarchicalMergeView (EffortPolicy.cs).
+    UIElement HierarchicalMergeControl()
+    {
+        var wrap = new StackPanel(); wrap.Orientation = Orientation.Horizontal;
+        wrap.VerticalAlignment = VerticalAlignment.Center; wrap.Margin = new Thickness(0, 0, 12, 0);
+
+        _hmLbl = new TextBlock(); _hmLbl.VerticalAlignment = VerticalAlignment.Center;
+        _hmLbl.FontSize = 12; _hmLbl.Margin = new Thickness(0, 0, 8, 0);
+        wrap.Children.Add(_hmLbl);
+
+        _hmBox = new ComboBox();
+        _hmBox.ToolTip = HierarchicalMergeView.Help(_lang == 0) + "\n" + HierarchicalMergeView.TakeEffectTip(_lang == 0);
+        _hmBox.Cursor = Cursors.Hand; _hmBox.FontSize = 12;
+        _hmBox.FontWeight = FontWeights.SemiBold; _hmBox.MinWidth = 64;
+        _hmBox.Padding = new Thickness(8, 2, 4, 2);
+        _hmBox.VerticalAlignment = VerticalAlignment.Center;
+        var hmHelp = new Dictionary<string, string>();
+        foreach (string m in HierarchicalMergeView.Modes) hmHelp[m] = HierarchicalMergeView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_hmBox, HierarchicalMergeView.Modes, hmHelp, _hmVal);
+        _hmBox.DropDownOpened += delegate { CloseHeaderPopups("effort"); };
+        _hmBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_hmBox);
+            if (!HierarchicalMergeView.IsMode(sel) || sel == _hmVal) return;   // unchanged -> no write, no re-fire
+            _hmVal = sel;
+            SaveKey(HierarchicalMergeView.Key, _hmVal);
+            PaintHierarchicalMergeInEffect(_lastRoot);
+        };
+        wrap.Children.Add(_hmBox);
+
+        _hmNow = new TextBlock(); _hmNow.VerticalAlignment = VerticalAlignment.Center;
+        _hmNow.FontSize = 11.5; _hmNow.Margin = new Thickness(8, 0, 0, 0);
+        wrap.Children.Add(_hmNow);
+        _hmPending = new TextBlock(); _hmPending.VerticalAlignment = VerticalAlignment.Center;
+        _hmPending.FontSize = 11.5; _hmPending.FontWeight = FontWeights.SemiBold;
+        _hmPending.Margin = new Thickness(8, 0, 0, 0);
+        _hmPending.Visibility = Visibility.Collapsed;
+        wrap.Children.Add(_hmPending);
+
+        PaintHierarchicalMerge();
+        return wrap;
+    }
+    void PaintHierarchicalMerge()
+    {
+        if (_hmLbl != null) { _hmLbl.Text = HierarchicalMergeView.Label(_lang == 0); _hmLbl.Foreground = Muted; }
+        if (_hmBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_hmBox), _hmVal)) ComboSelectVal(_hmBox, _hmVal);
+        _hmBox.ToolTip = HierarchicalMergeView.Help(_lang == 0) + "\n" + HierarchicalMergeView.TakeEffectTip(_lang == 0);
+        _hmBox.Background = BtnBg; _hmBox.Foreground = Fg; _hmBox.BorderBrush = Border;
+        StyleFlatCombo(_hmBox);
+        PaintHierarchicalMergeInEffect(_lastRoot);
+    }
+    // What the COORDINATOR says it applies (status.json "fanout_depth".hierarchical_merge). No
+    // report (old runner, no run yet) -> nothing shown, never a guess from the selection.
+    void PaintHierarchicalMergeInEffect(Dictionary<string, object> root)
+    {
+        if (_hmNow == null || _hmPending == null) return;
+        bool ja = _lang == 0;
+        string now = null, pend = null;
+        Dictionary<string, object> fd = root != null ? Obj(root, "fanout_depth") : null;
+        if (fd != null && fd.ContainsKey("hierarchical_merge") && fd["hierarchical_merge"] != null)
+        {
+            string rep = S(fd, "hierarchical_merge");
+            now = HierarchicalMergeView.Describe(rep, ja);
+            pend = HierarchicalMergeView.PendingText(rep, _hmVal, ja);
+        }
+        _hmNow.Text = now ?? "";
+        _hmNow.Foreground = Muted;
+        _hmNow.Visibility = now != null ? Visibility.Visible : Visibility.Collapsed;
+        _hmPending.Text = pend ?? "";
+        _hmPending.Foreground = Theme.Br(Theme.Warning(_dark));
+        _hmPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
     }
     // Sibling write scope (off|shadow), beside the split depth. Persists through SaveKey only; the
     // coordinator re-reads the key at every sweep (each_gate). SHADOW ONLY: it records overlapping
@@ -12244,6 +12333,7 @@ class CockpitWindow : Window
         PaintFanoutInEffect(root);         // what the coordinator was started with (fan-out)
         PaintFanoutBudgetInEffect(root);   // the per-tree limits the coordinator applies
         PaintFanoutDepthInEffect(root);    // the split depth the coordinator applies
+        PaintHierarchicalMergeInEffect(root);   // the hierarchical-merge state the coordinator applies
         PaintWriteScopeInEffect(root);     // the sibling write-scope mode the coordinator applies
         // Preserve scroll position across the rebuild. Without this, every worker update
         // (status/turn change) reset the list and snapped the view back to the TOP -- which is
