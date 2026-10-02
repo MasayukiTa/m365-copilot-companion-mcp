@@ -107,7 +107,9 @@ def test_the_coordinator_reports_what_it_was_started_with():
 
 def test_the_cockpit_has_a_visible_control_not_only_the_slash_command():
     src = _read("ui", "FleetCockpit.cs")
-    assert "ctrls.Children.Add(FanoutControl());" in src
+    # lives in the gear popup (BuildSettingsPanel), NOT in the header
+    assert "col.Children.Add(FanoutControl());" in src
+    assert "ctrls.Children.Add(FanoutControl());" not in src
     assert "_fanoutBox = new ComboBox();" in src
     assert 'Obj(root, "fanout_run")' in src
     # the combo persists through the same key the slash command writes
