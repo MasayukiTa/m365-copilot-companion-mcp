@@ -628,6 +628,18 @@ def _no_writes_to_the_live_records(tmp_path_factory, monkeypatch):
             except Exception:
                 pass
 
+    # THE TEMP HOME, TOO. relay.temp_home.system_temp() is what both the writers (job logs, bench
+    # scratch) and the age sweep (fleet_retention.temp_home, run by apply()) resolve %TEMP%
+    # through. Pointing it at this session's directory means no test creates entries in, or
+    # sweeps, the operator's real %TEMP%.
+    try:
+        from relay import temp_home as _th
+        _sys_temp = base / "system_temp"
+        _sys_temp.mkdir(exist_ok=True)
+        monkeypatch.setattr(_th, "system_temp", lambda: str(_sys_temp))
+    except Exception:
+        pass
+
     yield base
 
 

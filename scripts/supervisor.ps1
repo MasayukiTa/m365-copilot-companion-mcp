@@ -184,7 +184,31 @@ try {
     $SupervisorStartedUnix = 0
 }
 
+# The supervisor log is written for the life of the machine session and was never rotated.
+# One generation is kept: at 5 MB the log becomes <log>.1 (replacing the previous .1) and a
+# fresh log starts. Never throws: a log that cannot be rotated is simply written on.
+function Invoke-SupervisorLogRotation {
+    param([string]$Path, [long]$MaxBytes = 5242880)
+    try {
+        $item = Get-Item -LiteralPath $Path -ErrorAction Stop
+        if ($item.Length -lt $MaxBytes) { return $false }
+        $old = $Path + ".1"
+        if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Force -ErrorAction Stop }
+        Move-Item -LiteralPath $Path -Destination $old -Force -ErrorAction Stop
+        return $true
+    } catch {
+        return $false
+    }
+}
+$script:LogWritesSinceRotationCheck = 0
+[void](Invoke-SupervisorLogRotation -Path $Log)
+
 function Write-Log($msg) {
+    $script:LogWritesSinceRotationCheck++
+    if ($script:LogWritesSinceRotationCheck -ge 200) {
+        $script:LogWritesSinceRotationCheck = 0
+        [void](Invoke-SupervisorLogRotation -Path $Log)
+    }
     "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $msg" | Out-File -FilePath $Log -Append -Encoding utf8
 }
 

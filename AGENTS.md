@@ -14,3 +14,17 @@ For cross-PC / production-relevant fixes:
 6. After merge, inspect the `main` workflow runs. A green feature branch with a red `main` is not a finished delivery.
 
 Do not postpone this integration step when the current work is specifically about stability, setup, portability, authentication, fleet scheduling, or anything needed on a second machine.
+
+## Temporary files: one swept home
+
+Everything temporary that this product or an agent creates goes under `%TEMP%\m365-companion\`
+(`relay/temp_home.py`: `temp_home()`, `temp_dir(name)`). `relay/fleet_retention.py` (`temp_home`,
+run by `apply()`) deletes entries there that have had no write for 24 hours (override with the
+env var `MCP_TEMP_HOME_MAX_AGE_H`). Nothing else in `%TEMP%` is ever swept.
+
+- Put venvs, clones, build output and test scratch under `%TEMP%\m365-companion\agents\<name>\`
+  and delete them when the work is done; the sweep is the backstop, not the plan.
+- An idle directory is judged by its newest file. A long-lived venv you still need must be
+  touched (or used) at least once a day, or put somewhere else.
+- Do not write new scratch directly in `%TEMP%`: it is not swept and was the cause of the disk
+  filling up.
