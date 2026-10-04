@@ -1201,7 +1201,7 @@ def test_the_unlock_job_is_actually_sent():
     w._turn_sent_at = 1.0
     w._unlock_attempts = 0
     orig_looks, orig_pw = rf._looks_locked, rf._unlock_password
-    rf._looks_locked = lambda resp, since=0.0, worker="": True
+    rf._looks_locked = lambda resp, since=0.0, worker="", on_unattributed=None: True
     rf._unlock_password = lambda: "pw"
     try:
         w._decide("[locked: unlock required]")
