@@ -46,6 +46,7 @@ from bench.companionbench.redact import redact
 from relay.selfimprove import manifest as M
 from relay.selfimprove import runtime_config as RC
 from relay.selfimprove import solver_feedback as SF
+from relay.temp_home import temp_home as _temp_home  # scratch under the swept temp home
 
 from bench.companionbench.episode import (COVERAGE_COMPLETE, COVERAGE_PARTIAL,
                                           COVERAGE_VIOLATION)
@@ -221,7 +222,7 @@ class _EvidenceTrace:
     """
 
     def __init__(self):
-        self.dir = tempfile.mkdtemp(prefix="cb_trace_")
+        self.dir = tempfile.mkdtemp(prefix="cb_trace_", dir=_temp_home())
         self.path = os.path.join(self.dir, "calls.jsonl")
         self.key = secrets.token_hex(32)
         self._prev = {}
