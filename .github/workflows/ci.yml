@@ -206,6 +206,7 @@ jobs:
             relay/test_write_scope.py \
             relay/test_verification_survives_the_archive.py \
             relay/test_fleet_autostart.py \
+            relay/test_fleet_auto_resume_setting.py \
             relay/test_refute_resend.py \
             relay/test_for_fleet_is_not_a_dead_end.py \
             relay/test_a_parked_goal_is_never_read_half_written.py \
