@@ -843,6 +843,12 @@ class CockpitWindow : Window
     string _arVal = AutoResumeView.Default;
     ComboBox _arBox;
     TextBlock _arLbl, _arNow, _arPending;
+    // supervisor self-restart off|on -> settings.txt supervisor_self_restart ; absent key = on
+    string _srVal = SupervisorCodeView.Default;
+    ComboBox _srBox;
+    TextBlock _srLbl, _srNow;
+    DateTime _srReadAt = DateTime.MinValue;   // supervisor_state.json is re-read at most every 5 s
+    string _srText = null;
     string _approval = "run";  // approval mode run|plan|auto -> settings.txt approval=
     string _runtimeMode = "fleet"; // next launch: fleet | durable -> settings.txt runtime=
     bool _durableEnqueuePending = false; // one durable campaign intake process at a time
@@ -1884,6 +1890,11 @@ class CockpitWindow : Window
                 {
                     string arv = AutoResumeView.ParseLine(ln);   // off|on only; junk keeps the value
                     if (arv != null) _arVal = arv;
+                }
+                else if (ln.StartsWith("supervisor_self_restart="))
+                {
+                    string srv = SupervisorCodeView.ParseLine(ln);   // off|on only; junk keeps the value
+                    if (srv != null) _srVal = srv;
                 }
                 else if (ln.StartsWith("fanout_hierarchical_merge="))
                 {
@@ -7843,6 +7854,7 @@ class CockpitWindow : Window
                 return "live";
             case "fanout_hierarchical_merge":
             case "fleet_auto_resume":
+            case "supervisor_self_restart":
             case "rate_ceiling_rpm":
             case "job_approval_mode":
             case "fanout_write_scope":
@@ -8332,6 +8344,7 @@ class CockpitWindow : Window
         col.Children.Add(SectionHeader(L("復旧 / Recovery", "Recovery")));
         col.Children.Add(AutoResumeControl());
         PaintAutoResumeInEffect(_lastRoot);
+        col.Children.Add(SupervisorSelfRestartControl());
 
         // THE RE-UNLOCK CONTROL WAS REMOVED HERE, DELIBERATELY, AND MUST NOT COME BACK.
         //
@@ -9273,6 +9286,7 @@ class CockpitWindow : Window
         PaintHierarchicalMerge();
         PaintWriteScope();
         PaintAutoResume();
+        PaintSupervisorSelfRestart();
     }
     // What the COORDINATOR says it was started with (status.json "fanout_run"), beside the combo.
     // No report (old runner, no run yet) -> nothing shown, never a guess from the combo.
@@ -9715,6 +9729,96 @@ class CockpitWindow : Window
         _arPending.Text = pend ?? "";
         _arPending.Foreground = Theme.Br(Theme.Warning(_dark));
         _arPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
+    }
+    // Supervisor self-restart (off|on), in the Recovery section under the auto-resume control. The
+    // supervisor is a PowerShell script loaded once, so it can run older code than the checkout;
+    // it publishes that in .fleet/supervisor_state.json and this note words it (SupervisorCodeView).
+    // Persists through SaveKey only; the supervisor reads the key only once it is stale (each_gate).
+    UIElement SupervisorSelfRestartControl()
+    {
+        _srLbl = new TextBlock(); _srLbl.VerticalAlignment = VerticalAlignment.Center;
+        _srLbl.FontSize = 12;
+
+        _srBox = new ComboBox();
+        _srBox.ToolTip = SupervisorCodeView.Help(_lang == 0) + "\n" + SupervisorCodeView.TakeEffectTip(_lang == 0);
+        _srBox.Cursor = Cursors.Hand; _srBox.FontSize = 12;
+        _srBox.FontWeight = FontWeights.SemiBold; _srBox.MinWidth = 64;
+        _srBox.Padding = new Thickness(8, 2, 4, 2);
+        _srBox.VerticalAlignment = VerticalAlignment.Center;
+        var srHelp = new Dictionary<string, string>();
+        foreach (string m in SupervisorCodeView.Modes) srHelp[m] = SupervisorCodeView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_srBox, SupervisorCodeView.Modes, srHelp, _srVal);
+        _srBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _srBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_srBox);
+            if (!SupervisorCodeView.IsMode(sel) || sel == _srVal) return;   // unchanged -> no write, no re-fire
+            _srVal = sel;
+            SaveKey(SupervisorCodeView.Key, _srVal);
+        };
+
+        _srNow = new TextBlock(); _srNow.VerticalAlignment = VerticalAlignment.Center;
+        _srNow.FontSize = 11.5; _srNow.TextWrapping = TextWrapping.Wrap; _srNow.MaxWidth = 300;
+        _srNow.FontWeight = FontWeights.SemiBold;
+        _srNow.Visibility = Visibility.Collapsed;
+
+        var wrap = SettingsComboBlock(_srLbl, _srBox, _srNow, new TextBlock());
+        PaintSupervisorSelfRestart();
+        return wrap;
+    }
+    void PaintSupervisorSelfRestart()
+    {
+        if (_srLbl != null) { _srLbl.Text = SupervisorCodeView.Label(_lang == 0); _srLbl.Foreground = Muted; }
+        if (_srBox == null) return;
+        if (!Equals(ComboVal(_srBox), _srVal)) ComboSelectVal(_srBox, _srVal);
+        _srBox.ToolTip = SupervisorCodeView.Help(_lang == 0) + "\n" + SupervisorCodeView.TakeEffectTip(_lang == 0);
+        _srBox.Background = BtnBg; _srBox.Foreground = Fg; _srBox.BorderBrush = Border;
+        StyleFlatCombo(_srBox);
+        _srReadAt = DateTime.MinValue;   // repaint the note in the new language / theme
+        PaintSupervisorCodeNote();
+    }
+    // The plain message "supervisor is running older code: restart needed", from the supervisor's own
+    // report. Nothing is shown when the file is missing, unreadable, names a dead process, or says
+    // the code is current. Re-read at most every 5 s (this runs on every status refresh).
+    void PaintSupervisorCodeNote()
+    {
+        if (_srNow == null) return;
+        if ((DateTime.UtcNow - _srReadAt).TotalSeconds >= 5.0)
+        {
+            _srReadAt = DateTime.UtcNow;
+            _srText = null;
+            try
+            {
+                string path = Path.Combine(RepoRootForSettings(), ".fleet", "supervisor_state.json");
+                if (File.Exists(path))
+                {
+                    var raw = _js.DeserializeObject(File.ReadAllText(path, Encoding.UTF8)) as Dictionary<string, object>;
+                    bool alive = false;
+                    if (raw != null && raw.ContainsKey("pid") && raw.ContainsKey("start_ts"))
+                    {
+                        // a PID alone can be reused after the supervisor dies: it must also have been born
+                        // when the file says
+                        int pid = Convert.ToInt32(raw["pid"], System.Globalization.CultureInfo.InvariantCulture);
+                        double born = Convert.ToDouble(raw["start_ts"], System.Globalization.CultureInfo.InvariantCulture);
+                        try
+                        {
+                            var p = System.Diagnostics.Process.GetProcessById(pid);
+                            if (!p.HasExited)
+                            {
+                                double actual = new DateTimeOffset(p.StartTime.ToUniversalTime()).ToUnixTimeSeconds();
+                                alive = born > 0.0 && Math.Abs(actual - born) <= 2.0;
+                            }
+                        }
+                        catch (Exception) { alive = false; }
+                    }
+                    _srText = SupervisorCodeView.Describe(raw, alive, _lang == 0);
+                }
+            }
+            catch (Exception) { _srText = null; }
+        }
+        _srNow.Text = _srText ?? "";
+        _srNow.Foreground = Theme.Br(Theme.Warning(_dark));
+        _srNow.Visibility = _srText != null ? Visibility.Visible : Visibility.Collapsed;
     }
     void PaintEffort()
     {
@@ -12446,6 +12550,7 @@ class CockpitWindow : Window
         PaintHierarchicalMergeInEffect(root);   // the hierarchical-merge state the coordinator applies
         PaintWriteScopeInEffect(root);     // the sibling write-scope mode the coordinator applies
         PaintAutoResumeInEffect(root);     // the auto-resume setting and the gate's last decision
+        PaintSupervisorCodeNote();         // "supervisor is running older code" (supervisor_state.json)
         // Preserve scroll position across the rebuild. Without this, every worker update
         // (status/turn change) reset the list and snapped the view back to the TOP -- which is
         // exactly why scrolling "didn't work" while tasks were live: the user scrolled down, a

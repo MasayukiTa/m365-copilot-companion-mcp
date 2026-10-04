@@ -189,6 +189,19 @@ KEYS = OrderedDict([
        "cycle with no restart. An MCP_FLEET_AUTORESUME environment variable, when set, beats it. "
        "Default on, matching the startup resume that was always on."),
 
+    # Read by the supervisor only once its own code has been found stale (a changed
+    # scripts/supervisor.ps1), never on an ordinary cycle.
+    _k("supervisor_self_restart", EACH_GATE, "on",
+       "relay/code_staleness.py:self_restart_setting (supervisor cycle, only once its code is stale)",
+       "off|on. A supervisor is a PowerShell script loaded once, so a merged change to "
+       "scripts/supervisor.ps1 does nothing until it restarts. on lets the supervisor replace "
+       "itself, but only when it is safe: no coordinator running, no interrupted run pending or "
+       "being resumed, no review or local-loop run, the bridge idle, the new script parses, and "
+       "not within 10 minutes of its last self-restart. off only reports that a restart is "
+       "needed. Re-read each cycle with no restart. Default on: the failure it removes (a "
+       "stale supervisor running a dry-run resume) already happened, and the gates above are "
+       "the same idle rule the server's stale-code cycle uses."),
+
     _k("autoretry", SWEEP_START, 1,
        "relay/fleet_runner.py:settings_autoretry (once, before the sweep)",
        "Takes effect on the NEXT run."),
