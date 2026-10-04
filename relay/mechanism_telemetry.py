@@ -70,7 +70,26 @@ MECHANISMS = ("fanout", "refuter", "panel", "veto", "retry", "bestofn", "skill",
               # declares an INFRASTRUCTURE fault rather than a task failure, so the first time
               # it is right about that should not land only in a status field the next sweep
               # overwrites.
-              "unlanded_calls")
+              "unlanded_calls",
+              # Phase 1 of the per-goal effort policy: SHADOW rows only (what it would have
+              # done). Registered so summarise() reads it; see relay/effort_policy.py.
+              "effort_policy",
+              # The first message of a fresh conversation was not absorbed (the reply is a
+              # greeting / ask-for-the-goal / empty-message / canned refusal) and was sent
+              # again. Registered so the redelivery RATE can be read from one place.
+              "first_message_not_absorbed",
+              # A split reply whose list numbers were lost in transit, parsed from the plain
+              # lines above SUBTASKS_READY (relay/fanout.py). One row per rescued split, so
+              # the rate of this path is readable rather than inferred.
+              "fanout_unnumbered_fallback",
+              # A finished child whose answer was missing from the campaign ledger: recovered
+              # from a durable source or re-queued once, and the merge-queue stall detector
+              # that notices a family waiting forever on such a child.
+              "child_result_recovery",
+              "merge_stalled_missing_child_result",
+              # Two siblings of one campaign wrote the same path, or one wrote a path another's
+              # step names. SHADOW only (relay/write_scope.py): recorded, never acted on.
+              "scope_overlap")
 
 
 def patch_hash(text):

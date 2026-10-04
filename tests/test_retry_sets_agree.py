@@ -92,3 +92,15 @@ def test_every_retry_site_goes_through_the_shared_predicate():
 
     bulk = _method(src, "int RetryAllShown(", "static readonly string[] _retryableOutcomes")
     assert "IsRetryableWorker(w)" in bulk
+
+
+def test_interrupted_is_not_retryable_on_either_side():
+    """INTERRUPTED (coordinator died) is recovered by the coordinator-level resume. If either
+    retry list carried it, the cockpit's per-worker requeue AND the resume would run the same
+    goal twice. Both lists stay equal to each other (test above) and neither has it."""
+    from relay.outcomes import RETRYABLE, NON_RETRYABLE
+
+    assert "INTERRUPTED" not in RETRYABLE and "INTERRUPTED" in NON_RETRYABLE
+    src = _cs()
+    i = src.index("static readonly string[] _retryableOutcomes")
+    assert "INTERRUPTED" not in src[i:src.index(";", i)]

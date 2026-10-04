@@ -119,17 +119,24 @@ def test_the_startup_resume_still_comes_before_the_first_reap(src):
 
 _FAKE_RUNNER = r'''
 import json, os, sys, time
-d = os.path.join(os.getcwd(), ".fleet")
-while not os.path.exists(os.path.join(d, "GO")):
-    if os.path.exists(os.path.join(d, "STOP")):
-        sys.exit(3)          # died before writing its own marker
-    time.sleep(0.1)
-tmp = os.path.join(d, "fleet_run_active.json.tmp")
-with open(tmp, "w") as fh:
-    json.dump({"pid": os.getpid(), "start_ts": time.time(), "argv": [], "resume_argv": ["--x"]}, fh)
-os.replace(tmp, os.path.join(d, "fleet_run_active.json"))
-while not os.path.exists(os.path.join(d, "STOP")):
-    time.sleep(0.1)
+def main():
+    d = os.path.join(os.getcwd(), ".fleet")
+    while not os.path.exists(os.path.join(d, "GO")):
+        if os.path.exists(os.path.join(d, "STOP")):
+            sys.exit(3)          # died before writing its own marker
+        time.sleep(0.1)
+    tmp = os.path.join(d, "fleet_run_active.json.tmp")
+    with open(tmp, "w") as fh:
+        json.dump({"pid": os.getpid(), "start_ts": time.time(), "argv": [], "resume_argv": ["--x"]}, fh)
+    os.replace(tmp, os.path.join(d, "fleet_run_active.json"))
+    while not os.path.exists(os.path.join(d, "STOP")):
+        time.sleep(0.1)
+
+
+# Only when launched as `-m relay.fleet_runner`: the supervisor also IMPORTS the real module
+# (settings_disk_floor) to read the floor, and an import must not block.
+if __name__ == "__main__":
+    main()
 '''
 
 _FAKE_NOTIFY = r'''
@@ -236,6 +243,23 @@ try {
     $r.early.markerExistsAfterDeath = Test-Path $FleetMarkerPath
     $r.early.tracked = [bool]$script:ResumedFleet
     $r.early.log = @($script:CapturedLog)
+
+    # 5. the per-cycle check reads the reaper's pending snapshot when the live marker is gone,
+    # and in dry-run says so ONCE however many cycles look at it
+    Remove-Item (Join-Path $FleetDir "GO"), (Join-Path $FleetDir "STOP") -Force -ErrorAction SilentlyContinue
+    Remove-Item $FleetMarkerPath -Force -ErrorAction SilentlyContinue
+    $snapDir = Join-Path $FleetDir "interrupted"
+    New-Item -ItemType Directory -Path $snapDir -Force | Out-Null
+    $snapBody = @{ schema = 1; run_id = "rTEST_a1"; state = "pending"; written_ts = 5.0
+                   marker = @{ pid = $DeadPid; start_ts = 1.0; argv = @("--x"); resume_argv = @("--x") }
+                   interrupted = @{ free_bytes_at_detection = 1000 }
+                   resume = @{ count = 0; history = @() } }
+    Set-Content -Path (Join-Path $snapDir "rTEST_a1.json") -Value ($snapBody | ConvertTo-Json -Depth 6) -Encoding ASCII
+    $script:CapturedLog.Clear()
+    $c1 = [bool](Invoke-FleetAutoResume -DryRun -FromCycle)
+    $c2 = [bool](Invoke-FleetAutoResume -DryRun -FromCycle)
+    $r.cycle = [ordered]@{ first = $c1; second = $c2; log = @($script:CapturedLog)
+                           snapshotStillPending = ((Get-Content (Join-Path $snapDir "rTEST_a1.json") -Raw | ConvertFrom-Json).state) }
 } finally {
     if ($fake) { Stop-Process -Id $fake.Id -Force }
     New-Item -ItemType File -Path (Join-Path $FleetDir "GO") -Force | Out-Null
@@ -250,12 +274,14 @@ _FUNCTIONS = (
     "function Register-AutoResumeRunner", "function Test-FleetAutoResumeEnabled",
     "function Get-FleetActiveMarker", "function Test-PidAlive", "function Test-FleetShouldAutoResume",
     "function Get-ThisCheckoutFleetCoordinatorPids", "function Invoke-FleetAutoResume",
+    "function Get-FleetResumeGate", "function Get-FleetPendingSnapshot",
+    "function Write-FleetResumeLog",
     "function Get-FleetReapHoldReason", "function Invoke-FleetReap",
 )
 _INIT_LINES = (
     "$script:PyRecheckSeconds =", "$script:PyRejectedAt = $null", "$script:PyRejectedWhy = $null",
     "$script:AutoResumeRunners = New-Object", "$script:ResumedFleet = $null",
-    "$script:FleetReapHeldFor =",
+    "$script:FleetReapHeldFor =", "$script:FleetCycleNoted = @{}",
 )
 
 
@@ -365,3 +391,110 @@ def test_a_resumed_run_that_dies_before_its_marker_releases_the_hold(driver_resu
     assert r["tracked"] is False, "the dead resumer is still held as if it were running"
     assert r["markerExistsAfterDeath"] is False, \
         "the resumer died before writing its marker and the reap stayed withheld: %s" % _lines(r["log"])
+
+
+@windows_only
+def test_the_cycle_check_resumes_from_a_pending_snapshot_in_dry_run_and_says_so_once(driver_result):
+    r = driver_result["cycle"]
+    assert r["first"] is True and r["second"] is True, _lines(r["log"])
+    would = [l for l in _lines(r["log"]) if "auto-resuming" in l]
+    dry = [l for l in _lines(r["log"]) if "DRY RUN" in l]
+    assert len(would) == 1 and len(dry) == 1, "dry-run repeated every cycle: %s" % _lines(r["log"])
+    assert r["snapshotStillPending"] == "pending", "a dry run changed the snapshot"
+
+
+def test_the_cycle_call_is_dry_run_unless_explicitly_made_live(src):
+    code = _code_only(src)
+    assert "Invoke-FleetAutoResume -DryRun:(-not $FleetCycleResumeLive) -FromCycle" in code
+    assert code.index("Invoke-FleetAutoResume -DryRun:(-not $FleetCycleResumeLive)") > \
+        code.index("\n    Invoke-FleetReap\n"), "the cycle resume must come after the reap"
+
+
+def test_supervisor_ps1_additions_stay_ascii_in_the_resume_gate(src):
+    gate = _extract_braced_block(src, "function Get-FleetResumeGate")
+    assert gate.isascii()
+
+
+# -- the PowerShell gate and relay.fleet_resume.resume_gate are one rule -----------------------
+
+_NOW = 1_000_000.0
+_GB = 1024 ** 3
+_GATE_CASES = [
+    # (name, record, free_bytes, floor_gb, signature, coordinator_live, enospc)
+    ("fresh", {"state": "pending"}, 50 * _GB, None, "", False, False),
+    ("stop", {"state": "pending", "stop_requested": True}, 50 * _GB, None, "", False, False),
+    ("live", {"state": "pending"}, 50 * _GB, None, "", True, False),
+    ("resumed", {"state": "resumed"}, 50 * _GB, None, "", False, False),
+    ("gave_up", {"state": "gave_up"}, 50 * _GB, None, "", False, False),
+    ("cap", {"state": "pending", "resume": {"count": 3, "last_ts": 1.0}}, 50 * _GB, None, "", False, False),
+    ("backoff", {"state": "pending", "resume": {"count": 1, "last_ts": _NOW - 100}}, 50 * _GB, None, "", False, False),
+    ("backoff_over", {"state": "pending", "resume": {"count": 1, "last_ts": _NOW - 601}}, 50 * _GB, None, "", False, False),
+    ("backoff2", {"state": "pending", "resume": {"count": 2, "last_ts": _NOW - 1000}}, 50 * _GB, None, "", False, False),
+    ("floor_below", {"state": "pending"}, 5 * _GB, 6.0, "", False, False),
+    ("floor_ok", {"state": "pending"}, 7 * _GB, 6.0, "", False, False),
+    ("floor_zero", {"state": "pending"}, 1 * _GB, 0, "", False, False),
+    ("same_sig_no_gain", {"state": "pending", "resume": {"count": 1, "last_ts": 1.0, "last_signature": "abc", "last_free_bytes": 10 * _GB}},
+     10 * _GB, None, "abc", False, False),
+    ("same_sig_gain", {"state": "pending", "resume": {"count": 1, "last_ts": 1.0, "last_signature": "abc", "last_free_bytes": 10 * _GB}},
+     11 * _GB, None, "abc", False, False),
+    ("other_sig", {"state": "pending", "resume": {"count": 1, "last_ts": 1.0, "last_signature": "abc", "last_free_bytes": 10 * _GB}},
+     10 * _GB, None, "def", False, False),
+    ("enospc_no_gain", {"state": "pending", "interrupted": {"free_bytes_at_detection": 100}}, 100, None, "", False, True),
+    ("enospc_gain", {"state": "pending", "interrupted": {"free_bytes_at_detection": 100}}, 10 * _GB, None, "", False, True),
+    ("enospc_death_field", {"state": "pending", "interrupted": {"free_bytes_at_death": 100}}, 50, None, "", False, True),
+]
+
+
+def test_the_python_gate_gives_the_reasons_the_design_names():
+    from relay.fleet_resume import resume_gate
+    want = {"fresh": "ok", "stop": "stop_requested", "live": "coordinator_live",
+            "resumed": "state_resumed", "gave_up": "state_gave_up", "cap": "max_resumes",
+            "backoff": "backoff", "backoff_over": "ok", "backoff2": "backoff",
+            "floor_below": "below_floor", "floor_ok": "ok", "floor_zero": "ok",
+            "same_sig_no_gain": "same_crash_no_more_space", "same_sig_gain": "ok",
+            "other_sig": "ok", "enospc_no_gain": "disk_full_no_more_space",
+            "enospc_gain": "ok", "enospc_death_field": "disk_full_no_more_space"}
+    for name, rec, free, floor, sig, live, enospc in _GATE_CASES:
+        ok, reason = resume_gate(rec, _NOW, free, floor, sig, coordinator_live=live, enospc=enospc)
+        assert reason == want[name], (name, reason)
+        assert ok == (reason == "ok")
+
+
+@windows_only
+def test_the_powershell_gate_agrees_with_the_python_gate_on_every_case(src):
+    from relay.fleet_resume import resume_gate
+    work = tempfile.mkdtemp(prefix="sup_gate_parity_")
+    try:
+        cases = [{"name": n, "record": rec, "free": free, "floor": floor, "sig": sig,
+                  "live": live, "enospc": enospc}
+                 for n, rec, free, floor, sig, live, enospc in _GATE_CASES]
+        cases_path = os.path.join(work, "cases.json")
+        with open(cases_path, "w", encoding="ascii") as fh:
+            json.dump(cases, fh)
+        driver = os.path.join(work, "driver.ps1")
+        out = os.path.join(work, "out.json")
+        body = (
+            "param([string]$CasesFile, [string]$OutFile, [double]$Now)\n"
+            "$ErrorActionPreference = 'Stop'\n"
+            + _extract_braced_block(src, "function Get-FleetResumeGate") + "\n"
+            "$res = [ordered]@{}\n"
+            "foreach ($c in (Get-Content $CasesFile -Raw | ConvertFrom-Json)) {\n"
+            "  $res[$c.name] = Get-FleetResumeGate -Record $c.record -Now $Now -FreeBytes $c.free "
+            "-FloorGb $c.floor -Signature ([string]$c.sig) -CoordinatorLive:([bool]$c.live) "
+            "-Enospc:([bool]$c.enospc)\n"
+            "}\n"
+            "$res | ConvertTo-Json | Set-Content -Path $OutFile -Encoding ASCII\n")
+        with open(driver, "w", encoding="ascii") as fh:
+            fh.write(body)
+        proc = childproc.run(
+            [_POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", driver,
+             "-CasesFile", cases_path, "-OutFile", out, "-Now", str(_NOW)],
+            timeout=120, creationflags=childproc.headless_creationflags())
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        with open(out, "r", encoding="utf-8-sig") as fh:
+            ps = json.load(fh)
+        for n, rec, free, floor, sig, live, enospc in _GATE_CASES:
+            ok, reason = resume_gate(rec, _NOW, free, floor, sig, coordinator_live=live, enospc=enospc)
+            assert ps[n] == reason, "case %s: powershell says %r, python says %r" % (n, ps[n], reason)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)

@@ -102,19 +102,24 @@ def test_dead_pid_reaps_successfully(tmp_path):
     assert done_worker["closed"] is True
     assert len(done_worker["phase_events"]) == 1  # untouched
 
+    # The coordinator DIED (nobody asked for a stop): the unfinished worker is `interrupted`,
+    # a non-terminal resumable status, NOT `cancelled`; it is not closed.
     refuting_worker = next(w for w in status["workers"] if w["name"] == "w-refuting")
-    assert refuting_worker["closed"] is True
-    assert refuting_worker["status"] == "cancelled"
-    assert refuting_worker["outcome"] == "CANCELLED"
-    assert refuting_worker["pill"] == "停止"
-    assert refuting_worker["color"] == "muted"
-    assert isinstance(refuting_worker["reason"], str) and refuting_worker["reason"]
+    assert refuting_worker["closed"] is False
+    assert refuting_worker["status"] == "interrupted"
+    assert refuting_worker["outcome"] == "INTERRUPTED"
+    assert refuting_worker["pill"] == "中断"
+    assert refuting_worker["color"] == "warn"
+    assert refuting_worker["reason"].startswith("coordinator died")
+    assert refuting_worker["prior_status"] == "refuting"
     assert len(refuting_worker["phase_events"]) == 2
-    assert refuting_worker["phase_events"][-1]["event"] == "cancelled"
+    assert refuting_worker["phase_events"][-1]["event"] == "interrupted"
+    assert status["done_count"] == 1     # only the finished worker counts as done
 
     history = _read(os.path.join(fleet_dir, "history.json"))
     refuting_entry = next(e for e in history if e["name"] == "w-refuting")
-    assert refuting_entry["status"] == "cancelled"
+    assert refuting_entry["status"] == "interrupted"
+    assert refuting_entry["outcome"] == "INTERRUPTED"
     done_entry = next(e for e in history if e["name"] == "w-done")
     assert done_entry["status"] == "done"
 

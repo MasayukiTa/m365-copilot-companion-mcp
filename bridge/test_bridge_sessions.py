@@ -91,6 +91,38 @@ def test_should_autoresume_happy_path():
     assert "resumable" in reason
 
 
+def test_startup_candidate_never_searches_backward_for_an_attached_session():
+    newest = {"sid": "newest", "conv_url": ""}
+
+    class FakeStore:
+        def __init__(self):
+            self.latest_calls = 0
+
+        def latest_session(self):
+            self.latest_calls += 1
+            return newest
+
+        def latest_attached(self):
+            raise AssertionError("startup must not search backward for an attached session")
+
+    store = FakeStore()
+    got = B.startup_resume_candidate(store)
+    assert got is newest
+    assert store.latest_calls == 1
+    should, reason = B.should_autoresume(got)
+    assert should is False
+    assert "no conversation attached" in reason
+
+
+def test_startup_path_uses_the_tested_latest_session_candidate_helper():
+    from pathlib import Path
+    src = Path(B.__file__).read_text(encoding="utf-8")
+    i = src.index("# STARTUP AUTO-RESUME")
+    block = src[i:i + 1800]
+    assert "latest = startup_resume_candidate()" in block
+    assert "latest_attached()" not in block
+
+
 def test_should_autoresume_with_real_conv_url():
     sess = {"conv_url": "https://m365.cloud.microsoft/chat/agent/T_x/conversation/"
                           "9374821f-6bff-4050-b6fd-8a4338013664"}

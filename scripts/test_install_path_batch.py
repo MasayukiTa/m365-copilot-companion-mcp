@@ -247,6 +247,13 @@ def _quickstart_tree(root: Path, env_text: str, dt_exit: int = 1) -> Path:
     (tree / "setup.bat").write_text(STUB_SETUP, encoding="ascii")
     for s in ("quickstart_lock.ps1", "detect_proxy.ps1", "env_file.py"):
         shutil.copyfile(H.REPO / "scripts" / s, tree / "scripts" / s)
+    # env_file's legacy-secret migration lazily imports tools.secret_store for DPAPI. The real
+    # quickstart always runs from the repository root where tools/ exists, so the throwaway tree
+    # must carry that dependency too or this stops testing the shipped path and only tests an
+    # artificial ImportError hidden by quickstart's 2>nul capture.
+    (tree / "tools").mkdir(exist_ok=True)
+    shutil.copyfile(H.REPO / "tools" / "__init__.py", tree / "tools" / "__init__.py")
+    shutil.copyfile(H.REPO / "tools" / "secret_store.py", tree / "tools" / "secret_store.py")
     (tree / "scripts" / "setup_devtunnel.ps1").write_text(
         STUB_DEVTUNNEL.replace("exit 1", "exit %d" % dt_exit), encoding="ascii")
     (tree / ".env").write_bytes(env_text.encode("utf-8"))
@@ -290,7 +297,11 @@ def test_quickstart_n_removes_the_anonymous_opt_in_and_reports_a_failed_fetch(tm
     # D4
     text = (tree / ".env").read_bytes().decode("utf-8")
     assert "MCP_TUNNEL_ALLOW_ANONYMOUS" not in text, text
-    assert text == "MCP_API_KEY=k\r\n# — keep me\r\nOTHER=1\r\n", "other lines were disturbed"
+    assert "MCP_API_KEY=k" not in text, text
+    protected_line = next(line for line in text.splitlines() if line.startswith("MCP_API_KEY_PROTECTED="))
+    from tools.secret_store import unprotect_secret
+    assert unprotect_secret(protected_line.split("=", 1)[1]) == "k"
+    assert "OTHER=1" in text and "keep me" in text, "non-secret lines were disturbed"
     assert "Removed MCP_TUNNEL_ALLOW_ANONYMOUS" in out and "REVOKED" in out
     assert "no grant yet" not in out
     args = (tree / "devtunnel_args.txt").read_text(encoding="utf-8", errors="replace")

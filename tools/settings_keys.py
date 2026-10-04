@@ -56,10 +56,6 @@ UI_ONLY = "ui_only"            # never read outside the GUI
 
 EFFECTS = (LIVE, EACH_GATE, SWEEP_START, BRIDGE_START, UI_ONLY)
 
-#: Sentinel for "absent means undecided", which is not the same as "absent means this value".
-#: `fanout` is the only key with it: unset does not mean off, it means the length heuristic in
-#: relay/task_router.py decides, and writing a boolean here would state something false.
-UNDECIDED = object()
 
 
 class Key(object):
@@ -131,6 +127,56 @@ KEYS = OrderedDict([
        "relay/fleet_runner.py:settings_effort (once, in main)",
        "Takes effect on the NEXT run."),
 
+    _k("effort_policy", EACH_GATE, "off",
+       "relay/effort_policy.py:mode_info (every mode() call, mtime-cached)",
+       "off|shadow|on. Re-read at each policy decision (next worker, fan-out or turn "
+       "evaluation) with no restart; decisions already made stand. An MCP_EFFORT_POLICY "
+       "environment variable beats this setting and is reported as a conflict."),
+
+    # Sibling write scope (relay/write_scope.py). SHADOW ONLY: it records overlapping writes
+    # among siblings of one campaign and changes nothing. There is deliberately no `on` value;
+    # enforcing a write scope would go through the folder policy (frozen) and needs a separate
+    # approval before such a value may exist.
+    _k("fanout_write_scope", EACH_GATE, "off",
+       "relay/write_scope.py:mode (every coordinator sweep, mtime-cached)",
+       "off|shadow. Re-read at every sweep with no restart. shadow records a scope_overlap "
+       "row when two siblings write one path or one writes a path another's step names; "
+       "nothing is blocked and no prompt or output changes."),
+
+    # Per-tree fan-out budget (relay/fanout_budget.py). Read at each split decision; a tree
+    # already running keeps going, and the next split uses the new values.
+    _k("fanout_max_total", EACH_GATE, 24,
+       "relay/fanout_budget.py:limits_from_settings (every split decision)",
+       "Most workers one fan-out tree may hold, children and merge together (one slot is kept "
+       "for the merge). Re-read at each split; a split that would exceed it is trimmed or run "
+       "in one conversation. Default 24 changes nothing: one split makes at most 12 children."),
+
+    _k("fanout_max_active", EACH_GATE, 3,
+       "relay/fanout_budget.py:limits_from_settings (every split decision)",
+       "Most workers of one tree that may be running when it asks for more. Absent means the "
+       "operator's maxtabs (default 3, the fleet's own concurrency cap), so it never lowers "
+       "what the fleet already runs at."),
+
+    _k("fanout_max_turns", EACH_GATE, 400,
+       "relay/fanout_budget.py:limits_from_settings (every split decision)",
+       "Total conversation turns one tree may have used before it may not split again."),
+
+    _k("fanout_max_wall_min", EACH_GATE, 120,
+       "relay/fanout_budget.py:limits_from_settings (every split decision)",
+       "Minutes since a tree's root split before it may not split again."),
+
+    _k("fanout_max_depth", EACH_GATE, 1,
+       "relay/fanout.py:configured_max_depth (every split decision)",
+       "How many levels deep a fan-out tree may split (1..3). 1 means only the top-level goal "
+       "splits. The value reported as in effect (status.json fanout_depth) can be lower than "
+       "the setting while the merge of nested splits is not enabled."),
+
+    _k("fanout_hierarchical_merge", EACH_GATE, "off",
+       "relay/fanout.py:hierarchical_merge_setting (every split decision)",
+       "off|on. on lets fanout_max_depth above 1 take effect; off caps the depth at 1 whatever "
+       "fanout_max_depth says. Keep it off until nested merging has been verified with small "
+       "goals. Re-read at each split with no restart; trees already split keep going."),
+
     _k("autoretry", SWEEP_START, 1,
        "relay/fleet_runner.py:settings_autoretry (once, before the sweep)",
        "Takes effect on the NEXT run."),
@@ -141,11 +187,11 @@ KEYS = OrderedDict([
        "0 means off and only the file can say it, because the panel expresses off "
        "with the autoretry toggle instead."),
 
-    _k("fanout", SWEEP_START, UNDECIDED,
+    _k("fanout", SWEEP_START, True,
        "relay/task_router.py:_wants_fanout (once per autostart goal)",
-       "Governs goals that arrive through autostart only; a run launched from the cockpit "
-       "carries the checkbox as a flag instead. Unset means UNDECIDED -- a length heuristic "
-       "decides, it does not mean off."),
+       "Governs every coordinator start (autostart and the cockpit's own launches). Unset "
+       "means ON: only an explicit fanout=off turns it off. Each goal is still judged "
+       "separately, so a goal that fits costs nothing."),
 
     _k("fleet_log_days", SWEEP_START, 14.0,
        "relay/fleet_retention.py:apply (once, at coordinator start)",

@@ -581,3 +581,40 @@ def test_supervisor_bridge_port_follows_env_file(src):
     stale = _extract_braced_block(src, "function Invoke-StaleServerCycle")
     assert 'http://127.0.0.1:$BridgePort/status' in stale
     assert '127.0.0.1:8765/status' not in stale
+
+def test_global_mutex_created_new_branch_exits_the_loser(src, tmp_path):
+    """Exercise the exact supervisor mutex guard against a held unique named mutex."""
+    start = src.index("$createdNew = $false")
+    end = src.index("\nfunction Write-Log", start)
+    guard = src[start:end]
+    guard = guard.replace('\"Global\\m365-copilot-companion-supervisor\"', '$Name')
+
+    ps = tmp_path / "mutex_guard.ps1"
+    log = tmp_path / "mutex_guard.log"
+    script = r'''param([string]$Log)
+$ErrorActionPreference = "Stop"
+function Invoke-Guard([string]$Name, [string]$Log) {
+%s
+    return "continued"
+}
+$name1 = "Local\mcp-supervisor-guard-test-$PID-$([guid]::NewGuid().ToString('N'))"
+$firstCreated = $false
+$held = New-Object System.Threading.Mutex($true, $name1, [ref]$firstCreated)
+$loser = Invoke-Guard -Name $name1 -Log $Log
+$loserLogged = (Test-Path $Log) -and ((Get-Content $Log -Raw) -match "another supervisor already running -> exiting")
+try { $held.ReleaseMutex() } catch { }
+$held.Dispose()
+$name2 = "Local\mcp-supervisor-guard-test-$PID-$([guid]::NewGuid().ToString('N'))"
+$winner = Invoke-Guard -Name $name2 -Log $Log
+[ordered]@{ firstCreated=$firstCreated; loserWasNull=($null -eq $loser); loserLogged=$loserLogged; winner=$winner } | ConvertTo-Json -Compress
+''' % guard
+    ps.write_text(script, encoding="utf-8")
+    proc = childproc.run([_POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                          "-File", str(ps), "-Log", str(log)],
+                         timeout=60, creationflags=childproc.headless_creationflags())
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    data = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert data["firstCreated"] is True
+    assert data["loserWasNull"] is True
+    assert data["loserLogged"] is True
+    assert data["winner"] == "continued"

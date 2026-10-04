@@ -1,4 +1,4 @@
-# N independent solves of the SAME instances at the SAME effort.
+﻿# N independent solves of the SAME instances at the SAME effort.
 #
 # WHY THIS AND NOT THE EFFORT A/B. Best-of-N only adds value where the candidates DISAGREE,
 # and the effort A/B produced three arms that agreed on all six instances -- same five
@@ -83,7 +83,9 @@ for ($k = 1; $k -le $N; $k++) {
     $submitted = $false
     for ($try = 1; $try -le 3 -and -not $submitted; $try++) {
         try {
-            & powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\win\submit_via_ui.ps1 -GoalFile "$OutDir/lines_$k.txt" 2>&1 |
+            # Already inside PowerShell. Invoke the UI submitter in-process: spawning another
+            # powershell.exe from an unattended/console-less parent can allocate a visible console.
+            & .\scripts\win\submit_via_ui.ps1 -GoalFile "$OutDir/lines_$k.txt" 2>&1 |
                 Select-Object -Last 4 | ForEach-Object { Say ("submit: " + $_) }
             $submitted = $true
         } catch { Say ("submit {0}/3 failed: {1}" -f $try, $_.Exception.Message); Start-Sleep -Seconds 20 }

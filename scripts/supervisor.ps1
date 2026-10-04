@@ -50,7 +50,10 @@ param(
     # Dry-run the fleet coordinator auto-resume check only: log what WOULD happen
     # (marker found, pid dead, would relaunch with these args) without actually
     # starting a process. Used for verification -- never triggers a real relaunch.
-    [switch]$FleetResumeDryRun
+    [switch]$FleetResumeDryRun,
+    # The per-cycle resume check (after the reap) is DRY-RUN unless this is passed: it logs what
+    # it would relaunch and never starts a process. The startup check keeps its own switch above.
+    [switch]$FleetCycleResumeLive
 )
 
 $ErrorActionPreference = "SilentlyContinue"
@@ -168,8 +171,56 @@ if (-not $createdNew) {
     return
 }
 
+# Bind planned-restart telemetry to THIS supervisor instance, not merely its reusable PID.
+# Windows can recycle a PID after this process dies; a stale marker must not keep a real outage
+# amber just because an unrelated process later receives the same number.
+try {
+    $selfProc = Get-Process -Id $PID -ErrorAction Stop
+    $SupervisorStartedUnix = [DateTimeOffset]::new($selfProc.StartTime.ToUniversalTime()).ToUnixTimeSeconds()
+} catch {
+    # Ownership evidence is mandatory for new markers. If process birth cannot be measured,
+    # leave zero so the reader fails closed instead of trusting an unverifiable marker.
+    $SupervisorStartedUnix = 0
+}
+
 function Write-Log($msg) {
     "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $msg" | Out-File -FilePath $Log -Append -Encoding utf8
+}
+
+# The cockpit must distinguish "the server died" from "the supervisor is deliberately
+# replacing stale code".  Without a machine-readable transition, both are a few seconds of
+# connection refused and both render as the same red Server/Tunnel pair.  This marker is advisory
+# only and intentionally short-lived on the reader side; a stale file can never mask a real outage.
+$ServerTransitionPath = Join-Path (Join-Path $Root ".fleet") "server_transition.json"
+
+function Write-ServerTransition([string]$Reason) {
+    try {
+        if ([string]::IsNullOrWhiteSpace($Reason)) { return }
+        if (-not (Test-Path $FleetDir)) { New-Item -ItemType Directory -Path $FleetDir -Force | Out-Null }
+        $tmp = $ServerTransitionPath + ".tmp." + $PID
+        $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        # Keep the UI's planned-restart state aligned with THIS supervisor's actual policy:
+        # main.py may spend StartupGraceSeconds alive-but-not-listening, then ordinary failure
+        # debounce still consumes FailuresBeforeAction * IntervalSeconds before another action.
+        $transitionBudgetSeconds = $StartupGraceSeconds + ($FailuresBeforeAction * $IntervalSeconds)
+        if ($transitionBudgetSeconds -lt 1) { $transitionBudgetSeconds = 1 }
+        $body = [ordered]@{
+            state = "planned_restart"
+            reason = $Reason
+            started = $now
+            expires = $now + $transitionBudgetSeconds
+            supervisor_pid = $PID
+            supervisor_started = $SupervisorStartedUnix
+        } | ConvertTo-Json -Compress
+        [IO.File]::WriteAllText($tmp, $body, (New-Object Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $tmp -Destination $ServerTransitionPath -Force
+    } catch {
+        # Health telemetry must never be able to block the restart it describes.
+    }
+}
+
+function Clear-ServerTransition {
+    try { Remove-Item -LiteralPath $ServerTransitionPath -Force -ErrorAction SilentlyContinue } catch { }
 }
 
 # -- WHICH PYTHON: re-decided before every launch, not once at startup (new-PC analysis D2) ----
@@ -577,6 +628,7 @@ function Invoke-StaleServerCycle {
     # Get-ServerExitRecord (see Start-Server) will show for this cycle's exit record instead of
     # the generic default Start-Server falls back to when nothing upstream has said why.
     $script:ServerPlannedEndReason = "stale code cycle"
+    Write-ServerTransition $script:ServerPlannedEndReason
     Start-Server
 }
 
@@ -1456,12 +1508,86 @@ function Test-FleetShouldAutoResume {
     # its recorded pid is DEAD -> resume. Marker absent, or its pid is still alive
     # (already running -- never double-launch) -> do nothing. Kept side-effect free so it
     # can be exercised with a fake marker + a known-dead pid (see docs/validation notes).
-    param($Marker)
+    #
+    # With -Gate it ALSO applies the loop guard, mirroring relay.fleet_resume.resume_gate()
+    # (Get-FleetResumeGate below): stop requested, coordinator live, max 3 automatic resumes,
+    # backoff 5 min * 2^count, disk floor (READ from settings, never chosen here), and the same
+    # crash with no more free space than last time. Without -Gate the old behaviour is unchanged.
+    param($Marker, [switch]$Gate, $Record = $null, $FreeBytes = $null, $FloorGb = $null,
+          [string]$Signature = "", [double]$Now = 0, [switch]$CoordinatorLive, [switch]$Enospc)
     if ($null -eq $Marker) { return $false }
     $procId = 0
     try { $procId = [int]$Marker.pid } catch { return $false }
     if ($procId -le 0) { return $false }
-    return -not (Test-PidAlive -ProcId $procId)
+    if (Test-PidAlive -ProcId $procId) { return $false }
+    if (-not $Gate) { return $true }
+    $reason = Get-FleetResumeGate -Record $Record -Now $Now -FreeBytes $FreeBytes -FloorGb $FloorGb `
+        -Signature $Signature -CoordinatorLive:$CoordinatorLive -Enospc:$Enospc
+    return ($reason -eq "ok")
+}
+
+function Get-FleetResumeGate {
+    # PURE. MIRRORS relay.fleet_resume.resume_gate(): returns "ok" or the refusal reason, first
+    # refusal wins, same order and same reason strings. scripts/test_supervisor_fleet_resume_guard.py
+    # feeds one table of cases to both and fails if they differ. MAX 3 / 300 s are the design's
+    # proposed loop-guard numbers (relay.fleet_resume.MAX_AUTO_RESUMES / BACKOFF_BASE_S).
+    param($Record = $null, [double]$Now = 0, $FreeBytes = $null, $FloorGb = $null,
+          [string]$Signature = "", [switch]$CoordinatorLive, [switch]$Enospc)
+    if ($Now -le 0) { $Now = [double][DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
+    $intr = $null
+    if ($Record) { $intr = $Record.interrupted }
+    if ($Record -and $Record.stop_requested -eq $true) { return "stop_requested" }
+    if ($intr -and $intr.stop_requested -eq $true) { return "stop_requested" }
+    if ($CoordinatorLive) { return "coordinator_live" }
+    $state = "pending"
+    if ($Record -and $Record.state) { $state = [string]$Record.state }
+    if ($state -ne "pending") { return ("state_" + $state) }
+    $res = $null
+    if ($Record) { $res = $Record.resume }
+    $count = 0
+    if ($res -and $null -ne $res.count) { $count = [int]$res.count }
+    if ($count -ge 3) { return "max_resumes" }
+    $lastTs = $null
+    if ($res -and $null -ne $res.last_ts) { $lastTs = [double]$res.last_ts }
+    if ($count -gt 0 -and $null -ne $lastTs) {
+        if ($Now -lt ($lastTs + (300.0 * [math]::Pow(2, $count)))) { return "backoff" }
+    }
+    $free = $null
+    if ($null -ne $FreeBytes) { $free = [double]$FreeBytes }
+    $floor = $null
+    if ($null -ne $FloorGb) { $floor = [double]$FloorGb }
+    if ($null -ne $floor -and $floor -gt 0 -and $null -ne $free -and $free -lt ($floor * 1073741824.0)) {
+        return "below_floor"
+    }
+    $prev = $null
+    if ($res -and $null -ne $res.last_free_bytes) { $prev = [double]$res.last_free_bytes }
+    elseif ($intr -and $null -ne $intr.free_bytes_at_detection) { $prev = [double]$intr.free_bytes_at_detection }
+    elseif ($intr -and $null -ne $intr.free_bytes_at_death) { $prev = [double]$intr.free_bytes_at_death }
+    $noGain = ($null -eq $free) -or ($null -eq $prev) -or ($free -le $prev)
+    $lastSig = ""
+    if ($res -and $res.last_signature) { $lastSig = [string]$res.last_signature }
+    if ($Signature -and ($Signature -eq $lastSig) -and $noGain) { return "same_crash_no_more_space" }
+    if ($Enospc -and $noGain) { return "disk_full_no_more_space" }
+    return "ok"
+}
+
+function Get-FleetPendingSnapshot {
+    # The newest .fleet\interrupted\*.json whose state is "pending" (relay.fleet_reaper writes
+    # it before it removes the live marker), as @{ Path; Data }, or $null. Mirrors
+    # relay.fleet_reaper.read_interrupted_snapshot(). Never throws.
+    try {
+        $dir = Join-Path $FleetDir "interrupted"
+        if (-not (Test-Path $dir)) { return $null }
+        $best = $null
+        foreach ($f in (Get-ChildItem -Path $dir -Filter "*.json" -File -ErrorAction SilentlyContinue)) {
+            try { $d = (Get-Content -Path $f.FullName -Raw -ErrorAction Stop) | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+            if (-not $d -or $d.state -ne "pending") { continue }
+            $ts = 0.0
+            try { $ts = [double]$d.written_ts } catch { $ts = 0.0 }
+            if ($null -eq $best -or $ts -gt $best.Ts) { $best = @{ Path = $f.FullName; Data = $d; Ts = $ts } }
+        }
+        return $best
+    } catch { return $null }
 }
 
 # A COORDINATOR OF THIS CHECKOUT THAT IS ALREADY RUNNING. A MIRROR, NOT A SHARED COPY, of
@@ -1482,18 +1608,39 @@ function Get-ThisCheckoutFleetCoordinatorPids {
 # Get-FleetReapHoldReason.
 $script:ResumedFleet = $null
 
+# THE PER-TICK RESUME CHECK RUNS EVERY CYCLE and, in dry-run or while refused, would repeat the
+# same lines every cycle. Keys already logged in this supervisor's life are not logged again.
+$script:FleetCycleNoted = @{}
+
+function Write-FleetResumeLog {
+    param([string]$Msg, [string]$Key, [switch]$Once)
+    if ($Once) {
+        if ($script:FleetCycleNoted.ContainsKey($Key)) { return }
+        $script:FleetCycleNoted[$Key] = $true
+    }
+    Write-Log $Msg
+}
+
 function Invoke-FleetAutoResume {
     # Returns $true iff it (would have) relaunched the coordinator; $false otherwise.
     # -DryRun logs the would-be relaunch command without starting a process.
-    param([switch]$DryRun)
+    # The resume SOURCE is the live marker, else the marker copy in the newest pending
+    # .fleet\interrupted\*.json (the reaper removes the live marker once it has marked the
+    # run interrupted). A snapshot source is also put through the loop guard
+    # (Get-FleetResumeGate). -FromCycle marks the per-tick call, which is quieter when there is
+    # nothing to do.
+    param([switch]$DryRun, [switch]$FromCycle)
     if (-not (Test-FleetAutoResumeEnabled)) {
-        Write-Log "fleet auto-resume disabled via MCP_FLEET_AUTORESUME -- skipping check"
+        if (-not $FromCycle) { Write-Log "fleet auto-resume disabled via MCP_FLEET_AUTORESUME -- skipping check" }
         return $false
     }
     $marker = Get-FleetActiveMarker
-    if (-not (Test-FleetShouldAutoResume $marker)) {
-        return $false
+    $snap = $null
+    if ($null -eq $marker) {
+        $snap = Get-FleetPendingSnapshot
+        if ($snap -and $snap.Data.marker) { $marker = $snap.Data.marker }
     }
+    if (-not (Test-FleetShouldAutoResume $marker)) { return $false }
     # A DEAD PID IN THE MARKER DOES NOT MEAN NOTHING IS RUNNING. A coordinator resumed a moment
     # ago -- by start_all's resume_interrupted_fleet.py, or by hand -- writes its fresh marker
     # only after its imports and ledger load, so for that window the marker still names the
@@ -1502,18 +1649,50 @@ function Invoke-FleetAutoResume {
     # Get-FleetResumeSkipReason); this is the supervisor's side of that rule.
     $runningCoordinators = @(Get-ThisCheckoutFleetCoordinatorPids | Where-Object { $_ })
     if ($runningCoordinators.Count -gt 0) {
-        Write-Log ("fleet run marker names dead pid $($marker.pid), but a fleet coordinator of this checkout " +
+        Write-FleetResumeLog -Once:$FromCycle -Key "$($marker.pid):live" -Msg ("fleet run marker names dead pid $($marker.pid), but a fleet coordinator of this checkout " +
                    "is already running (pid " + ($runningCoordinators -join ", ") + ") -- not resuming a second one")
         return $false
+    }
+    $freeNow = $null
+    $signature = ""
+    $enospc = $false
+    if ($snap) {
+        # THE LOOP GUARD, snapshot source only. The floor is READ (settings.txt via the
+        # product's own accessor) and never chosen here; no value is defined in this script.
+        try { $freeNow = [int64](New-Object System.IO.DriveInfo ([System.IO.Path]::GetPathRoot($FleetDir))).AvailableFreeSpace } catch { $freeNow = $null }
+        $floorGb = $null
+        try {
+            $f = & $Py -c "import sys; sys.path.insert(0, r'$Root'); from relay.fleet_runner import settings_disk_floor; print(settings_disk_floor())" 2>$null
+            $parsed = 0.0
+            if ($f -and [double]::TryParse(([string]$f).Trim(), [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$parsed) -and $parsed -gt 0) { $floorGb = $parsed }
+        } catch { $floorGb = $null }
+        try {
+            $sigOut = & $Py -c "import sys, json; sys.path.insert(0, r'$Root'); sys.path.insert(0, r'$Root\scripts\win'); import resume_interrupted_fleet as r; d = r.fleet_resume_record(r'$($snap.Path)'); s, e = r.signature_for(r'$FleetDir', d, d.get('marker') or {}); print(s + ' ' + str(int(e)))" 2>$null
+            $parts = ([string]$sigOut).Trim() -split ' '
+            if ($parts.Count -ge 1 -and $parts[0]) { $signature = $parts[0] }
+            if ($parts.Count -ge 2 -and $parts[1] -eq "1") { $enospc = $true }
+        } catch { }
+        $reason = Get-FleetResumeGate -Record $snap.Data -Now 0 -FreeBytes $freeNow -FloorGb $floorGb `
+            -Signature $signature -CoordinatorLive:($runningCoordinators.Count -gt 0) -Enospc:$enospc
+        if ($reason -ne "ok") {
+            Write-FleetResumeLog -Once:$FromCycle -Key "$($marker.pid):refused:$reason" -Msg "fleet auto-resume REFUSED for pid $($marker.pid): $reason (free bytes $freeNow)"
+            if (-not $DryRun) {
+                # persist the refusal in the snapshot (max_resumes flips it to gave_up)
+                try {
+                    & $Py -c "import sys, time; sys.path.insert(0, r'$Root'); from relay import fleet_resume; fleet_resume.record_blocked(r'$($snap.Path)', time.time(), '$reason', $(if ($null -ne $freeNow) { $freeNow } else { 'None' }), '$signature')" 2>$null | Out-Null
+                } catch { }
+            }
+            return $false
+        }
     }
     Update-PythonInterpreter "the fleet auto-resume"
     $resumeArgs = @()
     if ($marker.resume_argv) { $resumeArgs = @($marker.resume_argv) }
     $resumeArgs = @($resumeArgs) + "--resume"
     $shown = ($resumeArgs -join " ")
-    Write-Log "fleet run INTERRUPTED (marker pid $($marker.pid) is dead) -> auto-resuming: python -m relay.fleet_runner $shown"
+    Write-FleetResumeLog -Once:($FromCycle -and $DryRun) -Key "$($marker.pid):dry" -Msg "fleet run INTERRUPTED (marker pid $($marker.pid) is dead) -> auto-resuming: python -m relay.fleet_runner $shown"
     if ($DryRun) {
-        Write-Log "fleet auto-resume DRY RUN -- not relaunching (verification mode)"
+        Write-FleetResumeLog -Once:($FromCycle -and $DryRun) -Key "$($marker.pid):dry2" -Msg "fleet auto-resume DRY RUN -- not relaunching (verification mode)"
         return $true
     }
     try {
@@ -1524,8 +1703,21 @@ function Invoke-FleetAutoResume {
         # before main() runs. Registering it here is what lets Invoke-AutoResumeRunnerCheck
         # (see its header, above the marker-path variables) read the exit code back later.
         $fleetLaunchAt = Get-Date
-        $fleetProc = Start-Process -FilePath $Py -ArgumentList (@("-m", "relay.fleet_runner") + $resumeArgs) `
-            -WorkingDirectory $Root -WindowStyle Hidden -PassThru
+        # WHICH INTERRUPTED RUN THIS ONE DESCENDS FROM, so a run that dies again keeps the
+        # resume count (relay.fleet_reaper inherits it from the marker's resume_lineage).
+        $hadLineage = Test-Path Env:MCP_FLEET_RESUME_LINEAGE
+        if ($snap -and $snap.Data.run_id) { $env:MCP_FLEET_RESUME_LINEAGE = [string]$snap.Data.run_id }
+        try {
+            $fleetProc = Start-Process -FilePath $Py -ArgumentList (@("-m", "relay.fleet_runner") + $resumeArgs) `
+                -WorkingDirectory $Root -WindowStyle Hidden -PassThru
+        } finally {
+            if (-not $hadLineage) { Remove-Item Env:MCP_FLEET_RESUME_LINEAGE -ErrorAction SilentlyContinue }
+        }
+        if ($snap -and $fleetProc) {
+            try {
+                & $Py -c "import sys, time; sys.path.insert(0, r'$Root'); from relay import fleet_resume; fleet_resume.record_resume(r'$($snap.Path)', time.time(), $(if ($null -ne $freeNow) { $freeNow } else { 'None' }), '$signature')" 2>$null | Out-Null
+            } catch { }
+        }
         Register-AutoResumeRunner -Proc $fleetProc -LaunchTime $fleetLaunchAt -Kind "fleet" `
             -CommandLine ('"' + $Py + '" -m relay.fleet_runner ' + $shown)
         if ($fleetProc) { $script:ResumedFleet = @{ Proc = $fleetProc; OldPid = [int]$marker.pid } }
@@ -2163,6 +2355,9 @@ while ($true) {
     # Wait-ForNextTick below does not run an express pass for a job this pass was already shown.
     $shownToPass = Get-PendingJobNames -Dir $PendingDir
     Invoke-FleetReap
+    # AFTER the reap, which is what turns a dead coordinator's marker into a pending snapshot.
+    # Dry-run by default (FleetCycleResumeLive is the explicit opt-in).
+    Invoke-FleetAutoResume -DryRun:(-not $FleetCycleResumeLive) -FromCycle | Out-Null
     Invoke-QueueDrain
     foreach ($n in $shownToPass) { [void]$script:ExpressSeen.Add($n) }
 
@@ -2178,6 +2373,9 @@ while ($true) {
 
     if (Test-ServerUp) {
         $serverMiss = 0
+        # The planned-transition marker is useful only while the replacement server is absent.
+        # Clear any old marker first; Invoke-StaleServerCycle may immediately publish a fresh one.
+        Clear-ServerTransition
         Invoke-StaleServerCycle
     } else {
         # DO NOT KILL A SERVER THAT IS STILL STARTING. main.py takes 10-25 seconds just to

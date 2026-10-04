@@ -183,7 +183,7 @@ def task_envelope_from_goal(goal: dict[str, Any] | str, default_role: str = "pro
         text = str(goal.get("text") or goal.get("goal") or "")
         metadata = dict(goal.get("metadata") or {})
         for key in ("scope", "files", "output_contract", "authorization_preamble",
-                    "prohibited_actions", "dimension", "resilience_profile"):
+                    "prohibited_actions", "dimension", "resilience_profile", "root_id"):
             if key in goal and key not in metadata:
                 metadata[key] = copy.deepcopy(goal[key])
         return TaskEnvelope(

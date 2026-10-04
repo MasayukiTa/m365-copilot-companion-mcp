@@ -464,6 +464,71 @@ ACTING = (
 )
 
 
+# English negative imperatives are constraints, not effects.  This matters especially for the
+# fleet's own READ-ONLY audit prompts: "Do not edit, write, create, delete, commit, push..."
+# used to trip every action keyword and turn a safely-repeatable review into a landed-action
+# refusal.  Strip ONLY an explicitly-negated CLAUSE before scanning for ACTING verbs.
+#
+# This is deliberately conservative.  Negation-inverting phrases ("do not forget to send",
+# "do not just review, send...") remain untouched. Any contrast/exception/condition marker
+# ("but/instead/except/unless") also leaves the WHOLE clause acting; interpreting its scope
+# would risk deleting the very action whose delivery is uncertain. An ambiguous comma-separated clause with multiple action
+# verbs but no and/or list marker is also left acting rather than risk hiding a real imperative.
+_NEGATED_ACTION_PREFIX = re.compile(
+    r"^\s*(?:do\s+not|don't|dont|must\s+not|mustn't|should\s+not|shouldn't|cannot|can't)\b\s*(?P<body>.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_NEGATION_INVERTER = re.compile(
+    r"^\s*(?:forget|fail|hesitate|neglect|avoid|just|only|merely)\b", re.IGNORECASE)
+_NEGATION_PIVOT = re.compile(
+    r"\b(?:but|however|instead|rather|except|unless)\b", re.IGNORECASE)
+_NEGATION_CLAUSE_SPLIT = re.compile(r"([.;\n]+)")
+
+
+def _action_scan_text(goal: str) -> str:
+    """Text whose explicit negative-imperative clauses cannot trigger ``ACTING``.
+
+    This is NOT a general natural-language negation engine.  It handles the narrow syntax the
+    product itself emits for read-only work while preserving the safe default for ambiguous text.
+    """
+    parts = _NEGATION_CLAUSE_SPLIT.split(goal or "")
+    out = []
+    for idx, segment in enumerate(parts):
+        if idx % 2:                     # punctuation/newline separator
+            out.append(segment)
+            continue
+        m = _NEGATED_ACTION_PREFIX.match(segment)
+        if not m:
+            out.append(segment)
+            continue
+        body = m.group("body") or ""
+
+        # "Do not forget to send" / "do not just review, send" are positive imperatives
+        # wrapped in negation.  Never hide their action verbs.
+        if _NEGATION_INVERTER.match(body):
+            out.append(segment)
+            continue
+
+        # Contrast/exception/condition makes scope ambiguous. Fail closed: retain the whole
+        # segment so any action verb, including one before "unless", remains visible.
+        if _NEGATION_PIVOT.search(body):
+            out.append(segment)
+            continue
+
+        # A comma can either enumerate prohibitions or separate two imperatives.  A proper
+        # prohibition list normally carries and/or; without it, multiple acting verbs are
+        # ambiguous, so retain the whole clause and fail closed as acting.
+        hits = sum(1 for pattern in ACTING if re.search(pattern, body, re.IGNORECASE))
+        if "," in body and hits >= 2 and not re.search(r"\b(?:and|or)\b", body, re.IGNORECASE):
+            out.append(segment)
+            continue
+
+        # The entire clause is an explicit prohibition.  Preserve only its separator (handled
+        # by the next split part); no action from this clause should affect resend policy.
+        out.append("")
+    return "".join(out)
+
+
 def goal_may_act(goal: str) -> bool:
     """Whether re-sending this goal's turn could repeat something done to the world.
 
@@ -471,7 +536,7 @@ def goal_may_act(goal: str) -> bool:
     reconnect path and the tab fallback both re-sent the turn verbatim, and the only guard
     was a count of how many times they had done it.
     """
-    text = (goal or "")
+    text = _action_scan_text(goal or "")
     for pattern in ACTING:
         if re.search(pattern, text, re.IGNORECASE):
             return True

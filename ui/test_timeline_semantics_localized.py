@@ -1,5 +1,5 @@
 ﻿# -*- coding: utf-8 -*-
-"""Execution timeline keeps its historical semantic colours and follows the UI language."""
+"""Expanded execution-history timeline keeps semantic colours and localized vocabulary."""
 from pathlib import Path
 
 THEME = Path(__file__).with_name('Theme.cs').read_text(encoding='utf-8')
@@ -54,14 +54,14 @@ def test_timeline_status_lookup_normalizes_protocol_event_case():
     assert 'canonical.Trim().ToLowerInvariant()' in THEME
 
 
-def test_spine_uses_timeline_colour_and_localized_labels():
-    i = COCKPIT.index('UIElement BuildSpineContent(')
-    b = COCKPIT[i:COCKPIT.index('\n    //', i + 14000)]
-    assert 'Theme.TimelineLabel(peEvent, _lang)' in b
-    assert 'Theme.TimelineColor(peEvent, _dark)' in b
-    assert 'sectionLbl.Text = ja ? "実行タイムライン" : "Execution timeline";' in b
-    assert 'ja ? "(フェーズ遷移)" : "(phase transitions)"' in b
-    assert 'ja ? "(会話ターンから推定)" : "(estimated from turns)"' in b
+def test_left_spine_reuses_the_execution_timeline_contract():
+    helper = COCKPIT[COCKPIT.index('void AddSpineTimeline('):COCKPIT.index('UIElement BuildSpineContent(')]
+    spine = COCKPIT[COCKPIT.index('UIElement BuildSpineContent('):COCKPIT.index('List<Tuple<string, string>> BuildTimelineEvents', COCKPIT.index('UIElement BuildSpineContent('))]
+    assert '"Content details"' in spine
+    assert 'AddSpineTimeline(outer, primaryWorker);' in spine
+    assert '"Execution timeline"' in helper
+    assert 'BuildTimelineEvents(' in helper
+    assert '"phase_events"' in helper
 
 
 def test_expanded_timeline_no_longer_forces_every_event_to_muted_gray():
@@ -86,27 +86,15 @@ def test_neutral_timeline_uses_graphite_not_body_black():
     assert 'return Secondary(dark);' in block
 
 def test_color_restore_does_not_rewrite_historical_event_wording():
-    # 053a0ff was meant to restore semantic colours, but it also changed operator-facing copy.
-    # Keep the event-history wording that existed immediately before that colour-only repair.
-    i = COCKPIT.index('UIElement BuildSpineContent(')
-    spine = COCKPIT[i:COCKPIT.index('\
-    //', i + 18000)]
-    assert 'string qLabel = ja ? "投入" : "Queued";' in spine
-    assert 'string sLabel = ja ? "開始" : "Started";' in spine
-    assert 'phLabel = ja ? "要対応" : "Needs attention";' in spine
-    assert 'phLabel = ja ? "検証中" : "Verifying";' in spine
-    assert spine.count('phLabel = ja ? "実行中" : "Running";') >= 2
-    assert '(ja ? "(会話ターンから推定)" : "(estimated from turns)")' in spine
-
+    # Timeline evidence now lives only in the expanded card. Keep its historical fallback wording
+    # stable while allowing the left task-inspection surface to evolve independently.
     i = COCKPIT.index('List<Tuple<string, string>> BuildTimelineEvents')
-    timeline = COCKPIT[i:COCKPIT.index('\
-    double ReadTranscriptStartTs', i)]
+    timeline = COCKPIT[i:COCKPIT.index('double ReadTranscriptStartTs', i)]
     assert 'queuedTs + (ja ? "投入" : "Queued")' in timeline
     assert 'startTs + (ja ? "開始" : "Started")' in timeline
     assert 'ja ? ("レビュー (" + reviews + "x)")' in timeline
     assert 'outcomeEv = ja ? "ターン上限" : "Max turns reached"' in timeline
     assert 'outcomeEv = ja ? "停滞" : "Stuck"' in timeline
-    # Colour semantics remain the newer implementation.
     assert 'Theme.TimelineColor("pending", _dark)' in timeline
     assert 'Theme.TimelineColor("ready", _dark)' in timeline
 
@@ -137,6 +125,10 @@ def test_real_mode_uses_event_history_vocabulary_not_status_chip_copy():
         assert f'case "{key}"' in t
         assert ja in t and en in t
 
-    # Both REAL phase-event renderers must use TimelineLabel; status chips keep StatusLabel.
-    assert COCKPIT.count('Theme.TimelineLabel(peEvent, _lang)') >= 2
-    assert 'Theme.StatusLabel(peEvent, _lang)' not in COCKPIT
+    # Both surfaces share BuildTimelineEvents; protocol event labels are produced there once and
+    # consumed by both the left Spine and the expanded-card Timeline.
+    assert COCKPIT.count('Theme.TimelineLabel(peEvent, _lang)') == 1
+    helper = COCKPIT[COCKPIT.index('void AddSpineTimeline('):COCKPIT.index('UIElement BuildSpineContent(')]
+    assert 'BuildTimelineEvents(' in helper
+    timeline = COCKPIT[COCKPIT.index('List<Tuple<string, string>> BuildTimelineEvents'):]
+    assert 'Theme.StatusLabel(peEvent, _lang)' not in timeline

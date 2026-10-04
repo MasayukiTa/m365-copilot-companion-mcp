@@ -1024,6 +1024,104 @@ def test_a_ping_only_socket_turn_does_not_get_twenty_minutes_of_patience(monkeyp
     assert w.status == "ready"
 
 
+
+
+def _waiting_socket_worker(idle_s, *, socket=True):
+    import time as _t
+    w = _worker()
+    w.socket = socket
+    w.drv = _GenDrv2(generating=True, idle_s=idle_s)
+    w.status = "waiting"
+    w._count_before = 0
+    w._t_send = _t.time() - 100.0   # below the old 240s outer timeout
+    return w
+
+
+def test_waiting_socket_uses_meaningful_idle_watchdog_before_outer_timeout(monkeypatch):
+    monkeypatch.setattr(rf, "SOCKET_MEANINGFUL_IDLE_S", 90.0)
+    w = _waiting_socket_worker(91.0)
+    assert w.poll() is False
+    assert "no meaningful progress" in w.drv.failed
+    assert "reconnect/fallback" in w.reason
+    assert w.status == "ready"
+    assert w.transient == 0, "transport stall detection is not a turn-timeout retry"
+
+
+def test_waiting_socket_with_recent_progress_keeps_waiting(monkeypatch):
+    monkeypatch.setattr(rf, "SOCKET_MEANINGFUL_IDLE_S", 90.0)
+    w = _waiting_socket_worker(89.0)
+    assert w.poll() is False
+    assert not w.drv.failed
+    assert w.status == "waiting"
+
+
+
+
+def test_socket_idle_probe_records_each_threshold_once_per_turn(monkeypatch):
+    import relay.relay_fleet as rf
+
+    class Recorder:
+        def __init__(self):
+            self.events = []
+        def record(self, event, **fields):
+            self.events.append((event, fields))
+
+    rec = Recorder()
+    monkeypatch.setattr(rf, "_socket_route", lambda: rec)
+    monkeypatch.setattr(rf, "SOCKET_MEANINGFUL_IDLE_S", 90.0)
+    monkeypatch.setattr(rf, "SOCKET_IDLE_PROBE_BUCKETS", (5.0, 10.0, 20.0, 30.0, 45.0, 60.0, 90.0))
+
+    w = _waiting_socket_worker(12.0)
+    w.turn = 3
+    assert w._socket_meaningful_idle_stalled() is False
+    assert [e[1]["bucket_s"] for e in rec.events] == [5.0, 10.0]
+    assert all(e[0] == "socket_idle_probe" for e in rec.events)
+    assert all(e[1]["turn"] == 3 for e in rec.events)
+
+    # Same turn does not spam the same buckets. Crossing one new boundary adds one record.
+    w.drv.idle_s = 24.0
+    assert w._socket_meaningful_idle_stalled() is False
+    assert [e[1]["bucket_s"] for e in rec.events] == [5.0, 10.0, 20.0]
+    w.drv.idle_s = 24.0
+    assert w._socket_meaningful_idle_stalled() is False
+    assert [e[1]["bucket_s"] for e in rec.events] == [5.0, 10.0, 20.0]
+
+    # A new turn gets a fresh measurement set.
+    w.turn = 4
+    w.drv.idle_s = 6.0
+    assert w._socket_meaningful_idle_stalled() is False
+    assert rec.events[-1][1]["bucket_s"] == 5.0
+    assert rec.events[-1][1]["turn"] == 4
+
+
+def test_socket_idle_probe_never_runs_for_tab_or_finished_turn(monkeypatch):
+    import relay.relay_fleet as rf
+
+    class Recorder:
+        def __init__(self):
+            self.events = []
+        def record(self, event, **fields):
+            self.events.append((event, fields))
+
+    rec = Recorder()
+    monkeypatch.setattr(rf, "_socket_route", lambda: rec)
+
+    tab = _waiting_socket_worker(999.0, socket=False)
+    assert tab._socket_meaningful_idle_stalled() is False
+    assert rec.events == []
+
+    finished = _waiting_socket_worker(999.0)
+    finished.drv.generating = False
+    assert finished._socket_meaningful_idle_stalled() is False
+    assert rec.events == []
+
+def test_waiting_tab_is_not_subject_to_socket_meaningful_idle(monkeypatch):
+    monkeypatch.setattr(rf, "SOCKET_MEANINGFUL_IDLE_S", 90.0)
+    w = _waiting_socket_worker(999.0, socket=False)
+    assert w.poll() is False
+    assert not w.drv.failed
+    assert w.status == "waiting"
+
 def test_a_socket_turn_that_has_stopped_falls_back_to_the_normal_rules():
     """生成が止まっているのに待ち続けるのは、ただのハングになる。"""
     w = _deferring_worker(_GenDrv2(generating=False))
@@ -1833,3 +1931,24 @@ def test_the_incident_clock_goes_with_the_route(monkeypatch):
     monkeypatch.setattr(rf, "_LAST_ROUTE_FAULT", [12345.0])
     rf.reset_socket_route()
     assert rf._LAST_ROUTE_FAULT[0] == 0.0
+
+
+def test_socket_meaningful_idle_default_is_sixty_seconds():
+    import relay.relay_fleet as rf
+    assert rf.SOCKET_MEANINGFUL_IDLE_DEFAULT_S == 60.0
+
+
+def test_waiting_socket_sixty_second_default_boundary(monkeypatch):
+    import relay.relay_fleet as rf
+    monkeypatch.setattr(rf, "SOCKET_MEANINGFUL_IDLE_S", 60.0)
+
+    healthy_margin = _waiting_socket_worker(59.0)
+    assert healthy_margin.poll() is False
+    assert not healthy_margin.drv.failed
+    assert healthy_margin.status == "waiting"
+
+    stalled = _waiting_socket_worker(60.1)
+    assert stalled.poll() is False
+    assert "no meaningful progress" in stalled.drv.failed
+    assert "limit 60s" in stalled.reason
+    assert stalled.status == "ready"

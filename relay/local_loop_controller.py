@@ -19,6 +19,7 @@ from pathlib import Path
 
 from relay.acceptance import Check, normalize_checks
 from relay.execution_profiles import ExecutionProfile
+from relay.send_errors import FreshSubmitAmbiguous
 from relay.local_job_store import (
     INTERACTION_WAIT_STATUSES,
     JobStoreError,
@@ -1144,6 +1145,17 @@ class LocalLoopController:
             sent_attempts += 1
             try:
                 self.driver.send(trigger, track_answer=False)
+            except FreshSubmitAmbiguous as exc:
+                reason = (
+                    "fresh submit delivery ambiguous; automatic retry/rotation forbidden: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                self.store.record_event(self.job_id, "UI_TRIGGER_AMBIGUOUS", {
+                    "seq": seq, "worker_id": self.worker_id, "reason": reason,
+                }, seq)
+                self.store.mark_waiting_runtime(self.job_id, reason, scope="campaign")
+                self._project()
+                return "WAITING_RUNTIME"
             except Exception as exc:
                 reason = f"send failed: {type(exc).__name__}: {exc}"
                 self.store.record_event(self.job_id, "UI_TRIGGER_FAILED", {

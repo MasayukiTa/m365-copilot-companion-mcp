@@ -813,6 +813,7 @@ class CockpitWindow : Window
                                // The free RAM the autoscale keeps for the user (RAM analog of the disk
                                // floor). Persisted via SaveKey AND pushed live via {"set_ram_floor_mb":N}.
     string _effort = "auto";   // effort mode min|max|ultra|auto -> settings.txt effort= (NEW)
+    string _effortPolicy = "off";   // effort policy off|shadow|on -> settings.txt effort_policy= (EffortPolicy.cs)
     // Split a goal into independent sub-goals, run them in parallel, and merge the answers.
     // For work whose SIZE is the problem: a goal that cannot fit in one conversation fails at
     // the conversation, not at the work. Off by default -- a goal that fits should not pay for
@@ -820,7 +821,24 @@ class CockpitWindow : Window
     // ON, matching relay.fleet_runner's own default since 2026-09-13. Every goal is still
     // judged separately (offline triage, then the agent, which may answer NO_SPLIT), so a goal
     // that fits costs nothing; this only decides whether the question is ever asked.
-    bool _fanout = true;       // -> settings.txt fanout=
+    bool _fanout = true;       // -> settings.txt fanout= ; absent key = ON (FanoutView.DefaultOn)
+    // per-tree fan-out budget -> settings.txt fanout_max_total / _active / _turns / _wall_min
+    int[] _fbVals = (int[])FanoutBudgetView.Defaults.Clone();
+    TextBox[] _fbBox = new TextBox[4];
+    TextBlock _fbLbl, _fbNow, _fbPending;
+    TextBlock[] _fbCap = new TextBlock[4];
+    // split depth 1|2|3 -> settings.txt fanout_max_depth ; absent key = 1 (FanoutDepthView.Default)
+    int _fdVal = FanoutDepthView.Default;
+    ComboBox _fdBox;
+    TextBlock _fdLbl, _fdNow, _fdPending;
+    // sibling write scope off|shadow -> settings.txt fanout_write_scope ; absent key = off (WriteScopeView.Default)
+    string _wsVal = WriteScopeView.Default;
+    // hierarchical merge off|on -> settings.txt fanout_hierarchical_merge ; absent key = off
+    string _hmVal = HierarchicalMergeView.Default;
+    ComboBox _hmBox;
+    TextBlock _hmLbl, _hmNow, _hmPending;
+    ComboBox _wsBox;
+    TextBlock _wsLbl, _wsNow, _wsPending;
     string _approval = "run";  // approval mode run|plan|auto -> settings.txt approval=
     string _runtimeMode = "fleet"; // next launch: fleet | durable -> settings.txt runtime=
     bool _durableEnqueuePending = false; // one durable campaign intake process at a time
@@ -1053,6 +1071,7 @@ class CockpitWindow : Window
     bool _autoRetry = true;
     int _autoRetryMax = 2;
     Dictionary<string, int> _autoRetryCount = new Dictionary<string, int>();
+    HashSet<string> _autoRetriedWorkers = new HashSet<string>();   // RetryWorkerKey of workers already re-queued
 
     // Conversation retention. OWNER DECISION 2026-09-24: _retDays now DEFAULTS TO 90, not 0.
     // The store exists because history was disappearing, and a policy that started deleting
@@ -1110,6 +1129,20 @@ class CockpitWindow : Window
     // component -- bridge/copilot_bridge.py + tools/tool_probe.py -- this file only reads it).
     enum HealthState { Gray = 0, Green = 1, Yellow = 2, Red = 3, Checking = 4 }
     class DotState { public HealthState State = HealthState.Gray; public string Detail = ""; public DateTime Checked = DateTime.MinValue; }
+    class PlannedServerTransition
+    {
+        public string State = "";
+        public string Reason = "";
+        public double Started = 0;
+        public double Expires = 0;
+        public int SupervisorPid = 0;
+        public double SupervisorStarted = 0;
+    }
+    // Old supervisors wrote only `started`; preserve that format for one deployment generation.
+    // New supervisors write their own policy-derived expiry. The hard cap is only corruption /
+    // stale-file safety: it is intentionally NOT the normal restart budget.
+    const double LEGACY_SERVER_TRANSITION_MAX_AGE_S = 60.0;
+    const double SERVER_TRANSITION_HARD_MAX_AGE_S = 600.0;
     // Index map: 0=server 1=tunnel 2=edge 3=signin 4=agent 5=tool(bridge probe).
     // SIZED BY THE COUNT, never by however many literals somebody typed. This was six
     // `new DotState()` in a row. Adding a seventh dot compiled cleanly, and the first
@@ -1125,6 +1158,12 @@ class CockpitWindow : Window
         return a;
     }
     readonly object _healthLock = new object();
+    // EXACT HEALTH-POLL SELFTEST SEAMS. Null in every normal process. They exist so a temp
+    // harness can execute PollHealthOnce() itself against an unreachable synthetic server and a
+    // temp transition marker without stopping the production MCP server. Both uses are gated by
+    // WindowSelfTest.Active below; normal cockpit behaviour cannot redirect either source.
+    string _serverTransitionPathForSelfTest = null;
+    Func<string, int, string> _serverHealthBodyForSelfTest = null;
     // The last /health body, captured by the Server dot's poll so dot 5 can read the FLEET
     // tool path from it without a second HTTP round trip. Empty until the first successful
     // poll, and empty must read as "no evidence" everywhere it is used.
@@ -1456,6 +1495,7 @@ class CockpitWindow : Window
         if (k == "flt_active") return ja ? "実行中" : "Active";
         if (k == "flt_needs") return ja ? "承認待ち" : "Needs input";
         if (k == "flt_done") return ja ? "完了" : "Done";
+        if (k == "flt_intr") return ja ? "中断" : "Interrupted";
         // legacy key kept for safety (no longer rendered)
         // Feature C: retry
         if (k == "retry") return ja ? "再試行" : "Retry";
@@ -1472,6 +1512,7 @@ class CockpitWindow : Window
         if (k == "rate") return ja ? "件/時" : "/h";
         // Effort selector + fleet-wide pause/stop (NEW)
         if (k == "effort") return ja ? "推論" : "Reasoning";
+        if (k == "effort_policy") return ja ? "推論方針" : "Effort policy";
         if (k == "approval") return ja ? "承認" : "Approval";
         if (k == "run_mode") return ja ? "実行方式" : "Run mode";
         if (k == "pause") return ja ? "一時停止" : "Pause";
@@ -1706,6 +1747,7 @@ class CockpitWindow : Window
         if (s == "maxturns") return ja ? "上限" : "Max turns";
         if (s == "error") return ja ? "エラー" : "Error";
         if (s == "cancelled") return ja ? "停止" : "Stopped";
+        if (s == "interrupted") return ja ? "中断" : "Interrupted";
         if (s == "pending") return ja ? "待機列" : "Queued";
         if (s == "ready") return ja ? "準備" : "Ready";
         return s;
@@ -1809,6 +1851,11 @@ class CockpitWindow : Window
                                         System.Globalization.CultureInfo.InvariantCulture, out ut))
                     { _scaleTarget = Math.Max(0.8, Math.Min(3.0, ut)); _scaleTargetLoaded = true; }
                 }
+                else if (ln.StartsWith(EffortPolicyView.Key + "="))
+                {
+                    string epm = EffortPolicyView.ParseMode(ln);
+                    if (epm != null) _effortPolicy = epm;
+                }
                 else if (ln.StartsWith("effort="))
                 {
                     string ef = ln.Substring(7).Trim();
@@ -1821,8 +1868,31 @@ class CockpitWindow : Window
                 }
                 else if (ln.StartsWith("fanout="))
                 {
-                    string fx = ln.Substring(7).Trim().ToLower();
-                    _fanout = (fx == "on" || fx == "1" || fx == "true");
+                    bool? fxv = FanoutView.ParseSetting(ln);   // same reading as Python's settings_fanout
+                    if (fxv.HasValue) _fanout = fxv.Value;
+                }
+                else if (ln.StartsWith("fanout_write_scope="))
+                {
+                    string wsv = WriteScopeView.ParseLine(ln);   // off|shadow only; junk keeps the value
+                    if (wsv != null) _wsVal = wsv;
+                }
+                else if (ln.StartsWith("fanout_hierarchical_merge="))
+                {
+                    string hmv = HierarchicalMergeView.ParseLine(ln);   // off|on only; junk keeps the value
+                    if (hmv != null) _hmVal = hmv;
+                }
+                else if (ln.StartsWith("fanout_max_depth="))
+                {
+                    int? fdv = FanoutDepthView.ParseLine(ln);   // clamped; junk keeps the value
+                    if (fdv.HasValue) _fdVal = fdv.Value;
+                }
+                else if (ln.StartsWith("fanout_max_"))
+                {
+                    for (int fbi = 0; fbi < FanoutBudgetView.Keys.Length; fbi++)
+                    {
+                        int? fbv = FanoutBudgetView.ParseLine(fbi, ln);   // clamped; junk keeps the value
+                        if (fbv.HasValue) _fbVals[fbi] = fbv.Value;
+                    }
                 }
                 else if (ln.StartsWith("runtime="))
                 {
@@ -1946,6 +2016,9 @@ class CockpitWindow : Window
         PaintWorkerChipBorder(_workerChipBorder);
         ctrls.Children.Add(_workerChipBorder);
 
+        // HEADER CONTROL SET IS PINNED by relay/test_cockpit_header_controls.py. Do NOT add a
+        // control here: new settings belong in the gear popup (BuildSettingsPanel), in the
+        // "Fan-out" / "Effort" sections or a new section of their own.
         ctrls.Children.Add(EffortControl());
         ctrls.Children.Add(ApprovalControl());
         ctrls.Children.Add(ApprovalCenterControl());
@@ -2675,10 +2748,102 @@ class CockpitWindow : Window
         }
     }
 
+    PlannedServerTransition ReadPlannedServerTransition()
+    {
+        try
+        {
+            string path = (WindowSelfTest.Active && !string.IsNullOrEmpty(_serverTransitionPathForSelfTest))
+                ? _serverTransitionPathForSelfTest
+                : Path.Combine(RepoRootForSettings(), ".fleet", "server_transition.json");
+            if (!File.Exists(path)) return null;
+            var raw = _js.DeserializeObject(File.ReadAllText(path, Encoding.UTF8)) as Dictionary<string, object>;
+            if (raw == null) return null;
+            object stateObj, reasonObj, startedObj, expiresObj, supervisorPidObj, supervisorStartedObj;
+            if (!raw.TryGetValue("state", out stateObj) || stateObj == null) return null;
+            string state = Convert.ToString(stateObj).Trim().ToLowerInvariant();
+            if (state != "planned_restart") return null;
+            if (!raw.TryGetValue("started", out startedObj) || startedObj == null) return null;
+            double started = Convert.ToDouble(startedObj, System.Globalization.CultureInfo.InvariantCulture);
+            double nowUnix = NowUnix();
+            double age = nowUnix - started;
+            if (age < -5.0 || age > SERVER_TRANSITION_HARD_MAX_AGE_S) return null;
+
+            double expires = started + LEGACY_SERVER_TRANSITION_MAX_AGE_S;
+            if (raw.TryGetValue("expires", out expiresObj) && expiresObj != null)
+                expires = Convert.ToDouble(expiresObj, System.Globalization.CultureInfo.InvariantCulture);
+            double declaredWindow = expires - started;
+            if (declaredWindow <= 0.0 || declaredWindow > SERVER_TRANSITION_HARD_MAX_AGE_S) return null;
+            double effectiveExpiry = Math.Min(expires, started + SERVER_TRANSITION_HARD_MAX_AGE_S);
+            if (nowUnix > effectiveExpiry) return null;
+
+            // OWNERSHIP IS PART OF FRESHNESS. A PID alone is unsafe on Windows because it can be
+            // reused after the supervisor dies. New markers therefore name both PID and process
+            // birth. If either is missing/unreadable/mismatched, fail closed: an unverifiable
+            // marker is never permission to soften a real server outage from red to yellow.
+            if (!raw.TryGetValue("supervisor_pid", out supervisorPidObj) || supervisorPidObj == null) return null;
+            if (!raw.TryGetValue("supervisor_started", out supervisorStartedObj) || supervisorStartedObj == null) return null;
+            int supervisorPid = Convert.ToInt32(supervisorPidObj, System.Globalization.CultureInfo.InvariantCulture);
+            double supervisorStarted = Convert.ToDouble(supervisorStartedObj, System.Globalization.CultureInfo.InvariantCulture);
+            if (supervisorPid <= 0 || supervisorStarted <= 0.0) return null;
+            try
+            {
+                var supervisorProcess = System.Diagnostics.Process.GetProcessById(supervisorPid);
+                if (supervisorProcess.HasExited) return null;
+                double processStarted = new DateTimeOffset(supervisorProcess.StartTime.ToUniversalTime()).ToUnixTimeSeconds();
+                if (Math.Abs(processStarted - supervisorStarted) > 2.0) return null;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+
+            string reason = "planned restart";
+            if (raw.TryGetValue("reason", out reasonObj) && reasonObj != null)
+                reason = Convert.ToString(reasonObj).Trim();
+            if (string.IsNullOrEmpty(reason)) reason = "planned restart";
+            return new PlannedServerTransition { State = state, Reason = reason, Started = started, Expires = expires, SupervisorPid = supervisorPid, SupervisorStarted = supervisorStarted };
+        }
+        catch (Exception)
+        {
+            // An unreadable transition is not permission to soften a red health signal.
+            return null;
+        }
+    }
+
+    // Execute the REAL server segment of PollHealthOnce in a --selftest process. This is not a
+    // second implementation: it only supplies the two external inputs (HTTP body + marker path),
+    // calls PollHealthOnce below, and returns the dot state it actually wrote. Production callers
+    // cannot use it because WindowSelfTest.Active is false.
+    internal string SelfTestServerHealthPoll(string transitionPath, bool reachable)
+    {
+        if (!WindowSelfTest.Active)
+            throw new InvalidOperationException("server health selftest seam is available only under --selftest");
+        string oldPath = _serverTransitionPathForSelfTest;
+        Func<string, int, string> oldBody = _serverHealthBodyForSelfTest;
+        try
+        {
+            _serverTransitionPathForSelfTest = transitionPath;
+            _serverHealthBodyForSelfTest = delegate(string url, int timeoutMs)
+            {
+                if (!reachable) return null;
+                return "{\"status\":\"ok\",\"auth_fail_10m\":0,\"server_code\":\"current\"}";
+            };
+            PollHealthOnce();
+            lock (_healthLock)
+                return _health[0].State.ToString() + "|" + (_health[0].Detail ?? "");
+        }
+        finally
+        {
+            _serverTransitionPathForSelfTest = oldPath;
+            _serverHealthBodyForSelfTest = oldBody;
+        }
+    }
+
     // One full infra sweep. Writes results into _health under _healthLock.
     void PollHealthOnce()
     {
         DateTime now = DateTime.UtcNow;
+        PlannedServerTransition plannedRestart = ReadPlannedServerTransition();
 
         // 0) Server: GET http://127.0.0.1:8000/health, and READ WHAT IT SAYS.
         //
@@ -2690,7 +2855,9 @@ class CockpitWindow : Window
         // So: unreachable stays Red, and a reachable server that is REPORTING A PROBLEM about
         // itself goes Amber rather than Green. Amber, not Red, because the server process is
         // genuinely up -- the distinction matters for what a person does next.
-        string srvBody = HttpBody("http://127.0.0.1:8000/health", 3500);
+        string srvBody = (WindowSelfTest.Active && _serverHealthBodyForSelfTest != null)
+            ? _serverHealthBodyForSelfTest("http://127.0.0.1:8000/health", 3500)
+            : HttpBody("http://127.0.0.1:8000/health", 3500);
         bool srvOk = srvBody != null;
         if (srvOk) { _lastHealthBody = srvBody; _lastHealthBodyAt = NowUnix(); }
         string authFails = HealthField(srvBody, "auth_fail_10m");
@@ -2715,7 +2882,14 @@ class CockpitWindow : Window
         // scripts/stale_server_check.classify_staleness.
         string codeState = HealthField(srvBody, "server_code");
         if (!srvOk)
-            SetDot(0, HealthState.Red, T("hs_srv_detail_bad"), now);
+        {
+            if (plannedRestart != null)
+                SetDot(0, HealthState.Yellow,
+                       (_lang == 0 ? "計画されたサーバ再起動中: " : "Planned server restart in progress: ")
+                       + plannedRestart.Reason, now);
+            else
+                SetDot(0, HealthState.Red, T("hs_srv_detail_bad"), now);
+        }
         else if (authStorm)
             SetDot(0, HealthState.Yellow,
                    T("hs_srv_detail_auth") + " (" + authFails + ")", now);
@@ -2737,6 +2911,8 @@ class CockpitWindow : Window
             SetDot(0, HealthState.Green, T("hs_srv_detail_stale_recent"), now);
         else
             SetDot(0, HealthState.Green, T("hs_srv_detail_ok"), now);
+
+        if (WindowSelfTest.Active && _serverHealthBodyForSelfTest != null) return;
 
         // 1) Tunnel: read MCP_TUNNEL_URL from ..\.env; GET <url>/health == 200. Gray if none.
         //
@@ -2794,7 +2970,16 @@ class CockpitWindow : Window
             string locPid = HealthField(srvBody, "server_pid");
             bool pidsDisagree = tunPid.Length > 0 && locPid.Length > 0 && tunPid != locPid;
             if (!tunOk)
-                SetDot(1, HealthState.Red, T("hs_tun_detail_bad"), now);
+            {
+                // If the local server is deliberately between processes, the tunnel cannot reach
+                // it either.  That is the same planned transition, not a second independent fault.
+                if (plannedRestart != null && !srvOk)
+                    SetDot(1, HealthState.Yellow,
+                           (_lang == 0 ? "計画されたサーバ再起動に伴いトンネル待機中"
+                                       : "Tunnel waiting for the planned server restart"), now);
+                else
+                    SetDot(1, HealthState.Red, T("hs_tun_detail_bad"), now);
+            }
             else if (pidsDisagree)
                 SetDot(1, HealthState.Yellow,
                        T("hs_tun_detail_other") + " (" + tunPid + " != " + locPid + ")", now);
@@ -4886,26 +5071,19 @@ class CockpitWindow : Window
             if (runEnded || allDone) overallPhase = "ended";
         }
         string started = root != null ? S(root, "started") : "";
-        // Re-key on the PRIMARY worker's own status + phase-event count so this panel repaints
-        // when workers[0] itself progresses, even while sibling workers keep overallPhase pinned
-        // to "running" (a repaint-gating bug, not a BuildSpineContent rendering bug -- that method
-        // already reads workers[0].phase_events correctly, it just wasn't being re-invoked).
-        string primaryStatus = "";
-        int primaryPhaseCount = 0;
+        // Re-key on the selected task's OPERATOR-FACING CONTENT. The old spine was a timeline,
+        // so phase-event count was enough. Content details must repaint when progress/current/next/
+        // waiting/artifacts change even if status and phase-event count do not.
+        string primaryDetailSig = "";
         if (spineWorkers != null && spineWorkers.Count > 0)
         {
             Dictionary<string, object> primaryW = SpineFocusWorker(spineWorkers);
-            if (primaryW != null)
-            {
-                primaryStatus = S(primaryW, "name") + ":" + S(primaryW, "status");
-                object pe;
-                if (primaryW.TryGetValue("phase_events", out pe) && pe is object[]) primaryPhaseCount = ((object[])pe).Length;
-            }
+            if (primaryW != null) primaryDetailSig = SpineDetailSignature(primaryW);
         }
         string spineSig = (hasWorkers ? "1" : "0") + "|" + started + "|" + overallPhase
                           + "|" + (_toolbarAll != null ? _toolbarAll.Count : 0)
                           + "|" + (_dark ? "D" : "L") + _lang
-                          + "|" + primaryStatus + "|" + primaryPhaseCount;
+                          + "|" + primaryDetailSig;
         if (spineSig == _spineSig) return;
         _spineSig = spineSig;
 
@@ -4945,7 +5123,63 @@ class CockpitWindow : Window
         return workers[0];
     }
 
-    // Build the spine panel content: section header + vertical [COMPUTED] execution timeline.
+    string SpineDetailSignature(Dictionary<string, object> w)
+    {
+        if (w == null) return "";
+        var parts = new List<string>();
+        parts.Add(S(w, "name"));
+        parts.Add(S(w, "status"));
+        parts.Add(I(w, "turn").ToString());
+        parts.Add(I(w, "max_turns").ToString());
+        parts.Add(S(w, "goal_summary"));
+        parts.Add(S(w, "reason"));
+        parts.Add(S(w, "outcome"));
+        parts.Add(I(w, "verify_attempts").ToString());
+        object phaseRaw;
+        if (w.TryGetValue("phase_events", out phaseRaw) && phaseRaw is object[])
+        {
+            object[] phaseArr = (object[])phaseRaw;
+            parts.Add(phaseArr.Length.ToString());
+            if (phaseArr.Length > 0)
+            {
+                var lastPhase = phaseArr[phaseArr.Length - 1] as Dictionary<string, object>;
+                if (lastPhase != null)
+                {
+                    parts.Add(S(lastPhase, "event"));
+                    parts.Add(S(lastPhase, "label"));
+                    parts.Add(S(lastPhase, "ts"));
+                }
+            }
+        }
+        var execution = Obj(w, "execution");
+        if (execution != null)
+        {
+            parts.Add(S(execution, "state"));
+            parts.Add(S(execution, "current_step"));
+            parts.Add(S(execution, "last_progress"));
+            parts.Add(S(execution, "next_step"));
+            parts.Add(S(execution, "waiting_reason"));
+            parts.Add(I(execution, "completed_count").ToString());
+            parts.Add(I(execution, "total_steps").ToString());
+            object artsRaw;
+            if (execution.TryGetValue("artifacts", out artsRaw) && artsRaw is object[])
+            {
+                foreach (object obj in (object[])artsRaw)
+                {
+                    var artifact = obj as Dictionary<string, object>;
+                    if (artifact == null) continue;
+                    parts.Add(S(artifact, "path"));
+                    parts.Add(S(artifact, "name"));
+                    parts.Add(S(artifact, "uri"));
+                }
+            }
+        }
+        return string.Join("|", parts.ToArray());
+    }
+
+    // Left task-inspection spine. Content details answer "what is it doing now?"; the timeline
+    // directly below answers "how did it get here?". Both follow the same selected worker, and
+    // the expanded card keeps the richer evidence view rather than being the only timeline.
     // GIVE THE SPINE A VIEWPORT. The column is a fixed 220px lane whose content has NO upper
     // bound: the timeline is one entry per phase transition, and the Border it sat in simply
     // CLIPPED everything past the fold. The entries were rendered and unreachable, with no
@@ -4977,409 +5211,226 @@ class CockpitWindow : Window
         return sv;
     }
 
+    void AddSpineTimeline(StackPanel outer, Dictionary<string, object> w)
+    {
+        if (outer == null || w == null) return;
+        bool ja = _lang == 0;
+
+        var divider = new Border();
+        divider.Height = 1;
+        divider.Background = Theme.Br(Theme.Border(_dark));
+        divider.Margin = new Thickness(0, 12, 0, 8);
+        outer.Children.Add(divider);
+
+        var title = new TextBlock();
+        title.Text = ja ? "実行タイムライン" : "Execution timeline";
+        title.Foreground = Theme.Br(Theme.Muted(_dark));
+        title.FontSize = 10.5;
+        title.FontWeight = FontWeights.SemiBold;
+        title.Margin = new Thickness(0, 0, 0, 2);
+        outer.Children.Add(title);
+
+        bool real = false;
+        object peRaw;
+        if (w.TryGetValue("phase_events", out peRaw) && peRaw is object[])
+            real = ((object[])peRaw).Length > 0;
+        outer.Children.Add(new TextBlock {
+            Text = real ? (ja ? "(フェーズ遷移)" : "(phase transitions)")
+                        : (ja ? "(ターン記録から推定)" : "(estimated from turns)"),
+            Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 9.5,
+            Margin = new Thickness(0, 0, 0, 7) });
+
+        // The phase name alone is not enough operationally. Surface what this selected worker
+        // is doing NOW, but only from fields the runner actually published -- no invented step.
+        string timelineNow = "";
+        var timelineExec = Obj(w, "execution");
+        if (timelineExec != null)
+        {
+            string current = S(timelineExec, "current_step");
+            string progress = S(timelineExec, "last_progress");
+            if (!string.IsNullOrEmpty(current)) timelineNow = current;
+            if (!string.IsNullOrEmpty(progress) && progress != current)
+                timelineNow = string.IsNullOrEmpty(timelineNow) ? progress : (timelineNow + " · " + progress);
+        }
+        if (string.IsNullOrEmpty(timelineNow)) timelineNow = S(w, "reason");
+        timelineNow = (timelineNow ?? "").Replace("\r", " ").Replace("\n", " ").Trim();
+        if (timelineNow.Length > 180) timelineNow = timelineNow.Substring(0, 179).TrimEnd() + "…";
+        if (!string.IsNullOrEmpty(timelineNow))
+            outer.Children.Add(new TextBlock {
+                Text = (ja ? "現在: " : "Now: ") + timelineNow,
+                Foreground = Muted, FontSize = 10.5, TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 0, 0, 8) });
+
+        string status = S(w, "status");
+        string outcome = S(w, "outcome");
+        bool terminal = status == "done" || status == "stuck" || status == "maxturns"
+                     || status == "error" || status == "cancelled";
+        int reviews = I(w, "verify_attempts");
+        var events = BuildTimelineEvents(S(w, "transcript"), outcome, terminal, reviews, w);
+        for (int i = 0; i < events.Count; i++)
+        {
+            bool last = i == events.Count - 1;
+            string label = events[i].Item1;
+            string color = events[i].Item2;
+
+            var row = new Grid();
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(18) });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+            var rail = new DockPanel();
+            rail.HorizontalAlignment = HorizontalAlignment.Center;
+            var head = new Border { Width = 1.5, Height = 7,
+                Background = i > 0 ? Theme.Br(Theme.Border(_dark)) : Brushes.Transparent,
+                HorizontalAlignment = HorizontalAlignment.Center };
+            DockPanel.SetDock(head, Dock.Top);
+            rail.Children.Add(head);
+            var dot = new System.Windows.Shapes.Ellipse { Width = 8, Height = 8,
+                Fill = Theme.Br(color), HorizontalAlignment = HorizontalAlignment.Center };
+            DockPanel.SetDock(dot, Dock.Top);
+            rail.Children.Add(dot);
+            rail.Children.Add(new Border { Width = 1.5,
+                Background = last ? Brushes.Transparent : Theme.Br(Theme.Border(_dark)),
+                HorizontalAlignment = HorizontalAlignment.Center });
+            Grid.SetColumn(rail, 0);
+            row.Children.Add(rail);
+
+            var tb = new TextBlock { Text = label, Foreground = Theme.Br(color), FontSize = 11.0,
+                FontWeight = FontWeights.SemiBold, TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(4, i == 0 ? 1 : 0, 0, 5) };
+            Grid.SetColumn(tb, 1);
+            row.Children.Add(tb);
+            outer.Children.Add(row);
+        }
+    }
+
     // Derives events honestly from available data: run started ts, transcript first-turn ts,
     // current overall phase (polled), run ended state. No fabricated phase_events.
     UIElement BuildSpineContent(Dictionary<string, object> root, string overallPhase, bool runEnded,
                                 List<Dictionary<string, object>> workers)
     {
         bool ja = _lang == 0;
-
         var outer = new StackPanel();
         outer.Margin = new Thickness(12, 12, 8, 12);
 
-        // ── Section label ──────────────────────────────────────────────────────────
         var sectionLbl = new TextBlock();
-        sectionLbl.Text = ja ? "実行タイムライン" : "Execution timeline";
+        sectionLbl.Text = ja ? "内容詳細" : "Content details";
         sectionLbl.Foreground = Theme.Br(Theme.Muted(_dark));
         sectionLbl.FontSize = 10.5;
         sectionLbl.FontWeight = FontWeights.SemiBold;
-        sectionLbl.Margin = new Thickness(0, 0, 0, 1);
+        sectionLbl.Margin = new Thickness(0, 0, 0, 7);
         outer.Children.Add(sectionLbl);
 
-        // ── Check for real phase_events from the primary worker ────────────────────
-        // The primary worker is the first/earliest worker in the workers list.
-        // If phase_events is present and non-empty, render from those (REAL mode).
-        // Otherwise, fall through to the [COMPUTED] turn-timestamp fallback below.
-        bool usingRealEvents = false;
-        var realPhaseEvents = new List<Tuple<string, string, string>>();  // label, timeStr, colorHex
-        if (workers != null && workers.Count > 0)
+        Dictionary<string, object> primaryWorker = SpineFocusWorker(workers);
+        if (primaryWorker == null)
         {
-            Dictionary<string, object> primaryWorker = SpineFocusWorker(workers);
-            object peRaw;
-            if (primaryWorker.TryGetValue("phase_events", out peRaw) && peRaw is object[])
-            {
-                object[] peArr = (object[])peRaw;
-                if (peArr.Length > 0)
-                {
-                    usingRealEvents = true;
-                    foreach (object peObj in peArr)
-                    {
-                        var pe = peObj as Dictionary<string, object>;
-                        if (pe == null) continue;
-                        // ts: epoch double
-                        double peTs = 0;
-                        object peTsRaw;
-                        if (pe.TryGetValue("ts", out peTsRaw) && peTsRaw != null)
-                        {
-                            try { peTs = Convert.ToDouble(peTsRaw); } catch { }
-                        }
-                        // event: the status-key string
-                        string peEvent = "";
-                        object peEventRaw;
-                        if (pe.TryGetValue("event", out peEventRaw) && peEventRaw != null)
-                            peEvent = peEventRaw.ToString();
-                        // label: English fallback from the stored label field
-                        string peFallbackLabel = peEvent;
-                        object peLabelRaw;
-                        if (pe.TryGetValue("label", out peLabelRaw) && peLabelRaw != null)
-                            peFallbackLabel = peLabelRaw.ToString();
-                        // Localized timeline-event label; fall back to stored label for unknown events
-                        string localLabel = Theme.TimelineLabel(peEvent, _lang);
-                        if (string.IsNullOrEmpty(localLabel) || localLabel == peEvent)
-                        {
-                            // TimelineLabel returns the key itself when unrecognized; use stored fallback
-                            string knownKey = Theme.TimelineLabel(peEvent, _lang);
-                            localLabel = (knownKey == peEvent && !string.IsNullOrEmpty(peFallbackLabel))
-                                ? peFallbackLabel : knownKey;
-                        }
-                        string colorHex = Theme.TimelineColor(peEvent, _dark);
-                        string timeStr = "";
-                        if (peTs > 0)
-                        {
-                            try
-                            {
-                                timeStr = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)
-                                    .AddSeconds(peTs).ToLocalTime().ToString("HH:mm");
-                            }
-                            catch { }
-                        }
-                        realPhaseEvents.Add(new Tuple<string, string, string>(localLabel, timeStr, colorHex));
-                    }
-                }
-            }
-        }
-
-        // Sub-label changes based on mode (real vs computed)
-        var subLbl = new TextBlock();
-        subLbl.Text = usingRealEvents
-            ? (ja ? "(フェーズ遷移)" : "(phase transitions)")
-            // "from turns" did not say that these times are INFERRED. That was the whole content
-            // of the [COMPUTED] tag underneath, so it moves up here where it is read first.
-            : (ja ? "(会話ターンから推定)" : "(estimated from turns)");
-        subLbl.Foreground = Theme.Br(Theme.Faint(_dark));
-        subLbl.FontSize = 9.5;
-        subLbl.Margin = new Thickness(0, 0, 0, 8);
-        outer.Children.Add(subLbl);
-
-        // ── If real events mode: render from phase_events and skip [COMPUTED] path ─
-        if (usingRealEvents)
-        {
-            for (int i = 0; i < realPhaseEvents.Count; i++)
-            {
-                string evLabel = realPhaseEvents[i].Item1;
-                string evTime  = realPhaseEvents[i].Item2;
-                string evColor = realPhaseEvents[i].Item3;
-                bool isLast = (i == realPhaseEvents.Count - 1);
-                var row = new Grid();
-                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(18) });
-                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-                // A DOCKPANEL, NOT A STACKPANEL. Measured on screen: an 8px hole in every
-                // connector, at every step, in both of this widget's two implementations. The
-                // rail was drawn as a fixed 8px above the dot and a fixed 8px below it -- 24px
-                // of column against a row whose height is set by the label and its timestamp,
-                // about 32px. It could never reach, and a wrapped label opens the gap further.
-                // Docking the head to the top and letting the tail take the remaining height
-                // makes the rail follow the row instead of guessing at it.
-                var lineAndDot = new DockPanel();
-                lineAndDot.HorizontalAlignment = HorizontalAlignment.Center;
-                {
-                    var connector = new Border();
-                    connector.Width = 1.5; connector.Height = 8;
-                    // Transparent rather than absent on the first row: the head still has to
-                    // occupy its 8px so every dot lands at the same height down the column.
-                    connector.Background = i > 0 ? Theme.Br(Theme.Border(_dark)) : Brushes.Transparent;
-                    connector.HorizontalAlignment = HorizontalAlignment.Center;
-                    DockPanel.SetDock(connector, Dock.Top);
-                    lineAndDot.Children.Add(connector);
-                }
-                var dot = new System.Windows.Shapes.Ellipse();
-                dot.Width = 8; dot.Height = 8;
-                dot.Fill = Theme.Br(evColor);
-                dot.HorizontalAlignment = HorizontalAlignment.Center;
-                DockPanel.SetDock(dot, Dock.Top);
-                lineAndDot.Children.Add(dot);
-                {
-                    // The last child of a DockPanel fills what is left, so this is the piece that
-                    // reaches the next dot however tall the row turns out to be. Added even on the
-                    // last row -- invisible there -- because if it were absent the dot would
-                    // become the filling child and stretch.
-                    var tail = new Border();
-                    tail.Width = 1.5;
-                    tail.Background = isLast ? Brushes.Transparent : Theme.Br(Theme.Border(_dark));
-                    tail.HorizontalAlignment = HorizontalAlignment.Center;
-                    lineAndDot.Children.Add(tail);
-                }
-                Grid.SetColumn(lineAndDot, 0);
-                row.Children.Add(lineAndDot);
-                var labelBlock = new StackPanel();
-                labelBlock.VerticalAlignment = VerticalAlignment.Top;
-                labelBlock.Margin = new Thickness(4, i == 0 ? 2 : 0, 0, 4);
-                var labelTb = new TextBlock();
-                labelTb.Text = evLabel;
-                labelTb.Foreground = Theme.Br(evColor);
-                labelTb.FontSize = 11; labelTb.FontWeight = FontWeights.SemiBold;
-                labelTb.TextTrimming = TextTrimming.CharacterEllipsis;
-                labelBlock.Children.Add(labelTb);
-                if (!string.IsNullOrEmpty(evTime))
-                {
-                    var timeTb = new TextBlock();
-                    timeTb.Text = evTime;
-                    timeTb.Foreground = Theme.Br(Theme.Muted(_dark));
-                    timeTb.FontSize = 10;
-                    labelBlock.Children.Add(timeTb);
-                }
-                Grid.SetColumn(labelBlock, 1);
-                row.Children.Add(labelBlock);
-                outer.Children.Add(row);
-            }
-            // [REAL] used to be printed here. It is a tag from this project's own spec, where
-            // every displayed field is marked [REAL] / [COMPUTED] / [FUTURE] so nobody ships a
-            // fabricated number -- a good rule that had leaked into the product as jargon. The
-            // distinction it carried is already stated in words at the top of this panel:
-            // "(phase transitions)" against "(estimated from turns)". Saying it twice, once in
-            // brackets, is not more honest.
+            outer.Children.Add(new TextBlock {
+                Text = ja ? "表示できるタスク情報がありません" : "No task details available",
+                Foreground = Theme.Br(Theme.Muted(_dark)), FontSize = 12.0,
+                TextWrapping = TextWrapping.Wrap });
             return outer;
         }
 
-        // ── [COMPUTED] fallback: derive timestamps from transcript ────────────────
-        // Use the first worker in the workers list that has a transcript path.
-        string transcriptPath = "";
-        if (workers != null)
-        {
-            foreach (Dictionary<string, object> tw in workers)
-            {
-                string tp = S(tw, "transcript");
-                if (!string.IsNullOrEmpty(tp) && File.Exists(tp)) { transcriptPath = tp; break; }
-            }
-            if (string.IsNullOrEmpty(transcriptPath) && workers.Count > 0)
-                transcriptPath = S(workers[0], "transcript");
-        }
+        string fullGoal = S(primaryWorker, "goal");
+        string goalSummary = S(primaryWorker, "goal_summary");
+        if (string.IsNullOrEmpty(goalSummary))
+            goalSummary = CardTitle(S(primaryWorker, "conv_title"), fullGoal);
+        if (!string.IsNullOrEmpty(goalSummary))
+            outer.Children.Add(new TextBlock {
+                Text = goalSummary, Foreground = Fg, FontSize = 13.0,
+                FontWeight = FontWeights.SemiBold, TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 0, 0, 7) });
 
-        // Read meta ts (= "queued") and first turn ts (= "started") from transcript.
-        double metaTs = 0, firstTurnTs = 0;
-        try
+        string status = S(primaryWorker, "status");
+        int turn = I(primaryWorker, "turn");
+        int maxTurns = I(primaryWorker, "max_turns");
+        string statusText = StatusLabel(status);
+        if (string.IsNullOrEmpty(statusText)) statusText = overallPhase;
+        if (turn > 0)
+            statusText += maxTurns > 0 ? ("  ·  Turn " + turn + "/" + maxTurns) : ("  ·  Turn " + turn);
+        if (!string.IsNullOrEmpty(statusText))
+            outer.Children.Add(new TextBlock {
+                Text = statusText, Foreground = Theme.Br(Theme.Secondary(_dark)), FontSize = 11.5,
+                TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 7) });
+
+        var execution = Obj(primaryWorker, "execution");
+        string waiting = "";
+        if (execution != null)
         {
-            if (!string.IsNullOrEmpty(transcriptPath) && File.Exists(transcriptPath))
+            string state = S(execution, "state");
+            string current = S(execution, "current_step");
+            string progress = S(execution, "last_progress");
+            string next = S(execution, "next_step");
+            waiting = S(execution, "waiting_reason");
+
+            if (!string.IsNullOrEmpty(current))
             {
-                string[] tlines;
-                using (var fsr = new FileStream(transcriptPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-                using (var sr = new StreamReader(fsr, Encoding.UTF8))
-                    tlines = sr.ReadToEnd().Replace("\r", "").Split('\n');
-                foreach (var tln in tlines)
+                outer.Children.Add(new TextBlock { Text = ja ? "現在" : "Current",
+                    Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 10.5,
+                    FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 2, 0, 1) });
+                string currentText = current;
+                if (!string.IsNullOrEmpty(state) && state != current) currentText = state + "  ·  " + current;
+                outer.Children.Add(new TextBlock { Text = currentText, Foreground = Fg, FontSize = 12.0,
+                    TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 5) });
+            }
+            else if (!string.IsNullOrEmpty(state))
+            {
+                outer.Children.Add(new TextBlock { Text = (ja ? "状態: " : "State: ") + state,
+                    Foreground = Fg, FontSize = 12.0, TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(0, 2, 0, 5) });
+            }
+
+            if (!string.IsNullOrEmpty(progress))
+                outer.Children.Add(new TextBlock { Text = (ja ? "進捗: " : "Progress: ") + progress,
+                    Foreground = Muted, FontSize = 11.5, TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(0, 1, 0, 4) });
+            if (!string.IsNullOrEmpty(next))
+                outer.Children.Add(new TextBlock { Text = (ja ? "次: " : "Next: ") + next,
+                    Foreground = Muted, FontSize = 11.5, TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(0, 1, 0, 4) });
+
+            object artsRaw;
+            if (execution.TryGetValue("artifacts", out artsRaw) && artsRaw is object[])
+            {
+                object[] arts = (object[])artsRaw;
+                if (arts.Length > 0)
                 {
-                    if (string.IsNullOrEmpty(tln)) continue;
-                    Dictionary<string, object> obj;
-                    try { obj = _js.DeserializeObject(tln) as Dictionary<string, object>; } catch { continue; }
-                    if (obj == null) continue;
-                    if (obj.ContainsKey("meta") && Convert.ToBoolean(obj["meta"]))
+                    outer.Children.Add(new TextBlock { Text = ja ? "成果物" : "Artifacts",
+                        Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 10.5,
+                        FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 5, 0, 1) });
+                    int shown = 0;
+                    foreach (object obj in arts)
                     {
-                        if (obj.ContainsKey("ts") && obj["ts"] != null) metaTs = Convert.ToDouble(obj["ts"]);
-                        continue;
+                        var artifact = obj as Dictionary<string, object>;
+                        if (artifact == null) continue;
+                        string label = S(artifact, "path");
+                        if (string.IsNullOrEmpty(label)) label = S(artifact, "name");
+                        if (string.IsNullOrEmpty(label)) label = S(artifact, "uri");
+                        if (string.IsNullOrEmpty(label)) continue;
+                        outer.Children.Add(new TextBlock { Text = "• " + label,
+                            Foreground = Muted, FontSize = 11.0, TextWrapping = TextWrapping.Wrap,
+                            Margin = new Thickness(5, 1, 0, 1) });
+                        shown++;
+                        if (shown >= 5) break;
                     }
-                    if (obj.ContainsKey("role") && obj.ContainsKey("ts") && obj["ts"] != null && firstTurnTs == 0)
-                        firstTurnTs = Convert.ToDouble(obj["ts"]);
-                    if (firstTurnTs > 0) break;
+                    if (arts.Length > shown)
+                        outer.Children.Add(new TextBlock { Text = "+" + (arts.Length - shown),
+                            Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 10.5,
+                            Margin = new Thickness(5, 1, 0, 2) });
                 }
             }
         }
-        catch { }
 
-        // Fall back: if meta ts is absent, use root["started"] (epoch, top-level).
-        if (metaTs <= 0 && root != null) metaTs = Dbl(root, "started");
-
-        // ── Helper: format epoch as "HH:mm" ──────────────────────────────────────
-        // C# 5: use a local method-delegate pattern
-        Func<double, string> fmtHM = delegate(double ts)
+        string reason = !string.IsNullOrEmpty(waiting) ? waiting : S(primaryWorker, "reason");
+        if (!string.IsNullOrEmpty(reason))
         {
-            if (ts <= 0) return "";
-            try
-            {
-                return new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)
-                    .AddSeconds(ts).ToLocalTime().ToString("HH:mm");
-            }
-            catch { return ""; }
-        };
-
-        // ── Build events list ──────────────────────────────────────────────────────
-        // [COMPUTED] Honest markers only: queued/received, started (first turn), now/phase, ended.
-        var events = new List<Tuple<string, string, string>>();
-        // Each tuple: (label, time-string, railColor-hex)
-        string graphite = Theme.Text(_dark);
-        string live = Theme.Info(_dark);
-        string attn = Theme.Warning(_dark);
-        string ended = Theme.Success(_dark);
-        string danger = Theme.Warning(_dark);
-
-        // Marker 1: Queued / directive received
-        string qLabel = ja ? "投入" : "Queued";
-        string qTime = fmtHM(metaTs);
-        events.Add(new Tuple<string, string, string>(qLabel, qTime, graphite));
-
-        // Marker 2: Started (first turn in transcript)
-        //
-        // ONLY WHEN IT SAYS SOMETHING THE PREVIOUS MARKER DID NOT. The meta line and the first
-        // user turn are usually written within the same second, so at HH:mm resolution 投入 and
-        // 開始 carried the identical clock time on every task first measured -- two rows, one
-        // fact. A timeline whose steps repeat each other reads as a template rather than as
-        // this task's history, which is how the wrong 終了 above stayed invisible.
-        //
-        // THE TEST IS WHETHER THE DISPLAYED TIMES DIFFER, not whether the gap clears some
-        // number of seconds. The first version used >= 60s as a stand-in for "the minute will
-        // have changed", which is sound in one direction only: 60s guarantees a different
-        // minute, but a shorter wait can straddle a boundary and be equally informative. On
-        // the real records the waits run median 6.5s with 13% over thirty seconds -- the queue
-        // does wait, in steps, as admission control staggers the workers -- so a threshold
-        // picked in seconds hides real history at 10:59:50 -> 11:00:48 while claiming to show
-        // it. Comparing the strings that will actually be rendered is the exact question, and
-        // it needs no threshold at all.
-        string sTime = fmtHM(firstTurnTs);
-        if (firstTurnTs > 0 && sTime != "" && sTime != qTime)
-        {
-            string sLabel = ja ? "開始" : "Started";
-            events.Add(new Tuple<string, string, string>(sLabel, sTime, live));
+            outer.Children.Add(new TextBlock { Text = ja ? "待機・補足" : "Waiting / note",
+                Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 10.5,
+                FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 6, 0, 1) });
+            outer.Children.Add(new TextBlock { Text = reason, Foreground = Muted, FontSize = 11.5,
+                TextWrapping = TextWrapping.Wrap });
         }
 
-        // Marker 3: Current / overall phase (polled; [COMPUTED])
-        if (!runEnded)
-        {
-            string phLabel;
-            string phColor;
-            if (overallPhase == "attn")
-            {
-                phLabel = ja ? "要対応" : "Needs attention";
-                phColor = attn;
-            }
-            else if (overallPhase == "verifying")
-            {
-                phLabel = ja ? "検証中" : "Verifying";
-                phColor = attn;
-            }
-            else if (overallPhase == "running")
-            {
-                phLabel = ja ? "実行中" : "Running";
-                phColor = live;
-            }
-            else
-            {
-                phLabel = ja ? "実行中" : "Running";
-                phColor = live;
-            }
-            string nowTime = fmtHM(NowUnix());
-            events.Add(new Tuple<string, string, string>(phLabel, nowTime, phColor));
-        }
-        else
-        {
-            // Marker 3 (ended). root["updated"] is the RUN's clock, and for a past task that is
-            // the wrong one: RefreshSpine focuses a single history entry, and every one of them
-            // was then shown ending at the same minute the run did. Measured on the last eight
-            // entries of .fleet/history.json -- true ends 10:53, 10:53, 10:56, 10:57, 10:57,
-            // 10:59, 11:01, 11:05, all displayed as 11:05. Seven of eight wrong, and wrong in
-            // the way that hides it: identical, so it reads as a rendering of the run rather
-            // than as a mistake about the task.
-            //
-            // The focused entry carries its own finish time. Use it whenever exactly one task
-            // is in view; a live run's spine covers many workers, and there the run's clock is
-            // the right one.
-            double endedTs = 0;
-            if (workers != null && workers.Count == 1)
-                endedTs = Dbl(workers[0], "ts");
-            if (endedTs <= 0 && root != null) endedTs = Dbl(root, "updated");
-            string eLabel = ja ? "終了" : "Ended";
-            string eTime = fmtHM(endedTs);
-            string eColor = (overallPhase == "attn") ? danger : ended;
-            events.Add(new Tuple<string, string, string>(eLabel, eTime, eColor));
-        }
-
-        // ── Render the vertical timeline ───────────────────────────────────────────
-        for (int i = 0; i < events.Count; i++)
-        {
-            string evLabel = events[i].Item1;
-            string evTime = events[i].Item2;
-            string evColor = events[i].Item3;
-            bool isLast = (i == events.Count - 1);
-
-            var row = new Grid();
-            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(18) });  // dot + line col
-            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) }); // label col
-
-            // Vertical connector: a thin line above the dot (hidden for first item).
-            // Same rail, same hole, second copy. See the note in the phase-events branch.
-            var lineAndDot = new DockPanel();
-            lineAndDot.HorizontalAlignment = HorizontalAlignment.Center;
-            {
-                var connector = new Border();
-                connector.Width = 1.5;
-                connector.Height = 8;
-                connector.Background = i > 0 ? Theme.Br(Theme.Border(_dark)) : Brushes.Transparent;
-                connector.HorizontalAlignment = HorizontalAlignment.Center;
-                DockPanel.SetDock(connector, Dock.Top);
-                lineAndDot.Children.Add(connector);
-            }
-
-            // Dot
-            var dot = new System.Windows.Shapes.Ellipse();
-            dot.Width = 8;
-            dot.Height = 8;
-            dot.Fill = Theme.Br(evColor);
-            dot.HorizontalAlignment = HorizontalAlignment.Center;
-            dot.Margin = new Thickness(0, i == 0 ? 4 : 0, 0, 0);
-            DockPanel.SetDock(dot, Dock.Top);
-            lineAndDot.Children.Add(dot);
-
-            // Tail connector below dot (hidden for last item)
-            if (!isLast)
-            {
-                var tail = new Border();
-                tail.Width = 1.5;
-                tail.Background = isLast ? Brushes.Transparent : Theme.Br(Theme.Border(_dark));
-                tail.HorizontalAlignment = HorizontalAlignment.Center;
-                lineAndDot.Children.Add(tail);
-            }
-
-            Grid.SetColumn(lineAndDot, 0);
-            row.Children.Add(lineAndDot);
-
-            // Label + time block
-            var labelBlock = new StackPanel();
-            labelBlock.VerticalAlignment = VerticalAlignment.Top;
-            labelBlock.Margin = new Thickness(4, i == 0 ? 2 : 0, 0, 4);
-
-            var labelTb = new TextBlock();
-            labelTb.Text = evLabel;
-            labelTb.Foreground = Theme.Br(evColor);
-            labelTb.FontSize = 11;
-            labelTb.FontWeight = FontWeights.SemiBold;
-            labelTb.TextTrimming = TextTrimming.CharacterEllipsis;
-            labelBlock.Children.Add(labelTb);
-
-            if (!string.IsNullOrEmpty(evTime))
-            {
-                var timeTb = new TextBlock();
-                timeTb.Text = evTime;
-                timeTb.Foreground = Theme.Br(Theme.Muted(_dark));
-                timeTb.FontSize = 10;
-                labelBlock.Children.Add(timeTb);
-            }
-
-            Grid.SetColumn(labelBlock, 1);
-            row.Children.Add(labelBlock);
-
-            outer.Children.Add(row);
-        }
-
-        // ── [COMPUTED] footer tag ─────────────────────────────────────────────────
-        // The [COMPUTED] tag stood here; the subtitle now carries the same warning in words.
-
+        AddSpineTimeline(outer, primaryWorker);
         return outer;
     }
 
@@ -5524,6 +5575,7 @@ class CockpitWindow : Window
         _folderBtn.Click += delegate { FolderToGoals(); };
         btns.Children.Add(_folderBtn);
         _startBtn = new Button();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_startBtn, "startButton");
         _startBtn.Cursor = Cursors.Hand; _startBtn.BorderThickness = new Thickness(0);
         _startBtn.Height = Theme.BtnH; _startBtn.MinWidth = 132; _startBtn.FontWeight = FontWeights.SemiBold;
         _startBtn.Margin = new Thickness(8, 0, 0, 0); _startBtn.Padding = new Thickness(16, 0, 16, 0);
@@ -5669,6 +5721,7 @@ class CockpitWindow : Window
             {
                 _fanout = (v == "on");
                 SaveKey("fanout", _fanout ? "on" : "off");
+                PaintFanout();
                 if (_startNote != null)
                     _startNote.Text = _lang == 0
                         ? (_fanout ? "分割実行 ON — 長い依頼を独立したサブタスクに分けて並列実行し、結果を統合します。"
@@ -7416,6 +7469,21 @@ class CockpitWindow : Window
         effortVal.VerticalAlignment = VerticalAlignment.Center;
         effortVal.Margin = new Thickness(4, 0, 24, 0);
         effortRow.Children.Add(effortVal);
+        // read-only mirror of the header effort-policy combo (the header dropdown is authoritative)
+        var epLbl = new TextBlock();
+        epLbl.Text = T("effort_policy") + ": ";
+        epLbl.FontSize = 12;
+        epLbl.Foreground = Theme.Br(Theme.Muted(_dark));
+        epLbl.VerticalAlignment = VerticalAlignment.Center;
+        effortRow.Children.Add(epLbl);
+        var epVal = new TextBlock();
+        epVal.Text = _effortPolicy;
+        epVal.FontSize = 12;
+        epVal.FontWeight = FontWeights.SemiBold;
+        epVal.Foreground = Theme.Br(Theme.Text(_dark));
+        epVal.VerticalAlignment = VerticalAlignment.Center;
+        epVal.Margin = new Thickness(4, 0, 24, 0);
+        effortRow.Children.Add(epVal);
         var approvalLbl = new TextBlock();
         approvalLbl.Text = (ja ? "実行方式 / Run mode: " : "Run mode: ");
         approvalLbl.FontSize = 12;
@@ -7538,6 +7606,10 @@ class CockpitWindow : Window
     ComboBox _effortBox;
     ComboBox _approvalBox;
     TextBlock _effortLbl;
+    ComboBox _effortPolicyBox;
+    TextBlock _effortPolicyLbl, _effortPolicyNow, _effortPolicyWarn;
+    ComboBox _fanoutBox;
+    TextBlock _fanoutLbl, _fanoutNow, _fanoutPending;
     TextBlock _approvalLbl;
     Button _pauseBtn, _stopBtn;
     System.Windows.Shapes.Path _pauseIcon, _stopIcon;   // drawn geometry (no font glyph needed)
@@ -7760,8 +7832,16 @@ class CockpitWindow : Window
             case "ram_floor_mb":
             case "maxtabs":
                 return "live";
+            case "fanout_hierarchical_merge":
             case "rate_ceiling_rpm":
             case "job_approval_mode":
+            case "fanout_write_scope":
+            case "fanout_max_depth":
+            case "fanout_max_total":
+            case "fanout_max_active":
+            case "fanout_max_turns":
+            case "fanout_max_wall_min":
+            case "effort_policy":
                 return "each_gate";
             case "session_retention_days":
             case "session_max_mb":
@@ -8216,6 +8296,26 @@ class CockpitWindow : Window
         policyNote.TextWrapping = TextWrapping.Wrap; policyNote.MaxWidth = 300;
         policyNote.Margin = new Thickness(0, 2, 0, 2);
         col.Children.Add(policyNote);
+
+        // ── Effort policy. The effort level itself stays in the header; the policy that may
+        // adjust it per worker (off|shadow|on) lives here, with the runner's "in effect" line.
+        col.Children.Add(SectionHeader(L("推論", "Effort")));
+        col.Children.Add(EffortPolicyControl());
+
+        // ── Fan-out / 分割: every fan-out control in ONE section. They used to sit in the cockpit
+        // header (one slice added one control each) and crowded it out; new fan-out settings
+        // go here, not in the header (relay/test_cockpit_header_controls.py pins the header).
+        col.Children.Add(SectionHeader(L("分割 / Fan-out", "Fan-out")));
+        col.Children.Add(FanoutControl());
+        col.Children.Add(FanoutDepthControl());
+        col.Children.Add(HierarchicalMergeControl());
+        col.Children.Add(WriteScopeControl());
+        col.Children.Add(FanoutBudgetControl());
+        // the controls' Paint* run on every build, but fill the "in effect" lines from the
+        // latest status.json too, so a freshly opened popup is never blank until the next tick
+        PaintEffortPolicyInEffect(_lastRoot); PaintFanoutInEffect(_lastRoot);
+        PaintFanoutBudgetInEffect(_lastRoot); PaintFanoutDepthInEffect(_lastRoot);
+        PaintHierarchicalMergeInEffect(_lastRoot); PaintWriteScopeInEffect(_lastRoot);
 
         // THE RE-UNLOCK CONTROL WAS REMOVED HERE, DELIBERATELY, AND MUST NOT COME BACK.
         //
@@ -9013,6 +9113,517 @@ class CockpitWindow : Window
 
         PaintEffort();
         return wrap;
+    }
+    // Effort policy selector (off|shadow|on). Persists effort_policy= to settings.txt, which
+    // relay/effort_policy.py re-reads at every decision (each_gate). This control never passes
+    // MCP_EFFORT_POLICY itself; what is REALLY in effect is what the runner reports in
+    // status.json (see PaintEffortPolicyInEffect), and an inherited env override is shown as a
+    // conflict. All wording/parsing lives in the WPF-free EffortPolicy.cs.
+    // Layout shared by the combo rows that live in the gear popup (effort policy, fan-out, depth,
+    // hierarchical merge, write scope): label left / combo right, and the runner's "in effect" and
+    // "pending" lines wrapped underneath as the row's secondary text.
+    UIElement SettingsComboBlock(TextBlock lbl, ComboBox box, TextBlock now, TextBlock pending)
+    {
+        var wrap = new StackPanel(); wrap.Orientation = Orientation.Vertical;
+        wrap.Margin = new Thickness(0, 4, 0, 4);
+        var row = new DockPanel(); row.LastChildFill = false;
+        DockPanel.SetDock(box, Dock.Right); row.Children.Add(box);
+        lbl.Margin = new Thickness(0, 0, 8, 0);
+        DockPanel.SetDock(lbl, Dock.Left); row.Children.Add(lbl);
+        wrap.Children.Add(row);
+        foreach (TextBlock t in new[] { now, pending })
+        {
+            t.Margin = new Thickness(0, 2, 0, 0); t.MaxWidth = 300; t.TextWrapping = TextWrapping.Wrap;
+            wrap.Children.Add(t);
+        }
+        return wrap;
+    }
+    UIElement EffortPolicyControl()
+    {
+        _effortPolicyLbl = new TextBlock(); _effortPolicyLbl.VerticalAlignment = VerticalAlignment.Center;
+        _effortPolicyLbl.FontSize = 12;
+
+        _effortPolicyBox = new ComboBox();
+        _effortPolicyBox.ToolTip = EffortPolicyView.Help(_lang == 0) + "\n" + EffortPolicyView.TakeEffectTip(_lang == 0);
+        _effortPolicyBox.Cursor = Cursors.Hand; _effortPolicyBox.FontSize = 12;
+        _effortPolicyBox.FontWeight = FontWeights.SemiBold; _effortPolicyBox.MinWidth = 78;
+        _effortPolicyBox.Padding = new Thickness(8, 2, 4, 2);
+        _effortPolicyBox.VerticalAlignment = VerticalAlignment.Center;
+        var epHelp = new Dictionary<string, string>();
+        foreach (string m in EffortPolicyView.Modes) epHelp[m] = EffortPolicyView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_effortPolicyBox, EffortPolicyView.Modes, epHelp, _effortPolicy);
+        _effortPolicyBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _effortPolicyBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_effortPolicyBox);
+            if (!EffortPolicyView.IsMode(sel) || sel == _effortPolicy) return;
+            _effortPolicy = sel;
+            SaveKey(EffortPolicyView.Key, _effortPolicy);
+            PaintEffortPolicyInEffect(_lastRoot);
+        };
+
+        _effortPolicyNow = new TextBlock(); _effortPolicyNow.VerticalAlignment = VerticalAlignment.Center;
+        _effortPolicyNow.FontSize = 11.5;
+        _effortPolicyWarn = new TextBlock(); _effortPolicyWarn.VerticalAlignment = VerticalAlignment.Center;
+        _effortPolicyWarn.FontSize = 11.5; _effortPolicyWarn.FontWeight = FontWeights.SemiBold;
+        _effortPolicyWarn.Visibility = Visibility.Collapsed;
+
+        var wrap = SettingsComboBlock(_effortPolicyLbl, _effortPolicyBox, _effortPolicyNow, _effortPolicyWarn);
+        PaintEffortPolicy();
+        return wrap;
+    }
+    void PaintEffortPolicy()
+    {
+        if (_effortPolicyLbl != null) { _effortPolicyLbl.Text = T("effort_policy"); _effortPolicyLbl.Foreground = Muted; }
+        if (_effortPolicyBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_effortPolicyBox), _effortPolicy)) ComboSelectVal(_effortPolicyBox, _effortPolicy);
+        _effortPolicyBox.Background = BtnBg; _effortPolicyBox.Foreground = Fg; _effortPolicyBox.BorderBrush = Border;
+        StyleFlatCombo(_effortPolicyBox);
+        PaintEffortPolicyInEffect(_lastRoot);
+    }
+    // What the RUNNER says is in effect (status.json "effort_policy"), beside the combo. No
+    // report (old runner, no run yet) -> nothing shown, never a guess from the combo.
+    void PaintEffortPolicyInEffect(Dictionary<string, object> root)
+    {
+        if (_effortPolicyNow == null || _effortPolicyWarn == null) return;
+        bool ja = _lang == 0;
+        string now = null, warn = null;
+        Dictionary<string, object> ep = root != null ? Obj(root, "effort_policy") : null;
+        if (ep != null)
+        {
+            string mode = S(ep, "mode");
+            object cf;
+            bool conflict = ep.TryGetValue("conflict", out cf) && cf is bool && (bool)cf;
+            now = EffortPolicyView.Describe(mode, S(ep, "source"), conflict, ja);
+            warn = EffortPolicyView.ConflictText(mode, _effortPolicy, conflict, ja);
+        }
+        _effortPolicyNow.Text = now ?? "";
+        _effortPolicyNow.Foreground = Muted;
+        _effortPolicyNow.Visibility = now != null ? Visibility.Visible : Visibility.Collapsed;
+        _effortPolicyWarn.Text = warn ?? "";
+        _effortPolicyWarn.Foreground = Theme.Br(Theme.Warning(_dark));
+        _effortPolicyWarn.Visibility = warn != null ? Visibility.Visible : Visibility.Collapsed;
+    }
+    // Fan-out selector (on|off), the visible GUI path for what used to be reachable only by typing
+    // /fanout. Persists fanout= to settings.txt (SaveKey), which every coordinator start reads
+    // (sweep_start). Absent key = ON. What the coordinator was REALLY started with comes from
+    // status.json "fanout_run" (PaintFanoutInEffect); its words live in FanoutView (EffortPolicy.cs).
+    UIElement FanoutControl()
+    {
+        _fanoutLbl = new TextBlock(); _fanoutLbl.VerticalAlignment = VerticalAlignment.Center;
+        _fanoutLbl.FontSize = 12;
+
+        _fanoutBox = new ComboBox();
+        _fanoutBox.ToolTip = FanoutView.Help(_lang == 0) + "\n" + FanoutView.TakeEffectTip(_lang == 0);
+        _fanoutBox.Cursor = Cursors.Hand; _fanoutBox.FontSize = 12;
+        _fanoutBox.FontWeight = FontWeights.SemiBold; _fanoutBox.MinWidth = 64;
+        _fanoutBox.Padding = new Thickness(8, 2, 4, 2);
+        _fanoutBox.VerticalAlignment = VerticalAlignment.Center;
+        var foHelp = new Dictionary<string, string>();
+        foreach (string m in FanoutView.Modes) foHelp[m] = FanoutView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_fanoutBox, FanoutView.Modes, foHelp, FanoutView.Token(_fanout));
+        _fanoutBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _fanoutBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_fanoutBox);
+            if ((sel != "on" && sel != "off") || sel == FanoutView.Token(_fanout)) return;
+            _fanout = (sel == "on");
+            SaveKey("fanout", _fanout ? "on" : "off");
+            PaintFanoutInEffect(_lastRoot);
+        };
+
+        _fanoutNow = new TextBlock(); _fanoutNow.VerticalAlignment = VerticalAlignment.Center;
+        _fanoutNow.FontSize = 11.5;
+        _fanoutPending = new TextBlock(); _fanoutPending.VerticalAlignment = VerticalAlignment.Center;
+        _fanoutPending.FontSize = 11.5; _fanoutPending.FontWeight = FontWeights.SemiBold;
+        _fanoutPending.Visibility = Visibility.Collapsed;
+
+        var wrap = SettingsComboBlock(_fanoutLbl, _fanoutBox, _fanoutNow, _fanoutPending);
+        PaintFanout();
+        return wrap;
+    }
+    void PaintFanout()
+    {
+        if (_fanoutLbl != null) { _fanoutLbl.Text = FanoutView.Label(_lang == 0); _fanoutLbl.Foreground = Muted; }
+        if (_fanoutBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_fanoutBox), FanoutView.Token(_fanout))) ComboSelectVal(_fanoutBox, FanoutView.Token(_fanout));
+        _fanoutBox.Background = BtnBg; _fanoutBox.Foreground = Fg; _fanoutBox.BorderBrush = Border;
+        StyleFlatCombo(_fanoutBox);
+        PaintFanoutInEffect(_lastRoot);
+        PaintFanoutBudget();
+        PaintFanoutDepth();
+        PaintHierarchicalMerge();
+        PaintWriteScope();
+    }
+    // What the COORDINATOR says it was started with (status.json "fanout_run"), beside the combo.
+    // No report (old runner, no run yet) -> nothing shown, never a guess from the combo.
+    void PaintFanoutInEffect(Dictionary<string, object> root)
+    {
+        if (_fanoutNow == null || _fanoutPending == null) return;
+        bool ja = _lang == 0;
+        string now = null, pend = null;
+        Dictionary<string, object> fr = root != null ? Obj(root, "fanout_run") : null;
+        if (fr != null)
+        {
+            object ev;
+            bool has = fr.TryGetValue("enabled", out ev) && ev is bool;
+            bool enabled = has && (bool)ev;
+            now = FanoutView.Describe(has, enabled, S(fr, "source"), ja);
+            pend = FanoutView.PendingText(has, enabled, _fanout, ja);
+        }
+        _fanoutNow.Text = now ?? "";
+        _fanoutNow.Foreground = Muted;
+        _fanoutNow.Visibility = now != null ? Visibility.Visible : Visibility.Collapsed;
+        _fanoutPending.Text = pend ?? "";
+        _fanoutPending.Foreground = Theme.Br(Theme.Warning(_dark));
+        _fanoutPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
+    }
+    // Per-tree fan-out budget: four numeric boxes (total / active / turns / minutes) beside the
+    // fan-out selector. Each persists through SaveKey only, when the operator commits (Enter or
+    // leaving the box); the runner re-reads the keys at every split (each_gate). What the
+    // COORDINATOR applies comes from status.json "fanout_budget" (PaintFanoutBudgetInEffect);
+    // the words, bounds and parsing live in FanoutBudgetView (EffortPolicy.cs).
+    UIElement FanoutBudgetControl()
+    {
+        // popup layout: the group label, then ONE compact row of four cells (caption over box)
+        var wrap = new StackPanel(); wrap.Orientation = Orientation.Vertical;
+        wrap.Margin = new Thickness(0, 4, 0, 4);
+
+        _fbLbl = new TextBlock(); _fbLbl.VerticalAlignment = VerticalAlignment.Center;
+        _fbLbl.FontSize = 12; _fbLbl.Margin = new Thickness(0, 0, 0, 2);
+        wrap.Children.Add(_fbLbl);
+
+        var grid = new Grid();
+        for (int c = 0; c < 4; c++) grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        wrap.Children.Add(grid);
+
+        for (int i = 0; i < 4; i++)
+        {
+            int idx = i;
+            var cell = new StackPanel(); cell.Orientation = Orientation.Vertical;
+            cell.Margin = new Thickness(i == 0 ? 0 : 6, 0, 0, 0);
+            Grid.SetColumn(cell, i); grid.Children.Add(cell);
+
+            _fbCap[i] = new TextBlock(); _fbCap[i].VerticalAlignment = VerticalAlignment.Center;
+            _fbCap[i].FontSize = 11.5; _fbCap[i].Margin = new Thickness(0, 0, 0, 2);
+            cell.Children.Add(_fbCap[i]);
+
+            var tb = new TextBox();
+            tb.HorizontalAlignment = HorizontalAlignment.Stretch; tb.FontSize = 12; tb.Padding = new Thickness(4, 2, 4, 2);
+            tb.VerticalAlignment = VerticalAlignment.Center;
+            tb.HorizontalContentAlignment = HorizontalAlignment.Right;
+            tb.MaxLength = 7;
+            tb.Text = _fbVals[i].ToString();
+            tb.LostFocus += delegate { CommitFanoutBudget(idx); };
+            tb.KeyDown += delegate(object s, KeyEventArgs e)
+            {
+                if (e.Key == Key.Enter) { CommitFanoutBudget(idx); e.Handled = true; }
+            };
+            _fbBox[i] = tb;
+            cell.Children.Add(tb);
+        }
+
+        _fbNow = new TextBlock(); _fbNow.VerticalAlignment = VerticalAlignment.Center;
+        _fbNow.FontSize = 11.5; _fbNow.Margin = new Thickness(0, 2, 0, 0);
+        _fbNow.MaxWidth = 300; _fbNow.TextWrapping = TextWrapping.Wrap;
+        wrap.Children.Add(_fbNow);
+        _fbPending = new TextBlock(); _fbPending.VerticalAlignment = VerticalAlignment.Center;
+        _fbPending.FontSize = 11.5; _fbPending.FontWeight = FontWeights.SemiBold;
+        _fbPending.Margin = new Thickness(0, 2, 0, 0);
+        _fbPending.MaxWidth = 300; _fbPending.TextWrapping = TextWrapping.Wrap;
+        _fbPending.Visibility = Visibility.Collapsed;
+        wrap.Children.Add(_fbPending);
+
+        PaintFanoutBudget();
+        return wrap;
+    }
+    // Commit one box: a non-number reverts to the held value, a number is clamped to the key's
+    // bounds, and an UNCHANGED value is not written (so leaving a box never rewrites the file).
+    void CommitFanoutBudget(int idx)
+    {
+        TextBox tb = _fbBox[idx];
+        if (tb == null) return;
+        int v;
+        if (!FanoutBudgetView.TryParseInput(idx, tb.Text, out v)) { tb.Text = _fbVals[idx].ToString(); return; }
+        tb.Text = v.ToString();
+        if (v == _fbVals[idx]) return;
+        _fbVals[idx] = v;
+        SaveFanoutBudgetKey(idx, v);
+        PaintFanoutBudgetInEffect(_lastRoot);
+    }
+    void SaveFanoutBudgetKey(int idx, int v)
+    {
+        string s = v.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        switch (idx)
+        {
+            case 0: SaveKey("fanout_max_total", s); break;
+            case 1: SaveKey("fanout_max_active", s); break;
+            case 2: SaveKey("fanout_max_turns", s); break;
+            case 3: SaveKey("fanout_max_wall_min", s); break;
+        }
+    }
+    void PaintFanoutBudget()
+    {
+        bool ja = _lang == 0;
+        if (_fbLbl != null) { _fbLbl.Text = FanoutBudgetView.GroupLabel(ja); _fbLbl.Foreground = Muted; }
+        for (int i = 0; i < 4; i++)
+        {
+            if (_fbCap[i] != null)
+            {
+                _fbCap[i].Text = FanoutBudgetView.ShortLabel(i, ja); _fbCap[i].Foreground = Muted;
+            }
+            TextBox tb = _fbBox[i];
+            if (tb == null) continue;
+            tb.ToolTip = FanoutBudgetView.Help(i, ja) + "\n" + FanoutBudgetView.TakeEffectTip(ja);
+            // assign only when different and not being typed in, so a repaint never fights the operator
+            if (!tb.IsKeyboardFocused && tb.Text != _fbVals[i].ToString()) tb.Text = _fbVals[i].ToString();
+            tb.Background = BtnBg; tb.Foreground = Fg; tb.BorderBrush = Border;
+        }
+        PaintFanoutBudgetInEffect(_lastRoot);
+    }
+    // What the COORDINATOR says it applies (status.json "fanout_budget"), beside the boxes. No
+    // report (old runner, no run yet) -> nothing shown, never a guess from the boxes.
+    void PaintFanoutBudgetInEffect(Dictionary<string, object> root)
+    {
+        if (_fbNow == null || _fbPending == null) return;
+        bool ja = _lang == 0;
+        string now = null, pend = null;
+        Dictionary<string, object> fb = root != null ? Obj(root, "fanout_budget") : null;
+        if (fb != null)
+        {
+            bool ok = true;
+            int[] lim = new int[4];
+            for (int i = 0; i < 4; i++)
+            {
+                if (!fb.ContainsKey(FanoutBudgetView.ReportKeys[i]) || fb[FanoutBudgetView.ReportKeys[i]] == null) { ok = false; break; }
+                lim[i] = I(fb, FanoutBudgetView.ReportKeys[i]);
+            }
+            if (ok)
+            {
+                now = FanoutBudgetView.Describe(lim, ja);
+                pend = FanoutBudgetView.PendingText(lim, _fbVals, ja);
+            }
+        }
+        _fbNow.Text = now ?? "";
+        _fbNow.Foreground = Muted;
+        _fbNow.Visibility = now != null ? Visibility.Visible : Visibility.Collapsed;
+        _fbPending.Text = pend ?? "";
+        _fbPending.Foreground = Theme.Br(Theme.Warning(_dark));
+        _fbPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
+    }
+    // Split depth (1|2|3), beside the fan-out selector. Persists through SaveKey only; the runner
+    // re-reads the key at every split (each_gate). What is IN EFFECT comes from status.json
+    // "fanout_depth" (configured + effective), so the screen never claims a depth the coordinator
+    // is not applying; the words and parsing live in FanoutDepthView (EffortPolicy.cs).
+    UIElement FanoutDepthControl()
+    {
+        _fdLbl = new TextBlock(); _fdLbl.VerticalAlignment = VerticalAlignment.Center;
+        _fdLbl.FontSize = 12;
+
+        _fdBox = new ComboBox();
+        _fdBox.ToolTip = FanoutDepthView.Help(_lang == 0) + "\n" + FanoutDepthView.TakeEffectTip(_lang == 0);
+        _fdBox.Cursor = Cursors.Hand; _fdBox.FontSize = 12;
+        _fdBox.FontWeight = FontWeights.SemiBold; _fdBox.MinWidth = 64;
+        _fdBox.Padding = new Thickness(8, 2, 4, 2);
+        _fdBox.VerticalAlignment = VerticalAlignment.Center;
+        var fdHelp = new Dictionary<string, string>();
+        foreach (string m in FanoutDepthView.Modes) fdHelp[m] = FanoutDepthView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_fdBox, FanoutDepthView.Modes, fdHelp, _fdVal.ToString());
+        _fdBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _fdBox.SelectionChanged += delegate
+        {
+            int sel;
+            if (!int.TryParse(ComboVal(_fdBox), out sel)) return;
+            sel = FanoutDepthView.Clamp(sel);
+            if (sel == _fdVal) return;   // unchanged -> no write, no re-fire
+            _fdVal = sel;
+            SaveKey("fanout_max_depth", sel.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            PaintFanoutDepthInEffect(_lastRoot);
+        };
+
+        _fdNow = new TextBlock(); _fdNow.VerticalAlignment = VerticalAlignment.Center;
+        _fdNow.FontSize = 11.5;
+        _fdPending = new TextBlock(); _fdPending.VerticalAlignment = VerticalAlignment.Center;
+        _fdPending.FontSize = 11.5; _fdPending.FontWeight = FontWeights.SemiBold;
+        _fdPending.Visibility = Visibility.Collapsed;
+
+        var wrap = SettingsComboBlock(_fdLbl, _fdBox, _fdNow, _fdPending);
+        PaintFanoutDepth();
+        return wrap;
+    }
+    void PaintFanoutDepth()
+    {
+        if (_fdLbl != null) { _fdLbl.Text = FanoutDepthView.Label(_lang == 0); _fdLbl.Foreground = Muted; }
+        if (_fdBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_fdBox), _fdVal.ToString())) ComboSelectVal(_fdBox, _fdVal.ToString());
+        _fdBox.Background = BtnBg; _fdBox.Foreground = Fg; _fdBox.BorderBrush = Border;
+        StyleFlatCombo(_fdBox);
+        PaintFanoutDepthInEffect(_lastRoot);
+    }
+    // What the COORDINATOR says it applies (status.json "fanout_depth"). No report (old runner,
+    // no run yet) -> nothing shown, never a guess from the selection.
+    void PaintFanoutDepthInEffect(Dictionary<string, object> root)
+    {
+        if (_fdNow == null || _fdPending == null) return;
+        bool ja = _lang == 0;
+        string now = null, pend = null;
+        Dictionary<string, object> fd = root != null ? Obj(root, "fanout_depth") : null;
+        if (fd != null && fd.ContainsKey("configured") && fd["configured"] != null
+            && fd.ContainsKey("effective") && fd["effective"] != null)
+        {
+            int conf = I(fd, "configured"), eff = I(fd, "effective");
+            now = FanoutDepthView.Describe(conf, eff, S(fd, "reason"), ja);
+            pend = FanoutDepthView.PendingText(conf, _fdVal, ja);
+        }
+        _fdNow.Text = now ?? "";
+        _fdNow.Foreground = Muted;
+        _fdNow.Visibility = now != null ? Visibility.Visible : Visibility.Collapsed;
+        _fdPending.Text = pend ?? "";
+        _fdPending.Foreground = Theme.Br(Theme.Warning(_dark));
+        _fdPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
+    }
+    // Hierarchical merge (off|on), beside the split depth. Persists through SaveKey only; the
+    // runner re-reads the key at every split (each_gate). On lets a split depth above 1 take
+    // effect; what is IN EFFECT comes from status.json "fanout_depth".hierarchical_merge. The
+    // words and parsing live in HierarchicalMergeView (EffortPolicy.cs).
+    UIElement HierarchicalMergeControl()
+    {
+        _hmLbl = new TextBlock(); _hmLbl.VerticalAlignment = VerticalAlignment.Center;
+        _hmLbl.FontSize = 12;
+
+        _hmBox = new ComboBox();
+        _hmBox.ToolTip = HierarchicalMergeView.Help(_lang == 0) + "\n" + HierarchicalMergeView.TakeEffectTip(_lang == 0);
+        _hmBox.Cursor = Cursors.Hand; _hmBox.FontSize = 12;
+        _hmBox.FontWeight = FontWeights.SemiBold; _hmBox.MinWidth = 64;
+        _hmBox.Padding = new Thickness(8, 2, 4, 2);
+        _hmBox.VerticalAlignment = VerticalAlignment.Center;
+        var hmHelp = new Dictionary<string, string>();
+        foreach (string m in HierarchicalMergeView.Modes) hmHelp[m] = HierarchicalMergeView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_hmBox, HierarchicalMergeView.Modes, hmHelp, _hmVal);
+        _hmBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _hmBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_hmBox);
+            if (!HierarchicalMergeView.IsMode(sel) || sel == _hmVal) return;   // unchanged -> no write, no re-fire
+            _hmVal = sel;
+            SaveKey(HierarchicalMergeView.Key, _hmVal);
+            PaintHierarchicalMergeInEffect(_lastRoot);
+        };
+
+        _hmNow = new TextBlock(); _hmNow.VerticalAlignment = VerticalAlignment.Center;
+        _hmNow.FontSize = 11.5;
+        _hmPending = new TextBlock(); _hmPending.VerticalAlignment = VerticalAlignment.Center;
+        _hmPending.FontSize = 11.5; _hmPending.FontWeight = FontWeights.SemiBold;
+        _hmPending.Visibility = Visibility.Collapsed;
+
+        var wrap = SettingsComboBlock(_hmLbl, _hmBox, _hmNow, _hmPending);
+        PaintHierarchicalMerge();
+        return wrap;
+    }
+    void PaintHierarchicalMerge()
+    {
+        if (_hmLbl != null) { _hmLbl.Text = HierarchicalMergeView.Label(_lang == 0); _hmLbl.Foreground = Muted; }
+        if (_hmBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_hmBox), _hmVal)) ComboSelectVal(_hmBox, _hmVal);
+        _hmBox.ToolTip = HierarchicalMergeView.Help(_lang == 0) + "\n" + HierarchicalMergeView.TakeEffectTip(_lang == 0);
+        _hmBox.Background = BtnBg; _hmBox.Foreground = Fg; _hmBox.BorderBrush = Border;
+        StyleFlatCombo(_hmBox);
+        PaintHierarchicalMergeInEffect(_lastRoot);
+    }
+    // What the COORDINATOR says it applies (status.json "fanout_depth".hierarchical_merge). No
+    // report (old runner, no run yet) -> nothing shown, never a guess from the selection.
+    void PaintHierarchicalMergeInEffect(Dictionary<string, object> root)
+    {
+        if (_hmNow == null || _hmPending == null) return;
+        bool ja = _lang == 0;
+        string now = null, pend = null;
+        Dictionary<string, object> fd = root != null ? Obj(root, "fanout_depth") : null;
+        if (fd != null && fd.ContainsKey("hierarchical_merge") && fd["hierarchical_merge"] != null)
+        {
+            string rep = S(fd, "hierarchical_merge");
+            now = HierarchicalMergeView.Describe(rep, ja);
+            pend = HierarchicalMergeView.PendingText(rep, _hmVal, ja);
+        }
+        _hmNow.Text = now ?? "";
+        _hmNow.Foreground = Muted;
+        _hmNow.Visibility = now != null ? Visibility.Visible : Visibility.Collapsed;
+        _hmPending.Text = pend ?? "";
+        _hmPending.Foreground = Theme.Br(Theme.Warning(_dark));
+        _hmPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
+    }
+    // Sibling write scope (off|shadow), beside the split depth. Persists through SaveKey only; the
+    // coordinator re-reads the key at every sweep (each_gate). SHADOW ONLY: it records overlapping
+    // sibling writes and blocks nothing, and there is no enforcing option. What is IN EFFECT comes
+    // from status.json "fanout_write_scope"; the words and parsing live in WriteScopeView.
+    UIElement WriteScopeControl()
+    {
+        _wsLbl = new TextBlock(); _wsLbl.VerticalAlignment = VerticalAlignment.Center;
+        _wsLbl.FontSize = 12;
+
+        _wsBox = new ComboBox();
+        _wsBox.ToolTip = WriteScopeView.Help(_lang == 0) + "\n" + WriteScopeView.TakeEffectTip(_lang == 0);
+        _wsBox.Cursor = Cursors.Hand; _wsBox.FontSize = 12;
+        _wsBox.FontWeight = FontWeights.SemiBold; _wsBox.MinWidth = 78;
+        _wsBox.Padding = new Thickness(8, 2, 4, 2);
+        _wsBox.VerticalAlignment = VerticalAlignment.Center;
+        var wsHelp = new Dictionary<string, string>();
+        foreach (string m in WriteScopeView.Modes) wsHelp[m] = WriteScopeView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_wsBox, WriteScopeView.Modes, wsHelp, _wsVal);
+        _wsBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _wsBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_wsBox);
+            if (!WriteScopeView.IsMode(sel) || sel == _wsVal) return;   // unchanged -> no write, no re-fire
+            _wsVal = sel;
+            SaveKey(WriteScopeView.Key, _wsVal);
+            PaintWriteScopeInEffect(_lastRoot);
+        };
+
+        _wsNow = new TextBlock(); _wsNow.VerticalAlignment = VerticalAlignment.Center;
+        _wsNow.FontSize = 11.5;
+        _wsPending = new TextBlock(); _wsPending.VerticalAlignment = VerticalAlignment.Center;
+        _wsPending.FontSize = 11.5; _wsPending.FontWeight = FontWeights.SemiBold;
+        _wsPending.Visibility = Visibility.Collapsed;
+
+        var wrap = SettingsComboBlock(_wsLbl, _wsBox, _wsNow, _wsPending);
+        PaintWriteScope();
+        return wrap;
+    }
+    void PaintWriteScope()
+    {
+        if (_wsLbl != null) { _wsLbl.Text = WriteScopeView.Label(_lang == 0); _wsLbl.Foreground = Muted; }
+        if (_wsBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_wsBox), _wsVal)) ComboSelectVal(_wsBox, _wsVal);
+        _wsBox.ToolTip = WriteScopeView.Help(_lang == 0) + "\n" + WriteScopeView.TakeEffectTip(_lang == 0);
+        _wsBox.Background = BtnBg; _wsBox.Foreground = Fg; _wsBox.BorderBrush = Border;
+        StyleFlatCombo(_wsBox);
+        PaintWriteScopeInEffect(_lastRoot);
+    }
+    // What the COORDINATOR says it applies (status.json "fanout_write_scope"). No report (old
+    // runner, no run yet) -> nothing shown, never a guess from the selection.
+    void PaintWriteScopeInEffect(Dictionary<string, object> root)
+    {
+        if (_wsNow == null || _wsPending == null) return;
+        bool ja = _lang == 0;
+        string now = null, pend = null;
+        Dictionary<string, object> ws = root != null ? Obj(root, "fanout_write_scope") : null;
+        if (ws != null && ws.ContainsKey("mode") && ws["mode"] != null)
+        {
+            string rep = S(ws, "mode");
+            now = WriteScopeView.Describe(rep, ws.ContainsKey("overlaps_seen") && ws["overlaps_seen"] != null ? I(ws, "overlaps_seen") : 0, ja);
+            pend = WriteScopeView.PendingText(rep, _wsVal, ja);
+        }
+        _wsNow.Text = now ?? "";
+        _wsNow.Foreground = Muted;
+        _wsNow.Visibility = now != null ? Visibility.Visible : Visibility.Collapsed;
+        _wsPending.Text = pend ?? "";
+        _wsPending.Foreground = Theme.Br(Theme.Warning(_dark));
+        _wsPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
     }
     void PaintEffort()
     {
@@ -10781,6 +11392,8 @@ class CockpitWindow : Window
         PaintAutoToggle();
         UpdateAutoEnabled();
         PaintEffort();
+        PaintEffortPolicy();
+        PaintFanout();
         PaintApproval();
         PaintApprovalCenterButton(PendingGates(ReadStatus()).Count);
         PaintPause();
@@ -10852,6 +11465,8 @@ class CockpitWindow : Window
         if (_autoValue != null) _autoValue.Text = _autoMax.ToString();
         PaintAutoToggle();
         PaintEffort();
+        PaintEffortPolicy();
+        PaintFanout();
         PaintApproval();
         PaintApprovalCenterButton(PendingGates(ReadStatus()).Count);
         PaintPause();
@@ -10910,6 +11525,13 @@ class CockpitWindow : Window
                     bool d0 = _dark; int l0 = _lang; double s0 = _uiScale;
                     bool a0 = _uiAuto; double t0 = _scaleTarget;
                     LoadSettings();
+                    // The fan-out / effort-policy controls live in the gear popup, which may not
+                    // exist yet (every Paint* is null-safe) and is rebuilt on each open. Repaint
+                    // whatever is there so an external settings.txt edit shows without reopening.
+                    // Paint* only assigns when different, so SelectionChanged does not re-fire.
+                    PaintEffort();
+                    PaintEffortPolicy();
+                    PaintFanout();
                     if (d0 != _dark) { ApplyThemeBrushes(); PaintChrome(); _lastSig = ""; }
                     else if (l0 != _lang) { RebuildChrome(); }
                     // External ui_scale edit (e.g. the chat app zoomed / switched to auto): apply it live
@@ -11060,6 +11682,7 @@ class CockpitWindow : Window
         {
             var w = o as Dictionary<string, object>;
             if (w == null) continue;
+            if (IsInterruptedWorker(w)) continue;              // resumable: never archived, never blocks
             if (!IsTerminalWorker(w)) return;                  // not fully finished yet -> wait
         }
         // _toolbarShown is populated by the last RenderCards; on the finished tick it holds this
@@ -11106,6 +11729,11 @@ class CockpitWindow : Window
             int n = 0;
             if (_autoRetryCount.ContainsKey(goal)) n = _autoRetryCount[goal];
             if (n >= _autoRetryMax) continue;          // budget spent -> never loop
+            // ONE RE-QUEUE PER WORKER. The terminal worker stays terminal, so without this every
+            // tick re-queued the same STUCK worker until the per-goal budget ran out (2026-10-01:
+            // two extra copies on top of the runner's own retry).
+            if (RetryAlreadyCovered(root, w)) continue;
+            _autoRetriedWorkers.Add(RetryWorkerKey(w));
             _autoRetryCount[goal] = n + 1;             // count BEFORE re-queue (idempotent per tick)
             RetryGoal(w);
         }
@@ -11235,7 +11863,7 @@ class CockpitWindow : Window
         _header.Text = "Fleet";
 
         // Compute running/queued/done counts from the workers array.
-        int cntRunning = 0, cntQueued = 0, cntDoneW = 0;
+        int cntRunning = 0, cntQueued = 0, cntDoneW = 0, cntIntr = 0;
         object wo2;
         if (root.TryGetValue("workers", out wo2) && wo2 is object[])
         {
@@ -11245,6 +11873,7 @@ class CockpitWindow : Window
                 if (ww == null) continue;
                 string wst = S(ww, "status");
                 if (IsTerminalWorker(ww)) cntDoneW++;
+                else if (IsInterruptedWorker(ww)) cntIntr++;   // not running, not done, not a failure
                 else if (wst == "pending") cntQueued++;
                 else cntRunning++;
             }
@@ -11267,7 +11896,7 @@ class CockpitWindow : Window
                 {
                     var ww2 = ow2 as Dictionary<string, object>;
                     if (ww2 == null) continue;
-                    if (!IsTerminalWorker(ww2)) { allTerminal = false; }
+                    if (!IsTerminalWorker(ww2) && !IsInterruptedWorker(ww2)) { allTerminal = false; }
                     if (IsOperatorAttention(ww2)) cntAttn++;
                 }
             }
@@ -11279,11 +11908,11 @@ class CockpitWindow : Window
             // Run-ended header: "{done} done · {attn} needs attention · run ended"
             if (ja2)
             {
-                triple = cntDoneW + " 完了 · " + cntAttn + " 要対応 · 終了";
+                triple = cntDoneW + " 完了 · " + cntAttn + " 要対応 · " + (cntIntr > 0 ? cntIntr + " 中断 · " : "") + "終了";
             }
             else
             {
-                triple = cntDoneW + " done · " + cntAttn + " needs attention · run ended";
+                triple = cntDoneW + " done · " + cntAttn + " needs attention · " + (cntIntr > 0 ? cntIntr + " interrupted · " : "") + "run ended";
             }
         }
         else
@@ -11357,6 +11986,8 @@ class CockpitWindow : Window
                 _subChips.Children.Add(ChipMargin(Pill(cntDoneW + " " + (ja2 ? "完了" : "done"), "success")));
                 _subChips.Children.Add(ChipMargin(Pill(cntAttn + " " + (ja2 ? "要対応" : "needs attention"),
                     cntAttn > 0 ? "warning" : "neutral")));
+                if (cntIntr > 0)
+                    _subChips.Children.Add(ChipMargin(Pill(cntIntr + " " + (ja2 ? "中断" : "interrupted"), "warning")));
                 _subChips.Children.Add(ChipMargin(Pill(ja2 ? "終了" : "run ended", "neutral")));
             }
             else
@@ -11717,6 +12348,12 @@ class CockpitWindow : Window
     void RenderCards(Dictionary<string, object> root)
     {
         _lastRoot = root;               // cache for single-card toggles
+        PaintEffortPolicyInEffect(root);   // what the runner reports is in effect (effort policy)
+        PaintFanoutInEffect(root);         // what the coordinator was started with (fan-out)
+        PaintFanoutBudgetInEffect(root);   // the per-tree limits the coordinator applies
+        PaintFanoutDepthInEffect(root);    // the split depth the coordinator applies
+        PaintHierarchicalMergeInEffect(root);   // the hierarchical-merge state the coordinator applies
+        PaintWriteScopeInEffect(root);     // the sibling write-scope mode the coordinator applies
         // Preserve scroll position across the rebuild. Without this, every worker update
         // (status/turn change) reset the list and snapped the view back to the TOP -- which is
         // exactly why scrolling "didn't work" while tasks were live: the user scrolled down, a
@@ -11785,7 +12422,7 @@ class CockpitWindow : Window
         string g = (_dark ? "D" : "L") + _lang.ToString();
         string sig = "T|" + g + "|" + _toolbarShown.Count + "/" + _toolbarAll.Count
                      + "|all" + tc[0] + ":act" + tc[1] + ":need" + tc[2] + ":done" + tc[3]
-                     + ":max" + tc[5] + ":bad" + tc[6] + ":hid" + tc[7]
+                     + ":max" + tc[5] + ":bad" + tc[6] + ":hid" + tc[7] + ":int" + tc[8]
                      + "|ar" + (_autoRetry ? 1 : 0) + ":" + _autoRetryMax + "|f" + _cardFilter;
         _pinnedToolbarHost.Visibility = Visibility.Visible;
         if (sig == _pinnedToolbarSig && _pinnedToolbarHost.Child != null) return;   // unchanged -> keep as-is
@@ -11821,11 +12458,13 @@ class CockpitWindow : Window
             string oc = S(w, "outcome");
             string st = S(w, "status");
             // Tab 1 = Active: non-terminal AND not pending (actively working statuses)
-            if (_cardFilter == 1 && (IsTerminalWorker(w) || st == "pending")) continue;
+            if (_cardFilter == 1 && (IsTerminalWorker(w) || IsInterruptedWorker(w) || st == "pending")) continue;
             // Tab 2 = Needs input: awaiting only
             if (_cardFilter == 2 && st != "awaiting") continue;
             // Tab 3 = Done: outcome == DONE
             if (_cardFilter == 3 && oc != "DONE") continue;
+            // Tab 4 = Interrupted (coordinator died, resumable); the tab only exists while one is on the board
+            if (_cardFilter == 4 && !IsInterruptedWorker(w)) continue;
             shown.Add(w);
         }
         // THE LIST'S ORDER, decided in one place (SubmittedTasks.Compose, executed by
@@ -11885,7 +12524,7 @@ class CockpitWindow : Window
                    : (Dbl(root, "updated") > 0 && dbStarted > 0 ? Dbl(root, "updated") - dbStarted : 0));
             int dbActive = 0;
             foreach (Dictionary<string, object> dw in onBoard)
-                if (!IsTerminalWorker(dw) && S(dw, "status") != "pending") dbActive++;
+                if (!IsTerminalWorker(dw) && !IsInterruptedWorker(dw) && S(dw, "status") != "pending") dbActive++;
             bool dbJa = _lang == 0;
             var dbMeta = new StringBuilder();
             if (dbStarted > 0)
@@ -12053,7 +12692,7 @@ class CockpitWindow : Window
                 int[] tc0 = ToolbarCounts(_toolbarAll);
                 return "T|" + g + "|" + _toolbarShown.Count + "/" + _toolbarAll.Count
                        + "|all" + tc0[0] + ":act" + tc0[1] + ":need" + tc0[2] + ":done" + tc0[3]
-                       + ":max" + tc0[5] + ":bad" + tc0[6] + ":hid" + tc0[7]
+                       + ":max" + tc0[5] + ":bad" + tc0[6] + ":hid" + tc0[7] + ":int" + tc0[8]
                        + "|ar" + (_autoRetry ? 1 : 0) + ":" + _autoRetryMax + "|f" + _cardFilter;
             case 2: return "HH|" + g;                          // history header (static chrome; search box preserved across renders)
             case 7:                                            // date-group subheader: keyed on its label
@@ -12102,6 +12741,10 @@ class CockpitWindow : Window
                   .Append(':').Append(StableShortHash(S(w, "conv_title")));
                 // TASK 3 (Bucket C): track next_step + self_confidence so the collapsed row re-renders.
                 sb.Append('|').Append(S(w, "next_step").Length).Append(':').Append(S(w, "self_confidence"));
+                // effort badge fields: re-render when the level/source/last switch change
+                sb.Append("|ef:").Append(S(w, "effort_level")).Append(S(w, "effort_source"))
+                  .Append(StableShortHash(S(Obj(w, "effort_last_switch") ?? new Dictionary<string, object>(), "reason")))
+                  .Append(S(Obj(w, "effort_last_switch") ?? new Dictionary<string, object>(), "turn"));
                 var ex = Obj(w, "execution");
                 if (ex != null)
                     sb.Append("|exec:").Append(S(ex, "state"))
@@ -12128,6 +12771,7 @@ class CockpitWindow : Window
                 bool hasDraft = _steerDraft.TryGetValue(nm, out draftSt) && !string.IsNullOrEmpty(draftSt);
                 bool hasFocus = _steerFocusWorker == nm;
                 sb.Append('|').Append(hasDraft ? "d1" : "d0").Append(hasFocus ? "f1" : "f0");
+                sb.Append("|grp:").Append(StableShortHash(GroupLineText(w) + GroupExtraSig(w) + "|" + S(w, "display_label")));
                 return sb.ToString();
         }
     }
@@ -12553,7 +13197,7 @@ class CockpitWindow : Window
     int[] ToolbarCounts(List<Dictionary<string, object>> all)
     {
         int cntAll = 0, cntActive = 0, cntNeeds = 0, cntDone = 0;
-        int doneN = 0, maxN = 0, badN = 0, hiddenTerminal = 0;
+        int doneN = 0, maxN = 0, badN = 0, hiddenTerminal = 0, intN = 0;
         string startedRootTb = _lastRoot != null ? S(_lastRoot, "started") : "";
         if (all != null)
         {
@@ -12576,10 +13220,11 @@ class CockpitWindow : Window
                 else if (oc == "STUCK" || oc == "ERROR" || oc == "CANCELLED"
                          || oc == "EVIDENCE_CONTRADICTED") badN++;
                 if (st == "awaiting") cntNeeds++;
-                if (!IsTerminalWorker(w) && st != "pending") cntActive++;
+                if (IsInterruptedWorker(w)) intN++;   // own counter: resumable, not a failure of the goal
+                if (!IsTerminalWorker(w) && !IsInterruptedWorker(w) && st != "pending") cntActive++;
             }
         }
-        return new int[] { cntAll, cntActive, cntNeeds, cntDone, doneN, maxN, badN, hiddenTerminal };
+        return new int[] { cntAll, cntActive, cntNeeds, cntDone, doneN, maxN, badN, hiddenTerminal, intN };
     }
 
     UIElement BuildCardToolbar(List<Dictionary<string, object>> all,
@@ -12593,7 +13238,7 @@ class CockpitWindow : Window
         // the render and RowSig can never diverge.
         int[] tc = ToolbarCounts(all);
         int cntAll = tc[0], cntActive = tc[1], cntNeeds = tc[2], cntDone = tc[3];
-        int doneN = tc[4], maxN = tc[5], badN = tc[6];
+        int doneN = tc[4], maxN = tc[5], badN = tc[6], cntIntr = tc[8];
 
         var bar = new Border();
         bar.BorderThickness = new Thickness(1); bar.BorderBrush = Border;
@@ -12677,7 +13322,13 @@ class CockpitWindow : Window
         segRow.Children.Add(SegDivider());
         segRow.Children.Add(SegFilterButton(needsLabel, 2, true, cntNeeds, false, false));
         segRow.Children.Add(SegDivider());
-        segRow.Children.Add(SegFilterButton(doneLabel, 3, false, 0, false, true));
+        bool showIntr = cntIntr > 0 || _cardFilter == 4;
+        segRow.Children.Add(SegFilterButton(doneLabel, 3, false, 0, false, !showIntr));
+        if (showIntr)
+        {
+            segRow.Children.Add(SegDivider());
+            segRow.Children.Add(SegFilterButton(T("flt_intr") + " " + cntIntr, 4, false, 0, false, true));
+        }
 
         seg.Child = segRow;
         left.Children.Add(seg);
@@ -13219,9 +13870,44 @@ class CockpitWindow : Window
 
     static bool IsRetryableWorker(Dictionary<string, object> w)
     {
-        return w != null
-            && !IsLocalLoopControlGoal(S(w, "goal"))
+        if (w == null) return false;
+        // The worker's own verdict beats the outcome-wide rule: `retryable: false` is written when
+        // re-running could duplicate work (e.g. an ambiguous fresh submit, outcome STUCK).
+        object rv;
+        if (w.TryGetValue("retryable", out rv) && rv is bool && !(bool)rv) return false;
+        return !IsLocalLoopControlGoal(S(w, "goal"))
             && IsRetryableOutcome(S(w, "outcome"));
+    }
+
+    // One key per worker instance (jid when the runner minted one, else name + run_id), so a
+    // terminal STUCK worker is re-queued at most once per cockpit session.
+    static string RetryWorkerKey(Dictionary<string, object> w)
+    {
+        string jid = S(w, "jid");
+        if (!string.IsNullOrEmpty(jid)) return "jid:" + jid;
+        return "w:" + S(w, "name") + "|" + S(w, "run_id");
+    }
+
+    // True when this terminal worker has already been re-queued (by us, or by the runner), or an
+    // identical goal is queued/running now -- i.e. another copy exists and must not be added.
+    bool RetryAlreadyCovered(Dictionary<string, object> root, Dictionary<string, object> w)
+    {
+        if (_autoRetriedWorkers.Contains(RetryWorkerKey(w))) return true;
+        object rq;
+        if (w.TryGetValue("retry_queued", out rq) && rq is bool && (bool)rq) return true;
+        string goal = S(w, "goal");
+        object wo;
+        if (root != null && root.TryGetValue("workers", out wo) && wo is object[])
+        {
+            foreach (object o in (object[])wo)
+            {
+                var x = o as Dictionary<string, object>;
+                if (x == null || object.ReferenceEquals(x, w)) continue;
+                if (IsTerminalWorker(x)) continue;
+                if (S(x, "goal") == goal) return true;
+            }
+        }
+        return false;
     }
 
     // P0: an INFRA_STUCK worker is NOT a task failure — the engine parked it because the infra
@@ -13281,6 +13967,115 @@ class CockpitWindow : Window
         catch (Exception) { ShowScaleToast(T("copy_result_fail")); }
     }
 
+    // ── Split group (分割グループ) line on a fan-out parent card ─────────────────────────────
+    // `groups` in status.json is written by relay/family_view.py (contract in its docstring).
+    // OWNER RULES: never the long goal text -- only the capped `ledger` strings it carries;
+    // plain Japanese wording; one small line, no popup, no toast. Read-only.
+    Dictionary<string, object> GroupOfParent(Dictionary<string, object> w)
+    {
+        if (w == null || _lastRoot == null) return null;
+        object go;
+        if (!_lastRoot.TryGetValue("groups", out go) || !(go is object[])) return null;
+        string nm = S(w, "name");
+        if (nm.Length == 0) return null;
+        foreach (object o in (object[])go)
+        {
+            var g = o as Dictionary<string, object>;
+            var par = g != null ? Obj(g, "parent") : null;
+            if (par != null && S(par, "name") == nm) return g;
+        }
+        return null;
+    }
+
+    static string GroupCount(Dictionary<string, object> ch, string key, string label)
+    {
+        int n = I(ch, key);
+        return n > 0 ? label + " " + n : "";
+    }
+
+    // One line: 分割グループ 子N件: 待機 a · 実行中 b · ... / 統合: <label> [/ 下位グループ n件]
+    // The words live in GroupTreeView (EffortPolicy.cs, tested by a compiled harness).
+    string GroupLineText(Dictionary<string, object> w)
+    {
+        return GroupTreeView.Line(GroupOfParent(w), _lang == 0);
+    }
+
+    // The second line of a root group: tree usage + the depth-cap note. "" when not reported.
+    string GroupExtraText(Dictionary<string, object> w, out int level)
+    {
+        level = 0;
+        var g = GroupOfParent(w);
+        if (g == null || _lastRoot == null) return "";
+        return GroupTreeView.ExtraText(_lastRoot, g, _lang == 0, out level) ?? "";
+    }
+
+    string GroupExtraSig(Dictionary<string, object> w)
+    {
+        int lv;
+        string x = GroupExtraText(w, out lv);
+        return x.Length == 0 ? "" : "|x" + lv + x;
+    }
+
+    // Cards whose usage line the person collapsed (click the group line). Not persisted.
+    readonly HashSet<string> _groupExtraHidden = new HashSet<string>();
+
+    UIElement BuildGroupLine(Dictionary<string, object> w)
+    {
+        string text = GroupLineText(w);
+        if (text.Length == 0) return null;
+        var g = GroupOfParent(w);
+        var row = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(24 + GroupTreeView.IndentPx(g), 3, 0, 0) };
+        int xLevel;
+        string extra = GroupExtraText(w, out xLevel);
+        TextBlock extraTb = null;
+        string cardName = S(w, "name");
+        row.MouseLeftButtonUp += delegate (object s2, MouseButtonEventArgs e2)
+        {
+            e2.Handled = true;
+            if (extraTb == null) return;
+            bool hide = extraTb.Visibility == Visibility.Visible;
+            extraTb.Visibility = hide ? Visibility.Collapsed : Visibility.Visible;
+            if (hide) _groupExtraHidden.Add(cardName); else _groupExtraHidden.Remove(cardName);
+        };
+        row.Children.Add(new TextBlock {
+            Text = text, Foreground = Muted, FontSize = 12,
+            VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis,
+            TextWrapping = TextWrapping.NoWrap, MaxWidth = 560 });
+        // Constraint tokens (dates, quoted names, amounts) from the capped ledger: small chips.
+        var led = Obj(g, "ledger");
+        int shown = 0;
+        var tip = new List<string>();
+        if (led != null)
+        {
+            if (S(led, "task").Length > 0) tip.Add(S(led, "task"));
+            object co, to;
+            if (led.TryGetValue("constraints", out co) && co is object[])
+                foreach (object c in (object[])co) tip.Add("- " + (c != null ? c.ToString() : ""));
+            if (led.TryGetValue("tokens", out to) && to is object[])
+                foreach (object t in (object[])to)
+                {
+                    string ts = t != null ? t.ToString() : "";
+                    if (ts.Length == 0 || shown >= 4) continue;
+                    var chip = Pill(ts, "neutral");
+                    chip.Margin = new Thickness(8, 0, 0, 0);
+                    row.Children.Add(chip);
+                    shown++;
+                }
+        }
+        if (tip.Count > 0) row.ToolTip = string.Join("\n", tip.ToArray());
+        if (extra.Length == 0) return row;
+        extraTb = new TextBlock {
+            Text = extra, FontSize = 12, Margin = new Thickness(24 + GroupTreeView.IndentPx(g), 1, 0, 0),
+            Foreground = xLevel >= 2 ? Theme.Br(Theme.Danger(_dark))
+                         : xLevel == 1 ? Theme.Br(Theme.Warning(_dark)) : Muted,
+            TextTrimming = TextTrimming.CharacterEllipsis, TextWrapping = TextWrapping.NoWrap, MaxWidth = 560,
+            Visibility = _groupExtraHidden.Contains(cardName) ? Visibility.Collapsed : Visibility.Visible };
+        var both = new StackPanel { Orientation = Orientation.Vertical };
+        both.Children.Add(row);
+        both.Children.Add(extraTb);
+        return both;
+    }
+
     Border Card(Dictionary<string, object> w)
     {
         string name = S(w, "name");
@@ -13325,6 +14120,16 @@ class CockpitWindow : Window
         bool isDone = status == "done" || string.Equals(S(w, "outcome"), "DONE", StringComparison.OrdinalIgnoreCase);
         string chipKind = internalControl ? "neutral"
             : (isDone ? "success" : (isInfra ? "warning" : Theme.StatusKind(status)));
+        // Fan-out PARENT: its real status is done/FANOUT on purpose, which reads as "finished"
+        // while its children still run. The coordinator-side derived display_label (waiting etc.)
+        // replaces the chip text only; status/outcome are untouched.
+        string parentLabel = internalControl ? "" : S(w, "display_label");
+        if (parentLabel.Length > 0)
+        {
+            string pds = S(w, "display_state");
+            chipKind = pds == "merge_failed" ? "danger"
+                     : (pds == "interrupted" ? "warning" : (pds == "done" ? "success" : "info"));
+        }
 
         // Pass A2-1 TASK 1: demote the collapsed row to a LEDGER ROW.
         // - No rounded corners, no card background fill, no full border.
@@ -13448,13 +14253,17 @@ class CockpitWindow : Window
         var chip = Pill(internalControl
             ? (_lang == 0 ? "内部制御" : "Internal control")
             : (isAgentSetupWait ? (_lang == 0 ? "エージェント設定待ち" : "Agent setup required")
-                : (isInfra ? T("infra_wait") : Theme.StatusLabel(status, _lang))), chipKind);
+                : (isInfra ? T("infra_wait") : (parentLabel.Length > 0 ? parentLabel : Theme.StatusLabel(status, _lang)))), chipKind);
         chip.Margin = new Thickness(2, 0, 5, 0);
+        if (status == "interrupted" && !string.IsNullOrEmpty(reason)) chip.ToolTip = reason;
         DockPanel.SetDock(chip, Dock.Left); left.Children.Add(chip);
         // AGENT BADGE (P0 feature 4): which agent this conversation is bound to. Green subtle badge
         // for the configured agent, WARNING-colored 既定Copilot badge for a plain /chat/ (default) url.
         var agentBadge = BuildAgentBadge(conv, convTitle);
         if (agentBadge != null) { DockPanel.SetDock(agentBadge, Dock.Left); left.Children.Add(agentBadge); }
+        // EFFORT BADGE: only when the runner sent effort_level (policy not off); absent = none.
+        var effBadge = BuildEffortBadge(w);
+        if (effBadge != null) { DockPanel.SetDock(effBadge, Dock.Left); left.Children.Add(effBadge); }
         string headline = !string.IsNullOrEmpty(goalSummary)
             ? goalSummary : CardTitle(convTitle, goal);
         var ht = new TextBlock {
@@ -13465,6 +14274,8 @@ class CockpitWindow : Window
         left.Children.Add(ht);
         Grid.SetColumn(left, 0); top.Children.Add(left);
         col.Children.Add(top);
+        UIElement groupLine = BuildGroupLine(w);
+        if (groupLine != null) col.Children.Add(groupLine);
 
         if (!isOpen)
         {
@@ -14339,7 +15150,7 @@ class CockpitWindow : Window
             evs.Add(new Tuple<string, string>(
                 ja ? ("レビュー (" + reviews + "x)") : ("Reviewed (" + reviews + "x)"),
                 Theme.TimelineColor("refuting", _dark)));
-        if (terminal)
+        if (terminal || outcome == "INTERRUPTED")
         {
             string outcomeEv;
             string outcomeKey;
@@ -14350,6 +15161,7 @@ class CockpitWindow : Window
                 case "STUCK":     outcomeEv = ja ? "停滞" : "Stuck"; outcomeKey = "stuck"; break;
                 case "ERROR":     outcomeEv = ja ? "エラー" : "Error"; outcomeKey = "error"; break;
                 case "CANCELLED": outcomeEv = ja ? "停止" : "Cancelled"; outcomeKey = "cancelled"; break;
+                case "INTERRUPTED": outcomeEv = ja ? "中断" : "Interrupted"; outcomeKey = "interrupted"; break;
                 case "EVIDENCE_CONTRADICTED": outcomeEv = ja ? "記録と矛盾" : "Contradicted"; outcomeKey = "stuck"; break;
                 default:           outcomeEv = string.IsNullOrEmpty(outcome) ? (ja ? "終了" : "Ended") : outcome; outcomeKey = "cancelled"; break;
             }
@@ -14452,6 +15264,7 @@ class CockpitWindow : Window
             case "STUCK": return ja ? "停滞して終了" : "Stuck";
             case "ERROR": return ja ? "エラーで終了" : "Error";
             case "CANCELLED": return ja ? "停止されました" : "Cancelled";
+            case "INTERRUPTED": return ja ? "中断されました(コーディネータ停止)" : "Interrupted (coordinator died)";
             // The worker said it was finished; the recorded tool calls say otherwise -- the
             // acceptance command was never run, or nothing was written. NOT an error and NOT a
             // completion: a claim that could not be believed. DONE is a self-report measured at
@@ -15010,6 +15823,7 @@ class CockpitWindow : Window
         item["checks"] = checks;
         item["cwd"] = S(w, "cwd");
         item["priority"] = true;
+        item["retry"] = true;   // the runner refuses a retry whose goal is already live
         return item;
     }
 
@@ -15069,6 +15883,8 @@ class CockpitWindow : Window
             // mean "everything that is not DONE", which swept up fan-out parents and threw
             // away the merged answers they carried.
             if (!IsRetryableWorker(w)) continue;
+            // Already re-queued once (by us or by the runner): never a second copy of this worker.
+            if (RetryAlreadyCovered(null, w)) continue;
             string g = S(w, "goal");
             // Same counter, same key (goal text), same ceiling as AutoRetryScan, so the auto
             // and manual paths cannot each spend a full allowance on the same goal.
@@ -15079,6 +15895,7 @@ class CockpitWindow : Window
                 if (used >= _autoRetryMax) { skippedAtCap++; continue; }
                 _autoRetryCount[g] = used + 1;   // count BEFORE queueing, as AutoRetryScan does
             }
+            _autoRetriedWorkers.Add(RetryWorkerKey(w));
             adds.Add(RetryEntry(w));
             if (!string.IsNullOrEmpty(g)) goalTexts.Add(g);
             n++;
@@ -15121,6 +15938,15 @@ class CockpitWindow : Window
                || status == "content_refused";
     }
 
+    // relay/fleet_reaper.py writes status "interrupted" into the sidecars of a coordinator that
+    // DIED (crash, kill, disk full). It is NOT terminal (never add it to IsTerminalWorker: the
+    // work is resumable and must not be archived or counted as finished) and it is NOT running
+    // and NOT a failure of the goal. Mirrors relay/outcomes.py STATUS_OF["INTERRUPTED"].
+    static bool IsInterruptedWorker(Dictionary<string, object> w)
+    {
+        return w != null && S(w, "status") == "interrupted";
+    }
+
     // Severity rank for the "unfinished only" sort: failures first, then max-turns, then
     // cancelled, then still-running/other (stable within a rank).
     static int SeverityRank(Dictionary<string, object> w)
@@ -15129,6 +15955,7 @@ class CockpitWindow : Window
         if (oc == "STUCK" || oc == "ERROR") return 0;
         if (oc == "MAXTURNS") return 1;
         if (oc == "CANCELLED") return 2;
+        if (oc == "INTERRUPTED") return 2;
         return 3;   // still-running / other
     }
 
@@ -15197,6 +16024,20 @@ class CockpitWindow : Window
             ? (_lang == 0 ? "既定Copilotの会話（MCPコネクタ無し）。エージェントに接続し直してください。"
                           : "Default-Copilot conversation (no MCP connector). Reconnect to the agent.")
             : (_lang == 0 ? "この会話はエージェントに接続されています" : "This conversation is bound to the agent");
+        return b;
+    }
+
+    // Per-worker effort pill from the additive status.json fields (EffortPolicyView words it).
+    Border BuildEffortBadge(Dictionary<string, object> w)
+    {
+        bool ja = _lang == 0;
+        Dictionary<string, object> last = Obj(w, "effort_last_switch");
+        string level = S(w, "effort_level"), src = S(w, "effort_source");
+        string text = EffortPolicyView.BadgeText(level, src, last, ja);
+        if (text == null) return null;
+        var b = Pill(text, "neutral");
+        b.Margin = new Thickness(0, 0, 5, 0);
+        b.ToolTip = EffortPolicyView.BadgeTip(level, src, last, ja);
         return b;
     }
 

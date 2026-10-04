@@ -103,6 +103,54 @@ _ADDITIONAL_INSTRUCTION = re.compile(r"追加指示[:：]\s*(.+)", re.S)
 
 _SHORT_NO_SPLIT_LEN = 200
 
+# --- Japanese-aware signals ---------------------------------------------------------------
+# Everything below is gated on the goal containing CJK text, so an English goal takes exactly
+# the path it always did. Written after a live run (2026-10-02) where a dense Japanese goal
+# naming three separate things was judged "short, single lookup": 3 independent requests in
+# well under 200 characters, because a Japanese character carries roughly twice the meaning
+# of a Latin one.
+_CJK = re.compile(r"[぀-ヿ㐀-䶿一-鿿＀-￯]")
+
+#: Weight of one CJK character against one Latin character in the length rule.
+_CJK_WEIGHT = 2
+
+# 「それぞれ」 is deliberately NOT here: "一覧にして、それぞれのサイズも教えて" is a measured
+# single short lookup (test_short_single_lookups_are_not_split). It counts only alongside an
+# enumeration, which is already a signal by itself.
+_JA_INDEPENDENCE = re.compile(
+    r"別々|別個|互いに(?:無関係|独立)|相互に(?:無関係|独立)|独立して|独立した"
+    r"|バラバラに|個別に|並列で")
+
+#: One enumerated item per line: `1.` `1)` `1、` `（1）` `①` or a ・/•/●/- bullet.
+_JA_ENUM_LINE = re.compile(
+    r"^\s*(?:[0-9０-９]+\s*[\.\)）、．]|[（(]\s*[0-9０-９]+\s*[)）]|[①-⑳]|[・•●■◆▪\-])\s*\S",
+    re.MULTILINE)
+_JA_ENUM_PAREN = re.compile(r"[（(]\s*[0-9０-９]+\s*[)）]")
+_JA_ENUM_ORDINAL = re.compile(r"第\s*[一二三四五六七八九十1-9１-９]\s*に")
+
+#: Sentences that end a clause. A goal of four or more is several requests however short.
+_JA_SENTENCE = re.compile(r"[^。！？\n]+[。！？]")
+_JA_MANY_SENTENCES = 4
+
+
+def _has_cjk(text: str) -> bool:
+    return bool(_CJK.search(text))
+
+
+def weighted_length(text: str) -> int:
+    """Length in Latin-character equivalents: a CJK character counts `_CJK_WEIGHT`.
+
+    For text with no CJK this is exactly `len(text)`, so the English threshold is unchanged."""
+    cjk = len(_CJK.findall(text))
+    return len(text) + cjk * (_CJK_WEIGHT - 1)
+
+
+def japanese_enumeration_count(text: str) -> int:
+    """Largest count of enumerated parts (lines `1.`/`（1）`/`①`/`・`, inline （1）（2）, or
+    第一に/第二に) in a goal."""
+    return max(len(_JA_ENUM_LINE.findall(text)), len(_JA_ENUM_PAREN.findall(text)),
+               len(_JA_ENUM_ORDINAL.findall(text)))
+
 
 @dataclass
 class Verdict:
@@ -245,7 +293,28 @@ def judge(text: str) -> Verdict:
             {"numbered_items": numbered, "unwrapped_continuation": unwrapped},
         )
 
-    if len(effective) < _SHORT_NO_SPLIT_LEN:
+    if _has_cjk(effective):
+        # A multi-part Japanese goal is a candidate even when short. UNCERTAIN, never SPLIT:
+        # the same restraint as the numbered-facets case above, and the live path hands an
+        # UNCERTAIN goal to the agent, which is the judge for this band.
+        n_enum = japanese_enumeration_count(effective)
+        indep = _JA_INDEPENDENCE.search(effective)
+        n_sent = len(_JA_SENTENCE.findall(effective))
+        if n_enum >= 2 or indep or n_sent >= _JA_MANY_SENTENCES:
+            sig = {"ja_enumerated_parts": n_enum, "ja_independence_word": indep.group(0) if indep else "",
+                   "ja_sentences": n_sent, "weighted_len": weighted_length(effective),
+                   "unwrapped_continuation": unwrapped}
+            return Verdict(
+                UNCERTAIN,
+                "Japanese goal with multi-part signals (%d enumerated parts, independence "
+                "wording %r, %d sentences); possibly independent parts but no catalogue or "
+                "per-item phrasing proves it -- default is NOT to split on uncertainty"
+                % (n_enum, sig["ja_independence_word"], n_sent),
+                sig,
+            )
+
+    wlen = weighted_length(effective)
+    if wlen < _SHORT_NO_SPLIT_LEN:
         return Verdict(
             NO_SPLIT,
             "short with no independence/enumeration signal; reads as a "

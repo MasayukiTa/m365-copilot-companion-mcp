@@ -195,6 +195,7 @@ static class Theme
         { "maxturns",    "warning" },
         { "error",       "danger"  },
         { "cancelled",   "neutral" },
+        { "interrupted", "warning" },   // coordinator died; resumable. Not the muted "stopped".
         { "freed",       "neutral" },
     };
 
@@ -277,6 +278,7 @@ static class Theme
             case "maxturns":    return jp ? "要対応"                 : "Needs attention";
             case "error":       return jp ? "停止(エラー)"           : "Stopped (error)";
             case "cancelled":   return jp ? "停止"                   : "Stopped";
+            case "interrupted": return jp ? "中断"                   : "Interrupted";
             case "freed":       return jp ? "解放済"                 : "Released";
             case "job_created": return jp ? "ジョブ作成"             : "Job created";
             case "job_cancelled": return jp ? "ジョブ停止"           : "Job cancelled";
@@ -316,6 +318,7 @@ static class Theme
             case "maxturns":    return jp ? "ターン上限"     : "Max turns reached";
             case "error":       return jp ? "エラー"         : "Error";
             case "cancelled":   return jp ? "停止"           : "Cancelled";
+            case "interrupted": return jp ? "中断"           : "Interrupted";
             case "freed":       return jp ? "解放"           : "Released";
             case "job_created": return jp ? "ジョブ作成"     : "Job created";
             case "job_cancelled": return jp ? "ジョブ停止"   : "Job cancelled";
