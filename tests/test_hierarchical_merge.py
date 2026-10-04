@@ -23,6 +23,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 
 import pytest
@@ -361,10 +362,13 @@ def test_a_budget_refusal_inside_a_nested_level_still_runs_directly(tmp_path, mo
 
 def test_production_code_never_turns_the_hierarchical_switch_on():
     assert fanout.HIERARCHICAL_MERGE_READY is False
-    out = []
-    for dp, dns, fns in os.walk(REPO):
-        dns[:] = [d for d in dns if not d.startswith(".") and d not in ("node_modules", "venv")]
-        out += [os.path.relpath(os.path.join(dp, f), REPO) for f in fns if f.endswith(".py")]
+    # Scan the repository, not the developer's whole worktree.  os.walk(REPO) made this
+    # invariant depend on ignored/untracked local artifacts: a Shift-JIS helper under output/
+    # caused UnicodeDecodeError even though CI's clean checkout was green.  Production code for
+    # this policy means tracked Python files, which is also exactly what can ship or merge.
+    out = subprocess.check_output(
+        ["git", "ls-files", "*.py"], cwd=REPO, text=True, encoding="utf-8"
+    ).splitlines()
     pat = re.compile(r"HIERARCHICAL_MERGE_READY\s*(?:=|,)\s*True|"
                      r"setattr\([^)]*HIERARCHICAL_MERGE_READY[^)]*True")
     bad = []

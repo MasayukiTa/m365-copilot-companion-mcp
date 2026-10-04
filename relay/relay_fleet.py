@@ -8933,9 +8933,13 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         if cid in campaigns or _campaign_already_on_disk(cid):
             return steps, ""
         try:
-            rows = fanout_budget_mod.read_campaign_rows(
+            # A top-level split is its own, brand-new root: no worker carries its id and no
+            # header of it exists (a family already on disk returned above), so its usage is
+            # zero by construction and the ledger is not read at all. Only a NESTED split
+            # needs the tree's recorded rows, and only those of its own root.
+            rows = fanout_budget_mod.ledger_rows_for_split(
                 os.path.join(os.path.dirname(transcript_dir), "campaigns.jsonl")
-                if transcript_dir else "")
+                if transcript_dir else "", root_id)
             # A nested split is charged to the tree's root (and is itself one of its active
             # workers); a top-level split is its own root.
             use, why = fanout_budget_mod.apply_budget(
@@ -8947,6 +8951,17 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         if len(use) != len(steps) or why:
             print("[fanout] %s: budget %s (%d -> %d subtask(s))"
                   % (cid, why or "trimmed", len(steps), len(use)), flush=True)
+        if root_id and "usage unknown" in (why or ""):
+            # Fail closed on a nested split is the one refusal that is not a limit being
+            # reached, so it is the one that must be visible as its own row.
+            try:
+                _mt.record("fanout_budget_usage_unknown", run_id=run_id, configured=True,
+                           config_source="split", eligible=True, triggered=False,
+                           not_triggered_reason=why,
+                           extra={"campaign_id": cid, "root_id": root_id,
+                                  "requested": len(steps)})
+            except Exception:
+                pass
         return use, why
 
     _spawn_children.grant = _grant_children
