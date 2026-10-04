@@ -71,7 +71,10 @@ MAX_ROOTS_EXPORTED = 20
 _TERMINAL = ("done", "stuck", "maxturns", "error", "cancelled", "content_refused")
 _NOT_YET_RUNNING = ("pending",)
 
-_MAX_CAMPAIGN_BYTES = 2000000
+#: The CPU bound on reading the ledger: a file past this is "unknown" (fail closed for nested
+#: splits only). It was 2 MB, which a few dozen finished campaigns exceed, and it disabled
+#: fan-out on every machine whose ledger had grown; retention caps the file at 64 MB.
+_MAX_CAMPAIGN_BYTES = 50000000
 
 
 def default_limits():
@@ -280,23 +283,105 @@ def apply_budget(steps, root_id, workers, campaigns, limits, min_children=2, now
     return trim_steps(steps, granted), why
 
 
-def read_campaign_rows(path):
-    """campaigns.jsonl as dicts: [] when there is no file, None when it exists but cannot be
-    read (unknown, so a caller fails closed)."""
+#: The only fields usage_from_status reads from a campaign header. The index keeps these and
+#: drops the rest (the header's goal text can be thousands of characters).
+_HEADER_KEYS = ("kind", "campaign_id", "root_id", "n", "ts")
+
+#: path -> {"sig": (mtime_ns, size), "off": bytes consumed, "idx": {rid: [header rows]}}. The
+#: ledger is append-only, so a grown file is read from `off` onward and a shrunk or replaced
+#: one is read again from the start.
+_INDEX_CACHE = {}
+_INDEX_CACHE_MAX = 4
+
+
+def _scan_headers(path, state):
+    """Extend `state` (offset + index) with the lines appended since it was last read.
+
+    Streams the file in binary, one line at a time; a line is parsed only when it can be a
+    campaign header (it carries a "kind" key; child rows, merge rows and result rows do not), so
+    the cost is about one substring test per line rather than one JSON parse. A final line with
+    no newline yet (a write in progress) is left for the next call.
+    """
+    idx = state["idx"]
+    with open(path, "rb") as fh:
+        fh.seek(state["off"])
+        off = state["off"]
+        for raw in fh:
+            if not raw.endswith(b"\n"):
+                break
+            off += len(raw)
+            if b'"kind"' not in raw:
+                continue
+            ln = raw.decode("utf-8", "replace")
+            if off == len(raw) and ln.startswith("﻿"):
+                ln = ln[1:]
+            c = _as_row(ln)
+            if not c or c.get("kind") != "campaign":
+                continue
+            rid = c.get("root_id") or c.get("campaign_id")
+            if not rid:
+                continue
+            idx.setdefault(str(rid), []).append({k: c[k] for k in _HEADER_KEYS if k in c})
+        state["off"] = off
+
+
+def _header_index(path):
+    """The campaign-header index of `path`, or None when it cannot be built (unreadable, or
+    past _MAX_CAMPAIGN_BYTES, the CPU bound). Cached by (mtime, size), appended incrementally."""
+    st = os.stat(path)
+    sig = (st.st_mtime_ns, st.st_size)
+    if st.st_size > _MAX_CAMPAIGN_BYTES:
+        return None
+    key = os.path.normcase(os.path.abspath(path))
+    state = _INDEX_CACHE.get(key)
+    if state is not None and state["sig"] == sig:
+        return state["idx"]
+    if state is None or st.st_size < state["off"] or state["sig"][1] > st.st_size:
+        state = {"sig": sig, "off": 0, "idx": {}}
+    _scan_headers(path, state)
+    state["sig"] = sig
+    _INDEX_CACHE.pop(key, None)
+    _INDEX_CACHE[key] = state
+    while len(_INDEX_CACHE) > _INDEX_CACHE_MAX:
+        _INDEX_CACHE.pop(next(iter(_INDEX_CACHE)))
+    return state["idx"]
+
+
+def read_campaign_rows(path, root_ids=None):
+    """Campaign header rows from campaigns.jsonl: [] when there is no file, None when it exists
+    but cannot be read (unknown, so a caller fails closed).
+
+    The ledger is STREAMED, never loaded whole, and its size no longer turns into "unknown" until
+    _MAX_CAMPAIGN_BYTES (50 MB), far above where a ledger sits under retention. Only header rows
+    are returned (the only rows usage_from_status reads), reduced to the fields it uses.
+    `root_ids` (an iterable of ids) narrows the result to exactly those roots; None returns every
+    header. A row belongs to root_id when its root_id is that id, or, with no root_id, when its
+    campaign_id is: an id that merely contains another is a different root.
+    """
     if not path or not os.path.exists(path):
         return []
     try:
-        if os.path.getsize(path) > _MAX_CAMPAIGN_BYTES:
-            return None
-        with open(path, encoding="utf-8-sig") as fh:
-            rows = []
-            for ln in fh.read().splitlines():
-                r = _as_row(ln)
-                if r is not None:
-                    rows.append(r)
-            return rows
+        idx = _header_index(path)
     except Exception:
         return None
+    if idx is None:
+        return None
+    if root_ids is None:
+        return [r for rows in idx.values() for r in rows]
+    return [r for rid in {str(x) for x in root_ids} for r in idx.get(rid, ())]
+
+
+def ledger_rows_for_split(path, root_id):
+    """The campaign rows a split decision needs, as read_campaign_rows returns them.
+
+    A TOP-LEVEL split (`root_id` empty) is its own brand-new root: no worker carries its id and
+    no header of it exists yet, so its recorded usage is zero by construction and the ledger is
+    not read, whatever its size or state. A NESTED split reads only its own root's rows, and None
+    (unreadable) refuses that split alone, via grant()'s fail-closed "tree usage unknown".
+    """
+    if not root_id:
+        return []
+    return read_campaign_rows(path, root_ids=[root_id])
 
 
 def status_block(workers, campaigns, limits=None, now=None):
@@ -309,7 +394,11 @@ def status_block(workers, campaigns, limits=None, now=None):
     usage = usage_from_status(workers, campaigns, now=now)
     if usage is None:
         return {}
-    ranked = sorted(usage.items(), key=lambda kv: (-kv[1]["total"], kv[0]))[:MAX_ROOTS_EXPORTED]
+    # Trees that have a worker now come first: a ledger full of finished campaigns must not
+    # crowd the live tree out of the capped export.
+    live = {str(r.get("root_id")) for r in (workers or []) if isinstance(r, dict) and r.get("root_id")}
+    ranked = sorted(usage.items(),
+                    key=lambda kv: (kv[0] not in live, -kv[1]["total"], kv[0]))[:MAX_ROOTS_EXPORTED]
     return {"fanout_budget": dict(lim),
             "tree_budget": {rid: {"total": e["total"], "active": e["active"], "turns": e["turns"],
                                   "wall_min": e["wall_min"], "known": e["known"],
@@ -317,4 +406,4 @@ def status_block(workers, campaigns, limits=None, now=None):
 
 
 __all__ = ["grant", "usage_from_status", "apply_budget", "trim_steps", "limits_from_settings",
-           "status_block", "read_campaign_rows", "rows_from_workers", "default_limits"]
+           "status_block", "read_campaign_rows", "ledger_rows_for_split", "rows_from_workers", "default_limits"]

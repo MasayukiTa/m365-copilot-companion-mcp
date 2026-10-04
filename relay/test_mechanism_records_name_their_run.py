@@ -200,6 +200,10 @@ BLANK_BY_DESIGN = {
         "derived from a worker's transcript name (`_run_id_of`) and there is no worker yet. "
         "The verb is a property of the submission, not of the sweep that later picks it up, "
         "so a blank id is the honest answer rather than a gap",
+    ("relay/fleet_retention.py", "campaigns_ledger_large"):
+        "a housekeeping sweep over the whole .fleet directory that runs between runs, not inside "
+        "one; the ledger it warns about holds campaigns from many runs, so there is no single "
+        "run to name and a blank id is the honest answer",
 }
 
 _MECH_NAME = re.compile(r'_mt\.record\(\s*"([a-z_]+)"')
