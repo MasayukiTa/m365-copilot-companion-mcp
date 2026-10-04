@@ -1395,6 +1395,17 @@ def _write_scope_tick(workers):
         pass
 
 
+def _auto_resume_block():
+    """`auto_resume`: {setting, last_decision, pending_snapshots}, additive. The production caller
+    of relay.fleet_resume.auto_resume_report; the screen shows whether an interrupted run is
+    waiting and what the resume gate last decided. {} on any failure."""
+    try:
+        from relay import fleet_resume as _fres
+        return {"auto_resume": _fres.auto_resume_report(_ACTIVE_STATE_DIR or os.path.join(_repo_root(), ".fleet"))}
+    except Exception:
+        return {}
+
+
 def _fanout_depth_block():
     """`fanout_depth`: the split depth asked for and the one in force, additive.
 
@@ -1876,6 +1887,7 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
     _snap.update(_tree_budget_block(_snap["workers"]))
     _snap.update(_fanout_depth_block())
     _snap.update(_write_scope_block())
+    _snap.update(_auto_resume_block())
     return _snap
 
 

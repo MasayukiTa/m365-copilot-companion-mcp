@@ -1165,6 +1165,18 @@ def autostart_status(state_dir=None, now=None) -> tuple:
         return False, "autostart is off (FLEET_INTAKE_AUTOSTART)"
     if fleet_is_live(state_dir):
         return False, "a fleet is already running"
+    # THE INTERRUPTED RUN COMES FIRST. A pending snapshot whose automatic resume is on its way
+    # (or a resume the supervisor has just launched and that has not written its marker yet)
+    # must not be answered by a FRESH coordinator for the queued goals: that one ignores the
+    # snapshot and the interrupted trees are lost. The goals stay queued and join the resumed
+    # run through the live-fleet delivery. Bounded -- see relay.fleet_resume.autostart_hold.
+    try:
+        from relay import fleet_resume as _fres
+        held = _fres.autostart_hold(state_dir or FLEET_STATE_DIR, now=now)
+    except Exception:
+        held = ""
+    if held:
+        return False, "an interrupted run is being resumed first (%s)" % held
     rec = _read_autostart(state_dir)
     started = float(rec.get("started_at") or 0)
     if started:

@@ -403,11 +403,38 @@ def test_the_cycle_check_resumes_from_a_pending_snapshot_in_dry_run_and_says_so_
     assert r["snapshotStillPending"] == "pending", "a dry run changed the snapshot"
 
 
-def test_the_cycle_call_is_dry_run_unless_explicitly_made_live(src):
+def test_the_cycle_call_is_governed_by_the_setting_not_by_a_command_line_flag(src):
+    """The per-cycle resume used to be a DRY RUN unless -FleetCycleResumeLive was passed on the
+    command line -- a switch the operator cannot reach from the cockpit, so for them the feature
+    did not exist. It now runs live whenever the fleet_auto_resume setting is on (the default);
+    the flag only forces it over a setting of off."""
     code = _code_only(src)
-    assert "Invoke-FleetAutoResume -DryRun:(-not $FleetCycleResumeLive) -FromCycle" in code
-    assert code.index("Invoke-FleetAutoResume -DryRun:(-not $FleetCycleResumeLive)") > \
-        code.index("\n    Invoke-FleetReap\n"), "the cycle resume must come after the reap"
+    call = "Invoke-FleetAutoResume -DryRun:$FleetResumeDryRun -FromCycle -ForceEnabled:$FleetCycleResumeLive"
+    assert call in code
+    assert "-DryRun:(-not $FleetCycleResumeLive)" not in code, "the cycle resume is dry-run by default again"
+    assert code.index(call) > code.index("\n    Invoke-FleetReap\n"), \
+        "the cycle resume must come after the reap"
+    # and it comes BEFORE the queue drain, so a resumed run's launch guard exists when the router asks
+    assert code.index(call) < code.index("\n    Invoke-QueueDrain\n"), \
+        "the queue drain runs before the resume: queued goals would start a fresh coordinator first"
+
+
+def test_the_switch_is_asked_only_with_a_candidate_and_reads_the_products_setting(src):
+    body = _code_only(_extract_braced_block(src, "function Test-FleetAutoResumeEnabled"))
+    assert "fleet_resume.auto_resume_setting()" in body, "the setting is not read through the product reader"
+    assert "MCP_FLEET_AUTORESUME" in body and "$Force" in body, "the env override / -Force override is gone"
+    inv = _code_only(_extract_braced_block(src, "function Invoke-FleetAutoResume"))
+    assert inv.index("Test-FleetShouldAutoResume") < inv.index("Test-FleetAutoResumeEnabled"), \
+        "every tick would spawn python to read the setting"
+
+
+def test_the_launch_guard_is_written_before_the_launch_and_completed_after(src):
+    inv = _code_only(_extract_braced_block(src, "function Invoke-FleetAutoResume"))
+    first = inv.index("write_launch_guard(r'$FleetDir', 0,")
+    launch = inv.index("Start-Process -FilePath $Py")
+    done = inv.index("write_launch_guard(r'$FleetDir', $($fleetProc.Id)")
+    assert first < launch < done
+    assert inv.count("clear_launch_guard") == 2, "a failed launch must drop the guard"
 
 
 def test_supervisor_ps1_additions_stay_ascii_in_the_resume_gate(src):
@@ -498,3 +525,232 @@ def test_the_powershell_gate_agrees_with_the_python_gate_on_every_case(src):
             assert ps[n] == reason, "case %s: powershell says %r, python says %r" % (n, ps[n], reason)
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+# -- the fleet_auto_resume setting drives the cycle resume, end to end through the real gate ------
+#
+# Same temp checkout and stand-in coordinator as above, but this one carries the REAL
+# relay/fleet_resume.py and tools/settings_path.py, so the setting is read, the snapshot is
+# updated, the decision is recorded and the launch guard is written by the product's own code.
+# APPDATA points at an empty folder: settings_path falls back to %APPDATA% when the checkout has
+# no .config/settings.txt, and the operator's real settings must not leak into a test.
+
+_SETTING_DRIVER_FOOTER = r'''
+$env:APPDATA = Join-Path $RootDir "appdata"
+$SettingsPath = Join-Path $Root ".config\settings.txt"
+New-Item -ItemType Directory -Path (Join-Path $Root ".config") -Force | Out-Null
+$snapDir = Join-Path $FleetDir "interrupted"
+New-Item -ItemType Directory -Path $snapDir -Force | Out-Null
+$StopFile = Join-Path $FleetDir "STOP"
+
+function Put-Setting($v) {
+    if ($null -eq $v) { Remove-Item $SettingsPath -Force -ErrorAction SilentlyContinue }
+    else { Set-Content -Path $SettingsPath -Value ("fleet_auto_resume=" + $v) -Encoding ASCII }
+}
+function New-Snap($id, $res, $extra) {
+    Get-ChildItem $snapDir -Filter *.json | Remove-Item -Force
+    $body = @{ schema = 1; run_id = $id; state = "pending"
+               written_ts = [double][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+               marker = @{ pid = $DeadPid; start_ts = 1.0; argv = @("--x"); resume_argv = @("--x") }
+               interrupted = @{ free_bytes_at_detection = 1000 }
+               resume = $res }
+    if ($extra) { foreach ($k in $extra.Keys) { $body[$k] = $extra[$k] } }
+    Set-Content -Path (Join-Path $snapDir "$id.json") -Value ($body | ConvertTo-Json -Depth 6) -Encoding ASCII
+}
+function Read-Json($p) { if (Test-Path $p) { return (Get-Content $p -Raw | ConvertFrom-Json) } else { return $null } }
+function Snap-State($id) { $d = Read-Json (Join-Path $snapDir "$id.json"); if ($d) { return [string]$d.state } else { return "" } }
+function Decision() { $d = Read-Json (Join-Path $FleetDir "auto_resume_state.json"); if ($d) { return ($d.decision + ":" + $d.reason) } else { return "" } }
+function Runner-Count() { return $script:AutoResumeRunners.Count }
+function Stop-Fakes {
+    New-Item -ItemType File -Path $StopFile -Force | Out-Null
+    foreach ($e in $script:AutoResumeRunners.ToArray()) { try { $e.Proc.WaitForExit(20000) | Out-Null } catch { } }
+    Remove-Item $StopFile -Force -ErrorAction SilentlyContinue
+}
+function Case($name, [scriptblock]$body) {
+    $script:CapturedLog.Clear()
+    Remove-Item (Join-Path $FleetDir "resume_launch.json"), (Join-Path $FleetDir "auto_resume_state.json") -Force -ErrorAction SilentlyContinue
+    $before = Runner-Count
+    $o = [ordered]@{}
+    & $body $o
+    $o.launched = (Runner-Count) - $before
+    $o.log = @($script:CapturedLog)
+    $o.decision = Decision
+    $r[$name] = $o
+    Stop-Fakes
+}
+$r = [ordered]@{}
+try {
+    # A. setting absent = the registry default (on): resumed ONCE, guard written with the pid
+    Put-Setting $null
+    Case "default_on" { param($o)
+        New-Snap "rA_1" @{ count = 0; history = @() } $null
+        $o.first = [bool](Invoke-FleetAutoResume -FromCycle)
+        $o.afterFirst = Runner-Count
+        $o.second = [bool](Invoke-FleetAutoResume -FromCycle)
+        $o.afterSecond = Runner-Count
+        $o.snapState = Snap-State "rA_1"
+        $g = Read-Json (Join-Path $FleetDir "resume_launch.json")
+        $o.guardPid = if ($g) { [int]$g.pid } else { -1 }
+        $o.guardRun = if ($g) { [string]$g.run_id } else { "" }
+        $o.runnerPid = $script:AutoResumeRunners[$script:AutoResumeRunners.Count - 1].Proc.Id
+    }
+    # B. setting off: never launched, the snapshot stays pending for a manual resume
+    Put-Setting "off"
+    Case "off" { param($o)
+        New-Snap "rB_1" @{ count = 0; history = @() } $null
+        $o.resumed = [bool](Invoke-FleetAutoResume -FromCycle)
+        $o.again = [bool](Invoke-FleetAutoResume -FromCycle)
+        $o.snapState = Snap-State "rB_1"
+        $o.guardExists = Test-Path (Join-Path $FleetDir "resume_launch.json")
+    }
+    # C. off + the old -FleetCycleResumeLive switch (now -ForceEnabled): still an override
+    Case "off_forced" { param($o)
+        New-Snap "rC_1" @{ count = 0; history = @() } $null
+        $o.resumed = [bool](Invoke-FleetAutoResume -FromCycle -ForceEnabled)
+    }
+    # D. MCP_FLEET_AUTORESUME beats the setting in BOTH directions
+    Put-Setting "on"
+    $env:MCP_FLEET_AUTORESUME = "0"
+    Case "env_off_over_on" { param($o)
+        New-Snap "rD_1" @{ count = 0; history = @() } $null
+        $o.resumed = [bool](Invoke-FleetAutoResume -FromCycle)
+        $o.snapState = Snap-State "rD_1"
+    }
+    Put-Setting "off"
+    $env:MCP_FLEET_AUTORESUME = "1"
+    Case "env_on_over_off" { param($o)
+        New-Snap "rD_2" @{ count = 0; history = @() } $null
+        $o.resumed = [bool](Invoke-FleetAutoResume -FromCycle)
+    }
+    $env:MCP_FLEET_AUTORESUME = ""
+    # E. the loop guard still decides when the setting is on
+    Put-Setting "on"
+    Case "loop_cap" { param($o)
+        New-Snap "rE_1" @{ count = 3; last_ts = 1.0; history = @() } $null
+        $o.resumed = [bool](Invoke-FleetAutoResume -FromCycle)
+        $o.snapState = Snap-State "rE_1"
+    }
+    Case "stop_requested" { param($o)
+        New-Snap "rF_1" @{ count = 0; history = @() } @{ stop_requested = $true }
+        $o.resumed = [bool](Invoke-FleetAutoResume -FromCycle)
+        $o.snapState = Snap-State "rF_1"
+    }
+    Case "backoff" { param($o)
+        New-Snap "rG_1" @{ count = 1; last_ts = [double][DateTimeOffset]::UtcNow.ToUnixTimeSeconds(); history = @() } $null
+        $o.resumed = [bool](Invoke-FleetAutoResume -FromCycle)
+        $o.snapState = Snap-State "rG_1"
+    }
+    Case "coordinator_already_live" { param($o)
+        New-Snap "rH_1" @{ count = 0; history = @() } $null
+        $fake = Start-Process -FilePath $BasePy -WindowStyle Hidden -PassThru -ArgumentList @(
+            '-c', '"import time; time.sleep(120)"', 'relay.fleet_runner', '--resume', ('"' + $Root + '"'))
+        $until = (Get-Date).AddSeconds(15)
+        while ((Get-Date) -lt $until -and -not (@(Get-ThisCheckoutFleetCoordinatorPids) -contains $fake.Id)) { Start-Sleep -Milliseconds 200 }
+        $o.resumed = [bool](Invoke-FleetAutoResume -FromCycle)
+        $o.snapState = Snap-State "rH_1"
+        Stop-Process -Id $fake.Id -Force
+    }
+} finally {
+    New-Item -ItemType File -Path (Join-Path $FleetDir "GO") -Force | Out-Null
+    New-Item -ItemType File -Path $StopFile -Force | Out-Null
+    foreach ($e in $script:AutoResumeRunners.ToArray()) { try { $e.Proc.WaitForExit(10000) | Out-Null } catch { } }
+    $r | ConvertTo-Json -Depth 8 | Set-Content -Path $OutFile -Encoding UTF8
+}
+'''
+
+
+@pytest.fixture(scope="module")
+def setting_result(src):
+    work = tempfile.mkdtemp(prefix="sup_fleet_setting_")
+    try:
+        root = os.path.join(work, "repo")
+        for d in (".fleet", "relay", "tools"):
+            os.makedirs(os.path.join(root, d))
+        for rel in ("relay/fleet_reaper.py", "relay/fleet_resume.py", "tools/settings_path.py"):
+            shutil.copy(os.path.join(REPO, *rel.split("/")), os.path.join(root, *rel.split("/")))
+        for rel, body in (("relay/__init__.py", ""), ("relay/fleet_runner.py", _FAKE_RUNNER),
+                          ("tools/__init__.py", ""), ("tools/notify_ops.py", _FAKE_NOTIFY)):
+            with open(os.path.join(root, rel), "w", encoding="ascii") as fh:
+                fh.write(body)
+        dead = childproc.run([sys.executable, "-c", "import os; print(os.getpid())"], timeout=60,
+                             creationflags=childproc.headless_creationflags())
+        dead_pid = int(dead.stdout.strip().splitlines()[-1])
+
+        parts = [_extract_line(src, l) for l in _INIT_LINES]
+        parts += [_extract_braced_block(src, f) for f in _FUNCTIONS]
+        driver = os.path.join(work, "driver.ps1")
+        out = os.path.join(work, "out.json")
+        with open(driver, "w", encoding="utf-8") as fh:
+            fh.write(_DRIVER_HEADER + "\n\n" + "\n\n".join(parts) + "\n\n" + _SETTING_DRIVER_FOOTER)
+        base_py = getattr(sys, "_base_executable", None) or sys.executable
+        env = dict(os.environ)
+        env.pop("MCP_FLEET_AUTORESUME", None)
+        proc = childproc.run(
+            [_POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", driver,
+             "-RootDir", root, "-RunnerPy", _venv_python(), "-BasePy", base_py,
+             "-DeadPid", str(dead_pid), "-OutFile", out],
+            timeout=420, creationflags=childproc.headless_creationflags(), env=env)
+        assert proc.returncode == 0, "driver failed:\n%s\n%s" % (proc.stdout, proc.stderr)
+        with open(out, "r", encoding="utf-8-sig") as fh:
+            return json.load(fh)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@windows_only
+def test_setting_on_resumes_an_interrupted_run_exactly_once(setting_result):
+    r = setting_result["default_on"]
+    assert r["first"] is True and r["afterFirst"] >= 1, _lines(r["log"])
+    assert r["second"] is False, "a second resume was launched for the same interrupted run"
+    assert r["afterSecond"] == r["afterFirst"] and r["launched"] == 1, r
+    assert r["snapState"] == "resumed"
+    assert r["decision"] == "resumed:"
+
+
+@windows_only
+def test_a_resume_writes_a_launch_guard_naming_the_process_it_started(setting_result):
+    """This is what stops the queue from starting a fresh coordinator in the same cycle."""
+    r = setting_result["default_on"]
+    assert r["guardPid"] == r["runnerPid"], "the guard does not name the launched coordinator: %s" % r
+    assert r["guardRun"] == "rA_1"
+
+
+@windows_only
+def test_setting_off_never_launches_and_leaves_the_snapshot_pending(setting_result):
+    r = setting_result["off"]
+    assert r["resumed"] is False and r["again"] is False
+    assert r["launched"] == 0
+    assert r["snapState"] == "pending", "the snapshot was consumed with auto-resume off"
+    assert r["guardExists"] is False
+    assert any("OFF" in l for l in _lines(r["log"])), _lines(r["log"])
+
+
+@windows_only
+def test_the_old_cycle_switch_and_the_env_var_are_still_overrides(setting_result):
+    assert setting_result["off_forced"]["resumed"] is True, "-ForceEnabled no longer overrides off"
+    assert setting_result["env_off_over_on"]["resumed"] is False
+    assert setting_result["env_off_over_on"]["launched"] == 0
+    assert setting_result["env_off_over_on"]["snapState"] == "pending"
+    assert setting_result["env_on_over_off"]["resumed"] is True
+
+
+@windows_only
+def test_the_loop_guard_still_refuses_with_the_setting_on(setting_result):
+    cap = setting_result["loop_cap"]
+    assert cap["resumed"] is False and cap["launched"] == 0
+    assert cap["snapState"] == "gave_up", "the cap was not recorded"
+    assert cap["decision"] == "refused:max_resumes"
+    stop = setting_result["stop_requested"]
+    assert stop["resumed"] is False and stop["launched"] == 0
+    assert stop["decision"] == "refused:stop_requested"
+    back = setting_result["backoff"]
+    assert back["resumed"] is False and back["launched"] == 0
+    assert back["snapState"] == "pending", "a backoff must leave the run to be resumed later"
+    assert back["decision"] == "waiting:backoff"
+
+
+@windows_only
+def test_no_second_coordinator_even_with_the_setting_on(setting_result):
+    r = setting_result["coordinator_already_live"]
+    assert r["resumed"] is False and r["launched"] == 0
+    assert r["snapState"] == "pending"

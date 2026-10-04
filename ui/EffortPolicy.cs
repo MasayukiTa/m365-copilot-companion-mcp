@@ -661,3 +661,100 @@ public static class GroupTreeView
         return n == null ? b : b + " / " + n;
     }
 }
+
+// The auto-resume switch's words and parsing, WPF-free (same file as WriteScopeView). The Python
+// side decides: relay/fleet_resume.py reads `fleet_auto_resume` and the supervisor consults the
+// loop guard each cycle; relay/fleet_runner.py exports {setting, last_decision, pending_snapshots}
+// as status.json "auto_resume" (relay/fleet_resume.py also patches an idle status.json, so the
+// screen can say what the gate decided although no coordinator is alive). Default on.
+public static class AutoResumeView
+{
+    //: must equal tools/settings_keys.py and relay/fleet_resume.py AUTO_RESUME_SETTING_KEY / _DEFAULT.
+    public const string Key = "fleet_auto_resume";
+    public const string Default = "on";
+
+    public static readonly string[] Modes = { "off", "on" };
+
+    public static bool IsMode(string v) { return v == "off" || v == "on"; }
+
+    /// <summary>The mode named by one fleet_auto_resume= line; null when the line is not that key
+    /// or the value is not off|on (the caller keeps its value, on). A byte order mark is tolerated
+    /// and the value is case-insensitive, as in Python.</summary>
+    public static string ParseLine(string line)
+    {
+        if (line == null) return null;
+        string ln = line.TrimStart('﻿').Trim();
+        if (!ln.StartsWith(Key + "=", StringComparison.Ordinal)) return null;
+        string v = ln.Substring(Key.Length + 1).Trim().ToLowerInvariant();
+        return IsMode(v) ? v : null;
+    }
+
+    public static string Label(bool ja) { return ja ? "中断した実行を自動で再開" : "Auto-resume interrupted runs"; }
+
+    public static string ModeLabel(string mode, bool ja)
+    {
+        if (mode == "off") return ja ? "オフ" : "Off";
+        if (mode == "on") return ja ? "オン" : "On";
+        return mode ?? "";
+    }
+
+    public static string Help(bool ja)
+    {
+        return ja ? "オン=コーディネーターが落ちて中断した実行を、人に聞かずに再開します。再開は最大3回、間隔は5分×2^回数で、停止指示のあと・実行中・空き容量が下限未満のときは再開しません。待機中の依頼は中断した実行の再開を先に待ちます。"
+                  : "On resumes a run interrupted by a coordinator crash without asking. At most 3 automatic resumes, 5 min x 2^n apart; never after a stop, while a coordinator is running, or under the disk floor. Queued goals wait for the interrupted run to be resumed first.";
+    }
+
+    public static string TakeEffectTip(bool ja)
+    {
+        return ja ? "次の監視サイクル(約15秒)から有効。再起動不要。"
+                  : "Applies from the next supervisor cycle (about 15 s), no restart.";
+    }
+
+    /// <summary>The gate's last decision in words; null when there is none.</summary>
+    public static string DecisionText(string decision, string reason, bool ja)
+    {
+        if (string.IsNullOrEmpty(decision)) return null;
+        if (decision == "resumed") return ja ? "再開しました" : "resumed";
+        string why = ReasonText(reason, ja);
+        if (decision == "waiting") return (ja ? "待機中" : "waiting") + (why != null ? " (" + why + ")" : "");
+        return (ja ? "再開しません" : "not resumed") + (why != null ? " (" + why + ")" : "");
+    }
+
+    static string ReasonText(string reason, bool ja)
+    {
+        switch (reason)
+        {
+            case "backoff": return ja ? "次の試行まで間隔を空けています" : "waiting out the retry interval";
+            case "below_floor": return ja ? "空き容量が下限未満" : "free space is under the floor";
+            case "max_resumes": return ja ? "自動再開の上限3回に達しました" : "reached the 3-resume limit";
+            case "stop_requested": return ja ? "停止が指示されていました" : "a stop was requested";
+            case "same_crash_no_more_space": return ja ? "同じ原因で空きが増えていません" : "same crash and no more free space";
+            case "disk_full_no_more_space": return ja ? "ディスク満杯で空きが増えていません" : "disk was full and has not freed up";
+            case "coordinator_live": return ja ? "別のコーディネーターが稼働中" : "a coordinator is already running";
+            default: return string.IsNullOrEmpty(reason) ? null : reason;
+        }
+    }
+
+    /// <summary>What the runner/supervisor report: the setting in force, whether an interrupted run
+    /// is waiting, and what the gate last decided; null when the setting is not usable (old runner),
+    /// so the cockpit shows nothing rather than guessing.</summary>
+    public static string Describe(string reported, string decision, string reason, int pending, bool ja)
+    {
+        if (!IsMode(reported)) return null;
+        string head = (ja ? "稼働中: " : "In effect: ") + ModeLabel(reported, ja);
+        head += pending > 0
+            ? (ja ? " / 再開待ちの中断 " + pending + " 件" : " / " + pending + " interrupted run(s) waiting")
+            : (ja ? " / 再開待ちなし" : " / none waiting");
+        string d = DecisionText(decision, reason, ja);
+        if (d != null) head += (ja ? " / 直近の判断: " : " / last decision: ") + d;
+        return head;
+    }
+
+    /// <summary>The note shown when the setting the supervisor reports differs from the selection
+    /// (it re-reads the key each cycle); null when they agree.</summary>
+    public static string PendingText(string reported, string selected, bool ja)
+    {
+        if (!IsMode(reported) || reported == selected) return null;
+        return ja ? "選択は次の監視サイクルから反映" : "selection applies from the next cycle";
+    }
+}
