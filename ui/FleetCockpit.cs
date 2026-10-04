@@ -14104,6 +14104,10 @@ class CockpitWindow : Window
             && string.Equals(S(w, "execution_profile"), "LOCAL_LOOP", StringComparison.OrdinalIgnoreCase)
             && string.Equals(S(w, "runtime_resume_allowed"), "True", StringComparison.OrdinalIgnoreCase);
         bool isAgentSetupWait = isLocalRuntimeWait && IsAgentSetupRuntimeWait(reason);
+        bool isLocalLoop = string.Equals(
+            S(w, "execution_profile"), "LOCAL_LOOP", StringComparison.OrdinalIgnoreCase);
+        bool localSteerBlocked = isLocalLoop && (status == "waiting_user"
+            || status == "waiting_external" || status == "needs_routing");
         // Attention lane: stuck/maxturns/error and NOT yet expanded -- gets recovery surface treatment.
         // INFRA_STUCK is carved out of the red attention lane (handled by its own infra branch).
         bool isAttention = !closed && IsOperatorAttention(w);
@@ -14601,7 +14605,7 @@ class CockpitWindow : Window
             // Feature 1: always-visible steer affordance -- reachable WITHOUT expanding the card.
             // Same terminal gate the expanded drawer's SteerRow/RetryRow/ContinueRow switch uses
             // (below): a terminal card (done/stuck/maxturns/error/cancelled) gets nothing here.
-            if (!terminal) col.Children.Add(CollapsedSteerRow(name));
+            if (!terminal && !localSteerBlocked) col.Children.Add(CollapsedSteerRow(name));
         }
         else
         {
@@ -14611,7 +14615,7 @@ class CockpitWindow : Window
             // dump onto the surface at once. Heavy content is built ONLY when expanded.
             col.Children.Add(BuildCardTabs(w, name, goal, last, reason, terminal));
             // Actions live BELOW the tabs (not inside one) so steer/retry are always reachable.
-            if (!terminal) col.Children.Add(SteerRow(name));
+            if (!terminal && !localSteerBlocked) col.Children.Add(SteerRow(name));
             else if (IsRetryableWorker(w)) col.Children.Add(RetryRow(w));
             else col.Children.Add(ContinueRow(name, goal, S(w, "conv_url")));
         }
@@ -15504,8 +15508,8 @@ class CockpitWindow : Window
         tb.FontSize = 12; tb.Padding = new Thickness(4, 2, 4, 2);
         tb.BorderThickness = new Thickness(0, 0, 0, 1); tb.BorderBrush = Border;
         tb.Background = Brushes.Transparent; tb.Foreground = Fg; tb.CaretBrush = Fg;
-        tb.ToolTip = _lang == 0 ? "回答待ち中でも割り込み指示を送れます（次のターンに最優先で反映）"
-                                : "Inject a steering instruction (applied on the next turn)";
+        tb.ToolTip = _lang == 0 ? "このタスクへ追加指示（長時間タスクでは次の安全なターン境界で反映）"
+                                : "Add an operator instruction (durable tasks apply it at the next safe turn boundary)";
         string draft;
         tb.Text = _steerDraft.TryGetValue(nm, out draft) ? draft : "";
         _steerBoxRef[nm] = tb;   // newest realized instance for this worker (used by the focus-restore pass)
@@ -15617,8 +15621,11 @@ class CockpitWindow : Window
         tb.FontSize = 12.5; tb.Padding = new Thickness(4, 3, 4, 3);
         tb.BorderThickness = new Thickness(0); tb.Background = Brushes.Transparent; tb.Foreground = Fg;
         tb.CaretBrush = Fg;
-        tb.ToolTip = _lang == 0 ? "回答待ち中でも割り込み指示を送れます（次のターンに最優先で反映）"
-                                : "Inject a steering instruction (applied on the next turn)";
+        tb.ToolTip = _lang == 0 ? "このタスクへ追加指示（長時間タスクでは次の安全なターン境界で反映）"
+                                : "Add an operator instruction (durable tasks apply it at the next safe turn boundary)";
+        string savedDraft;
+        tb.Text = _steerDraft.TryGetValue(name, out savedDraft) ? savedDraft : "";
+        _steerBoxRef[name] = tb;
         // placeholder watermark text (hides when text is present)
         var placeholder = new TextBlock();
         placeholder.Text = _lang == 0 ? "このタスクに追加指示..." : "Add instruction to this task...";
@@ -15645,6 +15652,7 @@ class CockpitWindow : Window
                 return false;
             }
             tb.Text = "";
+            _steerDraft.Remove(nm);
             // Task 6: updated post-send wording
             note.Text = _lang == 0 ? "次のターンに送信しました" : "Queued for the next turn";
             return true;
@@ -15659,6 +15667,7 @@ class CockpitWindow : Window
         tb.TextChanged += delegate
         {
             bool hasText = tb.Text != null && tb.Text.Length > 0;
+            _steerDraft[nm] = tb.Text;
             placeholder.Visibility = hasText ? Visibility.Collapsed : Visibility.Visible;
             if (note.Text.Length > 0 && hasText) note.Text = "";
         };
@@ -16282,6 +16291,138 @@ class CockpitWindow : Window
         SendCommand(Cmd1("set_autoscale", sa));
     }
 
+    Dictionary<string, object> WorkerByName(string name)
+    {
+        if (string.IsNullOrEmpty(name)) return null;
+        try
+        {
+            foreach (Dictionary<string, object> w in WorkersOf(_lastRoot))
+                if (string.Equals(S(w, "name"), name, StringComparison.Ordinal)) return w;
+            Dictionary<string, object> root = ReadStatus();
+            foreach (Dictionary<string, object> w in WorkersOf(root))
+                if (string.Equals(S(w, "name"), name, StringComparison.Ordinal)) return w;
+        }
+        catch (Exception) { }
+        return null;
+    }
+
+    static bool IsLocalLoopWorker(Dictionary<string, object> w)
+    {
+        return w != null && string.Equals(
+            S(w, "execution_profile"), "LOCAL_LOOP", StringComparison.OrdinalIgnoreCase);
+    }
+
+    bool QueueLocalLoopSteer(Dictionary<string, object> w, string text, out string failReason)
+    {
+        failReason = null;
+        string steerFile = null;
+        System.Diagnostics.Process proc = null;
+        try
+        {
+            if (w == null) { failReason = "LOCAL_LOOP worker metadata is unavailable."; return false; }
+            if (!DurableRuntimeEnabled())
+            {
+                failReason = _lang == 0 ? "長時間実行が無効です。" : "Durable runtime is disabled.";
+                return false;
+            }
+            string jobId = S(w, "name").Replace("\"", "");
+            string db = S(w, "local_job_db").Replace("\"", "");
+            if (string.IsNullOrWhiteSpace(jobId) || string.IsNullOrWhiteSpace(db))
+            {
+                failReason = _lang == 0 ? "長時間タスクの識別情報が不足しています。"
+                                        : "Durable task identity is incomplete.";
+                return false;
+            }
+            string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+            string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
+            if (!File.Exists(py)) py = "python";
+            string stateDir = Path.GetDirectoryName(_statusPath);
+            string token = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString() + "_"
+                         + Guid.NewGuid().ToString("N").Substring(0, 8);
+            steerFile = Path.Combine(stateDir, "durable_steer_" + token + ".txt");
+            File.WriteAllText(steerFile, text ?? "", new UTF8Encoding(false));
+
+            var psi = new System.Diagnostics.ProcessStartInfo();
+            psi.FileName = py;
+            psi.Arguments = "-m relay.local_loop_controller --operator-steer-job-id \"" + jobId
+                          + "\" --operator-steer-file \"" + steerFile
+                          + "\" --state-dir \"" + stateDir + "\" --db \"" + db + "\"";
+            psi.WorkingDirectory = repo;
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
+            proc = System.Diagnostics.Process.Start(psi);
+            if (proc == null) throw new InvalidOperationException("LOCAL_LOOP steer process did not start");
+            WatchLocalLoopSteer(proc, jobId, steerFile, text ?? "");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            try { if (!string.IsNullOrEmpty(steerFile) && File.Exists(steerFile)) File.Delete(steerFile); }
+            catch (Exception) { }
+            try { if (proc != null) proc.Dispose(); } catch (Exception) { }
+            failReason = (_lang == 0 ? "追加指示を保存できませんでした: " : "Could not save operator update: ") + ex.Message;
+            return false;
+        }
+    }
+
+    void WatchLocalLoopSteer(System.Diagnostics.Process proc, string jobId,
+                             string steerFile, string text)
+    {
+        var timer = new System.Windows.Threading.DispatcherTimer();
+        timer.Interval = TimeSpan.FromMilliseconds(200);
+        timer.Tick += delegate
+        {
+            try
+            {
+                proc.Refresh();
+                if (!proc.HasExited) return;
+                timer.Stop();
+                int code = -1;
+                try { code = proc.ExitCode; } catch (Exception) { }
+                if (code == 0)
+                {
+                    _steerDraft.Remove(jobId);
+                    try { if (!string.IsNullOrEmpty(steerFile) && File.Exists(steerFile)) File.Delete(steerFile); }
+                    catch (Exception) { }
+                    ShowScaleToast(_lang == 0 ? "追加指示を長時間タスクへ保存しました"
+                                               : "Operator update saved to the durable task");
+                    _lastSig = "";
+                }
+                else
+                {
+                    _steerDraft[jobId] = text;
+                    TextBox box;
+                    if (_steerBoxRef.TryGetValue(jobId, out box) && box != null)
+                    {
+                        try { if (string.IsNullOrEmpty(box.Text)) box.Text = text; } catch (Exception) { }
+                    }
+                    try { if (!string.IsNullOrEmpty(steerFile) && File.Exists(steerFile)) File.Delete(steerFile); }
+                    catch (Exception) { }
+                    ShowScaleToast((_lang == 0 ? "追加指示を保存できませんでした。入力を復元しました。終了コード "
+                                                   : "Operator update failed; input restored. Exit code ") + code);
+                    _lastSig = "";
+                }
+                try { proc.Dispose(); } catch (Exception) { }
+            }
+            catch (Exception ex)
+            {
+                timer.Stop();
+                _steerDraft[jobId] = text;
+                TextBox box;
+                if (_steerBoxRef.TryGetValue(jobId, out box) && box != null)
+                {
+                    try { if (string.IsNullOrEmpty(box.Text)) box.Text = text; } catch (Exception) { }
+                }
+                ShowScaleToast((_lang == 0 ? "追加指示の確認に失敗しました。入力を復元しました。 "
+                                               : "Could not confirm operator update; input restored. ") + ex.Message);
+                try { proc.Dispose(); } catch (Exception) { }
+                _lastSig = "";
+            }
+        };
+        timer.Start();
+    }
+
     void RequestSteer(string name, string text)
     {
         if (string.IsNullOrEmpty(text)) return;
@@ -16302,6 +16443,9 @@ class CockpitWindow : Window
         failReason = null;
         string t = (text ?? "").Trim();
         if (t.Length == 0) return false;
+        Dictionary<string, object> worker = WorkerByName(name);
+        if (IsLocalLoopWorker(worker))
+            return QueueLocalLoopSteer(worker, t, out failReason);
         if (!RunIsLive()) { failReason = T("steer_dead"); return false; }
         RequestSteer(name, t);
         return true;
