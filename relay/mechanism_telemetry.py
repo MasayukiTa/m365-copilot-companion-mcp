@@ -89,7 +89,13 @@ MECHANISMS = ("fanout", "refuter", "panel", "veto", "retry", "bestofn", "skill",
               "merge_stalled_missing_child_result",
               # Two siblings of one campaign wrote the same path, or one wrote a path another's
               # step names. SHADOW only (relay/write_scope.py): recorded, never acted on.
-              "scope_overlap")
+              "scope_overlap",
+              # A NESTED split refused because its root's usage could not be read (fail closed),
+              # and the campaigns ledger passing the size where it should have been compacted
+              # (relay/fleet_retention.py). Registered so a fan-out that is silently refusing
+              # splits shows up in a summary instead of only in a console line.
+              "fanout_budget_usage_unknown",
+              "campaigns_ledger_large")
 
 
 def patch_hash(text):
