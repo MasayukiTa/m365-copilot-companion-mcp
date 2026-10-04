@@ -622,8 +622,8 @@ def resume_children_goals(state_dir, done_map=None, log=print, scope=None):
         if cid not in scope:
             skipped += 1
             continue
-        if fam.get("merge_done"):
-            continue
+        if fam.get("merge_done") or fam.get("merge_abandoned"):
+            continue                # finished, or written off after its merge was lost twice
         # DONE in the done-map but no answer on the ledger: recover the answer from durable
         # sources, else re-queue that child once (never leave it in limbo).
         _requeue = {id(c) for c in recover_family_results(state_dir, cid, fam, done_map,
@@ -677,6 +677,65 @@ def rehydrate_decision(fam, done_map):
     if int(fam.get("merge_requeued") or 0) >= 1:
         return "drop"                      # automatic cap 1: a person decides after this
     return "reissue"
+
+
+def merge_abandon_due(fam, done_map):
+    """PURE. Is this family's merge LOST for good: queued, never finished, already re-issued once
+    (the cap rehydrate_decision enforces), no aggregator DONE on record, and not yet written off?
+    Such a family used to be dropped silently and read as 'waiting' forever."""
+    if fam.get("merge_done") or fam.get("merge_abandoned") or not fam.get("merged"):
+        return False
+    if not fam.get("agg_key") or done_map.get(fam.get("agg_key")) == "DONE":
+        return False
+    return int(fam.get("merge_requeued") or 0) >= 1
+
+
+def abandon_exhausted_merges(state_dir, camps, done_map, log=print, run_id=""):
+    """Write off every family whose merge was lost twice, ONCE, in the open.
+
+    Per family: one `merge_abandoned` ledger line (so family_view reports merge_state 'failed'
+    and a later start does not do it again), one mechanism row, and -- for a NESTED family --
+    an explicit MISSING `nested` row on the parent slot, so the parent's merge names the gap
+    instead of waiting for an answer that will never come. The re-issue cap is NOT raised and
+    the merge is not queued again. Mutates `camps` in memory to match what it appended.
+    Returns the campaign ids written off. Never raises."""
+    from relay import fanout
+    done = []
+    for cid, fam in sorted((camps or {}).items()):
+        try:
+            if not merge_abandon_due(fam, done_map or {}):
+                continue
+            append_ledger_row(state_dir, {"kind": "merge_abandoned", "campaign_id": cid,
+                                          "agg_key": fam.get("agg_key"),
+                                          "merge_requeued": int(fam.get("merge_requeued") or 0),
+                                          "ts": time.time()})
+            fam["merge_abandoned"] = True
+            pc, pi = fam.get("parent_campaign_id"), fam.get("parent_subtask_index")
+            parent = (camps or {}).get(pc) if pc else None
+            slot = False
+            if parent is not None and pi is not None and not parent.get("merge_done") \
+                    and not any(r.get("nested") and r.get("subtask_index") == pi
+                                for r in parent.get("child_results") or []):
+                row = fanout.nested_result_row(pc, pi, cid, "", merge_ok=False,
+                                               missing=fam.get("nested_missing") or (),
+                                               task_id="%s-%s" % (pc, pi))
+                row["sealed"] = "nested_merge_abandoned"
+                append_ledger_row(state_dir, row)
+                parent.setdefault("child_results", []).append(row)
+                slot = True
+            try:
+                from relay import mechanism_telemetry as _mt
+                _mt.record("merge_abandoned", run_id=run_id, triggered=True, executed=True,
+                           extra={"campaign_id": cid, "parent_campaign_id": pc or "",
+                                  "parent_slot_marked_missing": slot})
+            except Exception:
+                pass
+            log("[resume] campaign %s: merge lost twice; written off as failed%s"
+                % (cid, " (parent slot %s of %s marked MISSING)" % (pi, pc) if slot else ""))
+            done.append(cid)
+        except Exception:
+            continue
+    return done
 
 
 # --------------------------------------------------------------------------- resume gate
