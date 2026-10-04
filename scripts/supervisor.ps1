@@ -188,6 +188,348 @@ function Write-Log($msg) {
     "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $msg" | Out-File -FilePath $Log -Append -Encoding utf8
 }
 
+# -- STALE CODE: A SUPERVISOR RUNS THE SCRIPT IT WAS STARTED WITH ---------------------------------
+# A PowerShell script is parsed once, when its process starts. Updating this file (or the script it
+# dot-sources) on disk changes NOTHING until the process is replaced. 2026-10-04: this supervisor kept
+# running its pre-#122 text after the auto-resume change was merged, so when the coordinator died it
+# logged "DRY RUN -- not relaunching" and nothing resumed. The server, bridge and coordinator pick up
+# new code on their own restarts and the cockpit is rebuilt by rebuild_ui.ps1; only this had no
+# staleness handling at all.
+#
+# WHAT THIS DOES. Right here, as early as possible (what is fingerprinted should be what was loaded),
+# it records sha256 of this script and the script it dot-sources, plus the git HEAD read from the
+# .git files (never by running git). Every tick, Invoke-SupervisorCodeCycle compares: one stat per
+# file (mtime + length), a hash only when the stat moved. Differences are published to
+# .fleet\supervisor_state.json (the cockpit's Recovery section reads it) and logged once.
+#
+# SELF-RESTART (setting supervisor_self_restart, default on, read only once the code is stale) hands
+# the job to scripts\supervisor_handoff.ps1, which waits for THIS process to exit and starts the new
+# supervisor, retrying. The old one exits only after the helper is confirmed alive, so a failed
+# helper launch leaves this supervisor running. It happens only when Get-SupervisorRestartVerdict says
+# "ok": nothing in flight (no coordinator, no pending or launching resume, no review / local-loop run,
+# bridge idle), the new scripts parse, and the previous self-restart is more than 10 minutes old.
+# The server and the tunnel host are separate processes: they keep running through the swap and the
+# new supervisor adopts them (it launches the server only when nothing listens).
+$SupFleetDir = Join-Path $Root ".fleet"
+$SupervisorStatePath = Join-Path $SupFleetDir "supervisor_state.json"
+$SupervisorRestartMarkPath = Join-Path $SupFleetDir "supervisor_selfrestart.json"
+$SelfRestartMinIntervalSeconds = 600
+# Must equal relay/code_staleness.py SUPERVISOR_CODE_FILES (pinned by a test).
+$script:SupCodeFiles = @("scripts/supervisor.ps1", "scripts/tunnel_name_util.ps1")
+$script:SupCodeRecorded = @{}
+$script:SupCodeStat = @{}
+$script:SupCodeCurrent = @{}
+$script:SupCodeChanged = @()
+$script:SupGitHead = ""
+$script:SupExported = $null
+$script:SupNoted = @{}
+$script:SupLastVerdict = ""
+
+function Get-SupervisorFileStat([string]$Rel) {
+    try {
+        $i = Get-Item -LiteralPath (Join-Path $Root $Rel) -ErrorAction Stop
+        return ("{0}:{1}" -f $i.LastWriteTimeUtc.Ticks, $i.Length)
+    } catch { return "" }
+}
+
+function Get-SupervisorFileHash([string]$Rel) {
+    try {
+        return (Get-FileHash -LiteralPath (Join-Path $Root $Rel) -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+    } catch { return "" }
+}
+
+function Get-SupervisorGitHead {
+    # The commit the checkout is on, read from .git files; "" when it cannot be told. Informational
+    # only (a commit that touched no supervisor file does not make it stale). Never runs git.
+    try {
+        $gitDir = Join-Path $Root ".git"
+        if (Test-Path -LiteralPath $gitDir -PathType Leaf) {
+            $t = (Get-Content -LiteralPath $gitDir -Raw).Trim()
+            if ($t -match '^gitdir:\s*(.+)$') { $gitDir = $matches[1].Trim() }
+        }
+        $head = (Get-Content -LiteralPath (Join-Path $gitDir "HEAD") -Raw).Trim()
+        if ($head -notmatch '^ref:\s*(.+)$') { return $head }
+        $ref = $matches[1].Trim()
+        $common = $gitDir
+        $cf = Join-Path $gitDir "commondir"
+        if (Test-Path -LiteralPath $cf) {
+            $common = [IO.Path]::GetFullPath((Join-Path $gitDir (Get-Content -LiteralPath $cf -Raw).Trim()))
+        }
+        foreach ($d in @($gitDir, $common)) {
+            $rp = Join-Path $d $ref
+            if (Test-Path -LiteralPath $rp) { return (Get-Content -LiteralPath $rp -Raw).Trim() }
+        }
+        $pk = Join-Path $common "packed-refs"
+        if (Test-Path -LiteralPath $pk) {
+            foreach ($ln in (Get-Content -LiteralPath $pk)) {
+                if ($ln -match ('^([0-9a-f]{40}) ' + [regex]::Escape($ref) + '$')) { return $matches[1] }
+            }
+        }
+        return ""
+    } catch { return "" }
+}
+
+function Initialize-SupervisorCodeWatch {
+    # The stat is taken BEFORE the hash, so a write landing between the two is seen as a change on
+    # the next check instead of being absorbed into the record.
+    foreach ($r in $script:SupCodeFiles) {
+        $script:SupCodeStat[$r] = Get-SupervisorFileStat $r
+        $h = Get-SupervisorFileHash $r
+        $script:SupCodeRecorded[$r] = $h
+        $script:SupCodeCurrent[$r] = $h
+    }
+    $script:SupGitHead = Get-SupervisorGitHead
+}
+
+function Update-SupervisorCodeState {
+    # Which recorded files differ from the disk now. mtime/length first; hash only when it moved.
+    $changed = @()
+    foreach ($r in $script:SupCodeFiles) {
+        $st = Get-SupervisorFileStat $r
+        if ($st -ne $script:SupCodeStat[$r]) {
+            $script:SupCodeStat[$r] = $st
+            $script:SupCodeCurrent[$r] = Get-SupervisorFileHash $r
+        }
+        if ($script:SupCodeCurrent[$r] -ne $script:SupCodeRecorded[$r]) { $changed += $r }
+    }
+    $script:SupCodeChanged = @($changed)
+}
+
+function Write-SupervisorState {
+    # Atomic. Advisory for the cockpit, which also checks that pid is alive; never blocks anything.
+    param([string]$Verdict = "")
+    try {
+        if (-not (Test-Path $SupFleetDir)) { New-Item -ItemType Directory -Path $SupFleetDir -Force | Out-Null }
+        $fp = [ordered]@{}
+        foreach ($r in $script:SupCodeFiles) { $fp[$r] = [string]$script:SupCodeRecorded[$r] }
+        $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        $body = [ordered]@{
+            pid = $PID
+            start_ts = $SupervisorStartedUnix
+            fingerprint = $fp
+            git_head = $script:SupGitHead
+            checked = $now
+            supervisor = [ordered]@{
+                pid = $PID
+                started = $SupervisorStartedUnix
+                stale = [bool]($script:SupCodeChanged.Count -gt 0)
+                changed_files = @($script:SupCodeChanged)
+            }
+            self_restart = [ordered]@{ verdict = $Verdict; ts = $now }
+        } | ConvertTo-Json -Depth 6 -Compress
+        $tmp = $SupervisorStatePath + ".tmp." + $PID
+        [IO.File]::WriteAllText($tmp, $body, (New-Object Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $tmp -Destination $SupervisorStatePath -Force
+    } catch { }
+}
+
+function Get-SupervisorSelfRestartSetting {
+    # The `supervisor_self_restart` setting, "on" or "off", through the product's own reader. A
+    # reader that cannot run reads as the registry default, ON. Asked only once the code is stale.
+    $setting = ""
+    try {
+        $setting = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root'); from relay import code_staleness; print(code_staleness.self_restart_setting())" 2>$null)).Trim()
+    } catch { $setting = "" }
+    if ($setting -eq "off") { return "off" }
+    return "on"
+}
+
+function Test-SupervisorScriptsParse {
+    # Do the files the NEXT supervisor will run parse? Same parser PowerShell itself uses to load
+    # them, in-process. Returns the errors (empty = parses). A file that cannot be read is an error.
+    param([string[]]$Paths)
+    $errs = @()
+    foreach ($p in $Paths) {
+        try {
+            $tokens = $null; $perr = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($p, [ref]$tokens, [ref]$perr)
+            if ($perr -and $perr.Count -gt 0) {
+                $errs += ("{0}: {1} (line {2})" -f (Split-Path $p -Leaf), $perr[0].Message, $perr[0].Extent.StartLineNumber)
+            }
+        } catch { $errs += ("{0}: unreadable ({1})" -f (Split-Path $p -Leaf), $_.Exception.Message) }
+    }
+    return $errs
+}
+
+function Get-SupervisorRestartVerdict {
+    # PURE. "ok" -- or the FIRST reason the supervisor must not replace itself now. An unknown
+    # state is a refusal (bridge "unknown" counts as busy), never a licence.
+    param(
+        [bool]$Stale,
+        [string]$Setting,
+        [bool]$ParseOk,
+        [double]$LastRestartAgeSeconds = -1,
+        [double]$MinIntervalSeconds = 600,
+        [int]$CoordinatorCount = 0,
+        [bool]$SnapshotPending = $false,
+        [bool]$ResumeInProgress = $false,
+        [bool]$OtherRunActive = $false,
+        [string]$Bridge = "idle"
+    )
+    if (-not $Stale) { return "not_stale" }
+    if ($Setting -eq "off") { return "setting_off" }
+    if (-not $ParseOk) { return "parse_error" }
+    if ($LastRestartAgeSeconds -ge 0 -and $LastRestartAgeSeconds -lt $MinIntervalSeconds) { return "loop_guard" }
+    if ($CoordinatorCount -gt 0) { return "coordinator_running" }
+    if ($SnapshotPending) { return "snapshot_pending" }
+    if ($ResumeInProgress) { return "resume_in_progress" }
+    if ($OtherRunActive) { return "run_active" }
+    if ($Bridge -ne "idle") { return "bridge_busy" }
+    return "ok"
+}
+
+function Get-SupervisorBridgeState {
+    # "idle" | "busy" | "unknown". Same reading as Invoke-StaleServerCycle: turn_running / busy from
+    # /status; an unreadable answer is "unknown" unless the port itself proves no bridge of ours is
+    # there (nothing listening, or a foreign process).
+    try {
+        $breq = [System.Net.WebRequest]::Create("http://127.0.0.1:$BridgePort/status")
+        $breq.Method = "GET"; $breq.Timeout = 5000; $breq.ReadWriteTimeout = 5000
+        $bresp = $breq.GetResponse()
+        $bbody = (New-Object System.IO.StreamReader($bresp.GetResponseStream())).ReadToEnd()
+        $bresp.Close()
+        $bj = $bbody | ConvertFrom-Json -ErrorAction Stop
+        if (-not $bj -or $bj.ok -ne $true) { throw "bridge /status did not return bridge JSON" }
+        if (($bj.turn_running -eq $true) -or ($bj.busy -eq $true)) { return "busy" }
+        return "idle"
+    } catch {
+        try {
+            $bv = Get-BridgePortVerdict $BridgePort
+            if ($bv.Kind -eq "foreign" -or $bv.Kind -eq "none") { return "idle" }
+        } catch { }
+        return "unknown"
+    }
+}
+
+function Test-SupervisorResumeInProgress {
+    # A resume this supervisor launched that has not exited, or a launch guard that is still fresh
+    # (.fleet\resume_launch.json, written BEFORE Start-Process by Invoke-FleetAutoResume).
+    try {
+        if ($script:AutoResumeRunners -and $script:AutoResumeRunners.Count -gt 0) { return $true }
+        $gp = Join-Path $SupFleetDir "resume_launch.json"
+        if (Test-Path -LiteralPath $gp) {
+            $g = (Get-Content -LiteralPath $gp -Raw -ErrorAction Stop) | ConvertFrom-Json -ErrorAction Stop
+            $age = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [double]$g.ts
+            if ($age -ge 0 -and $age -lt 600) {
+                $gpid = 0
+                try { $gpid = [int]$g.pid } catch { $gpid = 0 }
+                if ($gpid -eq 0 -or (Get-Process -Id $gpid -ErrorAction SilentlyContinue)) { return $true }
+            }
+        }
+        return $false
+    } catch { return $true }   # cannot tell -> treat as in progress
+}
+
+function Test-SupervisorOtherRunActive {
+    # A review run or a LOCAL_LOOP job whose process is alive.
+    try {
+        $rm = Get-ReviewActiveMarker
+        if ($null -ne $rm -and (Test-ReviewMarkerProcessAlive $rm)) { return $true }
+        if (Test-Path -LiteralPath $LocalLoopMarkerDir) {
+            foreach ($f in @(Get-ChildItem -Path $LocalLoopMarkerDir -Filter "*.json" -File -ErrorAction SilentlyContinue)) {
+                try { $m = (Get-Content -Path $f.FullName -Raw -ErrorAction Stop) | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+                if ($null -ne $m -and (Test-LocalLoopMarkerProcessAlive $m)) { return $true }
+            }
+        }
+        return $false
+    } catch { return $true }
+}
+
+function Get-SupervisorLastRestartAge {
+    # Seconds since the previous self-restart, -1 when there was none / the mark is unreadable.
+    try {
+        if (-not (Test-Path -LiteralPath $SupervisorRestartMarkPath)) { return -1 }
+        $m = (Get-Content -LiteralPath $SupervisorRestartMarkPath -Raw -ErrorAction Stop) | ConvertFrom-Json -ErrorAction Stop
+        $age = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [double]$m.ts
+        if ($age -lt 0) { return 0 }
+        return [double]$age
+    } catch { return -1 }
+}
+
+function Start-SupervisorHandoff {
+    # Starts scripts\supervisor_handoff.ps1 (waits for THIS process to exit, then starts the new
+    # supervisor and retries). $true only when the helper is confirmed alive after a moment; the
+    # caller exits only then.
+    try {
+        $helper = Join-Path $PSScriptRoot "supervisor_handoff.ps1"
+        if (-not (Test-Path -LiteralPath $helper)) { return $false }
+        $a = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", ('"{0}"' -f $helper),
+               "-OldPid", $PID, "-TunnelName", ('"{0}"' -f $TunnelName), "-Port", $Port,
+               "-IntervalSeconds", $IntervalSeconds, "-FailuresBeforeAction", $FailuresBeforeAction,
+               "-StartupGraceSeconds", $StartupGraceSeconds, "-LogPath", ('"{0}"' -f $Log))
+        if ($FleetResumeDryRun) { $a += "-FleetResumeDryRun" }
+        if ($FleetCycleResumeLive) { $a += "-FleetCycleResumeLive" }
+        $p = Start-Process -FilePath (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+                -ArgumentList $a -WindowStyle Hidden -PassThru
+        if (-not $p) { return $false }
+        Start-Sleep -Seconds 2
+        $p.Refresh()
+        return (-not $p.HasExited)
+    } catch { return $false }
+}
+
+function Invoke-SupervisorCodeCycle {
+    # Once per tick. Cheap when nothing changed (a stat per file). Never throws.
+    try {
+        Update-SupervisorCodeState
+        $changed = @($script:SupCodeChanged)
+        $stale = ($changed.Count -gt 0)
+        $verdict = "not_stale"
+        $setting = ""
+        if ($stale) {
+            $key = ($changed -join "|")
+            $setting = Get-SupervisorSelfRestartSetting
+            $paths = @(foreach ($r in $script:SupCodeFiles) { Join-Path $Root $r }) + @(Join-Path $PSScriptRoot "supervisor_handoff.ps1")
+            $parseErrs = @(Test-SupervisorScriptsParse $paths)
+            $busyArgs = @{}
+            if ($setting -ne "off" -and $parseErrs.Count -eq 0) {
+                $busyArgs = @{
+                    CoordinatorCount = @(Get-ThisCheckoutFleetCoordinatorPids | Where-Object { $_ }).Count
+                    SnapshotPending = [bool](Get-FleetPendingSnapshot)
+                    ResumeInProgress = [bool](Test-SupervisorResumeInProgress)
+                    OtherRunActive = [bool](Test-SupervisorOtherRunActive)
+                    Bridge = (Get-SupervisorBridgeState)
+                }
+            }
+            $verdict = Get-SupervisorRestartVerdict -Stale $true -Setting $setting -ParseOk ($parseErrs.Count -eq 0) `
+                -LastRestartAgeSeconds (Get-SupervisorLastRestartAge) -MinIntervalSeconds $SelfRestartMinIntervalSeconds @busyArgs
+            if (-not $script:SupNoted.ContainsKey("stale:$key")) {
+                $script:SupNoted["stale:$key"] = $true
+                Write-Log ("supervisor is running OLDER CODE than the checkout (changed on disk: {0}) -- a PowerShell script is loaded once, so a restart is needed; self-restart setting is {1}" -f ($changed -join ", "), $setting)
+            }
+            if ($verdict -ne "ok" -and -not $script:SupNoted.ContainsKey("v:${key}:$verdict")) {
+                $script:SupNoted["v:${key}:$verdict"] = $true
+                $why = $verdict
+                if ($verdict -eq "parse_error") { $why = "the new script does not parse: " + ($parseErrs -join "; ") }
+                Write-Log "supervisor self-restart not done now: $why"
+            }
+        }
+        $exportKey = "{0}|{1}|{2}" -f $stale, ($changed -join "|"), $verdict
+        if ($exportKey -ne $script:SupExported) {
+            $script:SupExported = $exportKey
+            Write-SupervisorState -Verdict $verdict
+        }
+        if ($verdict -ne "ok") { return }
+
+        # Safe, allowed, and the new code parses. The mark is written FIRST so a restart that goes
+        # wrong cannot loop: the next supervisor sees it and waits out the interval.
+        if (-not (Test-Path $SupFleetDir)) { New-Item -ItemType Directory -Path $SupFleetDir -Force | Out-Null }
+        $markBody = [ordered]@{ ts = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds(); from_pid = $PID; files = @($changed) } | ConvertTo-Json -Compress
+        [IO.File]::WriteAllText($SupervisorRestartMarkPath, $markBody, (New-Object Text.UTF8Encoding($false)))
+        Write-Log ("supervisor code changed on disk ({0}) and nothing is in flight -- handing over to a fresh supervisor so the checkout's fixes are live" -f ($changed -join ", "))
+        if (Start-SupervisorHandoff) {
+            Write-Log "supervisor handoff helper is running -- this supervisor exits now; the server and tunnel host keep running"
+            exit 0
+        }
+        Write-Log "supervisor self-restart FAILED to start the handoff helper -- staying up on the old code"
+    } catch {
+        Write-Log "supervisor code check failed: $($_.Exception.Message)"
+    }
+}
+
+Initialize-SupervisorCodeWatch
+Write-SupervisorState
+
 # The cockpit must distinguish "the server died" from "the supervisor is deliberately
 # replacing stale code".  Without a machine-readable transition, both are a few seconds of
 # connection refused and both render as the same red Server/Tunnel pair.  This marker is advisory
@@ -2488,6 +2830,10 @@ while ($true) {
         # PC's tunnel: report, do not fight) -- see Resolve-TunnelHostingState.
         Invoke-TunnelHostingCheck | Out-Null
     }
+
+    # LAST STEP OF THE TICK: is this process still the code on disk? Stat-only unless a file
+    # changed; replaces this supervisor (and exits) only when Get-SupervisorRestartVerdict says ok.
+    Invoke-SupervisorCodeCycle
 
     Wait-ForNextTick -Seconds $IntervalSeconds -Dir $PendingDir -ExpressPass {
         Invoke-FleetReap

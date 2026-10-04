@@ -758,3 +758,102 @@ public static class AutoResumeView
         return ja ? "選択は次の監視サイクルから反映" : "selection applies from the next cycle";
     }
 }
+
+// The supervisor runs the PowerShell script it was started with, so a merged change to
+// scripts/supervisor.ps1 does nothing until the supervisor restarts. The supervisor records a
+// fingerprint of its own code at start and publishes .fleet/supervisor_state.json
+// {pid, start_ts, supervisor:{pid, started, stale, changed_files}, self_restart:{verdict}}; this
+// class only words that file for the Recovery section (WPF-free, like AutoResumeView). The
+// `supervisor_self_restart` setting (off|on, default on) lets the supervisor replace itself when
+// nothing is in flight; relay/code_staleness.py reads it.
+public static class SupervisorCodeView
+{
+    //: must equal tools/settings_keys.py and relay/code_staleness.py SELF_RESTART_KEY / _DEFAULT.
+    public const string Key = "supervisor_self_restart";
+    public const string Default = "on";
+
+    public static readonly string[] Modes = { "off", "on" };
+
+    public static bool IsMode(string v) { return v == "off" || v == "on"; }
+
+    /// <summary>The mode named by one supervisor_self_restart= line; null when the line is not that
+    /// key or the value is not off|on (the caller keeps its value).</summary>
+    public static string ParseLine(string line)
+    {
+        if (line == null) return null;
+        string ln = line.TrimStart('﻿').Trim();
+        if (!ln.StartsWith(Key + "=", StringComparison.Ordinal)) return null;
+        string v = ln.Substring(Key.Length + 1).Trim().ToLowerInvariant();
+        return IsMode(v) ? v : null;
+    }
+
+    public static string Label(bool ja) { return ja ? "監視プロセスの自動再起動" : "Supervisor self-restart"; }
+
+    public static string ModeLabel(string mode, bool ja)
+    {
+        if (mode == "off") return ja ? "オフ" : "Off";
+        if (mode == "on") return ja ? "オン" : "On";
+        return mode ?? "";
+    }
+
+    public static string Help(bool ja)
+    {
+        return ja ? "監視プロセス(supervisor)はスクリプトを起動時に一度だけ読み込むため、更新されても再起動するまで古いコードのままです。オン=何も実行中でないとき(コーディネーター・中断した実行・再開処理・レビュー・チャット橋が空き)に限り、新しいスクリプトの構文を確認してから自分で入れ替わります。10分以内の連続再起動はしません。オフ=古いことを表示するだけです。"
+                  : "The supervisor loads its script once, so a merged update changes nothing until it restarts. On replaces it by itself, only when nothing is in flight (no coordinator, interrupted or resuming run, review run, or busy bridge), after checking that the new script parses, and never twice within 10 minutes. Off only shows that a restart is needed.";
+    }
+
+    public static string TakeEffectTip(bool ja)
+    {
+        return ja ? "次の監視サイクル(約15秒)から有効。再起動不要。"
+                  : "Applies from the next supervisor cycle (about 15 s), no restart.";
+    }
+
+    static string VerdictText(string verdict, bool ja)
+    {
+        switch (verdict)
+        {
+            case "ok": return ja ? "まもなく自動で再起動します" : "restarting by itself now";
+            case "setting_off": return ja ? "自動再起動はオフ: start_all.bat を再実行するか監視プロセスを再起動してください" : "self-restart is off: re-run start_all.bat or restart the supervisor";
+            case "parse_error": return ja ? "新しいスクリプトに構文エラーがあるため再起動しません" : "not restarting: the new script does not parse";
+            case "loop_guard": return ja ? "直近10分以内に再起動済みのため待機中" : "waiting: it already restarted within the last 10 minutes";
+            case "coordinator_running": return ja ? "コーディネーター稼働中のため、終わってから自動で再起動します" : "will restart by itself once the running coordinator is done";
+            case "snapshot_pending": return ja ? "中断した実行が未再開のため、片付いてから自動で再起動します" : "will restart by itself once the interrupted run is dealt with";
+            case "resume_in_progress": return ja ? "再開処理中のため、終わってから自動で再起動します" : "will restart by itself once the resume has started";
+            case "run_active": return ja ? "レビュー/ローカルループ実行中のため、終わってから自動で再起動します" : "will restart by itself once the review / local-loop run is done";
+            case "bridge_busy": return ja ? "チャット橋が使用中のため、空いてから自動で再起動します" : "will restart by itself once the bridge is idle";
+            default: return null;
+        }
+    }
+
+    /// <summary>The message for the Recovery section, or null when the supervisor is current (or
+    /// there is no usable report). `state` is the parsed supervisor_state.json; `alive` says the
+    /// pid in it is a live process, so a file left by a dead supervisor is never shown.</summary>
+    public static string Describe(Dictionary<string, object> state, bool alive, bool ja)
+    {
+        if (state == null || !alive) return null;
+        object so;
+        if (!state.TryGetValue("supervisor", out so)) return null;
+        Dictionary<string, object> sup = so as Dictionary<string, object>;
+        if (sup == null) return null;
+        object st;
+        if (!sup.TryGetValue("stale", out st) || !(st is bool) || !(bool)st) return null;
+        string head = ja ? "監視プロセスは古いコードで動いています: 再起動が必要です"
+                         : "supervisor is running older code: restart needed";
+        object files;
+        if (sup.TryGetValue("changed_files", out files) && files is System.Collections.IEnumerable && !(files is string))
+        {
+            var names = new List<string>();
+            foreach (object f in (System.Collections.IEnumerable)files) if (f != null) names.Add(Convert.ToString(f));
+            if (names.Count > 0) head += " (" + string.Join(", ", names.ToArray()) + ")";
+        }
+        object sr;
+        string verdict = null;
+        if (state.TryGetValue("self_restart", out sr) && sr is Dictionary<string, object>)
+        {
+            object v;
+            if (((Dictionary<string, object>)sr).TryGetValue("verdict", out v) && v != null) verdict = Convert.ToString(v);
+        }
+        string vt = VerdictText(verdict, ja);
+        return vt != null ? head + " / " + vt : head;
+    }
+}
