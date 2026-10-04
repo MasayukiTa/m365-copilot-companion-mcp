@@ -1328,7 +1328,57 @@ def _worker_recently_granted(
     return False
 
 
-def _looks_locked(resp: str, since: float = 0.0, worker: str = "") -> bool:
+def _refusal_candidates_exclude(rec, worker: str):
+    """None when `rec` may be attributed to `worker`; else the in-flight candidate count.
+
+    The prose and fallback branches of `_looks_locked` read the server's refusal ledger without
+    identity, so every worker that had a turn open when ONE refusal landed was classified as
+    locked and spent its own unlock budget (measured on a 439-worker run: 58 of 120 refusal
+    records injected more than one worker; workers that had already replied DONE were finally
+    marked STUCK by their siblings' refusals). A refusal belongs to a worker only when that
+    worker is the sole turn in flight at the refusal's instant. When nobody is known to be in
+    flight (no windows opened: single-shot callers, tests) the historical behaviour is kept.
+    """
+    if not worker:
+        return None
+    try:
+        ts = float((rec or {}).get("ts") or 0)
+        if not ts:
+            return None
+        from relay import turn_windows as _tw
+        cands = _tw.candidates(ts)
+    except Exception:
+        return None
+    if not cands:
+        return None
+    if len(cands) == 1 and cands[0] == str(worker):
+        return None
+    return len(cands)
+
+
+def _reply_completed_without_claiming_lock(resp: str, since: float, worker: str) -> bool:
+    """True when `resp` ends in a DONE/CONTINUE marker and carries no lock evidence of its own.
+
+    STUCK/FAIL are deliberately not included: a worker that was really refused writes
+    "STUCK: unlock ..." and is the one the unlock steer exists for. A worker that already
+    reported DONE/CONTINUE and quotes no server refusal must never be sent an unlock steer
+    on the strength of someone else's refusal.
+    """
+    try:
+        from relay.control_markers import parse as _parse_marker
+        mk = _parse_marker(resp)
+        if mk is None or mk.kind not in ("DONE", "CONTINUE"):
+            return False
+        low = (resp or "").lower()
+        if any(m in low for m in LOCKED_MARKERS):
+            return False
+        return not _exclusively_refused(worker, since)
+    except Exception:
+        return False
+
+
+def _looks_locked(resp: str, since: float = 0.0, worker: str = "",
+                  on_unattributed=None) -> bool:
     """True iff `resp` looks like the SERVER's require_unlocked() lock error, not a worker's
     prose that merely discusses/quotes the unlock() API (see the FALSE-POSITIVE FIX comment
     above LOCKED_MARKERS for the incident this guards against: a security-review worker
@@ -1429,8 +1479,16 @@ def _looks_locked(resp: str, since: float = 0.0, worker: str = "") -> bool:
         _recs = [r for r in _ls.matching_records(since)
                  if not str(r.get("detail") or "").startswith(NO_CONTEXT_REFUSAL)]
         if _recs and _mentions_being_locked(resp):
-            _note_locked("paraphrase", resp, since, _recs[-1], worker)
-            return True
+            # ONLY A REFUSAL THIS WORKER ALONE COULD HAVE PRODUCED IS ITS OWN. Several turns in
+            # flight means the record could be any of theirs; injecting all of them spends each
+            # bystander's unlock budget (see _refusal_candidates_exclude).
+            _own = [r for r in _recs if _refusal_candidates_exclude(r, worker) is None]
+            if _own:
+                _note_locked("paraphrase", resp, since, _own[-1], worker)
+                return True
+            if on_unattributed is not None:
+                on_unattributed(_refusal_candidates_exclude(_recs[-1], worker) or 0)
+                on_unattributed = None
     except Exception:
         pass
     # THE SAME DOMINANCE RULE THE MARKER BRANCH USES. Without it this branch judged replies of
@@ -1485,6 +1543,14 @@ def _looks_locked(resp: str, since: float = 0.0, worker: str = "") -> bool:
                 if not str(r.get("detail") or "").startswith(NO_CONTEXT_REFUSAL)]
         if not mine:
             return False
+        # Same attribution rule as the paraphrase branch: a refusal that several in-flight
+        # workers could each have produced is nobody's in particular.
+        _own = [r for r in mine if _refusal_candidates_exclude(r, worker) is None]
+        if not _own:
+            if on_unattributed is not None:
+                on_unattributed(_refusal_candidates_exclude(mine[-1], worker) or 0)
+            return False
+        mine = _own
         # Name the record actually decided on, not merely the last one to arrive. The note is
         # the only way to check afterwards whether a classification had evidence behind it.
         _note_locked("fallback", resp, since, mine[-1], worker)
@@ -5348,6 +5414,17 @@ class RelayWorker:
         self._last_heap_mb = heap
         return heap >= FLEET_HEAP_RECYCLE_MB
 
+    def _note_unattributed_refusal(self, n_candidates):
+        """Record that a refusal in this turn's window was not attributable to this worker."""
+        try:
+            _mt.record("unlock_refusal_unattributed", run_id=getattr(self, "run_id", ""),
+                       instance=getattr(self, "name", ""), turn=getattr(self, "turn", None),
+                       configured=True, config_source="turn_windows",
+                       eligible=True, triggered=True, executed=False,
+                       extra={"candidates": int(n_candidates or 0), "injected": False})
+        except Exception:
+            pass
+
     def _inject_unlock(self):
         """UNLOCK-REQUIRED recovery: auto-inject unlock(password) with the LOCAL .env password
         (NOT the agent's persistent instructions), then resume the goal. Bounded by
@@ -5882,9 +5959,15 @@ class RelayWorker:
         # normal; past the cap STUCK with an actionable reason. Uses _looks_locked() (distinctive
         # marker + dominance) rather than a bare substring match so a long security-review
         # response that merely discusses unlock() is never mistaken for the real lock error.
-        if _looks_locked(resp, getattr(self, "_turn_sent_at", 0.0), self.name):
-            self._inject_unlock()
-            return
+        if _looks_locked(resp, getattr(self, "_turn_sent_at", 0.0), self.name,
+                         on_unattributed=self._note_unattributed_refusal):
+            # A reply that already ended DONE/CONTINUE and quotes no refusal is never sent an
+            # unlock steer: the classification came from a sibling's refusal, and every steer
+            # costs that worker a turn and a slice of its budget.
+            if not _reply_completed_without_claiming_lock(
+                    resp, getattr(self, "_turn_sent_at", 0.0), self.name):
+                self._inject_unlock()
+                return
         # LOCK-AMBIGUITY PROBE (widens the above, does not replace it -- _looks_locked's two
         # branches are untouched and still fire exactly as before). _looks_locked_ambiguous()
         # only matches the leftover case: a distinctive marker present, but the reply is too
