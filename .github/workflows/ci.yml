@@ -234,6 +234,7 @@ jobs:
             ui/test_a_retry_budget_bounds_the_repair_it_pays_for.py \
             ui/test_every_lane_in_flight_is_on_screen.py \
             ui/test_durable_execution_state_visible.py \
+            ui/test_durable_operator_steer.py \
             ui/test_durable_live_campaign_enqueue.py \
             ui/test_a_selection_survives_a_refresh_that_changed_nothing.py \
             ui/test_a_follow_up_is_not_a_wall_of_text.py \
@@ -480,6 +481,8 @@ jobs:
             relay/test_fleet_resume.py \
             relay/test_local_job_store.py \
             relay/test_local_loop_controller.py \
+            relay/test_local_loop_operator_steer.py \
+            relay/test_local_operator_steer.py \
             relay/test_local_loop_autoresume.py \
             relay/test_local_loop_campaign_queue.py \
             relay/test_a_drain_deletes_only_what_it_consumed.py \

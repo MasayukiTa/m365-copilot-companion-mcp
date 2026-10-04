@@ -51,7 +51,9 @@ def test_main_owns_lock_and_marker_before_browser_start():
     src = Path(ll.__file__).read_text(encoding='utf-8')
     main = src[src.index('def main(argv=None):'):]
     lock = main.index('_acquire_job_lock(')
-    project = main.index('_project_job_snapshot(')
+    # The operator-steer mode projects a snapshot earlier in main() without owning the job lock;
+    # the ordering that matters is the controller run path, i.e. the first projection after the lock.
+    project = main.index('_project_job_snapshot(', lock)
     marker = main.index('_write_controller_marker(')
     browser = main.index('connect_over_cdp(')
     assert lock < marker < project < browser
