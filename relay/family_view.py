@@ -313,11 +313,24 @@ def _link_parents(groups, ws, heads):
                 Q = nodes.get(P["parent_id"])
                 if Q and Q["campaign_id"] and Q["campaign_id"] != cid:
                     pc, slot = Q["campaign_id"], Q["id"]
-        if pc is None and pcid in groups and pcid != cid:
-            pc = pcid
-        if pc is not None and pc not in groups:
+        if pc is None and pcid and pcid != cid and (pcid in groups or pcid in heads):
+            # the DURABLE campaign header names the parent group, even when the slot row and the
+            # parent group's own rows have been archived out of status.json
+            pc, slot = pcid, slot or ptid
+        if pc is not None and pc not in groups and pc not in heads:
             pc, slot = None, ""
         links[cid] = (pc, slot, pc is None and recorded)
+    # Ancestor groups known only from their header (no live rows) get a link of their own so the
+    # chain can still be walked; they are never reported as groups themselves.
+    for cid in list(links):
+        cur, hops = links[cid][0], 0
+        while cur is not None and cur not in links and hops <= MAX_DEPTH:
+            hops += 1
+            nxt = (heads.get(cur) or {}).get("parent_campaign_id") or None
+            if nxt == cur or (nxt is not None and nxt not in groups and nxt not in heads):
+                nxt = None
+            links[cur] = (nxt, "", False)
+            cur = nxt
     # Cut loops and over-deep chains: those groups are reported as orphans.
     for cid in list(links):
         seen, cur = [], cid
@@ -341,7 +354,7 @@ def build_groups(workers, campaign_lines=None, ledger_fn=None):
         links = {cid: (None, "", False) for cid in gmap}
     children = {cid: [] for cid in gmap}
     for cid, (pc, _slot, _o) in links.items():
-        if pc is not None:
+        if pc is not None and pc in children:
             children[pc].append(cid)
     turns, fan_slots = {}, {}
     for w in ws:
