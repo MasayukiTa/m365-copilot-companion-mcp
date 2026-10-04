@@ -80,6 +80,28 @@ SECRET_RESULT_TOOLS = {"office_password_recovery"}
 _CALL_TOOLS = {}
 _CALL_TOOLS_MAX = 4096
 
+#: call_id -> (wall ts, monotonic) at the moment the call row was written, so the outcome row can
+#: state its own start and end without trusting the caller to pass them. Bounded like the map
+#: above for the same reason.
+_CALL_STARTS = {}
+
+#: Identifies THIS process for the lifetime of the ledger module. time.monotonic() is only
+#: comparable within one process, so every row carries it; a reader subtracts monotonic stamps
+#: only when `proc` matches and falls back to wall-clock `ts` otherwise.
+_PROC = uuid.uuid4().hex[:8]
+
+#: THE ONLY HONEST SOURCE OF TASK/WORKER FOR A CALL MADE INSIDE A WORKER'S TURN. The gateway
+#: has no idea which fleet run a call belongs to; nothing upstream passes `_task`. What a worker
+#: DOES state itself is the turn-loop protocol: claim_turn(job_id, worker_id), then heartbeat /
+#: read_job_context / commit_turn / abort_turn with the same job_id. Those arguments are the
+#: worker's own declaration, and the MCP session they arrived on is the only thing tying its
+#: other calls to that declaration. A call on a session that never declared itself stays EMPTY --
+#: a guess would be counted as coverage the data does not have.
+_LOOP_DECLARING = {"claim_turn", "heartbeat", "read_job_context"}
+_LOOP_ENDING = {"commit_turn", "abort_turn"}
+_SESSION_IDENTITY = {}      # session fingerprint -> (task, worker)
+_SESSION_IDENTITY_MAX = 1024
+
 _LOCK = threading.Lock()
 
 
@@ -429,6 +451,96 @@ def result_is_secret(call_id: str, tool: str = "") -> bool:
     return name in SECRET_RESULT_TOOLS
 
 
+#: session fingerprint -> (task, worker, bound_at). Set ONLY by an unambiguous turn-window match
+#: (exactly one worker in flight), so a later call on that session that lands in an overlap of
+#: several windows can reuse it. Expires, and is only reused when its worker is among the
+#: overlapping candidates -- a session that moved to another worker must not carry the old label.
+_WINDOW_BINDING = {}
+_WINDOW_BINDING_MAX = 1024
+
+
+def _window_identity(session: str, ts: float):
+    """(task, worker, how) from the coordinator's turn windows (tools/turn_context.py).
+
+    how: "window" (one worker in flight), "session-window" (several, but this session was bound
+    earlier by an unambiguous match to one of them), "ambiguous" (several, no usable binding:
+    task and worker stay EMPTY), or "" (no window matched / no file). Never raises.
+    """
+    try:
+        from tools import turn_context
+        cands = turn_context.candidates(float(ts))
+        if not cands:
+            return "", "", ""
+        now = time.time()
+        if len(cands) == 1:
+            worker, task = cands[0]
+            if session:
+                with _LOCK:
+                    if len(_WINDOW_BINDING) >= _WINDOW_BINDING_MAX:
+                        _WINDOW_BINDING.clear()
+                    _WINDOW_BINDING[session] = (task, worker, now)
+            return task, worker, "window"
+        if session:
+            with _LOCK:
+                bound = _WINDOW_BINDING.get(session)
+            if bound and now - bound[2] <= turn_context.MAX_OPEN_S \
+                    and any(w == bound[1] for w, _t in cands):
+                return bound[0], bound[1], "session-window"
+        return "", "", "ambiguous"
+    except Exception:
+        return "", "", ""
+
+
+def _identity_for(tool: str, arguments, session: str, task: str, worker: str, ts: float = None):
+    """(task, worker, how) for a call. `how` is "explicit", "session", "window",
+    "session-window", "ambiguous" or "" (not attributable).
+
+    Explicit values win. Then the identity a worker declared through the turn-loop protocol on
+    the same MCP session. Then the coordinator's own record of whose turn was in flight at `ts`
+    (see tools/turn_context.py for the clock basis and the overlap rule). Never raises.
+    """
+    try:
+        if task or worker:
+            return task, worker, "explicit"
+        got = _declared_identity(tool, arguments, session)
+        if got:
+            return got
+        return _window_identity(session, ts if ts is not None else time.time())
+    except Exception:
+        return "", "", ""
+
+
+def _declared_identity(tool: str, arguments, session: str):
+    """The turn-loop declaration path: (task, worker, "session") or None. Never raises."""
+    try:
+        if not session:
+            return None
+        args = arguments if isinstance(arguments, dict) else {}
+        if tool in _LOOP_DECLARING and args.get("job_id"):
+            with _LOCK:
+                prev = _SESSION_IDENTITY.get(session, ("", ""))
+                job = str(args.get("job_id"))
+                who = str(args.get("worker_id") or (prev[1] if prev[0] == job else ""))
+                if len(_SESSION_IDENTITY) >= _SESSION_IDENTITY_MAX:
+                    _SESSION_IDENTITY.clear()
+                _SESSION_IDENTITY[session] = (job, who)
+                return job, who, "session"
+        if tool in _LOOP_ENDING:
+            with _LOCK:
+                got = _SESSION_IDENTITY.pop(session, None)
+            if got:
+                return got[0], got[1], "session"
+            job = str(args.get("job_id") or "")
+            return (job, "", "session") if job else None
+        with _LOCK:
+            got = _SESSION_IDENTITY.get(session)
+        if got:
+            return got[0], got[1], "session"
+    except Exception:
+        pass
+    return None
+
+
 def record_call(tool: str, arguments=None, *, task: str = "", worker: str = "",
                 turn=None, call_id: str = "", ts: float = None) -> str:
     """Write the CALL record, BEFORE the tool runs. Returns the id to pass to record_outcome.
@@ -451,19 +563,44 @@ def record_call(tool: str, arguments=None, *, task: str = "", worker: str = "",
         _sess = session_fingerprint()
     except Exception:
         _sess = ""
+    _ts = float(ts if ts is not None else time.time())
+    task, worker, _how = _identity_for(tool, arguments, _sess, task, worker, _ts)
+    _mono = time.monotonic()
     row = {
         "schema": SCHEMA_VERSION,
         "event": "call",
         "id": cid,
-        "ts": float(ts if ts is not None else time.time()),
+        "ts": _ts,
+        "mono": round(_mono, 4),
+        "proc": _PROC,
         "tool": str(tool or "")[:120],
         "task": str(task or "")[:120],
         "worker": str(worker or "")[:64],
         "turn": turn,
         "args": redact_args(arguments),
     }
+    if _how:
+        row["attr"] = _how
+    if _how in ("window", "session-window") and worker:
+        # Additive fan-out identity from the same window (campaign_id, subtask_id, parent_task_id,
+        # root_id, role) so a join with the campaign records needs no id translation. Never
+        # touches task/worker; absent for non-fan-out workers and for old window rows.
+        try:
+            from tools import turn_context
+            _id = turn_context.identity_of(worker, _ts)
+            for _k, _dst in (("campaign_id", "campaign_id"), ("task_id", "subtask_id"),
+                             ("parent_task_id", "parent_task_id"), ("root_id", "root_id"),
+                             ("role", "role")):
+                if _id.get(_k):
+                    row[_dst] = _id[_k]
+        except Exception:
+            pass
     if _sess:
         row["session"] = _sess
+    with _LOCK:
+        if len(_CALL_STARTS) >= _CALL_TOOLS_MAX:
+            _CALL_STARTS.clear()
+        _CALL_STARTS[cid] = (row["ts"], _mono)
     _remember_tool(cid, tool)
     _append(row)
     return cid
@@ -498,11 +635,20 @@ def record_outcome(call_id: str, *, ok: bool, result=None, error: str = "",
     elif ok and looks_failed(result):
         ok = False
         error = error or "returned its own error report"
+    _end_ts = float(ts if ts is not None else time.time())
+    _end_mono = time.monotonic()
+    with _LOCK:
+        _start = _CALL_STARTS.pop(str(call_id or ""), None)
+    _timing = {"proc": _PROC, "mono": round(_end_mono, 4), "ts_end": _end_ts}
+    if _start:
+        _timing["ts_start"] = _start[0]
+        _timing["dur_mono_s"] = round(max(0.0, _end_mono - _start[1]), 4)
     _append({
         "schema": SCHEMA_VERSION,
         "event": "outcome",
         "id": str(call_id or ""),
-        "ts": float(ts if ts is not None else time.time()),
+        "ts": _end_ts,
+        **_timing,
         "ok": bool(ok),
         "duration_s": (round(float(duration_s), 3) if duration_s is not None else None),
         "error": str(error or "")[:MAX_INLINE],

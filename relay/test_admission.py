@@ -222,6 +222,25 @@ def _restore_worker(orig):
 def test_continuous_admission_no_barrier():
     rf.avail_phys_mb = lambda: 64000.0       # RAM never the constraint here
     rf.free_disk_gb = lambda path=None: 500.0  # disk never the constraint here
+
+    # THIS TEST IS ABOUT THE TAB CAP. Socket workers deliberately bypass worker-count/tab
+    # admission and are paced at the generative send instead (test_socket_admission_no_pending).
+    # Force the route closed here so fake_attach's page sentinel represents the route the
+    # production admission loop actually budgeted.
+    class _NoSocketRoute:
+        closed_reason = ""
+        def open(self):
+            return False
+        def needs_refresh(self):
+            return False
+        def record(self, *a, **k):
+            pass
+
+    orig_route = rf._socket_route
+    orig_due = rf.admission_is_due
+    rf._socket_route = lambda: _NoSocketRoute()
+    rf.admission_is_due = lambda now=None: True
+
     state = {"control": {}}
     orig = _install_fake_worker(state)
     try:
@@ -268,6 +287,8 @@ def test_continuous_admission_no_barrier():
         # not move with poll_s or with the speed of the machine.
         check("continuous_made_progress", opens["transitions"] <= 12)
     finally:
+        rf._socket_route = orig_route
+        rf.admission_is_due = orig_due
         _restore_worker(orig)
 
 

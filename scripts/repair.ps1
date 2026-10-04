@@ -1,4 +1,4 @@
-# =============================================================================
+﻿# =============================================================================
 #  repair.ps1 -- situation-aware repair dispatcher for the m365-copilot-companion-mcp
 #  stack. DETECTION stays single-source in scripts\doctor.ps1 (read-only); this
 #  script only ACTS, and only on what doctor actually reports as broken -- it never
@@ -103,9 +103,10 @@ $doctorPs1 = Join-Path $scriptDir "doctor.ps1"
 # -----------------------------------------------------------------------------
 # REGISTRY: id -> { Tier; Key (dedupe bucket); Cmd (what to run, Tier A/B only);
 #                    Human (the manual step text, Tier C only); Note }
-# Tier A/B commands are plain command lines run via Invoke-Expression -- they are
-# NOT user input, they are fixed strings authored right here, one per registry
-# row, so there is no injection surface.
+# Tier A/B keep a human-readable Cmd string for dry-run/reporting. PowerShell-backed
+# repairs execute from structured Script + Args metadata through a hidden, console-less
+# ProcessStartInfo child; only non-PowerShell external tools (currently winget) still use
+# the fixed Cmd string via Invoke-Expression. None of these values come from user input.
 # -----------------------------------------------------------------------------
 $stackStartCmd     = "powershell -NoProfile -ExecutionPolicy Bypass -File `"$scriptDir\start_all.ps1`" -NoUi -NoSplash"
 $edgeCompanionCmd   = "powershell -NoProfile -ExecutionPolicy Bypass -File `"$scriptDir\start_companion_edge.ps1`""
@@ -114,6 +115,17 @@ $tunnelCliCmd       = "winget install Microsoft.devtunnel"
 $tunnelSetupCmd     = "powershell -NoProfile -ExecutionPolicy Bypass -File `"$scriptDir\setup_devtunnel.ps1`""
 $tunnelHealCmd      = "powershell -NoProfile -ExecutionPolicy Bypass -File `"$scriptDir\heal_tunnel.ps1`""
 $uiRebuildCmd       = "powershell -NoProfile -ExecutionPolicy Bypass -File `"$repo\ui\rebuild_ui.ps1`" -NoLaunch"
+
+# Execution metadata is separate from the display command. These fixed .ps1 repairs used to be
+# reparsed through `Invoke-Expression`, which launched a NEW powershell.exe from a windowless WPF
+# parent. On Windows that child is allowed to allocate/activate its own console. Keep the process
+# boundary (the target scripts use `exit`) but launch it explicitly console-less below.
+$stackStartScript    = Join-Path $scriptDir "start_all.ps1"
+$edgeCompanionScript = Join-Path $scriptDir "start_companion_edge.ps1"
+$edgeBridgeScript     = Join-Path $scriptDir "start_bridge.ps1"
+$tunnelSetupScript    = Join-Path $scriptDir "setup_devtunnel.ps1"
+$tunnelHealScript     = Join-Path $scriptDir "heal_tunnel.ps1"
+$uiRebuildScript      = Join-Path $repo "ui\rebuild_ui.ps1"
 
 # THE FIX LINE IS FOR THE PERSON AT THE DESK, NOT FOR AN ENGINEER. This used to be a raw
 # PowerShell command ("powershell -File scripts\start_companion_edge.ps1 -Foreground ..."),
@@ -143,17 +155,17 @@ $m365SigninFixJa = -join (@(
 ) | ForEach-Object { [char]$_ })
 
 $Registry = @{
-    server_up       = @{ Tier = 'A'; Key = 'stack_start';    Cmd = $stackStartCmd;   Note = 'starts the MCP server (via supervisor.ps1, hosted by start_all.ps1)' }
-    tunnel_serving  = @{ Tier = 'A'; Key = 'stack_start';    Cmd = $stackStartCmd;   Note = 'same stack start as server_up -- the supervisor also hosts the Dev Tunnel' }
-    tunnel_owned    = @{ Tier = 'A'; Key = 'tunnel_heal';    Cmd = $tunnelHealCmd;   Note = 'repoints MCP_TUNNEL_NAME to a tunnel this account owns (URL-preserving when possible; safe to auto-run)' }
-    edge_companion  = @{ Tier = 'A'; Key = 'edge_companion'; Cmd = $edgeCompanionCmd; Note = 'launches the dedicated companion Edge (:9222)' }
-    edge_bridge     = @{ Tier = 'A'; Key = 'edge_bridge';    Cmd = $edgeBridgeCmd;   Note = 'required -- every chat-window turn runs on this Edge (doctor.ps1 no longer calls it optional)' }
+    server_up       = @{ Tier = 'A'; Key = 'stack_start';    Cmd = $stackStartCmd;   Script = $stackStartScript;    Args = @('-NoUi','-NoSplash'); Note = 'starts the MCP server (via supervisor.ps1, hosted by start_all.ps1)' }
+    tunnel_serving  = @{ Tier = 'A'; Key = 'stack_start';    Cmd = $stackStartCmd;   Script = $stackStartScript;    Args = @('-NoUi','-NoSplash'); Note = 'same stack start as server_up -- the supervisor also hosts the Dev Tunnel' }
+    tunnel_owned    = @{ Tier = 'A'; Key = 'tunnel_heal';    Cmd = $tunnelHealCmd;   Script = $tunnelHealScript;    Args = @(); Note = 'repoints MCP_TUNNEL_NAME to a tunnel this account owns (URL-preserving when possible; safe to auto-run)' }
+    edge_companion  = @{ Tier = 'A'; Key = 'edge_companion'; Cmd = $edgeCompanionCmd; Script = $edgeCompanionScript; Args = @(); Note = 'launches the dedicated companion Edge (:9222)' }
+    edge_bridge     = @{ Tier = 'A'; Key = 'edge_bridge';    Cmd = $edgeBridgeCmd;   Script = $edgeBridgeScript;     Args = @('-Keepalive'); Note = 'required -- every chat-window turn runs on this Edge (doctor.ps1 no longer calls it optional)' }
 
     tunnel_cli      = @{ Tier = 'B'; Key = 'tunnel_cli_install'; Cmd = $tunnelCliCmd;   Note = 'installs software (devtunnel CLI) -- confirm first' }
-    tunnel_exists   = @{ Tier = 'B'; Key = 'tunnel_setup';       Cmd = $tunnelSetupCmd; Note = 're-creates the tunnel -- changes the public URL; the Copilot Studio connector may need updating' }
-    tunnel_name_private = @{ Tier = 'B'; Key = 'tunnel_rename';  Cmd = $tunnelSetupCmd; Note = 'recreates the tunnel under a private name -- changes the public URL; the Copilot Studio connector will need the new URL afterward' }
-    ui_copilotchat  = @{ Tier = 'B'; Key = 'ui_rebuild';         Cmd = $uiRebuildCmd;   Note = 'closes and rebuilds both UI windows' }
-    ui_fleetcockpit = @{ Tier = 'B'; Key = 'ui_rebuild';         Cmd = $uiRebuildCmd;   Note = 'same rebuild as ui_copilotchat -- covers both apps' }
+    tunnel_exists   = @{ Tier = 'B'; Key = 'tunnel_setup';       Cmd = $tunnelSetupCmd; Script = $tunnelSetupScript; Args = @(); Note = 're-creates the tunnel -- changes the public URL; the Copilot Studio connector may need updating' }
+    tunnel_name_private = @{ Tier = 'B'; Key = 'tunnel_rename';  Cmd = $tunnelSetupCmd; Script = $tunnelSetupScript; Args = @(); Note = 'recreates the tunnel under a private name -- changes the public URL; the Copilot Studio connector will need the new URL afterward' }
+    ui_copilotchat  = @{ Tier = 'B'; Key = 'ui_rebuild';         Cmd = $uiRebuildCmd; Script = $uiRebuildScript; Args = @('-NoLaunch'); Note = 'closes and rebuilds both UI windows' }
+    ui_fleetcockpit = @{ Tier = 'B'; Key = 'ui_rebuild';         Cmd = $uiRebuildCmd; Script = $uiRebuildScript; Args = @('-NoLaunch'); Note = 'same rebuild as ui_copilotchat -- covers both apps' }
 
     tunnel_login    = @{ Tier = 'C'; Human = "Run:  devtunnel login   (opens a browser; the supervisor cannot host the tunnel until the CLI is logged in). Then re-run this." }
     m365_signin     = @{ Tier = 'C'; Human = $m365SigninFixJa }
@@ -174,6 +186,42 @@ $Registry = @{
 # -----------------------------------------------------------------------------
 # Doctor invocation / mock input
 # -----------------------------------------------------------------------------
+function Invoke-HiddenPowerShellFile {
+    param(
+        [Parameter(Mandatory=$true)][string]$ScriptPath,
+        [string[]]$ScriptArgs = @()
+    )
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psExe = (Get-Command powershell.exe -ErrorAction Stop).Source
+    $psi.FileName = $psExe
+    $quotedScript = '"' + ($ScriptPath -replace '"', '\\"') + '"'
+    $parts = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $quotedScript)
+    foreach ($arg in @($ScriptArgs)) {
+        # All current repair arguments are fixed switches. Quote defensively if a future value
+        # contains whitespace; paths live in ScriptPath and are already quoted above.
+        if ($arg -match '[\s"]') { $parts += ('"' + ($arg -replace '"', '\\"') + '"') }
+        else { $parts += $arg }
+    }
+    $psi.Arguments = ($parts -join ' ')
+    $psi.WorkingDirectory = $repo
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $p = [System.Diagnostics.Process]::Start($psi)
+    $outTask = $p.StandardOutput.ReadToEndAsync()
+    $errTask = $p.StandardError.ReadToEndAsync()
+    $p.WaitForExit()
+    $stdout = $outTask.Result
+    $stderr = $errTask.Result
+    return [PSCustomObject]@{
+        ExitCode = $p.ExitCode
+        StdOut = $stdout
+        StdErr = $stderr
+    }
+}
+
 function Get-DoctorResults {
     if ($JsonInput) {
         if (-not (Test-Path $JsonInput)) {
@@ -196,11 +244,11 @@ function Get-DoctorResults {
         return $null
     }
     try {
-        $raw = & powershell -NoProfile -ExecutionPolicy Bypass -File $doctorPs1 -Json 2>$null
-        # -Json mode emits exactly one line; if $raw came back as an array of lines
-        # (rare, but be defensive), take the last non-empty one.
-        $line = $raw
-        if ($raw -is [array]) { $line = ($raw | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 1) }
+        $doctorRun = Invoke-HiddenPowerShellFile -ScriptPath $doctorPs1 -ScriptArgs @('-Json')
+        $raw = $doctorRun.StdOut
+        # -Json mode emits exactly one meaningful line; take the last non-empty one in case the
+        # script writes incidental diagnostics before it.
+        $line = (($raw -replace "`r", "") -split "`n" | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 1)
         if (-not $line) {
             Write-Host "ERROR: doctor.ps1 -Json produced no output." -ForegroundColor Red
             return $null
@@ -216,9 +264,16 @@ function Get-DoctorResults {
 # -----------------------------------------------------------------------------
 # Execute one registry command (Tier A/B only). Best-effort: never throws.
 # -----------------------------------------------------------------------------
-function Invoke-RepairCommand([string]$cmd) {
+function Invoke-RepairCommand($entry) {
     try {
-        Invoke-Expression $cmd
+        if ($entry.ContainsKey('Script')) {
+            $run = Invoke-HiddenPowerShellFile -ScriptPath $entry.Script -ScriptArgs @($entry.Args)
+            if ($run.StdOut -and $run.StdOut.Trim()) { Write-Host $run.StdOut.TrimEnd() }
+            if ($run.StdErr -and $run.StdErr.Trim()) { Write-Host $run.StdErr.TrimEnd() -ForegroundColor DarkGray }
+            return ($run.ExitCode -eq 0)
+        }
+        # Non-PowerShell external tools (currently winget) keep the old fixed-string execution.
+        Invoke-Expression $entry.Cmd
         return ($LASTEXITCODE -eq $null) -or ($LASTEXITCODE -eq 0)
     } catch {
         Write-Host ("      FAILED: " + $_.Exception.Message) -ForegroundColor Red
@@ -283,7 +338,7 @@ function Invoke-RepairPass([array]$failing) {
                 $wouldFix += $id
                 continue
             }
-            $ok = Invoke-RepairCommand $entry.Cmd
+            $ok = Invoke-RepairCommand $entry
             Write-Host ("      " + $(if ($ok) { "OK -- command completed" } else { "FAILED -- see output above" })) -ForegroundColor $(if ($ok) { "Green" } else { "Red" })
             $ranKeys[$key] = $ok
             if ($ok) { $autoFixed += $id; $anyActionRan = $true }
@@ -318,7 +373,7 @@ function Invoke-RepairPass([array]$failing) {
                 $ranKeys[$key] = $false
                 continue
             }
-            $ok = Invoke-RepairCommand $entry.Cmd
+            $ok = Invoke-RepairCommand $entry
             Write-Host ("      " + $(if ($ok) { "OK -- command completed" } else { "FAILED -- see output above" })) -ForegroundColor $(if ($ok) { "Green" } else { "Red" })
             $ranKeys[$key] = $ok
             if ($ok) { $autoFixed += $id; $anyActionRan = $true }

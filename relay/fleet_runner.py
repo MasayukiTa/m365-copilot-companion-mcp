@@ -171,6 +171,7 @@ STATUS_PILL = {
     "maxturns":  ("上限",   "bad"),
     "error":     ("エラー", "bad"),
     "cancelled": ("停止",   "muted"),    # user released it from the cockpit
+    "interrupted": ("中断", "warn"),     # coordinator died; reaper-written, resumable, not a stop
     "fresh_replay": ("新規会話", "good"),
     "content_refused": ("内容拒否", "bad"),
 }
@@ -377,8 +378,14 @@ def _follow_up(worker, text, enqueue, say):
         return False
     try:
         from relay.relay_fleet import is_recovery_payload as _is_recovery
+        from relay.relay_fleet import fill_recovery_goal as _fill_goal
     except Exception:
         _is_recovery = None
+        _fill_goal = None
+    if _fill_goal is not None:
+        # The recovery payload ends at the goal heading; without the goal the new worker's
+        # whole task would be the unlock text.
+        text = _fill_goal(text, goal)
     template = FOLLOW_UP_PROMPT
     if _is_recovery is not None:
         try:
@@ -1303,6 +1310,99 @@ def reject_local_loop_control_goals(goals):
     return errors
 
 
+def _effort_policy_block():
+    """{"effort_policy": {mode, source, conflict}} for the snapshot, or {} on any failure."""
+    try:
+        from relay import effort_policy as _ep
+        m, src, conflict = _ep.mode_info()
+        return {"effort_policy": {"mode": m, "source": src, "conflict": bool(conflict)}}
+    except Exception:
+        return {}
+
+
+#: What THIS coordinator was started with for fan-out: {"enabled": bool, "source": "flag"|"default"}.
+#: Set once after argument parsing. status.json carries it so the cockpit shows what is really in
+#: effect (including "started with --no-fanout"), not what its own switch currently says.
+_RUN_FANOUT = {}
+
+
+def _record_run_fanout(enabled, argv=None):
+    """Remember the coordinator's resolved fan-out flag; `source` says whether argv named it."""
+    named = any(a in ("--fanout", "--no-fanout") for a in (sys.argv[1:] if argv is None else argv))
+    _RUN_FANOUT.clear()
+    _RUN_FANOUT.update({"enabled": bool(enabled), "source": "flag" if named else "default"})
+
+
+def _fanout_run_block():
+    """{"fanout_run": {enabled, source}} for the snapshot, or {} before the flag is known."""
+    return {"fanout_run": dict(_RUN_FANOUT)} if _RUN_FANOUT else {}
+
+
+def _effort_worker_fields(w):
+    """Per-worker effort badge fields (see effort_policy.status_fields); {} on any failure."""
+    try:
+        from relay import effort_policy as _ep
+        return _ep.status_fields(w)
+    except Exception:
+        return {}
+
+
+def _tree_worker_fields(w):
+    """Task-tree root id for a worker row (additive); {} when the worker has none."""
+    try:
+        rid = (getattr(getattr(w, "task_envelope", None), "metadata", None) or {}).get("root_id")
+        return {"root_id": str(rid)} if rid else {}
+    except Exception:
+        return {}
+
+
+def _tree_budget_block(worker_rows):
+    """`fanout_budget` (the limits in force) and `tree_budget` (per-root usage), additive.
+
+    The production caller of relay.fanout_budget.usage_from_status. Rows are the snapshot's own
+    worker rows (they carry root_id). The campaign ledger is read only when some worker belongs
+    to a tree; {} on any failure.
+    """
+    try:
+        from relay import fanout_budget as _fb
+        if not any(isinstance(r, dict) and r.get("root_id") for r in worker_rows):
+            return {"fanout_budget": _fb.limits_from_settings(), "tree_budget": {}}
+        return _fb.status_block(worker_rows, _campaign_lines())
+    except Exception:
+        return {}
+
+
+def _write_scope_block():
+    """`fanout_write_scope`: {mode, overlaps_seen}, additive. The production caller of
+    relay.write_scope.status_block (and so of the mode reader). {} on any failure."""
+    try:
+        from relay import write_scope as _ws
+        return _ws.status_block()
+    except Exception:
+        return {}
+
+
+def _write_scope_tick(workers):
+    """Once per sweep: in shadow, record sibling write overlaps (never raises, never blocks)."""
+    try:
+        from relay import write_scope as _ws
+        _ws.shadow_tick(workers)
+    except Exception:
+        pass
+
+
+def _fanout_depth_block():
+    """`fanout_depth`: the split depth asked for and the one in force, additive.
+
+    The production caller of relay.fanout.effective_max_depth. {} on any failure.
+    """
+    try:
+        from relay import fanout as _fo
+        return {"fanout_depth": _fo.depth_report()}
+    except Exception:
+        return {}
+
+
 def _pending_gates(started=0.0):
     """Scan .companion_gates/ for unanswered HITL gates and return a list of dicts.
 
@@ -1550,6 +1650,49 @@ def _goal_summary(goal):
         return one if len(one) <= 64 else one[:63].rstrip() + "…"
 
 
+# FREE-SPACE RING (design section 3). One fixed-size, pre-allocated file per coordinator, so a
+# full disk cannot make the write fatal and the last minutes before a death survive it. Only
+# REPORTS; the floor shown is whatever the run resolved, never a value of its own.
+_FREE_RING = None
+_LAST_DISK = {}
+
+
+def _start_forensics(state_dir):
+    """Open the free-space ring and the faulthandler log. Best-effort, never raises."""
+    global _FREE_RING
+    try:
+        from relay import fleet_resume as _fr
+        _FREE_RING = _fr.FreeSpaceRing(os.path.join(state_dir, _fr.RING_FILE))
+        _fr.enable_fault_log(state_dir)
+    except Exception as e:
+        sys.stderr.write("[forensics] WARN: ring/fault log unavailable: %s\n" % e)
+
+
+def _sample_free_space(state_dir, floor_gb, now=None, force=False):
+    """Take a free-space sample at most every RING_SAMPLE_S. Never raises."""
+    try:
+        from relay import fleet_resume as _fr
+        now = time.time() if now is None else now
+        if not force and (now - _LAST_DISK.get("sampled_ts", 0.0)) < _fr.RING_SAMPLE_S:
+            return
+        import shutil
+        u = shutil.disk_usage(state_dir)
+        floor = floor_gb if (isinstance(floor_gb, (int, float)) and floor_gb > 0) else None
+        _LAST_DISK.update({"free_bytes": u.free, "total_bytes": u.total,
+                           "floor_gb": floor, "sampled_ts": now})
+        if _FREE_RING is not None:
+            _FREE_RING.sample(u.free, u.total, floor, now=now)
+    except Exception:
+        pass
+
+
+def _disk_block(disk_floor_gb):
+    from relay import fleet_resume as _fr
+    return _fr.disk_status(_LAST_DISK.get("free_bytes"), _LAST_DISK.get("total_bytes"),
+                           disk_floor_gb, _LAST_DISK.get("sampled_ts"),
+                           _FREE_RING.failures if _FREE_RING is not None else 0)
+
+
 def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paused=False,
               ram_floor_mb=0.0, directive="", run_label="", goal_count=0, queued=0,
               reunlock=None, command_rejections=None):
@@ -1584,6 +1727,7 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         # disk admission reserve + current C: free, so the cockpit can show the disk gate.
         "disk_floor_gb": round(disk_floor_gb, 1),
         "free_disk_gb": round(free_disk_gb(), 1),
+        "disk": _disk_block(disk_floor_gb),
         # RAM admission reserve (free RAM kept for the user) so the cockpit can show the RAM gate.
         "ram_floor_mb": round(ram_floor_mb),
         # THE THIRD GATE, and the one that was invisible. Disk and RAM have been on this panel
@@ -1689,6 +1833,10 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
             "depth": getattr(getattr(w, "task_envelope", None), "depth", 0),
             "subtask_index": getattr(w, "subtask_index", None),
             "goal_hash": getattr(w, "original_goal_hash", ""),
+            # None = outcome-wide rule; False = this worker's end is not safe to re-run
+            # (the cockpit's retry predicate honours it). retry_queued = runner re-queued it.
+            "retryable": getattr(w, "retryable_override", None),
+            "retry_queued": bool(getattr(w, "retry_queued", False)),
             "fresh_replay_count": getattr(w, "fresh_replay_count", 0),
             "refusal_count": getattr(w, "refusal_count", 0),
             "refusal_history": list(getattr(w, "refusal_history", [])),
@@ -1696,6 +1844,10 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
             "recovery_result": getattr(w, "recovery_result", ""),
             "recovery_state": getattr(w, "recovery_state", ""),
             "attempt_transcripts": list(getattr(w, "attempt_transcripts", [])),
+            # Effort-policy badge data (additive; absent when the policy is off). Status,
+            # outcome and pill above are untouched: this is display only, and shadow is record-only.
+            **_effort_worker_fields(w),
+            **_tree_worker_fields(w),
         } for w in workers],
         # Pending HITL gates from the autonomy contract gate (contract_gate.py).
         # Each entry: {"token": str, "question": str, "context": str, "ts": float, "path": str}
@@ -1705,13 +1857,62 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         # Set {"answered": true, "answer": "approved"}  to approve
         # Set {"answered": true, "answer": "denied"}    to deny
         "pending_gates": _pending_gates(started=started),
+        # What the effort policy is REALLY set to (env > settings > off) so the cockpit shows
+        # the truth, not its own combo. Additive; absent if it cannot be resolved.
+        **_effort_policy_block(),
+        # What this coordinator was started with for fan-out (additive; absent until known).
+        **_fanout_run_block(),
     }
     # Derived fan-out family markers (parent / child / aggregator / stalled) so the
     # cockpit can render the split-and-merge structure the lineage already implies.
     _fv = fanout_family_view(_snap["workers"])
     for _w in _snap["workers"]:
         _w["fanout"] = _fv.get(_w["name"], {"kind": "solo", "campaign_id": _w.get("campaign_id", ""), "label": ""})
+    _attach_split_groups(_snap)
+    _snap.update(_tree_budget_block(_snap["workers"]))
+    _snap.update(_fanout_depth_block())
+    _snap.update(_write_scope_block())
     return _snap
+
+
+#: Most split groups status.json carries. build_groups already clips every ledger string; this
+#: bounds the COUNT so a run with hundreds of campaigns cannot bloat the file the cockpit polls.
+_MAX_SPLIT_GROUPS = 50
+_MAX_CAMPAIGN_LEDGER_BYTES = 2_000_000
+
+
+def _campaign_lines():
+    """campaigns.jsonl lines from the active state dir; [] when absent, torn or too large."""
+    if not _ACTIVE_STATE_DIR:
+        return []
+    try:
+        path = os.path.join(_ACTIVE_STATE_DIR, "campaigns.jsonl")
+        if os.path.getsize(path) > _MAX_CAMPAIGN_LEDGER_BYTES:
+            return []
+        with open(path, encoding="utf-8-sig") as f:
+            return f.read().splitlines()
+    except Exception:
+        return []
+
+
+def _attach_split_groups(snap):
+    """Add the owner-facing split-group ledger to `snap`, DERIVED READ-ONLY from its workers.
+
+    `groups` is relay.family_view.build_groups over the workers already in the snapshot, and each
+    fan-out parent's row gains a separate `display_state` key (annotate_display_state returns
+    copies and never touches status / outcome / pill, which the cockpit and the reaper read).
+    ANY failure only omits the additions: the snapshot is the liveness signal of the whole
+    fleet and must never be lost to a display feature.
+    """
+    try:
+        from relay import family_view as _fvw
+        lines = _campaign_lines()
+        groups = _fvw.build_groups(snap["workers"], lines)[:_MAX_SPLIT_GROUPS]
+        annotated = _fvw.annotate_display_state(snap["workers"], lines)
+        snap["groups"] = groups
+        snap["workers"] = annotated
+    except Exception:
+        snap.pop("groups", None)
 
 
 #: How long to keep trying to replace a status file a reader is holding open. The cockpit
@@ -1772,6 +1973,10 @@ LAST_RUN_GOALS = "last_run_goals.json"
 LAST_RUN_DONE = "last_run_done.json"
 # outcome strings that count as a goal being genuinely finished (don't re-queue on resume)
 _RESUME_SUCCESS_OUTCOMES = ("DONE",)
+# A FANOUT parent ended on purpose when it split (its children carry the work). It is recorded
+# in the done-map so resume can tell "split" from "never ran", but it is NOT a success outcome:
+# it counts as finished only if its campaign header is on disk (see _resume_goal_is_done).
+_RESUME_FANOUT_OUTCOME = "FANOUT"
 
 
 def _goal_key(text):
@@ -1929,11 +2134,14 @@ def _update_done_map(state_dir, workers):
         done = _read_done_map(state_dir)
         for w in workers:
             outcome = getattr(w, "outcome", None)
-            if outcome in _RESUME_SUCCESS_OUTCOMES:
-                done[_goal_resume_key({
+            if outcome in _RESUME_SUCCESS_OUTCOMES or outcome == _RESUME_FANOUT_OUTCOME:
+                _k = _goal_resume_key({
                     "text": getattr(w, "goal", "") or "",
                     "jid": getattr(w, "jid", None),
-                })] = outcome
+                })
+                # monotonic: a later FANOUT never downgrades a recorded DONE
+                if not (outcome == _RESUME_FANOUT_OUTCOME and done.get(_k) in _RESUME_SUCCESS_OUTCOMES):
+                    done[_k] = outcome
         _write_atomic(os.path.join(state_dir, LAST_RUN_DONE), done)
     except Exception as e:
         # log ONCE per process (not once per tick) to avoid stderr spam every sweep.
@@ -1958,10 +2166,31 @@ def _merge_final_done_map(state_dir, results):
             goal = r.get("goal") or ""
         except Exception:
             continue
-        if outcome in _RESUME_SUCCESS_OUTCOMES and goal:
-            done[_goal_resume_key({"text": goal, "jid": r.get("jid")})] = outcome
+        if (outcome in _RESUME_SUCCESS_OUTCOMES or outcome == _RESUME_FANOUT_OUTCOME) and goal:
+            _k = _goal_resume_key({"text": goal, "jid": r.get("jid")})
+            if not (outcome == _RESUME_FANOUT_OUTCOME and done.get(_k) in _RESUME_SUCCESS_OUTCOMES):
+                done[_k] = outcome
     _write_atomic(os.path.join(state_dir, LAST_RUN_DONE), done)
     return done
+
+
+def _resume_goal_is_done(entry, key, done_map, state_dir):
+    """Did this ledger goal finish? DONE, or FANOUT whose campaign header is on disk.
+
+    G1: the FANOUT parent ends `done/FANOUT` at the split and used to be re-queued on every
+    resume (one wasted turn, nothing queued). It counts as finished only when the header line
+    for its campaign exists in campaigns.jsonl; without one (that write is best-effort) the
+    parent is re-queued so the work is not lost."""
+    outcome = done_map.get(key)
+    if outcome in _RESUME_SUCCESS_OUTCOMES:
+        return True
+    if outcome == _RESUME_FANOUT_OUTCOME:
+        try:
+            from relay import fleet_resume
+            return fleet_resume.has_campaign_header(state_dir, entry.get("text", ""))
+        except Exception:
+            return False
+    return False
 
 
 def _resume_goals(state_dir):
@@ -1985,8 +2214,8 @@ def _resume_goals(state_dir):
     remainder = []
     for entry in ledger:
         primary = _goal_resume_key(entry)
-        if done_map.get(primary) in _RESUME_SUCCESS_OUTCOMES:
-            continue                       # already finished successfully -- skip
+        if _resume_goal_is_done(entry, primary, done_map, state_dir):
+            continue                       # already finished successfully (or split) -- skip
         stored = entry.get("key") or _goal_key(entry.get("text", ""))
         if (primary != stored and legacy_key_counts.get(stored) == 1
                 and done_map.get(stored) in _RESUME_SUCCESS_OUTCOMES):
@@ -2052,6 +2281,12 @@ def _write_active_marker(state_dir, argv=None, pid=None, start_ts=None, raise_on
                    "start_ts": float(start_ts if start_ts is not None else time.time()),
                    "argv": raw_argv,
                    "resume_argv": _resume_argv(raw_argv)}
+        # WHICH INTERRUPTED RUN THIS ONE RESUMED, set by the resumer in the environment, so a
+        # run that dies again inherits its predecessor's resume count (the loop guard) via
+        # relay.fleet_reaper. Absent for an ordinary run.
+        _lineage = os.environ.get("MCP_FLEET_RESUME_LINEAGE", "").strip()
+        if _lineage:
+            payload["resume_lineage"] = _lineage
         _write_atomic(os.path.join(state_dir, ACTIVE_MARKER), payload)
         return True
     except Exception as e:
@@ -2498,6 +2733,17 @@ def _validate_command(cmd, state_dir):
         mixed = sorted(k for k in cmd if k not in ("add_goal", "ack"))
         if mixed:
             errs.append("add_goal cannot be combined with control key(s): %s" % mixed[:8])
+
+    # MESSAGE-BEARING CONTROLS ARE THEIR OWN RETRY UNIT. If a command steers a worker and a
+    # later effect in the same claimed file fails, restoring the claim would send the steer a
+    # second time. Settings/close/pause/stop are locally idempotent; user turns and unlock turns
+    # are not. Keep each of these isolated (landing ack is metadata, not an effect).
+    for isolated in ("steer", "reunlock"):
+        if isolated in cmd:
+            mixed = sorted(k for k in cmd if k not in (isolated, "ack"))
+            if mixed:
+                errs.append("%s cannot be combined with other control key(s): %s"
+                            % (isolated, mixed[:8]))
 
     def _items(key, v):
         items = v if isinstance(v, list) else [v]
@@ -3350,6 +3596,7 @@ def main():
     ap.add_argument("--state-dir", default=os.path.join(_repo_root(), ".fleet"),
                     help="where to write the live status.json the cockpit reads")
     args = ap.parse_args()
+    _record_run_fanout(args.fanout)
 
     # FINAL EXCLUSION LAYER: one state dir may have exactly one coordinator. Do this before
     # coordinator logs, queue receipts, retention, resume expansion, or any durable run-state
@@ -3533,6 +3780,37 @@ def main():
                   "(no last-run ledger found -- nothing to resume)")
         else:
             print("RESUME: %d of %d goals unfinished -- requeueing." % (n_unfinished, m_total))
+        # G2: campaign children that never finished were only ever queued in memory, so they
+        # are not in the goals ledger. Re-queue every child not DONE for campaigns whose merge
+        # has not finished, skipping any the ledger already carries (a second resume).
+        try:
+            from relay import fleet_resume as _fr
+            _kids, _degraded = _fr.resume_children_goals(args.state_dir)
+            _have = {_goal_resume_key(g) for g in resume_goals}
+            _kids = [k for k in _kids if _goal_resume_key(k) not in _have]
+            if _kids:
+                print("RESUME: %d unfinished campaign child(ren) re-queued from the campaign "
+                      "ledger (%d degraded)." % (len(_kids), _degraded))
+            # HARD SAFETY CAP. Scoping to the interrupted run is the fix; this refuses, loudly
+            # and with the snapshot left pending, anything that would still queue an absurd
+            # number of goals (545 were queued for a 2-goal run before the scoping existed).
+            _cap = _fr.resume_queue_cap(m_total)
+            _would = len(resume_goals) + len(_kids)
+            if _would > _cap:
+                print("REFUSING TO RESUME: it would queue %d goals (%d from the goals ledger, "
+                      "%d campaign children) but the cap is %d (max(%d, %dx the run's %d "
+                      "goals)). State left pending; nothing was queued."
+                      % (_would, len(resume_goals), len(_kids), _cap, _fr.RESUME_CAP_FLOOR,
+                         _fr.RESUME_CAP_FACTOR, m_total), flush=True)
+                _fr.record_resume_refused(
+                    args.state_dir, os.environ.get("MCP_FLEET_RESUME_LINEAGE", "").strip(),
+                    time.time(), _would, _cap)
+                _release_run_lock(_ACTIVE_RUN_LOCK)
+                _ACTIVE_RUN_LOCK = None
+                return 6
+            resume_goals = resume_goals + _kids
+        except Exception as _e:
+            print("RESUME: could not read campaign children: %s: %s" % (type(_e).__name__, _e))
         # resume set goes first so it keeps its original order ahead of any new goals.
         goals = resume_goals + goals
         if not goals:
@@ -3610,7 +3888,12 @@ def main():
         _ACTIVE_RUN_LOCK = None
         return 5
     try:
-        _write_atomic(os.path.join(args.state_dir, LAST_RUN_DONE), {})
+        # A RESUME KEEPS THE DONE MAP. It is monotonic (DONE keys are only ever added), and the
+        # goals ledger written above holds just the unfinished goals, so wiping the map here
+        # forgot every finished goal -- a second resume could then re-run them. Only a fresh
+        # run starts from {}.
+        if not args.resume:
+            _write_atomic(os.path.join(args.state_dir, LAST_RUN_DONE), {})
     except Exception as e:
         sys.stderr.write("[resume] WARN: could not reset done map: %s\n" % e)
 
@@ -3627,6 +3910,8 @@ def main():
         _release_run_lock(_ACTIVE_RUN_LOCK)
         _ACTIVE_RUN_LOCK = None
         return 5
+    _start_forensics(args.state_dir)
+    _sample_free_space(args.state_dir, None, force=True)   # floor not resolved yet; ticks carry it
     if _adopt_claim is not None:
         if not commit_command_claim(args.state_dir, _adopt_claim, applied=True):
             restore_command_claim(_adopt_claim)
@@ -3848,7 +4133,11 @@ def main():
                 if not commit_command_claim(args.state_dir, claim, applied=False, rejected_errors=errs):
                     _pending_command_commits.append((claim, False, errs))
                     return
-            else:                    # application failed before a durable effect; retry next sweep
+            else:
+                # Application raised before the claim could commit. add_goal is ledger-idempotent;
+                # steer/reunlock are schema-isolated retry units; remaining controls are local
+                # idempotent assignments/cancellation. Restoring is therefore safe under the
+                # admitted command contract rather than an unqualified "no effect happened" claim.
                 restore_command_claim(claim)
                 return
 
@@ -4075,6 +4364,8 @@ def main():
         # RUN-RESUME: refresh the completion map so a crash after this sweep can resume
         # only the still-unfinished goals. Cheap (in-memory scan + one atomic write).
         _update_done_map(args.state_dir, workers)
+        _sample_free_space(args.state_dir, disk_box[0])
+        _write_scope_tick(workers)      # shadow: record overlapping sibling writes (off = no-op)
         try:
             _write_atomic(status_path, _snapshot(workers, started, len(goals), mc_box[0],
                                                  disk_floor_gb=disk_box[0], paused=pause_box[0],
@@ -4445,7 +4736,10 @@ def main():
             "campaign_id": r.get("campaign_id", ""),
             "role": r.get("role", ""),
             "depth": r.get("depth", 0),
+            **({"root_id": r["root_id"]} if r.get("root_id") else {}),
             "goal_hash": r.get("goal_hash", ""),
+            "retryable": r.get("retryable"),
+            "retry_queued": bool(r.get("retry_queued", False)),
             "fresh_replay_count": r.get("fresh_replay_count", 0),
             "refusal_count": r.get("refusal_count", 0),
             "refusal_history": r.get("refusal_history", []),

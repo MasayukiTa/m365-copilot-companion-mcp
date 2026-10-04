@@ -19,11 +19,45 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from relay.transport_policy import (  # noqa: E402
     effect_is_checkable,
+    goal_may_act,
     resend_decision_for_landed_act,
     CHECK_PRESENT,
     CHECK_ABSENT,
     CHECK_UNKNOWN,
 )
+
+
+# -- goal_may_act / explicit prohibitions --------------------------------------------------
+
+def test_explicit_do_not_action_is_not_itself_an_action():
+    assert goal_may_act("Do not send email.") is False
+    assert goal_may_act("Do not send or post anything.") is False
+
+
+def test_read_only_boilerplate_does_not_turn_an_audit_into_an_acting_goal():
+    goal = (
+        "READ-ONLY independent review. "
+        "Do not edit, write, create, delete, commit, push, reset, rebase, or modify any "
+        "repository or local files; return findings only in your response."
+    )
+    assert goal_may_act(goal) is False
+
+
+def test_positive_action_after_a_prohibition_still_makes_the_goal_acting():
+    assert goal_may_act("Do not edit files; then commit the fix.") is True
+    assert goal_may_act("Do not send email; send a Slack message instead.") is True
+    assert goal_may_act("Do not send email, but post the result to Slack.") is True
+
+
+def test_negation_inverters_never_hide_a_real_action():
+    assert goal_may_act("Do not forget to send the email.") is True
+    assert goal_may_act("Do not just review, send the email too.") is True
+
+
+def test_conditional_or_contrast_negation_fails_closed_as_acting():
+    assert goal_may_act("Do not send email unless approved.") is True
+    assert goal_may_act("Do not send email except to Alice.") is True
+    assert goal_may_act("Do not send email, but only after 5pm.") is True
 
 
 # -- effect_is_checkable -------------------------------------------------------------------

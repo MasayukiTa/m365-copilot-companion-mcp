@@ -115,6 +115,11 @@ EXEMPT = {
         "ui/harness/ into a throwaway console exe: it runs the cockpit's submitted-group merge "
         "and list order against real files without WPF, which is the reason SubmittedTasks.cs "
         "is its own file, not a build of the UI",
+    "ui/test_the_effort_policy_says_what_is_in_effect.py":
+        "compiles ui/EffortPolicy.cs with the test-only driver ui/harness/EffortPolicyHarness.cs "
+        "into a throwaway console exe: it runs the effort-policy parse and wording the cockpit "
+        "shows, without WPF, which is the reason EffortPolicy.cs is its own file, not a build of "
+        "the UI",
     "ui/test_the_startup_loop_has_a_backstop.py":
         "compiles the SHIPPED ui/SelfImproveDashboard.cs + ui/Theme.cs (with WPF references, "
         "since SelfImproveDashboardWindow extends Window) plus the test-only driver in "
@@ -131,7 +136,8 @@ COMPILED_BY_A_TEST = {
     "ui/testdata/ChatSendHarness.cs": "ui/test_the_chat_window_sends_what_was_typed.py",
     "ui/testdata/BridgeClientHarness.cs": "ui/test_the_bridge_client_sends_the_token.py",
     "ui/harness/SubmittedTasksHarness.cs": "ui/test_a_submitted_task_is_on_top_at_once.py",
-    "ui/harness/StartupGateHarness.cs": "ui/test_the_startup_loop_has_a_backstop.py",
+    "ui/harness/EffortPolicyHarness.cs": "ui/test_the_effort_policy_says_what_is_in_effect.py",
+    "ui/harness/StartupGateHarness.cs":"ui/test_the_startup_loop_has_a_backstop.py",
     "ui/harness/FleetConvIdentityHarness.cs": "ui/test_a_fleet_interrupt_survives_a_supervisor_restart.py",
 }
 

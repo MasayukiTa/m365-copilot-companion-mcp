@@ -758,7 +758,7 @@ def test_the_exit_code_has_something_to_count():
         start_all.index('$script:startupFailures += ("unlock password repair failed: ')
 
 
-def test_appending_to_env_cannot_join_the_new_key_onto_the_last_one():
+def test_appending_to_env_cannot_join_the_new_key_onto_the_last_one(monkeypatch):
     """MEASURED, all three forms:
 
         echo KEY=1 >> f                          -> "KEY=1 \r\n"   the space lands in the VALUE
@@ -783,14 +783,18 @@ def test_appending_to_env_cannot_join_the_new_key_onto_the_last_one():
     import tempfile
     sys.path.insert(0, str(ROOT / "scripts"))
     import env_file
+    monkeypatch.setattr(env_file, "_protect_secret", lambda value: "dpapi:test-" + value)
     with tempfile.TemporaryDirectory() as d:
         p = Path(d) / ".env"
         p.write_bytes(b"MCP_API_KEY=abc")                      # no trailing newline
         env_file.set_key(p, "MCP_IMPL_AGENT_URL", "https://x.invalid/a")
-        assert p.read_bytes().splitlines() == [b"MCP_API_KEY=abc", b"MCP_IMPL_AGENT_URL=https://x.invalid/a"]
+        assert p.read_bytes().splitlines() == [
+            b"MCP_API_KEY_PROTECTED=dpapi:test-abc",
+            b"MCP_IMPL_AGENT_URL=https://x.invalid/a",
+        ]
 
 
-def test_the_access_choice_beats_the_file_and_the_environment():
+def test_the_access_choice_beats_the_file_and_the_environment(monkeypatch):
     """Choosing A did not reliably grant anonymous access. Get-AllowAnonymous reads the parent
     environment FIRST and then scans .env taking the FIRST match and breaking -- so appending
     the key at the end had no effect whenever the variable was set in the environment, or .env
@@ -822,6 +826,7 @@ def test_the_access_choice_beats_the_file_and_the_environment():
     import tempfile
     sys.path.insert(0, str(ROOT / "scripts"))
     import env_file
+    monkeypatch.setattr(env_file, "_protect_secret", lambda value: "dpapi:test-" + value)
     with tempfile.TemporaryDirectory() as d:
         p = Path(d) / ".env"
         before = "# 日本語のコメント\r\nMCP_TUNNEL_ALLOW_ANONYMOUS=0\r\nMCP_API_KEY=k\r\n"
@@ -829,7 +834,9 @@ def test_the_access_choice_beats_the_file_and_the_environment():
         env_file.set_key(p, "MCP_TUNNEL_ALLOW_ANONYMOUS", "1")
         raw = p.read_bytes()
         assert not raw.startswith(b"\xef\xbb\xbf")
-        assert raw.decode("utf-8") == before.replace("ANONYMOUS=0", "ANONYMOUS=1")
+        expected = before.replace("ANONYMOUS=0", "ANONYMOUS=1").replace(
+            "MCP_API_KEY=k", "MCP_API_KEY_PROTECTED=dpapi:test-k")
+        assert raw.decode("utf-8") == expected
     assert "-Encoding ASCII" not in qs, "an ASCII rewrite of .env destroys non-ASCII values"
 
 
