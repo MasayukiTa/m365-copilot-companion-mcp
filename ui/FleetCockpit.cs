@@ -839,6 +839,10 @@ class CockpitWindow : Window
     TextBlock _hmLbl, _hmNow, _hmPending;
     ComboBox _wsBox;
     TextBlock _wsLbl, _wsNow, _wsPending;
+    // auto-resume of an interrupted run off|on -> settings.txt fleet_auto_resume ; absent key = on
+    string _arVal = AutoResumeView.Default;
+    ComboBox _arBox;
+    TextBlock _arLbl, _arNow, _arPending;
     string _approval = "run";  // approval mode run|plan|auto -> settings.txt approval=
     string _runtimeMode = "fleet"; // next launch: fleet | durable -> settings.txt runtime=
     bool _durableEnqueuePending = false; // one durable campaign intake process at a time
@@ -1875,6 +1879,11 @@ class CockpitWindow : Window
                 {
                     string wsv = WriteScopeView.ParseLine(ln);   // off|shadow only; junk keeps the value
                     if (wsv != null) _wsVal = wsv;
+                }
+                else if (ln.StartsWith("fleet_auto_resume="))
+                {
+                    string arv = AutoResumeView.ParseLine(ln);   // off|on only; junk keeps the value
+                    if (arv != null) _arVal = arv;
                 }
                 else if (ln.StartsWith("fanout_hierarchical_merge="))
                 {
@@ -7833,6 +7842,7 @@ class CockpitWindow : Window
             case "maxtabs":
                 return "live";
             case "fanout_hierarchical_merge":
+            case "fleet_auto_resume":
             case "rate_ceiling_rpm":
             case "job_approval_mode":
             case "fanout_write_scope":
@@ -8316,6 +8326,12 @@ class CockpitWindow : Window
         PaintEffortPolicyInEffect(_lastRoot); PaintFanoutInEffect(_lastRoot);
         PaintFanoutBudgetInEffect(_lastRoot); PaintFanoutDepthInEffect(_lastRoot);
         PaintHierarchicalMergeInEffect(_lastRoot); PaintWriteScopeInEffect(_lastRoot);
+
+        // ── Recovery / 復旧: what happens to a run whose coordinator died. One control for now;
+        // like the fan-out ones it lives in this popup, never in the header.
+        col.Children.Add(SectionHeader(L("復旧 / Recovery", "Recovery")));
+        col.Children.Add(AutoResumeControl());
+        PaintAutoResumeInEffect(_lastRoot);
 
         // THE RE-UNLOCK CONTROL WAS REMOVED HERE, DELIBERATELY, AND MUST NOT COME BACK.
         //
@@ -9256,6 +9272,7 @@ class CockpitWindow : Window
         PaintFanoutDepth();
         PaintHierarchicalMerge();
         PaintWriteScope();
+        PaintAutoResume();
     }
     // What the COORDINATOR says it was started with (status.json "fanout_run"), beside the combo.
     // No report (old runner, no run yet) -> nothing shown, never a guess from the combo.
@@ -9624,6 +9641,80 @@ class CockpitWindow : Window
         _wsPending.Text = pend ?? "";
         _wsPending.Foreground = Theme.Br(Theme.Warning(_dark));
         _wsPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
+    }
+    // Auto-resume of an interrupted run (off|on), in its own Recovery section. Persists through
+    // SaveKey only; the supervisor re-reads the key every cycle (each_gate). What is IN EFFECT comes
+    // from status.json "auto_resume" {setting, last_decision, pending_snapshots}; the words and
+    // parsing live in AutoResumeView (EffortPolicy.cs).
+    UIElement AutoResumeControl()
+    {
+        _arLbl = new TextBlock(); _arLbl.VerticalAlignment = VerticalAlignment.Center;
+        _arLbl.FontSize = 12;
+
+        _arBox = new ComboBox();
+        _arBox.ToolTip = AutoResumeView.Help(_lang == 0) + "\n" + AutoResumeView.TakeEffectTip(_lang == 0);
+        _arBox.Cursor = Cursors.Hand; _arBox.FontSize = 12;
+        _arBox.FontWeight = FontWeights.SemiBold; _arBox.MinWidth = 64;
+        _arBox.Padding = new Thickness(8, 2, 4, 2);
+        _arBox.VerticalAlignment = VerticalAlignment.Center;
+        var arHelp = new Dictionary<string, string>();
+        foreach (string m in AutoResumeView.Modes) arHelp[m] = AutoResumeView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_arBox, AutoResumeView.Modes, arHelp, _arVal);
+        _arBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _arBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_arBox);
+            if (!AutoResumeView.IsMode(sel) || sel == _arVal) return;   // unchanged -> no write, no re-fire
+            _arVal = sel;
+            SaveKey(AutoResumeView.Key, _arVal);
+            PaintAutoResumeInEffect(_lastRoot);
+        };
+
+        _arNow = new TextBlock(); _arNow.VerticalAlignment = VerticalAlignment.Center;
+        _arNow.FontSize = 11.5; _arNow.TextWrapping = TextWrapping.Wrap; _arNow.MaxWidth = 300;
+        _arPending = new TextBlock(); _arPending.VerticalAlignment = VerticalAlignment.Center;
+        _arPending.FontSize = 11.5; _arPending.FontWeight = FontWeights.SemiBold;
+        _arPending.Visibility = Visibility.Collapsed;
+
+        var wrap = SettingsComboBlock(_arLbl, _arBox, _arNow, _arPending);
+        PaintAutoResume();
+        return wrap;
+    }
+    void PaintAutoResume()
+    {
+        if (_arLbl != null) { _arLbl.Text = AutoResumeView.Label(_lang == 0); _arLbl.Foreground = Muted; }
+        if (_arBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_arBox), _arVal)) ComboSelectVal(_arBox, _arVal);
+        _arBox.ToolTip = AutoResumeView.Help(_lang == 0) + "\n" + AutoResumeView.TakeEffectTip(_lang == 0);
+        _arBox.Background = BtnBg; _arBox.Foreground = Fg; _arBox.BorderBrush = Border;
+        StyleFlatCombo(_arBox);
+        PaintAutoResumeInEffect(_lastRoot);
+    }
+    // What the SUPERVISOR/COORDINATOR report (status.json "auto_resume"). No report (old runner, no
+    // run yet) -> nothing shown, never a guess from the selection.
+    void PaintAutoResumeInEffect(Dictionary<string, object> root)
+    {
+        if (_arNow == null || _arPending == null) return;
+        bool ja = _lang == 0;
+        string now = null, pend = null;
+        Dictionary<string, object> ar = root != null ? Obj(root, "auto_resume") : null;
+        if (ar != null && ar.ContainsKey("setting") && ar["setting"] != null)
+        {
+            string rep = S(ar, "setting");
+            Dictionary<string, object> ld = Obj(ar, "last_decision");
+            string dec = ld != null ? S(ld, "decision") : null;
+            string rsn = ld != null ? S(ld, "reason") : null;
+            int pc = ar.ContainsKey("pending_snapshots") && ar["pending_snapshots"] != null ? I(ar, "pending_snapshots") : 0;
+            now = AutoResumeView.Describe(rep, dec, rsn, pc, ja);
+            pend = AutoResumeView.PendingText(rep, _arVal, ja);
+        }
+        _arNow.Text = now ?? "";
+        _arNow.Foreground = Muted;
+        _arNow.Visibility = now != null ? Visibility.Visible : Visibility.Collapsed;
+        _arPending.Text = pend ?? "";
+        _arPending.Foreground = Theme.Br(Theme.Warning(_dark));
+        _arPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
     }
     void PaintEffort()
     {
@@ -12354,6 +12445,7 @@ class CockpitWindow : Window
         PaintFanoutDepthInEffect(root);    // the split depth the coordinator applies
         PaintHierarchicalMergeInEffect(root);   // the hierarchical-merge state the coordinator applies
         PaintWriteScopeInEffect(root);     // the sibling write-scope mode the coordinator applies
+        PaintAutoResumeInEffect(root);     // the auto-resume setting and the gate's last decision
         // Preserve scroll position across the rebuild. Without this, every worker update
         // (status/turn change) reset the list and snapped the view back to the TOP -- which is
         // exactly why scrolling "didn't work" while tasks were live: the user scrolled down, a

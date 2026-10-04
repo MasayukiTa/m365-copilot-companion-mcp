@@ -51,8 +51,9 @@ param(
     # (marker found, pid dead, would relaunch with these args) without actually
     # starting a process. Used for verification -- never triggers a real relaunch.
     [switch]$FleetResumeDryRun,
-    # The per-cycle resume check (after the reap) is DRY-RUN unless this is passed: it logs what
-    # it would relaunch and never starts a process. The startup check keeps its own switch above.
+    # No longer needed: the per-cycle resume check (after the reap) is governed by the operator's
+    # `fleet_auto_resume` setting (cockpit gear popup, Recovery; default on). This switch only
+    # forces it on over a setting of off. MCP_FLEET_AUTORESUME, when set, beats both.
     [switch]$FleetCycleResumeLive
 )
 
@@ -1480,9 +1481,23 @@ function Invoke-AutoResumeRunnerCheck {
 }
 
 function Test-FleetAutoResumeEnabled {
+    # THE PRIMARY SWITCH IS THE OPERATOR'S SETTING `fleet_auto_resume` (cockpit gear popup, section
+    # Recovery), read through the product's own reader (relay.fleet_resume.auto_resume_setting) so
+    # the file and its default are not parsed twice. Precedence: MCP_FLEET_AUTORESUME when set
+    # (the old override, still honoured), then -Force (the old -FleetCycleResumeLive switch), then
+    # the setting. A reader that cannot run reads as the registry default, ON.
+    # Called only once a resume candidate exists, so an ordinary tick spawns no python for it.
+    param([switch]$Force)
     $v = $env:MCP_FLEET_AUTORESUME
-    if ([string]::IsNullOrWhiteSpace($v)) { return $true }   # unset -> default ON
-    return -not ($v -in @("0", "false", "False", "FALSE", "no", "No", "NO", "off", "Off", "OFF"))
+    if (-not [string]::IsNullOrWhiteSpace($v)) {
+        return -not ($v -in @("0", "false", "False", "FALSE", "no", "No", "NO", "off", "Off", "OFF"))
+    }
+    if ($Force) { return $true }
+    $setting = ""
+    try {
+        $setting = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root'); from relay import fleet_resume; print(fleet_resume.auto_resume_setting())" 2>$null)).Trim()
+    } catch { $setting = "" }
+    return ($setting -ne "off")
 }
 
 function Get-FleetActiveMarker {
@@ -1629,11 +1644,7 @@ function Invoke-FleetAutoResume {
     # run interrupted). A snapshot source is also put through the loop guard
     # (Get-FleetResumeGate). -FromCycle marks the per-tick call, which is quieter when there is
     # nothing to do.
-    param([switch]$DryRun, [switch]$FromCycle)
-    if (-not (Test-FleetAutoResumeEnabled)) {
-        if (-not $FromCycle) { Write-Log "fleet auto-resume disabled via MCP_FLEET_AUTORESUME -- skipping check" }
-        return $false
-    }
+    param([switch]$DryRun, [switch]$FromCycle, [switch]$ForceEnabled)
     $marker = Get-FleetActiveMarker
     $snap = $null
     if ($null -eq $marker) {
@@ -1641,6 +1652,11 @@ function Invoke-FleetAutoResume {
         if ($snap -and $snap.Data.marker) { $marker = $snap.Data.marker }
     }
     if (-not (Test-FleetShouldAutoResume $marker)) { return $false }
+    # THE SWITCH IS ASKED ONLY NOW, with a candidate in hand (see Test-FleetAutoResumeEnabled).
+    if (-not (Test-FleetAutoResumeEnabled -Force:$ForceEnabled)) {
+        Write-FleetResumeLog -Once:$FromCycle -Key "$($marker.pid):disabled" -Msg "fleet auto-resume is OFF (fleet_auto_resume setting / MCP_FLEET_AUTORESUME) -- interrupted run (marker pid $($marker.pid)) left for a manual resume"
+        return $false
+    }
     # A DEAD PID IN THE MARKER DOES NOT MEAN NOTHING IS RUNNING. A coordinator resumed a moment
     # ago -- by start_all's resume_interrupted_fleet.py, or by hand -- writes its fresh marker
     # only after its imports and ledger load, so for that window the marker still names the
@@ -1707,6 +1723,16 @@ function Invoke-FleetAutoResume {
         # resume count (relay.fleet_reaper inherits it from the marker's resume_lineage).
         $hadLineage = Test-Path Env:MCP_FLEET_RESUME_LINEAGE
         if ($snap -and $snap.Data.run_id) { $env:MCP_FLEET_RESUME_LINEAGE = [string]$snap.Data.run_id }
+        # THE LAUNCH GUARD (relay.fleet_resume.autostart_hold), WRITTEN BEFORE THE LAUNCH with no pid
+        # yet and completed with the pid below. Until the resumed coordinator has written its own
+        # marker nothing says "a fleet is coming up", and a queue pass (this cycle's drain, or the
+        # server handing a goal over) would start a fresh coordinator for the queued goals while
+        # the interrupted run is still waiting. The interrupted run goes first.
+        $guardRun = ""
+        if ($snap -and $snap.Data.run_id) { $guardRun = ([string]$snap.Data.run_id) -replace '[^A-Za-z0-9_\-]', '' }
+        try {
+            & $Py -c "import sys, time; sys.path.insert(0, r'$Root'); from relay import fleet_resume; fleet_resume.write_launch_guard(r'$FleetDir', 0, '$guardRun', time.time())" 2>$null | Out-Null
+        } catch { }
         try {
             $fleetProc = Start-Process -FilePath $Py -ArgumentList (@("-m", "relay.fleet_runner") + $resumeArgs) `
                 -WorkingDirectory $Root -WindowStyle Hidden -PassThru
@@ -1718,6 +1744,14 @@ function Invoke-FleetAutoResume {
                 & $Py -c "import sys, time; sys.path.insert(0, r'$Root'); from relay import fleet_resume; fleet_resume.record_resume(r'$($snap.Path)', time.time(), $(if ($null -ne $freeNow) { $freeNow } else { 'None' }), '$signature')" 2>$null | Out-Null
             } catch { }
         }
+        # complete the guard with the pid (or drop it when nothing was started)
+        try {
+            if ($fleetProc) {
+                & $Py -c "import sys, time; sys.path.insert(0, r'$Root'); from relay import fleet_resume; fleet_resume.write_launch_guard(r'$FleetDir', $($fleetProc.Id), '$guardRun', time.time())" 2>$null | Out-Null
+            } else {
+                & $Py -c "import sys; sys.path.insert(0, r'$Root'); from relay import fleet_resume; fleet_resume.clear_launch_guard(r'$FleetDir')" 2>$null | Out-Null
+            }
+        } catch { }
         Register-AutoResumeRunner -Proc $fleetProc -LaunchTime $fleetLaunchAt -Kind "fleet" `
             -CommandLine ('"' + $Py + '" -m relay.fleet_runner ' + $shown)
         if ($fleetProc) { $script:ResumedFleet = @{ Proc = $fleetProc; OldPid = [int]$marker.pid } }
@@ -1728,6 +1762,9 @@ function Invoke-FleetAutoResume {
         return $true
     } catch {
         Write-Log "fleet auto-resume FAILED to relaunch: $($_.Exception.Message)"
+        try {
+            & $Py -c "import sys; sys.path.insert(0, r'$Root'); from relay import fleet_resume; fleet_resume.clear_launch_guard(r'$FleetDir')" 2>$null | Out-Null
+        } catch { }
         return $false
     }
 }
@@ -2356,8 +2393,10 @@ while ($true) {
     $shownToPass = Get-PendingJobNames -Dir $PendingDir
     Invoke-FleetReap
     # AFTER the reap, which is what turns a dead coordinator's marker into a pending snapshot.
-    # Dry-run by default (FleetCycleResumeLive is the explicit opt-in).
-    Invoke-FleetAutoResume -DryRun:(-not $FleetCycleResumeLive) -FromCycle | Out-Null
+    # LIVE when the operator's fleet_auto_resume setting is on (the default); the loop guard in
+    # Invoke-FleetAutoResume still decides each time. -FleetResumeDryRun logs only, and
+    # -FleetCycleResumeLive forces it on over a setting of off (override, no longer needed).
+    Invoke-FleetAutoResume -DryRun:$FleetResumeDryRun -FromCycle -ForceEnabled:$FleetCycleResumeLive | Out-Null
     Invoke-QueueDrain
     foreach ($n in $shownToPass) { [void]$script:ExpressSeen.Add($n) }
 

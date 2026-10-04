@@ -111,6 +111,11 @@ def _reader_write_scope():
     return mode()
 
 
+def _reader_auto_resume():
+    from relay.fleet_resume import auto_resume_setting
+    return auto_resume_setting()
+
+
 def _fanout_limit_reader(field):
     def _read():
         from relay.fanout_budget import limits_from_settings
@@ -131,6 +136,7 @@ _LIVE_READERS = {
     "fanout_max_depth": (_reader_fanout_depth, "2", "3"),
     "fanout_hierarchical_merge": (_reader_hierarchical_merge, "on", "off"),
     "fanout_write_scope": (_reader_write_scope, "shadow", "off"),
+    "fleet_auto_resume": (_reader_auto_resume, "off", "on"),
     "fanout_max_total": (_fanout_limit_reader("total"), "10", "30"),
     "fanout_max_active": (_fanout_limit_reader("active"), "2", "6"),
     "fanout_max_turns": (_fanout_limit_reader("turns"), "100", "500"),
