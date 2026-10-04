@@ -8392,6 +8392,10 @@ def _campaigns_from_disk(transcript_dir):
         return {}
     out = {}
     done_map = resume_mod.read_done_map(os.path.dirname(transcript_dir))
+    # A merge lost twice is written off in the open (ledger + mechanism row; a nested one marks
+    # its parent slot MISSING) before the carry/drop decision below drops it.
+    resume_mod.abandon_exhausted_merges(os.path.dirname(transcript_dir), fams, done_map,
+                                        log=lambda m: print(m, flush=True))
     # NOT SCOPED TO THE INTERRUPTED RUN, ON PURPOSE (swept with the resume-scope fix): this only
     # CARRIES families in memory; a family with no children in this run queues nothing. The one
     # thing it can queue is a re-issued merge, and that needs `merged` WITH an agg_key (written
@@ -9072,7 +9076,11 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 if _cr.get("nested"):
                     _recs.append(fanout_mod.slot_record(_ci, _cr))
                     continue
-                _recs.append({"finished": True, "outcome": "DONE", "subtask_index": _ci,
+                # the ROW'S outcome, not a presumed DONE: a MISSING / non-DONE row from the
+                # ledger is a named gap for the merge, never a counted success
+                _recs.append({"finished": True,
+                              "outcome": str(_cr.get("outcome") or "DONE").upper(),
+                              "subtask_index": _ci,
                               "result": _cr.get("result") or ""})
             # Every child ADMITTED must be finished, and all of them must have been admitted:
             # a family half of which is still queued is not a finished campaign, and merging

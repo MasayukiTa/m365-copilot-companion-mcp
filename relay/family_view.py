@@ -159,12 +159,14 @@ def _default_ledger_fn():
         return lambda goal, job_id="": ""
 
 
-def _merge_state(view_state, aggs, merged_flag):
+def _merge_state(view_state, aggs, merged_flag, abandoned=False):
     if any(_child_state(a) == "done" for a in aggs):
         return "merged"
     if any(_child_state(a) in ("running", "queued") for a in aggs):
         return "merging"
     if aggs:                       # all aggregators failed / interrupted
+        return "failed"
+    if abandoned:                  # ledger: the merge was lost twice and written off
         return "failed"
     if merged_flag:
         return "merging"           # ledger says the merge was queued, worker not visible yet
@@ -219,7 +221,8 @@ def build_flat_groups(workers, campaign_lines=None, ledger_fn=None):
         pname = str(parent.get("name") or "")
         marker = view.get(pname) or view.get(str((aggs or kids)[0].get("name") or "")) or {}
         camp = camps.get(cid) or {}
-        merge = _merge_state(marker.get("fanin_state", "pending"), aggs, bool(camp.get("merged")))
+        merge = _merge_state(marker.get("fanin_state", "pending"), aggs, bool(camp.get("merged")),
+                       abandoned=bool(camp.get("merge_abandoned")))
         goal = camp.get("goal") or parent.get("goal") or ""
         try:
             ledger = ledger_fn(goal, str(parent.get("task_id") or "")) or ""
@@ -386,7 +389,8 @@ def build_groups(workers, campaign_lines=None, ledger_fn=None):
         waiting = unknown = False
         for c in children[cid]:
             cm = gmap[c]["merge_state"]
-            waiting = waiting or cm != "merged"
+            # a failed (abandoned) subgroup is a MISSING slot for the parent's merge, not a wait
+            waiting = waiting or cm not in ("merged", "failed")
             unknown = unknown or cm == "unknown"
             if cm == "failed":
                 g["warnings"].append("統合に失敗したサブグループがあります: " + c)
