@@ -203,15 +203,35 @@ def _count_bracketed_list_items(text: str) -> int:
     return best
 
 
-def judge(text: str) -> Verdict:
+def child_own_slice(text: str) -> str:
+    """The step a fan-out child owns, without the parent goal, the scope heading or the
+    closing contract ("" when `text` carries no scope block). Judging the whole child text
+    would measure the boilerplate every child carries, not the child's own work."""
+    from . import fanout as _fanout
+    return _fanout._own_scope_step(text)
+
+
+def judge(text: str, depth: int = 0, max_depth: int | None = None) -> Verdict:
     """Judge whether `text` (a goal) describes independent, parallelizable
     work. Pure function: no I/O, no model call, safe to call for every
-    goal on every admission path."""
+    goal on every admission path.
+
+    `depth` is the requester's own depth in the task tree and `max_depth` the effective
+    maximum (`fanout.effective_max_depth()`). A goal that carries the child markers is a leaf
+    unless the requester may still split (`0 < depth < max_depth`); then the heuristics run on
+    the child's OWN slice. With `max_depth` left as None the behaviour is exactly the
+    depth-blind one: any child text is NO_SPLIT."""
     if not text or not text.strip():
         return Verdict(NO_SPLIT, "empty goal text cannot be split", {})
 
-    for pat in _CHILD_MARKERS:
-        if pat.search(text):
+    _is_child = any(pat.search(text) for pat in _CHILD_MARKERS)
+    _child_slice = ""
+    if _is_child:
+        if max_depth is not None and 0 < int(depth or 0) < int(max_depth):
+            _child_slice = child_own_slice(text)
+        if _child_slice:
+            text = _child_slice
+        else:
             return Verdict(
                 NO_SPLIT,
                 "already a fan-out child (carries its own N/M range marker "
