@@ -600,6 +600,7 @@ jobs:
             tests/test_resume_interrupted.py \
             tests/test_fleet_resume_phase2.py \
             tests/test_child_result_durable.py \
+            tests/test_a_lost_merge_is_visible.py \
             tests/test_hierarchical_merge.py \
             tests/test_hierarchical_merge_adversarial.py \
             tests/test_hierarchical_merge_setting.py \

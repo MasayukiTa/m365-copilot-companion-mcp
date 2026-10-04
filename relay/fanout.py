@@ -758,8 +758,8 @@ def slot_record(subtask_index, row=None, *, nested_cid=None):
 
 
 #: Ledger line kinds that mark state rather than describe a child. See campaigns_from_ledger.
-_LEDGER_MARKER_KINDS = ("merged", "merge_done", "merge_requeued", "child_result",
-                        "child_requeued")
+_LEDGER_MARKER_KINDS = ("merged", "merge_done", "merge_requeued", "merge_abandoned",
+                        "child_result", "child_requeued")
 
 
 def campaigns_from_ledger(lines):
@@ -817,6 +817,10 @@ def campaigns_from_ledger(lines):
                 fam["merge_done"] = True
             elif kind == "merge_requeued":
                 fam["merge_requeued"] = int(fam.get("merge_requeued") or 0) + 1
+            elif kind == "merge_abandoned":
+                # The merge was lost after its one re-issue and the family was given up on, in
+                # the open: a failed merge, not a silent wait. Written once per family.
+                fam["merge_abandoned"] = True
             elif kind == "child_result":
                 fam.setdefault("child_results", []).append(rec)
             elif kind == "child_requeued":
@@ -851,7 +855,8 @@ def campaigns_from_ledger(lines):
                 if rec.get("parent_subtask_index") is not None:
                     out[cid]["parent_subtask_index"] = rec["parent_subtask_index"]
             # Marker flags that arrived before the header survive it.
-            for _k in ("merge_done", "merge_requeued", "child_results", "agg_key",
+            for _k in ("merge_done", "merge_requeued", "merge_abandoned", "child_results",
+                       "agg_key",
                        "child_requeued", "nested_missing"):
                 if _k in _prev:
                     out[cid][_k] = _prev[_k]
