@@ -95,7 +95,10 @@ MECHANISMS = ("fanout", "refuter", "panel", "veto", "retry", "bestofn", "skill",
               # (relay/fleet_retention.py). Registered so a fan-out that is silently refusing
               # splits shows up in a summary instead of only in a console line.
               "fanout_budget_usage_unknown",
-              "campaigns_ledger_large")
+              "campaigns_ledger_large",
+              # A lock refusal landed while several workers had a turn in flight and could not be
+              # attributed to this one, so no unlock steer was sent (relay_fleet._looks_locked).
+              "unlock_refusal_unattributed")
 
 
 def patch_hash(text):
