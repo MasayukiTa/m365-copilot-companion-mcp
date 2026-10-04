@@ -177,6 +177,18 @@ KEYS = OrderedDict([
        "fanout_max_depth says. Keep it off until nested merging has been verified with small "
        "goals. Re-read at each split with no restart; trees already split keep going."),
 
+    # Recovery. Read by the supervisor on every cycle (about every 15 s) through
+    # relay/fleet_resume.py:auto_resume_enabled; "each_gate" is the nearest declared boundary:
+    # a decision per cycle, work already in flight untouched.
+    _k("fleet_auto_resume", EACH_GATE, "on",
+       "relay/fleet_resume.py:auto_resume_setting (every supervisor cycle)",
+       "off|on. on lets the supervisor resume an interrupted fleet run by itself, behind the loop "
+       "guard (at most 3 automatic resumes per run, 5 min x 2^n backoff, never after a stop, never "
+       "while a coordinator is live, never under the disk floor). Queued goals wait for the "
+       "interrupted run's resume instead of starting a fresh coordinator. Re-read each supervisor "
+       "cycle with no restart. An MCP_FLEET_AUTORESUME environment variable, when set, beats it. "
+       "Default on, matching the startup resume that was always on."),
+
     _k("autoretry", SWEEP_START, 1,
        "relay/fleet_runner.py:settings_autoretry (once, before the sweep)",
        "Takes effect on the NEXT run."),
