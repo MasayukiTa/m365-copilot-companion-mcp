@@ -190,6 +190,7 @@ jobs:
             relay/test_fanout_carries_the_procedure.py \
             relay/test_a_fresh_conversation_is_a_locked_conversation.py \
             relay/test_attribution_beats_reading_the_reply.py \
+            relay/test_a_sibling_refusal_is_not_every_workers_lock.py \
             relay/test_a_streak_that_never_resets_is_not_a_streak.py \
             relay/test_a_watchdog_that_repeats_itself_is_paying_rent.py \
             relay/test_a_compaction_that_launders_a_claim_is_worse_than_none.py \
