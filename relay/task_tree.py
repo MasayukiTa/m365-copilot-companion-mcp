@@ -63,8 +63,61 @@ def _node_id(w):
     tid = w.get("task_id")
     if tid not in (None, ""):
         return str(tid)
+    cid = str(w.get("campaign_id") or "")
+    if cid and str(w.get("role") or "").lower() not in ("subtask", "aggregator"):
+        return cid          # a root parent's own task identity is its campaign id
     name = str(w.get("name") or "")
     return "w:" + name if name else ""
+
+
+#: Longest slot chain followed when materialising a missing parent (a loop cannot hang).
+_MAX_CHAIN = 64
+
+
+def _durable_ids(rows, campaign_lines):
+    """(headers, known campaign ids, {slot task id: parent campaign id}) from durable records."""
+    try:
+        from relay.family_view import _headers
+        heads = _headers(list(campaign_lines or [])[:MAX_LINES])
+    except Exception:
+        heads = {}
+    known = set(heads)
+    for w in rows:
+        for k in ("campaign_id", "root_id"):
+            v = w.get(k)
+            if v not in (None, ""):
+                known.add(str(v))
+    slots = {}
+    for cid, h in heads.items():
+        if h.get("parent_task_id") and h.get("parent_campaign_id"):
+            slots[h["parent_task_id"]] = h["parent_campaign_id"]
+    return heads, known, slots
+
+
+def _materialise(pid, nodes, heads, known, slots, merge):
+    """Add the missing parent `pid` (and the missing chain above it) as virtual nodes, all or
+    nothing. Returns False, adding nothing, when no durable record names `pid`."""
+    chain, cur = [], pid
+    while cur not in nodes:
+        if len(chain) >= _MAX_CHAIN:
+            return False
+        if cur in slots:
+            pcid = slots[cur]
+            par = (heads.get(pcid) or {}).get("parent_task_id") or pcid
+            chain.append((cur, par, pcid))
+            cur = par
+        elif cur in known:
+            chain.append((cur, "", cur))
+            break
+        else:
+            return False
+    for nid, par, cid in reversed(chain):
+        nodes[nid] = {"id": nid, "parent_id": par, "root_id": "", "depth": 0, "declared_depth": 0,
+                      "role": "", "state": "", "merge_state": merge.get(cid, "") if not par else "",
+                      "turns": 0, "children": [], "child_count": 0, "descendants": None,
+                      "subtree_turns": None, "campaign_id": cid, "anomaly": "",
+                      "virtual": True, "unlinked": False}
+    return True
 
 
 def _parent_id(w):
@@ -149,7 +202,8 @@ def build_tree(workers, campaign_lines=None, max_nodes=MAX_NODES):
     """The task tree described in the module docstring. Never raises on bad rows."""
     rows = [w for w in (workers or []) if isinstance(w, dict)]
     out = {"nodes": {}, "roots": [], "orphans": [], "cycles": [], "unidentified": 0,
-           "duplicate_ids": 0, "ledger_only_children": 0, "truncated": False, "dropped": 0,
+           "duplicate_ids": 0, "ledger_only_children": 0, "unlinked": 0,
+           "truncated": False, "dropped": 0,
            "total_input": len(rows)}
     if len(rows) > max_nodes:
         out["truncated"], out["dropped"] = True, len(rows) - max_nodes
@@ -175,7 +229,24 @@ def build_tree(workers, campaign_lines=None, max_nodes=MAX_NODES):
                       "state": _child_state(w), "merge_state": ms,
                       "turns": _as_int(w.get("turn")), "children": [], "child_count": 0,
                       "descendants": None, "subtree_turns": None, "campaign_id": cid,
-                      "anomaly": ""}
+                      "anomaly": "", "virtual": False,
+                      # identified by worker name only: no task_id, no campaign, no parent
+                      "unlinked": (w.get("task_id") in (None, "") and not cid
+                                   and not _parent_id(w))}
+
+    # Durable identity: a fan-out parent's own row may carry no task_id (a producer) or may have
+    # been archived out of status.json. The campaign headers still say which campaign it was and
+    # which slot each nested campaign hangs from, so the missing parents are materialised as
+    # VIRTUAL nodes. A parent is an orphan only when nothing durable names it either.
+    heads, known, slots = _durable_ids(rows, campaign_lines)
+    unlinked = 0
+    for nid, n in list(nodes.items()):
+        p = n["parent_id"]
+        if p and p not in nodes:
+            _materialise(p, nodes, heads, known, slots, merge)
+        if n["unlinked"]:
+            unlinked += 1
+    out["unlinked"] = unlinked
 
     top, kind = _resolve(nodes)
     for nid, n in nodes.items():
@@ -210,7 +281,7 @@ def build_tree(workers, campaign_lines=None, max_nodes=MAX_NODES):
 
     out["nodes"] = nodes
     out["roots"] = [i for i, n in nodes.items()
-                    if n["parent_id"] == "" and n["anomaly"] == ""]
+                    if n["parent_id"] == "" and n["anomaly"] == "" and not n["unlinked"]]
     out["orphans"] = [i for i, n in nodes.items() if n["anomaly"] == "orphan"]
     out["cycles"] = _cycle_lists(nodes, kind)
     out["ledger_only_children"] = _ledger_only_children(nodes, campaign_lines)
@@ -239,8 +310,10 @@ def tree_shape(tree):
                       key=lambda r: (-r[0], r[2]))
     by_state = {}
     for n in nodes.values():
-        by_state[n["state"]] = by_state.get(n["state"], 0) + 1
-    return {"nodes": len(nodes), "roots": len(tree.get("roots") or []),
+        if not n.get("virtual"):
+            by_state[n["state"]] = by_state.get(n["state"], 0) + 1
+    return {"nodes": len(nodes), "virtual": sum(1 for n in nodes.values() if n.get("virtual")),
+            "unlinked": int(tree.get("unlinked") or 0), "roots": len(tree.get("roots") or []),
             "orphans": len(tree.get("orphans") or []),
             "cycle_nodes": sum(1 for n in nodes.values()
                                if n["anomaly"] in ("cycle", "under_cycle")),

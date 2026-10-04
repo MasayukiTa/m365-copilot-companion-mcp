@@ -56,6 +56,7 @@ def build_report(workers, campaign_lines, quota=None):
                                    " (TRUNCATED, %d dropped)" % tree["dropped"] if tree["truncated"] else ""),
             "- nodes: %d  roots: %d  orphans: %d  nodes in/under a cycle: %d"
             % (shape["nodes"], shape["roots"], shape["orphans"], shape["cycle_nodes"]),
+            "- unplaced rows (no identity beyond a worker name): %d" % shape["unlinked"],
             "- max depth (tree distance from top): %d" % shape["max_depth"],
             "- states: " + (", ".join("%s=%d" % kv for kv in sorted(shape["by_state"].items())) or "none"),
             ""]
@@ -89,8 +90,11 @@ def build_report(workers, campaign_lines, quota=None):
         out.append("- unavailable (status.json carries no quota object)")
     out.append("")
 
-    unknown_role = sum(1 for n in nodes.values() if n["role"] == "")
+    unknown_role = sum(1 for n in nodes.values() if n["role"] == "" and not n.get("virtual"))
     out += ["## Unknown", "",
+            "- rows with no task_id, no campaign and no parent (placed by name only, not roots): %d"
+            % tree["unlinked"],
+            "- parents rebuilt from campaign headers (virtual nodes): %d" % shape["virtual"],
             "- rows with no task_id and no name (cannot be placed): %d" % tree["unidentified"],
             "- rows repeating an id already seen: %d" % tree["duplicate_ids"],
             "- nodes with no role: %d" % unknown_role,

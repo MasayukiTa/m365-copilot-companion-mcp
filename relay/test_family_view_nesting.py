@@ -163,6 +163,39 @@ def test_no_goal_text_in_the_output():
     assert SECRET not in json.dumps(fv.build_groups(ws, lines), ensure_ascii=False)
 
 
+def test_nesting_survives_pruned_slot_and_parent_rows():
+    """Finished slot rows (and the whole parent group) are archived out of status.json: the
+    durable campaign headers must still resolve parent_group_id, depth and root."""
+    ws, lines = _two_level()
+    only_inner = [w for w in ws if w["campaign_id"] == "cI"]
+    g = fv.build_groups(only_inner, lines)
+    assert [x["group_id"] for x in g] == ["cI"]
+    i = g[0]
+    assert i["parent_group_id"] == "cO" and i["depth"] == 1 and i["root_id"] == "cO"
+    assert i["orphan"] is False
+    # parent group still present but its slot row is gone: linked through the header
+    no_slot = [w for w in ws if w["task_id"] != "tk1"]
+    gs = _by_id(fv.build_groups(no_slot, lines))
+    assert gs["cI"]["parent_group_id"] == "cO" and gs["cI"]["depth"] == 1
+    assert gs["cO"]["child_group_ids"] == ["cI"] and gs["cO"]["descendant_count"] == 1
+
+
+def test_three_level_chain_resolves_from_headers_alone():
+    ws = [_w(name="x%d" % i, campaign_id="cC", task_id="tx%d" % i, parent_task_id="s2",
+             role="subtask", status="running") for i in range(2)]
+    lines = [_head("cA", "tpa"), _head("cB", "s1", pcid="cA", root="cA"),
+             _head("cC", "s2", pcid="cB", root="cA")]
+    c = fv.build_groups(ws, lines)[0]
+    assert c["parent_group_id"] == "cB" and c["depth"] == 2 and c["root_id"] == "cA"
+    assert c["orphan"] is False
+
+
+def test_header_naming_an_unknown_parent_is_still_an_orphan():
+    ws = [_w(name="x", campaign_id="cX", task_id="tx", parent_task_id="s9", role="subtask")]
+    g = fv.build_groups(ws, [_head("cX", "s9", pcid="cNowhere", root="cNowhere")])[0]
+    assert g["parent_group_id"] is None and g["orphan"] is True and g["depth"] == 0
+
+
 def test_render_text_indents_by_depth_and_flat_stays_flat():
     ws, lines = _two_level()
     txt = fv.render_text(fv.build_groups(ws, lines)).splitlines()
