@@ -5,11 +5,15 @@ so what is tested is the shipped text, not a Python re-implementation of it.
 """
 import os
 import shutil
-import subprocess
+import sys
 
 import pytest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
+
+from tools import childproc  # noqa: E402
+
 PS1 = os.path.join(REPO, "scripts", "supervisor.ps1")
 _PS = shutil.which("powershell") or shutil.which("powershell.exe")
 
@@ -61,8 +65,8 @@ def test_a_big_log_rotates_a_small_one_does_not(tmp_path):
     shutil.copy(str(big), str(log))
     big_old = tmp_path / "big.log.1"
     big_old.write_bytes(b"previous generation")
-    out = subprocess.run([_PS, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-                          "-File", str(script)], capture_output=True, text=True, timeout=120)
+    out = childproc.run([_PS, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                         "-File", str(script)], timeout=120)
     assert out.stdout.split() == ["True", "False", "False"], (out.stdout, out.stderr)
     assert not big.exists() and big_old.stat().st_size == 5 * 1048576 + 10
     assert small.read_bytes() == b"s" * 100
