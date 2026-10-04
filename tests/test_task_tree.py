@@ -138,6 +138,74 @@ def test_report_on_status_json_shape(tmp_path):
     assert sorted(os.listdir(tmp_path)) == files_before    # read only
 
 
+def _hdr(cid, ptid="", pcid="", root=""):
+    return json.dumps({"kind": "campaign", "campaign_id": cid, "goal": "g", "n": 2,
+                       "parent_task_id": ptid, "parent_campaign_id": pcid, "root_id": root or cid})
+
+
+def _depth2_fleet(prune_slot=False):
+    """Producer rows carry NO task_id and NO campaign_id; children name the campaign id (root
+    parent identity) or a slot id. Campaign cB hangs from slot cA-1 of root campaign cA."""
+    ws = [_w("", None, "producer", outcome="FANOUT", name="w0", jid="j1"),
+          _w("cA-1", "cA", "subtask", campaign_id="cA", outcome="FANOUT"),
+          _w("cA-2", "cA", "subtask", campaign_id="cA"),
+          _w("cA-merge", "cA", "aggregator", campaign_id="cA"),
+          _w("cB-1", "cA-1", "subtask", campaign_id="cB"),
+          _w("cB-2", "cA-1", "subtask", campaign_id="cB")]
+    if prune_slot:
+        ws = [w for w in ws if w["task_id"] != "cA-1"]
+    lines = [_hdr("cA", "cA"), _hdr("cB", "cA-1", "cA", "cA")]
+    return ws, lines
+
+
+def test_depth2_fleet_with_empty_producer_ids_has_depth2_and_no_orphans():
+    for prune in (False, True):
+        ws, lines = _depth2_fleet(prune)
+        t = tt.build_tree(ws, lines)
+        sh = tt.tree_shape(t)
+        assert sh["max_depth"] == 2 and sh["orphans"] == 0 and t["orphans"] == []
+        assert t["nodes"]["cB-1"]["root_id"] == "cA" and t["nodes"]["cB-1"]["depth"] == 2
+        assert t["nodes"]["cA"]["virtual"] is True and t["nodes"]["cA"]["descendants"] == 5
+        assert t["roots"] == ["cA"]
+        assert t["nodes"]["cA-1"]["virtual"] is prune
+
+
+def test_empty_task_id_producer_is_unknown_not_a_root_or_orphan():
+    ws, lines = _depth2_fleet()
+    t = tt.build_tree(ws, lines)
+    assert t["unlinked"] == 1 and "w:w0" in t["nodes"]
+    assert "w:w0" not in t["roots"] and "w:w0" not in t["orphans"]
+    rep = tr.build_report(ws, lines)
+    assert "orphans: 0" in rep and "unplaced rows (no identity beyond a worker name): 1" in rep
+    assert "max depth (tree distance from top): 2" in rep
+
+
+def test_producer_with_campaign_id_takes_it_as_its_identity():
+    ws = [_w("", None, "producer", campaign_id="cA", outcome="FANOUT"),
+          _w("cA-1", "cA", "subtask", campaign_id="cA")]
+    t = tt.build_tree(ws, [_hdr("cA", "cA")])
+    assert t["roots"] == ["cA"] and t["nodes"]["cA"]["virtual"] is False
+    assert t["orphans"] == [] and t["nodes"]["cA"]["descendants"] == 1
+
+
+def test_orphan_only_when_the_claimed_parent_is_missing_everywhere():
+    ws, lines = _depth2_fleet()
+    ws.append(_w("z-1", "zzz-7", "subtask", campaign_id="cZ"))
+    t = tt.build_tree(ws, lines)
+    assert t["orphans"] == ["z-1"] and t["nodes"]["z-1"]["anomaly"] == "orphan"
+    # a header that names a parent campaign nobody recorded does not invent one either
+    ws2 = [_w("q-1", "cA-9", "subtask", campaign_id="cQ")]
+    t2 = tt.build_tree(ws2, [_hdr("cQ", "cA-9", "cNope", "cNope")])
+    assert t2["orphans"] == ["q-1"]
+
+
+def test_header_loop_cannot_hang_materialisation():
+    ws = [_w("a-1", "b-1", "subtask", campaign_id="cA")]
+    lines = [_hdr("cA", "b-1", "cB"), _hdr("cB", "a-1", "cA")]
+    t = tt.build_tree(ws, lines)
+    assert set(t["nodes"]) >= {"a-1"}
+
+
 def test_report_without_quota_or_files_says_unavailable(tmp_path):
     rep = tr.build_report([], [], tr.read_quota(str(tmp_path)))
     assert "unavailable" in rep and "n/a (0 rows)" in rep
