@@ -170,6 +170,50 @@ def get_summary(now: Optional[float] = None, fresh_s: float = FRESH_S) -> dict:
     }
 
 
+def last_real_success(now: Optional[float] = None, within_s: float = FRESH_S):
+    """(call_ts, tool) of the newest REAL tool call that succeeded within `within_s`, else None.
+
+    The bridge's idle self-probe asks this before it sends anything: a real call that reached
+    this server and did its job is better evidence than the probe's synthetic one, and it costs
+    no Copilot message. "Real" excludes, by the same rules get_summary() applies, discovery
+    chatter (call_tool.*), calls that were not able to run (locked screen) and refusals/failures
+    (row_ok), and additionally the probe's OWN list_directory calls: those name the challenge
+    directory in their arguments, and counting them would let one probe excuse the next.
+
+    The timestamp returned is the CALL's, so a health display built on it shows the age of a
+    real event and never the time this function ran. Never raises; no ledger reads as None.
+    """
+    now = time.time() if now is None else now
+    cutoff = now - within_s
+    calls = {}
+    best = None
+    for rec in _tail_records(LEDGER, TAIL_BYTES):
+        try:
+            ts = float(rec.get("ts") or 0)
+        except (TypeError, ValueError):
+            continue
+        event = rec.get("event")
+        if event == "call":
+            tool = str(rec.get("tool") or "?")
+            try:
+                probe = "probe_challenge" in json.dumps(rec.get("args") or {})[:4096].lower()
+            except (TypeError, ValueError):
+                probe = False
+            calls[rec.get("id")] = (ts, tool, probe)
+        elif event == "outcome":
+            call = calls.get(rec.get("id"))
+            if call is None:
+                continue          # the call row fell outside the tail: not provable, not counted
+            c_ts, tool, probe = call
+            if probe or tool.startswith("call_tool.") or c_ts < cutoff or c_ts > now + 60:
+                continue
+            if _ledger.row_unavailable(rec) or not _ledger.row_ok(rec):
+                continue
+            if best is None or c_ts >= best[0]:
+                best = (c_ts, tool)
+    return best
+
+
 def describe(summary: Optional[dict] = None) -> str:
     """One line for a human, saying which of the three states this is and on what evidence."""
     s = get_summary() if summary is None else summary

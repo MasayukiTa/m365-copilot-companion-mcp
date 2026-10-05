@@ -582,3 +582,22 @@ static class ChatSend
         fx.StickToEnd();
     }
 }
+
+// The one temp directory the product writes under: %TEMP%\m365-companion\ (see relay/temp_home.py,
+// relay/fleet_retention.temp_home sweeps it by age). WPF-free so ChatSend.cs stays testable.
+public static class ChatTempHome
+{
+    public static string Dir()
+    {
+        try
+        {
+            string d = Path.Combine(Path.GetTempPath(), "m365-companion");
+            Directory.CreateDirectory(d);
+            return d;
+        }
+        catch (Exception)
+        {
+            return Path.GetTempPath();
+        }
+    }
+}
