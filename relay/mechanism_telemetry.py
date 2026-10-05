@@ -101,7 +101,12 @@ MECHANISMS = ("fanout", "refuter", "panel", "veto", "retry", "bestofn", "skill",
               "unlock_refusal_unattributed",
               # MCP_JUDGE_BACKEND=sampling was configured but the backend is gone (fastmcp 4
               # removed Context.sample); one row per process (tools/judge_backend.py).
-              "judge_backend_sampling_removed")
+              "judge_backend_sampling_removed",
+              # A conversation was opened for a worker and no message went out within a minute,
+              # and the merge's conversation choice (relay/conversation_saving.py). Registered so
+              # the unsent RATE and the aggregator inputs are readable from one place.
+              "conversation_created_unsent",
+              "aggregator_conversation")
 
 
 def patch_hash(text):
