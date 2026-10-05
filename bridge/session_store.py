@@ -41,12 +41,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import random
 import re
 import sqlite3
 import time
 from pathlib import Path
+
+_log = logging.getLogger(__name__)
 
 REPO = Path(__file__).resolve().parent.parent
 SESS_DIR = os.path.join(str(REPO), ".fleet", "sessions")
@@ -329,6 +332,37 @@ def _initialize(conn):
         -- empty once the fold is done, and new rows are written with goal = '' and never
         -- enter it.
         CREATE INDEX IF NOT EXISTS fleet_turns_unfolded_idx ON fleet_turns(id) WHERE goal <> '';
+        -- THE AUDIT LEDGER OF THE VALIDITY TOOLS, one row per piece of conversation, bound to a
+        -- claim id (or 'UNATTRIBUTED' -- never dropped) and tagged by role: goal / worker_prompt
+        -- / worker_prompt_wire / worker_reply / tool_call / tool_result / refuter_prompt /
+        -- refuter_prompt_wire / refuter_reply / verdict / outcome. Added 2026-10-06, additive
+        -- (CREATE IF NOT EXISTS; no existing table is altered). Append-only: a row is never
+        -- updated. Written by bridge/validity_audit.py (live and by scripts/validity_audit_backfill.py).
+        --
+        -- IDEMPOTENT ON THE SOURCE, not on position: UNIQUE is (claim, worker, role, sha16, the
+        -- row it was read from), so re-running over more data never duplicates and never depends
+        -- on a sequence number that would shift when later rows arrive. `seq` only orders.
+        -- `text` is whole and redacted by the shared redactor; a cut at MCP_FULLTEXT_MAX_CHARS is
+        -- flagged in `truncated` with the full sha256 / orig_chars.
+        CREATE TABLE IF NOT EXISTS validity_audit (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            claim_id     TEXT NOT NULL,
+            run_id       TEXT NOT NULL DEFAULT '',
+            worker_key   TEXT NOT NULL DEFAULT '',
+            seq          INTEGER NOT NULL DEFAULT 0,
+            role_tag     TEXT NOT NULL,
+            ts           REAL NOT NULL,
+            sha16        TEXT NOT NULL,
+            sha256       TEXT NOT NULL DEFAULT '',
+            orig_chars   INTEGER NOT NULL DEFAULT 0,
+            truncated    INTEGER NOT NULL DEFAULT 0,
+            text         TEXT NOT NULL DEFAULT '',
+            source_table TEXT NOT NULL DEFAULT '',
+            source_key   TEXT NOT NULL DEFAULT '',
+            extra_json   TEXT NOT NULL DEFAULT '{}',
+            UNIQUE (claim_id, worker_key, role_tag, sha16, source_table, source_key)
+        );
+        CREATE INDEX IF NOT EXISTS validity_audit_claim_idx ON validity_audit(claim_id, ts, seq);
         """
     )
     _migrate(conn)
@@ -820,8 +854,236 @@ def record_fleet_turn(key, obj, name="", goal=""):
         finally:
             conn.close()
         return True
-    except Exception:
+    except Exception as exc:
+        # NOT SWALLOWED (the chat-persist lesson, PR #130: a store that fails silently is a
+        # store that silently holds nothing). The fleet still must not stall, so this returns
+        # False -- but it says so on the log, with the key and the exception type.
+        _log.error("record_fleet_turn failed for key=%r: %s: %s", str(key)[:80],
+                   type(exc).__name__, str(exc)[:200])
         return False
+
+
+#: How many characters of ONE stored text are kept. 0 = no cap. The default is far above any
+#: real prompt (the longest worker turn measured is ~300 KB) -- it exists so a runaway text
+#: cannot fill the disk, not to shorten ordinary ones. Over it, the text is cut AND the row
+#: says so (`truncated`, `orig_chars`, full-text `sha256`); a cut is never silent.
+FULLTEXT_MAX_CHARS_ENV = "MCP_FULLTEXT_MAX_CHARS"
+FULLTEXT_MAX_CHARS_DEFAULT = 4_000_000
+
+
+def fulltext_max_chars():
+    raw = os.environ.get(FULLTEXT_MAX_CHARS_ENV, "").strip()
+    if not raw:
+        return FULLTEXT_MAX_CHARS_DEFAULT
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        _log.error("%s=%r is not an integer; using the default %d", FULLTEXT_MAX_CHARS_ENV,
+                   raw, FULLTEXT_MAX_CHARS_DEFAULT)
+        return FULLTEXT_MAX_CHARS_DEFAULT
+
+
+def _redact_for_record(text):
+    """Run the shared redactor over text about to be stored. Fails closed (marker), never raises.
+
+    The same function the fleet transcript uses, selected by secret NAME in one shared place.
+    Applied here, at the single write point, so no caller can forget it.
+    """
+    text = "" if text is None else str(text)
+    try:
+        from tools.secret_store import redact_secrets
+        return redact_secrets(text)
+    except Exception as exc:
+        _log.error("redaction unavailable (%s); stored the withheld marker instead of the text",
+                   type(exc).__name__)
+        return "[redaction failed: content withheld]"
+
+
+def _prepare_full_text(text):
+    """(stored_text, sha16, sha256, orig_chars, truncated) for a redacted full text."""
+    full = _redact_for_record(text)
+    digest = hashlib.sha256(full.encode("utf-8", "replace")).hexdigest()
+    cap = fulltext_max_chars()
+    truncated = bool(cap and len(full) > cap)
+    stored = full[:cap] if truncated else full
+    if truncated:
+        _log.error("full text of %d chars exceeds %s=%d; stored %d chars and flagged the row "
+                   "truncated (sha256=%s)", len(full), FULLTEXT_MAX_CHARS_ENV, cap, cap, digest)
+    return stored, digest[:16], digest, len(full), truncated
+
+
+def _redact_extra(extra):
+    """Redact string values in a free-form extra dict (shallow)."""
+    out = {}
+    for k, v in (extra or {}).items():
+        out[str(k)] = _redact_for_record(v) if isinstance(v, str) else v
+    return out
+
+
+def _unredacted_sha16(text):
+    """sha16 of the text BEFORE redaction, so a reader holding the original can match it.
+
+    A short prefix of a hash of text that may contain a secret is not a way to recover it (the
+    secret is a fraction of a longer text), and it is what lets a later reader prove which
+    prompt a redacted row came from.
+    """
+    return hashlib.sha256(("" if text is None else str(text)).encode("utf-8", "replace")
+                          ).hexdigest()[:16]
+
+
+def record_wire_turn(key, turn, text, *, name="", goal="", run_id="", route="", round=0):
+    """Store the string actually put on the wire for one worker turn, as a fleet_turns row.
+
+    role = "user_wire", distinct from the "user" row (the job text BEFORE the transport added
+    its protocol preamble / tool catalogue / whitespace collapse). Full text; the cap and the
+    redaction are the shared ones, and a cut is flagged on the row.
+    """
+    stored, sha16, sha256, orig_chars, truncated = _prepare_full_text(text)
+    return record_fleet_turn(
+        key,
+        {"turn": turn, "role": "user_wire", "text": stored, "ts": time.time(),
+         "sha16": sha16, "pre_redaction_sha16": _unredacted_sha16(text), "sha256": sha256,
+         "orig_chars": orig_chars, "truncated": truncated, "route": route,
+         "round": int(round or 0), "run_id": str(run_id or "")},
+        name=name, goal=goal)
+
+
+#: The fleet_turns roles the refuter / review panel writes, one row per text.
+#:   refuter_user       the prompt composed for the reviewer (what we meant to send)
+#:   refuter_wire       the payload the socket transport really sent (preamble/tools included)
+#:   refuter_assistant  one reply the reviewer settled on (a nudged review has several)
+#:   refuter_verdict    the verdict as the fleet took it, with its full reason
+REFUTER_ROLES = ("refuter_user", "refuter_wire", "refuter_assistant", "refuter_verdict")
+
+
+def refuter_key(parent_key, lens=""):
+    """The fleet_turns key a reviewer's conversation is stored under: parent key + lens."""
+    return "%s__refuter_%s" % (parent_key, lens or "single")
+
+
+def record_refuter_turn(parent_key, role, seq, text, *, lens="", name="", goal="", run_id="",
+                        extra=None, ts=None):
+    """Store one text of the reviewer's conversation in full, as a fleet_turns row. Idempotent.
+
+    Returns True when the row was written or is already there. NEVER RAISES, NEVER SWALLOWS: a
+    failure returns False and is logged with the exception type. IDEMPOTENT on (key, role,
+    turn=seq, sha16): fleet_turns has no unique key, so the check is a lookup before the insert;
+    a DIFFERENT text at the same position is a new row, not a dropped one.
+    """
+    key = refuter_key(parent_key, lens)
+    try:
+        stored, sha16, sha256, orig_chars, truncated = _prepare_full_text(text)
+        conn = _db(import_files=False)
+        try:
+            for r in conn.execute("SELECT extra FROM fleet_turns WHERE key = ? AND role = ? "
+                                  "AND turn = ?", (key, str(role), int(seq))):
+                try:
+                    if json.loads(r["extra"] or "{}").get("sha16") == sha16:
+                        return True
+                except ValueError:
+                    pass
+            obj_extra = _redact_extra(extra)
+            obj_extra.update({"sha16": sha16, "pre_redaction_sha16": _unredacted_sha16(text),
+                              "sha256": sha256, "orig_chars": orig_chars,
+                              "truncated": truncated, "run_id": str(run_id or ""),
+                              "parent_key": str(parent_key), "lens": str(lens or "")})
+            conn.execute(
+                "INSERT INTO fleet_turns (key, name, goal, goal_id, turn, role, text, extra, ts) "
+                "VALUES (?, ?, '', ?, ?, ?, ?, ?, ?)",
+                (key, str(name or ""), _intern_goal(conn, goal), int(seq), str(role), stored,
+                 json.dumps(obj_extra, ensure_ascii=False, default=str),
+                 float(ts or time.time())))
+        finally:
+            conn.close()
+        return True
+    except Exception as exc:
+        _log.error("record_refuter_turn failed (key=%r role=%r): %s: %s", key[:80], role,
+                   type(exc).__name__, str(exc)[:200])
+        return False
+
+
+def append_validity_audit(rows):
+    """Append audit rows (dicts) in ONE transaction. Idempotent. Returns (inserted, already_there).
+
+    Each row: claim_id, role_tag, ts, text, and optionally run_id, worker_key, seq,
+    source_table, source_key, extra (dict). Redaction and the size cap are the shared ones.
+    RAISES on a database failure: the caller is a batch job (live hook or backfill) that must
+    know a batch did not land, so nothing here is swallowed.
+    """
+    conn = _db(import_files=False)
+    inserted = skipped = 0
+    try:
+        conn.execute("BEGIN")
+        for r in rows:
+            stored, sha16, sha256, orig_chars, truncated = _prepare_full_text(r.get("text"))
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO validity_audit (claim_id, run_id, worker_key, seq, "
+                "role_tag, ts, sha16, sha256, orig_chars, truncated, text, source_table, "
+                "source_key, extra_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (str(r["claim_id"]), str(r.get("run_id") or ""), str(r.get("worker_key") or ""),
+                 int(r.get("seq") or 0), str(r["role_tag"]), float(r.get("ts") or time.time()),
+                 sha16, sha256, int(orig_chars), 1 if truncated else 0, stored,
+                 str(r.get("source_table") or ""), str(r.get("source_key") or ""),
+                 json.dumps(_redact_extra(r.get("extra")), ensure_ascii=False, default=str)))
+            if cur.rowcount:
+                inserted += 1
+            else:
+                skipped += 1
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+    return inserted, skipped
+
+
+def validity_audit_ledger(claim_id, limit=200, max_chars=20000):
+    """The conversation bound to one claim id, oldest first, every row tagged by role.
+
+    BOUNDED, AND SAYS SO. `limit` caps rows and `max_chars` caps the text returned in total; rows
+    past either bound are not returned and `omitted_rows` says how many, and a row whose text was
+    cut to fit has `text_cut_to` set. Nothing is dropped without being counted.
+    """
+    limit = max(1, int(limit))
+    max_chars = max(0, int(max_chars))
+    conn = _db(import_files=False)
+    try:
+        total = conn.execute("SELECT COUNT(*) FROM validity_audit WHERE claim_id = ?",
+                             (str(claim_id),)).fetchone()[0]
+        rows = conn.execute(
+            "SELECT * FROM validity_audit WHERE claim_id = ? ORDER BY ts, worker_key, seq, id "
+            "LIMIT ?", (str(claim_id), limit)).fetchall()
+    finally:
+        conn.close()
+    out, budget = [], max_chars
+    for r in rows:
+        d = dict(r)
+        d["extra"] = json.loads(d.pop("extra_json") or "{}")
+        text = d["text"]
+        if budget <= 0 and text:
+            break
+        if len(text) > budget:
+            d["text"], d["text_cut_to"] = text[:budget], budget
+        budget -= len(d["text"])
+        out.append(d)
+    return {"claim_id": str(claim_id), "total_rows": total, "returned_rows": len(out),
+            "omitted_rows": total - len(out), "limit": limit, "max_chars": max_chars,
+            "rows": out}
+
+
+def validity_audit_claims():
+    """Every claim id that has audit rows, with its row count and time span."""
+    conn = _db(import_files=False)
+    try:
+        return [dict(r) for r in conn.execute(
+            "SELECT claim_id, COUNT(*) AS rows, MIN(ts) AS first_ts, MAX(ts) AS last_ts "
+            "FROM validity_audit GROUP BY claim_id ORDER BY claim_id")]
+    finally:
+        conn.close()
 
 
 #: Both shapes at once. A row written before the goal was interned carries its own copy in
