@@ -35,6 +35,10 @@ BINARY_EXTS = frozenset({
 })
 
 
+#: Paths the LAST enumerate_files call left out because they were past max_bytes.
+SKIPPED_TOO_LARGE = []
+
+
 def enumerate_files(mode, repo_root, base_ref=None, cached=False, max_bytes=200_000,
                      exclude_ext=BINARY_EXTS):
     """List candidate review files from git, filtered to small, non-binary, existing files.
@@ -66,6 +70,7 @@ def enumerate_files(mode, repo_root, base_ref=None, cached=False, max_bytes=200_
         return []
 
     out = set()
+    skipped_big = []
     for line in (proc.stdout or "").splitlines():
         f = line.strip()
         if not f:
@@ -78,10 +83,19 @@ def enumerate_files(mode, repo_root, base_ref=None, cached=False, max_bytes=200_
             if not os.path.isfile(full):
                 continue  # deleted/missing (e.g. a diff entry for a removed file)
             if os.path.getsize(full) > max_bytes:
+                # NOT SILENT: a file past the cap is not reviewed, and a review that says nothing
+                # about it reads as "reviewed and clean". Recorded below and on stderr.
+                skipped_big.append(f)
                 continue
         except OSError:
             continue
         out.add(f)
+    SKIPPED_TOO_LARGE[:] = skipped_big
+    if skipped_big:
+        import sys as _sys
+        print("[review] %d file(s) over %d bytes were NOT enumerated for review: %s%s"
+              % (len(skipped_big), max_bytes, ", ".join(sorted(skipped_big)[:10]),
+                 " ..." if len(skipped_big) > 10 else ""), file=_sys.stderr)
     return sorted(out)
 
 
