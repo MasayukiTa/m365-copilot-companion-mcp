@@ -195,8 +195,8 @@ def find_silent_size_caps(source):
 
 def _tracked_py():
     try:
-        out = subprocess.run(["git", "ls-files", "*.py"], cwd=REPO, capture_output=True, text=True,
-                             timeout=60).stdout.split()
+        out = subprocess.run(["git", "ls-files", "*.py"], cwd=REPO, capture_output=True,
+                             timeout=60).stdout.decode("utf-8", "replace").split()
     except Exception:
         out = []
     if not out:
