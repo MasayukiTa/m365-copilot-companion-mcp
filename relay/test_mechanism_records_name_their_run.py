@@ -192,6 +192,10 @@ BLANK_BY_DESIGN = {
         "every path in is an offline bench analysis script or relay/solve_policy.py, which has "
         "no caller outside its own test; there is no fleet sweep to name, and a parameter here "
         "would be a field nobody could fill",
+    ("tools/judge_backend.py", "judge_backend_sampling_removed"):
+        "a stale env setting noticed once per MCP SERVER process while judging a command; it "
+        "belongs to the deployment, not to any fleet run, so a run id would be a field nobody "
+        "could fill",
     ("tools/skill_ops.py", "skill"):
         "runs in the MCP SERVER process; no worker identity crosses the gateway, which is the "
         "same gap tool_ledger records by leaving `task` empty and attributing by path instead",
