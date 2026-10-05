@@ -154,7 +154,11 @@ def _prune_jobs_locked() -> None:
 
 
 def _create_log_paths() -> tuple[str, str]:
-    base = Path(tempfile.gettempdir()) / "m365-copilot-companion-mcp-jobs"
+    # Under the one swept temp home (relay/temp_home.py). The logs' paths are stored on the job
+    # record and read back from there, so nothing depends on the old directory name; logs left
+    # in the old %TEMP%\m365-copilot-companion-mcp-jobs stay readable where they are.
+    from relay.temp_home import temp_dir
+    base = Path(temp_dir("jobs"))
     base.mkdir(parents=True, exist_ok=True)
     stem = uuid.uuid4().hex[:10]
     return str(base / f"{stem}.out.log"), str(base / f"{stem}.err.log")
@@ -244,8 +248,9 @@ def run_python_in_background(code: str, label: str = "") -> str:
         if _g is not None:
             return _g
     try:
+        from relay.temp_home import temp_dir
         with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".py", delete=False, encoding="utf-8"
+            mode="w", suffix=".py", delete=False, encoding="utf-8", dir=temp_dir("jobs")
         ) as f:
             f.write(code)
             script_path = f.name
