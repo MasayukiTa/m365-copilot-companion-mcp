@@ -758,3 +758,74 @@ public static class AutoResumeView
         return ja ? "選択は次の監視サイクルから反映" : "selection applies from the next cycle";
     }
 }
+
+// The merge-conversation selector's words and parsing, WPF-free. KEPT AT THE END OF THE FILE on
+// purpose: shape tests slice this file from one view class to the end of the next, and a view
+// dropped between two of them has already broken one. The Python side decides:
+// relay/conversation_saving.py reads `merge_conversation` at every split and every merge and, only
+// for `parent`, continues the splitting worker's conversation in the merge instead of opening a
+// fresh aggregator conversation; relay/fleet_runner.py exports the state in force as status.json
+// "conversation_saving" {merge_conversation, aggregators_saved, unsent_created}. Default fresh.
+public static class MergeConversationView
+{
+    //: must equal tools/settings_keys.py and relay/conversation_saving.py MERGE_SETTING_KEY / _DEFAULT
+    //: (tests/test_conversation_saving.py compares them).
+    public const string Key = "merge_conversation";
+    public const string Default = "fresh";
+
+    public static readonly string[] Modes = { "fresh", "parent" };
+
+    public static bool IsMode(string v) { return v == "fresh" || v == "parent"; }
+
+    /// <summary>The mode named by one merge_conversation= line; null when the line is not that key
+    /// or the value is not fresh|parent (the caller keeps its value, fresh). A byte order mark is
+    /// tolerated and the value is case-insensitive, as in Python.</summary>
+    public static string ParseLine(string line)
+    {
+        if (line == null) return null;
+        string ln = line.TrimStart('﻿').Trim();
+        if (!ln.StartsWith(Key + "=", StringComparison.Ordinal)) return null;
+        string v = ln.Substring(Key.Length + 1).Trim().ToLowerInvariant();
+        return IsMode(v) ? v : null;
+    }
+
+    public static string Label(bool ja) { return ja ? "統合を実行する会話" : "Merge conversation"; }
+
+    public static string ModeLabel(string mode, bool ja)
+    {
+        if (mode == "fresh") return ja ? "新しい会話" : "Fresh";
+        if (mode == "parent") return ja ? "分割した会話" : "Parent";
+        return mode ?? "";
+    }
+
+    public static string Help(bool ja)
+    {
+        return ja ? "新しい会話=統合のたびに新しい会話を開きます(従来どおり)。分割した会話=分割を担当した会話の続きで統合し、会話を1つ節約します。統合は別の依頼として扱われ、確認や順序は変わりません。まず小さな依頼で確認してください。"
+                  : "Fresh opens a new conversation for every merge (as before). Parent runs the merge in the splitting worker's own conversation and saves one conversation per family; the merge is still its own job with the same checks and order. Verify with small goals first.";
+    }
+
+    public static string TakeEffectTip(bool ja)
+    {
+        return ja ? "次の分割・統合の判断から有効。再起動不要。"
+                  : "Applies to the next split or merge decision, no restart.";
+    }
+
+    /// <summary>The state the coordinator reports plus the savings so far; null when it reported
+    /// nothing usable.</summary>
+    public static string Describe(string reported, int saved, int unsent, bool ja)
+    {
+        if (!IsMode(reported)) return null;
+        string head = (ja ? "稼働中: " : "In effect: ") + ModeLabel(reported, ja);
+        head += ja ? " / 節約した統合会話 " + saved + " 件 / 未送信で終わった会話 " + unsent + " 件"
+                   : " / merge conversations saved " + saved + " / opened but never sent " + unsent;
+        return head;
+    }
+
+    /// <summary>The note shown when the state the runner reports differs from the selection (the
+    /// runner re-reads the key at its next split or merge); null when they agree.</summary>
+    public static string PendingText(string reported, string selected, bool ja)
+    {
+        if (!IsMode(reported) || reported == selected) return null;
+        return ja ? "選択は次の分割・統合から反映" : "selection applies from the next split or merge";
+    }
+}
