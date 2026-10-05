@@ -2454,8 +2454,8 @@ def _record_exchange_durably(sid, user_msg, final_text, sleep=time.sleep):
     came back."""
     with _CHAT_PERSIST_LOCK:
         _CHAT_PERSIST["asked"] += 1
-    user_text = _redact_unlock_password(user_msg or "")
-    assistant_text = _redact_unlock_password(final_text or "") if final_text else ""
+    user_text = _redact_unlock_password(user_msg)
+    assistant_text = _redact_unlock_password(final_text) if final_text else ""
     last = None
     for attempt in range(len(_PERSIST_RETRY_DELAYS) + 1):
         try:
