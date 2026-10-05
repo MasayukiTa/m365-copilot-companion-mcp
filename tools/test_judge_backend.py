@@ -20,39 +20,68 @@ def test_the_context_accessor_exists_where_this_module_expects_it():
     assert callable(get_context)
 
 
-def test_the_client_capabilities_this_module_uses_exist():
+def test_the_client_capability_this_module_uses_exists():
     import inspect
     from fastmcp import Context
-    for name in ("sample", "elicit"):
-        fn = getattr(Context, name, None)
-        assert fn is not None, "fastmcp.Context has no %s" % name
-        assert inspect.iscoroutinefunction(fn), (
-            "%s stopped being async; the thread bridge in judge_backend assumes it is" % name)
+    fn = getattr(Context, "elicit", None)
+    assert fn is not None, "fastmcp.Context has no elicit"
+    assert inspect.iscoroutinefunction(fn), (
+        "elicit stopped being async; the thread bridge in judge_backend assumes it is")
 
 
-def test_sample_still_takes_a_separate_system_prompt():
-    """The whole anti-injection property depends on the instructions and the payload
-    travelling in different fields. If this parameter goes away, concatenating them back
-    together is NOT the fix."""
-    import inspect
-    from fastmcp import Context
-    assert "system_prompt" in inspect.signature(Context.sample).parameters
+def test_the_sampling_backend_is_gone():
+    """fastmcp 4 removed Context.sample and production never ran sampling. Nothing in this
+    module may still offer it, or a caller could pick a judge that cannot answer."""
+    for name in ("sampling_judge", "sampling_judge_async", "sampling_supported", "_text_of"):
+        assert not hasattr(B, name), "%s should have been removed with Context.sample" % name
 
 
 # ── choosing a backend ────────────────────────────────────────────────────────────────────
 
-@pytest.mark.parametrize("val,expect_none", [
-    (None, True), ("", True), ("none", True), ("off", True),
-    ("nonsense", True),          # asked for a judge we do not have -> no judge, not a bypass
-    ("sampling", False),
-])
-def test_backend_selection(monkeypatch, val, expect_none):
+@pytest.fixture
+def _telemetry_in_tmp(monkeypatch, tmp_path):
+    """The one-time sampling warning writes a mechanism row; keep it out of the real .fleet."""
+    from relay import mechanism_telemetry as mt
+    monkeypatch.setattr(mt, "LOG", str(tmp_path / "mechanisms.jsonl"))
+    monkeypatch.setattr(B, "_SAMPLING_WARNED", False)
+    return mt
+
+
+@pytest.mark.parametrize("val", [None, "", "none", "off",
+                                 "nonsense",   # asked for a judge we do not have -> no judge, not a bypass
+                                 "sampling"])  # removed backend: degrades to no judge
+def test_backend_selection_gives_no_judge(monkeypatch, _telemetry_in_tmp, val):
     if val is None:
         monkeypatch.delenv(B.BACKEND_ENV, raising=False)
     else:
         monkeypatch.setenv(B.BACKEND_ENV, val)
-    got = B.get()
-    assert (got is None) is expect_none
+    assert B.get() is None
+
+
+def test_bridge_is_still_selectable(monkeypatch):
+    monkeypatch.setenv(B.BACKEND_ENV, "bridge")
+    assert B.get() is B.bridge_judge
+
+
+def test_a_configured_sampling_backend_warns_once_and_degrades_to_none(
+        monkeypatch, _telemetry_in_tmp, caplog):
+    """Safe degradation: still no judge (so REQUIRE_HUMAN, recorded in shadow), with exactly one
+    warning log line and one mechanism row however many commands are judged."""
+    import json
+    import logging
+    monkeypatch.setenv(B.BACKEND_ENV, "sampling")
+    with caplog.at_level(logging.WARNING, logger=B.__name__):
+        assert B.get() is None
+        assert B.get() is None
+        assert B.get() is None
+    assert len([r for r in caplog.records if "sampling" in r.getMessage()]) == 1
+    rows = [json.loads(line) for line in
+            open(_telemetry_in_tmp.LOG, encoding="utf-8").read().splitlines()]
+    assert [r["mechanism"] for r in rows] == ["judge_backend_sampling_removed"]
+    assert "judge_backend_sampling_removed" in _telemetry_in_tmp.MECHANISMS
+    out = J.judge_command({}, B.get())
+    assert out["decision"] == J.REQUIRE_HUMAN
+    assert B.availability()["sampling_backend_removed"] is True
 
 
 def test_the_default_is_no_judge():
@@ -68,16 +97,19 @@ def test_outside_a_request_there_is_no_context():
     assert B._context() is None
 
 
-def test_sampling_outside_a_request_raises_rather_than_returning_something():
+def test_bridge_outside_a_reachable_bridge_raises_rather_than_returning_something(monkeypatch):
     """It must RAISE. A backend that returned "" here would reach parse_verdict, which would
     also refuse -- but through a path that reads as "the model said nothing" rather than
     "there was no model", and those need different fixes."""
+    monkeypatch.setenv(B.BRIDGE_PORT_ENV, "1")      # nothing listens there
     with pytest.raises(B.JudgeTransportError):
-        B.sampling_judge('{"pending_command":"rm -rf /"}')
+        B.bridge_judge('{"pending_command":"rm -rf /"}')
 
 
 def test_a_raising_backend_becomes_require_human_not_allow():
-    out = J.judge_command({}, B.sampling_judge)
+    def _boom(_req):
+        raise B.JudgeTransportError("nobody to ask")
+    out = J.judge_command({}, _boom)
     assert out["decision"] == J.REQUIRE_HUMAN
     assert out["source"] == "unavailable"
 
@@ -92,8 +124,7 @@ def test_no_human_reachable_is_not_an_approval():
 def test_the_capability_types_this_module_names_are_real():
     """Same guard as the API-name tests above, for the same reason: a wrong name here is
     caught by an `except Exception` and reads as "the client cannot do it"."""
-    from mcp.types import ClientCapabilities, ElicitationCapability, SamplingCapability
-    assert ClientCapabilities(sampling=SamplingCapability()).sampling is not None
+    from mcp.types import ClientCapabilities, ElicitationCapability
     assert ClientCapabilities(elicitation=ElicitationCapability()).elicitation is not None
 
 
@@ -102,9 +133,8 @@ def test_the_session_check_exists():
     assert hasattr(ServerSession, "check_client_capability")
 
 
-@pytest.mark.parametrize("fn", [B.sampling_supported, B.elicitation_supported])
-def test_outside_a_request_nothing_is_supported(fn):
-    assert fn() is False
+def test_outside_a_request_nothing_is_supported():
+    assert B.elicitation_supported() is False
 
 
 def test_a_session_that_says_no_is_believed(monkeypatch):
@@ -112,7 +142,7 @@ def test_a_session_that_says_no_is_believed(monkeypatch):
         def check_client_capability(self, _c):
             return False
     monkeypatch.setattr(B, "_context", lambda: type("C", (), {"session": _S()})())
-    assert B.sampling_supported() is False
+    assert B.elicitation_supported() is False
     assert B.human_available() is False
 
 
@@ -121,7 +151,7 @@ def test_a_session_that_says_yes_is_believed(monkeypatch):
         def check_client_capability(self, _c):
             return True
     monkeypatch.setattr(B, "_context", lambda: type("C", (), {"session": _S()})())
-    assert B.sampling_supported() is True
+    assert B.elicitation_supported() is True
     assert B.human_available() is True
 
 
@@ -133,7 +163,6 @@ def test_a_session_that_raises_is_not_taken_as_yes(monkeypatch):
         def check_client_capability(self, _c):
             raise RuntimeError("older client")
     monkeypatch.setattr(B, "_context", lambda: type("C", (), {"session": _S()})())
-    assert B.sampling_supported() is False
     assert B.elicitation_supported() is False
     assert B.human_available() is False
 
@@ -146,16 +175,6 @@ def test_human_available_is_about_the_capability_not_about_being_in_a_request(mo
     assert B.human_available() is False
 
 
-def test_sampling_refuses_immediately_when_the_client_never_declared_it(monkeypatch):
-    """Otherwise every judged command pays the full timeout to learn something the handshake
-    already said."""
-    monkeypatch.setattr(B, "_context", lambda: type("C", (), {"session": None})())
-    monkeypatch.setattr(B, "sampling_supported", lambda: False)
-    with pytest.raises(B.JudgeTransportError) as exc:
-        B.sampling_judge("{}")
-    assert "sampling" in str(exc.value)
-
-
 def test_availability_separates_never_configured_from_cannot_run(monkeypatch):
     monkeypatch.delenv(B.BACKEND_ENV, raising=False)
     a = B.availability()
@@ -164,30 +183,10 @@ def test_availability_separates_never_configured_from_cannot_run(monkeypatch):
     monkeypatch.setenv(B.BACKEND_ENV, "sampling")
     b = B.availability()
     assert b["configured"] is True
-    assert b["client_sampling"] is False, "no request context -> the client can do nothing"
+    assert b["sampling_backend_removed"] is True, "a stale `sampling` setting must say so"
+    assert "client_sampling" not in b
     # The two states must be distinguishable, which is the whole point of the field.
     assert a != b
-
-
-# ── reading the client's answer ───────────────────────────────────────────────────────────
-
-class _Text:
-    def __init__(self, t):
-        self.text = t
-
-
-class _Nested:
-    def __init__(self, t):
-        self.content = _Text(t)
-
-
-@pytest.mark.parametrize("obj,want", [
-    (_Text('{"decision":"ALLOW"}'), '{"decision":"ALLOW"}'),
-    (_Nested('{"decision":"ALLOW"}'), '{"decision":"ALLOW"}'),
-    ("plain string", "plain string"),
-])
-def test_the_answer_text_is_found_whatever_shape_it_arrives_in(obj, want):
-    assert B._text_of(obj) == want
 
 
 # ── the human verdict, by result type ─────────────────────────────────────────────────────
@@ -218,6 +217,32 @@ def test_only_an_acceptance_is_an_approval(monkeypatch, cls, want):
     monkeypatch.setattr(B, "_context", lambda: object())
     monkeypatch.setattr(B, "_run_async", lambda fn, *a, **k: cls())
     assert B.ask_human("may I?") is want
+
+
+def test_an_accepted_answer_of_false_is_not_an_approval():
+    """fastmcp 4 asks the question as a bool confirmation (response_type=None is refused), so an
+    accepted `False` must read as a refusal."""
+    class AcceptedElicitation:
+        def __init__(self, data):
+            self.data = data
+    assert B._approval_of(AcceptedElicitation(True)) is True
+    assert B._approval_of(AcceptedElicitation(False)) is False
+
+
+def test_the_question_is_asked_with_a_response_type(monkeypatch):
+    """ctx.elicit() in fastmcp 4 raises TypeError without one; ask_human would swallow that and
+    answer None forever, so pin the argument."""
+    seen = {}
+
+    class _Ctx:
+        async def elicit(self, message, response_type=None, **kw):
+            seen["response_type"] = response_type
+            return type("AcceptedElicitation", (), {"data": True})()
+
+    monkeypatch.setattr(B, "_context", lambda: _Ctx())
+    monkeypatch.setattr(B, "_run_async", lambda fn, *a, **k: __import__("asyncio").run(fn()))
+    assert B.ask_human("may I?") is True
+    assert seen["response_type"] is bool
 
 
 def test_an_elicitation_that_throws_is_not_an_approval(monkeypatch):

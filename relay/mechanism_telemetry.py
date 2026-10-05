@@ -99,6 +99,9 @@ MECHANISMS = ("fanout", "refuter", "panel", "veto", "retry", "bestofn", "skill",
               # A lock refusal landed while several workers had a turn in flight and could not be
               # attributed to this one, so no unlock steer was sent (relay_fleet._looks_locked).
               "unlock_refusal_unattributed",
+              # MCP_JUDGE_BACKEND=sampling was configured but the backend is gone (fastmcp 4
+              # removed Context.sample); one row per process (tools/judge_backend.py).
+              "judge_backend_sampling_removed",
               # The bridge's tool-call probe failed (or a probe turn never ran) and the next one
               # was pushed back (interval x 2^failures, capped) instead of re-asked at once.
               # One row per backed-off probe (bridge/copilot_bridge.py _record_probe_backoff).
