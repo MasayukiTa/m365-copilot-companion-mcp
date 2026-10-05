@@ -84,9 +84,12 @@
   - Cockpit exe: rebuilt by `ui/rebuild_ui.ps1`; the running exe is the old build until restarted.
   - `devtunnel host`: not our code.
 
-- SAFE RESTART PROCEDURE for a supervisor that predates this change (the live one, pid 26560, cannot
-  restart itself because it does not contain this code). Do it AFTER the merge is pulled into the live
-  checkout (`<repo>` = the live checkout root).
+- UPDATE 2026-10-05 20:44: the live supervisor that predated this change (the old pid) was already
+  replaced by hand and is up to date, so the procedure below is no longer needed for it. It is kept as the
+  manual path for any supervisor that predates this change (such a supervisor cannot restart itself
+  because it does not contain this code).
+- SAFE RESTART PROCEDURE for a supervisor that predates this change. Do it AFTER the merge is pulled into
+  the live checkout (`<repo>` = the live checkout root).
   1. Preconditions, all read-only, in this order; any "no" means wait:
      a. No coordinator: no process whose command line matches `relay[\\/.]fleet_runner` and `<repo>`.
      b. No resume in flight: `.fleet\resume_launch.json` absent or older than 10 minutes.
@@ -100,7 +103,7 @@
   2. Start the helper FIRST (it waits for the old pid, then starts the new supervisor and retries):
      `Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','"<repo>\scripts\supervisor_handoff.ps1"','-OldPid','26560','-TunnelName','"<tunnel name from the old command line>"'`
   3. Then stop ONLY the old supervisor, after confirming its command line names `<repo>\scripts\supervisor.ps1`:
-     `Stop-Process -Id 26560`. Do not touch the server, devtunnel host, bridge or keepalive.
+     `Stop-Process -Id <old pid>`. Do not touch the server, devtunnel host, bridge or keepalive.
   4. Verify within about a minute: the log (`%TEMP%\m365-companion-supervisor.log`) has "[handoff] new
      supervisor started" and a new "supervisor up" line; `.fleet\supervisor_state.json` has a pid other
      than 26560 and `supervisor.stale` false; the old pid is gone; `/health` still reports the same
