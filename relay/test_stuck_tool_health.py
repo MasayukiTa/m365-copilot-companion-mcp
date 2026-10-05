@@ -109,8 +109,10 @@ def test_stuck_still_retries_when_tool_healthy(monkeypatch):
 def test_tool_health_stale_probe_is_not_trusted(monkeypatch):
     """A probe result that is 'ok' but OLDER than STUCK_TOOL_HEALTH_MAX_AGE_S must NOT be
     treated as current proof the tool path works -- it must be terminal (keep_retrying=False),
-    matching the module's threshold of 1800s (3x the bridge's default 600s probe cadence)."""
-    assert STUCK_TOOL_HEALTH_MAX_AGE_S == 1800.0
+    matching the module's threshold: 3x the CONFIGURED probe interval (30 min by default since
+    the probe became idle-only, so 5400s), never below the old 1800s."""
+    assert STUCK_TOOL_HEALTH_MAX_AGE_S == max(1800.0, 3.0 * tool_probe.configured_interval_s())
+    assert STUCK_TOOL_HEALTH_MAX_AGE_S >= 1800.0
     monkeypatch.setattr(tool_probe, "get_summary", _stale_ok_summary)
     keep_retrying, detail = _tool_health_for_stuck()
     assert keep_retrying is False
