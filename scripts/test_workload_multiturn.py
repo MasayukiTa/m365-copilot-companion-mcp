@@ -305,7 +305,8 @@ def test_no_tracked_file_carries_a_banned_identifier():
             continue
         p = root / rel
         try:
-            if not p.is_file() or p.stat().st_size > 2_000_000:
+            # NO SIZE SKIP: a banned identifier in a tracked file past 2 MB used to go unseen.
+            if not p.is_file():
                 continue
             text = p.read_text(encoding="utf-8", errors="ignore")
         except Exception:

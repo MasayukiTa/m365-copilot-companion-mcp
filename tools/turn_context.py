@@ -202,11 +202,37 @@ def _windows():
         st = os.stat(path)
     except OSError:
         return []
-    key = (st.st_mtime_ns, st.st_size)
+    # JUST AFTER A ROTATION the live file is nearly empty and the turns that were open at that
+    # moment sit in `.1`: reading only the live tail lost every open window (no attribution)
+    # until the file refilled. When the live file is shorter than the tail window, the rest of
+    # the window comes from the end of `.1`.
+    prev = path + ".1"
+    prev_st = None
+    if st.st_size < READ_TAIL_BYTES:
+        try:
+            prev_st = os.stat(prev)
+        except OSError:
+            prev_st = None
+    key = (st.st_mtime_ns, st.st_size,
+           (prev_st.st_mtime_ns, prev_st.st_size) if prev_st else None)
     with _LOCK:
         if _CACHE["key"] == key and _CACHE["path"] == path:
             return _CACHE["windows"]
     rows = []
+    try:
+        if prev_st is not None:
+            with open(prev, "rb") as fh:
+                room = READ_TAIL_BYTES - st.st_size
+                if prev_st.st_size > room:
+                    fh.seek(prev_st.st_size - room)
+                    fh.readline()
+                for raw in fh:
+                    try:
+                        rows.append(json.loads(raw.decode("utf-8", "replace")))
+                    except ValueError:
+                        continue
+    except OSError:
+        rows = []
     try:
         with open(path, "rb") as fh:
             if st.st_size > READ_TAIL_BYTES:
