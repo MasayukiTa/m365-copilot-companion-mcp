@@ -18,7 +18,7 @@ Do not postpone this integration step when the current work is specifically abou
 ## Temporary files: one swept home
 
 Everything temporary that this product or an agent creates goes under `%TEMP%\m365-companion\`
-(`relay/temp_home.py`: `temp_home()`, `temp_dir(name)`). `relay/fleet_retention.py` (`temp_home`,
+(`relay/temp_home.py`: `temp_home()`, `temp_dir(name)`). `relay/fleet_retention.py` (`sweep_temp_home`,
 run by `apply()`) deletes entries there that have had no write for 24 hours (override with the
 env var `MCP_TEMP_HOME_MAX_AGE_H`). Nothing else in `%TEMP%` is ever swept.
 

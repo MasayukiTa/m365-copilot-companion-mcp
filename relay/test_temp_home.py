@@ -99,7 +99,7 @@ def test_only_old_entries_under_the_home_are_removed(root):
     old = _file(str(home / "old.txt"), age_h=30, now=now)
     new = _file(str(home / "new.txt"), age_h=1, now=now)
     olddir = _file(str(home / "agents" / "a" / "x.bin"), age_h=48, now=now)
-    freed, items = R.temp_home(now=now, temp_root=str(root))
+    freed, items = R.sweep_temp_home(now=now, temp_root=str(root))
     assert not os.path.exists(old)
     assert os.path.exists(new)
     assert not os.path.exists(str(home / "agents"))
@@ -113,7 +113,7 @@ def test_a_directory_with_one_recent_file_inside_is_kept_whole(root):
     _file(str(home / "venv" / "lib" / "old.py"), age_h=100, now=now)
     keep = _file(str(home / "venv" / "lib" / "fresh.py"), age_h=1, now=now)
     _age_dir(str(home / "venv"), 100, now)
-    R.temp_home(now=now, temp_root=str(root))
+    R.sweep_temp_home(now=now, temp_root=str(root))
     assert os.path.exists(keep)
     assert os.path.exists(str(home / "venv" / "lib" / "old.py"))
 
@@ -131,7 +131,7 @@ def test_siblings_and_lookalikes_outside_the_home_are_never_touched(root):
         _file(str(root / "playwright-artifacts-keepme" / "trace.zip"), age_h=999, now=now),
         _file(str(root / "playwright-artifactsX"), age_h=999, now=now),
     ]
-    freed, items = R.temp_home(now=now, temp_root=str(root))
+    freed, items = R.sweep_temp_home(now=now, temp_root=str(root))
     assert items == [] and freed == 0
     assert all(os.path.exists(p) for p in keep)
 
@@ -140,7 +140,7 @@ def test_pasted_images_are_swept_by_exact_name_and_age(root):
     now = time.time()
     old = _file(str(root / "copilot_paste_0123abcd.png"), age_h=30, now=now)
     new = _file(str(root / "copilot_paste_89abcdef.png"), age_h=2, now=now)
-    freed, items = R.temp_home(now=now, temp_root=str(root))
+    freed, items = R.sweep_temp_home(now=now, temp_root=str(root))
     assert not os.path.exists(old) and os.path.exists(new)
     assert items == [old] and freed == 32
 
@@ -157,7 +157,7 @@ def test_playwright_artifacts_only_when_empty_and_old(root):
     full_old.mkdir()
     _file(str(full_old / "video.webm"), age_h=900, now=now)
     _age_dir(str(full_old), 900, now)
-    R.temp_home(now=now, temp_root=str(root))
+    R.sweep_temp_home(now=now, temp_root=str(root))
     assert not empty_old.exists()
     assert empty_new.exists() and full_old.exists()
     assert (full_old / "video.webm").exists()
@@ -166,9 +166,9 @@ def test_playwright_artifacts_only_when_empty_and_old(root):
 def test_the_age_limit_is_a_parameter(root):
     now = time.time()
     p = _file(str(root / "m365-companion" / "f"), age_h=3, now=now)
-    R.temp_home(now=now, temp_root=str(root))
+    R.sweep_temp_home(now=now, temp_root=str(root))
     assert os.path.exists(p)
-    R.temp_home(now=now, temp_root=str(root), max_age_h=2)
+    R.sweep_temp_home(now=now, temp_root=str(root), max_age_h=2)
     assert not os.path.exists(p)
 
 
@@ -179,14 +179,14 @@ def test_dry_run_reports_and_removes_nothing(root):
     e = root / "playwright-artifacts-x1"
     e.mkdir()
     _age_dir(str(e), 50, now)
-    freed, items = R.temp_home(now=now, dry_run=True, temp_root=str(root))
+    freed, items = R.sweep_temp_home(now=now, dry_run=True, temp_root=str(root))
     assert len(items) == 3 and freed == 64
     assert os.path.exists(a) and os.path.exists(b) and e.exists()
 
 
 def test_a_missing_home_or_temp_root_is_not_an_error(tmp_path):
-    assert R.temp_home(temp_root=str(tmp_path / "nowhere")) == (0, [])
-    assert R.temp_home(temp_root=str(tmp_path)) == (0, [])
+    assert R.sweep_temp_home(temp_root=str(tmp_path / "nowhere")) == (0, [])
+    assert R.sweep_temp_home(temp_root=str(tmp_path)) == (0, [])
 
 
 # -- the sweep: how safely it removes --------------------------------------------------------
@@ -205,7 +205,7 @@ def test_a_locked_file_is_skipped_without_failing(monkeypatch, root):
         return real_remove(path, *a, **k)
 
     monkeypatch.setattr(R.os, "remove", fake_remove)
-    freed, items = R.temp_home(now=now, temp_root=str(root))   # must not raise
+    freed, items = R.sweep_temp_home(now=now, temp_root=str(root))   # must not raise
     assert os.path.exists(locked), "a locked file must survive"
     assert not os.path.exists(other) and not os.path.exists(plain)
     assert os.path.isdir(os.path.dirname(locked)), "its directory cannot go while it is there"
@@ -215,7 +215,7 @@ def test_an_unexpected_error_never_reaches_the_caller(monkeypatch, root):
     def boom(*a, **k):
         raise RuntimeError("scandir exploded")
     monkeypatch.setattr(R.os, "scandir", boom)
-    assert R.temp_home(temp_root=str(root)) == (0, [])
+    assert R.sweep_temp_home(temp_root=str(root)) == (0, [])
 
 
 def test_a_link_inside_the_home_is_removed_as_a_link_and_never_followed(root, tmp_path):
@@ -232,7 +232,7 @@ def test_a_link_inside_the_home_is_removed_as_a_link_and_never_followed(root, tm
             and _mklink_dir(str(home / "top_link"), str(outside))):
         pytest.skip("neither symlinks nor junctions can be created here")
     _age_dir(str(d), 60, now)
-    R.temp_home(now=now, temp_root=str(root))
+    R.sweep_temp_home(now=now, temp_root=str(root))
     assert os.path.exists(precious), "the sweep followed a link out of the home"
     assert not os.path.lexists(str(d / "nested_link"))
 
@@ -243,7 +243,7 @@ def test_a_linked_home_is_not_swept(root, tmp_path):
     victim = _file(str(real / "old.txt"), age_h=999, now=now)
     if not _mklink_dir(str(root / "m365-companion"), str(real)):
         pytest.skip("neither symlinks nor junctions can be created here")
-    R.temp_home(now=now, temp_root=str(root))
+    R.sweep_temp_home(now=now, temp_root=str(root))
     assert os.path.exists(victim)
 
 
