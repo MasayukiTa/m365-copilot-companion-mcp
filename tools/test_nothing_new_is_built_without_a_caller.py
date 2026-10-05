@@ -115,7 +115,6 @@ NO_CALLER_BUT_TESTED = {
     "bridge/session_store.py::search_turns",                     # 26 lines
     "tools/tool_probe.py::classify_probe_reply",                 # 26 lines
     "relay/selfimprove/trace_to_eval.py::record_correction",     # 25 lines
-    "tools/judge_backend.py::sampling_judge_async",              # 24 lines
     "relay/selfimprove/harness_tree.py::justified",              # 17 lines
     "bench/companionbench/runner.py::solver_feedback_entries",   # 15 lines
     "relay/project_memory.py::list_themes",                      # 15 lines
@@ -347,7 +346,6 @@ REASONS: dict[str, tuple[str, str]] = {
     "tools/tool_probe.py::verify_probe_reply": ("deliberate", "docs/unreached_burndown.md"),
     "tools/tool_probe.py::classify_probe_reply": ("deliberate", "docs/unreached_burndown.md"),
     "tools/tool_probe.py::next_probe_instruction": ("deliberate", "docs/unreached_burndown.md"),
-    "tools/judge_backend.py::sampling_judge_async": ("deliberate", "docs/unreached_burndown.md"),
     "tools/judge_backend.py::ask_human_async": ("deliberate", "docs/unreached_burndown.md"),
     "tools/security.py::clear_presented_token": ("deliberate", "docs/unreached_burndown.md"),
     "tools/security.py::is_unlocked": ("deliberate", "docs/unreached_burndown.md"),
