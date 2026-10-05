@@ -847,6 +847,12 @@ class CockpitWindow : Window
     string _arVal = AutoResumeView.Default;
     ComboBox _arBox;
     TextBlock _arLbl, _arNow, _arPending;
+    // tool-call check interval 0|15|30|60 minutes -> settings.txt tool_probe_idle_min ; absent key = 30
+    string _tpVal = ToolProbeView.Default;
+    ComboBox _tpBox;
+    TextBlock _tpLbl, _tpNow, _tpPending;
+    double _tpStateMtimeTicks = -1;          // the state file is re-read only when it changed
+    Dictionary<string, object> _tpState;     // .fleet/tool_probe_state.json as last read (null = none)
     string _approval = "run";  // approval mode run|plan|auto -> settings.txt approval=
     string _runtimeMode = "fleet"; // next launch: fleet | durable -> settings.txt runtime=
     bool _durableEnqueuePending = false; // one durable campaign intake process at a time
@@ -1888,6 +1894,11 @@ class CockpitWindow : Window
                 {
                     string arv = AutoResumeView.ParseLine(ln);   // off|on only; junk keeps the value
                     if (arv != null) _arVal = arv;
+                }
+                else if (ln.StartsWith("tool_probe_idle_min="))
+                {
+                    string tpv = ToolProbeView.ParseLine(ln);   // 0|15|30|60 only; junk keeps the value
+                    if (tpv != null) _tpVal = tpv;
                 }
                 else if (ln.StartsWith("merge_conversation="))
                 {
@@ -4075,9 +4086,12 @@ class CockpitWindow : Window
     //   GRAY  -- file has never existed (probe disabled / MCP_TOOL_PROBE_SEC=0 on this machine).
     //            Deliberately NOT red: a new/unconfigured feature must never read as an outage.
     //   RED   -- file missing after having looked (can't happen here since we check Exists first,
-    //            kept as a safety fallback) OR stale (>20 min since ts -- the probe itself isn't
-    //            running) OR the probe failed with nothing coming back at all.
-    //   GREEN -- ok==true AND fresh (<20 min old).
+    //            kept as a safety fallback) OR stale (older than the configured probe interval + 10
+    //            min, at least 20 -- ToolProbeStaleAfterMin; the probe itself isn't running) OR the
+    //            probe failed with nothing coming back at all.
+    //   GREEN -- ok==true AND fresh. ok may now come from a REAL tool call instead of a probe
+    //            (record kind "answer" with "evidence":"real_call", at that call's own time).
+    //   GRAY  -- also when the bridge reports the probe switched off (tool_probe_idle_min=0).
     //   YELLOW-- consent_card/canned_fallback, or the probe failed while "alive" says a reply
     //            DID arrive. Red is reserved for silence: a failed probe on a chat that is
     //            answering normally used to paint this dot red, and a red dot is read as
@@ -4092,7 +4106,7 @@ class CockpitWindow : Window
             // and grey means "no evidence expected" -- so two of those three were reported as
             // nothing to see. The setting is readable, so the three can be told apart.
             string probeSec = EnvValue("MCP_TOOL_PROBE_SEC");
-            bool disabled = probeSec == "0";
+            bool disabled = probeSec == "0" || ToolProbeReportedOff();
             SetDot(5, disabled ? HealthState.Gray : HealthState.Yellow,
                    T(disabled ? "hs_tool_detail_none" : "hs_tool_detail_never"), now);
             return;
@@ -4157,7 +4171,15 @@ class CockpitWindow : Window
                 // The bridge can call tools and the fleet cannot. Green here would hide the
                 // failure of the path that does the work.
                 SetDot(5, HealthState.Yellow, ageTxt + " " + T("hs_tool_detail_fleet_down"), now);
-            else if (ageMin >= 20.0)
+            else if (ToolProbeReportedOff())
+                // SWITCHED OFF IN THE SETTINGS (or by the environment): nothing is measured, so
+                // nothing is claimed. Not green (no event behind it) and not red (nothing broke):
+                // an old record from before it was switched off must not read as a stale outage.
+                SetDot(5, HealthState.Gray, T("hs_tool_detail_none"), now);
+            else if (ageMin >= ToolProbeStaleAfterMin())
+                // How long a green check stays valid FOLLOWS THE CONFIGURED INTERVAL (interval +
+                // 10 min, never under the 20 min it always was): with the probe idle-only at 30
+                // min a fixed 20 would paint a healthy, idle machine red between probes.
                 SetDot(5, HealthState.Red, ageTxt + " " + T("hs_tool_detail_stale"), now);
             else if (kind == "checking" || kind == "starting")
                 // A record written by an older prober, which still overwrote the verdict.
@@ -4184,6 +4206,31 @@ class CockpitWindow : Window
             // since the file DOES exist (the feature is active, just unreadable right now).
             SetDot(5, HealthState.Red, T("hs_tool_detail_down"), now);
         }
+    }
+
+    // The bridge's own account of its probe cadence, read on the poll thread (a fresh small parse;
+    // the settings-popup copy is cached separately). Null = no report / old bridge / unreadable.
+    Dictionary<string, object> ToolProbeStateForHealth()
+    {
+        try
+        {
+            string path = Path.Combine(RepoRoot(), ".fleet", "tool_probe_state.json");
+            if (!File.Exists(path)) return null;
+            return _js.DeserializeObject(File.ReadAllText(path, Encoding.UTF8)) as Dictionary<string, object>;
+        }
+        catch (Exception) { return null; }
+    }
+    // True when the bridge says the probe is off (setting 0 or MCP_TOOL_PROBE_SEC<=0).
+    bool ToolProbeReportedOff()
+    {
+        var st = ToolProbeStateForHealth();
+        return st != null && st.ContainsKey("enabled") && st["enabled"] != null
+               && !Convert.ToBoolean(st["enabled"]);
+    }
+    double ToolProbeStaleAfterMin()
+    {
+        var st = ToolProbeStateForHealth();
+        return ToolProbeView.StaleAfterMin(st != null ? Dbl(st, "interval_min") : 0.0);
     }
 
     // "N分前" / "N min ago" -- small formatter local to the Tool dot's tooltip; not routed through
@@ -7850,6 +7897,7 @@ class CockpitWindow : Window
             case "ram_floor_mb":
             case "maxtabs":
                 return "live";
+            case "tool_probe_idle_min":
             case "merge_conversation":
             case "fanout_hierarchical_merge":
             case "fleet_auto_resume":
@@ -8344,6 +8392,8 @@ class CockpitWindow : Window
         col.Children.Add(SectionHeader(L("復旧 / Recovery", "Recovery")));
         col.Children.Add(AutoResumeControl());
         PaintAutoResumeInEffect(_lastRoot);
+        col.Children.Add(ToolProbeControl());
+        PaintToolProbeInEffect();
 
         // THE RE-UNLOCK CONTROL WAS REMOVED HERE, DELIBERATELY, AND MUST NOT COME BACK.
         //
@@ -9286,6 +9336,7 @@ class CockpitWindow : Window
         PaintMergeConversation();
         PaintWriteScope();
         PaintAutoResume();
+        PaintToolProbe();
     }
     // What the COORDINATOR says it was started with (status.json "fanout_run"), beside the combo.
     // No report (old runner, no run yet) -> nothing shown, never a guess from the combo.
@@ -9800,6 +9851,96 @@ class CockpitWindow : Window
         _arPending.Text = pend ?? "";
         _arPending.Foreground = Theme.Br(Theme.Warning(_dark));
         _arPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
+    }
+    // Tool-call check interval (0|15|30|60 min), in the Recovery section. Persists through SaveKey
+    // only; the bridge re-reads the key about every 5 minutes (each_gate). What is IN EFFECT comes
+    // from the bridge's own account (.fleet/tool_probe_state.json, the same dict as its /status
+    // "probe"); the words and parsing live in ToolProbeView (EffortPolicy.cs).
+    UIElement ToolProbeControl()
+    {
+        _tpLbl = new TextBlock(); _tpLbl.VerticalAlignment = VerticalAlignment.Center;
+        _tpLbl.FontSize = 12;
+
+        _tpBox = new ComboBox();
+        _tpBox.ToolTip = ToolProbeView.Help(_lang == 0) + "\n" + ToolProbeView.TakeEffectTip(_lang == 0);
+        _tpBox.Cursor = Cursors.Hand; _tpBox.FontSize = 12;
+        _tpBox.FontWeight = FontWeights.SemiBold; _tpBox.MinWidth = 64;
+        _tpBox.Padding = new Thickness(8, 2, 4, 2);
+        _tpBox.VerticalAlignment = VerticalAlignment.Center;
+        var tpHelp = new Dictionary<string, string>();
+        foreach (string m in ToolProbeView.Choices) tpHelp[m] = ToolProbeView.ChoiceLabel(m, _lang == 0);
+        FillComboWithHelp(_tpBox, ToolProbeView.Choices, tpHelp, _tpVal);
+        _tpBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _tpBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_tpBox);
+            if (!ToolProbeView.IsChoice(sel) || sel == _tpVal) return;   // unchanged -> no write, no re-fire
+            _tpVal = sel;
+            SaveKey(ToolProbeView.Key, _tpVal);
+            PaintToolProbeInEffect();
+        };
+
+        _tpNow = new TextBlock(); _tpNow.VerticalAlignment = VerticalAlignment.Center;
+        _tpNow.FontSize = 11.5; _tpNow.TextWrapping = TextWrapping.Wrap; _tpNow.MaxWidth = 300;
+        _tpPending = new TextBlock(); _tpPending.VerticalAlignment = VerticalAlignment.Center;
+        _tpPending.FontSize = 11.5; _tpPending.FontWeight = FontWeights.SemiBold;
+        _tpPending.Visibility = Visibility.Collapsed;
+
+        var wrap = SettingsComboBlock(_tpLbl, _tpBox, _tpNow, _tpPending);
+        PaintToolProbe();
+        return wrap;
+    }
+    void PaintToolProbe()
+    {
+        if (_tpLbl != null) { _tpLbl.Text = ToolProbeView.Label(_lang == 0); _tpLbl.Foreground = Muted; }
+        if (_tpBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_tpBox), _tpVal)) ComboSelectVal(_tpBox, _tpVal);
+        _tpBox.ToolTip = ToolProbeView.Help(_lang == 0) + "\n" + ToolProbeView.TakeEffectTip(_lang == 0);
+        _tpBox.Background = BtnBg; _tpBox.Foreground = Fg; _tpBox.BorderBrush = Border;
+        StyleFlatCombo(_tpBox);
+        PaintToolProbeInEffect();
+    }
+    // The bridge's decision state, re-read only when the file changed. No report (old bridge, no
+    // bridge yet) -> null, and the screen shows nothing rather than a guess from the selection.
+    Dictionary<string, object> ReadToolProbeState()
+    {
+        try
+        {
+            string path = Path.Combine(RepoRoot(), ".fleet", "tool_probe_state.json");
+            if (!File.Exists(path)) { _tpState = null; _tpStateMtimeTicks = -1; return null; }
+            double ticks = (double)File.GetLastWriteTimeUtc(path).Ticks;
+            if (ticks != _tpStateMtimeTicks)
+            {
+                _tpState = _js.DeserializeObject(File.ReadAllText(path, Encoding.UTF8)) as Dictionary<string, object>;
+                _tpStateMtimeTicks = ticks;
+            }
+            return _tpState;
+        }
+        catch (Exception) { return null; }   // mid-write or unreadable: show nothing this time
+    }
+    void PaintToolProbeInEffect()
+    {
+        if (_tpNow == null || _tpPending == null) return;
+        bool ja = _lang == 0;
+        string now = null, pend = null;
+        Dictionary<string, object> st = ReadToolProbeState();
+        if (st != null && st.ContainsKey("enabled") && st["enabled"] != null)
+        {
+            bool enabled = Convert.ToBoolean(st["enabled"]);
+            double iv = Dbl(st, "interval_min");
+            string src = S(st, "source");
+            now = ToolProbeView.Describe(true, enabled, iv, src, Dbl(st, "last_sent"), S(st, "last_skipped_reason"),
+                                         Dbl(st, "last_skipped_ts"), I(st, "skipped_since_start"), Dbl(st, "evidence_ts"),
+                                         I(st, "backoff_failures"), NowUnix(), ja);
+            pend = ToolProbeView.PendingText(true, enabled, iv, src, _tpVal, ja);
+        }
+        _tpNow.Text = now ?? "";
+        _tpNow.Foreground = Muted;
+        _tpNow.Visibility = now != null ? Visibility.Visible : Visibility.Collapsed;
+        _tpPending.Text = pend ?? "";
+        _tpPending.Foreground = Theme.Br(Theme.Warning(_dark));
+        _tpPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
     }
     void PaintEffort()
     {
@@ -12532,6 +12673,7 @@ class CockpitWindow : Window
         PaintMergeConversationInEffect(root);   // the merge-conversation state and the savings so far
         PaintWriteScopeInEffect(root);     // the sibling write-scope mode the coordinator applies
         PaintAutoResumeInEffect(root);     // the auto-resume setting and the gate's last decision
+        PaintToolProbeInEffect();          // why the tool-call check did or did not send a message
         // Preserve scroll position across the rebuild. Without this, every worker update
         // (status/turn change) reset the list and snapped the view back to the TOP -- which is
         // exactly why scrolling "didn't work" while tasks were live: the user scrolled down, a

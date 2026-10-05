@@ -116,6 +116,11 @@ def _reader_auto_resume():
     return auto_resume_setting()
 
 
+def _reader_tool_probe_idle_min():
+    from tools.tool_probe import idle_min_setting
+    return idle_min_setting()
+
+
 def _reader_merge_conversation():
     from relay.conversation_saving import merge_conversation_setting
     return merge_conversation_setting()
@@ -142,6 +147,7 @@ _LIVE_READERS = {
     "fanout_hierarchical_merge": (_reader_hierarchical_merge, "on", "off"),
     "fanout_write_scope": (_reader_write_scope, "shadow", "off"),
     "fleet_auto_resume": (_reader_auto_resume, "off", "on"),
+    "tool_probe_idle_min": (_reader_tool_probe_idle_min, "15", "60"),
     "merge_conversation": (_reader_merge_conversation, "parent", "fresh"),
     "fanout_max_total": (_fanout_limit_reader("total"), "10", "30"),
     "fanout_max_active": (_fanout_limit_reader("active"), "2", "6"),
