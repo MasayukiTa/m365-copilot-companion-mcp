@@ -555,7 +555,11 @@ class Conversation:
         #: absence as "no socket route", not as "try anyway".
         self.template = template
         self.session_id = str(uuid.uuid4())
-        self.conversation_id = str(uuid.uuid4())
+        #: LAZY. The id is minted by the first read that needs it (the wire, in `ask`), not by
+        #: constructing the object: a conversation that is built and never spoken in must not
+        #: carry an id that a transcript, a ledger row or a resume could mistake for a real one
+        #: (467 such ids were counted in one burst on 2026-09-30). See `peek_conversation_id`.
+        self._conversation_id = ""
         #: One key per CONNECTION, not per conversation. The client sends a single value
         #: across chatsessionid, clientrequestid and XRoutingParameterSessionKey, and mints a
         #: fresh one every time it opens a socket -- captured over two consecutive messages in
@@ -577,6 +581,23 @@ class Conversation:
         #: refused (InvalidRequest) and only recovered once the socket had been dropped.
         #: Continuity lives in the conversation id, not in the wire.
         self._sock = None
+
+    @property
+    def conversation_id(self) -> str:
+        """The id the wire carries. Minted on first use, so the first message creates the
+        conversation in the same call that sends it."""
+        if not self._conversation_id:
+            self._conversation_id = str(uuid.uuid4())
+        return self._conversation_id
+
+    @conversation_id.setter
+    def conversation_id(self, value) -> None:
+        self._conversation_id = str(value or "")
+
+    def peek_conversation_id(self) -> str:
+        """The id if one exists, else "" -- WITHOUT creating it. What recorders ask, so that
+        looking at a conversation that never sent anything does not bring it into being."""
+        return self._conversation_id
 
     def headers(self) -> dict:
         h = {}

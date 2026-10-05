@@ -837,6 +837,10 @@ class CockpitWindow : Window
     string _hmVal = HierarchicalMergeView.Default;
     ComboBox _hmBox;
     TextBlock _hmLbl, _hmNow, _hmPending;
+    // merge conversation fresh|parent -> settings.txt merge_conversation ; absent key = fresh
+    string _mcVal = MergeConversationView.Default;
+    ComboBox _mcBox;
+    TextBlock _mcLbl, _mcNow, _mcPending;
     ComboBox _wsBox;
     TextBlock _wsLbl, _wsNow, _wsPending;
     // auto-resume of an interrupted run off|on -> settings.txt fleet_auto_resume ; absent key = on
@@ -1895,6 +1899,11 @@ class CockpitWindow : Window
                 {
                     string tpv = ToolProbeView.ParseLine(ln);   // 0|15|30|60 only; junk keeps the value
                     if (tpv != null) _tpVal = tpv;
+                }
+                else if (ln.StartsWith("merge_conversation="))
+                {
+                    string mcv = MergeConversationView.ParseLine(ln);   // fresh|parent only; junk keeps the value
+                    if (mcv != null) _mcVal = mcv;
                 }
                 else if (ln.StartsWith("fanout_hierarchical_merge="))
                 {
@@ -7889,6 +7898,7 @@ class CockpitWindow : Window
             case "maxtabs":
                 return "live";
             case "tool_probe_idle_min":
+            case "merge_conversation":
             case "fanout_hierarchical_merge":
             case "fleet_auto_resume":
             case "rate_ceiling_rpm":
@@ -8369,11 +8379,13 @@ class CockpitWindow : Window
         col.Children.Add(HierarchicalMergeControl());
         col.Children.Add(WriteScopeControl());
         col.Children.Add(FanoutBudgetControl());
+        col.Children.Add(MergeConversationControl());
         // the controls' Paint* run on every build, but fill the "in effect" lines from the
         // latest status.json too, so a freshly opened popup is never blank until the next tick
         PaintEffortPolicyInEffect(_lastRoot); PaintFanoutInEffect(_lastRoot);
         PaintFanoutBudgetInEffect(_lastRoot); PaintFanoutDepthInEffect(_lastRoot);
         PaintHierarchicalMergeInEffect(_lastRoot); PaintWriteScopeInEffect(_lastRoot);
+        PaintMergeConversationInEffect(_lastRoot);
 
         // ── Recovery / 復旧: what happens to a run whose coordinator died. One control for now;
         // like the fan-out ones it lives in this popup, never in the header.
@@ -9321,6 +9333,7 @@ class CockpitWindow : Window
         PaintFanoutBudget();
         PaintFanoutDepth();
         PaintHierarchicalMerge();
+        PaintMergeConversation();
         PaintWriteScope();
         PaintAutoResume();
         PaintToolProbe();
@@ -9622,6 +9635,78 @@ class CockpitWindow : Window
         _hmPending.Text = pend ?? "";
         _hmPending.Foreground = Theme.Br(Theme.Warning(_dark));
         _hmPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
+    }
+    // Merge conversation (fresh|parent), in the Fan-out section. Persists through SaveKey only; the
+    // runner re-reads the key at every split and every merge (each_gate). Parent runs the merge in
+    // the splitting worker's own conversation; what is IN EFFECT, and the savings so far, come from
+    // status.json "conversation_saving". The words and parsing live in MergeConversationView.
+    UIElement MergeConversationControl()
+    {
+        _mcLbl = new TextBlock(); _mcLbl.VerticalAlignment = VerticalAlignment.Center;
+        _mcLbl.FontSize = 12;
+
+        _mcBox = new ComboBox();
+        _mcBox.ToolTip = MergeConversationView.Help(_lang == 0) + "\n" + MergeConversationView.TakeEffectTip(_lang == 0);
+        _mcBox.Cursor = Cursors.Hand; _mcBox.FontSize = 12;
+        _mcBox.FontWeight = FontWeights.SemiBold; _mcBox.MinWidth = 64;
+        _mcBox.Padding = new Thickness(8, 2, 4, 2);
+        _mcBox.VerticalAlignment = VerticalAlignment.Center;
+        var mcHelp = new Dictionary<string, string>();
+        foreach (string m in MergeConversationView.Modes) mcHelp[m] = MergeConversationView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_mcBox, MergeConversationView.Modes, mcHelp, _mcVal);
+        _mcBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _mcBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_mcBox);
+            if (!MergeConversationView.IsMode(sel) || sel == _mcVal) return;   // unchanged -> no write, no re-fire
+            _mcVal = sel;
+            SaveKey(MergeConversationView.Key, _mcVal);
+            PaintMergeConversationInEffect(_lastRoot);
+        };
+
+        _mcNow = new TextBlock(); _mcNow.VerticalAlignment = VerticalAlignment.Center;
+        _mcNow.FontSize = 11.5; _mcNow.TextWrapping = TextWrapping.Wrap; _mcNow.MaxWidth = 300;
+        _mcPending = new TextBlock(); _mcPending.VerticalAlignment = VerticalAlignment.Center;
+        _mcPending.FontSize = 11.5; _mcPending.FontWeight = FontWeights.SemiBold;
+        _mcPending.Visibility = Visibility.Collapsed;
+
+        var wrap = SettingsComboBlock(_mcLbl, _mcBox, _mcNow, _mcPending);
+        PaintMergeConversation();
+        return wrap;
+    }
+    void PaintMergeConversation()
+    {
+        if (_mcLbl != null) { _mcLbl.Text = MergeConversationView.Label(_lang == 0); _mcLbl.Foreground = Muted; }
+        if (_mcBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_mcBox), _mcVal)) ComboSelectVal(_mcBox, _mcVal);
+        _mcBox.ToolTip = MergeConversationView.Help(_lang == 0) + "\n" + MergeConversationView.TakeEffectTip(_lang == 0);
+        _mcBox.Background = BtnBg; _mcBox.Foreground = Fg; _mcBox.BorderBrush = Border;
+        StyleFlatCombo(_mcBox);
+        PaintMergeConversationInEffect(_lastRoot);
+    }
+    // What the COORDINATOR says it applies and has saved (status.json "conversation_saving"). No
+    // report (old runner, no run yet) -> nothing shown, never a guess from the selection.
+    void PaintMergeConversationInEffect(Dictionary<string, object> root)
+    {
+        if (_mcNow == null || _mcPending == null) return;
+        bool ja = _lang == 0;
+        string now = null, pend = null;
+        Dictionary<string, object> cs = root != null ? Obj(root, "conversation_saving") : null;
+        if (cs != null && cs.ContainsKey("merge_conversation") && cs["merge_conversation"] != null)
+        {
+            string rep = S(cs, "merge_conversation");
+            int saved = cs.ContainsKey("aggregators_saved") && cs["aggregators_saved"] != null ? I(cs, "aggregators_saved") : 0;
+            int unsent = cs.ContainsKey("unsent_created") && cs["unsent_created"] != null ? I(cs, "unsent_created") : 0;
+            now = MergeConversationView.Describe(rep, saved, unsent, ja);
+            pend = MergeConversationView.PendingText(rep, _mcVal, ja);
+        }
+        _mcNow.Text = now ?? "";
+        _mcNow.Foreground = Muted;
+        _mcNow.Visibility = now != null ? Visibility.Visible : Visibility.Collapsed;
+        _mcPending.Text = pend ?? "";
+        _mcPending.Foreground = Theme.Br(Theme.Warning(_dark));
+        _mcPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
     }
     // Sibling write scope (off|shadow), beside the split depth. Persists through SaveKey only; the
     // coordinator re-reads the key at every sweep (each_gate). SHADOW ONLY: it records overlapping
@@ -12585,6 +12670,7 @@ class CockpitWindow : Window
         PaintFanoutBudgetInEffect(root);   // the per-tree limits the coordinator applies
         PaintFanoutDepthInEffect(root);    // the split depth the coordinator applies
         PaintHierarchicalMergeInEffect(root);   // the hierarchical-merge state the coordinator applies
+        PaintMergeConversationInEffect(root);   // the merge-conversation state and the savings so far
         PaintWriteScopeInEffect(root);     // the sibling write-scope mode the coordinator applies
         PaintAutoResumeInEffect(root);     // the auto-resume setting and the gate's last decision
         PaintToolProbeInEffect();          // why the tool-call check did or did not send a message

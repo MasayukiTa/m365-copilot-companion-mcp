@@ -72,6 +72,7 @@ from relay import mechanism_telemetry as _mt
 from relay import first_reply_check
 from relay import effort as effort_mod
 from relay import effort_policy as effort_policy_mod
+from relay import conversation_saving as conv_saving_mod
 from .planner import PLAN_PROMPT, extract_plan, opening_turn, plan_ready
 from .review_resilience import (
     RecoveryAction, diagnose_after_fresh_replay, freeze_goal_dict,
@@ -3696,6 +3697,10 @@ class RelayWorker:
         self._last_text = None
         self._stable_since = None
         self._t_send = 0.0
+        # WHEN A CONVERSATION WAS OPENED FOR THIS WORKER (attach), and whether the "opened but
+        # nothing sent" row was written -- see relay/conversation_saving.py. 0.0 = none opened.
+        self._attached_ts = 0.0
+        self._unsent_noted = False
         # full-text transcript (each turn's send + Copilot reply, untruncated). The KEY
         # is run-unique (run_id includes the fleet start time) so reused worker names
         # (w0/w1) across rounds never share a file. Path is exposed via .transcript so
@@ -3841,6 +3846,8 @@ class RelayWorker:
         self._stable_since = None
         self._count_before = 0
         self._t_send = 0.0
+        self._attached_ts = 0.0
+        self._unsent_noted = False
         self._cooldown_until = 0.0
         self.closed = False
 
@@ -3853,6 +3860,7 @@ class RelayWorker:
         try:
             self.page = _open_fresh(self._context, self._agent_url)
             self.drv = CopilotWebDriver(self.page)
+            self._attached_ts = time.time()
         except Exception as e:
             self.status, self.outcome = "error", "ERROR"
             self.reason = "fresh replay open failed: %s: %s" % (type(e).__name__, e)
@@ -3928,6 +3936,7 @@ class RelayWorker:
             if drv is not None:
                 self.page, self.drv, self.socket = None, drv, True
                 self.status = "ready"
+                self._attached_ts = time.time()
                 return True
 
         # A CONVERSATION ID IS NOT A URL, and everything below opens one. `open_url` is
@@ -3950,6 +3959,7 @@ class RelayWorker:
             self.page = _open_fresh(context, open_url)
             self.drv = CopilotWebDriver(self.page)
             self.status = "ready"
+            self._attached_ts = time.time()
             # BUG 4d fix: proactively run the EXISTING auto-consent click-through once, right
             # after the composer has rendered (_open_fresh only returns once it has), instead
             # of ONLY reactively from _decide after a real reply already contained consent
@@ -3970,6 +3980,31 @@ class RelayWorker:
             self.reason = "open failed: " + type(e).__name__ + ": " + str(e)
             return False
 
+    def _note_conversation_unsent(self, where):
+        """Write the `conversation_created_unsent` row, once, when a conversation was opened for
+        this worker and no message went out within conv_saving_mod.UNSENT_AFTER_S. Observes only:
+        it never sends, closes or creates anything (the id is peeked, not minted). Never raises."""
+        try:
+            if self._unsent_noted:
+                return
+            if not conv_saving_mod.unsent_overdue(self._attached_ts, self._t_send, self.turn):
+                return
+            self._unsent_noted = True
+            has_id = False
+            try:
+                if getattr(self, "socket", False) and self.drv is not None:
+                    has_id = bool((self.drv.conversation_ids() or {}).get("client"))
+                elif self.page is not None:
+                    has_id = bool(_CONV_GUID_RE.search(str(self.page.url).split("?", 1)[0]))
+            except Exception:
+                has_id = False
+            conv_saving_mod.record_unsent(
+                run_id=getattr(self, "run_id", ""), instance=getattr(self, "name", ""),
+                route=("socket" if getattr(self, "socket", False) else "tab"),
+                age_s=time.time() - self._attached_ts, where=where, has_id=has_id)
+        except Exception:
+            pass
+
     def close(self):
         """Release this worker and every resource it owns. Idempotent; never raises."""
         try:
@@ -3982,6 +4017,7 @@ class RelayWorker:
         if self.closed:
             return
         self.closed = True
+        self._note_conversation_unsent("close")
         try:
             # THE POSITIVE EXAMPLES TOO. A record of only the failures teaches a classifier
             # that everything fails; the goals that went the whole way over a socket are half
@@ -4499,6 +4535,7 @@ class RelayWorker:
         if getattr(self, "socket", False) and not admission_is_due():
             ok_rate, why_rate = rate_headroom_ok()
             self.reason = why_rate or "socket send pacing -- waiting for next send slot"
+            self._note_conversation_unsent("send_pacing")
             return
 
         # a queued steering message preempts the normal CONTINUE/FIX job for this turn
@@ -6582,7 +6619,8 @@ class RelayWorker:
                                     or self.last_response or "")[:4000]
                     self._spawn_fn(self.goal, kids,
                                    parent_checks=getattr(self, "checks", None) or None,
-                                   parent_partial=_partial)
+                                   parent_partial=_partial,
+                                   **conv_saving_mod.parent_merge_kwargs(self))
                     # SPLITTING ENDS THIS WORKER. A parent parked until its children finish
                     # holds an admission slot the whole time, and with a concurrency cap
                     # below the number of children that is a deadlock -- the parent waits
@@ -8904,7 +8942,8 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         except Exception:
             return None
 
-    def _spawn_children(parent_goal, kids, parent_checks=None, parent_partial=""):
+    def _spawn_children(parent_goal, kids, parent_checks=None, parent_partial="",
+                        parent_conv=""):
         """Queue a split parent's children and remember the family. Idempotent per campaign.
 
         THE ID WAS ALREADY STABLE AND NOTHING USED THAT. `campaign_id_for` hashes the parent
@@ -8972,6 +9011,11 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                           # mid-run. Empty for a turn-1 split. Without it the rescue throws
                           # away the work it was rescuing.
                           "partial": parent_partial or ""}
+        if parent_conv:
+            # THE PARENT'S CONVERSATION, for the `merge_conversation=parent` setting only (the
+            # spawn call passes it only then). Memory only, never written to the ledger: a
+            # family rebuilt in another process has no such id and merges in a fresh one.
+            campaigns[cid]["parent_conv"] = str(parent_conv)
         if int((kids[0] or {}).get("depth") or 1) > 1:
             campaigns[cid]["depth"] = int(kids[0]["depth"])   # the merge's depth (nested only)
         _link_parent_slot(cid, kids)
@@ -9220,6 +9264,10 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                                                run_id=run_id,
                                                **({"depth": _camp["depth"]}
                                                   if _camp.get("depth") else {}))
+            # WHICH CONVERSATION THE MERGE RUNS IN (setting merge_conversation): fresh, as ever,
+            # or the parent's. Only the goal's transport changes; `merged` just below is what
+            # keeps the merge to once.
+            _agg = conv_saving_mod.apply_merge_conversation(_agg, _camp, _recs, run_id=run_id)
             if _camp.get("parent_campaign_id"):
                 # a NESTED family: remember which slices this merge goes without, so the parent
                 # slot it fills is marked MISSING rather than complete

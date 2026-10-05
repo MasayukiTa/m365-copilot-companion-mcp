@@ -177,6 +177,15 @@ KEYS = OrderedDict([
        "fanout_max_depth says. Keep it off until nested merging has been verified with small "
        "goals. Re-read at each split with no restart; trees already split keep going."),
 
+    _k("merge_conversation", EACH_GATE, "fresh",
+       "relay/conversation_saving.py:merge_conversation_setting (every split and every merge)",
+       "fresh|parent. parent runs a fan-out family's merge in the PARENT worker's existing "
+       "conversation (a socket parent that has spoken) instead of opening a fresh aggregator "
+       "conversation; the merge stays its own goal with the same checks, slot and resume key. "
+       "A family without a recorded parent conversation merges in a fresh one. Default fresh "
+       "until a merge has been measured to answer as well in the parent's conversation. "
+       "Re-read at each split and each merge with no restart."),
+
     # Recovery. Read by the supervisor on every cycle (about every 15 s) through
     # relay/fleet_resume.py:auto_resume_enabled; "each_gate" is the nearest declared boundary:
     # a decision per cycle, work already in flight untouched.
