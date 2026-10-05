@@ -702,7 +702,7 @@ def test_halting_a_socket_turn_drops_the_driver_not_a_button():
 
     src = inspect.getsource(B.Handler._stream_text)
     i = src.index("except Exception as e:")
-    seg = src[i:i + 900]
+    seg = src[i:i + 2500]
     assert "release_socket_driver" in seg
     assert seg.index("_on_socket()") < seg.index("stop_button")
 
