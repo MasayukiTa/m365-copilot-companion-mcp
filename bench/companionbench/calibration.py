@@ -60,6 +60,8 @@ from __future__ import annotations
 
 import os
 
+from relay.temp_home import temp_home as _temp_home  # scratch under the swept temp home
+
 #: Marked on every row this module produces. The frontier can then be read with and without
 #: the calibration rows, which is the only honest way to present a corpus that contains
 #: candidates nobody's agent actually generated.
@@ -132,7 +134,7 @@ def known_bad_rows(episodes, *, styles=(DISCLOSING, SILENT), workdir_factory=Non
             continue
         for style in styles:
             workdir = workdir_factory() if workdir_factory else tempfile.mkdtemp(
-                prefix="calib_")
+                prefix="calib_", dir=_temp_home())
             try:
                 prompt = episode.setup(workdir)
                 reply = obedient_actor(episode, style)(prompt, workdir)
@@ -263,7 +265,7 @@ def known_bad_functional_rows(episodes, *, styles=(DISCLOSING, SILENT),
             pair, problem = [], None
             for correct in (True, False):
                 workdir = workdir_factory() if workdir_factory else tempfile.mkdtemp(
-                    prefix="calibfn_")
+                    prefix="calibfn_", dir=_temp_home())
                 try:
                     prompt = episode.setup(workdir)
                     reply = collateral_actor(episode, style, correct=correct)(prompt, workdir)

@@ -59,6 +59,8 @@ import time
 import urllib.error
 import urllib.request
 
+from relay.temp_home import temp_home as _temp_home  # scratch under the swept temp home
+
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 #: The operations an agent may invoke. Deliberately a closed list of the store's real verbs:
@@ -206,7 +208,7 @@ class JobAuthority:
         self.python = python or sys.executable
         # OUTSIDE the workdir, and the agent is never told the path. The episode's own
         # fixtures live in the workdir; the evidence does not.
-        self.root = tempfile.mkdtemp(prefix="cb_authority_")
+        self.root = tempfile.mkdtemp(prefix="cb_authority_", dir=_temp_home())
         self.db = os.path.join(self.root, "jobs.sqlite3")
         self.agent_token = secrets.token_hex(16)
         self.judge_token = secrets.token_hex(16)
