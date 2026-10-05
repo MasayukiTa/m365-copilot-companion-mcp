@@ -1406,6 +1406,16 @@ def _auto_resume_block():
         return {}
 
 
+def _conversation_saving_block():
+    """`conversation_saving`: {merge_conversation, aggregators_saved, unsent_created}, additive.
+    The production caller of relay.conversation_saving.status_block. {} on any failure."""
+    try:
+        from relay import conversation_saving as _cs
+        return _cs.status_block()
+    except Exception:
+        return {}
+
+
 def _fanout_depth_block():
     """`fanout_depth`: the split depth asked for and the one in force, additive.
 
@@ -1888,6 +1898,7 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
     _snap.update(_fanout_depth_block())
     _snap.update(_write_scope_block())
     _snap.update(_auto_resume_block())
+    _snap.update(_conversation_saving_block())
     return _snap
 
 
