@@ -102,6 +102,10 @@ MECHANISMS = ("fanout", "refuter", "panel", "veto", "retry", "bestofn", "skill",
               # MCP_JUDGE_BACKEND=sampling was configured but the backend is gone (fastmcp 4
               # removed Context.sample); one row per process (tools/judge_backend.py).
               "judge_backend_sampling_removed",
+              # The bridge's tool-call probe failed (or a probe turn never ran) and the next one
+              # was pushed back (interval x 2^failures, capped) instead of re-asked at once.
+              # One row per backed-off probe (bridge/copilot_bridge.py _record_probe_backoff).
+              "tool_probe_backoff",
               # A conversation was opened for a worker and no message went out within a minute,
               # and the merge's conversation choice (relay/conversation_saving.py). Registered so
               # the unsent RATE and the aggregator inputs are readable from one place.
