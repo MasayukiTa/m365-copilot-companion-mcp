@@ -160,7 +160,7 @@ class SelfImproveDashboardWindow : Window
     readonly string _jsonPath;
     DispatcherTimer _timer;
     string _lastSig = "";
-    JavaScriptSerializer _js = new JavaScriptSerializer();
+    JavaScriptSerializer _js = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
     double _upm = 960;
     Dictionary<string, string> _glyphs = new Dictionary<string, string>();
 
@@ -1064,7 +1064,7 @@ class SelfImproveDashboardWindow : Window
             string root = RepoRoot();
             string bp = Path.Combine(root, "relay", "selfimprove", "frozen_baseline.json");
             if (!File.Exists(bp)) { differing.Add("NO_BASELINE"); return false; }
-            var doc = (Dictionary<string, object>)(new JavaScriptSerializer()
+            var doc = (Dictionary<string, object>)(new JavaScriptSerializer { MaxJsonLength = int.MaxValue }
                 .DeserializeObject(File.ReadAllText(bp, Encoding.UTF8)));
             object sumsObj; doc.TryGetValue("checksums", out sumsObj);
             var sums = sumsObj as Dictionary<string, object>;
