@@ -4095,6 +4095,22 @@ class RelayWorker:
                 jid=(self.jid or ""))
         except Exception:
             pass
+        # THE VALIDITY AUDIT LEDGER, written when the conversation is complete. Only does work for
+        # a conversation that touched a validity_* tool or names one in its goal; idempotent, so
+        # the backfill script and this hook can both cover the same worker. A failure is reported
+        # on stderr by the helper, never raised into the close.
+        try:
+            from bridge.validity_audit import sync_worker_logged
+            from tools.tool_ledger import _repo_path
+            sync_worker_logged(
+                getattr(self, "_tx_key", ""), ledger_path=_repo_path(),
+                run_id=getattr(self, "run_id", ""), name=self.name, jid=(self.jid or ""),
+                outcome={"outcome": self.outcome, "status": self.status,
+                         "reason": (self.reason or "")[:300]},
+                reviewed=bool(getattr(self, "refute_count", 0)),
+                tail_bytes=16 * 1024 * 1024)
+        except Exception as exc:
+            _report_store_failure("validity audit sync", exc)
         try:
             if getattr(self, "socket", False) and self.drv is not None:
                 self.drv.close()          # a socket is cheap, but it is not free
