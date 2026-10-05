@@ -1136,7 +1136,7 @@ def _rm_tree_safe(path):
     return freed
 
 
-def temp_home(fleet_dir=None, now=None, dry_run=False, max_age_h=None, temp_root=None):
+def sweep_temp_home(fleet_dir=None, now=None, dry_run=False, max_age_h=None, temp_root=None):
     """Sweep what this product left in %TEMP%. Returns (bytes_freed, [paths]); never raises.
 
     ONLY three things are ever touched:
@@ -1239,10 +1239,10 @@ def apply(fleet_dir=None, now=None, dry_run=False):
                      ("workspace_clones", workspace_clones),
                      ("conversations", conversations),
                      ("cap_jsonl", cap_jsonl),
-                     ("temp_home", temp_home)):
+                     ("temp_home", sweep_temp_home)):
         try:
             if fn in (coordinator_logs, scratch, stores, compress, conversations,
-                     workspace_clones, temp_home):
+                     workspace_clones, sweep_temp_home):
                 freed, items = fn(fleet_dir, now=now, dry_run=dry_run)
             else:
                 freed, items = fn(fleet_dir, dry_run=dry_run)

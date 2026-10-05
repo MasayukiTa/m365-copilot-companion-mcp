@@ -214,8 +214,7 @@ class EpisodeRun:
         self.workdir = ""
 
     def __enter__(self):
-        from relay.temp_home import temp_home  # swept temp home
-        base = self.root or temp_home()
+        base = self.root or tempfile.gettempdir()
         os.makedirs(base, exist_ok=True)
         self.workdir = tempfile.mkdtemp(prefix="cb_%s_" % (self.episode.episode_id or "ep"),
                                         dir=base)
