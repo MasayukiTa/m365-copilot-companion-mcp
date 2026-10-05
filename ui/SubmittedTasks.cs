@@ -133,7 +133,7 @@ sealed class SubmittedTasks
     readonly List<Entry> _entries = new List<Entry>();
     long _order = 0;
 
-    static readonly JavaScriptSerializer _js = new JavaScriptSerializer();
+    static readonly JavaScriptSerializer _js = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
 
     // ── plain helpers ──────────────────────────────────────────────────────────────────────
 

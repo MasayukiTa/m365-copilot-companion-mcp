@@ -603,6 +603,119 @@ def append_turn(sid, role, text):
         pass                    # the row is already committed; the export is best effort
 
 
+#: An exchange identical to one this old (same session, same user text) is the SAME exchange
+#: arriving twice -- a retried write -- and is not recorded again.
+EXCHANGE_DEDUPE_SECONDS = 120.0
+
+
+def record_exchange(sid, user_text, assistant_text="", expect_turn=None):
+    """Record one chat exchange, ALL OR NOTHING, and say how many turn rows were written.
+
+    THE CHAT PATH'S ONLY WRITER. `append_turn` ran once for the user line and once for the
+    reply, each its own autocommit, and the caller wrapped both in `except Exception: warn`,
+    so a lock, a full disk or a half-finished pair left the ledger short and said so only in
+    a log. Here the user turn, the reply and the session's counter commit in ONE
+    transaction (BEGIN IMMEDIATE: it waits on the busy timeout rather than failing on a
+    reader), and every failure RAISES -- StoreUnavailable, sqlite3.Error, ValueError -- for the
+    caller to retry or to show.
+
+    `assistant_text` empty records the user line alone: the user typed something, and that is
+    kept even when no answer ever came back.
+
+    IDEMPOTENT two ways. `expect_turn` is the turn number the user line should get; when that
+    number already exists for the session the call writes nothing (a replay or a backfill can
+    be run twice). Without it, an exchange equal to the session's latest turns and recorded
+    within EXCHANGE_DEDUPE_SECONDS is treated as the same one arriving twice.
+
+    Returns the number of turn rows this call added (0 when it was a duplicate).
+    """
+    if not _valid_sid(sid):
+        raise ValueError("invalid session id")
+    user_text = user_text if isinstance(user_text, str) else str(user_text or "")
+    assistant_text = assistant_text if isinstance(assistant_text, str) else str(assistant_text or "")
+    if not user_text.strip() and not assistant_text.strip():
+        return 0
+    _ensure_dir()
+    conn = _db()
+    added = []
+    title = ""
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute("SELECT * FROM sessions WHERE sid = ?", (sid,)).fetchone()
+            sess = _row_to_session(row) if row else None
+            title = sess.get("title", "") if sess else ""
+            row_max = int(conn.execute(
+                "SELECT COALESCE(MAX(turn), 0) FROM turns WHERE sid = ?", (sid,)).fetchone()[0] or 0)
+            first = max(int(sess.get("turns", 0) if sess else 0), row_max) + 1
+            now = time.time()
+            if expect_turn is not None:
+                if conn.execute("SELECT 1 FROM turns WHERE sid = ? AND turn = ?",
+                                (sid, int(expect_turn))).fetchone():
+                    conn.execute("ROLLBACK")
+                    return 0
+                first = int(expect_turn)
+            else:
+                tail = conn.execute(
+                    "SELECT role, text, ts FROM turns WHERE sid = ? ORDER BY turn DESC LIMIT 2",
+                    (sid,)).fetchall()
+                want = [("assistant", assistant_text)] if assistant_text.strip() else []
+                if user_text.strip():
+                    want = want + [("user", user_text)]
+                got = [(r["role"], r["text"]) for r in tail][:len(want)]
+                if want and got == want and (now - float(tail[0]["ts"] or 0)) < EXCHANGE_DEDUPE_SECONDS:
+                    conn.execute("ROLLBACK")
+                    return 0
+            count = (1 if user_text.strip() else 0) + (1 if assistant_text.strip() else 0)
+            base = sess or {"sid": sid, "title": "", "conv_url": "", "created_ts": now,
+                            "status": "active", "transcript": _transcript_ref(sid),
+                            "pending": []}
+            # The session row FIRST: turns.sid is a foreign key, so a session that does not
+            # exist yet cannot take a turn. Same transaction, so it still commits or rolls back
+            # with the rows below.
+            _write_session(conn, dict(base, turns=first + count - 1, last_active_ts=now))
+            n = first
+            if user_text.strip():
+                conn.execute(
+                    "INSERT INTO turns (sid, turn, role, text, ts) VALUES (?, ?, 'user', ?, ?)",
+                    (sid, n, user_text, now))
+                added.append((n, "user", user_text, now))
+                n += 1
+            if assistant_text.strip():
+                conn.execute(
+                    "INSERT INTO turns (sid, turn, role, text, ts) VALUES (?, ?, 'assistant', ?, ?)",
+                    (sid, n, assistant_text, now))
+                added.append((n, "assistant", assistant_text, now))
+                n += 1
+            conn.execute("COMMIT")
+        except BaseException:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+    finally:
+        conn.close()
+    # The cockpit's compatibility transcript, after the commit, exactly as append_turn does:
+    # it may lag the table by a crash and never leads it. Best effort by design -- the rows
+    # above are the record.
+    path = _transcript_path(sid)
+    try:
+        lines = []
+        if not os.path.isfile(path):
+            lines.append(json.dumps({"meta": True, "sid": sid, "title": title, "ts": added[0][3]},
+                                    ensure_ascii=False))
+        for (tn, role, text, ts) in added:
+            lines.append(json.dumps({"turn": tn, "role": role, "text": text, "ts": ts},
+                                    ensure_ascii=False))
+        with open(path, "a", encoding="utf-8") as fh:
+            for line in lines:
+                fh.write(line + "\n")
+    except OSError:
+        pass
+    return len(added)
+
+
 def recent_turns(sid, limit=20):
     """The last `limit` turns, oldest-first. The reason this store exists.
 

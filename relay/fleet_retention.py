@@ -980,6 +980,16 @@ def conversations(fleet_dir, now=None, dry_run=False, keep_hours=None):
     ("r6a8cfa11_w0"), and NONE of the 409 conversation GUIDs appear as a key. There is no join
     from a registry row to the data, so a row with no session behind it cannot reach anything
     locally. (The M365 URL may still open server-side; what is gone is any local record.)
+
+    A ROW IS NOT DROPPED WHILE ITS TRANSCRIPT STILL EXISTS ON DISK (2026-10-05). The main chat
+    window lists conversations from the registry AND from the transcript directory, and an old
+    conversation whose registry row was pruned after 24 h could only be reached through that
+    directory scan. Rows are now dropped only when nothing links them AND the transcript is gone
+    AND they are older than the keep window. The registry is kept small the other way: the
+    full goal text of a row whose transcript has been idle for COMPACT_IDLE_HOURS (it is the bulk of the file: 1.9 of 2.4 million
+    characters on the live registry) is cut to GOAL_COMPACT_CHARS and flagged `goal_cut`; the
+    full text is the first line of the transcript, which the chat reads when the row is opened.
+    A file that is rewritten for the first time is backed up once as conversations.json.bak.
     """
     now = time.time() if now is None else now
     keep_hours = CONV_KEEP_HOURS if keep_hours is None else keep_hours
@@ -987,11 +997,11 @@ def conversations(fleet_dir, now=None, dry_run=False, keep_hours=None):
     if not os.path.isfile(path):
         return 0, []
     got = _linked_sessions(fleet_dir)
-    if got is None:
-        # FAIL CLOSED. Every row looks unlinked when the table cannot be read, and acting on
-        # that would empty the registry on exactly the failure it should be cautious about.
-        return 0, []
-    sids, linked = got
+    # FAIL CLOSED. Every row looks unlinked when the table cannot be read, and acting on that
+    # would empty the registry on exactly the failure it should be cautious about. Compaction
+    # needs no session table, so it still runs.
+    can_drop = got is not None
+    sids, linked = got if can_drop else (set(), set())
     guids = {_guid(u) for u in linked if _guid(u)}
     try:
         rows = json.load(io.open(path, encoding="utf-8-sig"))
@@ -1001,8 +1011,14 @@ def conversations(fleet_dir, now=None, dry_run=False, keep_hours=None):
         return 0, []
     before = _size(path)
     kept, dropped = [], []
+    compacted = 0
     for r in rows:
         if not isinstance(r, dict):
+            kept.append(r)
+            continue
+        if _compact_row(r, now, fleet_dir):
+            compacted += 1
+        if not can_drop:
             kept.append(r)
             continue
         url = (r.get("url") or "").strip()
@@ -1024,13 +1040,113 @@ def conversations(fleet_dir, now=None, dry_run=False, keep_hours=None):
         if age_h <= keep_hours:
             kept.append(r)
             continue
+        if transcript_on_disk(fleet_dir, r):
+            kept.append(r)       # still openable from disk: the chat must keep listing it
+            continue
         dropped.append(r.get("title") or url[:60])
-    if dropped and not dry_run:
-        tmp = path + ".tmp"
-        with io.open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(kept, fh, ensure_ascii=False, indent=1)
-        os.replace(tmp, path)
+    if (dropped or compacted) and not dry_run:
+        _write_registry(path, kept)
     return max(0, before - (_size(path) if not dry_run else 0)), dropped
+
+
+#: Goal text kept on a registry row past the keep window. The sidebar shows the title; the full
+#: goal is the first line of the transcript and is read from there when the row is opened.
+GOAL_COMPACT_CHARS = int(os.environ.get("MCP_FLEET_REGISTRY_GOAL_CHARS", "240"))
+
+
+#: A row whose transcript has not been written for this long is finished for the purpose of
+#: shrinking it. NOT the 24 h keep window: the registry only ever holds the last day or so of
+#: rows (the live file held 1,122 rows from one day, 1.9 of its 2.4 million characters being
+#: goal text), so waiting a day would leave an oversized file oversized. Safe because the full
+#: goal is recovered from the transcript when the row is opened and from a live worker.
+COMPACT_IDLE_HOURS = float(os.environ.get("MCP_FLEET_REGISTRY_IDLE_HOURS", "1"))
+
+
+def _compact_row(r, now, fleet_dir=None):
+    """Shrink one idle registry row in place; True when it changed. A row whose transcript is
+    still being written, or that is inside the keep window, is live and is never touched (a
+    running worker's goal addresses its follow-ups).
+
+    IDLE IS READ FROM THE TRANSCRIPT, NOT FROM `ts`: on the live registry 1,122 of 1,143 rows
+    carried a ts from the same day because something restamped them together, so `ts` alone
+    would have made the migration a no-op on exactly the oversized file it exists for."""
+    g = r.get("goal")
+    if not isinstance(g, str) or len(g) <= GOAL_COMPACT_CHARS:
+        return False
+    idle_h = None
+    if fleet_dir is not None:
+        idle_h = _transcript_idle_hours(fleet_dir, r, now)
+    if idle_h is None:
+        try:
+            idle_h = (now - float(r.get("ts") or 0)) / 3600.0
+        except (TypeError, ValueError):
+            idle_h = 1e9
+    if idle_h <= COMPACT_IDLE_HOURS:
+        return False
+    r["goal"] = g[:GOAL_COMPACT_CHARS]
+    r["goal_cut"] = True
+    return True
+
+
+def _transcript_paths_on_disk(fleet_dir, r):
+    """Every existing file (plain or .gz) a registry row's transcript pointers resolve to."""
+    found = []
+    for p in _row_transcripts(r):
+        norm = p.replace("\\", "/")
+        base = os.path.basename(norm)
+        for c in (p, norm, os.path.join(fleet_dir, norm),
+                  os.path.join(fleet_dir, "transcripts", base)):
+            plain = c[:-3] if c.endswith(".gz") else c
+            for f in (plain, plain + ".gz"):
+                if os.path.isfile(f):
+                    found.append(f)
+    return found
+
+
+def _transcript_idle_hours(fleet_dir, r, now):
+    """Hours since the NEWEST of a row's existing transcripts was written, None when none exist."""
+    best = None
+    for f in _transcript_paths_on_disk(fleet_dir, r):
+        try:
+            age = (now - os.path.getmtime(f)) / 3600.0
+        except OSError:
+            continue
+        best = age if best is None else min(best, age)
+    return best
+
+
+def _row_transcripts(r):
+    out = []
+    one = r.get("transcript")
+    if isinstance(one, str) and one.strip():
+        out.append(one.strip())
+    many = r.get("transcripts")
+    if isinstance(many, list):
+        out.extend(x.strip() for x in many if isinstance(x, str) and x.strip())
+    return out
+
+
+def transcript_on_disk(fleet_dir, r):
+    """True when any transcript a registry row points at still exists, as plain or gzipped, at
+    the stored path, under the fleet directory, or by file name in .fleet/transcripts (rows
+    written on another checkout carry that checkout's absolute path)."""
+    return bool(_transcript_paths_on_disk(fleet_dir, r))
+
+
+def _write_registry(path, rows):
+    """Atomic write of the registry, backing the previous file up ONCE as .bak (the first time
+    a compaction or prune rewrites it). No BOM: the C# reader and Python both tolerate one but
+    the writers never add it."""
+    bak = path + ".bak"
+    if not os.path.exists(bak):
+        try:
+            shutil.copy2(path, bak)
+        except OSError:
+            pass
+    tmp = path + ".tmp"
+    with io.open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(rows, fh, ensure_ascii=False, separators=(",", ":"))
+    os.replace(tmp, path)
 
 #: campaigns.jsonl is NOT compacted here. Resume (relay/fleet_resume.py) and campaigns_from_ledger
 #: (relay/fanout.py) read it for unfinished families, and cap_jsonl's tail cut at 64 MB is the only
