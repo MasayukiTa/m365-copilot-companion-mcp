@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import time
 
 CAMPAIGNS_FILE = "campaigns.jsonl"
@@ -835,7 +836,38 @@ def record_resume_refused(state_dir, lineage, now, queued, cap):
         return False
 
 
-def record_resume(path, now, free_bytes, signature):
+def mark_manual_resume(state_dir, now, lineage=None):
+    """A coordinator started by hand with --resume has adopted the interrupted run's goals: mark
+    that run's snapshot resumed (count + 1, launcher "manual") -> the snapshot path, or None.
+
+    WHY: a by-hand `--resume` re-queued the goals but left the snapshot `pending` with count 0, so
+    a later supervisor auto-resume resumed the SAME run again (duplicate work, double merges).
+    The supervisor and resume_interrupted_fleet.py set MCP_FLEET_RESUME_LINEAGE and mark the
+    snapshot themselves, so a launch that carries a lineage is left alone (no double count).
+    Idempotent: only a `pending` snapshot is marked, and it is the newest pending/resumed one,
+    the same choice interrupted_run_scope made to select the goals.
+    """
+    if lineage is None:
+        lineage = os.environ.get("MCP_FLEET_RESUME_LINEAGE", "")
+    if str(lineage or "").strip():
+        return None
+    best, best_ts = None, -1.0
+    for path in _snapshot_files(state_dir):
+        d = _snapshot_read(path)
+        if isinstance(d, dict) and d.get("state") in ("pending", "resumed"):
+            ts = _num(d.get("written_ts"), 0.0)
+            if ts > best_ts:
+                best, best_ts = (path, d), ts
+    if not best or best[1].get("state") != "pending":
+        return None
+    try:
+        free = shutil.disk_usage(state_dir).free
+    except OSError:
+        free = None
+    return best[0] if record_resume(best[0], now, free, "", launcher="manual") else None
+
+
+def record_resume(path, now, free_bytes, signature, launcher="supervisor"):
     """After a real relaunch: state=resumed, resume.count += 1, history. Never raises."""
     try:
         data = _snapshot_read(path)
@@ -843,6 +875,7 @@ def record_resume(path, now, free_bytes, signature):
             return False
         r = data.setdefault("resume", {})
         r["count"] = int(_num(r.get("count"), 0) or 0) + 1
+        r["launcher"] = launcher
         r["last_ts"] = now
         r["last_signature"] = signature or ""
         r["last_free_bytes"] = free_bytes
