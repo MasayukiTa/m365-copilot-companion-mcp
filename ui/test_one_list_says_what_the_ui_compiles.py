@@ -105,6 +105,10 @@ EXEMPT = {
         "ui/harness/FleetConvIdentityHarness.cs into a throwaway console exe: it replays "
         "OpenFromFleet's/SyncRegistry's own merge-decision call sequences and feeds the result "
         "into ChatSend's real send decision, without WPF, not a build of the UI",
+    "ui/test_the_conversation_list_shows_every_transcript.py":
+        "compiles ui/FleetConvIdentity.cs (its ConvListing class: transcript paging, registry read) "
+        "with the test-only driver ui/harness/ConvListingHarness.cs into a throwaway console exe: "
+        "it runs the sidebar's list logic without WPF, not a build of the UI",
     "ui/test_the_bridge_client_sends_the_token.py":
         "compiles ui/BridgeClient.cs with the test-only driver ui/testdata/BridgeClientHarness.cs "
         "into a throwaway console exe and runs it against a real bridge Handler on a free port: "
@@ -139,6 +143,7 @@ COMPILED_BY_A_TEST = {
     "ui/harness/EffortPolicyHarness.cs": "ui/test_the_effort_policy_says_what_is_in_effect.py",
     "ui/harness/StartupGateHarness.cs":"ui/test_the_startup_loop_has_a_backstop.py",
     "ui/harness/FleetConvIdentityHarness.cs": "ui/test_a_fleet_interrupt_survives_a_supervisor_restart.py",
+    "ui/harness/ConvListingHarness.cs": "ui/test_the_conversation_list_shows_every_transcript.py",
 }
 
 

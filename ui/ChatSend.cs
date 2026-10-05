@@ -141,7 +141,7 @@ static class ChatSend
         return false;
     }
 
-    static readonly JavaScriptSerializer _js = new JavaScriptSerializer();
+    static readonly JavaScriptSerializer _js = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
 
     /// status.json as text, or null when there is no such file. Opened FileShare.ReadWrite
     /// because the fleet replaces it about once a second. Throws on an unreadable file; the
