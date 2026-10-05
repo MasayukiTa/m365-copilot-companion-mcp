@@ -50,7 +50,11 @@ static class ConvListingHarness
             }
             if (args.Length == 3 && args[0] == "notice")
             {
-                Console.Out.Write(ConvListing.UnreadableNotice(args[1] == "ja", args[2]));
+                // hex of the UTF-8 bytes: the console code page would otherwise decide what a test reads
+                var bytes = System.Text.Encoding.UTF8.GetBytes(ConvListing.UnreadableNotice(args[1] == "ja", args[2]));
+                var hex = new System.Text.StringBuilder();
+                foreach (byte b in bytes) hex.Append(b.ToString("x2"));
+                Console.Out.Write(hex.ToString());
                 return 0;
             }
             Console.Error.WriteLine("usage: pages <dir> | registry <file> | notice <ja|en> <reason>");
