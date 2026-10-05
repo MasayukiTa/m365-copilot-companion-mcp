@@ -98,7 +98,10 @@ MECHANISMS = ("fanout", "refuter", "panel", "veto", "retry", "bestofn", "skill",
               "campaigns_ledger_large",
               # A lock refusal landed while several workers had a turn in flight and could not be
               # attributed to this one, so no unlock steer was sent (relay_fleet._looks_locked).
-              "unlock_refusal_unattributed")
+              "unlock_refusal_unattributed",
+              # MCP_JUDGE_BACKEND=sampling was configured but the backend is gone (fastmcp 4
+              # removed Context.sample); one row per process (tools/judge_backend.py).
+              "judge_backend_sampling_removed")
 
 
 def patch_hash(text):

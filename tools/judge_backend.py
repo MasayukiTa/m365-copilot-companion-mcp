@@ -55,6 +55,11 @@ backend would ask it for one judging turn. What has to be settled first is conve
 separation -- the bridge drives one long-lived conversation, so a judging turn would inherit
 whatever it has been doing, and "a fresh call with no inherited context" is the property that
 makes the judge worth having. Recorded here rather than half-built.
+
+UPDATE (fastmcp 4 migration): the `bridge` backend above now exists, and the `sampling` backend is
+GONE. fastmcp 4 removed `Context.sample`; production never ran sampling (its client never declares
+the capability), so nothing is lost. `MCP_JUDGE_BACKEND=sampling` still parses but behaves as
+`none`, with a one-time warning (see _warn_sampling_removed). Elicitation (ask_human) is unchanged.
 """
 from __future__ import annotations
 
@@ -99,20 +104,47 @@ def timeout_s() -> float:
         return DEFAULT_TIMEOUT_S
 
 
+_SAMPLING_WARNED = False
+
+
+def _warn_sampling_removed() -> None:
+    """Say once per process that MCP_JUDGE_BACKEND=sampling no longer selects anything.
+
+    One log line and one mechanism row, never an exception: this runs on the path of every
+    judged command, and a stale setting must degrade to "no judge", not to a failed command.
+    """
+    global _SAMPLING_WARNED
+    if _SAMPLING_WARNED:
+        return
+    _SAMPLING_WARNED = True
+    msg = ("MCP_JUDGE_BACKEND=sampling is no longer supported (fastmcp 4 removed Context.sample); "
+           "treating it as 'none'. Use MCP_JUDGE_BACKEND=bridge to get a judge.")
+    try:
+        import logging
+        logging.getLogger(__name__).warning(msg)
+    except Exception:
+        pass
+    try:
+        from relay import mechanism_telemetry as _mt
+        _mt.record("judge_backend_sampling_removed", configured=True,
+                   config_source="env " + BACKEND_ENV, config_value="sampling",
+                   eligible=False, ineligible_reason=msg)
+    except Exception:
+        pass
+
+
 def get() -> Optional[Callable[[str], str]]:
     """The judge callable for this deployment, or None.
 
-        MCP_JUDGE_BACKEND=sampling  ask the calling MCP client to run one completion
         MCP_JUDGE_BACKEND=bridge    ask bridge/copilot_bridge.py for one judging turn
         MCP_JUDGE_BACKEND=none      no judge (default)
+        MCP_JUDGE_BACKEND=sampling  REMOVED: behaves as none, with a one-time warning
 
     The separation that matters is not a different model -- it is a separate call, a fixed
     system prompt, input assembled by this server rather than by the caller being judged, and
-    no tools offered to the judge. `sampling` gives all four: the request is built here, the
-    instructions go in the `system_prompt` field rather than being concatenated into the text,
-    and no tools are passed.
+    no tools offered to the judge.
 
-    `bridge` gives the same four by a different route -- see bridge_judge. It opens a FRESH
+    `bridge` gives the same four by a route -- see bridge_judge. It opens a FRESH
     bridge conversation per call (the conversation-separation property that had to be settled
     before this backend could exist), sends the fixed rules plus the server-built request as
     one turn, and offers the judge conversation no tools. Its cost is that the rules ride in
@@ -123,7 +155,12 @@ def get() -> Optional[Callable[[str], str]]:
     if name in ("", "none", "off"):
         return None
     if name == "sampling":
-        return sampling_judge
+        # REMOVED, NOT RENAMED. fastmcp 4 has no Context.sample, and production never ran this
+        # backend (its client never declares the sampling capability). A deployment that still
+        # says `sampling` gets no judge -- None -> REQUIRE_HUMAN, which shadow records and
+        # enforce refuses -- and one warning row, so the stale setting is visible.
+        _warn_sampling_removed()
+        return None
     if name == "bridge":
         return bridge_judge
     # An unrecognised name is not a licence to run unjudged, but it is also not something this
@@ -261,32 +298,6 @@ def _run_async(coro_fn, *args, **kwargs):
     raise JudgeTransportError("no way back to the event loop from this thread")
 
 
-async def sampling_judge_async(request_json: str) -> str:
-    """The same question, asked from the async side, where it actually works.
-
-    This is the judge a tool gets once it is `async def`. Nothing about the policy differs --
-    the request is still built by command_judge, the rules still travel in system_prompt, no
-    tools are offered. The only difference is that there is a running loop to await on.
-    """
-    from tools.command_judge import SYSTEM_PROMPT
-    import anyio
-
-    ctx = _context()
-    if ctx is None:
-        raise JudgeTransportError("no MCP request context: nothing to ask")
-    if not sampling_supported():
-        raise JudgeTransportError(
-            "the connected client did not declare the sampling capability, so there is no "
-            "model to ask from inside this server")
-    try:
-        with anyio.fail_after(timeout_s()):
-            result = await ctx.sample(request_json, system_prompt=SYSTEM_PROMPT,
-                                      max_tokens=300, temperature=0.0)
-    except Exception as exc:
-        raise JudgeTransportError("%s: %s" % (type(exc).__name__, str(exc)[:160]))
-    return _text_of(result)
-
-
 async def ask_human_async(question: str) -> Optional[bool]:
     """The approval question, from the async side. Same three-valued answer as ask_human."""
     import anyio
@@ -296,54 +307,24 @@ async def ask_human_async(question: str) -> Optional[bool]:
         return None
     try:
         with anyio.fail_after(timeout_s()):
-            result = await ctx.elicit(question, response_type=None)
+            result = await ctx.elicit(question, response_type=bool)
     except Exception:
         return None
+    return _approval_of(result)
+
+
+def _approval_of(result) -> Optional[bool]:
+    """Three-valued reading of an elicitation result. Only an explicit yes is an approval.
+
+    fastmcp 4 refuses `response_type=None` (an empty form), so the question is asked as a bool
+    confirmation: an accepted answer of False is a refusal, not an approval.
+    """
     name = type(result).__name__
     if name.startswith("Accepted"):
-        return True
+        return False if getattr(result, "data", True) is False else True
     if name.startswith("Declined") or name.startswith("Cancelled"):
         return False
     return None
-
-
-def sampling_judge(request_json: str) -> str:
-    """Ask the calling client's model one question, in a completion that has seen nothing else.
-
-    Raises on any transport problem, which command_judge turns into REQUIRE_HUMAN rather than
-    into an allow.
-    """
-    from tools.command_judge import SYSTEM_PROMPT
-
-    ctx = _context()
-    if ctx is None:
-        raise JudgeTransportError("no MCP request context: nothing to ask")
-    if not sampling_supported():
-        # ASKED BEFORE TRYING. A client that never declared sampling will not answer, and
-        # finding that out by waiting for the timeout costs every judged command the full
-        # timeout and reports it as a transport fault rather than as a missing capability --
-        # two different problems with two different fixes.
-        raise JudgeTransportError(
-            "the connected client did not declare the sampling capability, so there is no "
-            "model to ask from inside this server")
-
-    async def _ask():
-        # THE INSTRUCTIONS AND THE PAYLOAD TRAVEL IN DIFFERENT FIELDS. The request is a JSON
-        # object in the message; the rules are the system prompt. Text inside the command
-        # therefore cannot close the instruction block and open a new one, which it could if
-        # the two were concatenated -- as the first version of this file did.
-        #
-        # NO TOOLS ARE OFFERED. A judge that can act is not a judge.
-        import anyio
-        with anyio.fail_after(timeout_s()):
-            return await ctx.sample(request_json, system_prompt=SYSTEM_PROMPT,
-                                    max_tokens=300, temperature=0.0)
-
-    try:
-        result = _run_async(_ask)
-    except Exception as exc:
-        raise JudgeTransportError("%s: %s" % (type(exc).__name__, str(exc)[:160]))
-    return _text_of(result)
 
 
 # ── the bridge backend ──────────────────────────────────────────────────────────────────────
@@ -492,21 +473,6 @@ def bridge_judge(request_json: str) -> str:
     return _bridge_stream(msg, timeout=t + 10.0)
 
 
-def _text_of(result) -> str:
-    """The answer's text, whatever shape the client's result object takes."""
-    for attr in ("text", "content", "message"):
-        val = getattr(result, attr, None)
-        if isinstance(val, str) and val.strip():
-            return val
-        if val is not None and not isinstance(val, str):
-            inner = getattr(val, "text", None)
-            if isinstance(inner, str) and inner.strip():
-                return inner
-    if isinstance(result, str):
-        return result
-    return str(result or "")
-
-
 # ── the human, who may overrule either layer ──────────────────────────────────────────────
 #
 # "引っかかったものでも問題なしとユーザが明示的に承認したら当然実行OK。それはユーザの責任" --
@@ -544,15 +510,6 @@ def _client_supports(**kw) -> bool:
         return False
 
 
-def sampling_supported() -> bool:
-    """Whether the calling client can run a completion for us."""
-    try:
-        from mcp.types import SamplingCapability
-        return _client_supports(sampling=SamplingCapability())
-    except Exception:
-        return False
-
-
 def elicitation_supported() -> bool:
     """Whether the calling client can put a question to its user."""
     try:
@@ -586,7 +543,10 @@ def availability() -> dict:
         "backend": name,
         "configured": name not in ("", "none", "off"),
         "in_request": _context() is not None,
-        "client_sampling": sampling_supported(),
+        # The sampling backend no longer exists (fastmcp 4 removed Context.sample); a deployment
+        # that still names it is running with NO judge, and this field is how the audit line says
+        # so rather than reading as a configured judge that merely could not be reached.
+        "sampling_backend_removed": name == "sampling",
         "client_elicitation": elicitation_supported(),
         # Only probed when the bridge backend is the configured one: /status is a network call,
         # and a sampling deployment has no reason to pay for it on every audit line. None means
@@ -614,7 +574,7 @@ def ask_human(question: str) -> Optional[bool]:
     async def _ask():
         import anyio
         with anyio.fail_after(timeout_s()):
-            return await ctx.elicit(question, response_type=None)
+            return await ctx.elicit(question, response_type=bool)
 
     try:
         result = _run_async(_ask)
@@ -623,9 +583,4 @@ def ask_human(question: str) -> Optional[bool]:
     # fastmcp returns AcceptedElicitation / DeclinedElicitation / CancelledElicitation. Only an
     # acceptance is an approval; anything else, including a shape this code does not recognise,
     # is not.
-    name = type(result).__name__
-    if name.startswith("Accepted"):
-        return True
-    if name.startswith("Declined") or name.startswith("Cancelled"):
-        return False
-    return None
+    return _approval_of(result)
