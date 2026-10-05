@@ -41,7 +41,9 @@ def test_real_fleet_tool_success_dominates_bridge_probe_color():
     block = _between('void PollToolProbeOnce(DateTime now)', 'string AgeMinutesText(')
     fleet = block.index('if (fleetWorking)')
     next_branch = block.index('else if (ok && fleetFailing)', fleet)
-    stale = block.index('ageMin >= 20.0', next_branch)
+    # The stale limit follows the configured probe interval (never under 20 min); it used to be a
+    # literal 20.0.
+    stale = block.index('ageMin >= ToolProbeStaleAfterMin()', next_branch)
     assert fleet < next_branch < stale, 'real fleet calls must be considered before stale bridge-probe metadata'
     branch = block[fleet:next_branch]
     assert 'HealthState.Green' in branch

@@ -194,7 +194,152 @@ def next_probe_instruction(count: int, desktop_dir: str) -> str:
 # Where the cockpit / /health can read the same summary without driving the browser.
 _PROBE_FILE = Path(__file__).resolve().parent.parent / ".fleet" / "tool_probe.json"
 
+#: The bridge's own account of WHY the probe did or did not run, for the screen and /status.
+#: A separate file from tool_probe.json on purpose: record_probe() replaces that file whole, so
+#: anything stored beside the verdict would be erased by the next probe. One writer (the bridge).
+_STATE_PATH = Path(__file__).resolve().parent.parent / ".fleet" / "tool_probe_state.json"
+
 _LOCK = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# How often the probe may cost a Copilot message.
+#
+# MEASURED 2026-09-28..10-05 from .fleet/tool_events.jsonl: the probe sent 118-158 real messages
+# a day on full days at its fixed 10-minute cadence, landing in 43-81 distinct MCP sessions a day,
+# and Copilot Studio counts sessions. Between a third and a half of them were sent within 30 minutes of a REAL tool call
+# from the fleet -- i.e. when the very thing the probe exists to prove had just been proved for
+# free. And a failed probe led to a quick re-probe (and, after a streak, a conversation recycle,
+# which is yet another session).
+#
+# So the probe is now the fallback, not the schedule: it runs only when nothing else has shown
+# the tool path working for a whole interval, and slows down further after a failure.
+IDLE_MIN_KEY = "tool_probe_idle_min"
+IDLE_MIN_DEFAULT = 30
+#: What the cockpit offers. 0 = never probe. A hand-edited value outside this set is honoured if
+#: it is 0 or a plausible number of minutes (5..1440), otherwise the default applies.
+IDLE_MIN_CHOICES = (0, 15, 30, 60)
+#: The longest the probe backs off to after consecutive failures, whatever the interval.
+BACKOFF_CAP_S = 7200.0
+
+
+def idle_min_setting(path: Optional[str] = None) -> int:
+    """The `tool_probe_idle_min` setting in minutes (0 = off). Read from settings.txt on every
+    call (the probe re-reads it each time it decides); absent, empty or unusable means
+    IDLE_MIN_DEFAULT. Never raises."""
+    try:
+        if path is None:
+            from tools.settings_path import settings_file
+            path = settings_file()
+        raw = None
+        if path and os.path.isfile(path):
+            with open(path, encoding="utf-8-sig") as fh:
+                for ln in fh.read().splitlines():
+                    if ln.startswith(IDLE_MIN_KEY + "="):
+                        raw = ln.split("=", 1)[1]
+        v = int(float((raw or "").strip()))
+        if v == 0 or 5 <= v <= 1440:
+            return v
+        return IDLE_MIN_DEFAULT
+    except Exception:
+        return IDLE_MIN_DEFAULT
+
+
+def probe_interval(env_sec: Optional[float], idle_min: int) -> Tuple[float, str]:
+    """(interval_s, source). `env_sec` is MCP_TOOL_PROBE_SEC when it was set, else None: the
+    environment variable stays the override of last resort (it beat every setting before the
+    setting existed, and a deployment that sets it keeps its behaviour). interval_s <= 0 means
+    the probe is disabled."""
+    if env_sec is not None:
+        return float(env_sec), "env"
+    return float(idle_min) * 60.0, "setting"
+
+
+def configured_interval_s(environ=None, path: Optional[str] = None) -> float:
+    """The probe interval other components derive their freshness windows from: the
+    MCP_TOOL_PROBE_SEC override when set (<= 0 stays <= 0: the operator turned the probe off by
+    environment), otherwise the setting in seconds -- and a setting of 0 (off) reports the default
+    interval instead, because 'no probe' must not shrink a window that real calls also feed.
+    Never raises."""
+    try:
+        env = os.environ if environ is None else environ
+        raw = (env.get("MCP_TOOL_PROBE_SEC") or "").strip()
+        sec, src = probe_interval(float(raw) if raw else None, idle_min_setting(path))
+        if src == "setting" and sec <= 0:
+            return IDLE_MIN_DEFAULT * 60.0
+        return sec
+    except Exception:
+        return IDLE_MIN_DEFAULT * 60.0
+
+
+def backoff_s(base_s: float, failures: int, cap_s: float = BACKOFF_CAP_S) -> float:
+    """How long to wait after `failures` consecutive failed probes: base doubled per failure,
+    never below base and never above max(base, cap). Pure."""
+    try:
+        n = max(0, int(failures))
+    except (TypeError, ValueError):
+        n = 0
+    base = max(0.0, float(base_s))
+    return min(max(base, cap_s), base * (2 ** min(n, 16)))
+
+
+def record_evidence(ts: float, tool: str, now: Optional[float] = None) -> bool:
+    """Record the tool-call check as passed BY A REAL CALL, at that call's own time. Returns
+    whether the file was written. Never raises.
+
+    Never moves the record backwards (a newer probe verdict stays), and never invents a time:
+    `ts` is the real call's timestamp from the ledger, so the age the cockpit shows is the age
+    of something that happened. Totals are carried forward untouched -- nothing was PROBED, so
+    neither `probes` nor `failures` moves.
+    """
+    try:
+        ts = float(ts)
+        if ts <= 0 or ts > (time.time() if now is None else now) + 60:
+            return False
+        with _LOCK:
+            prev = {}
+            try:
+                with open(str(_PROBE_FILE), encoding="utf-8") as fh:
+                    prev = json.load(fh)
+                if not isinstance(prev, dict):
+                    prev = {}
+            except Exception:
+                prev = {}
+            try:
+                if float(prev.get("ts") or 0.0) >= ts:
+                    return False
+            except Exception:
+                pass
+            payload = {"ts": ts, "ok": True, "kind": "answer",
+                       "detail": "real tool call reached the server: %s" % (str(tool)[:80],),
+                       "alive": True, "inbound": True, "evidence": "real_call", "tool": str(tool)[:80]}
+            if isinstance(prev.get("totals"), dict):
+                payload["totals"] = prev["totals"]
+            for k in ("probing_since", "probing_kind", "probing_detail"):
+                if k in prev:
+                    payload[k] = prev[k]
+            _PROBE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = str(_PROBE_FILE) + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False)
+            os.replace(tmp, str(_PROBE_FILE))
+        return True
+    except Exception:
+        return False
+
+
+def write_state(state: dict) -> bool:
+    """Persist the probe's decision state for the screen (atomic). Never raises."""
+    try:
+        with _LOCK:
+            _STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = str(_STATE_PATH) + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(state, fh, ensure_ascii=False)
+            os.replace(tmp, str(_STATE_PATH))
+        return True
+    except Exception:
+        return False
 
 
 def classify_probe_reply(reply_text: str, agent_loaded: bool) -> Tuple[bool, str]:
