@@ -210,6 +210,16 @@ KEYS = OrderedDict([
        "needed. Re-read each cycle with no restart. Default on: the failure it removes (a "
        "stale supervisor running a dry-run resume) already happened, and the gates above are "
        "the same idle rule the server's stale-code cycle uses."),
+    # The bridge's tool-call probe (bridge/copilot_bridge.py). It decides when to send, so the
+    # timer re-reads this every few minutes; "each_gate" is the nearest declared boundary: a
+    # decision per tick, a probe already in flight untouched.
+    _k("tool_probe_idle_min", EACH_GATE, 30,
+       "bridge/copilot_bridge.py:_probe_interval_s (every probe tick, about every 5 min)",
+       "0|15|30|60 (minutes; 0 = never probe). How long the tool path may go without any proof "
+       "before the bridge sends a probe message -- a real tool call that succeeded within the "
+       "interval counts as proof and no message is sent. Re-read about every 5 minutes with no "
+       "restart. A MCP_TOOL_PROBE_SEC environment variable, when set, beats it. Default 30 "
+       "(the probe used to run every 10 minutes whatever else was happening)."),
 
     _k("autoretry", SWEEP_START, 1,
        "relay/fleet_runner.py:settings_autoretry (once, before the sweep)",
