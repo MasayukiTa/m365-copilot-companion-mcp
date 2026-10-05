@@ -98,7 +98,12 @@ MECHANISMS = ("fanout", "refuter", "panel", "veto", "retry", "bestofn", "skill",
               "campaigns_ledger_large",
               # A lock refusal landed while several workers had a turn in flight and could not be
               # attributed to this one, so no unlock steer was sent (relay_fleet._looks_locked).
-              "unlock_refusal_unattributed")
+              "unlock_refusal_unattributed",
+              # A conversation was opened for a worker and no message went out within a minute,
+              # and the merge's conversation choice (relay/conversation_saving.py). Registered so
+              # the unsent RATE and the aggregator inputs are readable from one place.
+              "conversation_created_unsent",
+              "aggregator_conversation")
 
 
 def patch_hash(text):
