@@ -208,6 +208,7 @@ jobs:
             relay/test_verification_survives_the_archive.py \
             relay/test_fleet_autostart.py \
             relay/test_fleet_auto_resume_setting.py \
+            relay/test_a_size_cap_never_switches_a_feature_off.py \
             relay/test_conversation_saving.py \
             relay/test_refute_resend.py \
             relay/test_for_fleet_is_not_a_dead_end.py \
@@ -278,6 +279,7 @@ jobs:
             scripts/test_supervisor_fleet_resume_guard.py \
             scripts/test_supervisor_local_loop_resume.py \
             scripts/test_supervisor_local_loop_campaign.py \
+            scripts/test_supervisor_rotates_its_log.py \
             scripts/test_a_submitted_job_is_picked_up_at_once.py \
             scripts/test_a_failing_entry_point_says_why.py \
             scripts/test_dialogs_use_japanese_font.py \
@@ -728,6 +730,7 @@ jobs:
             relay/test_effort_expressible.py \
             relay/test_evidence_manifest.py \
             relay/test_fleet_retention.py \
+            relay/test_temp_home.py \
             relay/test_fleet_toolset.py \
             relay/test_gateway_executes.py \
             relay/test_lens_selection.py \

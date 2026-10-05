@@ -4980,7 +4980,7 @@ class ChatWindow : Window, IChatSendEffects
         {
             var img = Clipboard.GetImage();
             if (img == null) return;
-            string path = Path.Combine(Path.GetTempPath(), "copilot_paste_" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".png");
+            string path = Path.Combine(ChatTempHome.Dir(), "copilot_paste_" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".png");
             using (var fs = new FileStream(path, FileMode.Create))
             {
                 var enc = new PngBitmapEncoder();

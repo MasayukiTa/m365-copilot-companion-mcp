@@ -202,7 +202,8 @@ def grade(instance: str, patch_file: str, transport, timeout: float = DEFAULT_TI
             return done(False, "", INFRA, "timeout", "grade exceeded %d s" % hold)
 
         # read the verdict FILE back (scp is reliable where remote grep output is dropped)
-        tf = tempfile.NamedTemporaryFile(suffix=".verdict", delete=False)
+        from relay.temp_home import temp_home as _temp_home  # swept temp home
+        tf = tempfile.NamedTemporaryFile(suffix=".verdict", delete=False, dir=_temp_home())
         tf.close()
         try:
             got = transport.scp_from(remote_verdict, tf.name)
