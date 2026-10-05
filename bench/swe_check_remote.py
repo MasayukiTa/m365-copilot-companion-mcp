@@ -31,6 +31,11 @@ try:                       # bench/ on sys.path (how the swe_* scripts import si
     import verdicts as _V
 except ImportError:        # repo root on sys.path
     from bench import verdicts as _V
+try:                       # scratch under the swept temp home; plain %TEMP% if unavailable
+    from relay.temp_home import temp_home as _temp_home
+except ImportError:
+    def _temp_home():
+        return None
 
 # THE HOST COMES FROM THE ENVIRONMENT, WITH NO DEFAULT. It used to default to the machine's
 # actual name, which put an operator's hostname in a public repository -- and a wrong default
@@ -194,7 +199,7 @@ def main():
     runid = "g" + re.sub(r"[^A-Za-z0-9]", "", inst) + diff_hash
 
     tf = tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False, newline="\n",
-                                     encoding="utf-8")
+                                     encoding="utf-8", dir=_temp_home())
     tf.write(diff)
     tf.close()
 
@@ -231,7 +236,7 @@ def main():
     # 4) read the verdict FILE the runner wrote. scp is reliable where grep-over-SSH silently
     #    drops output, so the verdict is read back as a file rather than parsed from a remote grep.
     remote_verdict = "%s/verdicts/%s.verdict" % (REMOTE_DIR, runid)
-    lv = tempfile.NamedTemporaryFile(suffix=".verdict", delete=False)
+    lv = tempfile.NamedTemporaryFile(suffix=".verdict", delete=False, dir=_temp_home())
     lv.close()
     verdict = ""
     if _scp_from(remote_verdict, lv.name):
