@@ -276,6 +276,11 @@ def merge_conv_rows(existing, entries, now=None):
             g = entry.get("goal") or ""
             if g and not row.get("goal"):
                 fresh["goal"] = g
+            elif g and row.get("goal_cut") and g != row.get("goal"):
+                # A row compacted by fleet_retention.conversations keeps only the head of its
+                # goal; a live worker carries the whole text and addresses follow-ups with it.
+                fresh["goal"] = g
+                row.pop("goal_cut", None)
             if fresh:
                 row.update(fresh)
                 row["ts"] = time.time() if now is None else now

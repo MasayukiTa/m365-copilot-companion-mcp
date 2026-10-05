@@ -35,7 +35,7 @@ static class FleetCommands
     // matching the Python writer's itertools.count().
     static int _seq = -1;
 
-    static readonly JavaScriptSerializer _js = new JavaScriptSerializer();
+    static readonly JavaScriptSerializer _js = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
 
     static readonly DateTime _epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
 
