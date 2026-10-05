@@ -258,6 +258,7 @@ class ChatWindow : Window, IChatSendEffects
         if (k == "fleet_follow_idle") return ja ? "フリートが起動していないため、次の走行で拾われます（同じ会話の続きとして投入済み）。" : "No fleet is running, so this waits for the next one -- queued as a continuation of this conversation.";
         if (k == "fleet_no_goal")     return ja ? "この会話を識別するゴール本文が記録されていないため、続きを投入できません。" : "This conversation has no recorded goal text to identify it, so it can't be continued.";
         if (k == "fleet_send_failed") return ja ? "フリートへの受け渡しに失敗しました。送信は行われていません。" : "Could not hand this to the fleet -- nothing was sent.";
+        if (k == "not_saved") return ja ? "この会話は保存されていません: " : "This conversation was not saved: ";
         if (k == "send_offline") return ja ? "ブリッジに接続できません。送信していません。" : "Can't reach the bridge. Nothing was sent.";
         if (k == "retry_start_stack") return ja ? "スタックを起動して再試行" : "Start the stack and retry";
         if (k == "bridge_auth_problem") return ja ? "ブリッジが要求を受け付けませんでした（認証またはバージョンの不一致）。" : "The bridge refused the request (authentication or version mismatch).";
@@ -4826,7 +4827,7 @@ class ChatWindow : Window, IChatSendEffects
         _input.Text = text;
         _input.CaretIndex = _input.Text.Length;
     }
-    void IChatSendEffects.AddUser(string text) { AddUser(text); }
+    void IChatSendEffects.AddUser(string text) { AddUser(text); PersistSentTurn(); }
     void IChatSendEffects.AddAssistant(string text) { AddAssistant(text); }
     void IChatSendEffects.NewChat() { NewChat(); }
     // The interface keeps its historical name (the send-path oracle records "HttpGet|..."); it is
@@ -5033,6 +5034,8 @@ class ChatWindow : Window, IChatSendEffects
         var content = _pendingContent;
         var outer = _pendingOuter;
         string errMsg = null;
+        string persistErr = null;      // the bridge's `persist_error`: this turn is NOT in its session store
+        bool persistAcked = false;     // the bridge's `persist`: it is
         try
         {
             // /review and /security-review run a full-repo fleet pass that can exceed the
@@ -5075,6 +5078,9 @@ class ChatWindow : Window, IChatSendEffects
                                 _pendingText.AppendText(d); StickToEnd();
                             }));
                         }
+                        var pe = ExtractField(jsonData, "persist_error");
+                        if (!string.IsNullOrEmpty(pe)) persistErr = pe;
+                        else if (ExtractField(jsonData, "persist") == "ok") persistAcked = true;
                         var rep = ExtractField(jsonData, "replace");
                         if (!string.IsNullOrEmpty(rep))
                         {
@@ -5117,6 +5123,14 @@ class ChatWindow : Window, IChatSendEffects
             // currently shown -- these run unconditionally, keyed on `target`, never on `_conv`.
             target.Messages.Add(new Msg("A", answer));
             SaveConversation(target);
+            // The bridge keeps its own copy of every chat turn; when it says it could not, the
+            // person is told here. An answer that arrives with neither word is logged, not shown:
+            // slash commands that never reach the session store look exactly like that.
+            if (persistErr != null) NoteNotSaved(target, "bridge: " + persistErr);
+            else if (answer.Length > 0 && !persistAcked)
+            {
+                try { File.AppendAllText(Path.Combine(StoreDir, "chat_save_errors.log"), DateTime.Now.ToString("s") + "\t" + target.Id + "\tbridge sent no persist word\n", new UTF8Encoding(false)); } catch (Exception) { }
+            }
             // ── status dot outcome (reflects the VISIBLE conversation only) ──────────────
             if (!visible) return;
             if (errFinal != null)
@@ -5160,7 +5174,43 @@ class ChatWindow : Window, IChatSendEffects
     static string B64(string s) { return Convert.ToBase64String(Encoding.UTF8.GetBytes(s == null ? "" : s)); }
     static string UnB64(string s) { try { return Encoding.UTF8.GetString(Convert.FromBase64String(s)); } catch { return ""; } }
 
-    void SaveConversation(Conversation c)
+    // THE SAVE THAT TELLS YOU WHEN IT DID NOT SAVE. This was `catch { }`: a full disk, a locked or
+    // read-only folder, or a path that could not be created lost the conversation and said
+    // nothing, so a chat could be on screen and nowhere else. A failure is now counted, written to
+    // chat_save_errors.log beside the chats, and shown once per reason as a line in the chat.
+    int _chatUserTurnsSent;      // user lines sent from this window in this process
+    int _chatSaveFailures;       // saves (file or bridge store) that did not land
+    string _lastNotSavedReason = "";
+
+    void NoteNotSaved(Conversation c, string reason)
+    {
+        _chatSaveFailures++;
+        try
+        {
+            Directory.CreateDirectory(StoreDir);
+            File.AppendAllText(Path.Combine(StoreDir, "chat_save_errors.log"),
+                DateTime.Now.ToString("s") + "\t" + (c == null ? "" : c.Id) + "\t" + (reason ?? "") + "\tsent=" + _chatUserTurnsSent + " failures=" + _chatSaveFailures + "\n",
+                new UTF8Encoding(false));
+        }
+        catch (Exception) { /* the log is the second place; the notice below is the first */ }
+        if (reason == _lastNotSavedReason) return;     // once per reason, not once per send
+        _lastNotSavedReason = reason;
+        Action show = delegate { if (c == null || ReferenceEquals(c, _conv)) AddAssistant(T("not_saved") + reason); };
+        if (Dispatcher.CheckAccess()) show(); else Dispatcher.BeginInvoke(show);
+    }
+
+    // The user's line is kept the moment it is sent, not when (if) the answer comes back. A fleet
+    // conversation has no .chat file of its own: its durable record is the command file the fleet
+    // consumes, whose write failure ChatSend already reports (fleet_send_failed).
+    void PersistSentTurn()
+    {
+        _chatUserTurnsSent++;
+        var c = _conv;
+        if (c == null || c.Source == "fleet" || c.Messages.Count == 0) return;
+        SaveConversation(c);
+    }
+
+    bool SaveConversation(Conversation c)
     {
         try
         {
@@ -5172,8 +5222,14 @@ class ChatWindow : Window, IChatSendEffects
             sb.Append("TITLE\t").Append(B64(c.Title)).Append('\n');
             foreach (var m in c.Messages) sb.Append(m.Role).Append('\t').Append(B64(m.Text)).Append('\n');
             File.WriteAllText(Path_(c.Id), sb.ToString(), new UTF8Encoding(false));
+            _lastNotSavedReason = "";      // a good save re-arms the notice for the next failure
+            return true;
         }
-        catch { }
+        catch (Exception ex)
+        {
+            NoteNotSaved(c, ex.GetType().Name + ": " + ex.Message);
+            return false;
+        }
     }
 
     void LoadConversations()

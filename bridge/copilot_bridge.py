@@ -2394,6 +2394,100 @@ def _redact_unlock_password(text):
 _REDACTION_FAILED_MARKER = "[redaction failed: content withheld]"
 
 
+#: Where an exchange goes when the session store could not take it. A second place on disk, so a
+#: locked or full store does not mean the words are gone; .fleet/ is the bridge's own state dir.
+PERSIST_FAILURES_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".fleet",
+    "chat_persist_failures.jsonl")
+
+#: How many chat exchanges this process was asked to store, and how many are in the store. The
+#: difference is what the self-check reports to the window on every turn. In process only: a
+#: restart starts at zero, which is right -- the check is "did THIS process lose any".
+_CHAT_PERSIST = {"asked": 0, "written": 0, "failed": 0}
+_CHAT_PERSIST_LOCK = threading.Lock()
+
+#: Backoff between tries of a write that failed for a reason that is usually transient (a
+#: reader holding the file, a momentary I/O error). Three tries, then it is reported.
+_PERSIST_RETRY_DELAYS = (0.5, 1.5)
+
+
+def _persist_failure_reason(exc):
+    """One short, human-readable cause for the notice. Never the traceback."""
+    text = str(exc) or type(exc).__name__
+    low = text.lower()
+    if "full" in low or "no space" in low:
+        return "disk full (%s)" % text[:120]
+    if "locked" in low or "busy" in low:
+        return "store locked (%s)" % text[:120]
+    if "readonly" in low or "read-only" in low or "permission" in low:
+        return "store not writable (%s)" % text[:120]
+    return "%s: %s" % (type(exc).__name__, text[:120])
+
+
+def _spill_unstored_exchange(sid, user_text, assistant_text, reason):
+    """Keep the words somewhere else when the store refused them. Returns True when it landed."""
+    try:
+        os.makedirs(os.path.dirname(PERSIST_FAILURES_PATH), exist_ok=True)
+        row = {"ts": time.time(), "sid": str(sid or ""), "why": str(reason)[:300],
+               "user": str(user_text or "")[:20000], "assistant": str(assistant_text or "")[:20000]}
+        with open(PERSIST_FAILURES_PATH, "a", encoding="utf-8", newline=chr(10)) as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + chr(10))
+        return True
+    except OSError:
+        return False
+
+
+def _record_exchange_durably(sid, user_msg, final_text, sleep=time.sleep):
+    """Write one chat exchange to the session store, and ALWAYS say whether it landed.
+
+    THE DEFECT THIS REPLACES: the exchange was written by two separate appends inside
+    `except Exception: logger.warning(...)`. Any failure -- a locked file, a full disk, an invalid
+    session id -- left the ledger short and said so on a line of bridge.log that nobody reads, and
+    the window drew the answer as if it had been kept. The conversation then existed on screen
+    and nowhere else, which is "the chats since 9/18 are gone".
+
+    Now: ONE transaction (session_store.record_exchange), retried on the transient failures, a
+    spill to .fleet/chat_persist_failures.jsonl when it still fails, an error-level log line, and a
+    (False, reason) result the caller turns into a visible notice. Nothing is swallowed.
+
+    `final_text` empty stores the user line alone -- what was typed is kept even when no answer
+    came back."""
+    with _CHAT_PERSIST_LOCK:
+        _CHAT_PERSIST["asked"] += 1
+    user_text = _redact_unlock_password(user_msg or "")
+    assistant_text = _redact_unlock_password(final_text or "") if final_text else ""
+    last = None
+    for attempt in range(len(_PERSIST_RETRY_DELAYS) + 1):
+        try:
+            S.record_exchange(sid, user_text, assistant_text)
+            with _CHAT_PERSIST_LOCK:
+                _CHAT_PERSIST["written"] += 1
+            return True, ""
+        except ValueError as exc:            # an invalid sid does not get better with waiting
+            last = exc
+            break
+        except Exception as exc:             # StoreUnavailable, sqlite3.Error, OSError
+            last = exc
+            if attempt < len(_PERSIST_RETRY_DELAYS):
+                sleep(_PERSIST_RETRY_DELAYS[attempt])
+    reason = _persist_failure_reason(last)
+    spilled = _spill_unstored_exchange(sid, user_text, assistant_text, reason)
+    with _CHAT_PERSIST_LOCK:
+        _CHAT_PERSIST["failed"] += 1
+    logger.error("chat exchange NOT stored for sid=%s: %s (spilled to %s: %s)",
+                 logsafe(sid), logsafe(reason), PERSIST_FAILURES_PATH, spilled)
+    return False, reason
+
+
+def _chat_persist_selfcheck():
+    """What the stream tells the window after every turn: the asked/written/failed counts and,
+    when they disagree, the sentence to show."""
+    with _CHAT_PERSIST_LOCK:
+        c = dict(_CHAT_PERSIST)
+    c["ok"] = (c["asked"] == c["written"])
+    return c
+
+
 def _persist_exchange(sid, user_msg, final_text):
     """Persist one completed exchange to the session ledger, maintaining conv_url via
     CHANGE-BASED capture. Rules (all ASCII logs):
@@ -2402,12 +2496,14 @@ def _persist_exchange(sid, user_msg, final_text):
         worse than no resume -- no stale-marker or most-recent-entry fallback).
       * session HAS conv_url: never overwrite. Verify the pane's aria-current still matches
         and warn on mismatch.
-    Exception-guarded: a persistence hiccup must never break the chat turn."""
+    The TURNS are written first, durably and unconditionally (see _record_exchange_durably); the
+    conv_url bookkeeping after them is exception-guarded, because a failure THERE must never
+    break the chat turn or take the already-written turns with it.
+
+    Returns (ok, reason): ok False means the exchange is NOT in the session store, and the caller
+    owns telling the person (the /stream handler sends a `persist_error` event to the window)."""
+    ok, reason = _record_exchange_durably(sid, user_msg, final_text)
     try:
-        # 送る側は元の文（解錠の前置きを付けない方）を渡しているので平文は入らないが、
-        # 返ってきた側は相手次第。復唱されれば同じ台帳に平文で残る。両方に掛ける。
-        S.append_turn(sid, "user", _redact_unlock_password(user_msg))
-        S.append_turn(sid, "assistant", _redact_unlock_password(final_text))
         sess = S.load(sid) or {}
         existing = sess.get("conv_url") or ""
         if existing:
@@ -2461,7 +2557,8 @@ def _persist_exchange(sid, user_msg, final_text):
                 register_bridge_session_in_fleet_convs(
                     sid, new_sess.get("title") or "", ref, new_sess.get("transcript") or "")
     except Exception:
-        logger.warning("session persistence failed for sid=%s", logsafe(sid), exc_info=True)
+        logger.warning("session conv_url bookkeeping failed for sid=%s", logsafe(sid), exc_info=True)
+    return ok, reason
 
 
 def _verify_pane_on_guid(guid, cur_wait=10, turns_wait=20):
@@ -5408,6 +5505,19 @@ class Handler(BaseHTTPRequestHandler):
                     logger.warning("bridge auto-unlock turn raised", exc_info=True)
         return final
 
+    def _sse_persist_result(self, ok, reason):
+        """Tell the window whether this turn is in the session store: `persist` on success,
+        `persist_error` (with the reason) when it is not, both carrying the process's
+        asked/written/failed counts. Sent for every /stream turn so silence can be read as an
+        old bridge, and a missing store row can never be silent."""
+        check = _chat_persist_selfcheck()
+        if ok:
+            self._sse({"persist": "ok", "persist_asked": check["asked"],
+                       "persist_written": check["written"]})
+        else:
+            self._sse({"persist_error": reason or "unknown", "persist_asked": check["asked"],
+                       "persist_written": check["written"], "persist_failed": check["failed"]})
+
     def _stream_text(self, msg: str):
         """Send `msg` to the agent and stream the answer back over the ALREADY-open
         SSE response (the normal send/stream path). Used both for plain messages and
@@ -5428,6 +5538,7 @@ class Handler(BaseHTTPRequestHandler):
             ACTIVE_SID = S.new_session()["sid"]
             logger.info("no active session -- created %s", ACTIVE_SID)
         sid = ACTIVE_SID
+        recorded = False          # True once this turn's user line is in the store (or was refused)
         try:
             final = self._run_one_turn(sid, msg)
             if isinstance(final, dict) and final.get("consent_failed"):
@@ -5437,13 +5548,28 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if final:
                 self._sse({"replace": final})
-                # SESSION LIFECYCLE: only a genuine (non-consent-card) answer is worth
-                # persisting. Change-based capture / verify / warn all live in
-                # _persist_exchange (exception-guarded there).
-                _persist_exchange(sid, msg, final)
+                # SESSION LIFECYCLE: a genuine (non-consent-card) answer is persisted with
+                # its user line. Change-based capture / verify / warn all live in
+                # _persist_exchange; the TURNS are written durably there and the outcome comes
+                # back so the window is told when they were not stored.
+                ok, reason = _persist_exchange(sid, msg, final)
+            else:
+                # NO ANSWER, BUT THE PERSON TYPED SOMETHING: keep the line. An empty reply used
+                # to leave nothing at all in the ledger.
+                ok, reason = _record_exchange_durably(sid, msg, "")
+            recorded = True
+            self._sse_persist_result(ok, reason)
             self._sse({}, "done")
             self._drain_pending_queue(sid)
         except Exception as e:
+            # The turn raised or the client hung up, so the user's line has not been recorded
+            # yet. Record it now; it is what was typed, and it must survive the failure.
+            try:
+                if not recorded:
+                    ok, reason = _record_exchange_durably(sid, msg, "")
+                    self._sse_persist_result(ok, reason)
+            except Exception:
+                logger.error("recording the user line after a failed turn raised", exc_info=True)
             # The client hung up (the user pressed Esc/Stop) OR a real error -- either way, click
             # Copilot's OWN stop button so the SERVER-SIDE generation actually halts. Before this,
             # Esc only closed our local stream while Copilot kept generating.
@@ -5519,7 +5645,9 @@ class Handler(BaseHTTPRequestHandler):
             final = final or ""
             done, turn_text = detect_done(final)
             if turn_text:
-                _persist_exchange(sid, msg, turn_text)
+                ok, reason = _persist_exchange(sid, msg, turn_text)
+                if not ok:
+                    self._sse_persist_result(ok, reason)
             last_turn_text = turn_text
             self._sse({"turn_done": turn, "text": turn_text})
             outcome = decide_outcome(done, STOP_REQUESTED, turn, max_turns, consecutive_errors)
