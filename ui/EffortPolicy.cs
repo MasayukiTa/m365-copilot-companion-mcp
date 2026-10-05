@@ -758,3 +758,122 @@ public static class AutoResumeView
         return ja ? "選択は次の監視サイクルから反映" : "selection applies from the next cycle";
     }
 }
+
+// The tool-call check's interval, WPF-free (same file as AutoResumeView). The Python side decides:
+// bridge/copilot_bridge.py reads `tool_probe_idle_min` every few minutes and sends a probe message
+// only when no real tool call has proved the path for that long; it reports its decisions in
+// .fleet/tool_probe_state.json (and the bridge's /status "probe"). Default 30 minutes, 0 = never.
+public static class ToolProbeView
+{
+    //: must equal tools/settings_keys.py and tools/tool_probe.py IDLE_MIN_KEY / IDLE_MIN_DEFAULT.
+    public const string Key = "tool_probe_idle_min";
+    public const string Default = "30";
+
+    public static readonly string[] Choices = { "0", "15", "30", "60" };
+
+    public static bool IsChoice(string v)
+    {
+        for (int i = 0; i < Choices.Length; i++) if (Choices[i] == v) return true;
+        return false;
+    }
+
+    /// <summary>The choice named by one tool_probe_idle_min= line; null when the line is not that key
+    /// or the value is not one the control offers (the caller keeps its value; Python still honours
+    /// a hand-edited 5..1440, and the in-effect line then shows what is really running).</summary>
+    public static string ParseLine(string line)
+    {
+        if (line == null) return null;
+        string ln = line.TrimStart('﻿').Trim();
+        if (!ln.StartsWith(Key + "=", StringComparison.Ordinal)) return null;
+        string v = ln.Substring(Key.Length + 1).Trim();
+        return IsChoice(v) ? v : null;
+    }
+
+    /// <summary>How long a green tool-call check stays valid, in minutes: the interval plus ten
+    /// minutes of slack for the probe's own round trip (30-180 s), never less than the 20 minutes
+    /// the check always allowed. An unknown interval (old bridge) keeps the 20.</summary>
+    public static double StaleAfterMin(double intervalMin)
+    {
+        if (intervalMin <= 0) return 20.0;
+        return Math.Max(20.0, intervalMin + 10.0);
+    }
+
+    public static string Label(bool ja) { return ja ? "ツール呼び出し確認の間隔(待機時)" : "Tool-call check interval (idle)"; }
+
+    public static string ChoiceLabel(string v, bool ja)
+    {
+        if (v == "0") return ja ? "実行しない" : "Never";
+        return ja ? v + "分" : v + " min";
+    }
+
+    public static string Help(bool ja)
+    {
+        return ja ? "ツール呼び出しが実際に成功してから、この時間が経っても何の証拠も無いときだけ、確認用メッセージをCopilotへ送ります。実際のツール呼び出しが成功していれば送りません。失敗した後は間隔を倍々(最大2時間)に延ばします。「実行しない」では確認メッセージを送らず、画面は「未確認」になります(緑にはなりません)。"
+                  : "A check message is sent to Copilot only when no real tool call has succeeded for this long. A real successful call counts as proof and no message is sent. After a failed check the wait doubles (up to 2 hours). 'Never' sends no check message and the screen shows 'not checked' (never green).";
+    }
+
+    public static string TakeEffectTip(bool ja)
+    {
+        return ja ? "約5分以内に有効。再起動不要。" : "Applies within about 5 minutes, no restart.";
+    }
+
+    static string AgoText(double nowUnix, double ts, bool ja)
+    {
+        if (ts <= 0) return null;
+        int m = (int)Math.Max(0, Math.Round((nowUnix - ts) / 60.0));
+        return ja ? m + "分前" : m + " min ago";
+    }
+
+    static string ReasonText(string reason, double nowUnix, double evidenceTs, bool ja)
+    {
+        switch (reason)
+        {
+            case "fleet_evidence":
+                string ago = AgoText(nowUnix, evidenceTs, ja);
+                return ja ? "実際のツール呼び出しを確認済みのため送信せず" + (ago != null ? " (" + ago + ")" : "")
+                          : "not sent: a real tool call was seen" + (ago != null ? " (" + ago + ")" : "");
+            case "user_turn": return ja ? "送信せず: 利用者の発言の直後" : "not sent: right after a user turn";
+            case "page_busy": return ja ? "送信せず: ページ使用中" : "not sent: page busy";
+            case "disabled_setting": return ja ? "設定で停止中" : "switched off by the setting";
+            case "disabled_env": return ja ? "環境変数 MCP_TOOL_PROBE_SEC で停止中" : "switched off by MCP_TOOL_PROBE_SEC";
+            default: return string.IsNullOrEmpty(reason) ? null : reason;
+        }
+    }
+
+    /// <summary>What the bridge reports ("probe" in its /status, mirrored in the state file). Null
+    /// when the report is unusable (old bridge), so the screen shows nothing instead of guessing.</summary>
+    public static string Describe(bool known, bool enabled, double intervalMin, string source,
+                                  double lastSent, string skipReason, double skipTs, int skipped,
+                                  double evidenceTs, int backoffFailures, double nowUnix, bool ja)
+    {
+        if (!known) return null;
+        string head = ja ? "稼働中: " : "In effect: ";
+        if (!enabled)
+        {
+            head += ja ? "確認メッセージを送りません(画面は「未確認」)" : "no check message is sent (the screen shows 'not checked')";
+            if (source == "env") head += ja ? " / 環境変数が設定より優先" : " / the environment variable overrides the setting";
+            return head;
+        }
+        int im = (int)Math.Round(intervalMin);
+        head += ja ? im + "分ごと(実際のツール呼び出しが無いときだけ)" : "every " + im + " min (only when no real tool call has been seen)";
+        if (source == "env") head += ja ? " / 環境変数が設定より優先" : " / the environment variable overrides the setting";
+        string sent = AgoText(nowUnix, lastSent, ja);
+        head += ja ? " / 直近の送信: " + (sent ?? "なし") : " / last sent: " + (sent ?? "none");
+        if (skipped > 0) head += ja ? " / 送らずに済んだ回数 " + skipped : " / skipped " + skipped + "x";
+        string why = ReasonText(skipReason, nowUnix, evidenceTs, ja);
+        if (why != null && skipTs > 0) head += ja ? " / 直近: " + why : " / last: " + why;
+        if (backoffFailures > 0) head += ja ? " / 失敗後の待機を延長中(連続" + backoffFailures + "回)" : " / backing off after " + backoffFailures + " failure(s)";
+        return head;
+    }
+
+    /// <summary>The note shown when the interval the bridge reports differs from the selection.</summary>
+    public static string PendingText(bool known, bool enabled, double intervalMin, string source, string selected, bool ja)
+    {
+        if (!known || source == "env") return null;
+        double sel;
+        if (!double.TryParse(selected, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out sel)) return null;
+        double reported = enabled ? intervalMin : 0.0;
+        if (Math.Abs(reported - sel) < 0.01) return null;
+        return ja ? "選択は約5分以内に反映" : "selection applies within about 5 minutes";
+    }
+}

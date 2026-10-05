@@ -98,7 +98,11 @@ MECHANISMS = ("fanout", "refuter", "panel", "veto", "retry", "bestofn", "skill",
               "campaigns_ledger_large",
               # A lock refusal landed while several workers had a turn in flight and could not be
               # attributed to this one, so no unlock steer was sent (relay_fleet._looks_locked).
-              "unlock_refusal_unattributed")
+              "unlock_refusal_unattributed",
+              # The bridge's tool-call probe failed (or a probe turn never ran) and the next one
+              # was pushed back (interval x 2^failures, capped) instead of re-asked at once.
+              # One row per backed-off probe (bridge/copilot_bridge.py _record_probe_backoff).
+              "tool_probe_backoff")
 
 
 def patch_hash(text):

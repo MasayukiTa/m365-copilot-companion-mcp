@@ -216,7 +216,8 @@ LIVE_RECORD_REDIRECTS = {
     "bridge.session_store": {"SESS_DIR": "sessions"},
     "tools.tool_probe": {"_PROBE_FILE": "tool_probe.json",
                          "PROBE_FAILURE_JOURNAL": "tool_probe_failures.jsonl",
-                         "_INBOUND_PATH": "probe_inbound.json"},
+                         "_INBOUND_PATH": "probe_inbound.json",
+                         "_STATE_PATH": "tool_probe_state.json"},
 
     # ── THE FOURTH CLASS, 2026-09-24 ─────────────────────────────────────────────────────────
     #
@@ -1444,6 +1445,22 @@ def _no_leftover_kill_switch():
     STOP_FILE.unlink(missing_ok=True)
     yield
     STOP_FILE.unlink(missing_ok=True)
+
+
+@pytest.fixture(autouse=True)
+def _a_probe_backoff_does_not_outlive_its_test():
+    """The bridge keeps the probe's backoff counters at module level (they must survive from one
+    probe to the next). A test that fails a probe or returns an empty turn would otherwise leave
+    them raised for every later test that runs the probe in the same process. Only touches the
+    bridge when some test has already imported it."""
+    import sys
+    b = sys.modules.get("bridge.copilot_bridge")
+    if b is not None and isinstance(getattr(b, "_PROBE_RT", None), dict):
+        b._PROBE_RT.update({"anchor": 0.0, "defer": 0.0, "fails": 0, "empty": 0})
+    yield
+    b = sys.modules.get("bridge.copilot_bridge")
+    if b is not None and isinstance(getattr(b, "_PROBE_RT", None), dict):
+        b._PROBE_RT.update({"anchor": 0.0, "defer": 0.0, "fails": 0, "empty": 0})
 
 
 # --------------------------------------------------------------------------------------------

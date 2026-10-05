@@ -4114,6 +4114,10 @@ class Handler(BaseHTTPRequestHandler):
                 # tab the wall was on. The URL (IdP host) only with the token.
                 "signin_wall": _SIGNIN_WALL is not None,
                 "signin_wall_url": (_SIGNIN_WALL or {}).get("url", "") if authed else "",
+                # WHY THE TOOL-CALL CHECK DID OR DID NOT SEND A MESSAGE (additive, open route:
+                # numbers, a reason code and a tool name only). The same dict the cockpit reads
+                # from .fleet/tool_probe_state.json.
+                "probe": _probe_state_snapshot(),
             }
             if not authed:
                 # WITHOUT THE TOKEN: liveness and the busy flags, nothing that names a
@@ -5967,8 +5971,13 @@ def _find_or_open_agent(ctx):
 # is opened, and no click/consent logic is reimplemented. Runs ONLY when idle (see PAGE_LOCK
 # try-acquire and _LAST_USER_TURN_TS check below), never inside a real user turn.
 
-# 0 disables the probe entirely (opt-out); default 600s (10 min) matches the module docstring.
-MCP_TOOL_PROBE_SEC = float(os.environ.get("MCP_TOOL_PROBE_SEC", "600"))
+# THE ENVIRONMENT VARIABLE IS THE OVERRIDE OF LAST RESORT, NOT THE SCHEDULE. Unset (the normal
+# case) the cadence comes from the `tool_probe_idle_min` setting (cockpit: Recovery section;
+# default 30 min, 0 = never probe), re-read every time the probe decides. Set, it wins over the
+# setting exactly as it always did: a number of seconds, <= 0 disables the probe. None = unset.
+# See tools.tool_probe.probe_interval and _probe_interval_s below.
+_MCP_TOOL_PROBE_ENV = os.environ.get("MCP_TOOL_PROBE_SEC", "").strip()
+MCP_TOOL_PROBE_SEC = float(_MCP_TOOL_PROBE_ENV) if _MCP_TOOL_PROBE_ENV else None
 # Never fire within this many seconds of a real user/goal turn (_LAST_USER_TURN_TS, stamped by
 # _run_one_turn) -- a probe must not compete with, or be mistaken for, live work, and must not
 # burn the user's agent context while they are actively using the bridge.
@@ -5987,6 +5996,132 @@ TOOL_PROBE_TIMEOUT_SEC = 180
 # no longer needs to resolve or reference the user's Desktop path for probing at all.
 
 _TOOL_PROBE_TIMER = None  # the pending threading.Timer, so _schedule_tool_probe can re-arm it
+
+# ── when the probe may cost a Copilot message ──────────────────────────────────────────────
+# Copilot Studio counts SESSIONS, and every probe message opens one (a conversation idle for
+# 30 minutes times out and the next message starts a new session). Measured 2026-09-28..10-05:
+# 118-158 probe messages on full days, a third to a half of them sent within 30 minutes of a REAL
+# tool call that had already proved what the probe exists to prove. So the probe is now the
+# fallback:
+#   * it is skipped while a real, successful, non-probe tool call reached the server within the
+#     last interval (that call's own timestamp is recorded as the health check's evidence);
+#   * when nothing has proved the path for a whole interval it runs, every `tool_probe_idle_min`
+#     minutes (default 30; 0 = never; MCP_TOOL_PROBE_SEC, when set, still overrides);
+#   * after a failed probe it backs off (interval x 2^failures, capped at 2 h) instead of
+#     re-asking quickly -- a failing probe used to be followed by a re-probe and, after a streak,
+#     a conversation recycle, which is a new session each.
+# The decision state is exported (bridge /status "probe", .fleet/tool_probe_state.json) so the
+# screen can say why no probe ran.
+#: How often the timer wakes to re-read the setting and re-check whether a probe is due. Waking
+#: costs nothing (no message); it is what makes a setting change take effect within minutes
+#: instead of after the old interval has run out.
+PROBE_POLL_SEC = 300.0
+_PROBE_RT = {"anchor": 0.0,     # when the last probe turn was SENT (0 = none / retry pending)
+             "defer": 0.0,      # do not run before this (a short retry the caller asked for)
+             "fails": 0,        # consecutive failed verdicts (drives the backoff)
+             "empty": 0}        # consecutive turns that never ran (drives the short-retry backoff)
+_PROBE_STATE = {"last_sent": None, "last_skipped_reason": None, "last_skipped_ts": None,
+                "skipped_since_start": 0, "evidence_ts": None, "evidence_tool": None}
+_PROBE_STATE_WRITTEN = [None]
+
+
+def _probe_interval_s():
+    """(interval_s, source) from MCP_TOOL_PROBE_SEC when set, else the setting. Re-read every call."""
+    return tool_probe.probe_interval(MCP_TOOL_PROBE_SEC, tool_probe.idle_min_setting())
+
+
+def _probe_state_snapshot(now=None):
+    """The probe's state as the screen and /status report it. Never raises."""
+    try:
+        now = time.time() if now is None else now
+        interval_s, src = _probe_interval_s()
+        due = _probe_due_at(interval_s)
+        snap = {
+            "enabled": interval_s > 0,
+            "interval_min": round(interval_s / 60.0, 2),
+            "source": src,
+            "last_sent": _PROBE_STATE["last_sent"],
+            "last_skipped_reason": _PROBE_STATE["last_skipped_reason"],
+            "last_skipped_ts": _PROBE_STATE["last_skipped_ts"],
+            "skipped_since_start": _PROBE_STATE["skipped_since_start"],
+            "evidence_ts": _PROBE_STATE["evidence_ts"],
+            "evidence_tool": _PROBE_STATE["evidence_tool"],
+            "backoff_failures": _PROBE_RT["fails"],
+            "next_due": (due if interval_s > 0 else None),
+        }
+        return snap
+    except Exception:
+        return {"enabled": None}
+
+
+def _publish_probe_state():
+    """Write the snapshot beside the verdict for the cockpit, only when it changed."""
+    try:
+        snap = _probe_state_snapshot()
+        key = json.dumps({k: v for k, v in snap.items() if k != "next_due"}, sort_keys=True)
+        if key == _PROBE_STATE_WRITTEN[0]:
+            return
+        snap["written"] = time.time()
+        if tool_probe.write_state(snap):
+            _PROBE_STATE_WRITTEN[0] = key
+    except Exception:
+        pass
+
+
+def _probe_skipped(reason, count=True, **extra):
+    """Say why this tick sent nothing. `count` is False for 'switched off', which is not a probe
+    that would have run."""
+    now = time.time()
+    # One skipped probe is one count: a user turn keeps the retry at 5-30 s and would otherwise
+    # be counted every time it looks again.
+    if count and (reason != _PROBE_STATE["last_skipped_reason"]
+                  or now - float(_PROBE_STATE["last_skipped_ts"] or 0.0) > 120.0):
+        _PROBE_STATE["skipped_since_start"] += 1
+    _PROBE_STATE["last_skipped_reason"] = reason
+    _PROBE_STATE["last_skipped_ts"] = now
+    for k, v in extra.items():
+        _PROBE_STATE[k] = v
+    _publish_probe_state()
+
+
+def _probe_due_at(interval_s):
+    """Epoch time before which no probe message is sent: the last send + the interval, stretched
+    by the failure backoff, or the explicit short retry the last tick asked for."""
+    base = tool_probe.backoff_s(interval_s, _PROBE_RT["fails"])
+    return max(_PROBE_RT["anchor"] + base if _PROBE_RT["anchor"] > 0 else 0.0, _PROBE_RT["defer"])
+
+
+def _probe_wait_s(now=None):
+    """Seconds until the next tick should look at the probe again: the time until it is due,
+    never longer than PROBE_POLL_SEC (so a changed setting is noticed) and never zero."""
+    now = time.time() if now is None else now
+    interval_s, _src = _probe_interval_s()
+    if interval_s <= 0:
+        return PROBE_POLL_SEC
+    return max(5.0, min(PROBE_POLL_SEC, _probe_due_at(interval_s) - now))
+
+
+def _probe_not_due_yet(now=None):
+    """Seconds to wait if no probe is due yet, else None. Disabled counts as 'not due'."""
+    now = time.time() if now is None else now
+    interval_s, _src = _probe_interval_s()
+    if interval_s <= 0:
+        return None            # _run_tool_probe records the reason and returns
+    remaining = _probe_due_at(interval_s) - now
+    return None if remaining <= 0 else max(5.0, min(PROBE_POLL_SEC, remaining))
+
+
+def _record_probe_backoff(kind, failures, wait_s):
+    """One mechanism row per backed-off probe, so 'how often did the probe fail and how long did
+    it stay quiet afterwards' is a query and not a log search. Never raises."""
+    try:
+        from relay import mechanism_telemetry as _mt
+        _mt.record("tool_probe_backoff", configured=True, config_source="tool_probe_idle_min",
+                   eligible=True, triggered=True, executed=True,
+                   extra={"kind": kind, "consecutive_failures": int(failures),
+                          "next_probe_in_s": int(wait_s)})
+    except Exception:
+        pass
 
 
 # ── conversation recycling on token exhaustion ──────────────────────────────────
@@ -6555,14 +6690,38 @@ def _run_tool_probe():
     _probe_borrowed = None       # bound before the try: the finally below reads it on every
                                  # path, including one that throws before the borrow.
     try:
-        if MCP_TOOL_PROBE_SEC <= 0:
-            return  # opt-out
+        _interval_s, _interval_src = _probe_interval_s()
+        if _interval_s <= 0:
+            # Opt-out: the setting (0 = never) or MCP_TOOL_PROBE_SEC<=0. The health check then
+            # reads "not checked", never green -- nothing is measured, nothing is claimed.
+            _probe_skipped("disabled_env" if _interval_src == "env" else "disabled_setting",
+                           count=False)
+            return
+        # A REAL CALL IS BETTER EVIDENCE THAN OURS, AND FREE. If a real tool call -- not a probe,
+        # not discovery chatter -- reached the server and succeeded within the last interval, the
+        # thing this probe exists to prove has just been proved, so no message is sent. The health
+        # check is recorded as passed by THAT call, at ITS timestamp (never "now"), so the age the
+        # screen shows is the age of something that happened and the check can never be green
+        # without an event behind it.
+        try:
+            from tools import fleet_tool_health as _fth
+            _ev = _fth.last_real_success(time.time(), _interval_s)
+        except Exception:
+            _ev = None
+        if _ev is not None:
+            tool_probe.record_evidence(_ev[0], _ev[1])
+            _probe_skipped("fleet_evidence", evidence_ts=_ev[0], evidence_tool=_ev[1])
+            # Look again when that call would stop counting (it is the newest one, so nothing
+            # younger exists): until then every tick would find the same answer.
+            return max(60.0, min(_interval_s, _ev[0] + _interval_s - time.time()))
         since_user = time.time() - _LAST_USER_TURN_TS
         if since_user < TOOL_PROBE_MIN_IDLE_SEC:
             logger.debug("tool probe: skipped (user turn %.0fs ago)", since_user)
+            _probe_skipped("user_turn")
             return max(5.0, TOOL_PROBE_MIN_IDLE_SEC - since_user)
         if not PAGE_LOCK.acquire(blocking=False):
             logger.debug("tool probe: skipped (page busy)")
+            _probe_skipped("page_busy")
             return 15.0
         try:
             # BORROW INSIDE THE LOCK, AND GIVE IT BACK BEFORE RELEASING.
@@ -6615,6 +6774,13 @@ def _run_tool_probe():
             # FleetCockpit renders this as a spinner, so a 30-180s real tool round-trip never
             # looks like an inert stale-red indicator.
             tool_probe.record_probe(False, "checking", detail="tool probe in progress")
+            # From here a message is going out, whatever its outcome: this is the anchor the next
+            # due time is counted from (and the backoff stretches), and what the screen reports
+            # as the last probe sent.
+            _PROBE_RT["anchor"] = time.time()
+            _PROBE_RT["defer"] = 0.0
+            _PROBE_STATE["last_sent"] = _PROBE_RT["anchor"]
+            _publish_probe_state()
             # A FRESH, unguessable challenge every probe (see tool_probe.new_probe_challenge's
             # docstring) -- the token has to travel with this specific turn, so it is captured
             # here and threaded through to the verify_probe_reply() call(s) below rather than
@@ -6743,7 +6909,15 @@ def _run_tool_probe():
                     detail="probe turn returned empty in %.1fs; retrying" % _turn_s)
             except Exception:
                 pass
-            return PROBE_EMPTY_TURN_RETRY_SEC
+            # BACK OFF, NOT A FIXED 30 s FOREVER. Each of these retries is a real message (and a
+            # new session), and a page that keeps answering "idle" before anything was sent used
+            # to be asked again every 30 s without limit. 30 s, 60 s, 120 s ... never beyond the
+            # interval; reset by the first turn that really ran.
+            _PROBE_RT["empty"] += 1
+            _wait = min(_interval_s, PROBE_EMPTY_TURN_RETRY_SEC * (2 ** (_PROBE_RT["empty"] - 1)))
+            _record_probe_backoff("empty_turn", _PROBE_RT["empty"], _wait)
+            return _wait
+        _PROBE_RT["empty"] = 0
         tool_probe.record_probe(ok, kind, detail=(reply or "")[:200],
                                 alive=bool((reply or "").strip()), inbound=_inbound)
         # Additive: preserve the FULL reply (record_probe's `detail` above stays truncated to
@@ -6755,6 +6929,7 @@ def _run_tool_probe():
         except Exception:
             pass
         logger.info("tool probe: ok=%s kind=%s", ok, kind)
+        _publish_probe_state()
         try:
             _report_recycle_memory_effect()
         except Exception:
@@ -6775,6 +6950,7 @@ def _run_tool_probe():
         # conversation that caused it.
         global _PROBE_FAIL_STREAK
         if ok:
+            _PROBE_RT["fails"] = 0
             _PROBE_FAIL_STREAK = 0
             # ONLY AFTER A GOOD PROBE, and only after the record above. Recycling a
             # conversation that just failed would replace the evidence of the failure with a
@@ -6786,6 +6962,13 @@ def _run_tool_probe():
                 logger.warning("conversation recycle raised", exc_info=True)
         else:
             _PROBE_FAIL_STREAK += 1
+            # A FAILED PROBE MAKES THE NEXT ONE LATER, NOT SOONER. interval x 2^failures, capped
+            # at two hours (tools.tool_probe.backoff_s); _probe_due_at applies it. A path that is
+            # down is not found sooner by asking it more often -- and each ask is a session.
+            _PROBE_RT["fails"] += 1
+            _record_probe_backoff(
+                kind, _PROBE_RT["fails"],
+                tool_probe.backoff_s(_interval_s, _PROBE_RT["fails"]))
             if _PROBE_FAIL_STREAK >= PROBE_STUCK_CONVERSATION_FAILURES:
                 # The evidence is already on disk -- record_probe and journal_probe_failure
                 # both ran above, this time and the previous times -- so the objection to
@@ -6798,6 +6981,7 @@ def _run_tool_probe():
                     _recycle_long_conversation(force=True)
                 except Exception:
                     logger.warning("conversation recycle raised", exc_info=True)
+        _publish_probe_state()          # again: the failure count above changed the report
         if _page_probe_requires_restart(kind):
             try:
                 tool_probe.record_probe(
@@ -6862,15 +7046,26 @@ def _schedule_tool_probe(delay=None):
     fix above). Every self-re-arm from _tick() below omits it, so all SUBSEQUENT runs use the
     normal MCP_TOOL_PROBE_SEC idle cadence unchanged."""
     global _TOOL_PROBE_TIMER
-    if MCP_TOOL_PROBE_SEC <= 0:
+    if MCP_TOOL_PROBE_SEC is not None and MCP_TOOL_PROBE_SEC <= 0:
+        # The environment override says never: nothing is armed, as before. (The SETTING being 0
+        # is different -- it can be switched back on from the cockpit, so the timer keeps polling
+        # it; see _probe_wait_s.)
         logger.info("tool probe: disabled (MCP_TOOL_PROBE_SEC<=0)")
+        _probe_skipped("disabled_env", count=False)
         return
-    wait = MCP_TOOL_PROBE_SEC if delay is None else max(0.0, delay)
+    wait = _probe_wait_s() if delay is None else max(0.0, delay)
 
     def _tick():
         retry_delay = None
         try:
-            retry_delay = _run_tool_probe()
+            retry_delay = _probe_not_due_yet()
+            if retry_delay is None:
+                retry_delay = _run_tool_probe()
+                if retry_delay is not None:
+                    # A number from _run_tool_probe means "run me again after this long": it
+                    # replaces the normal cadence (a short retry, or the end of the evidence).
+                    _PROBE_RT["anchor"] = 0.0
+                    _PROBE_RT["defer"] = time.time() + float(retry_delay)
         except Exception:
             logger.warning("tool probe: _tick raised", exc_info=True)
             retry_delay = 30.0
