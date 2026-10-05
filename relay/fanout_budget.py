@@ -71,10 +71,11 @@ MAX_ROOTS_EXPORTED = 20
 _TERMINAL = ("done", "stuck", "maxturns", "error", "cancelled", "content_refused")
 _NOT_YET_RUNNING = ("pending",)
 
-#: The CPU bound on reading the ledger: a file past this is "unknown" (fail closed for nested
-#: splits only). It was 2 MB, which a few dozen finished campaigns exceed, and it disabled
-#: fan-out on every machine whose ledger had grown; retention caps the file at 64 MB.
-_MAX_CAMPAIGN_BYTES = 50000000
+#: There is NO size gate on reading the ledger. It was 2 MB (disabled fan-out on every machine
+#: whose ledger had grown), then 50 MB, but retention does not compact campaigns.jsonl
+#: (fleet_retention only warns), so any byte cap eventually turns a long-lived machine into
+#: "usage unknown" and refuses every nested split. The read is streamed and cached by
+#: (mtime, size) and appended incrementally, so its cost is the file's growth, not its size.
 
 
 def default_limits():
@@ -326,12 +327,10 @@ def _scan_headers(path, state):
 
 
 def _header_index(path):
-    """The campaign-header index of `path`, or None when it cannot be built (unreadable, or
-    past _MAX_CAMPAIGN_BYTES, the CPU bound). Cached by (mtime, size), appended incrementally."""
+    """The campaign-header index of `path` (the caller turns an OSError into "unknown"; the
+    file's size never does). Cached by (mtime, size), appended incrementally."""
     st = os.stat(path)
     sig = (st.st_mtime_ns, st.st_size)
-    if st.st_size > _MAX_CAMPAIGN_BYTES:
-        return None
     key = os.path.normcase(os.path.abspath(path))
     state = _INDEX_CACHE.get(key)
     if state is not None and state["sig"] == sig:
@@ -352,7 +351,7 @@ def read_campaign_rows(path, root_ids=None):
     but cannot be read (unknown, so a caller fails closed).
 
     The ledger is STREAMED, never loaded whole, and its size no longer turns into "unknown" until
-    _MAX_CAMPAIGN_BYTES (50 MB), far above where a ledger sits under retention. Only header rows
+    any byte cap (there is none). Only header rows
     are returned (the only rows usage_from_status reads), reduced to the fields it uses.
     `root_ids` (an iterable of ids) narrows the result to exactly those roots; None returns every
     header. A row belongs to root_id when its root_id is that id, or, with no root_id, when its

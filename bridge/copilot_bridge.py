@@ -2904,6 +2904,7 @@ _CONSENT_CHAIN_MAX = int(os.environ.get("MCP_CONSENT_CHAIN_MAX", "12"))
 _SETTLE_RESET_TRACE_AFTER_S = float(os.environ.get("MCP_SETTLE_RESET_TRACE_AFTER_S", "20"))
 _SETTLE_RESET_TRACE_PATH = os.path.join(".fleet", "settle_reset.jsonl")
 _SETTLE_RESET_TRACE_MAX_BYTES = 2_000_000
+_OUTER_READ_CAPPED_SAID = False
 
 
 def _outer_read_trace(t0, cleaned, final, partial):
@@ -2924,6 +2925,15 @@ def _outer_read_trace(t0, cleaned, final, partial):
         path = os.path.join(".fleet", "outer_read.jsonl")
         try:
             if os.path.getsize(path) > _SETTLE_RESET_TRACE_MAX_BYTES:
+                # SAME AS _settle_reset_trace: a log that stops quietly reads as good news.
+                global _OUTER_READ_CAPPED_SAID
+                if not _OUTER_READ_CAPPED_SAID:
+                    _OUTER_READ_CAPPED_SAID = True
+                    with open(path, "a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(
+                            {"ts": now, "event": "log_capped",
+                             "note": "size limit reached; nothing after this line was "
+                                     "recorded"}, ensure_ascii=False) + chr(10))
                 return
         except OSError:
             pass

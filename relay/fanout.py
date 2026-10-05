@@ -1017,7 +1017,11 @@ def aggregation_prompt(parent_goal, results, limit_each=1200, parent_partial="")
         head = "--- サブタスク %s / %s ---" % (r.get("subtask_index", "?"),
                                               (r.get("outcome") or "?"))
         body = (r.get("result") or "").strip()
-        if len(body) > limit_each:
+        # `>=`, NOT `>`: the ledger already clips a stored answer to this same length
+        # (fleet_resume.CHILD_RESULT_CAP), so a body of EXACTLY the limit is a clipped one and
+        # used to reach the merge with no marker -- the live merge of c53e2941 read a finished
+        # slot as "cut off mid-chapter" and reported it incomplete.
+        if len(body) >= limit_each:
             body = body[:limit_each] + "\n…（以下略）"
         parts.append("%s\n%s" % (head, body or "(報告なし)"))
 
