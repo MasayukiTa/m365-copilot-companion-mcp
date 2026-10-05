@@ -158,7 +158,7 @@ class CockpitProgram
 // required. One process drains all pending gates so a burst of workers never creates a window storm.
 class ApprovalPromptWindow : Window
 {
-    readonly JavaScriptSerializer _js = new JavaScriptSerializer();
+    readonly JavaScriptSerializer _js = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
     string _gateDir;
     string _currentPath;
     //: Why the path was refused, kept so the window can say it. It used to close itself in

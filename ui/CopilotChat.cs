@@ -279,6 +279,7 @@ class ChatWindow : Window, IChatSendEffects
         if (k == "tip_theme")     return _dark ? (ja ? "ライトテーマへ" : "Switch to light theme") : (ja ? "ダークテーマへ" : "Switch to dark theme");
         if (k == "rename_link")   return ja ? "名前変更" : "Rename";
         if (k == "show_more")     return ja ? ("+" + "{0}" + " 件を表示") : ("+{0} more");
+        if (k == "older_more")    return ja ? "さらに古い会話を読み込む（残り {0} 件）…" : "Load older conversations ({0} left)…";
         return k;
     }
 
@@ -1051,7 +1052,7 @@ class ChatWindow : Window, IChatSendEffects
                     RegistryTranscriptLineage(d), null, latestHint);
             }
         }
-        catch { }
+        catch (Exception ex) { NoteTranscriptLineFailure(url, ex); }
         return FleetConvIdentity.MergeTranscriptLineage(null, null, latestHint);
     }
 
@@ -1095,11 +1096,7 @@ class ChatWindow : Window, IChatSendEffects
     //
     // Strip a trailing ".gz" to get the logical (uncompressed) transcript identity, so a plain file
     // and its compressed successor are recognised as the SAME transcript.
-    static string StripGz(string path)
-    {
-        return (path != null && path.EndsWith(".gz", StringComparison.OrdinalIgnoreCase))
-            ? path.Substring(0, path.Length - 3) : path;
-    }
+    static string StripGz(string path) { return ConvListing.StripGz(path); }
 
     // True if the transcript exists on disk in EITHER form (plain or gzipped), regardless of
     // which spelling the caller has.
@@ -1114,21 +1111,7 @@ class ChatWindow : Window, IChatSendEffects
     // Enumerate every transcript in tdir, merging "*.jsonl" and "*.jsonl.gz" into one list
     // deduped by logical name (StripGz) -- when both spellings exist for the same transcript
     // (a race with fleet_retention mid-compress), the plain file wins the slot.
-    static List<string> ListTranscriptFiles(string tdir)
-    {
-        var byKey = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        var raw = new List<string>(Directory.GetFiles(tdir, "*.jsonl"));
-        raw.AddRange(Directory.GetFiles(tdir, "*.jsonl.gz"));
-        foreach (var f in raw)
-        {
-            string key = StripGz(f);
-            string existing;
-            bool fIsGz = f.EndsWith(".gz", StringComparison.OrdinalIgnoreCase);
-            if (!byKey.TryGetValue(key, out existing) || (!fIsGz && existing.EndsWith(".gz", StringComparison.OrdinalIgnoreCase)))
-                byKey[key] = f;
-        }
-        return new List<string>(byKey.Values);
-    }
+    static List<string> ListTranscriptFiles(string tdir) { return ConvListing.ListTranscriptFiles(tdir); }
 
     // Open a transcript for reading regardless of compression: resolves to whichever of
     // path/path+".gz" actually exists on disk (a caller may hand either spelling), then wraps the
@@ -1270,7 +1253,7 @@ class ChatWindow : Window, IChatSendEffects
                 return meta != null ? SS(meta, "goal") : "";
             }
         }
-        catch { return ""; }
+        catch (Exception ex) { NoteTranscriptLineFailure(path, ex); return ""; }
     }
 
     // One JSONL transcript line -> a turn, or nothing. Shared by the full read above and the
@@ -1291,7 +1274,15 @@ class ChatWindow : Window, IChatSendEffects
         if (string.IsNullOrEmpty(ln)) return false;
         Dictionary<string, object> o;
         try { o = _cjs.DeserializeObject(ln) as Dictionary<string, object>; }
-        catch { return false; }
+        catch (Exception ex)
+        {
+            // A line that does not parse is a turn the reader could not show. The writer appends
+            // while this runs, so a half-written LAST line is expected and harmless; anything
+            // else is not, and used to vanish without a trace (a line over the serializer's
+            // 2 MB default was dropped here, which is how a long answer went missing).
+            NoteTranscriptLineFailure(ln, ex);
+            return false;
+        }
         if (o == null) return false;
         if (!o.ContainsKey("role")) return false;   // skip meta / guid marker lines
         string role = o["role"] != null ? o["role"].ToString() : "assistant";
@@ -1300,6 +1291,15 @@ class ChatWindow : Window, IChatSendEffects
         if (text.Trim().Length == 0) return false;
         msg = new Msg(role.StartsWith("user") ? "U" : "A", text);
         return true;
+    }
+
+    int _lineFailures;
+    void NoteTranscriptLineFailure(string ln, Exception ex)
+    {
+        if (++_lineFailures > 20) return;      // a damaged file must not fill the log
+        ConvListing.Diag(Path.GetDirectoryName(_convsPath),
+            "transcript line (" + (ln == null ? 0 : ln.Length) + " chars) not readable: "
+            + ex.GetType().Name + ": " + ex.Message);
     }
 
     // Append any captured sub-agent (research) conversations for this worker. Each deep-dive is
@@ -1402,19 +1402,31 @@ class ChatWindow : Window, IChatSendEffects
         return sb.ToString().TrimEnd('\n');
     }
 
+    // THE REGISTRY, READ WITHOUT SWALLOWING. This used to be a bare `catch { }` returning an empty
+    // list, and the file crossed the serializer's 2,097,152-character default: every read threw,
+    // nothing was logged, and the sidebar showed no registry rows at all with no sign why. A
+    // failure is now logged (.fleet/chat_listing.log) and shown as a one-line notice in the
+    // sidebar; a later successful read clears it.
     List<object> ReadConvsRegistry()
     {
-        try
+        string err;
+        var rows = ConvListing.ReadRegistry(_convsPath, out err);
+        if (err.Length > 0)
         {
-            if (File.Exists(_convsPath))
-            {
-                var a = _cjs.DeserializeObject(File.ReadAllText(_convsPath, Encoding.UTF8)) as object[];
-                if (a != null) return new List<object>(a);
-            }
+            if (err != _lastRegistryError)
+                ConvListing.Diag(Path.GetDirectoryName(_convsPath), "registry read failed: " + err);
+            _lastRegistryError = err;
+            _historyNotice = ConvListing.UnreadableNotice(_lang == 0, err);
         }
-        catch { }
-        return new List<object>();
+        else if (_lastRegistryError.Length > 0)
+        {
+            _lastRegistryError = "";
+            _historyNotice = "";
+        }
+        return rows;
     }
+    string _lastRegistryError = "";
+    string _historyNotice = "";
     // Add this conversation to the shared registry so the cockpit/other side lists it.
     void RegisterConv(string url, string title, string source)
     {
@@ -1422,6 +1434,7 @@ class ChatWindow : Window, IChatSendEffects
         try
         {
             var list = ReadConvsRegistry();
+            if (_lastRegistryError.Length > 0) return;   // never write back what could not be read: that replaces the file with this one row
             foreach (var o in list) { var d = o as Dictionary<string, object>; if (d != null && SS(d, "url") == url) return; }
             var e = new Dictionary<string, object>(); e["url"] = url; e["title"] = title ?? ""; e["source"] = source; e["ts"] = 0;
             list.Add(e);
@@ -1438,6 +1451,7 @@ class ChatWindow : Window, IChatSendEffects
         try
         {
             var list = ReadConvsRegistry();
+            if (_lastRegistryError.Length > 0) return;   // same: an unreadable registry must not be overwritten with the remainder
             var keep = new List<object>();
             foreach (var o in list)
             {
@@ -1461,6 +1475,7 @@ class ChatWindow : Window, IChatSendEffects
             if (m == _convsMtime) return;
             _convsMtime = m;
             bool added = false;
+            string noticeBefore = _historyNotice;
             foreach (var o in ReadConvsRegistry())
             {
                 var d = o as Dictionary<string, object>;
@@ -1530,17 +1545,24 @@ class ChatWindow : Window, IChatSendEffects
                     c.Transcript = FleetConvIdentity.LatestTranscript(c.Transcripts, transcript);
                     c.Name = regName;
                     c.Goal = regGoal;
-                    try { c.Ts = (d.ContainsKey("ts") && d["ts"] != null) ? Convert.ToDouble(d["ts"]) : 0; }
-                    catch { c.Ts = 0; }
+                    double tsv;
+                    c.Ts = (d.ContainsKey("ts") && d["ts"] != null
+                            && double.TryParse(Convert.ToString(d["ts"], System.Globalization.CultureInfo.InvariantCulture),
+                                               System.Globalization.NumberStyles.Float,
+                                               System.Globalization.CultureInfo.InvariantCulture, out tsv)) ? tsv : 0;
                     _all.Insert(0, c);   // newest on top (registry/fleet convs were appended below)
                     added = true;
                 }
             }
-            if (added) RefreshConvList();
+            if (added || _historyNotice != noticeBefore) RefreshConvList();
         }
-        catch { }
+        catch (Exception ex)
+        {
+            ConvListing.Diag(Path.GetDirectoryName(_convsPath), "SyncRegistry failed: " + ex);
+            _historyNotice = ConvListing.UnreadableNotice(_lang == 0, ex.Message);
+        }
     }
-    readonly JavaScriptSerializer _cjs = new JavaScriptSerializer();
+    readonly JavaScriptSerializer _cjs = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
 
     // ── sidebar state persistence (pinned / archived / collapsed) ────────────────
     // Schema: {"pinned":["id",...], "archived":["id",...], "forced_today":["id",...],
@@ -3169,6 +3191,7 @@ class ChatWindow : Window, IChatSendEffects
         }
 
         _convList.Children.Clear();
+        if (_historyNotice.Length > 0) _convList.Children.Add(MakeHistoryNotice(_historyNotice));
 
         // Render sections in order: Pinned, Recent, Fleet, Archived.
         // Header always shows when the section is non-empty (so a collapsed section can be expanded).
@@ -3178,6 +3201,7 @@ class ChatWindow : Window, IChatSendEffects
         RenderSection(todayList,    "sec_today",    "today",    false, false, false);
         RenderSection(fleetList,    "sec_fleet",    "fleet",    true,  false, false);
         RenderSection(archivedList, "sec_archived", "archived", false, true,  false);
+        if (TranscriptsPending() > 0) _convList.Children.Add(MakeOlderRow(TranscriptsPending()));
 
         RefreshHeadTitle();   // keep the header title in sync with the active conversation (Wave 2)
     }
@@ -3223,6 +3247,38 @@ class ChatWindow : Window, IChatSendEffects
             foreach (var c in list)
                 if (c.Id == _conv.Id) AddConvRow(c, isFleet, archived, isPinned);   // keep the open conv reachable
         }
+    }
+
+    // One line at the top of the sidebar when part of the history could not be read.
+    UIElement MakeHistoryNotice(string text)
+    {
+        var tb = new TextBlock
+        {
+            Text = text, FontSize = 11.5, TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(12, 6, 8, 6)
+        };
+        SetRef(tb, TextBlock.ForegroundProperty, "Warning");
+        return tb;
+    }
+
+    // "Older..." row under the last section: loads the next page (one day) of the transcripts
+    // that are on disk but not yet listed. See LoadTranscriptPage.
+    UIElement MakeOlderRow(int pending)
+    {
+        var tb = new TextBlock
+        {
+            Text = T("older_more").Replace("{0}", pending.ToString()),
+            FontSize = 11.5, VerticalAlignment = VerticalAlignment.Center
+        };
+        SetRef(tb, TextBlock.ForegroundProperty, "Accent");
+        var btn = new Button
+        {
+            Content = tb, HorizontalContentAlignment = HorizontalAlignment.Left,
+            Padding = new Thickness(16, 6, 6, 8), Margin = new Thickness(0, 4, 0, 4),
+            BorderThickness = new Thickness(0), Background = Brushes.Transparent, Cursor = Cursors.Hand
+        };
+        btn.Click += delegate { LoadOlderPage(); };
+        return btn;
     }
 
     // Muted "+N more" row (ITEM 3c). Clicking expands the section for the session (RefreshConvList).
@@ -3823,6 +3879,10 @@ class ChatWindow : Window, IChatSendEffects
             {
                 c.Transcripts = FleetConvIdentity.MergeTranscriptLineage(c.Transcripts, null, tp);
                 c.Transcript = FleetConvIdentity.LatestTranscript(c.Transcripts, tp);
+                // The registry keeps only the head of an old row's goal (relay/fleet_retention.py
+                // compaction); the whole text is the transcript's first line, and a follow-up is
+                // addressed by it (ChatSend.DecideFleetSend), so restore it as the row is opened.
+                c.Goal = FleetConvIdentity.MergeForward(c.Goal, TranscriptMetaGoal(c.Transcript));
                 var tm = ReadTranscriptLineage(c.Transcripts);
                 foreach (var mm in tm) c.Messages.Add(mm);
             }
@@ -5247,7 +5307,7 @@ class ChatWindow : Window, IChatSendEffects
                     // stamp last-activity from the file mtime so the sidebar can sort by RECENCY
                     // (newest first) rather than alphabetically. Fleet/registry convs already carry Ts.
                     try { c.Ts = (File.GetLastWriteTimeUtc(f) - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds; }
-                    catch { c.Ts = 0; }
+                    catch (Exception ex) { c.Ts = 0; NoteTranscriptLineFailure(f, ex); }
                     foreach (var ln in File.ReadAllLines(f, Encoding.UTF8))
                     {
                         var tab = ln.IndexOf('\t'); if (tab < 0) continue;
@@ -5260,7 +5320,11 @@ class ChatWindow : Window, IChatSendEffects
                 }
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            ConvListing.Diag(Path.GetDirectoryName(_convsPath), "saved chats not readable: " + ex);
+            _historyNotice = ConvListing.UnreadableNotice(_lang == 0, ex.Message);
+        }
         DiscoverTranscripts();   // surface every fleet worker's disk transcript as a past chat
         // Restore what was open last time. _all[0] is just the first record read off disk --
         // neither the newest nor the one being worked on -- so startup used to reopen whatever
@@ -5292,6 +5356,20 @@ class ChatWindow : Window, IChatSendEffects
     // conversation whose agent the bridge is not on -> not one past chat was retrievable. Newest
     // first, capped so a huge dir doesn't flood the list; dedup by transcript path; sub-agent
     // (research) child transcripts are skipped (they nest under their parent on open).
+    //
+    // PAGED, NOT CAPPED (2026-10-05). The scan used to stop at the newest 80 and never run again,
+    // so 3,229 of 3,309 transcripts on disk were not in the sidebar at all. The directory is now
+    // indexed once (names and mtimes only: no file is opened) and the sidebar takes it a page at
+    // a time: the newest ConvListing.FirstPage at startup, then one local day per "older" click
+    // (LoadOlderPage). Opening a row still reads the local transcript first.
+    List<KeyValuePair<string, DateTime>> _transcriptIndex;
+    int _transcriptPos;
+
+    int TranscriptsPending()
+    {
+        return _transcriptIndex == null ? 0 : Math.Max(0, _transcriptIndex.Count - _transcriptPos);
+    }
+
     void DiscoverTranscripts()
     {
         try
@@ -5300,68 +5378,106 @@ class ChatWindow : Window, IChatSendEffects
             if (!Directory.Exists(tdir)) return;
             // Merged glob: relay/fleet_retention.py gzips anything older than
             // COMPRESS_AFTER_HOURS and deletes the plain file, so "*.jsonl" alone only ever
-            // shows the last few hours. See ListTranscriptFiles for the dedupe rule.
-            var files = ListTranscriptFiles(tdir);
-            files.Sort(delegate (string a, string b) { return File.GetLastWriteTimeUtc(b).CompareTo(File.GetLastWriteTimeUtc(a)); });
-            int budget = 80;
-            foreach (var f in files)
+            // shows the last few hours. See ConvListing.ListTranscriptFiles for the dedupe rule.
+            _transcriptIndex = ConvListing.ListMainTranscripts(tdir);
+            _transcriptPos = 0;
+            LoadTranscriptPage();
+        }
+        catch (Exception ex)
+        {
+            ConvListing.Diag(Path.GetDirectoryName(_convsPath), "transcript scan failed: " + ex);
+            _historyNotice = ConvListing.UnreadableNotice(_lang == 0, ex.Message);
+        }
+    }
+
+    // The "older" row's action: add the next page (one day) of transcripts to the sidebar and
+    // open the Archived section so they are visible. A page whose rows were all already listed
+    // (through the registry) is skipped over rather than reported as empty.
+    void LoadOlderPage()
+    {
+        int added = 0;
+        try
+        {
+            while (added == 0 && TranscriptsPending() > 0) added = LoadTranscriptPage();
+        }
+        catch (Exception ex)
+        {
+            ConvListing.Diag(Path.GetDirectoryName(_convsPath), "older page failed: " + ex);
+            _historyNotice = ConvListing.UnreadableNotice(_lang == 0, ex.Message);
+        }
+        _sectionCollapsed["archived"] = false;
+        _sectionExpanded.Add("archived");
+        RefreshConvList();
+    }
+
+    // Adds the next page of the transcript index to _all; returns how many rows it added.
+    int LoadTranscriptPage()
+    {
+        if (_transcriptIndex == null) return 0;
+        int end = ConvListing.PageEnd(_transcriptIndex, _transcriptPos, ConvListing.MaxPage);
+        var known = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var c in _all)
+        {
+            if (!string.IsNullOrEmpty(c.Transcript)) known.Add(StripGz(c.Transcript));
+            foreach (string tx in c.Transcripts)
+                if (!string.IsNullOrEmpty(tx)) known.Add(StripGz(tx));
+        }
+        int added = 0;
+        for (int i = _transcriptPos; i < end; i++)
+        {
+            string f = _transcriptIndex[i].Key;
+            if (known.Contains(StripGz(f))) continue;
+            string goal = "", name = "", guid = "";
+            try
             {
-                if (budget-- <= 0) break;
-                if (f.IndexOf("__sub_", StringComparison.Ordinal) >= 0) continue;   // research children
-                bool exists = false;
-                foreach (var c in _all)
+                using (var sr = OpenTranscriptReader(f))
                 {
-                    if (StripGz(c.Transcript) == StripGz(f)) { exists = true; break; }
-                    foreach (string tx in c.Transcripts)
-                        if (StripGz(tx) == StripGz(f)) { exists = true; break; }
-                    if (exists) break;
-                }
-                if (exists) continue;
-                string goal = "", name = "", guid = "";
-                try
-                {
-                    using (var sr = OpenTranscriptReader(f))
+                    string first = sr.ReadLine();
+                    if (!string.IsNullOrEmpty(first))
                     {
-                        string first = sr.ReadLine();
-                        if (!string.IsNullOrEmpty(first))
-                        {
-                            var meta = _cjs.DeserializeObject(first) as Dictionary<string, object>;
-                            if (meta != null) { goal = SS(meta, "goal"); name = SS(meta, "name"); }
-                        }
-                        // THE CONVERSATION'S OWN IDENTITY, written by _tx.note_guid on the
-                        // first poll after the worker's first turn. Without it ConvUrl stays
-                        // empty and _activeFleetUrl never arms, so neither steer mode nor the
-                        // live snapshot refresh can recognise the open conversation.
-                        // Bounded: the guid line lands within the first turn or not at all,
-                        // and this runs for up to 80 transcripts at startup.
-                        for (int li = 0; li < 40 && guid.Length == 0; li++)
-                        {
-                            string ln2 = sr.ReadLine();
-                            if (ln2 == null) break;
-                            if (ln2.IndexOf("\"guid\"", StringComparison.Ordinal) < 0) continue;
-                            var gd = _cjs.DeserializeObject(ln2) as Dictionary<string, object>;
-                            if (gd != null) guid = SS(gd, "guid");
-                        }
+                        var meta = _cjs.DeserializeObject(first) as Dictionary<string, object>;
+                        if (meta != null) { goal = SS(meta, "goal"); name = SS(meta, "name"); }
+                    }
+                    // THE CONVERSATION'S OWN IDENTITY, written by _tx.note_guid on the
+                    // first poll after the worker's first turn. Without it ConvUrl stays
+                    // empty and _activeFleetUrl never arms, so neither steer mode nor the
+                    // live snapshot refresh can recognise the open conversation.
+                    // Bounded: the guid line lands within the first turn or not at all,
+                    // and this runs for up to a page of transcripts.
+                    for (int li = 0; li < 40 && guid.Length == 0; li++)
+                    {
+                        string ln2 = sr.ReadLine();
+                        if (ln2 == null) break;
+                        if (ln2.IndexOf("\"guid\"", StringComparison.Ordinal) < 0) continue;
+                        var gd = _cjs.DeserializeObject(ln2) as Dictionary<string, object>;
+                        if (gd != null) guid = SS(gd, "guid");
                     }
                 }
-                catch { }
-                string title = goal.Length > 0 ? (goal.Length > 54 ? goal.Substring(0, 54) + "…" : goal)
-                                               : Path.GetFileNameWithoutExtension(StripGz(f));
-                double ts = 0;
-                try { ts = (File.GetLastWriteTimeUtc(f) - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds; }
-                catch { }
-                var discovered = new Conversation { Transcript = f, Name = name, Title = title, Source = "fleet",
-                                            Ts = ts, Goal = goal,
-                                            // "sess:<guid>" -- the bridge's own shape for a
-                                            // conversation with no navigable URL. NOT a url:
-                                            // calling it one is how a resume silently becomes
-                                            // a fresh chat.
-                                            ConvUrl = guid.Length > 0 ? "sess:" + guid : "" };
-                discovered.Transcripts.Add(f);
-                _all.Add(discovered);
             }
+            catch (Exception ex)
+            {
+                // The row is still listed (by file name) and still opens; only its title and
+                // identity are missing. Logged, because a file that cannot be read here is
+                // usually one that cannot be opened either.
+                NoteTranscriptLineFailure(f, ex);
+            }
+            string title = goal.Length > 0 ? (goal.Length > 54 ? goal.Substring(0, 54) + "…" : goal)
+                                           : Path.GetFileNameWithoutExtension(StripGz(f));
+            double ts = (_transcriptIndex[i].Value - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
+            var discovered = new Conversation { Transcript = f, Name = name, Title = title, Source = "fleet",
+                                        Ts = ts, Goal = goal,
+                                        // "sess:<guid>" -- the bridge's own shape for a
+                                        // conversation with no navigable URL. NOT a url:
+                                        // calling it one is how a resume silently becomes
+                                        // a fresh chat.
+                                        ConvUrl = guid.Length > 0 ? "sess:" + guid : "" };
+            discovered.Transcripts.Add(f);
+            _all.Add(discovered);
+            known.Add(StripGz(f));
+            added++;
         }
-        catch { }
+        _transcriptPos = end;
+        return added;
     }
 
     string BridgeCall(string path) { return BridgeCall(path, 60000); }
