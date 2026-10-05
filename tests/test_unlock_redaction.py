@@ -103,11 +103,13 @@ def test_both_sides_of_the_transcript_are_redacted():
 
 def test_bridge_redacts_both_sides_of_the_ledger():
     src = _src(BRIDGE)
-    body = re.search(r'def _persist_exchange\(.{0,1400}', src, re.S).group(0)
-    appends = re.findall(r'S\.append_turn\([^)]*\)', body)
-    assert len(appends) >= 2
-    for call in appends[:2]:
-        assert "_redact_unlock_password" in call, call
+    # The turns are written by _record_exchange_durably (one transaction); both the user line and
+    # the reply are redacted before they reach S.record_exchange.
+    body = re.search(r'def _record_exchange_durably\(.{0,3500}', src, re.S).group(0)
+    assert re.search(r'user_text = _redact_unlock_password\(user_msg\)', body)
+    assert re.search(r'assistant_text = _redact_unlock_password\(final_text\)', body)
+    call = re.search(r'S\.record_exchange\([^)]*\)', body).group(0)
+    assert "user_text" in call and "assistant_text" in call, call
 
 
 def test_bridge_redactor_exists_where_it_is_used():
