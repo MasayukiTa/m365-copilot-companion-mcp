@@ -478,6 +478,88 @@ def _tree_order(groups):
     return out
 
 
+_CAMPAIGN_KIND_RE = re.compile(rb'"kind"\s*:\s*"campaign"')
+#: path -> {"sig", "off", "wanted", "kept", "heads"}; the ledger is append-only, so a grown file is
+#: read from `off` onward and a shrunk or replaced one from the start.
+_LINES_CACHE = {}
+_LINES_CACHE_MAX = 4
+
+
+def _scan_campaign_lines(path, state):
+    wanted, kept, heads = state["wanted"], state["kept"], state["heads"]
+    with open(path, "rb") as fh:
+        fh.seek(state["off"])
+        off = state["off"]
+        for raw in fh:
+            if not raw.endswith(b"\n"):
+                break                  # a write in progress: left for the next call
+            off += len(raw)
+            if b'"campaign_id"' not in raw:
+                continue
+            is_head = bool(_CAMPAIGN_KIND_RE.search(raw))
+            if not is_head and not any(c in raw for c in state["wanted_b"]):
+                continue
+            ln = raw.decode("utf-8", "replace").strip().lstrip("﻿")
+            try:
+                rec = json.loads(ln)
+            except Exception:
+                continue
+            cid = str(rec.get("campaign_id") or "") if isinstance(rec, dict) else ""
+            if not cid:
+                continue
+            if cid in wanted:
+                kept.append(ln)
+            if is_head:
+                heads[cid] = (str(rec.get("parent_campaign_id") or ""), ln)
+        state["off"] = off
+
+
+def read_campaign_lines(path, wanted_cids):
+    """The campaigns.jsonl lines a split-group view needs, however large the file is.
+
+    A SIZE CAP USED TO TURN THIS INTO []: past 2 MB the snapshot's groups lost every parent link
+    (the ledger was ~7 MB), and the view of a nested run silently went flat. The view needs the
+    complete lines of the campaigns that have a live row (`wanted_cids`) plus the HEADER of each
+    of their ancestors (parent links only), so this STREAMS the file, keeps exactly those, and
+    never returns [] because of size. Cached by (mtime, size) and read incrementally, so the
+    3-second snapshot loop pays for the file's growth, not its length. [] only when the file is
+    absent or unreadable.
+    """
+    wanted = frozenset(str(c) for c in (wanted_cids or ()) if c)
+    try:
+        st = os.stat(path)
+    except OSError:
+        return []
+    key = os.path.normcase(os.path.abspath(path))
+    sig = (st.st_mtime_ns, st.st_size)
+    state = _LINES_CACHE.get(key)
+    try:
+        if state is None or state["wanted"] != wanted or st.st_size < state["off"]:
+            state = {"sig": sig, "off": 0, "wanted": wanted,
+                     "wanted_b": [c.encode("utf-8") for c in wanted], "kept": [], "heads": {}}
+        elif state["sig"] != sig:
+            state["sig"] = sig
+        _scan_campaign_lines(path, state)
+    except OSError:
+        return []
+    _LINES_CACHE.pop(key, None)
+    _LINES_CACHE[key] = state
+    while len(_LINES_CACHE) > _LINES_CACHE_MAX:
+        _LINES_CACHE.pop(next(iter(_LINES_CACHE)))
+    out, seen = list(state["kept"]), set(wanted)
+    for cid in wanted:                 # ancestors known only from their header
+        cur, hops = (state["heads"].get(cid) or ("", ""))[0], 0
+        while cur and cur not in seen and hops <= MAX_DEPTH:
+            hops += 1
+            seen.add(cur)
+            head = state["heads"].get(cur)
+            if not head:
+                break
+            out.append(head[1])
+            cur = head[0]
+    return out
+
+
 def read_fleet_dir(fleet_dir):
     """(workers, campaign_lines) from `.fleet/`; ([], []) for anything missing or torn."""
     workers, lines = [], []
