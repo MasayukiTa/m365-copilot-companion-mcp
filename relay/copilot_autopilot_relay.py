@@ -469,7 +469,19 @@ RETRY_JOB = (
 # delayed/retried probe tick without flapping between healthy/stale, while still catching a
 # probe subsystem that has gone quiet for a sustained stretch -- which is exactly the mined
 # incident this closes (tools were unreachable for the WHOLE run, not for a single missed tick).
-STUCK_TOOL_HEALTH_MAX_AGE_S = float(os.environ.get("MCP_STUCK_TOOL_HEALTH_MAX_AGE_S", "1800"))
+#: Three times the CONFIGURED probe interval (tools.tool_probe.configured_interval_s -- 30 min by
+#: default now, 10 min before), never below the old 1800 s: a record is up to one interval old
+#: between probes even when the probe subsystem is healthy.
+def _stuck_health_default_s():
+    try:
+        from tools import tool_probe as _tp
+        return max(1800.0, 3.0 * float(_tp.configured_interval_s()))
+    except Exception:
+        return 1800.0
+
+
+STUCK_TOOL_HEALTH_MAX_AGE_S = float(os.environ.get("MCP_STUCK_TOOL_HEALTH_MAX_AGE_S",
+                                                   str(_stuck_health_default_s())))
 
 
 def _tool_health_for_stuck(max_age_s: float = STUCK_TOOL_HEALTH_MAX_AGE_S,
