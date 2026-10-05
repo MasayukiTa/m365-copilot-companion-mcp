@@ -207,6 +207,10 @@ LIVE_RECORD_REDIRECTS = {
                               # would corrupt the one record the tab-leak incident left behind.
                               "PAGE_COUNT_LOG": "page_counts.jsonl",
                               "FLEET_CONVS_PATH": "fleet_convs.json",
+                              # Where a chat exchange goes when the session store refused it.
+                              # A test that forces that failure must not write into the
+                              # operator's real record of what was lost.
+                              "PERSIST_FAILURES_PATH": "chat_persist_failures.jsonl",
                               "RECYCLE_SAMPLES_PATH": "recycle_samples.jsonl",
                               "_SETTLE_RESET_TRACE_PATH": "settle_reset_trace.jsonl"},
     # THE BACK-FILL REWRITES TRANSCRIPTS IN PLACE, which is the most destructive shape on this

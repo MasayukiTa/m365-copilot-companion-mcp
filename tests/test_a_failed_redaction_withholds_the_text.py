@@ -167,6 +167,12 @@ class _FakeStore:
     def append_turn(self, sid, role, text):
         self.turns.append((sid, role, text))
 
+    def record_exchange(self, sid, user_text, assistant_text="", expect_turn=None):
+        self.turns.append((sid, "user", user_text))
+        if assistant_text:
+            self.turns.append((sid, "assistant", assistant_text))
+        return len(self.turns)
+
     def load(self, sid):
         return {"conv_url": ""}
 
