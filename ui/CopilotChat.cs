@@ -757,10 +757,12 @@ class ChatWindow : Window, IChatSendEffects
             if (m == _settingsMtime) return;
             _settingsMtime = m;
             int l0 = _lang;
+            int cap0 = _sectionCap;
             double s0 = _uiScale;
             bool a0 = _uiAuto; double t0 = _scaleTarget;
             LoadSettings();                              // re-reads lang/dark/ui_scale/target (+ApplyTheme)
             if (_lang != l0) { UpdateChrome(); RefreshConvList(); RerenderActiveConversation(); }
+            else if (_sectionCap != cap0) RefreshConvList();   // the cockpit changed the sidebar cap
             // Cockpit changed the shared zoom -> mirror it silently. In AUTO recompute for THIS monitor
             // (the per-monitor effective scale, not the other window's); in MANUAL push the shared number.
             if (_uiAuto)
@@ -3211,7 +3213,10 @@ class ChatWindow : Window, IChatSendEffects
     // so the full list renders. COLLAPSING the section (chevron) resets the override — MakeSectionHeader
     // clears the entry so re-expanding starts capped again.
     HashSet<string> _sectionExpanded = new HashSet<string>();
-    const int SectionCap = 8;
+    // How many rows a sidebar section shows before "+N more". Chosen in the cockpit settings popup
+    // (settings.txt sidebar_section_cap, default 8; 0 = no cap) and re-read when that file changes.
+    int _sectionCap = 8;
+    int SectionCap { get { return _sectionCap <= 0 ? int.MaxValue : _sectionCap; } }
 
     // Emits one section: header (if non-empty) + its rows. When collapsed, rows are skipped
     // EXCEPT the active conversation (cc.Id == _conv.Id), which always renders so the open
@@ -4341,6 +4346,8 @@ class ChatWindow : Window, IChatSendEffects
                 else if (ln.StartsWith("lang=") && int.TryParse(ln.Substring(5).Trim(), out v)) _lang = v;
                 else if (ln.StartsWith("dark=")) _dark = ln.Substring(5).Trim() != "0";
                 else if (ln.StartsWith("sidebar_collapsed=")) _sidebarCollapsed = ln.Substring(18).Trim() == "1";
+                else if (ln.StartsWith("sidebar_section_cap=") && int.TryParse(ln.Substring(20).Trim(), out v))
+                    _sectionCap = System.Math.Max(0, System.Math.Min(500, v));
                 else if (ln.StartsWith("last_open_conv=")) _lastOpenId = ln.Substring(15).Trim();
                 else if (ln.StartsWith("ui_scale="))
                 {
