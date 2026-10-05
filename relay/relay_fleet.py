@@ -683,9 +683,21 @@ _PROCESS_START = time.time()
 #: server, which only the custom agent can cause -- just not one this process caused. Recency
 #: is what makes it mean anything, so the window is derived from the probe interval rather than
 #: picked: shorter than one interval and a healthy machine still reads as unproven.
+#:
+#: THE INTERVAL IS NO LONGER A CONSTANT (the probe now runs only when nothing else has proved the
+#: tool path for a whole interval, default 30 min), so the window follows the configured interval
+#: instead of the old fixed 600 s, and a real tool call that succeeded within it counts as the same
+#: kind of evidence (see connector_proof_source) -- while a fleet is busy no probe is sent at all.
+def _default_proof_window_s():
+    try:
+        from tools import tool_probe as _tp
+        return 2.0 * float(_tp.configured_interval_s())
+    except Exception:
+        return 1200.0
+
+
 CONNECTOR_PROOF_WINDOW_S = float(os.environ.get(
-    "MCP_CONNECTOR_PROOF_S",
-    str(2.0 * float(os.environ.get("MCP_TOOL_PROBE_SEC", "600") or 0.0))))
+    "MCP_CONNECTOR_PROOF_S", str(_default_proof_window_s())))
 
 
 def connector_proof_source(now=None):
@@ -712,6 +724,18 @@ def connector_proof_source(now=None):
         # and stops a skewed clock reading as permanently proven.
         if 0.0 <= age <= CONNECTOR_PROOF_WINDOW_S:
             return "probe"
+    if CONNECTOR_PROOF_WINDOW_S > 0:
+        # THE PROBE NO LONGER RUNS WHILE REAL CALLS ARE LANDING, so its stamp can be hours old on
+        # a machine whose connector is working right now. A real, successful, non-probe tool call
+        # in the window is the same evidence (a call arrived at this server, which only the custom
+        # agent can cause) and the probe skipped itself precisely because of it.
+        try:
+            from tools import fleet_tool_health
+            now = time.time() if now is None else now
+            if fleet_tool_health.last_real_success(now, CONNECTOR_PROOF_WINDOW_S) is not None:
+                return "call"
+        except Exception:
+            pass
     return ""
 
 
@@ -6151,16 +6175,17 @@ class RelayWorker:
                                    "エージェントが応答しており、MCPコネクタは生きている。"
                                    "→ 接続の問題ではなく**この指示に対する拒否**。"
                                    "再ナビもヘッドフル復旧も効かない。指示の言い換えが要る。")
-                elif _proof == "probe":
+                elif _proof in ("probe", "call"):
                     self.retryable_override = False
                     # SAME VERDICT, DIFFERENT EVIDENCE. Saying "a sibling answered" here would
                     # be false -- this run may have had no sibling at all.
                     self.outcome = "REFUSED"
                     self.reason = ("⚠ 定型の無回答が継続。ただし直近%.0f分以内に本機のMCP"
-                                   "サーバへ実際のツール呼び出しが着弾しており(死活プローブ)、"
+                                   "サーバへ実際のツール呼び出しが着弾しており(%s)、"
                                    "コネクタ自体は生きている。→ 接続の問題ではなく"
                                    "**この指示に対する拒否**の可能性が高い。指示の言い換えから試せ。"
-                                   % (CONNECTOR_PROOF_WINDOW_S / 60.0))
+                                   % (CONNECTOR_PROOF_WINDOW_S / 60.0,
+                                      "死活プローブ" if _proof == "probe" else "別の実ツール呼び出し"))
                 else:
                     self.outcome = "INFRA_STUCK"
                     # WHAT IS MEASURED, THEN WHAT IS GUESSED, LABELLED AS SUCH. The old wording
