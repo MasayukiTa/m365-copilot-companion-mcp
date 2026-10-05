@@ -379,8 +379,13 @@ class CopilotSocketDriver:
         """
         try:
             c = self.conv
+            # PEEK, NEVER MINT: a driver that has not sent yet has no conversation to name.
+            # Reading the plain attribute here would create the id (it is lazy) and every
+            # status poll would then record a conversation nobody had spoken in.
+            _peek = getattr(c, "peek_conversation_id", None)
+            _client = _peek() if callable(_peek) else getattr(c, "conversation_id", "")
             return {
-                "client": str(getattr(c, "conversation_id", "") or ""),
+                "client": str(_client or ""),
                 "server": str(getattr(c, "server_conversation_id", "") or ""),
                 "session": str(getattr(c, "session_id", "") or ""),
                 "turns": int(getattr(c, "turns", 0) or 0),
