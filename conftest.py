@@ -216,7 +216,8 @@ LIVE_RECORD_REDIRECTS = {
     "bridge.session_store": {"SESS_DIR": "sessions"},
     "tools.tool_probe": {"_PROBE_FILE": "tool_probe.json",
                          "PROBE_FAILURE_JOURNAL": "tool_probe_failures.jsonl",
-                         "_INBOUND_PATH": "probe_inbound.json"},
+                         "_INBOUND_PATH": "probe_inbound.json",
+                         "_STATE_PATH": "tool_probe_state.json"},
 
     # ── THE FOURTH CLASS, 2026-09-24 ─────────────────────────────────────────────────────────
     #
@@ -627,6 +628,18 @@ def _no_writes_to_the_live_records(tmp_path_factory, monkeypatch):
                 monkeypatch.setattr(mod, const, value, raising=False)
             except Exception:
                 pass
+
+    # THE TEMP HOME, TOO. relay.temp_home.system_temp() is what both the writers (job logs, bench
+    # scratch) and the age sweep (fleet_retention.temp_home, run by apply()) resolve %TEMP%
+    # through. Pointing it at this session's directory means no test creates entries in, or
+    # sweeps, the operator's real %TEMP%.
+    try:
+        from relay import temp_home as _th
+        _sys_temp = base / "system_temp"
+        _sys_temp.mkdir(exist_ok=True)
+        monkeypatch.setattr(_th, "system_temp", lambda: str(_sys_temp))
+    except Exception:
+        pass
 
     yield base
 
@@ -1444,6 +1457,22 @@ def _no_leftover_kill_switch():
     STOP_FILE.unlink(missing_ok=True)
     yield
     STOP_FILE.unlink(missing_ok=True)
+
+
+@pytest.fixture(autouse=True)
+def _a_probe_backoff_does_not_outlive_its_test():
+    """The bridge keeps the probe's backoff counters at module level (they must survive from one
+    probe to the next). A test that fails a probe or returns an empty turn would otherwise leave
+    them raised for every later test that runs the probe in the same process. Only touches the
+    bridge when some test has already imported it."""
+    import sys
+    b = sys.modules.get("bridge.copilot_bridge")
+    if b is not None and isinstance(getattr(b, "_PROBE_RT", None), dict):
+        b._PROBE_RT.update({"anchor": 0.0, "defer": 0.0, "fails": 0, "empty": 0})
+    yield
+    b = sys.modules.get("bridge.copilot_bridge")
+    if b is not None and isinstance(getattr(b, "_PROBE_RT", None), dict):
+        b._PROBE_RT.update({"anchor": 0.0, "defer": 0.0, "fails": 0, "empty": 0})
 
 
 # --------------------------------------------------------------------------------------------

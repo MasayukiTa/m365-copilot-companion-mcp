@@ -117,11 +117,12 @@ def test_unreadable_usage_refuses_a_nested_split_only(tmp_path):
     assert use == STEPS and why == ""
 
 
-def test_a_ledger_past_the_cpu_bound_is_unknown_for_a_nested_split_only(tmp_path, monkeypatch):
+def test_a_big_ledger_is_never_unknown_because_of_its_size(tmp_path):
     p = tmp_path / "campaigns.jsonl"
-    _write(str(p), [_hdr("rootA")])
-    monkeypatch.setattr(fb, "_MAX_CAMPAIGN_BYTES", 10)
-    assert fb.ledger_rows_for_split(str(p), "rootA") is None
+    _write(str(p), [_hdr("rootA")] + [_child("rootA", i) for i in range(3)])
+    assert not hasattr(fb, "_MAX_CAMPAIGN_BYTES")
+    rows = fb.ledger_rows_for_split(str(p), "rootA")
+    assert rows is not None and len(rows) == 1
     assert fb.ledger_rows_for_split(str(p), "") == []
 
 

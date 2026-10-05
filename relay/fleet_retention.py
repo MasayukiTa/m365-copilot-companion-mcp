@@ -1175,6 +1175,163 @@ def campaigns_ledger_warning(fleet_dir, dry_run=False, warn_mb=None):
     return size
 
 
+#: Age after which an entry under %TEMP%\m365-companion\ is swept (hours; newest file inside).
+TEMP_HOME_MAX_AGE_H = float(os.environ.get("MCP_TEMP_HOME_MAX_AGE_H", "24"))
+#: An EMPTY top-level playwright-artifacts-* directory (left when a CDP-attached browser is
+#: killed) is swept after this many hours.
+PLAYWRIGHT_EMPTY_MAX_AGE_H = 6.0
+#: Exactly the name PasteImage() in ui/CopilotChat.cs gives a pasted picture.
+_PASTE_PNG = re.compile(r"^copilot_paste_[0-9a-f]{8}\.png$")
+_PLAYWRIGHT_DIR = re.compile(r"^playwright-artifacts-[A-Za-z0-9_\-]+$")
+
+
+def _is_link(path):
+    """True for a symlink or a Windows junction / any reparse point. lstat only, never follows."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    return bool(getattr(st, "st_file_attributes", 0) & 0x400)  # FILE_ATTRIBUTE_REPARSE_POINT
+
+
+def _unlink_quiet(path):
+    try:
+        os.remove(path)
+        return True
+    except OSError:
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            os.remove(path)
+            return True
+        except OSError:
+            return False
+
+
+def _remove_link(path):
+    """Remove a link/junction ITSELF, never what it points at."""
+    try:
+        os.unlink(path)
+        return True
+    except OSError:
+        try:
+            os.rmdir(path)  # a directory symlink or junction on Windows
+            return True
+        except OSError:
+            return False
+
+
+def _rm_tree_safe(path):
+    """Delete `path` and everything under it, never following a link out of it, skipping what
+    is locked. Returns bytes removed. Never raises."""
+    freed = 0
+    if _is_link(path):
+        _remove_link(path)
+        return 0
+    try:
+        entries = list(os.scandir(path))
+    except OSError:
+        return 0
+    for e in entries:
+        try:
+            if _is_link(e.path):
+                _remove_link(e.path)
+            elif e.is_dir(follow_symlinks=False):
+                freed += _rm_tree_safe(e.path)
+            else:
+                n = _size(e.path)
+                if _unlink_quiet(e.path):
+                    freed += n
+        except OSError:
+            continue
+    try:
+        os.rmdir(path)
+    except OSError:
+        pass  # something locked or new inside: leave it for the next pass
+    return freed
+
+
+def sweep_temp_home(fleet_dir=None, now=None, dry_run=False, max_age_h=None, temp_root=None):
+    """Sweep what this product left in %TEMP%. Returns (bytes_freed, [paths]); never raises.
+
+    ONLY three things are ever touched:
+      1. entries directly under %TEMP%\\m365-companion\\ whose newest file is older than
+         `max_age_h` (default 24) -- including agents' venvs under agents\\<name>\\;
+      2. top-level %TEMP%\\playwright-artifacts-* directories that are EMPTY and older than 6 h;
+      3. top-level %TEMP%\\copilot_paste_<8 hex>.png files older than `max_age_h`.
+    Anything else in %TEMP% is somebody else's and is not looked at. Links and junctions are
+    removed as links, never followed; a locked file is skipped, not an error. `fleet_dir` is
+    accepted only so apply() can call every rule the same way."""
+    freed, items = 0, []
+    try:
+        now = time.time() if now is None else now
+        max_age_h = TEMP_HOME_MAX_AGE_H if max_age_h is None else max_age_h
+        if temp_root is None:
+            from relay import temp_home as _th
+            temp_root = _th.system_temp()
+            home = _th.home_path()
+        else:
+            home = os.path.join(temp_root, "m365-companion")
+        cutoff = now - max_age_h * 3600.0
+
+        # 1. the home directory
+        if os.path.isdir(home) and not _is_link(home):
+            for e in list(os.scandir(home)):
+                try:
+                    if _is_link(e.path):
+                        # A planted link is removed as a link once old enough; never followed.
+                        if os.lstat(e.path).st_mtime < cutoff:
+                            items.append(e.path)
+                            if not dry_run:
+                                _remove_link(e.path)
+                        continue
+                    if e.is_dir(follow_symlinks=False):
+                        newest, size = _newest_mtime_and_size(e.path)
+                        newest = newest or os.lstat(e.path).st_mtime
+                        if newest < cutoff:
+                            items.append(e.path)
+                            freed += size
+                            if not dry_run:
+                                _rm_tree_safe(e.path)
+                    elif e.stat(follow_symlinks=False).st_mtime < cutoff:
+                        n = _size(e.path)
+                        items.append(e.path)
+                        freed += n
+                        if not dry_run:
+                            _unlink_quiet(e.path)
+                except OSError:
+                    continue
+
+        # 2 + 3. the two known strays directly in the system temp dir
+        if os.path.isdir(temp_root):
+            for e in list(os.scandir(temp_root)):
+                try:
+                    if _PLAYWRIGHT_DIR.match(e.name):
+                        if (e.is_dir(follow_symlinks=False) and not _is_link(e.path)
+                                and not os.listdir(e.path)
+                                and now - os.lstat(e.path).st_mtime > PLAYWRIGHT_EMPTY_MAX_AGE_H * 3600.0):
+                            items.append(e.path)
+                            if not dry_run:
+                                try:
+                                    os.rmdir(e.path)  # refuses a non-empty dir, by construction
+                                except OSError:
+                                    pass
+                    elif _PASTE_PNG.match(e.name):
+                        if (e.is_file(follow_symlinks=False) and not _is_link(e.path)
+                                and os.lstat(e.path).st_mtime < cutoff):
+                            n = _size(e.path)
+                            items.append(e.path)
+                            freed += n
+                            if not dry_run:
+                                _unlink_quiet(e.path)
+                except OSError:
+                    continue
+    except Exception:
+        pass
+    return freed, items
+
+
 def apply(fleet_dir=None, now=None, dry_run=False):
     """Run every rule. Returns a report; never raises."""
     fleet_dir = fleet_dir or os.path.join(
@@ -1197,10 +1354,11 @@ def apply(fleet_dir=None, now=None, dry_run=False):
                      ("stores", stores),
                      ("workspace_clones", workspace_clones),
                      ("conversations", conversations),
-                     ("cap_jsonl", cap_jsonl)):
+                     ("cap_jsonl", cap_jsonl),
+                     ("temp_home", sweep_temp_home)):
         try:
             if fn in (coordinator_logs, scratch, stores, compress, conversations,
-                     workspace_clones):
+                     workspace_clones, sweep_temp_home):
                 freed, items = fn(fleet_dir, now=now, dry_run=dry_run)
             else:
                 freed, items = fn(fleet_dir, dry_run=dry_run)

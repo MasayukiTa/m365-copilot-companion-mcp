@@ -1411,6 +1411,16 @@ def _auto_resume_block():
         return {}
 
 
+def _conversation_saving_block():
+    """`conversation_saving`: {merge_conversation, aggregators_saved, unsent_created}, additive.
+    The production caller of relay.conversation_saving.status_block. {} on any failure."""
+    try:
+        from relay import conversation_saving as _cs
+        return _cs.status_block()
+    except Exception:
+        return {}
+
+
 def _fanout_depth_block():
     """`fanout_depth`: the split depth asked for and the one in force, additive.
 
@@ -1893,25 +1903,28 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
     _snap.update(_fanout_depth_block())
     _snap.update(_write_scope_block())
     _snap.update(_auto_resume_block())
+    _snap.update(_conversation_saving_block())
     return _snap
 
 
 #: Most split groups status.json carries. build_groups already clips every ledger string; this
 #: bounds the COUNT so a run with hundreds of campaigns cannot bloat the file the cockpit polls.
 _MAX_SPLIT_GROUPS = 50
-_MAX_CAMPAIGN_LEDGER_BYTES = 2_000_000
 
 
-def _campaign_lines():
-    """campaigns.jsonl lines from the active state dir; [] when absent, torn or too large."""
+def _campaign_lines(workers=None):
+    """The campaigns.jsonl lines the split-group view needs, from the active state dir.
+
+    Never [] because of the file's SIZE (it was, past 2 MB, and the nesting vanished from
+    status.json): family_view.read_campaign_lines streams it and keeps the campaigns that have a
+    row in `workers` plus their ancestors' headers. [] when absent or unreadable.
+    """
     if not _ACTIVE_STATE_DIR:
         return []
     try:
-        path = os.path.join(_ACTIVE_STATE_DIR, "campaigns.jsonl")
-        if os.path.getsize(path) > _MAX_CAMPAIGN_LEDGER_BYTES:
-            return []
-        with open(path, encoding="utf-8-sig") as f:
-            return f.read().splitlines()
+        from relay import family_view as _fvw
+        cids = {str(w.get("campaign_id")) for w in (workers or []) if isinstance(w, dict) and w.get("campaign_id")}
+        return _fvw.read_campaign_lines(os.path.join(_ACTIVE_STATE_DIR, "campaigns.jsonl"), cids)
     except Exception:
         return []
 
@@ -1927,7 +1940,7 @@ def _attach_split_groups(snap):
     """
     try:
         from relay import family_view as _fvw
-        lines = _campaign_lines()
+        lines = _campaign_lines(snap["workers"])
         groups = _fvw.build_groups(snap["workers"], lines)[:_MAX_SPLIT_GROUPS]
         annotated = _fvw.annotate_display_state(snap["workers"], lines)
         snap["groups"] = groups
@@ -3837,6 +3850,13 @@ def main():
         if not goals:
             # everything finished (and no new -g/--goals-file goals) -> nothing to launch.
             sys.exit(0)
+        # A BY-HAND --resume ADOPTS THE INTERRUPTED RUN'S GOALS HERE, so it is also where the
+        # snapshot must say so (a supervisor/script launch sets the lineage and marks it itself).
+        try:
+            from relay import fleet_resume as _fr_mark
+            _fr_mark.mark_manual_resume(args.state_dir, time.time())
+        except Exception as _e:
+            print("RESUME: could not mark the snapshot resumed: %s" % type(_e).__name__)
 
     # RESUME IS AN INGRESS TOO. An old run ledger may predate the intake guards above (the
     # 2026-09-29 incident left LOCAL_LOOP wrapper text in last_run_goals.json). Never let a

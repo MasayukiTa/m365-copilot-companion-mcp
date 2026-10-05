@@ -177,6 +177,15 @@ KEYS = OrderedDict([
        "fanout_max_depth says. Keep it off until nested merging has been verified with small "
        "goals. Re-read at each split with no restart; trees already split keep going."),
 
+    _k("merge_conversation", EACH_GATE, "fresh",
+       "relay/conversation_saving.py:merge_conversation_setting (every split and every merge)",
+       "fresh|parent. parent runs a fan-out family's merge in the PARENT worker's existing "
+       "conversation (a socket parent that has spoken) instead of opening a fresh aggregator "
+       "conversation; the merge stays its own goal with the same checks, slot and resume key. "
+       "A family without a recorded parent conversation merges in a fresh one. Default fresh "
+       "until a merge has been measured to answer as well in the parent's conversation. "
+       "Re-read at each split and each merge with no restart."),
+
     # Recovery. Read by the supervisor on every cycle (about every 15 s) through
     # relay/fleet_resume.py:auto_resume_enabled; "each_gate" is the nearest declared boundary:
     # a decision per cycle, work already in flight untouched.
@@ -188,6 +197,17 @@ KEYS = OrderedDict([
        "interrupted run's resume instead of starting a fresh coordinator. Re-read each supervisor "
        "cycle with no restart. An MCP_FLEET_AUTORESUME environment variable, when set, beats it. "
        "Default on, matching the startup resume that was always on."),
+
+    # The bridge's tool-call probe (bridge/copilot_bridge.py). It decides when to send, so the
+    # timer re-reads this every few minutes; "each_gate" is the nearest declared boundary: a
+    # decision per tick, a probe already in flight untouched.
+    _k("tool_probe_idle_min", EACH_GATE, 30,
+       "bridge/copilot_bridge.py:_probe_interval_s (every probe tick, about every 5 min)",
+       "0|15|30|60 (minutes; 0 = never probe). How long the tool path may go without any proof "
+       "before the bridge sends a probe message -- a real tool call that succeeded within the "
+       "interval counts as proof and no message is sent. Re-read about every 5 minutes with no "
+       "restart. A MCP_TOOL_PROBE_SEC environment variable, when set, beats it. Default 30 "
+       "(the probe used to run every 10 minutes whatever else was happening)."),
 
     _k("autoretry", SWEEP_START, 1,
        "relay/fleet_runner.py:settings_autoretry (once, before the sweep)",

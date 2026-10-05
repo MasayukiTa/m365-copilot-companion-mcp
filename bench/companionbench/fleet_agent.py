@@ -73,6 +73,7 @@ import sys
 import tempfile
 
 from bench.companionbench.agents import FLEET, FLEET_FIELDS
+from relay.temp_home import temp_home as _temp_home  # scratch under the swept temp home
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -465,7 +466,7 @@ class FleetAgent:
         directory turns a paired comparison into a sequence: whatever the baseline learned is
         what the candidate starts from.
         """
-        d = tempfile.mkdtemp(prefix="cb_fleet_")
+        d = tempfile.mkdtemp(prefix="cb_fleet_", dir=_temp_home())
         state = os.path.join(d, ".fleet")
         if self.memory_seed and os.path.isdir(self.memory_seed):
             shutil.copytree(self.memory_seed, state)
