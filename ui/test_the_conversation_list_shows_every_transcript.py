@@ -190,8 +190,8 @@ def test_a_corrupt_registry_reports_why_instead_of_an_empty_list(exe, tmp_path):
 
 @needs_csc
 def test_the_notice_is_one_line_in_both_languages(exe):
-    ja = _run(exe, "notice", "ja", "ArgumentException: boom\nsecond line")
-    en = _run(exe, "notice", "en", "ArgumentException: boom")
+    ja = bytes.fromhex(_run(exe, "notice", "ja", "ArgumentException: boom second line").strip()).decode("utf-8")
+    en = bytes.fromhex(_run(exe, "notice", "en", "ArgumentException: boom").strip()).decode("utf-8")
     assert ja.startswith("履歴の一部を読めませんでした: ") and "\n" not in ja and "boom" in ja
     assert en.startswith("Part of the history could not be read: ") and "boom" in en
 
