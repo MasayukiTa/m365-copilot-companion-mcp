@@ -97,8 +97,13 @@ _PROCESS_STARTED = time.time()
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 from tools import childproc
+from relay.code_staleness import BRIDGE_CODE_FILES, CodeWatch
 
-DELETE_LOG = REPO / ".fleet" / "delete_log.jsonl"
+#: What this process loaded, fingerprinted at start. /status compares it with the disk so "is the
+#: bridge running the code that was merged?" is answered by the process, not by file timestamps.
+_CODE_WATCH = CodeWatch(str(REPO), BRIDGE_CODE_FILES)
+
+DELETE_LOG =REPO / ".fleet" / "delete_log.jsonl"
 FLEET_CONVS_PATH = REPO / ".fleet" / "conversations.json"
 GUID_RE = re.compile(r"/conversation/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})")
 # A bare GUID (not URL-embedded) -- e.g. a sidebar row's id/conversationId, as found live on
@@ -4195,6 +4200,7 @@ class Handler(BaseHTTPRequestHandler):
                 store = S.store_stats() or {}
             except Exception as exc:
                 store = {"error": "%s: %s" % (type(exc).__name__, str(exc)[:80])}
+            _code_changed = _CODE_WATCH.changed()
             status = {
                 "ok": True,
                 "transport": "socket" if _on_socket() else ("page" if DRIVER else "none"),
@@ -4213,6 +4219,10 @@ class Handler(BaseHTTPRequestHandler):
                 "store": store,
                 "pid": os.getpid(),
                 "started": _PROCESS_STARTED,
+                # ADDITIVE. True when a file this process loaded has changed on disk since it
+                # started (restart needed; the restart itself needs idle, see turn_running/busy).
+                "code_stale": bool(_code_changed),
+                "code_changed": _code_changed,
                 "python": platform.python_version(),
                 "authenticated": authed,
                 # WHETHER THIS BRIDGE'S PAGE IS STUCK ON A SIGN-IN PAGE. Read by
@@ -4233,6 +4243,7 @@ class Handler(BaseHTTPRequestHandler):
                 # the token (scripts/win/verify_stack.py does).
                 status.pop("conversation", None)
                 status.pop("active_sid", None)
+                status.pop("code_changed", None)   # file names only with the token
             self._json(status)
             return
         if parsed.path == "/conv":         # current conversation URL (for saving)
