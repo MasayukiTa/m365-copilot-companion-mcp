@@ -227,14 +227,21 @@ $script:SupLastVerdict = ""
 
 function Get-SupervisorFileStat([string]$Rel) {
     try {
-        $i = Get-Item -LiteralPath (Join-Path $Root $Rel) -ErrorAction Stop
+        $i = New-Object System.IO.FileInfo (Join-Path $Root $Rel)
+        if (-not $i.Exists) { return "" }
         return ("{0}:{1}" -f $i.LastWriteTimeUtc.Ticks, $i.Length)
     } catch { return "" }
 }
 
 function Get-SupervisorFileHash([string]$Rel) {
+    # .NET directly, not Get-FileHash: no module autoload, and it failed (empty hash) on the hosted
+    # Windows runner while working locally.
     try {
-        return (Get-FileHash -LiteralPath (Join-Path $Root $Rel) -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $bytes = [System.IO.File]::ReadAllBytes((Join-Path $Root $Rel))
+            return ([System.BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant()
+        } finally { $sha.Dispose() }
     } catch { return "" }
 }
 

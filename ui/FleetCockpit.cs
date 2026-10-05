@@ -7854,8 +7854,8 @@ class CockpitWindow : Window
                 return "live";
             case "fanout_hierarchical_merge":
             case "fleet_auto_resume":
-            case "supervisor_self_restart":
             case "rate_ceiling_rpm":
+            case "supervisor_self_restart":
             case "job_approval_mode":
             case "fanout_write_scope":
             case "fanout_max_depth":
