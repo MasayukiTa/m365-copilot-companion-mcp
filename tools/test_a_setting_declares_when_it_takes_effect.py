@@ -121,6 +121,11 @@ def _reader_tool_probe_idle_min():
     return idle_min_setting()
 
 
+def _reader_merge_conversation():
+    from relay.conversation_saving import merge_conversation_setting
+    return merge_conversation_setting()
+
+
 def _fanout_limit_reader(field):
     def _read():
         from relay.fanout_budget import limits_from_settings
@@ -143,6 +148,7 @@ _LIVE_READERS = {
     "fanout_write_scope": (_reader_write_scope, "shadow", "off"),
     "fleet_auto_resume": (_reader_auto_resume, "off", "on"),
     "tool_probe_idle_min": (_reader_tool_probe_idle_min, "15", "60"),
+    "merge_conversation": (_reader_merge_conversation, "parent", "fresh"),
     "fanout_max_total": (_fanout_limit_reader("total"), "10", "30"),
     "fanout_max_active": (_fanout_limit_reader("active"), "2", "6"),
     "fanout_max_turns": (_fanout_limit_reader("turns"), "100", "500"),
