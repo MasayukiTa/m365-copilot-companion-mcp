@@ -240,6 +240,38 @@ def _p(sub, name):
     return os.path.join(TASKS, sub, name)
 
 
+_SUBMITTER_CACHE = {}
+
+
+def submitter_for_jid(jid, tasks_dir=None):
+    """Who handed this job in, as short text: 'mcp:<source>' / 'cli:<args>' / 'ui:<...>'.
+
+    Read from the provenance fleet_intake / the CLI recorded on the job (`origin`), looked for in
+    the pending, running and done directories. Empty when the job id is unknown or carries no
+    origin. Cached per job id (a found answer never changes) so the status snapshot can ask on
+    every sweep. Never raises.
+    """
+    jid = str(jid or "")
+    if not jid or not all(ch.isalnum() or ch in "-_" for ch in jid):
+        return ""
+    if jid in _SUBMITTER_CACHE:
+        return _SUBMITTER_CACHE[jid]
+    base = tasks_dir or TASKS
+    for sub in ("done", "running", "pending", "for_fleet", "awaiting", "awaiting_ack"):
+        path = os.path.join(base, sub, jid + ".json")
+        try:
+            with open(path, encoding="utf-8-sig") as fh:
+                origin = (json.load(fh) or {}).get("origin")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(origin, dict) and (origin.get("via") or origin.get("source")):
+            text = ("%s:%s" % (origin.get("via") or "", origin.get("source") or "")).strip(":")
+            text = " ".join(text.split())[:80]
+            _SUBMITTER_CACHE[jid] = text
+            return text
+    return ""
+
+
 # ── LOCAL executors (bounded; return a (status, result, error) tuple) ─────────────────────────
 
 def _exec_shell(payload):

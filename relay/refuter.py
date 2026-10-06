@@ -212,6 +212,15 @@ def build_refuter_prompt(goal: str, final_response: str, lens: str = "",
     )
 
 
+def _preamble_id(lens="", unverifiable=False):
+    """A short id of the instruction text a reviewer is given (base + lens + unverifiable framing)."""
+    import hashlib
+    text = REFUTER_INSTRUCTION + (LENS_PROMPTS.get(lens, "") if lens else "")
+    if unverifiable:
+        text = UNVERIFIABLE_PREAMBLE + text
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
 def aggregate_panel(results, min_refute=None):
     """Aggregate a panel of (lens, kind, reason) verdicts into one (kind, reason).
 
@@ -437,8 +446,15 @@ class RefuterSession:
 
     def __init__(self, context, base_url, goal, final_response,
                  dwell_s=4.0, timeout_s=600, max_nudges=2, lens="",
-                 max_network_reopens=2, unverifiable=False):
+                 max_network_reopens=2, unverifiable=False, recorder=None):
         self.context = context
+        #: Called with one dict per text this session sends or receives (see _note), AS IT
+        #: HAPPENS. The reviewer's own conversation used to be stored nowhere: only its verdict
+        #: kind and a short reason survived. None = nobody is recording (the old behaviour).
+        self.recorder = recorder
+        self.exchanges = []
+        self.last_route = ""
+        self._last_received = None
         self.unverifiable = unverifiable
         self.base_url = base_url
         self.goal = goal
@@ -465,6 +481,58 @@ class RefuterSession:
         self.socket = False
         #: Asked once. A capture costs a real tab and a real turn.
         self._socket_tried = False
+
+    def _note(self, direction, text, route=None):
+        """Remember one text sent to / received from the reviewer, and hand it to the recorder.
+
+        NEVER RAISES INTO THE REVIEW, never swallows: a recorder failure is written to stderr
+        (a review must not die of a logging fault, but a lost record has to be knowable).
+        """
+        import sys
+        import time
+        ex = {"seq": len(self.exchanges), "direction": direction, "text": str(text or ""),
+              "ts": time.time(),
+              "route": route if route is not None else ("socket" if self.socket else "tab"),
+              "lens": self.lens or "",
+              # WHICH PREAMBLE, and which agent: the instruction text is edited over time and a
+              # stored row has to say which version of it the reviewer was given.
+              "preamble_id": _preamble_id(self.lens, self.unverifiable),
+              "gpt_id": str(getattr(getattr(self.drv, "conv", None), "gpt_id", "") or "")}
+        self.last_route = ex["route"]
+        self.exchanges.append(ex)
+        if self.recorder is None:
+            return
+        try:
+            self.recorder(ex)
+        except Exception as exc:
+            sys.stderr.write("[refuter] recorder failed (%s): %s: %s\n"
+                             % (direction, type(exc).__name__, str(exc)[:160]))
+
+    def _note_reply(self, text):
+        """Record a reply the reviewer settled on. The same text twice in a row is one reply."""
+        if text is None or text == self._last_received:
+            return
+        self._last_received = text
+        self._note("received", text)
+
+    def _wire_sink(self):
+        """The socket driver reports the payload it really sends (protocol preamble and
+        tool catalogue included); stored as `sent_wire` beside the prompt we composed."""
+        def sink(payload, round_no):
+            self._note("sent_wire", payload, route="socket")
+        return sink
+
+    def _send_prompt(self):
+        """Compose the reviewer prompt, send it, and record exactly what was sent."""
+        prompt = build_refuter_prompt(self.goal, self.final, lens=self.lens,
+                                      unverifiable=self.unverifiable)
+        if self.socket:
+            try:
+                self.drv.payload_sink = self._wire_sink()
+            except Exception:
+                pass
+        self.drv.send(prompt)
+        self._note("sent", prompt)
 
     def start(self):
         # Defer the side-page open until poll() sees enough free RAM (ram_room_for_tab) -- the
@@ -499,8 +567,7 @@ class RefuterSession:
             self.drv = CopilotWebDriver(self.page)
             self._count_before = self.drv._answers().count()
             self.drv._count_before = self._count_before
-            self.drv.send(build_refuter_prompt(self.goal, self.final, lens=self.lens,
-                                              unverifiable=self.unverifiable))
+            self._send_prompt()
             self._pending_open = False
             self._t_send = time.time()
         except Exception as exc:
@@ -576,8 +643,7 @@ class RefuterSession:
             self.page, self.drv, self.socket = None, drv, True
             self._count_before = 0
             self.drv._count_before = 0
-            self.drv.send(build_refuter_prompt(self.goal, self.final, lens=self.lens,
-                                              unverifiable=self.unverifiable))
+            self._send_prompt()
             self._pending_open = False
             self._t_send = time.time()
             return True
@@ -729,8 +795,10 @@ class RefuterSession:
                         self._settle_state = _settle.SettleState()
                         self._last, self._stable_since = None, None
                         return None
+                    self._note_reply(t)
                     self._nudge()
                     return None
+                self._note_reply(t)
                 accept = getattr(self.drv, "_accept_new_reply", None)
                 if callable(accept):
                     accept(t)
@@ -753,8 +821,10 @@ class RefuterSession:
                     verdict = parse_verdict(t)
                     # preamble-only answer ("I'll check...") -> nudge for the verdict
                     if verdict[0] == "UNCLEAR" and self._nudges_used < self.max_nudges:
+                        self._note_reply(t)
                         self._nudge()
                         return None
+                    self._note_reply(t)
                     accept = getattr(self.drv, "_accept_new_reply", None)
                     if callable(accept):
                         accept(t)
@@ -773,7 +843,14 @@ class RefuterSession:
         try:
             self._count_before = self.drv._answers().count()
             self.drv._count_before = self._count_before
-            self.drv.send(_next_refuter_nudge(self._nudges_used))
+            _nudge_text = _next_refuter_nudge(self._nudges_used)
+            if self.socket:
+                try:
+                    self.drv.payload_sink = self._wire_sink()
+                except Exception:
+                    pass
+            self.drv.send(_nudge_text)
+            self._note("sent", _nudge_text)
             self._t_send = time.time()
             self._last, self._stable_since = None, None
             # A nudge is a NEW turn. Carrying stability across it would let the settle

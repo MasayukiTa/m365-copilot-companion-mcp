@@ -283,6 +283,10 @@ KEYS = OrderedDict([
     _k("ui_scale", UI_ONLY, "auto", "ui/FleetCockpit.cs, ui/CopilotChat.cs", "Zoom."),
     _k("ui_scale_target", UI_ONLY, "auto", "ui/FleetCockpit.cs, ui/CopilotChat.cs", "Zoom."),
     _k("sidebar_collapsed", UI_ONLY, 0, "ui/CopilotChat.cs", "Sidebar state."),
+    _k("sidebar_section_cap", UI_ONLY, 8, "ui/FleetCockpit.cs (writes), ui/CopilotChat.cs (reads)",
+       "How many conversations each sidebar section shows before '+N more' (the Fleet runs "
+       "section especially). Chosen in the cockpit settings popup; the chat window re-reads it "
+       "when settings.txt changes. 0 shows every conversation."),
     _k("deletemode", UI_ONLY, 1, "ui/CopilotChat.cs", "Delete-button behaviour."),
     _k("last_open_conv", UI_ONLY, "", "ui/CopilotChat.cs", "Which conversation to reopen."),
     _k("autoarchive", UI_ONLY, 0, "ui/FleetCockpit.cs", "Archive a run when it finishes."),

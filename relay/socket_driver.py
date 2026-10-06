@@ -270,11 +270,18 @@ class CopilotSocketDriver:
                     if left > 0:
                         os.environ["MCP_SOCKET_FORCE_FAIL"] = "%d:%s" % (left - 1, _why)
                         raise ChatHubError(_why)
+            # OPTIONAL OBSERVER OF THE REAL WIRE PAYLOAD. Passed only when someone installed
+            # one (`driver.payload_sink = fn(payload, round)`), so a conversation object
+            # that predates the parameter is never handed a keyword it does not know.
+            _extra = {}
+            _sink = getattr(self, "payload_sink", None)
+            if _sink is not None:
+                _extra["on_payload"] = _sink
             answer = self.conv.ask(text, connect=self._connect, on_text=on_text,
                                    annotations=annotations,
                                    on_progress=on_progress,
                                    catalogue=self._catalogue, protocol=self._protocol,
-                                   run_tool=self._run_tool)
+                                   run_tool=self._run_tool, **_extra)
         except Exception as exc:
             # THE ROUTE FAILING IS NOT THE JOB FAILING. Recorded, not raised: the caller reads
             # `failed`, opens a tab and carries on with the same goal.

@@ -2020,6 +2020,17 @@ class FleetContextLost(Exception):
         self.unfinished = unfinished
 
 
+def _report_store_failure(what, exc):
+    """Say on stderr that a database write failed. Never raises (a log line must not cost a turn)."""
+    try:
+        import sys as _sys
+        _sys.stderr.write("[session_store] %s was NOT recorded: %s: %s\n"
+                          % (what, type(exc).__name__, str(exc)[:200]))
+        _sys.stderr.flush()
+    except Exception:
+        pass
+
+
 class _Transcript:
     """Append-only full-text log of one worker's conversation, one JSON object per line.
 
@@ -2078,8 +2089,10 @@ class _Transcript:
             from bridge.session_store import record_fleet_turn
             record_fleet_turn(self.key, obj, name=getattr(self, "_name", ""),
                               goal=getattr(self, "_goal", ""))
-        except Exception:
-            pass
+        except Exception as exc:
+            # NOT `pass`: a mirror that fails without a word is a database that silently holds
+            # nothing (the chat-persist lesson, #130). The fleet still carries on.
+            _report_store_failure("transcript mirror", exc)
 
     def _append(self, obj):
         self._to_db(obj)
@@ -2094,6 +2107,25 @@ class _Transcript:
 
     def user(self, turn, text):
         self._append({"turn": turn, "role": "user", "text": _redact_unlock_password(text), "ts": time.time()})
+
+    def wire(self, turn, text, route="", round=0, run_id=""):
+        """The string actually handed to the transport for this turn, in full, in the database.
+
+        DATABASE ONLY (not the JSONL beside it): the `user` row above is the job as composed;
+        this one is what the agent RECEIVED -- on the socket route the protocol preamble and the
+        tool catalogue the transport prepends, on a tab the whitespace-collapsed single line.
+        Redaction and the size cap are applied by the store's single write path; the cap, if it
+        ever bites, is flagged on the row.
+        """
+        try:
+            from bridge.session_store import record_wire_turn
+            ok = record_wire_turn(self.key, turn, text, name=getattr(self, "_name", ""),
+                                  goal=getattr(self, "_goal", ""), run_id=run_id,
+                                  route=route, round=round)
+            if not ok:
+                _report_store_failure("wire turn", RuntimeError("record_wire_turn returned False"))
+        except Exception as exc:
+            _report_store_failure("wire turn", exc)
 
     def assistant(self, turn, text):
         # 返ってきた側にも掛ける。こちらが送った文だけ伏せても、相手が復唱すれば
@@ -4063,6 +4095,22 @@ class RelayWorker:
                 jid=(self.jid or ""))
         except Exception:
             pass
+        # THE VALIDITY AUDIT LEDGER, written when the conversation is complete. Only does work for
+        # a conversation that touched a validity_* tool or names one in its goal; idempotent, so
+        # the backfill script and this hook can both cover the same worker. A failure is reported
+        # on stderr by the helper, never raised into the close.
+        try:
+            from bridge.validity_audit import sync_worker_logged
+            from tools.tool_ledger import _repo_path
+            sync_worker_logged(
+                getattr(self, "_tx_key", ""), ledger_path=_repo_path(),
+                run_id=getattr(self, "run_id", ""), name=self.name, jid=(self.jid or ""),
+                outcome={"outcome": self.outcome, "status": self.status,
+                         "reason": (self.reason or "")[:300]},
+                reviewed=bool(getattr(self, "refute_count", 0)),
+                tail_bytes=16 * 1024 * 1024)
+        except Exception as exc:
+            _report_store_failure("validity audit sync", exc)
         try:
             if getattr(self, "socket", False) and self.drv is not None:
                 self.drv.close()          # a socket is cheap, but it is not free
@@ -4605,6 +4653,7 @@ class RelayWorker:
             # generous total patience is realized across deferrals as a WALL-CLOCK budget
             # (max_gen_wait_s), not one blocking call. (run_relay's single-conversation path
             # keeps the full 240s.)
+            self._install_wire_sink()
             self.drv.send(self.job, gen_wait_s=2.0)
             if getattr(self, "socket", False):
                 note_admitted()
@@ -4734,6 +4783,12 @@ class RelayWorker:
         self._send_fail_streak = 0
         self._redirect_renavs = 0
         self._tx.user(self.turn, self.job)     # persist the full sent prompt for this turn
+        if not getattr(self, "socket", False):
+            # TAB ROUTE: send() collapses all whitespace to one line (a newline would submit the
+            # composer), so that single line is what the agent received. The socket route
+            # reports its own payload through the sink installed above.
+            self._tx.wire(self.turn, " ".join(str(self.job).split()), route="tab",
+                          run_id=getattr(self, "run_id", ""))
         self._last_sent_job = self.job         # so the next turn can recognise a verbatim re-send
         self._last_text, self._stable_since, self._t_send = None, None, time.time()
         self._settle_state = _settle.SettleState()
@@ -6981,7 +7036,8 @@ class RelayWorker:
                 self._refuter_session = RefuterSession(
                     self._context, self._agent_url or "", self.goal_as_amended(),
                     self.last_response,
-                    unverifiable=not self.checks).start()
+                    unverifiable=not self.checks,
+                    recorder=self._refuter_recorder("")).start()
             self.status = "refuting"
             return
         if self.fresh_replay_count:
@@ -7232,7 +7288,55 @@ class RelayWorker:
         self._refuter_session = RefuterSession(
             self._context, self._agent_url or "", self.goal_as_amended(),
             self.last_response, lens=lens,
-            unverifiable=not self.checks).start()
+            unverifiable=not self.checks,
+            recorder=self._refuter_recorder(lens)).start()
+
+    def _install_wire_sink(self):
+        """Have the socket driver report each real payload (preamble + tools + request, and
+        every tool-result follow-up) into fleet_turns as role "user_wire". Tab drivers have no
+        such hook and are recorded after send(); a failure here is logged, never raised."""
+        try:
+            if not getattr(self, "socket", False) or self.drv is None:
+                return
+            turn_no = self.turn + 1          # self.turn counts only after a send succeeds
+            tx = self._tx
+            run_id = getattr(self, "run_id", "")
+
+            def sink(payload, round_no):
+                tx.wire(turn_no, payload, route="socket", round=round_no, run_id=run_id)
+            self.drv.payload_sink = sink
+        except Exception as exc:
+            _report_store_failure("wire sink install", exc)
+
+    def _refuter_recorder(self, lens=""):
+        """A callable the RefuterSession invokes once per text it sends or receives, which
+        writes that text in full to fleet_turns under key `<parent key>__refuter_<lens>`
+        (roles refuter_user / refuter_wire / refuter_assistant / refuter_verdict). Written
+        AS IT HAPPENS, so a review that never finishes still leaves what it was asked."""
+        parent = getattr(self, "_tx_key", "") or ""
+        run_id = getattr(self, "run_id", "")
+        worker = getattr(self, "name", "")
+        refute_count = getattr(self, "refute_count", 0)
+        turn = getattr(self, "turn", None)
+        role_of = {"sent": "refuter_user", "sent_wire": "refuter_wire",
+                   "received": "refuter_assistant", "verdict": "refuter_verdict"}
+
+        def record(ex):
+            try:
+                from bridge.session_store import record_refuter_turn
+                extra = {"route": ex.get("route", ""), "gpt_id": ex.get("gpt_id", ""),
+                         "preamble_id": ex.get("preamble_id", ""),
+                         "refute_count": refute_count, "worker_turn": turn,
+                         "direction": ex["direction"]}
+                ok = record_refuter_turn(
+                    parent, role_of.get(ex["direction"], "refuter_" + str(ex["direction"])),
+                    ex["seq"], ex["text"], lens=lens or ex.get("lens", ""), name=worker,
+                    goal=getattr(self, "goal", ""), run_id=run_id, extra=extra, ts=ex.get("ts"))
+                if not ok:
+                    _report_store_failure("refuter exchange", RuntimeError("store returned False"))
+            except Exception as exc:
+                _report_store_failure("refuter exchange", exc)
+        return record
 
     def _append_panel_ledger(self, record):
         """One line per completed panel, beside the run state.
@@ -7304,6 +7408,18 @@ class RelayWorker:
         if r is None:
             return False
         kind, reason = r
+        # THE VERDICT AS THE FLEET TOOK IT, beside the texts that produced it (the session
+        # records those as they happen). Not truncated to the 300-character status reason.
+        _sess = self._refuter_session
+        try:
+            _rec = getattr(_sess, "recorder", None)
+            if callable(_rec):
+                _rec({"direction": "verdict", "seq": 10_000,
+                      "text": "%s: %s" % (kind, reason or ""), "ts": time.time(),
+                      "route": getattr(_sess, "last_route", ""),
+                      "lens": getattr(_sess, "lens", "")})
+        except Exception as exc:
+            _report_store_failure("refuter verdict", exc)
         if self.review_lenses:
             lens = self._refuter_session.lens
             self._panel_results.append((lens, kind, reason))

@@ -144,6 +144,7 @@ DELIBERATELY_EXCLUDED = {
     "survey_worktrees":  "reads what other trees the operator has checked out, which is not part of fixing the instance -- same reason as fleet_queue",
     "fleet_submit":      "queues work for this machine's fleet: a worker that can enqueue runs is not bounded by the run it is in -- same family as stop_request and schedule_create",
     "fleet_queue":       "reads what else the operator has running, which is not part of fixing the instance",
+    "validity_audit_ledger": "reads the audit ledger of the validity tools, which is the operator's record of other conversations and not part of fixing the instance",
     "loop_until_verified": "drives an edit/verify loop of its own inside one turn; a worker that can start an unbounded agent loop is not bounded by a list of tools -- same reason as forge_tool",
     "recurrent_begin":   "opens a self-generating loop, for the same reason",
     "recurrent_step":    "advances that loop",

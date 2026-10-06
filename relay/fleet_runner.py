@@ -1723,6 +1723,15 @@ def _disk_block(disk_floor_gb):
                            _FREE_RING.failures if _FREE_RING is not None else 0)
 
 
+def _submitter_of(jid):
+    """task_router.submitter_for_jid, never raising into the status snapshot."""
+    try:
+        from relay.task_router import submitter_for_jid
+        return submitter_for_jid(jid)
+    except Exception:
+        return ""
+
+
 def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paused=False,
               ram_floor_mb=0.0, directive="", run_label="", goal_count=0, queued=0,
               reunlock=None, command_rejections=None):
@@ -1819,6 +1828,9 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
             # is exactly the evidence bar the plan named: "同一run IDで受付・発火・実行・
             # 検証・終了を結ぶ". Empty for goals that never passed through admission.
             "jid": getattr(w, "jid", None) or "",
+            # WHO SUBMITTED IT (origin.via:source of the job), so a person looking for tonight's
+            # run can tell their own from the fleet's other work. Empty when unknown.
+            "submitter": _submitter_of(getattr(w, "jid", None) or ""),
             # THE NAME OF THE RUN THIS WORKER BELONGS TO, stated rather than left implicit.
             #
             # Four notions of "run" exist in the ledgers and none of them join: ownership.jsonl
