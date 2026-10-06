@@ -162,7 +162,7 @@ def test_the_ledger_read_is_bounded_and_says_what_it_left_out(store):
 
 
 def test_the_published_tool_reads_the_ledger(store):
-    from tools.auto.claim_audit_ledger import validity_audit_ledger
+    from tools.audit_ledger_ops import validity_audit_ledger
     S.append_validity_audit([{"claim_id": "SS1", "role_tag": "goal", "ts": T0, "text": "g",
                               "source_table": "t", "source_key": "1"}])
     assert json.loads(validity_audit_ledger("SS1"))["rows"][0]["role_tag"] == "goal"

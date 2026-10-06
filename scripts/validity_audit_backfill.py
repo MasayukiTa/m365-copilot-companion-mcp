@@ -104,6 +104,10 @@ def main(argv=None):
     print("unattributed validity tool calls: rows=%d inserted=%d already=%d" % (
         un["rows"], un["inserted"], un["already_there"]))
     print("workers audited=%d inserted=%d already_there=%d failed=%d" % (audited, ins, dup, failed))
+    for c in S.validity_audit_claims():
+        tags = S.validity_audit_ledger(c["claim_id"], limit=100000, max_chars=10**9)["rows"]
+        print("  claim %-14s rows=%d roles=%s" % (c["claim_id"], c["rows"],
+                                                 ",".join(sorted({r["role_tag"] for r in tags}))))
     return 1 if failed else 0
 
 
