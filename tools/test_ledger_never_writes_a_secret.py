@@ -166,6 +166,7 @@ def test_redaction_is_only_ever_applied_on_a_write_path(_held):
         "tools/tool_ledger.py",             # _append: writes the ledger line
         "relay/relay_fleet.py",             # _append: writes the fleet transcript
         "bridge/copilot_bridge.py",         # append_turn: writes the session store
+        "bridge/session_store.py",          # _redact_for_record: redacts before the full-text rows are written
     }
     found = set()
     for path in _python_files(root):

@@ -15701,7 +15701,7 @@ class CockpitWindow : Window
     UIElement ReviewerLedgerPanel(string transcriptPath)
     {
         bool ja = _lang == 0;
-        var host = new StackPanel { Margin = new Thickness(0, 10, 0, 0) };
+        var host = new StackPanel { Margin = new Thickness(0, 12, 0, 0) };
         string wkey = "";
         try { wkey = Path.GetFileNameWithoutExtension(transcriptPath ?? ""); } catch (Exception) { }
         if (string.IsNullOrEmpty(wkey)) return host;
