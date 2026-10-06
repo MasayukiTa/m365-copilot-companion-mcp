@@ -62,6 +62,16 @@ def load_auto_tools(package: str = "tools.auto") -> list[tuple[str, Callable]]:
             module = importlib.import_module(f"{package}.{mod_info.name}")
         except Exception:
             continue
+        # A module may opt out of registration by defining `_auto_tools_enabled()`. A gate that
+        # returns false OR raises means "publish nothing": the safe reading of a gate that
+        # cannot answer is closed. The name starts with "_", so the gate is never itself a tool.
+        gate = getattr(module, "_auto_tools_enabled", None)
+        if callable(gate):
+            try:
+                if not gate():
+                    continue
+            except Exception:
+                continue
         for attr_name, obj in vars(module).items():
             if attr_name.startswith("_") or _is_test_function(attr_name, obj):
                 continue
