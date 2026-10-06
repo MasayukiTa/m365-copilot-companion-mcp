@@ -23,8 +23,9 @@ this package uses.
 
 from __future__ import annotations
 
-import subprocess
 from dataclasses import dataclass, field
+
+from tools import childproc
 
 
 @dataclass
@@ -48,9 +49,7 @@ class PushRefused(ValueError):
 
 def _default_runner(args, *, cwd):
     """Run ``git <args>`` under ``cwd`` and return a GitResult. Matches the package style."""
-    proc = subprocess.run(
-        ["git", *args], cwd=cwd, capture_output=True, text=True,
-    )
+    proc = childproc.run(["git", *args], cwd=cwd)
     return GitResult(
         returncode=proc.returncode,
         stdout=proc.stdout or "",
